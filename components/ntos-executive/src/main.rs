@@ -485,7 +485,10 @@ pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
 // windows, and 0x1058..0x105B belong to the generic TP worker slot 0. The generic high worker
 // windows occupy 0x13E0..0x13FB, so this LSA-specific worker sits at the end of the same high thread
 // PT without overlapping any slot that lsass may claim dynamically.
-pub const LSA_WORKER_REGION_BASE: u64 = 0x0000_0100_13FC_0000; // lsass VSpace (own pml4)
+pub const LSA_WORKER_REGION_BASE: u64 = (TP_WORKER_SLOT1_REGION_BASE
+    + (TP_WORKER_SLOT_COUNT as u64 - 1) * TP_WORKER_EXEC_STRIDE
+    + 0x1f_ffff)
+    & !0x1f_ffff; // lsass VSpace (own pml4), after the generic worker target slots
 pub const LSA_WORKER_STACK_BASE: u64 = LSA_WORKER_REGION_BASE;
 pub const LSA_WORKER_STACK_FRAMES: u64 = 8;
 pub const LSA_WORKER_IPCBUF_VA: u64 = LSA_WORKER_REGION_BASE + 0x1_0000;
@@ -552,8 +555,8 @@ pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
 /// Executive-side windows for worker identities outside the legacy slot-0/slot-1, first-five-pi
 /// layout. The two legacy `TP_WORKER_*_EXEC_BASE` regions are laid out as `base + pi * STRIDE` and
 /// are only disjoint for `pi < TP_WORKER_PI_COUNT`; later hosted processes and extra worker slots get
-/// densely-packed `(pi, slot)` regions here: a genuinely free 32 MiB gap between the file-buffer POOL
-/// (`0x1500`+24*2 MiB = `0x1800`) and `FSD_EXEC_BASE` (`0x1A00`). Legacy slots for
+/// densely-packed `(pi, slot)` regions here: a free high band between the file-buffer POOL
+/// (`0x1500`+24*2 MiB = `0x1800`) and the hosted-driver execution arena. Legacy slots for
 /// `pi < TP_WORKER_PI_COUNT` are byte-identical to before.
 pub const TP_WORKER_AUX_EXEC_BASE: u64 = 0x0000_0100_1800_0000;
 
@@ -923,7 +926,7 @@ const _: () = {
     assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
     assert!(TP_WORKER_AUX_BADGE_BASE >= 0x100);
     assert!(TP_WORKER_SLOT_COUNT > TP_WORKER_LEGACY_SLOT_COUNT);
-    assert!(TP_WORKER_SLOT_COUNT <= 8);
+    assert!(TP_WORKER_SLOT_COUNT <= 16);
     assert!(tp_worker_badge(0, 0) == 16);
     assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 0) == 20);
     assert!(tp_worker_badge(0, 1) == 21);
@@ -962,12 +965,12 @@ const _: () = {
         tp_worker_stack_mirror_va(TP_WORKER_PI_COUNT - 1, TP_WORKER_LEGACY_SLOT_COUNT)
             >= TP_WORKER_AUX_EXEC_BASE
     );
-    // The AUX region must not alias either legacy mirror region, and must stay inside the free 32 MiB
-    // gap [POOL end 0x1800_0000, FSD_EXEC_BASE 0x1A00_0000).
+    // The AUX region must not alias either legacy mirror region, and must stay below the hosted
+    // driver execution arena.
     assert!(TP_WORKER_AUX_EXEC_BASE >= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
     assert!(
         tp_worker_env_scratch_va(MAX_PI - 1, TP_WORKER_SLOT_COUNT - 1) + 0x4000
-            <= 0x0000_0100_1A00_0000
+            <= crate::driver_launch::FSD_EXEC_BASE
     );
     assert!(tp_worker_stack_mirror_va(0, TP_WORKER_LEGACY_SLOT_COUNT) == TP_WORKER_AUX_EXEC_BASE);
     assert!(
@@ -7171,7 +7174,7 @@ pub(crate) static UT_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Minimum root-Untyped runway that must remain after a full desktop proof boot. CSpace exhaustion
 /// is now checked directly through live slot availability; Untyped pressure is a byte runway, not a
 /// stale percentage tied to the earlier, smaller boot frontier.
-const MIN_BOOT_UNTYPED_HEADROOM_BYTES: u64 = 48 * 1024 * 1024;
+pub(crate) const MIN_BOOT_UNTYPED_HEADROOM_BYTES: u64 = 48 * 1024 * 1024;
 /// Retypes that came back with a real seL4 error label, and the last such label/object type.
 /// `seL4_NotEnoughMemory` = 10 is "the boot Untyped is spent".
 pub(crate) static UT_RETYPE_FAILS: AtomicU64 = AtomicU64::new(0);
@@ -9281,14 +9284,14 @@ pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
 }
 
 unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(
-        pt,
-        LBL_X86_PAGE_TABLE_MAP,
-        TP_WORKER_SLOT1_REGION_BASE,
-        pml4,
-    );
+    let mut base = TP_WORKER_SLOT1_REGION_BASE;
+    let end = LSA_WORKER_REGION_BASE + 0x20_0000;
+    while base < end {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, base, pml4);
+        base += 0x20_0000;
+    }
 }
 
 /// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The spawned-service
@@ -10804,8 +10807,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
-unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
-    let mechanism = runtime.mechanism;
+unsafe fn release_hosted_thread_mechanism_caps(tid: u64, mechanism: HostedThreadMechanismCaps) {
     if !mechanism.is_live() {
         return;
     }
@@ -10829,7 +10831,7 @@ unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
     } else {
         if HOSTED_THREAD_CNODE_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[thread-term] mechanism CNode release failed tid=");
-            print_u64(runtime.tid);
+            print_u64(tid);
             print_str(b" sc=0x");
             print_hex_u64(mechanism.sched_context);
             print_str(b" cnode=0x");
@@ -10845,6 +10847,18 @@ unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
             print_str(b"\n");
         }
     }
+}
+
+unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
+    release_hosted_thread_mechanism_caps(runtime.tid, runtime.mechanism);
+}
+
+pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThreadSpawnResult) {
+    if spawn.tcb() > 1 {
+        let _ = tcb_suspend_r(spawn.tcb());
+        let _ = cnode_delete_recycle_r(spawn.tcb());
+    }
+    release_hosted_thread_mechanism_caps(0, spawn.mechanism());
 }
 
 unsafe fn pipe_io_cancel_thread(tid: u64) {
@@ -14357,9 +14371,9 @@ struct ExecNtHandler {
     pool_used: [u64; MAX_PI],
     /// Runtime suspended-on-create mask for claimed pool ETHREADs.
     pool_suspended: [u64; MAX_PI],
-    /// Hosted worker stack/TEB VA windows consumed in each process VSpace. A thread exit can reclaim
-    /// the TCB and ETHREAD pool slot, but the fixed userspace stack/TEB mappings are not reusable
-    /// until full VAD-backed unmap/free exists; the mask is cleared only with the process VSpace.
+    /// Hosted worker stack/TEB VA windows consumed in each process VSpace. Thread teardown releases
+    /// the mapped frames/caps and clears the slot, so a later ETHREAD can reuse the same mechanism
+    /// lane with fresh stack/TEB/IPCBUF/trampoline frames.
     tp_worker_window_used: [u64; MAX_PI],
     /// Executive-side seL4 mechanism runtime keyed by real NT TID. This is where live handler paths
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
@@ -16578,6 +16592,13 @@ static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 /// real hosted workloads can outgrow it, and the executive pins the bump-heap mark whenever a
 /// ProcessManager handle table expands after boot.
 const PM_HANDLE_RESERVE: usize = 512;
+/// Live debugger objects the executive supports without growing the durable `nt-process` Dbgk table
+/// after the boot heap mark. These are still created dynamically through `NtCreateDebugObject`; the
+/// cap is storage accounting, not identity policy.
+const PM_DEBUG_OBJECT_SLOTS: usize = 8;
+/// Per-debug-object queue budget: enough for attach fake thread/module messages plus live exception,
+/// create/exit, and module events in the hosted ReactOS frontier.
+const PM_DEBUG_EVENTS_PER_OBJECT: usize = 96;
 /// Total handles the executive has routed into the real per-EPROCESS handle tables (all mint sites).
 static PM_HANDLES_TRACKED: AtomicU64 = AtomicU64::new(0);
 /// Peak live handle count in any single EPROCESS table over the boot — the reservation-headroom gauge.
@@ -16600,18 +16621,11 @@ static PM_HANDLE_CAP_GROWTHS: AtomicU64 = AtomicU64::new(0);
 /// main TCB the spawn already made); every SUBSEQUENT one is a genuine ADDITIONAL thread and takes
 /// the real cross-VSpace spawn path. Exactly NT's rule — a process has one initial thread.
 pub(crate) static PM_INITIAL_THREAD_DONE: AtomicU64 = AtomicU64::new(0);
-/// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
-/// creation remains allocation-free. Three slots cover the existing specialized fan-out and two
-/// more admit the ntdll scheduler and completion worker without reallocating under the loop reset.
-///
-/// ★ RAISED 5 -> 8 (batch 61), on a MEASUREMENT rather than a guess: with the TEB corruption fixed
-/// winlogon really reaches its post-profile `LsaOpenPolicy`, rpcrt4 accepts a SECOND `\pipe\lsarpc`
-/// connection and asks for its per-connection `RPCRT4_io_thread` — and `[thread-pool] REFUSED
-/// NtCreateThread pi=4 used-mask=0x1f slots=5 pool-tids: 29 30 31 32 33` says lsass' pool was FULL,
-/// so the create answered STATUS_INSUFFICIENT_RESOURCES (`rpc_server.c:631 error=5aa`) and rpcrt4
-/// dropped the connection. Batch 60's "claim a generic worker slot" reached that refusal too; the
-/// slot it claimed existed, the ETHREAD behind it did not.
-const PM_RUNTIME_THREAD_SLOTS: usize = 8;
+/// Configured per-process hosted-thread mechanism windows. These are not launch policy: each slot is
+/// a reusable seL4/VA mechanism lane that can host any ordinary NT thread in that process. The
+/// current fixed-address userspace layout derives target stack/TEB/IPC/trampoline VAs and executive
+/// mirrors from this value, while ProcessManager remains the policy authority for real ETHREADs.
+const PM_RUNTIME_THREAD_SLOTS: usize = 16;
 /// Runtime `NtCreateThread`s refused because the pre-created ETHREAD pool had no free slot. Counted
 /// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
 /// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.

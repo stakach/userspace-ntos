@@ -31,7 +31,11 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// — allocations start returning null and callers quietly take their error paths, which is what a
 /// mysteriously slow, never-quiescing boot looks like from outside. The materialised profile tree
 /// and the per-user hive load need headroom above that, so the executive gets it.
-pub const HEAP_FRAMES: u64 = 1536;
+/// ★ RAISED 1536 -> 1792 (6 MiB -> 7 MiB) once Dbgk stopped allocating late and instead precharged
+/// bounded `DEBUG_OBJECT` slots/event queues before the service-loop reset mark. That is durable NT
+/// object state, not transient proof scaffolding, and the previous full boot ended with only a few
+/// KiB free under the 6 MiB cap.
+pub const HEAP_FRAMES: u64 = 1792;
 /// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
 /// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
 /// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The

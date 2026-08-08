@@ -17,7 +17,7 @@
 //! - **Base assignment** — each activated DLL gets a stable system-wide base from a bounded compact
 //!   arena; the first registered keeps its preferred ImageBase (no relocation).
 //! - **Faulting-VA lookup** ([`Registry::dll_for_page`]) — which mapped DLL owns a demand-fault
-//!   address, and at what RVA.
+//!   address in the faulting process, and at what RVA.
 //! - **`SECTION_IMAGE_INFORMATION`** ([`image_info`]) — the 64-byte x64 structure the loader reads
 //!   from NtQuerySection (TransferAddress, image characteristics, size).
 //!
@@ -88,8 +88,8 @@ pub struct Dll {
     /// Section handle from NtCreateSection, **per owning process** (growable; `section_handle(pi)`;
     /// 0 until sectioned by that process).
     section_handle: Vec<u64>,
-    /// Set once NtMapViewOfSection has reserved this DLL's VA range.
-    pub mapped: bool,
+    /// Set once NtMapViewOfSection has reserved this DLL's VA range in a given process.
+    mapped_by_pi: Vec<u8>,
 }
 
 /// Grow `v` so index `pi` is addressable (padding new slots with 0 = "no handle"), then return
@@ -97,6 +97,14 @@ pub struct Dll {
 /// [`PI_RESERVE`]); within the reserve it's a pure in-place write.
 #[inline]
 fn slot_mut(v: &mut Vec<u64>, pi: usize) -> &mut u64 {
+    if pi >= v.len() {
+        v.resize(pi + 1, 0);
+    }
+    &mut v[pi]
+}
+
+#[inline]
+fn flag_slot_mut(v: &mut Vec<u8>, pi: usize) -> &mut u8 {
     if pi >= v.len() {
         v.resize(pi + 1, 0);
     }
@@ -147,8 +155,10 @@ impl Registry {
         // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots (see [`PI_RESERVE`]).
         let mut file_handle = Vec::new();
         let mut section_handle = Vec::new();
+        let mut mapped_by_pi = Vec::new();
         file_handle.resize(PI_RESERVE, 0);
         section_handle.resize(PI_RESERVE, 0);
+        mapped_by_pi.resize(PI_RESERVE, 0);
         self.dlls.push(Dll {
             name_buf: [0u8; MAX_STEM],
             name_len: 0,
@@ -157,7 +167,7 @@ impl Registry {
             entry_rva: 0,
             file_handle,
             section_handle,
-            mapped: false,
+            mapped_by_pi,
         });
         self.dlls.len() - 1
     }
@@ -367,29 +377,67 @@ impl Registry {
             .position(|d| d.section_handle.get(pi).copied() == Some(handle))
     }
 
-    /// Mark DLL `i`'s view mapped (its VA range is now reserved + demand-pageable).
-    pub fn set_mapped(&mut self, i: usize) {
-        if let Some(d) = self.dlls.get_mut(i) {
-            d.mapped = true;
+    /// Mark DLL `i`'s view mapped in process `pi` (its VA range is now reserved + demand-pageable).
+    pub fn set_mapped(&mut self, pi: usize, i: usize) -> bool {
+        let Some(d) = self.dlls.get_mut(i) else {
+            return false;
+        };
+        if d.name_len == 0 || d.base == 0 || d.image_size == 0 {
+            return false;
         }
+        *flag_slot_mut(&mut d.mapped_by_pi, pi) = 1;
+        true
     }
 
-    /// True once DLL `i` has been mapped.
-    pub fn is_mapped(&self, i: usize) -> bool {
-        self.dlls.get(i).map(|d| d.mapped).unwrap_or(false)
+    /// Clear DLL `i`'s mapped-view state for process `pi`.
+    pub fn clear_mapped(&mut self, pi: usize, i: usize) -> bool {
+        let Some(d) = self.dlls.get_mut(i) else {
+            return false;
+        };
+        let Some(slot) = d.mapped_by_pi.get_mut(pi) else {
+            return false;
+        };
+        let was_mapped = *slot != 0;
+        *slot = 0;
+        was_mapped
     }
 
-    /// Which **mapped** DLL contains virtual address `va`, and at what RVA. Unmapped DLLs (whose VA
-    /// range isn't reserved yet) are excluded, so a stray address in an about-to-be-mapped range
-    /// isn't misrouted. Slots are distinct, so at most one matches.
-    pub fn dll_for_page(&self, va: u64) -> Option<(usize, u32)> {
+    /// True once DLL `i` has been mapped into process `pi`.
+    pub fn is_mapped(&self, pi: usize, i: usize) -> bool {
+        self.dlls
+            .get(i)
+            .and_then(|d| d.mapped_by_pi.get(pi))
+            .copied()
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// Which **mapped** DLL contains virtual address `va` in process `pi`, and at what RVA.
+    /// Unmapped DLLs (whose VA range isn't reserved in that process yet) are excluded, so a stray
+    /// address in an about-to-be-mapped range isn't misrouted. Slots are distinct, so at most one
+    /// matches.
+    pub fn dll_for_page(&self, pi: usize, va: u64) -> Option<(usize, u32)> {
         self.dlls.iter().enumerate().find_map(|(i, d)| {
-            if d.mapped && va >= d.base && va < d.base + d.image_size {
+            if d.mapped_by_pi.get(pi).copied().unwrap_or(0) != 0
+                && va >= d.base
+                && va < d.base + d.image_size
+            {
                 Some((i, (va - d.base) as u32))
             } else {
                 None
             }
         })
+    }
+
+    /// The next mapped DLL base in process `pi` after `va`, used to bound `MEM_FREE` queries.
+    pub fn next_mapped_base_after(&self, pi: usize, va: u64) -> Option<u64> {
+        self.dlls
+            .iter()
+            .filter(|d| {
+                d.mapped_by_pi.get(pi).copied().unwrap_or(0) != 0 && d.base != 0 && d.base > va
+            })
+            .map(|d| d.base)
+            .min()
     }
 
     /// The 64-byte `SECTION_IMAGE_INFORMATION` for DLL `i` (see [`image_info`]).
@@ -692,22 +740,50 @@ mod tests {
         for pi in 0..PI_RESERVE {
             assert_eq!(r.file_handle(pi, 0), 0);
             assert_eq!(r.section_handle(pi, 0), 0);
+            assert!(!r.is_mapped(pi, 0));
         }
     }
 
     #[test]
-    fn page_lookup_needs_a_mapped_view() {
+    fn page_lookup_needs_a_process_mapped_view() {
         let mut r = seeded();
         let basesrv_base = r.base(1);
         // Before mapping, its range doesn't resolve.
-        assert_eq!(r.dll_for_page(basesrv_base), None);
-        r.set_mapped(1);
-        assert!(r.is_mapped(1));
-        assert_eq!(r.dll_for_page(basesrv_base), Some((1, 0)));
-        assert_eq!(r.dll_for_page(basesrv_base + 0x2345), Some((1, 0x2345)));
-        assert_eq!(r.dll_for_page(basesrv_base + 0xD000 - 1), Some((1, 0xCFFF)));
-        assert_eq!(r.dll_for_page(basesrv_base + 0xD000), None);
-        assert_eq!(r.dll_for_page(0x8000_0000), None); // csrsrv's range, but it's unmapped
+        assert_eq!(r.dll_for_page(1, basesrv_base), None);
+        assert_eq!(r.next_mapped_base_after(1, ARENA_START), None);
+
+        assert!(r.set_mapped(1, 1));
+        assert!(r.is_mapped(1, 1));
+        assert!(!r.is_mapped(2, 1));
+        assert_eq!(r.dll_for_page(1, basesrv_base), Some((1, 0)));
+        assert_eq!(r.dll_for_page(2, basesrv_base), None);
+        assert_eq!(r.dll_for_page(1, basesrv_base + 0x2345), Some((1, 0x2345)));
+        assert_eq!(
+            r.dll_for_page(1, basesrv_base + 0xD000 - 1),
+            Some((1, 0xCFFF))
+        );
+        assert_eq!(r.dll_for_page(1, basesrv_base + 0xD000), None);
+        assert_eq!(r.dll_for_page(1, 0x8000_0000), None); // csrsrv's range, but it's unmapped in pi 1
+        assert_eq!(r.next_mapped_base_after(1, ARENA_START), Some(basesrv_base));
+        assert_eq!(r.next_mapped_base_after(2, ARENA_START), None);
+
+        assert!(r.clear_mapped(1, 1));
+        assert_eq!(r.dll_for_page(1, basesrv_base), None);
+        assert!(!r.clear_mapped(1, 1));
+    }
+
+    #[test]
+    fn mapped_views_grow_past_the_pre_reserved_process_set() {
+        let mut r = seeded();
+        let high_pi = PI_RESERVE + 5;
+        let winsrv_base = r.base(2);
+
+        assert_eq!(r.dll_for_page(high_pi, winsrv_base), None);
+        assert!(r.set_mapped(high_pi, 2));
+        assert!(r.is_mapped(high_pi, 2));
+        assert!(!r.is_mapped(1, 2));
+        assert_eq!(r.dll_for_page(high_pi, winsrv_base), Some((2, 0)));
+        assert_eq!(r.dll_for_page(1, winsrv_base), None);
     }
 
     #[test]

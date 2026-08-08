@@ -3211,7 +3211,7 @@ pub(crate) unsafe fn csr_fill_page(
             Some(p) => (nt_base, p),
             None => return false,
         }
-    } else if let Some((i, _)) = reg.dll_for_page(page) {
+    } else if let Some((i, _)) = reg.dll_for_page(1, page) {
         match dll_pes[i].as_ref() {
             Some(p) => (reg.base(i), p),
             None => return false,

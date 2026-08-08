@@ -1535,7 +1535,7 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
                 if (*faults as usize) >= filled_pages.len() {
                     return false;
                 }
-                let Some((index, rva)) = reg.dll_for_page(page) else {
+                let Some((index, rva)) = reg.dll_for_page(pi as usize, page) else {
                     return false;
                 };
                 let Some(pe) = dll_pes[index].as_ref() else {
@@ -1578,6 +1578,7 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
 /// page — demand-fills it and writes. csrss stores load-bearing handles/bases here (the CSR section
 /// handle, CsrSrvSharedSectionBase), so a silent miss leaves them NULL and later NULL-derefs.
 pub(crate) unsafe fn csrss_out_write(
+    pi: u64,
     va: u64,
     val: u64,
     filled_pages: &mut [u64; 512],
@@ -1599,7 +1600,7 @@ pub(crate) unsafe fn csrss_out_write(
     // global): demand-fill it from that DLL's PE so the write lands (a silent miss leaves a
     // load-bearing handle/base NULL → later NULL-deref).
     if sva.is_none() && (*faults as usize) < filled_pages.len() {
-        if let Some((i, rva)) = reg.dll_for_page(page) {
+        if let Some((i, rva)) = reg.dll_for_page(pi as usize, page) {
             if let Some(pe) = dll_pes[i].as_ref() {
                 let scratch = scratch_base + *faults * 0x1000;
                 let f = alloc_frame();

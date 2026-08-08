@@ -7,6 +7,8 @@
 use crate::*;
 use nt_io_abi::major;
 
+const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
+
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
@@ -756,6 +758,8 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     pm.reserve_modules(64);
     pm.reserve_process_capacity(MAX_PI);
     pm.reserve_thread_capacity(MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS));
+    pm.reserve_debug_objects(PM_DEBUG_OBJECT_SLOTS, PM_DEBUG_EVENTS_PER_OBJECT)
+        .expect("reserve bootstrap Dbgk object/event storage");
     PM_PROC_COUNT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
@@ -2824,11 +2828,16 @@ impl ExecNtHandler {
         role: HostedThreadRole,
     ) -> bool {
         if !self.register_hosted_thread_tcb(pi, tid, spawn.tcb(), badge, role) {
+            let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
             return false;
         }
         let mechanism = spawn.mechanism();
-        if mechanism.is_live() {
-            let _ = self.thread_runtime.set_mechanism_caps(tid, mechanism);
+        if mechanism.is_live() && self.thread_runtime.set_mechanism_caps(tid, mechanism).is_none()
+        {
+            let _ = self.release_hosted_thread_runtime(tid);
+            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
+            return false;
         }
         true
     }
@@ -4486,18 +4495,37 @@ impl ExecNtHandler {
         object: nt_process::dbgk::DebugObjectId,
         pid: Option<nt_process::ProcessId>,
     ) -> usize {
-        let released = self.pm.drain_blocked_reporters(object, pid);
-        let n = released.len();
-        for (_client, block) in released {
-            if block.is_fault() {
-                dbgk_reporter_abandon(&block);
-                crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
-            } else {
-                dbgk_reporter_resume(&block);
+        let empty = (
+            nt_process::ClientId {
+                unique_process: 0,
+                unique_thread: 0,
+            },
+            nt_process::dbgk::ReporterBlock::default(),
+        );
+        let mut released = [empty; PM_DEBUG_EVENTS_PER_OBJECT];
+        let mut total = 0usize;
+        loop {
+            let n = self
+                .pm
+                .drain_blocked_reporters_into(object, pid, &mut released);
+            if n == 0 {
+                break;
             }
-            DBGK_REPORTERS_RELEASED.fetch_add(1, Ordering::Relaxed);
+            for (_client, block) in released[..n].iter().copied() {
+                if block.is_fault() {
+                    dbgk_reporter_abandon(&block);
+                    crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
+                } else {
+                    dbgk_reporter_resume(&block);
+                }
+                DBGK_REPORTERS_RELEASED.fetch_add(1, Ordering::Relaxed);
+            }
+            total += n;
+            if n < released.len() {
+                break;
+            }
         }
-        n
+        total
     }
 
     /// Release every blocked reporter on EVERY live debug object — the unconditional, bounded
@@ -4781,6 +4809,9 @@ impl ExecNtHandler {
                 identity: index as u64,
                 thread,
             }),
+            None if self.events.contains(index as u64) => {
+                Some(nt_kernel_exec::DispatcherObject::Event(index as u64))
+            }
             _ => None,
         }
     }
@@ -7459,7 +7490,11 @@ impl ExecNtHandler {
         core::ptr::write(vm_map, *after);
         let registry_slot = self
             .loop_ctx
-            .and_then(|ctx| (&*ctx.reg).dll_for_page(plan.base).map(|(slot, _)| slot));
+            .and_then(|ctx| {
+                (&*ctx.reg)
+                    .dll_for_page(target_pi, plan.base)
+                    .map(|(slot, _)| slot)
+            });
         loader_trace_record(
             self.pi,
             LoaderOp::ProtectVirtualMemory,
@@ -7520,7 +7555,7 @@ impl ExecNtHandler {
         }
 
         let reg = &*ctx.reg;
-        if let Some((index, _)) = reg.dll_for_page(page) {
+        if let Some((index, _)) = reg.dll_for_page(target_pi, page) {
             let pe = ctx.dll_pes().get(index).and_then(|entry| entry.as_ref());
             if let (Some(dll), Some(pe)) = (reg.get(index), pe) {
                 if let Some(info) =
@@ -7574,12 +7609,8 @@ impl ExecNtHandler {
         if !ctx.ntdll_pe.is_null() && ctx.nt_end > ctx.nt_base && ctx.nt_base > page {
             next = next.min(ctx.nt_base);
         }
-        for index in 0..reg.len() {
-            if let Some(dll) = reg.get(index) {
-                if dll.mapped && dll.base > page {
-                    next = next.min(dll.base);
-                }
-            }
+        if let Some(candidate) = reg.next_mapped_base_after(target_pi, page) {
+            next = next.min(candidate);
         }
         if let Some(candidate) = process_committed_mapping_next_base_after(target_pi as u64, page) {
             next = next.min(candidate);
@@ -9075,7 +9106,7 @@ impl ExecNtHandler {
                     (&*ctx.pe, (cur - PE_LOAD_BASE) as u32)
                 } else if !ctx.ntdll_pe.is_null() && cur >= ctx.nt_base && cur < ctx.nt_end {
                     (&*ctx.ntdll_pe, (cur - ctx.nt_base) as u32)
-                } else if let Some((i, rva)) = reg.dll_for_page(cur) {
+                } else if let Some((i, rva)) = reg.dll_for_page(self.pi, cur) {
                     match dll_pes[i].as_ref() {
                         Some(pe) => (pe, rva),
                         None => return false,
@@ -9306,7 +9337,7 @@ impl ExecNtHandler {
                 && scratch_pages_available(ctx, self.pi as u64, va, len, false);
         }
         let reg = &*ctx.reg;
-        if let Some((index, _)) = reg.dll_for_page(va) {
+        if let Some((index, _)) = reg.dll_for_page(self.pi, va) {
             if let Some(pe) = ctx.dll_pes()[index].as_ref() {
                 return writable_image_range(pe, reg.base(index), va, len)
                     && scratch_pages_available(ctx, self.pi as u64, va, len, true);
@@ -10508,7 +10539,7 @@ impl ExecNtHandler {
         ];
         let index =
             ObjEntry::push_kind(&mut self.obj_ns, &name, OBJ_PARENT_ANONYMOUS, OBJ_KIND_EVENT, &[])?;
-        self.events.initialize(
+        if !self.events.try_initialize(
             index as u64,
             if auto_reset {
                 EventKind::Synchronization
@@ -10516,9 +10547,37 @@ impl ExecNtHandler {
                 EventKind::Notification
             },
             initial_state,
-        );
+        ) {
+            self.obj_ns.pop();
+            return None;
+        }
         Some(index)
     }
+
+    /// Create a dispatcher-only event identity for internal kernel objects such as
+    /// `DEBUG_OBJECT.EventsPresent`. It is waitable through the same dispatcher path as user-visible
+    /// events, but it is not an object-manager namespace entry and cannot be opened by name.
+    pub(crate) fn obj_create_internal_dispatcher_event(
+        &mut self,
+        auto_reset: bool,
+        initial_state: bool,
+    ) -> Option<u64> {
+        let n = self.anon_event_seq;
+        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
+        let index = INTERNAL_DISPATCHER_EVENT_BASE + n as u64;
+        self.events
+            .try_initialize(
+                index,
+                if auto_reset {
+                    EventKind::Synchronization
+                } else {
+                    EventKind::Notification
+                },
+                initial_state,
+            )
+            .then_some(index)
+    }
+
     pub(crate) fn obj_create_anon_semaphore(
         &mut self,
         initial: i32,
@@ -15694,7 +15753,7 @@ impl ExecNtHandler {
                 let size = args.get(2).copied().unwrap_or(0);
                 let registry_slot = unsafe {
                     self.loop_ctx.and_then(|ctx| {
-                        (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot)
+                        (&*ctx.reg).dll_for_page(self.pi, base).map(|(slot, _)| slot)
                     })
                 };
                 unsafe {
@@ -18265,6 +18324,7 @@ impl ExecNtHandler {
                             }
                         }
                         if !csrss_out_write(
+                            self.pi as u64,
                             out,
                             h,
                             filled_pages,
@@ -18311,6 +18371,7 @@ impl ExecNtHandler {
                     // window (demand-paged on touch, so unused pages cost nothing).
                     *ctx.csrss_anon_size = if maxsize == 0 { 0x10_0000 } else { maxsize };
                     if !csrss_out_write(
+                        self.pi as u64,
                         out,
                         h,
                         filled_pages,
@@ -18419,6 +18480,7 @@ impl ExecNtHandler {
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 }
                 if !csrss_out_write(
+                    self.pi as u64,
                     out,
                     h,
                     filled_pages,
@@ -18474,7 +18536,7 @@ impl ExecNtHandler {
                         // PER-PROCESS PD/PT reservation: the DLL's fixed base is the same in every
                         // process, but each VSpace needs its own page tables. csrss and winlogon load
                         // an overlapping DLL set at identical bases into distinct VSpaces, so gate the
-                        // reservation on this process's bitmask, not the registry's global `mapped`.
+                        // reservation on this process's bitmask, not any other process's image view.
                         let pi = self.pi;
                         let dll_pd_created = &mut *ctx.dll_pd_created;
                         let dll_pt_bits = &mut *ctx.dll_pt_bits;
@@ -18498,12 +18560,12 @@ impl ExecNtHandler {
                                 }
                             }
                         }
-                        reg.set_mapped(i);
+                        reg.set_mapped(self.pi, i);
                         let ext = image_extent(cpe);
-                        csrss_out_write(get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                        csrss_out_write(self.pi as u64, get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
                         let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                         if vs_ptr != 0 {
-                            csrss_out_write(vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                            csrss_out_write(self.pi as u64, vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                         }
                         if !self.current_process_is_winlogon() {
                             print_str(b"[ntos-exec] NtMapViewOfSection ");
@@ -18578,10 +18640,10 @@ impl ExecNtHandler {
                     }
                     // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
                     // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
-                    csrss_out_write(get_recv_mr(7), *ctx.csrss_anon_base, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                    csrss_out_write(self.pi as u64, get_recv_mr(7), *ctx.csrss_anon_base, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                     if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, *ctx.csrss_anon_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                        csrss_out_write(self.pi as u64, vs_ptr, *ctx.csrss_anon_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
                     print_hex((*ctx.csrss_anon_base >> 32) as u32);
@@ -18612,10 +18674,10 @@ impl ExecNtHandler {
                     for i in 0..npages {
                         let _ = page_map(copy_cap(nls_start + i), NLS_SECTION_CSRSS_VA + i * 0x1000, RW_NX, pml4);
                     }
-                    csrss_out_write(get_recv_mr(7), NLS_SECTION_CSRSS_VA, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                    csrss_out_write(self.pi as u64, get_recv_mr(7), NLS_SECTION_CSRSS_VA, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
                     let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                     if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, nls_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                        csrss_out_write(self.pi as u64, vs_ptr, nls_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
                     loader_trace_record(
@@ -18771,6 +18833,7 @@ impl ExecNtHandler {
                     core::ptr::write(vm_map, *after);
                     crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
                     if !csrss_out_write(
+                        self.pi as u64,
                         base_ptr,
                         plan.base,
                         filled_pages,
@@ -18780,6 +18843,7 @@ impl ExecNtHandler {
                         dll_pes,
                         pml4,
                     ) || !csrss_out_write(
+                        self.pi as u64,
                         view_size_ptr,
                         plan.size,
                         filled_pages,
@@ -19049,12 +19113,15 @@ impl ExecNtHandler {
                     Ok(object) => object,
                     Err(status) => return status,
                 };
-                // DebugObject->EventsPresent: a REAL notification dispatcher object (index+1 is
-                // stored so 0 stays "unbound" when the namespace is full).
-                if let Some(index) = self.obj_create_anon_event(false, false) {
-                    if let Some(o) = self.pm.debug_object_mut(object) {
-                        o.host_event = index as u64 + 1;
-                    }
+                // DebugObject->EventsPresent: a REAL notification dispatcher object. This is an
+                // internal dispatcher event, not an object-manager namespace entry, because no user
+                // handle or named-open path exists for this KEVENT.
+                let Some(index) = self.obj_create_internal_dispatcher_event(false, false) else {
+                    self.pm.destroy_debug_object(object);
+                    return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                };
+                if let Some(o) = self.pm.debug_object_mut(object) {
+                    o.host_event = index + 1;
                 }
                 let access = nt_process::dbgk::map_debug_object_access(args[1] as u32);
                 let Ok(handle) = self.insert_process_handle(
@@ -19070,6 +19137,7 @@ impl ExecNtHandler {
                     self.pm.destroy_debug_object(object);
                     return 0xC000_0005;
                 }
+                self.process_dirty = true;
                 DBGK_OBJECTS_CREATED.fetch_add(1, Ordering::Relaxed);
                 0
             },

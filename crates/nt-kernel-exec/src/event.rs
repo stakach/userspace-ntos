@@ -108,6 +108,26 @@ impl EventStore {
         e.signaled = signaled;
     }
 
+    /// Fallible `KeInitializeEvent` for executive paths that must return a real NT allocation
+    /// failure instead of depending on a late heap grow.
+    pub fn try_initialize(&mut self, ptr: u64, kind: EventKind, signaled: bool) -> bool {
+        if let Some(i) = self.events.iter().position(|e| e.ptr == ptr) {
+            let e = &mut self.events[i];
+            e.kind = kind;
+            e.signaled = signaled;
+            return true;
+        }
+        if self.events.len() == self.events.capacity() && self.events.try_reserve(16).is_err() {
+            return false;
+        }
+        self.events.push(Event {
+            ptr,
+            kind,
+            signaled,
+        });
+        true
+    }
+
     /// Whether an event identity has been initialized.
     pub fn contains(&self, ptr: u64) -> bool {
         self.events.iter().any(|event| event.ptr == ptr)
@@ -284,6 +304,17 @@ mod tests {
         assert_eq!(ev.poll(0xE2, &irql), WaitResult::TimedOut);
         ev.set(0xE2);
         assert_eq!(ev.poll(0xE2, &irql), WaitResult::Signaled);
+    }
+
+    #[test]
+    fn try_initialize_updates_existing_event() {
+        let mut ev = EventStore::with_capacity(1);
+        assert!(ev.try_initialize(1, EventKind::Notification, false));
+        assert!(ev.try_initialize(1, EventKind::Synchronization, true));
+        assert_eq!(
+            ev.query_existing(1),
+            Some((EventKind::Synchronization, true))
+        );
     }
 
     #[test]

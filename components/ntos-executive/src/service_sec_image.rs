@@ -5,6 +5,8 @@ use crate::*;
 use nt_io_abi::major;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
+const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 4 * 1024 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
@@ -540,7 +542,16 @@ fn sec_image_forward_run() -> u64 {
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slot_pressure = slots_cap != 0 && slots_used * 5 >= slots_cap * 4;
     let frame_pressure = CSRSS_FRAME_HW.load(Ordering::Relaxed) * 10 >= CSRSS_FRAME_CAP as u64 * 7;
-    if slot_pressure || frame_pressure {
+    let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
+    let untyped_free =
+        untyped_total.saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+    let untyped_low = untyped_total != 0
+        && untyped_free
+            <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES;
+    let untyped_critical = untyped_total != 0
+        && untyped_free
+            <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES;
+    if slot_pressure || frame_pressure || untyped_low {
         if SEC_IMAGE_PREFETCH_THROTTLE_LOGGED.swap(1, Ordering::Relaxed) == 0 {
             print_str(b"[sec-image] forward prefetch throttled under pool pressure: cslots=");
             print_u64(slots_used);
@@ -550,9 +561,12 @@ fn sec_image_forward_run() -> u64 {
             print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
             print_str(b"/");
             print_u64(CSRSS_FRAME_CAP as u64);
+            print_str(b" ut-free=");
+            print_u64(untyped_free >> 10);
+            print_str(b"KiB");
             print_str(b"\n");
         }
-        4
+        if untyped_critical { 1 } else { 4 }
     } else {
         32
     }
@@ -5390,7 +5404,7 @@ pub(crate) unsafe fn service_sec_image(
                 ntfaults += 1;
                 (nt_base, ntdll.unwrap().1)
             } else if let Some((i, _)) = if pi >= 1 {
-                reg.dll_for_page(page)
+                reg.dll_for_page(pi, page)
             } else {
                 None
             } {
@@ -5659,7 +5673,7 @@ pub(crate) unsafe fn service_sec_image(
                 img_end
             } else if base == nt_base {
                 nt_end
-            } else if let Some((di, _)) = reg.dll_for_page(page) {
+            } else if let Some((di, _)) = reg.dll_for_page(pi, page) {
                 reg.base(di) + reg.get(di).map(|d| d.image_size).unwrap_or(0)
             } else {
                 base
@@ -7463,6 +7477,7 @@ pub(crate) unsafe fn service_sec_image(
                             if out_ptr != 0 {
                                 // Client *PortHandle (&CsrApiPort, an ntdll .data global) — demand-fill window.
                                 csrss_out_write(
+                                    pi as u64,
                                     out_ptr,
                                     client_handle,
                                     &mut *filled_pages,
@@ -16466,15 +16481,32 @@ unsafe fn spawn_requested_tp_worker(
     );
     if spawned.tcb() == 0 {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
+        if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
+            let _ = nt_handler
+                .pm
+                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Initialized);
+            let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
+            let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
+        }
         return;
     }
-    nt_handler.register_hosted_thread_spawn(
+    if !nt_handler.register_hosted_thread_spawn(
         pi,
         tid,
         spawned,
         tp_worker_badge(pi, worker_slot),
         role,
-    );
+    ) {
+        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
+        if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
+            let _ = nt_handler
+                .pm
+                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Initialized);
+            let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
+            let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
+        }
+        return;
+    }
     nt_handler
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
@@ -16527,14 +16559,21 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
         resume: request.resume,
     });
     if spawned.tcb() != 0 {
-        nt_handler.register_hosted_thread_spawn(
+        if !nt_handler.register_hosted_thread_spawn(
             request.target_pi,
             request.cid_thread,
             spawned,
             tp_worker_badge(request.target_pi, request.slot),
             HostedThreadRole::TpWorker { slot: request.slot },
-        );
-        PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+        ) {
+            nt_handler.release_unmapped_hosted_tp_worker_slot(
+                request.target_pi,
+                request.slot,
+                request.cid_thread,
+            );
+        } else {
+            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         nt_handler.release_unmapped_hosted_tp_worker_slot(
             request.target_pi,
@@ -17518,7 +17557,7 @@ unsafe fn ensure_client_copyin_dll_page(
     if csrss_frame_get(pi, page) != 0 || client_copyin_frame_get(pi, page) != 0 {
         return true;
     }
-    let Some((i, rva)) = reg.dll_for_page(page) else {
+    let Some((i, rva)) = reg.dll_for_page(pi as usize, page) else {
         return false;
     };
     let Some(slot) = dll_pes.get(i) else {

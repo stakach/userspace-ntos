@@ -146,7 +146,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The old fixed
    object-namespace ceiling is also gone: object entries now grow by checked reserve, so late debug
    objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
-   slots. The latest FSD transport and handle-lifetime cleanup moves past the profile hive/user
+   slots. Dbgk object/event storage is now precharged during process-manager bootstrap and reused
+   from bounded slot bodies, so late `NtCreateDebugObject` and blocked-reporter release no longer
+   allocate out of the post-desktop bump frontier; the executive heap cap is rebased to `7 MiB` for
+   that durable kernel-owned state while spawned service heaps stay at `512 KiB`. The latest FSD
+   transport and handle-lifetime cleanup moves past the profile hive/user
    shell activation regression and the explorer icon/image-list wall again. Explorer now captures
    register-window messages, serves all required shell COM classes, redirects real api0 callbacks,
    installs WndProcs from client code, produces direct GDI returns, and leaves a wide non-background
@@ -1549,3 +1553,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   shell chrome still paints `34873` non-background pixels. Review adjustment: continue C3 by moving
   image/data section view ownership into per-process mapped-view state and then broaden
   unmap/query/protect regression gates.
+- Hosted worker/Dbgk resource durability closure. Hosted worker capacity now scales to the explorer
+  and RPC worker churn seen after genuine shell paint, extern-rootserver seL4 sched-context slab
+  capacity is raised for the same hosted-thread stress, and Dbgk storage is precharged before
+  post-desktop object creation. `nt-process` keeps reusable debug-object slot bodies with bounded
+  event queues, allocation-free process-flush/reporter-drain paths, and checked `STATUS_NO_MEMORY`
+  queue refusal instead of late heap growth. Validation: `cargo fmt --all`,
+  `cargo test -p nt-process`, `cargo test -p nt-dll-registry`, `cargo test -p nt-kernel-exec`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-dbgk-precharged-heap7m-20260808.log`. Result: the full executive gate is
+  `291/291`; Dbgk selftests report `bits=0x1fff` with `created=5`, `exec_vm_pool_headroom` remains
+  green, explorer shell chrome still paints `34873` non-background pixels, and the previous
+  `sc pool exhausted`, local-worker exhaustion, and allocator-panic frontiers are gone. Review
+  adjustment: continue the structural plan from C3 image/data section view ownership and A4
+  remaining SCM pipe/listener coordination, rather than adding shell-specific scaffolding.

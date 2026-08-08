@@ -207,6 +207,10 @@ impl<T> IdTable<T> {
     fn values(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|(_, value)| value)
     }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
 }
 
 pub struct ThreadIdSet {
@@ -235,6 +239,14 @@ impl ThreadIdSet {
 
     pub fn capacity(&self) -> usize {
         self.entries.capacity()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&ThreadId> {
+        self.entries.get(index)
     }
 
     pub fn insert(&mut self, tid: ThreadId) -> bool {
@@ -726,6 +738,19 @@ impl ProcessManager {
     /// real thread objects without growing the durable table mid-syscall.
     pub fn reserve_thread_capacity(&mut self, capacity: usize) {
         self.threads.reserve_capacity(capacity);
+    }
+
+    /// Pre-allocate and cap the debug-object table for a bounded host.
+    ///
+    /// `object_slots` is the maximum live `DEBUG_OBJECT` count; `events_per_object` is the
+    /// precharged queue size for each object. Pure host tests can leave this uncalled and use the
+    /// default growable model.
+    pub fn reserve_debug_objects(
+        &mut self,
+        object_slots: usize,
+        events_per_object: usize,
+    ) -> Result<(), u32> {
+        self.dbgk.reserve_capacity(object_slots, events_per_object)
     }
 
     pub fn process_capacity(&self) -> usize {
@@ -2006,19 +2031,23 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
-        let (tids, section) = {
+        let (thread_count, section) = {
             let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
                 return Ok(());
             }
             proc.state = ProcessState::Terminated;
             proc.exit_status = Some(exit_status);
-            (
-                proc.threads.iter().copied().collect::<Vec<_>>(),
-                proc.image_section,
-            )
+            (proc.threads.len(), proc.image_section)
         };
-        for tid in tids {
+        for index in 0..thread_count {
+            let Some(tid) = self
+                .processes
+                .get(&pid)
+                .and_then(|proc| proc.threads.get(index).copied())
+            else {
+                continue;
+            };
             if let Some(t) = self.threads.get_mut(&tid) {
                 if t.state != ThreadState::Terminated {
                     t.state = ThreadState::Terminated;
@@ -2060,14 +2089,21 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
-        let tids = {
+        let thread_count = {
             let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
                 return Ok(());
             }
-            proc.threads.iter().copied().collect::<Vec<_>>()
+            proc.threads.len()
         };
-        for tid in tids {
+        for index in 0..thread_count {
+            let Some(tid) = self
+                .processes
+                .get(&pid)
+                .and_then(|proc| proc.threads.get(index).copied())
+            else {
+                continue;
+            };
             if tid != current_tid {
                 let _ = self.exit_thread_at(tid, exit_status, exit_time_100ns);
             }
@@ -2314,23 +2350,34 @@ impl ProcessManager {
             return Err(dbgk::STATUS_PORT_ALREADY_SET);
         }
         let image_base = proc.image_base;
-        let candidates: Vec<ThreadId> = proc.threads.iter().copied().collect();
-        let threads: Vec<ThreadId> = candidates
-            .into_iter()
-            .filter(|tid| {
+        let thread_count = proc.threads.len();
+        let first_thread = proc
+            .threads
+            .iter()
+            .copied()
+            .find(|tid| {
                 self.threads
                     .get(tid)
                     .is_some_and(|t| t.state != ThreadState::Terminated)
             })
-            .collect();
-        if threads.is_empty() {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
+            .ok_or(STATUS_UNSUCCESSFUL)?;
 
         let mut posted = 0usize;
-        for (index, tid) in threads.iter().enumerate() {
-            let start_address = self.threads.get(tid).map(|t| t.start_address).unwrap_or(0);
-            let message = if index == 0 {
+        let mut live_index = 0usize;
+        for index in 0..thread_count {
+            let Some(tid) = self
+                .processes
+                .get(&pid)
+                .and_then(|proc| proc.threads.get(index).copied())
+            else {
+                continue;
+            };
+            let Some(start_address) = self.threads.get(&tid).and_then(|thread| {
+                (thread.state != ThreadState::Terminated).then_some(thread.start_address)
+            }) else {
+                continue;
+            };
+            let message = if live_index == 0 {
                 DbgKmMessage::CreateProcess {
                     sub_system_key: 0,
                     file_handle: 0,
@@ -2349,7 +2396,7 @@ impl ProcessManager {
             let mut event = DebugEvent::new(
                 ClientId {
                     unique_process: pid,
-                    unique_thread: *tid,
+                    unique_thread: tid,
                 },
                 message,
                 dbgk::DEBUG_EVENT_NOWAIT | dbgk::DEBUG_EVENT_INACTIVE,
@@ -2363,10 +2410,11 @@ impl ProcessManager {
             if let Err(status) = queued {
                 // Back out every message this attach posted, exactly as the failure path does.
                 if let Some(o) = self.dbgk.get_mut(object) {
-                    let _ = o.flush_process(pid);
+                    let _ = o.flush_process_count(pid);
                 }
                 return Err(status);
             }
+            live_index += 1;
             posted += 1;
         }
 
@@ -2374,7 +2422,6 @@ impl ProcessManager {
         // module already mapped in the target, all attributed to the FIRST reported thread (NT
         // passes `FirstThread` in). The executable's own view is skipped — the create-process
         // message above already reported `base_of_image`.
-        let first_thread = threads[0];
         let mut modules = [ProcessModule::default(); DEFAULT_TRACKED_MODULES];
         let module_count = self.process_modules_into(pid, &mut modules);
         for module in &modules[..module_count] {
@@ -2405,7 +2452,7 @@ impl ProcessManager {
                 .unwrap_or(Err(STATUS_INVALID_HANDLE));
             if let Err(status) = queued {
                 if let Some(o) = self.dbgk.get_mut(object) {
-                    let _ = o.flush_process(pid);
+                    let _ = o.flush_process_count(pid);
                 }
                 return Err(status);
             }
@@ -2441,7 +2488,7 @@ impl ProcessManager {
         let flushed = self
             .dbgk
             .get_mut(object)
-            .map(|o| o.flush_process(pid).len())
+            .map(|o| o.flush_process_count(pid))
             .unwrap_or(0);
         Ok(flushed)
     }
@@ -2452,20 +2499,16 @@ impl ProcessManager {
         if let Some(o) = self.dbgk.get_mut(object) {
             o.mark_debugger_inactive();
         }
-        let attached: Vec<ProcessId> = self
-            .processes
-            .values()
-            .filter(|p| p.debug_port == Some(object))
-            .map(|p| p.process_id)
-            .collect();
-        for pid in &attached {
-            if let Some(p) = self.processes.get_mut(pid) {
-                p.debug_port = None;
-                p.being_debugged = false;
+        let mut detached = 0usize;
+        for process in self.processes.values_mut() {
+            if process.debug_port == Some(object) {
+                process.debug_port = None;
+                process.being_debugged = false;
+                detached += 1;
             }
         }
         self.dbgk.destroy(object);
-        attached.len()
+        detached
     }
 
     /// `NtWaitForDebugEvent`'s non-blocking core: dequeue the next reportable event from `object`,
@@ -2585,6 +2628,20 @@ impl ProcessManager {
         }
     }
 
+    /// Allocation-free [`drain_blocked_reporters`](Self::drain_blocked_reporters) variant for
+    /// bounded hosts. Returns how many entries were written to `out`.
+    pub fn drain_blocked_reporters_into(
+        &mut self,
+        object: DebugObjectId,
+        pid: Option<ProcessId>,
+        out: &mut [(ClientId, dbgk::ReporterBlock)],
+    ) -> usize {
+        match self.dbgk.get_mut(object) {
+            Some(o) => o.drain_reporters_into(pid, out),
+            None => 0,
+        }
+    }
+
     /// How many events on `object` currently carry a blocked reporter.
     pub fn blocked_reporter_count(&self, object: DebugObjectId) -> usize {
         self.dbgk
@@ -2667,7 +2724,7 @@ impl ProcessManager {
         )
     }
 
-    /// Every live debug object's id, written into `out` (creation order); returns how many were
+    /// Every live debug object's id, written into `out` (stable slot order); returns how many were
     /// written. A host uses this to mirror each object's modelled `EventsPresent` onto its
     /// dispatcher object without allocating.
     pub fn debug_object_ids_into(&self, out: &mut [DebugObjectId]) -> usize {

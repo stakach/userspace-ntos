@@ -27,10 +27,9 @@
 //! `DBGUI_WAIT_STATE_CHANGE` byte image ntdll's `DbgUiWaitStateChange` receives — the exact input
 //! `nt_ntdll::dbg::convert_state_change` turns into a Win32 `DEBUG_EVENT`.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::{ClientId, ProcessId, ThreadId};
+use crate::{ClientId, ProcessId, ThreadId, STATUS_NO_MEMORY};
 
 /// Identity of a `DEBUG_OBJECT` inside a [`DebugObjectStore`].
 pub type DebugObjectId = u32;
@@ -531,7 +530,7 @@ impl DebugEvent {
 }
 
 /// A `DEBUG_OBJECT`: the debugger's event port.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DebugObject {
     /// The `Flags` union: `DebuggerInactive:1 | KillProcessOnExit:1`.
     pub flags: u32,
@@ -541,6 +540,9 @@ pub struct DebugObject {
     events_present: bool,
     /// `DebugObject->EventList`, head-to-tail.
     events: Vec<DebugEvent>,
+    /// Maximum queued events allowed for this object. Unbounded for the pure model by default; a
+    /// bounded host installs a fixed limit together with precharged event storage.
+    event_limit: usize,
     /// Opaque host key for the dispatcher object backing `EventsPresent` (the executive parks a
     /// `NtWaitForDebugEvent` caller on a REAL notification event, so the existing wait-park/wake
     /// machinery serves the debugger's block). `0` = no host object bound; the pure model's
@@ -560,8 +562,58 @@ impl DebugObject {
             handle_count: 0,
             events_present: false,
             events: Vec::new(),
+            event_limit: usize::MAX,
             host_event: 0,
         }
+    }
+
+    /// Reinitialise an unused reserved slot while preserving its already-charged event storage.
+    fn reset_for_reuse(&mut self, create_flags: u32) {
+        self.flags = if create_flags & DBGK_KILL_PROCESS_ON_EXIT != 0 {
+            DEBUG_OBJECT_KILL_PROCESS_ON_EXIT
+        } else {
+            0
+        };
+        self.handle_count = 0;
+        self.events_present = false;
+        self.events.clear();
+        self.host_event = 0;
+    }
+
+    /// Construct a `DEBUG_OBJECT` whose event queue has already been charged/reserved by the host.
+    pub fn with_event_capacity(create_flags: u32, event_capacity: usize) -> Result<Self, u32> {
+        let mut object = Self::new(create_flags);
+        if event_capacity != 0 {
+            object
+                .events
+                .try_reserve_exact(event_capacity)
+                .map_err(|_| STATUS_NO_MEMORY)?;
+            object.event_limit = event_capacity;
+        }
+        Ok(object)
+    }
+
+    /// Reserve event-list capacity up front and cap the queue there so later posts do not allocate.
+    pub fn reserve_event_capacity(&mut self, capacity: usize) -> Result<(), u32> {
+        if capacity > self.events.capacity() {
+            self.events
+                .try_reserve_exact(capacity - self.events.capacity())
+                .map_err(|_| STATUS_NO_MEMORY)?;
+        }
+        if capacity != 0 {
+            self.event_limit = capacity;
+        }
+        Ok(())
+    }
+
+    /// The event-list storage currently reserved for this object.
+    pub fn event_capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    /// Maximum events this object will queue before reporting `STATUS_NO_MEMORY`.
+    pub fn event_limit(&self) -> usize {
+        self.event_limit
     }
 
     /// Current number of open handles referencing this debug object.
@@ -635,6 +687,14 @@ impl DebugObject {
         if self.debugger_inactive() {
             return Err(STATUS_DEBUGGER_INACTIVE);
         }
+        if self.events.len() >= self.event_limit {
+            return Err(STATUS_NO_MEMORY);
+        }
+        if self.events.len() == self.events.capacity() {
+            self.events
+                .try_reserve_exact(1)
+                .map_err(|_| STATUS_NO_MEMORY)?;
+        }
         let nowait = event.flags & DEBUG_EVENT_NOWAIT != 0;
         self.events.push(event);
         if !nowait {
@@ -686,6 +746,36 @@ impl DebugObject {
             }
         }
         out
+    }
+
+    /// Allocation-free reporter drain for bounded hosts.
+    ///
+    /// Writes at most `out.len()` reporters and leaves the rest attached for a later call, so callers
+    /// can loop with a fixed stack buffer until this returns less than the buffer length.
+    pub fn drain_reporters_into(
+        &mut self,
+        pid: Option<ProcessId>,
+        out: &mut [(ClientId, ReporterBlock)],
+    ) -> usize {
+        let mut n = 0usize;
+        for event in self.events.iter_mut() {
+            if pid.is_some_and(|pid| event.process_id() != pid) {
+                continue;
+            }
+            let Some(block) = event.reporter.take() else {
+                continue;
+            };
+            if !block.is_blocked() {
+                continue;
+            }
+            if n == out.len() {
+                event.reporter = Some(block);
+                break;
+            }
+            out[n] = (event.client_id, block);
+            n += 1;
+        }
+        n
     }
 
     /// How many events currently carry a blocked reporter.
@@ -808,16 +898,39 @@ impl DebugObject {
     /// `pid`, each marked `STATUS_DEBUGGER_INACTIVE` so its (blocked) reporting thread is released.
     pub fn flush_process(&mut self, pid: ProcessId) -> Vec<DebugEvent> {
         let mut flushed = Vec::new();
-        let mut remaining = Vec::with_capacity(self.events.len());
-        for mut event in self.events.drain(..) {
-            if event.process_id() == pid {
+        let mut index = 0;
+        while index < self.events.len() {
+            if self.events[index].process_id() == pid {
+                let mut event = self.events.remove(index);
                 event.status = STATUS_DEBUGGER_INACTIVE;
                 flushed.push(event);
             } else {
-                remaining.push(event);
+                index += 1;
             }
         }
-        self.events = remaining;
+        self.recompute_events_present();
+        flushed
+    }
+
+    /// In-place `DbgkClearProcessDebugObject` drain for callers that only need a count.
+    pub fn flush_process_count(&mut self, pid: ProcessId) -> usize {
+        let mut flushed = 0usize;
+        let mut index = 0;
+        while index < self.events.len() {
+            if self.events[index].process_id() == pid {
+                let mut event = self.events.remove(index);
+                event.status = STATUS_DEBUGGER_INACTIVE;
+                let _ = event;
+                flushed += 1;
+            } else {
+                index += 1;
+            }
+        }
+        self.recompute_events_present();
+        flushed
+    }
+
+    fn recompute_events_present(&mut self) {
         if !self
             .events
             .iter()
@@ -825,24 +938,66 @@ impl DebugObject {
         {
             self.events_present = false;
         }
-        flushed
+    }
+}
+
+impl Default for DebugObject {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
 /// The executive's table of live `DEBUG_OBJECT`s.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DebugObjectStore {
-    objects: BTreeMap<DebugObjectId, DebugObject>,
+    objects: Vec<(Option<DebugObjectId>, DebugObject)>,
     next_id: DebugObjectId,
+    slot_limit: usize,
+    event_capacity: usize,
+}
+
+impl Default for DebugObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DebugObjectStore {
     /// A fresh, empty store. Ids start at 1 so `0` is never a valid object.
     pub fn new() -> Self {
         DebugObjectStore {
-            objects: BTreeMap::new(),
+            objects: Vec::new(),
             next_id: 1,
+            slot_limit: usize::MAX,
+            event_capacity: 0,
         }
+    }
+
+    /// Reserve object slots and per-object event capacity for a bounded host.
+    ///
+    /// A bump-allocating kernel host calls this before its reset mark, so later debug-object creation
+    /// and event posting consume already-reserved storage. Creation fails with `STATUS_NO_MEMORY` once
+    /// `object_slots` live slots are exhausted.
+    pub fn reserve_capacity(
+        &mut self,
+        object_slots: usize,
+        event_capacity: usize,
+    ) -> Result<(), u32> {
+        if object_slots > self.objects.capacity() {
+            self.objects
+                .try_reserve_exact(object_slots - self.objects.capacity())
+                .map_err(|_| STATUS_NO_MEMORY)?;
+        }
+        self.slot_limit = object_slots;
+        self.event_capacity = event_capacity;
+        for (_, object) in &mut self.objects {
+            object.reserve_event_capacity(event_capacity)?;
+        }
+        while self.objects.len() < object_slots {
+            self.objects
+                .push((None, DebugObject::with_event_capacity(0, event_capacity)?));
+        }
+        Ok(())
     }
 
     /// `NtCreateDebugObject` — validate `create_flags` and insert a new object.
@@ -850,43 +1005,75 @@ impl DebugObjectStore {
         if create_flags & !DBGK_ALL_FLAGS != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
+        let reuse_index = self
+            .objects
+            .iter()
+            .position(|(slot_id, _)| slot_id.is_none());
+        if reuse_index.is_none() && self.objects.len() >= self.slot_limit {
+            return Err(STATUS_NO_MEMORY);
+        }
         if self.next_id == 0 {
             self.next_id = 1;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.objects.insert(id, DebugObject::new(create_flags));
+        if let Some(index) = reuse_index {
+            self.objects[index].0 = Some(id);
+            self.objects[index].1.reset_for_reuse(create_flags);
+            return Ok(id);
+        }
+        let object = DebugObject::with_event_capacity(create_flags, self.event_capacity)?;
+        self.objects.push((Some(id), object));
         Ok(id)
     }
 
     /// Borrow an object.
     pub fn get(&self, id: DebugObjectId) -> Option<&DebugObject> {
-        self.objects.get(&id)
+        self.objects
+            .iter()
+            .find_map(|(candidate, object)| match candidate {
+                Some(candidate) if *candidate == id => Some(object),
+                _ => None,
+            })
     }
 
     /// Mutably borrow an object.
     pub fn get_mut(&mut self, id: DebugObjectId) -> Option<&mut DebugObject> {
-        self.objects.get_mut(&id)
+        self.objects
+            .iter_mut()
+            .find_map(|(candidate, object)| match candidate {
+                Some(candidate) if *candidate == id => Some(object),
+                _ => None,
+            })
     }
 
-    /// `DbgkpDeleteObject` — drop the object (its last handle closed).
-    pub fn destroy(&mut self, id: DebugObjectId) -> Option<DebugObject> {
-        self.objects.remove(&id)
+    /// `DbgkpDeleteObject` — retire the object (its last handle closed).
+    pub fn destroy(&mut self, id: DebugObjectId) -> bool {
+        let Some((slot_id, object)) = self
+            .objects
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == Some(id))
+        else {
+            return false;
+        };
+        *slot_id = None;
+        object.reset_for_reuse(0);
+        true
     }
 
     /// Number of live debug objects.
     pub fn len(&self) -> usize {
-        self.objects.len()
+        self.objects.iter().filter(|(id, _)| id.is_some()).count()
     }
 
     /// Whether no debug object is live.
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
+        self.len() == 0
     }
 
-    /// The id of every live object, in creation order.
+    /// The id of every live object, in slot order.
     pub fn ids(&self) -> impl Iterator<Item = DebugObjectId> + '_ {
-        self.objects.keys().copied()
+        self.objects.iter().filter_map(|(id, _)| *id)
     }
 }
 
@@ -1011,6 +1198,43 @@ mod tests {
         assert_eq!(store.len(), 2);
         // Ids are never zero, so a host can use 0 as "no object".
         assert!(plain != 0 && killer != 0);
+    }
+
+    #[test]
+    fn reserved_store_caps_live_objects_and_reuses_slots() {
+        let mut store = DebugObjectStore::new();
+        store.reserve_capacity(1, 2).unwrap();
+
+        let first = store.create(0).unwrap();
+        let object = store.get(first).unwrap();
+        assert_eq!(object.event_limit(), 2);
+        assert!(object.event_capacity() >= 2);
+        assert_eq!(store.create(0), Err(STATUS_NO_MEMORY));
+
+        assert!(store.destroy(first));
+        let second = store.create(DBGK_KILL_PROCESS_ON_EXIT).unwrap();
+        assert_ne!(first, second, "object ids remain monotonic");
+        assert_eq!(store.len(), 1);
+        let object = store.get(second).unwrap();
+        assert_eq!(object.event_limit(), 2);
+        assert!(object.event_capacity() >= 2);
+        assert!(object.kill_process_on_exit());
+        assert_eq!(store.ids().collect::<Vec<_>>(), alloc::vec![second]);
+    }
+
+    #[test]
+    fn reserved_event_queue_returns_no_memory_at_its_limit() {
+        let mut object = DebugObject::with_event_capacity(0, 1).unwrap();
+        let capacity = object.event_capacity();
+        object
+            .queue(DebugEvent::new(cid(8, 12), create_thread_msg(1), 0))
+            .unwrap();
+        assert_eq!(
+            object.queue(DebugEvent::new(cid(8, 13), create_thread_msg(2), 0)),
+            Err(STATUS_NO_MEMORY)
+        );
+        assert_eq!(object.len(), 1);
+        assert_eq!(object.event_capacity(), capacity);
     }
 
     #[test]
@@ -1364,7 +1588,7 @@ mod tests {
         let mut store = DebugObjectStore::new();
         let id = store.create(0).unwrap();
         assert!(store.get_mut(id).is_some());
-        assert!(store.destroy(id).is_some());
+        assert!(store.destroy(id));
         assert!(store.get(id).is_none());
         assert!(store.is_empty());
     }
