@@ -6204,12 +6204,8 @@ impl ExecNtHandler {
                 0x24
             }
             24 => {
-                let _pid = self.pm.resolve_process_handle(
-                    caller_pid,
-                    handle,
-                    nt_process::PROCESS_QUERY_INFORMATION,
-                )?;
-                put_u32(&mut output, 0, 0);
+                let session_id = self.pm.query_process_session_id(caller_pid, handle)?;
+                put_u32(&mut output, 0, session_id);
                 0x04
             }
             26 => {

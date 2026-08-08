@@ -421,6 +421,9 @@ impl ImageSection {
 pub struct NtProcess {
     pub process_id: ProcessId,
     pub parent: Option<ProcessId>,
+    /// Terminal Services session identity reported by
+    /// `NtQueryInformationProcess(ProcessSessionInformation)`.
+    pub session_id: u32,
     pub image_file_name: String,
     pub address_space_id: AddressSpaceId,
     pub image_section: Option<SectionId>,
@@ -752,11 +755,16 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.default_hard_error_processing)
             .unwrap_or(SEM_FAILCRITICALERRORS);
+        let session_id = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.session_id)
+            .unwrap_or(0);
         self.processes.insert(
             pid,
             NtProcess {
                 process_id: pid,
                 parent,
+                session_id,
                 image_file_name: image_file_name.into(),
                 address_space_id: asid,
                 image_section,
@@ -930,6 +938,13 @@ impl ProcessManager {
         let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
         self.process(pid)
             .map(|process| process.priority_class)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn query_process_session_id(&self, caller_pid: ProcessId, handle: u64) -> Result<u32, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        self.process(pid)
+            .map(|process| process.session_id)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 

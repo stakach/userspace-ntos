@@ -1353,3 +1353,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
   an FSD fallback; inspect the real userinit/explorer path around repeated `NtQueryInformationProcess`
   calls, missing explorer `RegisterWindowMessage` captures, the second shell COM class, and
   `WM_PAINT` begin/end dispatch.
+- Process session-query cleanup. `NtQueryInformationProcess(ProcessSessionInformation)` now reads the
+  process-manager-owned session id through the same access-checked handle path as the other process
+  query classes, instead of returning a syscall-layer literal. New child processes inherit their
+  parent's session id, and the host process-manager test covers the allowed and denied query paths.
+  Validation: `cargo fmt --all`,
+  `cargo test -p nt-process process_query_classes_use_access_checked_state_and_real_times`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: this removes one hardcoded process-information answer, but the desktop frontier
+  remains the explorer shell icon/image-list path before shell chrome paint begin/end proof.

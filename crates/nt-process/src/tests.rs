@@ -1014,6 +1014,11 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
         pm.query_process_priority_class(caller, handle as u64),
         Ok(PROCESS_PRIORITY_CLASS_NORMAL)
     );
+    assert_eq!(pm.query_process_session_id(caller, handle as u64), Ok(0));
+    assert_eq!(
+        pm.query_process_session_id(caller, denied as u64),
+        Err(STATUS_ACCESS_DENIED)
+    );
     pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
         .unwrap();
     assert_eq!(
