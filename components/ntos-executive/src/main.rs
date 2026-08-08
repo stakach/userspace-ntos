@@ -2084,6 +2084,7 @@ impl WaitObject {
     pub(crate) const KIND_PROCESS: u64 = 1;
     pub(crate) const KIND_THREAD: u64 = 2;
     pub(crate) const KIND_WIN32K_EVENT: u64 = 3;
+    pub(crate) const KIND_FILE: u64 = 4;
 
     pub(crate) const FREE: Self = Self(u64::MAX);
 
@@ -2101,6 +2102,10 @@ impl WaitObject {
 
     pub(crate) const fn win32k_event_body(body: u64) -> Self {
         Self((Self::KIND_WIN32K_EVENT << Self::KIND_SHIFT) | (body & Self::ID_MASK))
+    }
+
+    pub(crate) const fn file(file_id: u64) -> Self {
+        Self((Self::KIND_FILE << Self::KIND_SHIFT) | (file_id & Self::ID_MASK))
     }
 
     pub(crate) const fn raw(self) -> u64 {
@@ -2129,6 +2134,7 @@ impl WaitObject {
             Self::KIND_PROCESS => b"process",
             Self::KIND_THREAD => b"thread",
             Self::KIND_WIN32K_EVENT => b"win32k-event",
+            Self::KIND_FILE => b"file",
             _ => b"unknown",
         }
     }
@@ -14272,6 +14278,10 @@ struct ExecNtHandler {
     /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
     /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
     dll_loaded_dirty: bool,
+    /// Set by NtOpenFile when a dynamic hosted executable is admitted from the mounted ReactOS
+    /// volume. The executable's pool bytes are outside the bump heap, but the parsed PE section table
+    /// and catalog/runtime strings are durable loop state and must survive the next syscall reset.
+    hosted_exe_dirty: bool,
     /// Set by any handler that touched the WRITABLE FILESYSTEM OVERLAY (`writable_fs`) — its mount,
     /// a create/write/set-information/close, or a read (whose transient buffer is harmless but whose
     /// lazily-mounted volume is not). Exactly the same contract as `overlay_dirty`: the service loop
@@ -14413,6 +14423,16 @@ impl ExecFileCompletion {
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
+    }
+
+    fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_signaled(file_id, signaled) }
+    }
+
+    fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).is_signaled(file_id) }
     }
 }
 
@@ -20561,6 +20581,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         check(
                             b"npfs_client_connect_finds_fcb",
                             cst == 0 && cli_fid != 0,
+                            &mut passed,
+                        );
+                        check(
+                            b"npfs_client_server_endpoint_ids_distinct",
+                            cst == 0 && srv_fid != 0 && cli_fid != 0 && srv_fid != cli_fid,
                             &mut passed,
                         );
                         if cst == 0 && cli_fid != 0 {

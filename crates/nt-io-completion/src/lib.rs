@@ -23,6 +23,7 @@ struct FileCompletionEntry {
     file_id: u64,
     references: u32,
     synchronous: bool,
+    signaled: bool,
     binding: Option<FileCompletionBinding>,
 }
 
@@ -41,6 +42,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 file_id: 0,
                 references: 0,
                 synchronous: false,
+                signaled: false,
                 binding: None,
             }; FILES],
         }
@@ -75,6 +77,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             file_id,
             references: 1,
             synchronous,
+            signaled: true,
             binding: None,
         };
         Ok(())
@@ -124,6 +127,18 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
     pub fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         self.entry(file_id)
             .map(|entry| entry.synchronous)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        entry.signaled = signaled;
+        Ok(())
+    }
+
+    pub fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.signaled)
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
@@ -803,6 +818,20 @@ mod tests {
         assert_eq!(files.binding(10).unwrap().port_id, 3);
         assert_eq!(files.release_file(10), Ok(Some(3)));
         assert_eq!(files.binding(10), None);
+    }
+
+    #[test]
+    fn file_object_signal_state_tracks_pending_io() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, false).unwrap();
+        assert_eq!(files.is_signaled(10), Ok(true));
+
+        assert_eq!(files.set_signaled(10, false), Ok(()));
+        assert_eq!(files.is_signaled(10), Ok(false));
+
+        assert_eq!(files.set_signaled(10, true), Ok(()));
+        assert_eq!(files.is_signaled(10), Ok(true));
+        assert_eq!(files.set_signaled(20, false), Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]

@@ -118,8 +118,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    prerequisite exposed by the latest desktop boot has also been removed: `NtQueryKey` now answers
    the standard key information classes from the merged base-hive/overlay view instead of only
    `KeyFullInformation`, so HKCR, SCM, shell, and driver registry consumers can size and retry those
-   queries normally. The next SCM step is still live proof that services.exe's real auto-start path
-   reaches a non-bootstrap Win32 service child through the ordinary
+   queries normally. The current slice also corrected `NtCreateKey`'s relative-root handling so the
+   root key handle is used as an object-parse root rather than requiring `KEY_CREATE_SUB_KEY` before
+   CM creates the target child; this keeps ReactOS SCM's `Services\<Name>\Security` creation on the
+   real registry write path when service keys were opened for read. The next SCM step is still live
+   proof that services.exe's real auto-start path reaches a non-bootstrap Win32 service child through
+   the ordinary
    CreateProcess/NtOpenFile/NtCreateSection/NtCreateProcess route, without adding kernel-side
    service-name policy.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
@@ -1311,3 +1315,24 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: continue A3/A4 at the live SCM auto-start frontier; the gate still proves
   registry-selected launch specs but not yet a non-bootstrap `svchost.exe` child from services.exe's
   ordinary CreateProcess path.
+- SCM database registry-create access slice. The live SYSTEM hive has Win32 service keys such as
+  `AudioSrv` without `Security` subkeys, so ReactOS SCM's service database builder creates
+  `Services\<Name>\Security` while the parent service key is open for read. `NtCreateKey` now treats
+  `RootDirectory` as the relative object-parse root and defers requested access enforcement to the
+  target key handle it mints, matching the ReactOS/NT call shape instead of pre-requiring
+  `KEY_CREATE_SUB_KEY` on the parent handle. `NtSetValueKey` still requires `KEY_SET_VALUE` on the
+  returned child key, so this is a registry access-boundary correction rather than a fallback.
+  A follow-on NPFS transport fix moved hosted-FSD pending IRP and completion records out of shared
+  image statics backed by component-private `Vec` heaps and into each hosted FSD instance's DATA
+  arena. File handles now also track NT waitable-file signal state for pending/completed I/O.
+  Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-fsd-data-tables-20260808.log`. Result: kernel specs pass, NPFS
+  `exec_npfs_concurrent_irp_read_and_write` and `exec_npfs_write_split_across_pending_read` pass,
+  live pipe redrive wakes parked readers, LSA self-RPC remains green, and the run reaches the real
+  Winlogon profile/user-shell frontier before failing at `exec_ntloadkey_serviced` and downstream
+  userinit/explorer gates (`273/291`). Review adjustment: A3/A4 is no longer blocked by the SCM/LSA
+  named-pipe pending-read path; next work is the real `NtLoadKey`/user profile hive lifecycle that
+  Winlogon needs before `WlxActivateUserShell` reads `Userinit`.

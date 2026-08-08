@@ -6560,6 +6560,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.user_apc_redirected = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
+                nt_handler.hosted_exe_dirty = false;
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
                 nt_handler.hive_mounts_dirty = false;
@@ -6911,6 +6912,15 @@ pub(crate) unsafe fn service_sec_image(
                 // pool bytes + dll_pe_store write are already reset-safe; this covers the registry fill.
                 if nt_handler.dll_loaded_dirty {
                     nt_handler.dll_loaded_dirty = false;
+                    heap_mark = allocator::mark();
+                }
+                // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a
+                // later NtCreateSection/NtCreateProcessEx. Its pool bytes are reset-safe, but the
+                // parsed PE section table and owned image catalog state are bump-allocated loop
+                // metadata. Pin them before the next per-syscall reset so the process can fault its
+                // main image just like a bootstrap image.
+                if nt_handler.hosted_exe_dirty {
+                    nt_handler.hosted_exe_dirty = false;
                     heap_mark = allocator::mark();
                 }
                 if nt_handler.token_dirty {
@@ -17415,6 +17425,16 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
         if l.iosb_va != 0 {
             nt_handler.xas_write_buf(l.iosb_va, &0u32.to_le_bytes());
             nt_handler.xas_write_buf(l.iosb_va + 8, &0u64.to_le_bytes());
+        }
+        // NT file objects are waitable: overlapped callers may pass a NULL event and then wait on
+        // the file handle itself. Completing the listen sets the FILE_OBJECT signal state in addition
+        // to any explicit event below.
+        if nt_handler
+            .file_completion
+            .set_signaled(l.server_file_id, true)
+            .is_ok()
+        {
+            let _ = wait_wake_dispatcher_set(nt_handler);
         }
         // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
         // the exact NtSetEvent wake path: set the event's `signalled` flag then reevaluate waiters.

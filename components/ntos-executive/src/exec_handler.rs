@@ -313,7 +313,7 @@ unsafe fn admit_dynamic_hosted_exe(
     name16: &[u16],
     folded_name: &[u8],
     is_sxs: bool,
-) -> Option<nt_exe_image::HostedProcessImageRef<'static>> {
+) -> Option<(nt_exe_image::HostedProcessImageRef<'static>, bool)> {
     if is_sxs {
         return None;
     }
@@ -332,7 +332,7 @@ unsafe fn admit_dynamic_hosted_exe(
     let catalog: &'static nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
         &*ctx.exe_image_catalog;
     if let Some(existing) = catalog.get_by_leaf(leaf) {
-        return Some(existing);
+        return Some((existing, false));
     }
     let (pe, pool_va) = load_hosted_executable_from_volume_path(&volume_relative, leaf)?;
     let catalog: &'static mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
@@ -368,7 +368,7 @@ unsafe fn admit_dynamic_hosted_exe(
     print_str(b" leaf=");
     print_str(image.leaf);
     print_str(b"\n");
-    Some(image)
+    Some((image, true))
 }
 
 /// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
@@ -957,6 +957,7 @@ impl ExecNtHandler {
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
         write_field!(overlay_dirty, false);
         write_field!(dll_loaded_dirty, false);
+        write_field!(hosted_exe_dirty, false);
         write_field!(writable_fs_dirty, false);
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
@@ -4683,6 +4684,19 @@ impl ExecNtHandler {
                 }
                 Ok(WaitObject::thread(tid))
             }
+            Some(nt_process::HandleObject::File(file_id)) => {
+                let granted = self
+                    .pm
+                    .handle_access(caller, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if required_access != 0 && granted & required_access != required_access {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                if self.file_completion.is_signaled(file_id).is_err() {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(WaitObject::file(file_id))
+            }
             Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => crate::win32k_subsystem::event_body_for_client_handle(handle)
                 .map(WaitObject::win32k_event_body)
@@ -4748,6 +4762,10 @@ impl ExecNtHandler {
             WaitObject::KIND_PROCESS => self.pm.is_process_signaled(object.id() as u32),
             WaitObject::KIND_THREAD => self.pm.is_thread_signaled(object.id() as u32),
             WaitObject::KIND_WIN32K_EVENT => crate::win32k_subsystem::event_body_ready(object.id()),
+            WaitObject::KIND_FILE => self
+                .file_completion
+                .is_signaled(object.id())
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -4765,6 +4783,7 @@ impl ExecNtHandler {
             WaitObject::KIND_WIN32K_EVENT => {
                 crate::win32k_subsystem::event_body_consume(object.id())
             }
+            WaitObject::KIND_FILE => true,
             _ => false,
         }
     }
@@ -4851,6 +4870,9 @@ impl ExecNtHandler {
         status: u32,
         information: u64,
     ) {
+        if self.file_completion.set_signaled(file_id, true).is_ok() {
+            unsafe { wait_wake_dispatcher_set(self) };
+        }
         if apc_context == 0 {
             return;
         }
@@ -10795,8 +10817,14 @@ impl ExecNtHandler {
         };
         if hosted_exe_image.is_none() && !want_dir {
             let dynamic_role = self.dynamic_child_role();
-            hosted_exe_image =
-                admit_dynamic_hosted_exe(ctx, dynamic_role, &name16, &nb[..nlen], is_sxs);
+            if let Some((image, admitted)) =
+                admit_dynamic_hosted_exe(ctx, dynamic_role, &name16, &nb[..nlen], is_sxs)
+            {
+                if admitted {
+                    self.hosted_exe_dirty = true;
+                }
+                hosted_exe_image = Some(image);
+            }
         }
         let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
         let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
@@ -11856,7 +11884,11 @@ impl ExecNtHandler {
                 let root_target = if root_dir == 0 {
                     None
                 } else {
-                    match self.resolve_registry_key(root_dir, 0x4) {
+                    // NtCreateKey uses RootDirectory as the parse root for the target name. The
+                    // target handle's DesiredAccess is enforced when that target is minted; callers
+                    // such as ReactOS SCM can create a writable child below a service key opened
+                    // for read while the CM/security path decides whether the create is permitted.
+                    match self.resolve_registry_key(root_dir, 0) {
                         Ok(target) => Some(target),
                         Err(status) => return status,
                     }
@@ -12532,6 +12564,9 @@ impl ExecNtHandler {
                 }
                 if transceive_file_retained && status as u32 != 0x0000_0103 {
                     self.release_file_reference(fid);
+                }
+                if fid != 0 && (status as u32) == 0x0000_0103 {
+                    let _ = self.file_completion.set_signaled(fid, false);
                 }
                 // BATCH 33: an FSCTL_PIPE_TRANSCEIVE (write-then-read) on a real npfs pipe that returns
                 // PENDING has no response bytes yet → PARK this caller keyed by the reading end fid, and
@@ -16787,6 +16822,7 @@ impl ExecNtHandler {
                 };
 
                 let completion_event = self.validate_io_event(event);
+                let completion_event_index = completion_event.ok().flatten();
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut completion_file_id = 0u64;
@@ -16895,7 +16931,7 @@ impl ExecNtHandler {
                             match prepared {
                                 Err(status) => status,
                                 Ok(()) => {
-                                    if let Ok(Some(index)) = completion_event {
+                                    if let Some(index) = completion_event_index {
                                         let _ = self.events.reset_existing(index as u64);
                                     }
                                     let mut output = [];
@@ -16925,14 +16961,13 @@ impl ExecNtHandler {
                     self.release_file_reference(completion_file_id);
                 }
                 if pending_write_fid != 0 {
+                    let _ = self.file_completion.set_signaled(pending_write_fid, false);
                     let synchronous = self
                         .file_completion
                         .is_synchronous(pending_write_fid)
                         .unwrap_or(true);
-                    let event_obj_idx = completion_event
-                        .ok()
-                        .flatten()
-                        .map_or(u64::MAX, |index| index as u64);
+                    let event_obj_idx =
+                        completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
                         self.pipe_park_fid = pending_write_fid;
                         self.pipe_park_buffer_va = 0;
@@ -16995,15 +17030,16 @@ impl ExecNtHandler {
                             information,
                         );
                     }
-                    if let Ok(Some(index)) = completion_event {
-                        if self.events.set_existing(index as u64).is_some() {
-                            self.io_signal_event = index as i64;
-                        }
-                    }
                     // BATCH 33: the bytes are now queued in npfs on the PEER end. Ask the loop to
                     // re-drive every parked pipe read — npfs's FCB pairing wakes the peer's reader.
                     if status & 0xC000_0000 != 0xC000_0000 {
                         self.pipe_write_redrive = true;
+                    }
+                }
+                if status != 0x0000_0103 {
+                    if let Some(index) = completion_event_index {
+                        let _ = self.signal_event_index(index);
+                        self.io_signal_event = index as i64;
                     }
                 }
                 // ★ LSA SELF-RPC instrumentation. Every MS-RPC PDU (`rpc_ver == 5`) written onto lsass'
@@ -17322,6 +17358,7 @@ impl ExecNtHandler {
                     self.release_file_reference(completion_file_id);
                 }
                 if pending_read_fid != 0 {
+                    let _ = self.file_completion.set_signaled(pending_read_fid, false);
                     let synchronous = self
                         .file_completion
                         .is_synchronous(pending_read_fid)
@@ -17386,12 +17423,13 @@ impl ExecNtHandler {
                             information,
                         );
                     }
-                    if let Ok(Some(index)) = completion_event {
-                        if self.events.set_existing(index as u64).is_some() {
-                            self.io_signal_event = index as i64;
-                        }
-                    }
                     self.pipe_write_redrive = true;
+                }
+                if status != 0x0000_0103 {
+                    if let Ok(Some(index)) = completion_event {
+                        let _ = self.signal_event_index(index);
+                        self.io_signal_event = index as i64;
+                    }
                 }
                 if NT_READ_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-read-file] pi=");
@@ -17409,9 +17447,9 @@ impl ExecNtHandler {
                 status
             },
             // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
-            // Length[R9], FileInformationClass[sp+0x28]). lsass and winlogon set
-            // FilePipeInformation on typed \pipe\lsarpc / \pipe\ntsvcs handles before listening.
-            // Route those proven paths through isolated npfs instead of blanket-success modeling.
+            // Length[R9], FileInformationClass[sp+0x28]). FilePipeInformation is a normal
+            // named-pipe handle operation; route it by typed FILE_OBJECT context so dynamically
+            // launched services use the same NPFS path as bootstrap system processes.
             NativeService::NtSetInformationFile => unsafe {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
                 let information_class = args[4] as u32;
@@ -17471,9 +17509,7 @@ impl ExecNtHandler {
                 let status = match information_class {
                     23 => {
                         let file_id = self.npfs_file_id_for(args[0]);
-                        if !self.current_process_is_winlogon() && !self.current_process_is_lsass() {
-                            0xC000_0002 // STATUS_NOT_IMPLEMENTED
-                        } else if length < 8 {
+                        if length < 8 {
                             0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
                         } else if args[2] == 0 || !payload_ok {
                             0xC000_0005 // STATUS_ACCESS_VIOLATION

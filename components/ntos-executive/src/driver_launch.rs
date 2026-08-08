@@ -22,6 +22,7 @@
 
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -92,11 +93,16 @@ pub const FSD_STACK_FRAMES: u64 = 32;
 
 /// Aux PT window holding the DATA + SHARED + ARG frames (one 2 MiB PT).
 pub const FSD_AUX_PT_VADDR: u64 = 0x0000_0100_0F20_0000;
-/// DATA export/placeholder region: page 0 = misc placeholders, page 1 = KPCR placeholder (GS). 4 frames.
+/// DATA export/placeholder region: page 0 = misc placeholders, page 1 = KPCR placeholder (GS).
+/// The remaining pages hold per-instance FSD runtime tables. These tables cannot live in Rust
+/// `Vec`s: hosted driver callbacks run in the component VSpace, whose bump heap is private even
+/// though image statics are shared. Per-instance DATA frames give both sides a real shared address
+/// for the same driver instance.
 pub const FSD_DATA_VADDR: u64 = 0x0000_0100_0F30_0000;
-pub const FSD_DATA_FRAMES: u64 = 4;
+pub const FSD_DATA_FRAMES: u64 = 128;
 /// The component's GS base — a zeroed KPCR placeholder (an FSD, a kernel driver, may read `gs:[..]`).
 pub const FSD_KPCR_VA: u64 = FSD_DATA_VADDR + 0x1000;
+const _: () = assert!(FSD_DATA_VADDR + FSD_DATA_FRAMES * 0x1000 <= FSD_SHARED_VADDR);
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
 /// object out, then the IRP request/reply fields. The arena extends up to the ARG window so hosted
@@ -321,36 +327,27 @@ const IRP_MN_START_DEVICE: u64 = 0x00;
 const IRP_MJ_CLOSE: u64 = 0x02;
 const IRP_MJ_CLEANUP: u64 = 0x12;
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct PendingIrp {
     irp: u64,
     iosl: u64,
     file_object: u64,
     data: u64,
-    major: u8,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
     /// (`statesup.c:163/289/…`), so a completion racing a disconnect would key the delivered
     /// bytes under fid 0 and the parked reader would never be woken.
     fid: u64,
+    major: u8,
     /// Whether THIS IRP owns the FILE_OBJECT block (a transient one, not the per-open object in
     /// [`FILE_OBJECTS`]). Only a transient FILE_OBJECT may be freed on completion — see
     /// [`fo_for_open`].
     owns_fo: bool,
+    _pad: [u8; 6],
 }
 
-const PENDING_IRP_CAP: usize = 32;
-const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
-    irp: 0,
-    iosl: 0,
-    file_object: 0,
-    data: 0,
-    major: 0,
-    fid: 0,
-    owns_fo: false,
-};
-static mut PENDING_IRPS: [PendingIrp; PENDING_IRP_CAP] = [EMPTY_PENDING_IRP; PENDING_IRP_CAP];
 static mut DATA_TRACE_COUNT: u32 = 0;
 /// Bounded ENTER/EXIT trace of IRP dispatches (see [`dispatch_irp`]).
 static mut FSD_DISPATCH_TRACE: u32 = 0;
@@ -369,56 +366,262 @@ static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 // (or stale bytes). Capture the completed read's bytes here, keyed by the reader's fid, so the
 // executive's pipe re-drive delivers THESE bytes to the parked reader instead of re-reading. The read
 // result buffer npfs fills for a pending read is the IRP's user buffer (== our `data`, METHOD_NEITHER).
-const COMPLETED_READ_CAP: usize = PENDING_IRP_CAP;
 const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct CompletedRead {
+    seq: u64,
     fid: u64,
     status: u32,
+    length: u32,
     info: u64,
-    length: usize,
     bytes: [u8; COMPLETED_READ_BYTE_CAP],
 }
-static mut COMPLETED_READS: [CompletedRead; COMPLETED_READ_CAP] = [CompletedRead {
-    fid: 0,
-    status: 0,
-    info: 0,
-    length: 0,
-    bytes: [0; COMPLETED_READ_BYTE_CAP],
-}; COMPLETED_READ_CAP];
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct CompletedWrite {
+    seq: u64,
     fid: u64,
     status: u32,
+    _pad: u32,
     info: u64,
 }
 
-static mut COMPLETED_WRITES: [CompletedWrite; COMPLETED_READ_CAP] = [CompletedWrite {
+const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
+    irp: 0,
+    iosl: 0,
+    file_object: 0,
+    data: 0,
+    fid: 0,
+    major: 0,
+    owns_fo: false,
+    _pad: [0; 6],
+};
+const EMPTY_COMPLETED_READ: CompletedRead = CompletedRead {
+    seq: 0,
     fid: 0,
     status: 0,
+    length: 0,
     info: 0,
-}; COMPLETED_READ_CAP];
+    bytes: [0; COMPLETED_READ_BYTE_CAP],
+};
+const EMPTY_COMPLETED_WRITE: CompletedWrite = CompletedWrite {
+    seq: 0,
+    fid: 0,
+    status: 0,
+    _pad: 0,
+    info: 0,
+};
+
+const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
+const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
+const FSD_PENDING_IRP_CAP: usize = 128;
+const FSD_COMPLETED_WRITE_CAP: usize = 128;
+const FSD_COMPLETED_READ_CAP: usize = 30;
+const FSD_PENDING_IRPS_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x10;
+const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(
+    FSD_PENDING_IRPS_OFF + core::mem::size_of::<PendingIrp>() as u64 * FSD_PENDING_IRP_CAP as u64,
+    8,
+);
+const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
+    FSD_COMPLETED_WRITES_OFF
+        + core::mem::size_of::<CompletedWrite>() as u64 * FSD_COMPLETED_WRITE_CAP as u64,
+    8,
+);
+const _: () = assert!(
+    FSD_COMPLETED_READS_OFF
+        + core::mem::size_of::<CompletedRead>() as u64 * FSD_COMPLETED_READ_CAP as u64
+        <= FSD_DATA_FRAMES * 0x1000
+);
+
+const fn align_up_u64(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+unsafe fn next_completion_seq(data_base: u64) -> u64 {
+    let ptr = (data_base + FSD_COMPLETION_SEQ_OFF) as *mut u64;
+    let mut next = read_volatile(ptr).wrapping_add(1);
+    if next == 0 {
+        next = 1;
+    }
+    write_volatile(ptr, next);
+    next
+}
+
+#[inline]
+unsafe fn pending_irp_slot(data_base: u64, index: usize) -> *mut PendingIrp {
+    (data_base
+        + FSD_PENDING_IRPS_OFF
+        + (index as u64) * core::mem::size_of::<PendingIrp>() as u64)
+        as *mut PendingIrp
+}
+
+#[inline]
+unsafe fn completed_write_slot(data_base: u64, index: usize) -> *mut CompletedWrite {
+    (data_base
+        + FSD_COMPLETED_WRITES_OFF
+        + (index as u64) * core::mem::size_of::<CompletedWrite>() as u64)
+        as *mut CompletedWrite
+}
+
+#[inline]
+unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRead {
+    (data_base
+        + FSD_COMPLETED_READS_OFF
+        + (index as u64) * core::mem::size_of::<CompletedRead>() as u64)
+        as *mut CompletedRead
+}
+
+unsafe fn pending_irp_exists(irp: u64) -> bool {
+    (0..FSD_PENDING_IRP_CAP).any(|index| read_volatile(pending_irp_slot(FSD_DATA_VADDR, index)).irp == irp)
+}
+
+unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
+    for index in 0..FSD_PENDING_IRP_CAP {
+        let ptr = pending_irp_slot(FSD_DATA_VADDR, index);
+        let slot = read_volatile(ptr);
+        if slot.irp == irp {
+            write_volatile(ptr, EMPTY_PENDING_IRP);
+            return Some(slot);
+        }
+    }
+    None
+}
+
+unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
+    for index in 0..FSD_PENDING_IRP_CAP {
+        let ptr = pending_irp_slot(FSD_DATA_VADDR, index);
+        if read_volatile(ptr).irp == 0 {
+            write_volatile(ptr, entry);
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn insert_completed_write(fid: u64, status: u32, info: u64) -> bool {
+    if fid == 0 {
+        return false;
+    }
+    let seq = next_completion_seq(FSD_DATA_VADDR);
+    for index in 0..FSD_COMPLETED_WRITE_CAP {
+        let ptr = completed_write_slot(FSD_DATA_VADDR, index);
+        if read_volatile(ptr).fid == 0 {
+            write_volatile(
+                ptr,
+                CompletedWrite {
+                    seq,
+                    fid,
+                    status,
+                    _pad: 0,
+                    info,
+                },
+            );
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn insert_completed_read(
+    fid: u64,
+    status: u32,
+    info: u64,
+    source: u64,
+    length: usize,
+) -> bool {
+    if fid == 0 {
+        return false;
+    }
+    let seq = next_completion_seq(FSD_DATA_VADDR);
+    for index in 0..FSD_COMPLETED_READ_CAP {
+        let ptr = completed_read_slot(FSD_DATA_VADDR, index);
+        if read_volatile(ptr).fid == 0 {
+            let mut record = EMPTY_COMPLETED_READ;
+            record.seq = seq;
+            record.fid = fid;
+            record.status = status;
+            record.info = info;
+            record.length = length as u32;
+            let mut byte = 0usize;
+            while byte < length {
+                record.bytes[byte] = read_volatile((source + byte as u64) as *const u8);
+                byte += 1;
+            }
+            write_volatile(ptr, record);
+            return true;
+        }
+    }
+    false
+}
 
 /// Take (consume) a stashed completed-pending-read for `fid`, if any. Returns `(status, info, bytes)`.
 pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
-    let table = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
-    let slot = table.iter_mut().find(|e| e.fid == fid && e.fid != 0)?;
-    let bytes = alloc::vec::Vec::from(&slot.bytes[..slot.length]);
-    let out = (slot.status, slot.info, bytes);
-    slot.fid = 0;
-    slot.length = 0;
-    Some(out)
+    let mut best_instance = usize::MAX;
+    let mut best_slot = usize::MAX;
+    let mut best_seq = u64::MAX;
+    if let Some(instances) = driver_instances() {
+        for (instance, inst) in instances.iter().enumerate() {
+            if !inst.used {
+                continue;
+            }
+            let Some(win) = ExecVaWindow::try_for_instance(instance) else {
+                continue;
+            };
+            for slot_index in 0..FSD_COMPLETED_READ_CAP {
+                let slot = read_volatile(completed_read_slot(win.data_va, slot_index));
+                if slot.fid == fid && slot.fid != 0 && slot.seq < best_seq {
+                    best_instance = instance;
+                    best_slot = slot_index;
+                    best_seq = slot.seq;
+                }
+            }
+        }
+    }
+    if best_instance == usize::MAX {
+        return None;
+    }
+    let win = ExecVaWindow::try_for_instance(best_instance)?;
+    let ptr = completed_read_slot(win.data_va, best_slot);
+    let slot = read_volatile(ptr);
+    write_volatile(ptr, EMPTY_COMPLETED_READ);
+    let length = (slot.length as usize).min(COMPLETED_READ_BYTE_CAP);
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(&slot.bytes[..length]);
+    Some((slot.status, slot.info, bytes))
 }
 
 pub(crate) unsafe fn take_completed_write(fid: u64) -> Option<(u32, u64)> {
-    let table = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
-    let slot = table
-        .iter_mut()
-        .find(|entry| entry.fid == fid && entry.fid != 0)?;
-    let result = (slot.status, slot.info);
-    slot.fid = 0;
-    Some(result)
+    let mut best_instance = usize::MAX;
+    let mut best_slot = usize::MAX;
+    let mut best_seq = u64::MAX;
+    if let Some(instances) = driver_instances() {
+        for (instance, inst) in instances.iter().enumerate() {
+            if !inst.used {
+                continue;
+            }
+            let Some(win) = ExecVaWindow::try_for_instance(instance) else {
+                continue;
+            };
+            for slot_index in 0..FSD_COMPLETED_WRITE_CAP {
+                let slot = read_volatile(completed_write_slot(win.data_va, slot_index));
+                if slot.fid == fid && slot.fid != 0 && slot.seq < best_seq {
+                    best_instance = instance;
+                    best_slot = slot_index;
+                    best_seq = slot.seq;
+                }
+            }
+        }
+    }
+    if best_instance == usize::MAX {
+        return None;
+    }
+    let win = ExecVaWindow::try_for_instance(best_instance)?;
+    let ptr = completed_write_slot(win.data_va, best_slot);
+    let slot = read_volatile(ptr);
+    write_volatile(ptr, EMPTY_COMPLETED_WRITE);
+    Some((slot.status, slot.info))
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
@@ -806,8 +1009,7 @@ unsafe fn audit_data_queue(dq: u64) -> bool {
                     print_str(b" irp-major=");
                     print_u64(mj);
                     print_str(b" pending=");
-                    let table = &*core::ptr::addr_of!(PENDING_IRPS);
-                    print_u64(table.iter().any(|s| s.irp == eirp) as u64);
+                    print_u64(pending_irp_exists(eirp) as u64);
                 }
                 print_str(b"\n");
                 e = read_volatile(e as *const u64);
@@ -4378,8 +4580,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 print_str(b"\n");
             }
         }
-        let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
-        let Some(slot) = table.iter_mut().find(|entry| entry.irp == irp) else {
+        let Some(slot) = take_pending_irp(irp) else {
             if PEER_COMPLETION_TRACE_COUNT < 8 {
                 PEER_COMPLETION_TRACE_COUNT += 1;
                 print_str(b"[fsd-peer-complete] IRP=0x");
@@ -4407,38 +4608,27 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             // it). Fall back to our original buffer only if npfs left it in place.
             let sysbuf = read_unaligned((irp + 0x18) as *const u64);
             let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-            let ctable = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
-            if let Some(cslot) = ctable.iter_mut().find(|e| e.fid == 0) {
-                let length = (information as usize).min(COMPLETED_READ_BYTE_CAP);
-                let source = if sysbuf != 0 { sysbuf } else { slot.data };
-                let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-                let source_valid = source >= FSD_POOL_VADDR + POOL_DATA_OFF
-                    && source
-                        .checked_add(length as u64)
-                        .is_some_and(|end| end <= pool_end);
-                cslot.fid = fid;
-                cslot.status = if source_valid { status } else { 0xC000_0005 };
-                cslot.info = if source_valid { information } else { 0 };
-                cslot.length = if source_valid { length } else { 0 };
-                if source_valid {
-                    for index in 0..length {
-                        cslot.bytes[index] = read_volatile((source + index as u64) as *const u8);
-                    }
-                }
-            }
+            let length = (information as usize).min(COMPLETED_READ_BYTE_CAP);
+            let source = if sysbuf != 0 { sysbuf } else { slot.data };
+            let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+            let source_valid = source >= FSD_POOL_VADDR + POOL_DATA_OFF
+                && source
+                    .checked_add(length as u64)
+                    .is_some_and(|end| end <= pool_end);
+            let _ = insert_completed_read(
+                fid,
+                if source_valid { status } else { 0xC000_0005 },
+                if source_valid { information } else { 0 },
+                source,
+                if source_valid { length } else { 0 },
+            );
             // IoCompleteRequest normally owns a replacement SystemBuffer carrying
             // IRP_DEALLOCATE_BUFFER. Reclaim it while the component pool is mapped.
             if sysbuf != slot.data && irp_flags & 0x20 != 0 {
                 pool_free(sysbuf);
             }
         } else if slot.major as u64 == IRP_MJ_WRITE {
-            let fid = slot.fid;
-            let completed = &mut *core::ptr::addr_of_mut!(COMPLETED_WRITES);
-            if let Some(completed) = completed.iter_mut().find(|entry| entry.fid == 0) {
-                completed.fid = fid;
-                completed.status = status;
-                completed.info = information;
-            }
+            let _ = insert_completed_write(slot.fid, status, information);
         }
         if PEER_COMPLETION_TRACE_COUNT < 8 {
             PEER_COMPLETION_TRACE_COUNT += 1;
@@ -4462,7 +4652,6 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         if slot.owns_fo {
             pool_free(slot.file_object);
         }
-        *slot = EMPTY_PENDING_IRP;
     }
 }
 
@@ -7068,21 +7257,30 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         print_str(b"\n");
     }
     if st as u32 == STATUS_PENDING {
-        let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
-        if let Some(slot) = table.iter_mut().find(|entry| entry.irp == 0) {
-            *slot = PendingIrp {
-                irp,
-                iosl,
-                file_object: fo,
-                data,
-                major: major as u8,
-                // Capture the file id NOW: npfs NULLs `FILE_OBJECT->FsContext` on disconnect, so it
-                // cannot be recovered from the object at completion time.
-                fid: if fsctx != 0 { fsctx } else { file_id },
-                owns_fo: irp_owns_fo,
-            };
-        } else {
-            print_str(b"[fsd-host] pending IRP table exhausted\n");
+        let inserted = insert_pending_irp(PendingIrp {
+            irp,
+            iosl,
+            file_object: fo,
+            data,
+            // Capture the caller's open identity NOW: npfs may normalize or later NULL
+            // `FILE_OBJECT->FsContext`, but executive waiters are parked on the exact endpoint fid
+            // carried in this request.
+            fid: if file_id != 0 { file_id } else { fsctx },
+            major: major as u8,
+            owns_fo: irp_owns_fo,
+            _pad: [0; 6],
+        });
+        if !inserted {
+            pool_free(data);
+            if pnp_resource_list != 0 {
+                pool_free(pnp_resource_list);
+            }
+            pool_free(iosl);
+            pool_free(irp);
+            if irp_owns_fo {
+                pool_free(fo);
+            }
+            return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
     } else {
         if major == IRP_MJ_READ {
