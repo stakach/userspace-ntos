@@ -335,10 +335,14 @@ impl VmCommittedRange {
     }
 
     pub const fn image(base: u64, size: u64, protect: u32) -> Self {
+        Self::image_region(base, size, base, protect)
+    }
+
+    pub const fn image_region(base: u64, size: u64, allocation_base: u64, protect: u32) -> Self {
         Self {
             base,
             size,
-            allocation_base: base,
+            allocation_base,
             allocation_protect: PAGE_EXECUTE_WRITECOPY,
             protect,
             type_: MEM_IMAGE,
@@ -429,6 +433,23 @@ impl<const N: usize> VmCommittedRangeTable<N> {
             .find(|slot| slot.as_ref().is_some_and(|range| range.base == base))?;
         let removed = slot.take();
         self.normalize();
+        removed
+    }
+
+    pub fn unregister_allocation_base(&mut self, allocation_base: u64) -> usize {
+        let mut removed = 0usize;
+        for slot in &mut self.ranges {
+            if slot
+                .as_ref()
+                .is_some_and(|range| range.allocation_base == allocation_base)
+            {
+                *slot = None;
+                removed += 1;
+            }
+        }
+        if removed != 0 {
+            self.normalize();
+        }
         removed
     }
 

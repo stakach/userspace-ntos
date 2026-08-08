@@ -73,42 +73,6 @@ unsafe fn registered_frame_basic_information(
     })
 }
 
-unsafe fn image_page_protection(pe: &nt_pe_loader::PeFile, image_base: u64, page: u64) -> u32 {
-    let rights = img_spawn::page_rights(pe, (page - image_base) as u32);
-    if rights & PAGE_EXECUTE_NEVER == 0 {
-        nt_address_space::PAGE_EXECUTE_READ
-    } else if rights & 1 != 0 {
-        nt_address_space::PAGE_READWRITE
-    } else {
-        nt_address_space::PAGE_READONLY
-    }
-}
-
-unsafe fn image_basic_information(
-    pe: &nt_pe_loader::PeFile,
-    image_base: u64,
-    image_end: u64,
-    page: u64,
-) -> Option<nt_address_space::VmBasicInformation> {
-    if page < image_base || page >= image_end {
-        return None;
-    }
-    let protect = image_page_protection(pe, image_base, page);
-    let mut end = (page + 0x1000).min(image_end);
-    while end < image_end && image_page_protection(pe, image_base, end) == protect {
-        end += 0x1000;
-    }
-    Some(nt_address_space::VmBasicInformation {
-        base_address: page,
-        allocation_base: image_base,
-        allocation_protect: nt_address_space::PAGE_EXECUTE_WRITECOPY,
-        region_size: end - page,
-        state: nt_address_space::MEM_COMMIT,
-        protect,
-        type_: nt_address_space::MEM_IMAGE,
-    })
-}
-
 impl RegistryKeyStats {
     fn add_subkey(&mut self, name_bytes: usize) {
         self.subkeys = self.subkeys.saturating_add(1);
@@ -7536,36 +7500,6 @@ impl ExecNtHandler {
             });
         }
 
-        let loaded_images = &*ctx.hosted_loaded_images;
-        let main_pe = if target_pi == 0 {
-            (!ctx.pe.is_null()).then_some(&*ctx.pe)
-        } else {
-            loaded_images.pe_by_pi(target_pi)
-        };
-        if let Some(pe) = main_pe {
-            if let Some(info) = image_basic_information(pe, PE_LOAD_BASE, procs[target_pi].img_end, page) {
-                return Ok(info);
-            }
-        }
-        if !ctx.ntdll_pe.is_null() {
-            if let Some(info) = image_basic_information(&*ctx.ntdll_pe, ctx.nt_base, ctx.nt_end, page)
-            {
-                return Ok(info);
-            }
-        }
-
-        let reg = &*ctx.reg;
-        if let Some((index, _)) = reg.dll_for_page(target_pi, page) {
-            let pe = ctx.dll_pes().get(index).and_then(|entry| entry.as_ref());
-            if let (Some(dll), Some(pe)) = (reg.get(index), pe) {
-                if let Some(info) =
-                    image_basic_information(pe, dll.base, dll.base + dll.image_size, page)
-                {
-                    return Ok(info);
-                }
-            }
-        }
-
         if let Some(info) = process_committed_mapping_basic_information(target_pi as u64, page) {
             return Ok(info);
         }
@@ -7583,15 +7517,6 @@ impl ExecNtHandler {
 
         let mut next = USER_ADDRESS_LIMIT;
         if let Some(candidate) = vm_map.next_extent_base_after(page) {
-            next = next.min(candidate);
-        }
-        if procs[target_pi].img_end > PE_LOAD_BASE && PE_LOAD_BASE > page {
-            next = next.min(PE_LOAD_BASE);
-        }
-        if !ctx.ntdll_pe.is_null() && ctx.nt_end > ctx.nt_base && ctx.nt_base > page {
-            next = next.min(ctx.nt_base);
-        }
-        if let Some(candidate) = reg.next_mapped_base_after(target_pi, page) {
             next = next.min(candidate);
         }
         if let Some(candidate) = process_committed_mapping_next_base_after(target_pi as u64, page) {
@@ -15664,7 +15589,7 @@ impl ExecNtHandler {
                     if let Some((slot, _)) = reg.dll_for_page(target_pi, base) {
                         let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
                         if reg.clear_mapped(target_pi, slot) {
-                            let _ = process_committed_mapping_unregister(
+                            let _ = process_committed_mapping_unregister_allocation(
                                 target_pi as u64,
                                 image_base,
                             );
@@ -18560,14 +18485,8 @@ impl ExecNtHandler {
                         }
                         let ext = image_extent(cpe);
                         reg.set_mapped(self.pi, i);
-                        if !process_committed_mapping_register(
-                            self.pi as u64,
-                            nt_address_space::VmCommittedRange::image(
-                                dbase,
-                                ext,
-                                nt_address_space::PAGE_EXECUTE_READ,
-                            ),
-                        ) {
+                        if !img_spawn::register_image_committed_mappings(self.pi as u64, cpe, dbase)
+                        {
                             let _ = reg.clear_mapped(self.pi, i);
                             return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                         }

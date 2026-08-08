@@ -21,8 +21,6 @@ pub(crate) static OUR_KI_USER_APC_DISPATCHER_RVA: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OUR_TP_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of ntdll's completion-only worker, hosted separately from the timer/wait scheduler.
 pub(crate) static OUR_TP_COMPLETION_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
-/// Page-aligned extent of the single hosted ntdll image mapped into every process.
-pub(crate) static OUR_NTDLL_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE
@@ -55,18 +53,70 @@ unsafe fn register_spawn_mapped_mapping(pi: u64, base: u64, size: u64, protect: 
     );
 }
 
-unsafe fn register_spawn_image_mapping(pi: u64, base: u64, size: u64) {
-    assert!(
-        process_committed_mapping_register(
-            pi,
-            nt_address_space::VmCommittedRange::image(
-                base,
-                size,
-                nt_address_space::PAGE_EXECUTE_READ,
-            ),
+pub(crate) unsafe fn image_page_protection(
+    pe: &nt_pe_loader::PeFile,
+    image_base: u64,
+    page: u64,
+) -> u32 {
+    let rights = page_rights(pe, (page - image_base) as u32);
+    if rights & PAGE_EXECUTE_NEVER == 0 {
+        nt_address_space::PAGE_EXECUTE_READ
+    } else if rights & 1 != 0 {
+        nt_address_space::PAGE_READWRITE
+    } else {
+        nt_address_space::PAGE_READONLY
+    }
+}
+
+pub(crate) unsafe fn register_image_committed_mappings(
+    pi: u64,
+    pe: &nt_pe_loader::PeFile,
+    image_base: u64,
+) -> bool {
+    let image_size = image_extent(pe);
+    let Some(image_end) = image_base.checked_add(image_size) else {
+        return false;
+    };
+    if image_size == 0 || image_size & 0xFFF != 0 || image_end <= image_base {
+        return false;
+    }
+
+    let mut run_base = image_base;
+    let mut run_protect = image_page_protection(pe, image_base, image_base);
+    let mut page = image_base + 0x1000;
+    while page < image_end {
+        let protect = image_page_protection(pe, image_base, page);
+        if protect != run_protect {
+            if !process_committed_mapping_register(
+                pi,
+                nt_address_space::VmCommittedRange::image_region(
+                    run_base,
+                    page - run_base,
+                    image_base,
+                    run_protect,
+                ),
+            ) {
+                let _ = process_committed_mapping_unregister_allocation(pi, image_base);
+                return false;
+            }
+            run_base = page;
+            run_protect = protect;
+        }
+        page += 0x1000;
+    }
+    if !process_committed_mapping_register(
+        pi,
+        nt_address_space::VmCommittedRange::image_region(
+            run_base,
+            image_end - run_base,
+            image_base,
+            run_protect,
         ),
-        "spawn image committed mapping table exhausted"
-    );
+    ) {
+        let _ = process_committed_mapping_unregister_allocation(pi, image_base);
+        return false;
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -465,7 +515,7 @@ pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,
-    ntdll_base: u64,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     setup_env: bool,
     prio: u64,
     scr_base: u64,
@@ -504,7 +554,10 @@ pub(crate) unsafe fn spawn_sec_image(
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
     }
     if setup_env {
-        register_spawn_image_mapping(pi, PE_LOAD_BASE, main_image_size);
+        assert!(
+            register_image_committed_mappings(pi, pe, PE_LOAD_BASE),
+            "spawn image committed mapping table exhausted"
+        );
     }
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
@@ -514,14 +567,15 @@ pub(crate) unsafe fn spawn_sec_image(
     }
     // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
-    if ntdll_base != 0 {
+    if let Some((ntdll_base, ntdll_pe)) = ntdll {
         let npt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
         let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
         if setup_env {
-            let ntdll_image_size = OUR_NTDLL_IMAGE_SIZE.load(Ordering::Relaxed);
-            assert!(ntdll_image_size != 0, "hosted ntdll image size not published");
-            register_spawn_image_mapping(pi, ntdll_base, ntdll_image_size);
+            assert!(
+                register_image_committed_mappings(pi, ntdll_pe, ntdll_base),
+                "hosted ntdll committed mapping table exhausted"
+            );
         }
     }
     if setup_env {

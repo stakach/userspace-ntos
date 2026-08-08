@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-08
+Last updated: 2026-08-09
 
 ## Objective
 
@@ -62,7 +62,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `NtProtectVirtualMemory`, `NtMapViewOfSection`, and fault handling with `nt-address-space`.
 - `[~]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
   decommit, release, protect, query, and unmap semantics.
-- `[ ]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
+- `[~]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
   and dirty writeback.
 - `[ ]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
   `MEM_TOP_DOWN`, guard/no-access faults, and view teardown.
@@ -199,10 +199,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    retires the old generic-section `NtQueryVirtualMemory` query branch. Boot proof
    `.tmp/boot-committed-image-views-20260808.log` is fully green at `291/291` with
    `committed-map=85/128`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
-   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
-   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, C3 section-granular image protections and fault ownership, and
-   D1/D2 mutable registry/filesystem authority.
+   shell chrome still painting `34873` non-background pixels. C3's section-granular image committed
+   state is now green: main executable images, hosted ntdll, and SEC_IMAGE DLL views publish
+   allocation-owned `MEM_IMAGE` runs grouped by PE page protection; `NtQueryVirtualMemory` no longer
+   uses PE/global-DLL image query shortcuts, and DLL unmap removes all runs under the image
+   allocation base. Boot proof `.tmp/boot-section-granular-image-views-20260809.log` is fully green
+   at `291/291` with `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom`
+   green, and explorer shell chrome still painting `34873` non-background pixels. Continue the plan
+   from the remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener
+   special coordination, B3's real video/driver binding, C3 fault/protect ownership through the same
+   mapped-view authority, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1589,3 +1595,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Dbgk remains `bits=0x1fff`, and explorer shell chrome still paints `34873` non-background pixels.
   Review adjustment: finish C3 by making image views section-granular in committed state and using
   the same mapped-view authority for fault/protect/unmap across image and data sections.
+
+### 2026-08-09
+
+- C3 section-granular image committed-state slice. `VmCommittedRange::image_region` now preserves an
+  image allocation base across section/protection runs, and `VmCommittedRangeTable` can tear down all
+  committed ranges for one allocation base. Spawn and `NtMapViewOfSection(SEC_IMAGE)` walk the
+  parsed PE and publish `MEM_IMAGE` runs grouped by live page protection for main executables,
+  hosted ntdll, and DLL views. Hosted ntdll is passed to spawn as a parsed PE instead of publishing a
+  global image size, so the old transient whole-ntdll committed record is gone. `NtQueryVirtualMemory`
+  now uses the committed mapping table for image views instead of PE/global-DLL special query
+  branches, and image unmap removes the whole allocation's committed runs. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-section-granular-image-views-20260809.log`. Result: kernel specs pass,
+  the full executive gate is `291/291`, `committed-map=233/512`, `committed-map-fails=0`,
+  `exec_vm_pool_headroom` is green with `52331 KiB` root-Untyped free, and explorer shell chrome
+  still paints `34873` non-background pixels. Review adjustment: finish C3 by routing image fault
+  ownership and mapped-image protect decisions through the same mapped-view authority, then add the
+  C4 overlap/decommit/protect/view-teardown regression gates.

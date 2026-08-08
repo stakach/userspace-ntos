@@ -1439,6 +1439,7 @@ fn hosted_exe_spawn_for<'a>(
 unsafe fn spawn_requested_hosted_exe(
     request: nt_exe_image::SpawnRequest,
     spec: HostedExeSpawn<'_>,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     fault_ep: u64,
     procs: &mut [ProcExec; MAX_PI],
     nt_handler: &mut ExecNtHandler,
@@ -1458,7 +1459,7 @@ unsafe fn spawn_requested_hosted_exe(
         spec.image,
         spec.pe,
         mint_badged(fault_ep, spec.image.top_badge),
-        NTDLL_BASE,
+        ntdll,
         true,
         0,
         child_pid as u64,
@@ -3648,6 +3649,18 @@ pub(crate) unsafe fn service_sec_image(
             nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
         );
         process_committed_mapping_reset(index);
+    }
+    if ntdll.is_some() {
+        assert!(
+            img_spawn::register_image_committed_mappings(0, smss_pe, PE_LOAD_BASE),
+            "smss image committed mapping table exhausted after reset"
+        );
+        if let Some((ntdll_base, ntdll_pe)) = ntdll {
+            assert!(
+                img_spawn::register_image_committed_mappings(0, ntdll_pe, ntdll_base),
+                "smss ntdll committed mapping table exhausted after reset"
+            );
+        }
     }
     VM_FREE_FRAME_N = 0;
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
@@ -7140,6 +7153,7 @@ pub(crate) unsafe fn service_sec_image(
                             match spawn_requested_hosted_exe(
                                 request,
                                 spec,
+                                ntdll,
                                 fault_ep,
                                 procs,
                                 &mut nt_handler,

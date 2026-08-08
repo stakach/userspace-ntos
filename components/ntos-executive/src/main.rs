@@ -1383,10 +1383,11 @@ static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY
     [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
 /// Non-private committed mappings owned outside the private VAD allocator.
 ///
-/// This covers process-lifetime runtime pages plus mapped section/image views. Explorer loads dozens
-/// of image views after desktop paint, so keep enough precharged slots for real per-process view
-/// ownership without allocating in the syscall-reset window.
-const PROCESS_COMMITTED_MAPPING_CAPACITY: usize = 128;
+/// This covers process-lifetime runtime pages plus mapped section/image views. Image views are
+/// tracked at section-protection granularity, so each loaded module contributes several committed
+/// ranges under one allocation base. Keep the table precharged for explorer's post-desktop DLL set
+/// without allocating in the syscall-reset window.
+const PROCESS_COMMITTED_MAPPING_CAPACITY: usize = 512;
 static mut PROCESS_COMMITTED_MAPPINGS:
     [nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>; MAX_PI] =
     [const { nt_address_space::VmCommittedRangeTable::new() }; MAX_PI];
@@ -1443,6 +1444,19 @@ pub(crate) unsafe fn process_committed_mapping_unregister(pi: u64, base: u64) ->
         as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
         .add(pi as usize);
     (*table).unregister_base(base).is_some()
+}
+
+pub(crate) unsafe fn process_committed_mapping_unregister_allocation(
+    pi: u64,
+    allocation_base: u64,
+) -> bool {
+    if pi as usize >= MAX_PI {
+        return false;
+    }
+    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
+        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    (*table).unregister_allocation_base(allocation_base) != 0
 }
 
 pub(crate) unsafe fn process_committed_mapping_basic_information(
@@ -18385,7 +18399,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             smss_image,
             &pe,
             si_fault_c,
-            0,
+            None,
             false,
             0,
             0,
@@ -21783,8 +21797,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_COMPLETION_WORKER_RVA
                         .store(tp_completion_worker_rva, Ordering::Relaxed);
-                    img_spawn::OUR_NTDLL_IMAGE_SIZE
-                        .store(image_extent(&ntdll_pe), Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
                     print_str(b"\n");
@@ -21799,7 +21811,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         smss_image,
                         &pe,
                         si_fault_c,
-                        NTDLL_BASE,
+                        Some((NTDLL_BASE, smss_ntdll_pe)),
                         true,
                         smss_ldrp_rva,
                         0,

@@ -999,10 +999,12 @@ fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
 }
 
 #[test]
-fn committed_range_table_reports_image_views_and_unregisters_by_base() {
+fn committed_range_table_reports_section_granular_image_views_and_unregisters_allocation() {
     let mut table = VmCommittedRangeTable::<4>::new();
-    let image = VmCommittedRange::image(0x8000_0000, 0x3000, PAGE_EXECUTE_READ);
-    table.register(image).unwrap();
+    let headers = VmCommittedRange::image_region(0x8000_0000, 0x1000, 0x8000_0000, PAGE_READWRITE);
+    let text = VmCommittedRange::image_region(0x8000_1000, 0x2000, 0x8000_0000, PAGE_EXECUTE_READ);
+    table.register(headers).unwrap();
+    table.register(text).unwrap();
     table
         .register(VmCommittedRange::mapped(0x9000_0000, 0x1000, PAGE_READONLY))
         .unwrap();
@@ -1013,14 +1015,32 @@ fn committed_range_table_reports_image_views_and_unregisters_by_base() {
             base_address: 0x8000_0000,
             allocation_base: 0x8000_0000,
             allocation_protect: PAGE_EXECUTE_WRITECOPY,
-            region_size: 0x3000,
+            region_size: 0x1000,
+            state: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+            type_: MEM_IMAGE,
+        }
+    );
+    assert_eq!(
+        table.query_basic(0x8000_1000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x8000_1000,
+            allocation_base: 0x8000_0000,
+            allocation_protect: PAGE_EXECUTE_WRITECOPY,
+            region_size: 0x2000,
             state: MEM_COMMIT,
             protect: PAGE_EXECUTE_READ,
             type_: MEM_IMAGE,
         }
     );
-    assert_eq!(table.unregister_base(0x8000_0000), Some(image));
+    assert_eq!(table.unregister_base(0x8000_0000), Some(headers));
     assert!(table.query_basic(0x8000_0123).is_none());
+    assert_eq!(
+        table.query_basic(0x8000_1000).unwrap().protect,
+        PAGE_EXECUTE_READ
+    );
+    assert_eq!(table.unregister_allocation_base(0x8000_0000), 1);
+    assert!(table.query_basic(0x8000_1000).is_none());
     assert_eq!(table.range_count(), 1);
     assert_eq!(table.unregister_base(0x8000_1000), None);
 }
