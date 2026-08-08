@@ -294,16 +294,6 @@ pub(crate) fn take_mount_dirty() -> bool {
     WRITABLE_FS_MOUNT_DIRTY.swap(false, Ordering::AcqRel)
 }
 
-/// The volume's own NT path for a canonical volume-relative path. The writable volume is rooted at
-/// the DOS drive, so `profiles\administrator` ⇒ `\??\C:\profiles\administrator`.
-fn volume_path(relative: &[u8]) -> alloc::string::String {
-    let mut path = alloc::string::String::from(r"\??\C:\");
-    for &byte in relative {
-        path.push(byte as char);
-    }
-    path
-}
-
 /// Classify an NT object name: `Some(volume-relative path)` when it belongs to the writable volume,
 /// `None` when the read-only namespace still owns it.
 pub(crate) fn writable_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
@@ -337,8 +327,8 @@ pub(crate) unsafe fn create(
     let Some(fs) = writable_fs() else {
         return (nt_fs::STATUS_NOT_IMPLEMENTED, None, 0);
     };
-    let result = fs.zw_create_file(
-        &volume_path(relative),
+    let result = fs.zw_create_file_relative(
+        relative,
         desired_access,
         file_attributes,
         share_access,
@@ -394,6 +384,25 @@ pub(crate) unsafe fn read(
         trace_io_refusal(b"read", file_id, byte_offset, length, status);
     }
     (status, bytes)
+}
+
+/// `NtReadFile` on a writable-volume file object into caller-owned staging.
+pub(crate) unsafe fn read_into(
+    file_id: u64,
+    byte_offset: Option<u64>,
+    output: &mut [u8],
+) -> (u32, usize) {
+    let Some(fs) = writable_fs() else {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    };
+    let (status, read) = fs.zw_read_file_into(file_id, byte_offset, output);
+    if status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_READS.fetch_add(1, Ordering::Relaxed);
+        OVERLAY_BYTES_READ.fetch_add(read as u64, Ordering::Relaxed);
+    } else {
+        trace_io_refusal(b"read", file_id, byte_offset, output.len(), status);
+    }
+    (status, read)
 }
 
 /// `NtWriteFile` on a writable-volume file object.
@@ -580,6 +589,13 @@ pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
 /// volume's ordinary create surface. Every directory and every file byte comes from the image;
 /// nothing is invented. The result is then read back the way a hosted process reads it (by path,
 /// by content and by ENUMERATION) so the "real, enumerable tree" claim is measured, not asserted.
+///
+/// The FAT read buffer is fixed storage, not a temporary `Vec`: the writable filesystem owns the
+/// copied bytes after `provision_file`, and the service loop pins the mount syscall's dirty state.
+/// Keeping the read scratch out of the bump heap prevents that pin from retaining staging bytes.
+const MAX_STAGED_FILE: usize = 256 * 1024;
+static mut STAGED_FILE_COPY_BUF: [u8; MAX_STAGED_FILE] = [0; MAX_STAGED_FILE];
+
 unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     let Some(fat) = crate::fs_loader::exec_fs() else {
         print_str(b"[profile-source] no FAT volume -> \\Profiles NOT materialised\n");
@@ -638,11 +654,10 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
                     }
                 }
             } else if size as usize <= MAX_STAGED_FILE {
-                let mut data = alloc::vec::Vec::new();
-                if data.try_reserve_exact(size as usize).is_err() {
-                    continue;
-                }
-                data.resize(size as usize, 0);
+                let data = core::slice::from_raw_parts_mut(
+                    core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
+                    size as usize,
+                );
                 let got = if size == 0 {
                     0
                 } else {
@@ -703,10 +718,6 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_u64(regf_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
     print_str(b")\n");
 }
-
-/// The largest staged profile file the executive will materialise (the whole tree is ~360 bytes;
-/// this is a guard against a future tree dragging bulk data onto the bump heap).
-const MAX_STAGED_FILE: usize = 256 * 1024;
 
 /// How many records a directory really enumerates through the `Zw*` surface (`.`, `..`, children) —
 /// the same encoder `NtQueryDirectoryFile`, and therefore `FindFirstFileW`, goes through.

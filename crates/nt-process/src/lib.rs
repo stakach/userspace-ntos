@@ -156,6 +156,17 @@ impl<T> Default for IdTable<T> {
 }
 
 impl<T> IdTable<T> {
+    fn reserve_capacity(&mut self, capacity: usize) {
+        if capacity > self.entries.capacity() {
+            self.entries
+                .reserve_exact(capacity - self.entries.capacity());
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
     fn position(&self, key: u32) -> Result<usize, usize> {
         self.entries
             .binary_search_by_key(&key, |(candidate, _)| *candidate)
@@ -213,6 +224,17 @@ impl Default for ThreadIdSet {
 impl ThreadIdSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn reserve_capacity(&mut self, capacity: usize) {
+        if capacity > self.entries.capacity() {
+            self.entries
+                .reserve_exact(capacity - self.entries.capacity());
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     pub fn insert(&mut self, tid: ThreadId) -> bool {
@@ -692,6 +714,28 @@ impl ProcessManager {
         self.module_limit = capacity;
     }
 
+    /// Pre-allocate the process table for a host that knows its bounded hosted-process envelope.
+    /// This keeps later `NtCreateProcess[Ex]` object insertion from reallocating on reset-sensitive
+    /// allocators; it does not create any synthetic process identities.
+    pub fn reserve_process_capacity(&mut self, capacity: usize) {
+        self.processes.reserve_capacity(capacity);
+    }
+
+    /// Pre-allocate the global thread table for a host that pre-creates or dynamically creates a
+    /// bounded ETHREAD pool. Later [`create_thread`](Self::create_thread) calls can then insert
+    /// real thread objects without growing the durable table mid-syscall.
+    pub fn reserve_thread_capacity(&mut self, capacity: usize) {
+        self.threads.reserve_capacity(capacity);
+    }
+
+    pub fn process_capacity(&self) -> usize {
+        self.processes.capacity()
+    }
+
+    pub fn thread_capacity(&self) -> usize {
+        self.threads.capacity()
+    }
+
     // --- image sections (spec §13) -------------------------------------------
 
     /// `ZwCreateSection(SEC_IMAGE)` (spec §13.1): validate the PE, lay it out + relocate it to
@@ -807,6 +851,22 @@ impl ProcessManager {
                 proc.handles.reserve(capacity - proc.handles.capacity());
             }
         }
+    }
+
+    /// Pre-reserve the per-process TID link set. This is separate from
+    /// [`reserve_thread_capacity`](Self::reserve_thread_capacity): the global ETHREAD table stores
+    /// objects, while each EPROCESS also owns the ordered set of TIDs belonging to it.
+    pub fn reserve_process_threads(&mut self, pid: ProcessId, capacity: usize) {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.threads.reserve_capacity(capacity);
+        }
+    }
+
+    pub fn process_thread_capacity(&self, pid: ProcessId) -> usize {
+        self.processes
+            .get(&pid)
+            .map(|p| p.threads.capacity())
+            .unwrap_or(0)
     }
 
     /// `pid`'s current handle-table capacity (reserved slots) — for a host to check headroom.
@@ -1050,7 +1110,7 @@ impl ProcessManager {
                 disable_boost: false,
                 hide_from_debugger: false,
                 thread_name_len: 0,
-                thread_name: alloc::vec![0; THREAD_NAME_MAX_UNITS],
+                thread_name: Vec::new(),
                 user_apc_queue: [UserApc::default(); THREAD_USER_APC_QUEUE_CAP],
                 user_apc_head: 0,
                 user_apc_len: 0,
@@ -1368,8 +1428,8 @@ impl ProcessManager {
             return Err(0xC000_009A);
         }
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        thread.thread_name[..name.len()].copy_from_slice(name);
-        thread.thread_name[name.len()..].fill(0);
+        thread.thread_name.clear();
+        thread.thread_name.extend_from_slice(name);
         thread.thread_name_len = name.len() as u16;
         Ok(())
     }
@@ -1737,7 +1797,7 @@ impl ProcessManager {
         thread.disable_boost = false;
         thread.hide_from_debugger = false;
         thread.thread_name_len = 0;
-        thread.thread_name.fill(0);
+        thread.thread_name.clear();
         thread.user_apc_queue.fill(UserApc::default());
         thread.user_apc_head = 0;
         thread.user_apc_len = 0;

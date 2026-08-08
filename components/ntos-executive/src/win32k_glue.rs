@@ -55,6 +55,7 @@ static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WINDOWPROC_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_LOOKUP_FAILURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
@@ -63,6 +64,16 @@ static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
     nt_user_callback::ActiveCallbackStack::new();
+const USER_CALLBACK_CLIENT_REGISTRY_CAP: usize = MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS) + 16;
+
+#[derive(Clone, Copy)]
+struct UserCallbackClientRecord {
+    dispatch_id: u64,
+    client: crate::spawn_hosts::UserCallbackClient,
+}
+
+static mut USER_CALLBACK_CLIENT_REGISTRY: [Option<UserCallbackClientRecord>;
+    USER_CALLBACK_CLIENT_REGISTRY_CAP] = [None; USER_CALLBACK_CLIENT_REGISTRY_CAP];
 static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequence =
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -170,6 +181,109 @@ impl Win32kClientContext {
             token_user_sid: self.token_user_sid,
             token_user_sid_len: self.token_user_sid_len,
         }
+    }
+}
+
+fn user_callback_client_record_matches(
+    record: &UserCallbackClientRecord,
+    dispatch_id: u64,
+    client_pi: u32,
+    client_tid: u64,
+    client_badge: u64,
+) -> bool {
+    record.dispatch_id == dispatch_id
+        && record.client.pi == client_pi
+        && record.client.tid == client_tid
+        && record.client.badge == client_badge
+}
+
+fn user_callback_client_can_register(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+    client.pi != 0 && client.tid != 0 && client.badge != 0 && client.tcb > 1
+}
+
+unsafe fn register_user_callback_client_for_dispatch(
+    dispatch_id: u64,
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> bool {
+    if dispatch_id == 0 || !user_callback_client_can_register(client) {
+        return false;
+    }
+    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
+    let mut empty = None;
+    for (index, slot) in registry.iter_mut().enumerate() {
+        match slot {
+            Some(record)
+                if user_callback_client_record_matches(
+                    record,
+                    dispatch_id,
+                    client.pi,
+                    client.tid,
+                    client.badge,
+                ) =>
+            {
+                record.client = client;
+                return true;
+            }
+            Some(_) => {}
+            None if empty.is_none() => empty = Some(index),
+            None => {}
+        }
+    }
+    let Some(index) = empty else {
+        USER_CALLBACK_CLIENT_LOOKUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    registry[index] = Some(UserCallbackClientRecord {
+        dispatch_id,
+        client,
+    });
+    true
+}
+
+unsafe fn unregister_user_callback_client_for_dispatch(
+    dispatch_id: u64,
+    client_pi: u32,
+    client_tid: u64,
+    client_badge: u64,
+) {
+    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
+    for slot in registry.iter_mut() {
+        if slot.is_some_and(|record| {
+            user_callback_client_record_matches(
+                &record,
+                dispatch_id,
+                client_pi,
+                client_tid,
+                client_badge,
+            )
+        }) {
+            *slot = None;
+            return;
+        }
+    }
+}
+
+unsafe fn user_callback_client_for_request(
+    request: &nt_user_callback::CallbackHeader,
+) -> Option<crate::spawn_hosts::UserCallbackClient> {
+    let registry = &*core::ptr::addr_of!(USER_CALLBACK_CLIENT_REGISTRY);
+    registry.iter().find_map(|slot| {
+        let record = slot.as_ref()?;
+        user_callback_client_record_matches(
+            record,
+            request.dispatch_id,
+            request.client_pi,
+            request.client_tid,
+            request.client_badge,
+        )
+        .then_some(record.client)
+    })
+}
+
+unsafe fn clear_user_callback_client_registry() {
+    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
+    for slot in registry.iter_mut() {
+        *slot = None;
     }
 }
 
@@ -1092,6 +1206,7 @@ unsafe fn abort_controlled_user_callbacks() {
     restore_all_client_callback_windows();
     *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
         nt_user_callback::ContinuationStack::new();
+    clear_user_callback_client_registry();
     USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(0, Ordering::Relaxed);
     USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
 }
@@ -1232,23 +1347,32 @@ unsafe fn callback_payload_write_u64(
     }
 }
 
-pub(crate) unsafe fn service_user_callback(
-    client: crate::spawn_hosts::UserCallbackClient,
-) -> Option<UserCallbackDisposition> {
+pub(crate) unsafe fn service_user_callback() -> Option<UserCallbackDisposition> {
     const WPCA_MSG: usize = 0x18;
     const WPCA_RESULT: usize = 0x38;
 
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
-    if nt_user_callback::validate_request(&request).is_err()
-        || request.client_pi != client.pi
-        || request.client_tid != client.tid
-        || request.client_badge != client.badge
-    {
-        print_str(b"[user-callback] invalid or stale component request\n");
+    if nt_user_callback::validate_request(&request).is_err() {
+        print_str(b"[user-callback] invalid component request\n");
         return None;
     }
+    let Some(client) = user_callback_client_for_request(&request) else {
+        let n = USER_CALLBACK_CLIENT_LOOKUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            print_str(b"[user-callback] unregistered component request pi=");
+            print_u64(request.client_pi as u64);
+            print_str(b" badge=");
+            print_u64(request.client_badge);
+            print_str(b" tid=");
+            print_u64(request.client_tid);
+            print_str(b" dispatch=");
+            print_u64(request.dispatch_id);
+            print_str(b"\n");
+        }
+        return None;
+    };
     USER_CALLBACK_RENDEZVOUS.fetch_add(1, Ordering::Relaxed);
 
     let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
@@ -1809,7 +1933,6 @@ unsafe fn resume_suspended_user_callback_component(
         tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
         client_pi: client.pi as u64,
-        callback_client: Some(client),
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
@@ -2964,6 +3087,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_str(b"[user-callback] dispatch continuation failed to unwind\n");
         return None;
     }
+    unregister_user_callback_client_for_dispatch(
+        request.dispatch_id,
+        request.client_pi,
+        request.client_tid,
+        request.client_badge,
+    );
     // The client is about to resume in the ENCLOSING callback (or in its original syscall). This inner
     // callback's teardown — our own `restore_client_callback_window` above plus win32k's
     // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
@@ -4606,6 +4735,14 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     clear_published_win32k_context();
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let callback_client = client.callback_client();
+    let callback_capable = user_callback_client_can_register(callback_client);
+    if callback_capable
+        && !register_user_callback_client_for_dispatch(dispatch_id, callback_client)
+    {
+        print_str(b"[user-callback] callback client registry full for dispatch\n");
+        return (0xC000_009Au64, false);
+    }
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
         Ok(nested) => nested,
         Err(error) => {
@@ -4624,6 +4761,14 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
                     b"dispatch correlation mismatch\n"
                 }
             });
+            if callback_capable {
+                unregister_user_callback_client_for_dispatch(
+                    dispatch_id,
+                    client.pi,
+                    client.tid,
+                    client.badge,
+                );
+            }
             return (0xC000_000Du64, false);
         }
     };
@@ -4771,12 +4916,11 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: rw,
         client_pi,
-        callback_client: Some(client.callback_client()),
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
             client_attach: true,
-            usermode_callback: true,
+            usermode_callback: callback_capable,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -4794,7 +4938,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     retire_win32k_on_wall(&pr);
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
     if pr.callback_suspended {
-        capture_suspended_published_win32k_context(client.callback_client());
+        capture_suspended_published_win32k_context(callback_client);
     }
     if nested_user_callback {
         if pr.callback_suspended {
@@ -4802,8 +4946,19 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
             print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
+            if callback_capable {
+                unregister_user_callback_client_for_dispatch(
+                    dispatch_id,
+                    client.pi,
+                    client.tid,
+                    client.badge,
+                );
+            }
             return (pr.result, false);
         }
+    }
+    if callback_capable && !pr.callback_suspended {
+        unregister_user_callback_client_for_dispatch(dispatch_id, client.pi, client.tid, client.badge);
     }
     (pr.result, pr.completed)
 }

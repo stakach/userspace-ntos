@@ -35,9 +35,9 @@ pub const HEAP_FRAMES: u64 = 1536;
 /// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
 /// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
 /// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The
-/// documented consequence is that a spawned service allocating past its own 1 MiB faults instead of
-/// returning null; nothing comes remotely close (the old shared 32-frame heap sufficed for them).
-pub const SERVICE_HEAP_FRAMES: u64 = 256;
+/// documented consequence is that a spawned service allocating past its own 512 KiB faults instead
+/// of returning null; nothing comes remotely close (the old shared 32-frame heap sufficed for them).
+pub const SERVICE_HEAP_FRAMES: u64 = 128;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap

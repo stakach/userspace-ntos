@@ -120,7 +120,8 @@ pub(crate) fn bytes_at(b: &[u8], off: usize, len: usize) -> Result<&[u8], PeErro
 pub struct PeFile<'a> {
     bytes: &'a [u8],
     headers: Headers,
-    sections: alloc::vec::Vec<Section>,
+    sections: [Section; headers::MAX_SECTIONS],
+    section_count: usize,
 }
 
 impl core::fmt::Debug for PeFile<'_> {
@@ -129,7 +130,7 @@ impl core::fmt::Debug for PeFile<'_> {
             .field("entry_point_rva", &self.headers.entry_point_rva)
             .field("image_base", &self.headers.image_base)
             .field("size_of_image", &self.headers.size_of_image)
-            .field("sections", &self.sections.len())
+            .field("sections", &self.section_count)
             .finish()
     }
 }
@@ -138,15 +139,17 @@ impl<'a> PeFile<'a> {
     /// Parse + validate the headers and section table of `bytes`.
     pub fn parse(bytes: &'a [u8]) -> Result<PeFile<'a>, PeError> {
         let headers = Headers::parse(bytes)?;
-        let mut sections = alloc::vec::Vec::with_capacity(headers.number_of_sections as usize);
+        let section_count = headers.number_of_sections as usize;
+        let mut sections = [Section::default(); headers::MAX_SECTIONS];
         let table = headers.section_table_offset();
-        for i in 0..headers.number_of_sections as usize {
-            sections.push(Section::parse(bytes, table + i * 40)?);
+        for (i, section) in sections.iter_mut().enumerate().take(section_count) {
+            *section = Section::parse(bytes, table + i * 40)?;
         }
         Ok(PeFile {
             bytes,
             headers,
             sections,
+            section_count,
         })
     }
 
@@ -158,7 +161,7 @@ impl<'a> PeFile<'a> {
         &self.headers
     }
     pub fn sections(&self) -> &[Section] {
-        &self.sections
+        &self.sections[..self.section_count]
     }
     /// The preferred load address from the optional header.
     pub fn image_base(&self) -> u64 {
@@ -197,12 +200,12 @@ impl<'a> PeFile<'a> {
     /// Parse the import table (spec §7.2). Returns one [`ImportedDll`] per imported
     /// module with its named/ordinal functions + IAT slot RVAs.
     pub fn imports(&self) -> Result<alloc::vec::Vec<ImportedDll>, PeError> {
-        imports::parse_imports(self.bytes, &self.headers, &self.sections)
+        imports::parse_imports(self.bytes, &self.headers, self.sections())
     }
 
     /// Parse the export directory (spec §13.6). Returns the module's named exports with RVAs.
     pub fn exports(&self) -> Result<alloc::vec::Vec<ExportedSymbol>, PeError> {
-        exports::parse_exports(self.bytes, &self.headers, &self.sections)
+        exports::parse_exports(self.bytes, &self.headers, self.sections())
     }
 
     /// Read a NUL-terminated ASCII string at `rva` (via the section table). Used by the loader to
@@ -231,7 +234,7 @@ impl<'a> PeFile<'a> {
                 .ok_or(PeError::ImportTableInvalid)?;
             return Ok(&bytes[..end]);
         }
-        rva::cstr_at_rva(self.bytes, &self.sections, rva)
+        rva::cstr_at_rva(self.bytes, self.sections(), rva)
     }
 
     /// True if the image has a TLS directory (data dir 9) — its TLS callbacks must run around
@@ -249,7 +252,7 @@ impl<'a> PeFile<'a> {
         if rva < self.headers.size_of_headers && end_rva <= self.headers.size_of_headers {
             return self.bytes.get(rva as usize..end_rva as usize);
         }
-        let section = self.sections.iter().find(|section| {
+        let section = self.sections().iter().find(|section| {
             let delta = rva.checked_sub(section.virtual_address);
             delta.is_some_and(|delta| {
                 delta <= section.size_of_raw_data
@@ -264,7 +267,7 @@ impl<'a> PeFile<'a> {
 
     /// Parse the base-relocation table (spec §7.2).
     pub fn relocations(&self) -> Result<alloc::vec::Vec<Relocation>, PeError> {
-        relocs::parse_relocations(self.bytes, &self.headers, &self.sections)
+        relocs::parse_relocations(self.bytes, &self.headers, self.sections())
     }
 
     /// The RVA of the image's `__security_cookie` (`/GS`), read from the load-config
@@ -279,7 +282,7 @@ impl<'a> PeFile<'a> {
             return None;
         }
         let cookie_va =
-            rva::u64_at_rva(self.bytes, &self.sections, dir.virtual_address + 88).ok()?;
+            rva::u64_at_rva(self.bytes, self.sections(), dir.virtual_address + 88).ok()?;
         if cookie_va == 0 {
             return None;
         }
@@ -312,7 +315,7 @@ impl<'a> PeFile<'a> {
     /// characteristics) — the basis for a W^X mapping (executable code + read-only
     /// data are not writable; only writable data stays writable).
     pub fn protection_at(&self, rva: u32) -> Protection {
-        for s in &self.sections {
+        for s in self.sections() {
             let start = s.virtual_address;
             let size = s.virtual_size.max(s.size_of_raw_data);
             if rva >= start && rva - start < size {

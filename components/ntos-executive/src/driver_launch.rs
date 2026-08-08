@@ -8322,7 +8322,6 @@ unsafe fn load_driver_reserved(
         tcb,
         reply_cap,
         client_pi: 0,
-        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -10063,7 +10062,6 @@ unsafe fn dispatch_driver_unload_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
-        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -10120,7 +10118,6 @@ unsafe fn dispatch_add_device_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
-        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -10837,7 +10834,6 @@ unsafe fn dispatch_irp_for_instance(
         tcb: d.tcb,
         reply_cap: d.reply_cap,
         client_pi: 0,
-        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,

@@ -1249,6 +1249,55 @@ fn termination_timestamps_are_one_shot_and_cover_process_cascades() {
 }
 
 #[test]
+fn hosted_process_and_thread_tables_can_be_reserved() {
+    let mut pm = ProcessManager::new();
+    pm.reserve_process_capacity(16);
+    pm.reserve_thread_capacity(16 * 3);
+    let process_cap = pm.process_capacity();
+    let thread_cap = pm.thread_capacity();
+    assert!(process_cap >= 16);
+    assert!(thread_cap >= 48);
+
+    for index in 0..16 {
+        let pid = pm.create_process("hosted.exe", None, None);
+        pm.reserve_process_threads(pid, 3);
+        assert!(pm.process_thread_capacity(pid) >= 3);
+        for slot in 0..3 {
+            pm.create_thread(pid, 0x1000 + index * 0x100 + slot, 0, false)
+                .unwrap();
+        }
+    }
+
+    assert_eq!(pm.process_capacity(), process_cap);
+    assert_eq!(pm.thread_capacity(), thread_cap);
+}
+
+#[test]
+fn unnamed_threads_do_not_allocate_name_buffers() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+    assert_eq!(pm.thread(tid).unwrap().thread_name.capacity(), 0);
+
+    pm.set_thread_name(tid, &[b'r' as u16, b'p' as u16, b'c' as u16])
+        .unwrap();
+    assert!(pm.thread(tid).unwrap().thread_name.capacity() >= 3);
+    let mut name = [0u16; THREAD_NAME_MAX_UNITS];
+    assert_eq!(
+        pm.query_thread_name(pid, tid, u64::MAX - 1, &mut name),
+        Ok(3)
+    );
+    assert_eq!(&name[..3], &[b'r' as u16, b'p' as u16, b'c' as u16]);
+
+    pm.set_thread_name(tid, &[]).unwrap();
+    assert_eq!(
+        pm.query_thread_name(pid, tid, u64::MAX - 1, &mut name),
+        Ok(0)
+    );
+    assert_eq!(pm.thread(tid).unwrap().thread_name.len(), 0);
+}
+
+#[test]
 fn close_by_object_tag() {
     // The convergence hybrid: a host tags each entry with its own handle VALUE (Opaque) and closes
     // by that tag on NtClose, without knowing this table's internal slot-handle.

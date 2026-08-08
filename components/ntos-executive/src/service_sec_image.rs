@@ -3487,11 +3487,7 @@ pub(crate) unsafe fn service_sec_image(
     // 0x8000_0000 PDPT range. Load-flow DECISIONS (name/handle/VA lookups + SECTION_IMAGE_INFORMATION)
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (same
     // index) for the effectful demand-fill. (winsrv is ~100 pages — the root CNode is an XL page under
-    // extern-rootserver, so the caps fit.) These load at BOOT (below the service_sec_image heap mark)
-    // rather than on the fly during a syscall because the per-syscall bump-heap reset would rewind any
-    // registry Vec growth / pool alloc made ABOVE the mark; loading them here keeps every DLL's parsed
-    // PE + registry slot persistent (see project_full_fs Part 2 for the demand-load-during-syscall
-    // rework this still awaits).
+    // extern-rootserver, so the caps fit.)
     // Part 3 — TRUE syscall-time demand-load. The eager per-DLL `DLL_TABLE` is GONE: DLLs load PURELY
     // ON-DEMAND from the real \reactos FS when a hosted process's loader first requests one (a
     // `reg.resolve_name` MISS in NtOpenFile → `fs_loader::demand_load_dll`). At boot we only:
@@ -3501,9 +3497,9 @@ pub(crate) unsafe fn service_sec_image(
     //       documented pin (DLL_PIN_COUNT). No other DLL cares about its base (all get relocated).
     //   (2) RESERVE the remaining metadata slots empty (per-pi handle stores pre-allocated below
     //       the heap_mark → the on-demand `activate` at syscall time needs NO heap growth, surviving
-    //       the per-syscall bump-heap reset). `dll_pe_store` is pre-sized below the mark, so an
-    //       on-demand `dll_pe_store[slot] = Some(pe)` is likewise reset-safe. The pool bytes live
-    //       in the cap-mapped POOL arena (atomic POOL_NEXT), reset-safe too.
+    //       the per-syscall bump-heap reset). `dll_pe_store` is pre-sized below the mark and `PeFile`
+    //       stores section metadata inline, so an on-demand `dll_pe_store[slot] = Some(pe)` is likewise
+    //       reset-safe. The pool bytes live in the cap-mapped POOL arena (atomic POOL_NEXT).
     // Adding a new DLL (userinit/explorer/shell32/…) now needs NO edit here — it demand-loads into a
     // free reserved slot. NO maintained DLL list remains (only the 1-entry csrsrv base pin).
     // csrsrv (base pin) + the three `_vista` forwarder DLLs (loaded via LdrpSnapThunk's forwarder
@@ -6560,7 +6556,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.stop = false;
                 nt_handler.user_apc_redirected = false;
                 nt_handler.overlay_dirty = false;
-                nt_handler.dll_loaded_dirty = false;
                 nt_handler.hosted_exe_dirty = false;
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
@@ -6904,15 +6899,6 @@ pub(crate) unsafe fn service_sec_image(
                 // within the 2 MiB heap; non-mutating iterations still reset fully.
                 if nt_handler.overlay_dirty {
                     nt_handler.overlay_dirty = false;
-                    heap_mark = allocator::mark();
-                }
-                // Demand-load plane: a handler that demand-loaded a DLL (NtOpenFile resolve-miss →
-                // fs_loader::demand_load_dll → registry `activate`d a reserved slot + wrote its parsed
-                // PE into dll_pe_store) pins the heap mark PAST the load's allocations so the activated
-                // registry slot survives the next `reset_to(heap_mark)`. Mirrors `overlay_dirty` — the
-                // pool bytes + dll_pe_store write are already reset-safe; this covers the registry fill.
-                if nt_handler.dll_loaded_dirty {
-                    nt_handler.dll_loaded_dirty = false;
                     heap_mark = allocator::mark();
                 }
                 // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a
@@ -7773,17 +7759,6 @@ pub(crate) unsafe fn service_sec_image(
                             | NTGDI_RECTANGLE_SSN
                             | nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
                     );
-                if explorer_gui_client {
-                    match m0 {
-                        NTUSER_BEGIN_PAINT_SSN => {
-                            EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        NTUSER_END_PAINT_SSN => {
-                            EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    }
-                }
                 if dialog_modal_dispatch {
                     print_str(b"[dialog-pump] routing real modal SSN=");
                     print_hex(m0 as u32);
@@ -11403,6 +11378,17 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b"\n");
                             }
                             r = (0, true);
+                        }
+                    }
+                    if explorer_gui_client && r.1 && r.0 != 0 {
+                        match m0 {
+                            NTUSER_BEGIN_PAINT_SSN => {
+                                EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            NTUSER_END_PAINT_SSN => {
+                                EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {}
                         }
                     }
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =

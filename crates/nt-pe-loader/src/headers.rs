@@ -24,7 +24,7 @@ pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
-const MAX_SECTIONS: u16 = 96;
+pub(crate) const MAX_SECTIONS: usize = 96;
 
 /// An `IMAGE_DATA_DIRECTORY` entry.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -79,7 +79,7 @@ impl Headers {
             return Err(PeError::UnsupportedMachine(machine));
         }
         let number_of_sections = u16_at(b, fh + 2)?;
-        if number_of_sections > MAX_SECTIONS {
+        if number_of_sections as usize > MAX_SECTIONS {
             return Err(PeError::TooManySections(number_of_sections));
         }
         // TimeDateStamp@fh+4; the two COFF debug-info fields a debugger is told about.
@@ -170,7 +170,7 @@ impl Headers {
 }
 
 /// An `IMAGE_SECTION_HEADER` (40 bytes).
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Section {
     pub name: [u8; 8],
     pub virtual_size: u32,

@@ -9175,8 +9175,8 @@ unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
     );
 }
 
-/// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The generous heap
-/// is 512 frames = exactly one 2 MiB PT.
+/// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The spawned-service
+/// heap is deliberately smaller than the executive heap but still fits one 2 MiB PT.
 unsafe fn map_heap_pt(pml4: u64) {
     map_heap_pts(pml4, allocator::SERVICE_HEAP_FRAMES);
 }
@@ -14272,12 +14272,10 @@ struct ExecNtHandler {
     /// consumes it after dispatch: it advances the heap high-water mark to the current bump
     /// position so the overlay's runtime allocations are retained past the next per-syscall reset.
     overlay_dirty: bool,
-    /// Set by NtOpenFile when it DEMAND-LOADED a DLL (`fs_loader::demand_load_dll` on a
-    /// `reg.resolve_name` miss). Like `overlay_dirty`, the service loop advances the heap high-water
-    /// mark past whatever the load allocated so the registry's activated slot survives the per-syscall
-    /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
-    /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
-    dll_loaded_dirty: bool,
+    // On-demand DLL loads are reset-safe by construction: registry slots and per-pi handle stores
+    // are pre-reserved before the service-loop heap mark, PE bytes live in the cap-mapped pool, and
+    // `PeFile` section metadata is inline. Transient import/relocation/path allocations from the
+    // load syscall must therefore be reclaimed by the normal per-syscall heap rewind.
     /// Set by NtOpenFile when a dynamic hosted executable is admitted from the mounted ReactOS
     /// volume. The executable's pool bytes are outside the bump heap, but the parsed PE section table
     /// and catalog/runtime strings are durable loop state and must survive the next syscall reset.
@@ -16463,7 +16461,7 @@ static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 /// Initial handle-table capacity per hosted EPROCESS (path 1). This is only the bootstrap reserve:
 /// real hosted workloads can outgrow it, and the executive pins the bump-heap mark whenever a
 /// ProcessManager handle table expands after boot.
-const PM_HANDLE_RESERVE: usize = 1024;
+const PM_HANDLE_RESERVE: usize = 512;
 /// Total handles the executive has routed into the real per-EPROCESS handle tables (all mint sites).
 static PM_HANDLES_TRACKED: AtomicU64 = AtomicU64::new(0);
 /// Peak live handle count in any single EPROCESS table over the boot — the reservation-headroom gauge.
@@ -19952,7 +19950,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 tcb: WIN32K_TCB.load(Ordering::Relaxed),
                 reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
                 client_pi: 0,
-                callback_client: None,
                 // DriverEntry runs before any client exists: no client_attach (its faults are its
                 // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
                 // bespoke loop implemented inline.

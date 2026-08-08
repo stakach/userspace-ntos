@@ -631,9 +631,6 @@ pub(crate) struct PumpChannel {
     pub reply_cap: u64,
     /// win32k only (0 for the FSD): the client process-index for `client_attach`/foreign-frame sharing.
     pub client_pi: u64,
-    /// Explicit identity of the user thread whose win32k syscall is currently forwarded. This is
-    /// carried with the pump invocation so callback diagnostics never consult stale global identity.
-    pub callback_client: Option<UserCallbackClient>,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
 }
@@ -1288,8 +1285,8 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
 unsafe fn pump_service_user_callback(
     ch: &PumpChannel,
 ) -> Option<crate::win32k_glue::UserCallbackDisposition> {
-    ch.callback_client
-        .and_then(|client| crate::win32k_glue::service_user_callback(client))
+    let _ = ch;
+    crate::win32k_glue::service_user_callback()
 }
 
 #[inline(never)]

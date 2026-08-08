@@ -688,6 +688,8 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
         [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
 
     pm.reserve_modules(64);
+    pm.reserve_process_capacity(MAX_PI);
+    pm.reserve_thread_capacity(MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS));
     PM_PROC_COUNT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
@@ -703,6 +705,9 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
     let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
     bootstrap_pids.copy_from_slice(&[smss_pid, csrss_pid, winlogon_pid]);
+    for &pid in &bootstrap_pids {
+        pm.reserve_process_threads(pid, 1 + PM_RUNTIME_THREAD_SLOTS);
+    }
     for &pid in &bootstrap_pids {
         let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
     }
@@ -955,7 +960,6 @@ impl ExecNtHandler {
         write_field!(process_dirty, false);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
         write_field!(overlay_dirty, false);
-        write_field!(dll_loaded_dirty, false);
         write_field!(hosted_exe_dirty, false);
         write_field!(writable_fs_dirty, false);
         let handler = &mut *slot;
@@ -2247,7 +2251,7 @@ impl ExecNtHandler {
         if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
             return Err(0xC000_009A);
         }
-        let (index, _) = self.overlay.create(&path);
+        let (index, _) = self.overlay.create_owned(path);
         self.overlay_dirty = true;
         Ok(index)
     }
@@ -3435,6 +3439,8 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         self.publish_registered_hosted_process_metadata(image)?;
         let pid = self.pm.create_process(name, Some(parent), None);
+        self.pm
+            .reserve_process_threads(pid, 1 + PM_RUNTIME_THREAD_SLOTS);
         self.process_vspaces[child_pi] = 0;
         self.clear_hosted_tp_worker_windows(child_pi);
         let main_tid = self.pm.create_thread(pid, 0, 0, false)?;
@@ -10857,7 +10863,6 @@ impl ExecNtHandler {
             let load = demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen]);
             match load {
                 Ok(slot) => {
-                    self.dll_loaded_dirty = true;
                     dll_i = Some(slot);
                 }
                 Err(err) => {
@@ -11888,6 +11893,7 @@ impl ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
+                let transient_mark = allocator::mark();
                 let name = self.read_registry_objattr_name(oa);
                 // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
                 let full: Option<alloc::string::String> = if root_target == Some(MACHINE_ROOT_KEY) {
@@ -11988,8 +11994,23 @@ impl ExecNtHandler {
                 if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
                     return 0xC000_009A;
                 }
-                let (oidx, _) = self.overlay.create(&canon);
+                let canon_len = canon.len();
+                let mut canon_scratch = [0u8; 2048];
+                if canon_len > canon_scratch.len() {
+                    return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                }
+                canon_scratch[..canon_len].copy_from_slice(canon.as_bytes());
+                drop(canon);
+                drop(full);
+                drop(name);
+                allocator::reset_to(transient_mark);
+                let durable_canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
+                    Ok(path) => alloc::string::String::from(path),
+                    Err(_) => return 0xC000_0033, // STATUS_OBJECT_NAME_INVALID
+                };
+                let (oidx, _) = self.overlay.create_owned(durable_canon);
                 self.overlay_dirty = true;
+                let canon = self.overlay.path(oidx).unwrap_or("");
                 // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's OWN
                 // `LsapCreateDatabaseKeys`/`LsapCreateDatabaseObjects` under SECURITY\Policy, and by
                 // samsrv's OWN `SampSetupCreateServer` under SAM.
@@ -12050,6 +12071,7 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let transient_mark = allocator::mark();
                 let name = self.read_registry_ustr_name(args[1]);
                 let ty = args[3] as u32; // R9 = Type
                 let data_ptr = args[4];
@@ -12057,42 +12079,93 @@ impl ExecNtHandler {
                 if data_size != 0 && data_ptr == 0 {
                     return 0xC000_0005;
                 }
-                let mut data = alloc::vec::Vec::new();
-                if data.try_reserve_exact(data_size).is_err() {
+                const REG_VALUE_SCRATCH_CAP: usize = 64 * 1024;
+                if data_size > REG_VALUE_SCRATCH_CAP {
                     return 0xC000_009A;
                 }
-                data.resize(data_size, 0);
-                if data_size != 0 && !self.xas_read(data_ptr, &mut data) {
-                    return 0xC000_0005;
+                if data_size != 0 {
+                    let scratch = core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                        REG_VALUE_SCRATCH_CAP,
+                    );
+                    if !self.xas_read(data_ptr, &mut scratch[..data_size]) {
+                        return 0xC000_0005;
+                    }
                 }
+                let data_view = if data_size == 0 {
+                    &[][..]
+                } else {
+                    core::slice::from_raw_parts(
+                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                        data_size,
+                    )
+                };
                 if self
                     .registry_value(key, &name)
                     .is_some_and(|(existing_ty, existing_data)| {
-                        existing_ty == ty && existing_data.as_slice() == data.as_slice()
+                        existing_ty == ty && existing_data.as_slice() == data_view
                     })
                 {
                     return 0;
                 }
-                let oidx = match self.registry_shadow_key(key) {
-                    Ok(index) => index,
-                    Err(status) => return status,
+                let mut name_scratch = [0u8; 1024];
+                let name_len = name.len();
+                if name_len > name_scratch.len() {
+                    return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
+                }
+                name_scratch[..name_len].copy_from_slice(name.as_bytes());
+
+                let mut shadow_path_scratch = [0u8; 2048];
+                let mut shadow_path_len = 0usize;
+                let existing_overlay = if let Some(index) = overlay_key_idx(key) {
+                    if self.overlay.path(index).is_none() {
+                        return 0xC000_0008;
+                    }
+                    Some(index)
+                } else {
+                    let path = match self.registry_target_path(key) {
+                        Some(path) => path,
+                        None => return 0xC000_0008,
+                    };
+                    if let Some(index) = self.overlay.find(&path) {
+                        Some(index)
+                    } else {
+                        if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
+                            return 0xC000_009A;
+                        }
+                        shadow_path_len = path.len();
+                        if shadow_path_len > shadow_path_scratch.len() {
+                            return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                        }
+                        shadow_path_scratch[..shadow_path_len].copy_from_slice(path.as_bytes());
+                        None
+                    }
                 };
+                let key_path_for_counters = existing_overlay
+                    .and_then(|index| self.overlay.path(index))
+                    .or_else(|| {
+                        (shadow_path_len != 0).then(|| {
+                            core::str::from_utf8(&shadow_path_scratch[..shadow_path_len])
+                                .unwrap_or("")
+                        })
+                    });
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
                 // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
                 // the gate can assert real SID structure (Revision 1, 4 sub-authorities, NT
                 // authority 5) rather than "a write happened".
-                if name.is_empty()
-                    && self.overlay.path(oidx) == Some(r"\registry\machine\security\policy\polacdms")
-                {
-                    LSA_ACCT_DOMAIN_SID_LEN.store(data.len() as u64, Ordering::Relaxed);
+                let lsa_account_domain_sid =
+                    name.is_empty()
+                        && key_path_for_counters
+                            == Some(r"\registry\machine\security\policy\polacdms");
+                if lsa_account_domain_sid {
+                    LSA_ACCT_DOMAIN_SID_LEN.store(data_size as u64, Ordering::Relaxed);
                     let mut head = [0u8; 8];
-                    let n = data.len().min(8);
-                    head[..n].copy_from_slice(&data[..n]);
+                    let n = data_size.min(8);
+                    head[..n].copy_from_slice(&data_view[..n]);
                     LSA_ACCT_DOMAIN_SID_HEAD.store(u64::from_le_bytes(head), Ordering::Relaxed);
                 }
-                self.overlay.set_value(oidx, &name, ty, &data);
                 if self.current_process_is_winlogon() {
-                    if let Some(path) = self.overlay.path(oidx) {
+                    if let Some(path) = key_path_for_counters {
                         if is_profile_list_sid_key_canon(path) {
                             PROFILE_LIST_SID_VALUE_SETS.fetch_add(1, Ordering::Relaxed);
                             let name_lc = name.to_ascii_lowercase();
@@ -12109,11 +12182,38 @@ impl ExecNtHandler {
                                 print_str(b"\" type=");
                                 print_u64(ty as u64);
                                 print_str(b" bytes=");
-                                print_u64(data.len() as u64);
+                                print_u64(data_size as u64);
                                 print_str(b"\n");
                             }
                         }
                     }
+                }
+                drop(name);
+                allocator::reset_to(transient_mark);
+
+                let oidx = if let Some(index) = existing_overlay {
+                    index
+                } else {
+                    let path = match core::str::from_utf8(&shadow_path_scratch[..shadow_path_len]) {
+                        Ok(path) => alloc::string::String::from(path),
+                        Err(_) => return 0xC000_0033,
+                    };
+                    let (index, _) = self.overlay.create_owned(path);
+                    index
+                };
+                let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
+                    Ok(name) => alloc::string::String::from(name),
+                    Err(_) => return 0xC000_0033,
+                };
+                let staged = core::slice::from_raw_parts(
+                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                    data_size,
+                );
+                if !self
+                    .overlay
+                    .set_value_from_slice(oidx, durable_name, ty, staged)
+                {
+                    return 0xC000_0008;
                 }
                 self.overlay_dirty = true;
                 0 // STATUS_SUCCESS
@@ -17144,6 +17244,7 @@ impl ExecNtHandler {
                 // — the wall `CopyDirectory` hit at `userenv/directory.c:148` after creating the
                 // whole destination tree and opening BOTH files.
                 let overlay_file = self.overlay_file_id_for(fh);
+                const OVERLAY_IO_CAP: usize = 64 * 1024;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) {
                     len.min(16 * 1024 * 1024)
                 } else if overlay_file.is_some() {
@@ -17163,6 +17264,8 @@ impl ExecNtHandler {
                     && overlay_file.is_none()
                     && len > transport_capacity
                 {
+                    0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
+                } else if overlay_file.is_some() && len > OVERLAY_IO_CAP {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
@@ -17223,7 +17326,7 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                } else if let Some(file_id) = self.overlay_file_id_for(fh) {
+                } else if let Some(file_id) = overlay_file {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
                     let mut explicit = None;
                     let mut bad_offset = false;
@@ -17241,14 +17344,19 @@ impl ExecNtHandler {
                     if bad_offset {
                         0xC000_0005 // STATUS_ACCESS_VIOLATION
                     } else {
-                        let (status, bytes) = crate::writable_fs::read(file_id, explicit, len);
+                        let scratch = core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                            OVERLAY_IO_CAP,
+                        );
+                        let (status, read) =
+                            crate::writable_fs::read_into(file_id, explicit, &mut scratch[..len]);
                         if status == nt_fs::STATUS_SUCCESS
-                            && !bytes.is_empty()
-                            && !self.xas_try_write_buf(buffer, &bytes)
+                            && read != 0
+                            && !self.xas_try_write_buf(buffer, &scratch[..read])
                         {
                             0xC000_0005 // STATUS_ACCESS_VIOLATION
                         } else {
-                            information = bytes.len() as u64;
+                            information = read as u64;
                             status
                         }
                     }

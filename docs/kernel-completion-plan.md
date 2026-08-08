@@ -38,7 +38,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   data.
 - `[x]` A2: Provide host-tested service selection helpers for auto-start Win32 services and
   boot/system driver candidates, without embedding launch policy in the kernel.
-- `[~]` A3: Route SCM start requests through generic process creation or `NtLoadDriver` based on
+- `[x]` A3: Route SCM start requests through generic process creation or `NtLoadDriver` based on
   service metadata.
 - `[~]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
   the policy boundary.
@@ -121,11 +121,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
    queries normally. The current slice also corrected `NtCreateKey`'s relative-root handling so the
    root key handle is used as an object-parse root rather than requiring `KEY_CREATE_SUB_KEY` before
    CM creates the target child; this keeps ReactOS SCM's `Services\<Name>\Security` creation on the
-   real registry write path when service keys were opened for read. The next SCM step is still live
-   proof that services.exe's real auto-start path reaches a non-bootstrap Win32 service child through
-   the ordinary
-   CreateProcess/NtOpenFile/NtCreateSection/NtCreateProcess route, without adding kernel-side
-   service-name policy.
+   real registry write path when service keys were opened for read. The latest boot proof
+   `.tmp/boot-handle-reserve-512-20260808.log` now shows services.exe reaching a non-bootstrap
+   `svchost.exe` child through the ordinary dynamic image path: `hosted-exe` admits `svchost.exe`,
+   `NtCreateSection(SEC_IMAGE)`/`NtQuerySection` run, `NtCreateProcessEx` spawns `svchost.exe`, CSR
+   accepts it, and the child runs native and win32k syscalls. A3 is complete. Continue A4 by removing
+   the remaining SCM pipe/listener thread special coordination from the executive once the generic
+   LPC/pipe/thread model can carry it.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
@@ -148,10 +150,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
    shell activation regression and the explorer icon/image-list wall again. Explorer now captures
    register-window messages, serves all required shell COM classes, redirects real api0 callbacks,
    installs WndProcs from client code, produces direct GDI returns, and leaves a wide non-background
-   framebuffer span. The current frontier is the strict shell chrome paint lifecycle: explorer
-   reports `BeginPaint`/`EndPaint` as `17/16`, so the remaining work is the one unmatched paint
-   completion or stale paint accounting, not a fallback shell/COM/imagelist route. Continue from the
-   larger completion plan rather than adding more boot-frontier special cases.
+   framebuffer span. Paint accounting now records explorer `BeginPaint`/`EndPaint` only after a
+   successful isolated win32k return. The latest dynamic callback-client and handle-reserve proof
+   `.tmp/boot-handle-reserve-512-20260808.log` carries the boot back to genuine shell chrome:
+   `exec_desktop_shell_frontier` and `exec_explorer_shell_chrome_painted` pass, explorer reaches
+   `7704` syscalls (`5920` native, `1784` win32k), final explorer framebuffer proof has `34873`
+   non-background pixels, and the stale callback/allocator-panic walls are gone. The remaining red
+   gate was resource headroom, not shell behavior: `exec_vm_pool_headroom` failed because
+   root-Untyped free was `48385 KiB`, just below the measured `48 MiB` runway floor. The current
+   slice trims per-component spawned service heaps while keeping the executive heap unchanged, and
+   boot proof `.tmp/boot-service-heap-512k-20260808.log` flips `exec_vm_pool_headroom` green with
+   `51457 KiB` root-Untyped free while preserving genuine shell chrome. The follow-up
+   win32k-dispatch proof fixed the bootstrap harness side of the same transport boundary: hosted
+   clients still register callback identity per live dispatch, while callback-less bootstrap probes
+   run through the real component pump without advertising a non-existent user callback client.
+   Boot proof `.tmp/boot-win32k-bootstrap-callbackless-20260808.log` is fully green at `291/291`:
+   `win32k_dispatch_loop_roundtrip`, `win32k_dispatch_fault_via_reply_cap`,
+   `exec_vm_pool_headroom`, `exec_desktop_shell_frontier`, and
+   `exec_explorer_shell_chrome_painted` all pass, with no stale or unregistered user-callback
+   requests. Continue the plan from the remaining structural debt rather than shell-paint
+   scaffolding: A4's SCM pipe/listener special coordination, B3's real video/driver binding, C1/C2
+   VAD correctness, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1395,7 +1414,69 @@ in SCM, user-mode system processes, and our ntdll where possible.
   load failure, invalid image list, and allocator panic are gone. Explorer captures three register
   window messages, serves all required shell COM classes, reaches `BeginPaint`/`EndPaint` at `17/16`,
   produces 54 direct GDI returns, flushes 112 batch records, and leaves 34873 non-background
-  framebuffer pixels over a full-width lower-screen span. The run exits normally at `286/291`; the
-  remaining desktop frontier is the unmatched explorer paint completion that keeps
-  `exec_explorer_shell_chrome_painted` red, plus the pre-existing callback/dead-client/LSA-worker
-  accounting gates.
+  framebuffer pixels over a full-width lower-screen span. The follow-on paint-accounting slice now
+  counts explorer `BeginPaint`/`EndPaint` only after isolated win32k returns successfully, so stale
+  pre-dispatch accounting is no longer treated as a completed paint. A profile materialisation slice
+  also moved the per-file read scratch out of the executive bump heap; the next boot proof passed the
+  previous GDI owner/icon/image-list frontier and no longer exhausted hosted sched-context objects,
+  but exposed the remaining heap-lifetime wall: demand-loaded DLL syscalls were pinning transient
+  PE relocation/import/path buffers under the obsolete `dll_loaded_dirty` mark. The current slice
+  makes `nt-pe-loader::PeFile` store bounded section metadata inline and removes that broad DLL-load
+  heap pin, so the next proof should validate shell chrome under reclaimed demand-load transients
+  before moving on.
+- Hosted process allocation headroom. `nt-process` now supports explicit process/thread table
+  reservation, bootstrap hosted processes reserve their runtime thread sets, child hosted processes
+  reserve their expected thread slots at creation, and unnamed threads no longer allocate fixed
+  thread-name buffers. This keeps process identity dynamic while avoiding bump-heap growth at the
+  userinit -> explorer boundary. Validation: `cargo fmt --all`, `cargo test -p nt-process`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-process-reserve-20260808.log`. Result: explorer is allocated and spawned through the
+  genuine userinit shell path (`NtCreateSection` -> `NtCreateProcessEx`), reaches thousands of native
+  and win32k syscalls, loads the user profile hive, and passes the old allocation frontier. Review
+  adjustment: the next frontier is explorer nested user-callback request routing, not process-slot
+  identity or profile materialisation.
+- Dynamic win32k user-callback client routing. The pump no longer carries one static
+  `callback_client` identity for the whole component receive loop. Each real win32k dispatch
+  registers its live client context in a bounded `(pi, tid, badge, dispatch_id)` registry, and
+  `service_user_callback` resolves the callback request from win32k's header through that registry.
+  This matches NT's per-thread callback boundary when one suspended callback temporarily carries
+  nested dispatches for another hosted thread through the single isolated win32k component TCB.
+  The obsolete `PumpChannel.callback_client` field was removed, and temporary heap-pin diagnostics
+  were removed before the proof run. Validation: `cargo fmt --all`,
+  `cargo test -p nt-user-callback`, `cargo test -p nt-process`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-callback-client-registry-20260808.log`. Result: the previous
+  `[user-callback] invalid or stale component request` / win32k-retired wall is gone, explorer
+  reaches `6798` syscalls (`5120` native, `1678` win32k), and the desktop-painted proof still passes.
+  Review adjustment: the new frontier is heap headroom after deeper explorer shell activity admits
+  `kbswitch.exe`; the last census before panic shows `heap=6262728/6291456`, active callback depth
+  `3/6`, all explorer TP worker slots busy, and then a bump-allocator panic at `alloc.rs:573`.
+- Shell chrome and resource-headroom closure. The executive now right-sizes the bootstrap
+  per-process handle reserve to `512` and trims spawned component heaps to `512 KiB` without changing
+  the executive's own `6 MiB` heap. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-service-heap-512k-20260808.log`. Result: services.exe dynamically admits
+  and spawns a non-bootstrap `svchost.exe`, userinit/explorer still launch through the real shell
+  path, `exec_explorer_shell_chrome_painted` passes with `34873` non-background pixels, the stale
+  callback and allocator-panic frontiers remain gone, and `exec_vm_pool_headroom` flips green with
+  `51457 KiB` root-Untyped free. Review adjustment: the current red gates are the early
+  `win32k_dispatch_loop_roundtrip` and `win32k_dispatch_fault_via_reply_cap` checks; inspect their
+  real transport expectations before changing later shell behavior.
+- Win32k bootstrap dispatch harness closure. The user-callback client registry now admits only real
+  hosted client threads (`pi`, `tid`, `badge`, and TCB present), and bootstrap-only
+  `win32k_dispatch()` probes run the same component pump with `usermode_callback=false` instead of
+  registering a fake callback owner. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-win32k-bootstrap-callbackless-20260808.log`. Result:
+  `win32k_dispatch_loop_roundtrip` and `win32k_dispatch_fault_via_reply_cap` pass again, the full
+  executive gate is `291/291`, `exec_vm_pool_headroom` holds at `52068 KiB` root-Untyped free,
+  explorer shell chrome still paints `34873` non-background pixels, and there are no stale,
+  registry-full, or unregistered user-callback request warnings. Review adjustment: the shell/frontier
+  gates are green; continue with the remaining structural plan items instead of adding paint-path
+  scaffolding.

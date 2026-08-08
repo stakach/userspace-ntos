@@ -55,7 +55,7 @@ struct OverlayValue {
     name_raw: String,
     name_folded: String,
     ty: u32,
-    data: Vec<u8>,
+    data: Option<usize>,
     deleted: bool,
 }
 
@@ -75,12 +75,16 @@ struct OverlayKey {
 #[derive(Default)]
 pub struct RegistryOverlay {
     keys: Vec<OverlayKey>,
+    blobs: Vec<Vec<u8>>,
 }
 
 impl RegistryOverlay {
     /// An empty overlay.
     pub fn new() -> Self {
-        Self { keys: Vec::new() }
+        Self {
+            keys: Vec::new(),
+            blobs: Vec::new(),
+        }
     }
 
     /// An empty overlay whose key vector is pre-reserved for `n` keys (so the executive can pin
@@ -88,7 +92,13 @@ impl RegistryOverlay {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             keys: Vec::with_capacity(n),
+            blobs: Vec::new(),
         }
+    }
+
+    /// Number of unique value byte blobs retained by the overlay.
+    pub fn unique_data_blobs(&self) -> usize {
+        self.blobs.len()
     }
 
     /// Number of key SLOTS, including slots detached by [`Self::detach_subtree`]. This is the
@@ -127,7 +137,14 @@ impl RegistryOverlay {
     /// create. The `NtLoadKey` remount path uses [`Self::reattach_subtree`] instead, because a prior
     /// `RegFlushKey`/unload must make those retained writes visible again.
     pub fn create(&mut self, canon: &str) -> (usize, bool) {
-        if let Some(i) = self.find(canon) {
+        self.create_owned(String::from(canon))
+    }
+
+    /// Create-or-open a key, taking ownership of the caller's canonical path when a new overlay
+    /// slot is needed. This lets the executive transfer durable registry paths into the write plane
+    /// after dropping pre-mutation scratch allocations.
+    pub fn create_owned(&mut self, canon: String) -> (usize, bool) {
+        if let Some(i) = self.find(&canon) {
             return (i, false);
         }
         if let Some(i) = self.keys.iter().position(|k| k.path == canon && k.detached) {
@@ -136,7 +153,7 @@ impl RegistryOverlay {
             return (i, true);
         }
         self.keys.push(OverlayKey {
-            path: String::from(canon),
+            path: canon,
             values: Vec::new(),
             detached: false,
         });
@@ -200,26 +217,82 @@ impl RegistryOverlay {
     /// Set (create-or-replace) a value on an overlay key. `name` may be `""` (the default value).
     /// Returns `false` if `idx` is out of range.
     pub fn set_value(&mut self, idx: usize, name: &str, ty: u32, data: &[u8]) -> bool {
-        let folded = fold(name);
+        self.set_value_from_slice(idx, String::from(name), ty, data)
+    }
+
+    /// Set (create-or-replace) a value, taking ownership of the raw name and data bytes.
+    pub fn set_value_owned(&mut self, idx: usize, name: String, ty: u32, data: Vec<u8>) -> bool {
+        if !self.keys.get(idx).is_some_and(|k| !k.detached) {
+            return false;
+        }
+        let data_index = self.intern_data_owned(data);
+        self.set_value_with_blob(idx, name, ty, data_index)
+    }
+
+    /// Set (create-or-replace) a value, taking ownership of the raw name and borrowing data bytes.
+    /// Equal data already held by the overlay is reused without allocating another byte blob.
+    pub fn set_value_from_slice(&mut self, idx: usize, name: String, ty: u32, data: &[u8]) -> bool {
+        if !self.keys.get(idx).is_some_and(|k| !k.detached) {
+            return false;
+        }
+        let data_index = self.intern_data_slice(data);
+        self.set_value_with_blob(idx, name, ty, data_index)
+    }
+
+    fn set_value_with_blob(
+        &mut self,
+        idx: usize,
+        name: String,
+        ty: u32,
+        data_index: usize,
+    ) -> bool {
+        if !self.keys.get(idx).is_some_and(|k| !k.detached) {
+            return false;
+        }
+        let folded = fold(&name);
         let Some(k) = self.keys.get_mut(idx).filter(|k| !k.detached) else {
             return false;
         };
         if let Some(v) = k.values.iter_mut().find(|v| v.name_folded == folded) {
             v.ty = ty;
-            v.name_raw = String::from(name);
-            v.data.clear();
-            v.data.extend_from_slice(data);
+            v.name_raw = name;
+            v.name_folded = folded;
+            v.data = Some(data_index);
             v.deleted = false;
         } else {
             k.values.push(OverlayValue {
-                name_raw: String::from(name),
+                name_raw: name,
                 name_folded: folded,
                 ty,
-                data: data.to_vec(),
+                data: Some(data_index),
                 deleted: false,
             });
         }
         true
+    }
+
+    fn intern_data_slice(&mut self, data: &[u8]) -> usize {
+        if let Some(index) = self
+            .blobs
+            .iter()
+            .position(|existing| existing.as_slice() == data)
+        {
+            return index;
+        }
+        self.blobs.push(data.to_vec());
+        self.blobs.len() - 1
+    }
+
+    fn intern_data_owned(&mut self, data: Vec<u8>) -> usize {
+        if let Some(index) = self
+            .blobs
+            .iter()
+            .position(|existing| existing.as_slice() == data.as_slice())
+        {
+            return index;
+        }
+        self.blobs.push(data);
+        self.blobs.len() - 1
     }
 
     /// Hide a value in this overlay, including a value that exists only in the read-only base hive.
@@ -232,14 +305,14 @@ impl RegistryOverlay {
         };
         if let Some(v) = k.values.iter_mut().find(|v| v.name_folded == folded) {
             v.name_raw = String::from(name);
-            v.data.clear();
+            v.data = None;
             v.deleted = true;
         } else {
             k.values.push(OverlayValue {
                 name_raw: String::from(name),
                 name_folded: folded,
                 ty: 0,
-                data: Vec::new(),
+                data: None,
                 deleted: true,
             });
         }
@@ -263,7 +336,7 @@ impl RegistryOverlay {
         k.values
             .iter()
             .find(|v| v.name_folded == folded && !v.deleted)
-            .map(|v| (v.ty, v.data.as_slice()))
+            .and_then(|v| Some((v.ty, self.blobs.get(v.data?)?.as_slice())))
     }
 
     /// Number of values set on an overlay key.
@@ -277,11 +350,13 @@ impl RegistryOverlay {
     /// Enumerate the value at `i` on an overlay key: `(original-case name, reg_type, data)`.
     pub fn value_by_index(&self, idx: usize, i: usize) -> Option<(&str, u32, &[u8])> {
         let k = self.keys.get(idx).filter(|k| !k.detached)?;
-        k.values
-            .iter()
-            .filter(|v| !v.deleted)
-            .nth(i)
-            .map(|v| (v.name_raw.as_str(), v.ty, v.data.as_slice()))
+        k.values.iter().filter(|v| !v.deleted).nth(i).and_then(|v| {
+            Some((
+                v.name_raw.as_str(),
+                v.ty,
+                self.blobs.get(v.data?)?.as_slice(),
+            ))
+        })
     }
 
     /// The immediate child key-name components (already canonical/folded) of `parent_canon`.
@@ -383,6 +458,18 @@ mod tests {
     }
 
     #[test]
+    fn create_owned_has_the_same_create_or_open_semantics() {
+        let mut ov = RegistryOverlay::new();
+        let (i0, created0) = ov.create_owned(String::from(r"\registry\machine\software\classes"));
+        assert!(created0);
+
+        let (i1, created1) = ov.create_owned(String::from(r"\registry\machine\software\classes"));
+        assert_eq!(i0, i1);
+        assert!(!created1);
+        assert_eq!(ov.path(i0), Some(r"\registry\machine\software\classes"));
+    }
+
+    #[test]
     fn set_and_read_value_roundtrip() {
         let mut ov = RegistryOverlay::new();
         let (i, _) = ov.create(r"\control\servicecurrent");
@@ -403,6 +490,52 @@ mod tests {
         ov.set_value(i, "V", 1, b"hello"); // same folded name, new type + data
         assert_eq!(ov.values_len(i), 1);
         assert_eq!(ov.value(i, "v"), Some((1u32, &b"hello"[..])));
+    }
+
+    #[test]
+    fn set_value_owned_replaces_in_place() {
+        let mut ov = RegistryOverlay::new();
+        let (i, _) = ov.create(r"\k");
+        assert!(ov.set_value_owned(i, String::from("Value"), 4, Vec::from(&b"old"[..])));
+        assert!(ov.set_value_owned(i, String::from("VALUE"), 1, Vec::from(&b"new"[..])));
+
+        assert_eq!(ov.values_len(i), 1);
+        assert_eq!(ov.value(i, "value"), Some((1, &b"new"[..])));
+        assert_eq!(ov.value_by_index(i, 0).map(|v| v.0), Some("VALUE"));
+    }
+
+    #[test]
+    fn set_value_owned_interns_equal_data_across_keys() {
+        let mut ov = RegistryOverlay::new();
+        let (a, _) = ov.create(r"\a");
+        let (b, _) = ov.create(r"\b");
+        let descriptor = Vec::from(&b"same-security-descriptor"[..]);
+
+        assert!(ov.set_value_owned(a, String::from("Security"), 3, descriptor.clone()));
+        assert!(ov.set_value_owned(b, String::from("Security"), 3, descriptor));
+
+        assert_eq!(ov.unique_data_blobs(), 1);
+        assert_eq!(
+            ov.value(a, "security"),
+            Some((3, &b"same-security-descriptor"[..]))
+        );
+        assert_eq!(
+            ov.value(b, "security"),
+            Some((3, &b"same-security-descriptor"[..]))
+        );
+    }
+
+    #[test]
+    fn set_value_from_slice_reuses_existing_blob_without_owned_data() {
+        let mut ov = RegistryOverlay::new();
+        let (a, _) = ov.create(r"\a");
+        let (b, _) = ov.create(r"\b");
+
+        assert!(ov.set_value_from_slice(a, String::from("Security"), 3, b"descriptor"));
+        assert!(ov.set_value_from_slice(b, String::from("Security"), 3, b"descriptor"));
+
+        assert_eq!(ov.unique_data_blobs(), 1);
+        assert_eq!(ov.value(b, "security"), Some((3, &b"descriptor"[..])));
     }
 
     #[test]
@@ -518,6 +651,20 @@ mod tests {
             "the previous mount's writes must not survive"
         );
         assert_eq!(ov.len(), 1);
+    }
+
+    #[test]
+    fn create_owned_reattaches_a_detached_slot() {
+        let mut ov = RegistryOverlay::new();
+        let (idx, _) = ov.create(r"\registry\user\s-1-5-21-1");
+        ov.set_value(idx, "Stale", 4, &7u32.to_le_bytes());
+        assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-1"), 1);
+
+        let (again, created_again) = ov.create_owned(String::from(r"\registry\user\s-1-5-21-1"));
+        assert_eq!(again, idx);
+        assert!(created_again);
+        assert_eq!(ov.values_len(idx), 0);
+        assert_eq!(ov.path(idx), Some(r"\registry\user\s-1-5-21-1"));
     }
 
     #[test]

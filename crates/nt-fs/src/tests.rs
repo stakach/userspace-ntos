@@ -270,6 +270,59 @@ fn writable_mount_relative_into_and_relative_query_are_canonical() {
 }
 
 #[test]
+fn relative_create_uses_folded_volume_paths_directly() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let dir = fs.zw_create_file_relative(
+        b"profiles",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(
+        (dir.status, dir.information),
+        (STATUS_SUCCESS, FILE_CREATED)
+    );
+
+    let file = fs.zw_create_file_relative(
+        b"profiles\\administrator\\ntuser.dat",
+        FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(
+        (file.status, file.information),
+        (STATUS_OBJECT_PATH_NOT_FOUND, 0)
+    );
+
+    assert!(fs.provision_directory(r"\??\C:\profiles\administrator"));
+    let file = fs.zw_create_file_relative(
+        b"profiles\\administrator\\ntuser.dat",
+        FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(
+        (file.status, file.information),
+        (STATUS_SUCCESS, FILE_CREATED)
+    );
+    assert_eq!(
+        fs.zw_write_file(file.handle, None, b"regf"),
+        (STATUS_SUCCESS, 4)
+    );
+    let info = fs.zw_query_standard_information(file.handle).unwrap();
+    assert_eq!(
+        (info.end_of_file, info.attributes),
+        (4, FILE_ATTRIBUTE_HIDDEN)
+    );
+}
+
+#[test]
 fn create_dispositions() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     // OPEN an existing fixture hive file.
@@ -343,6 +396,87 @@ fn read_write_offset_and_eof() {
     assert_eq!(fs.zw_read_file(h, None, 4).0, STATUS_END_OF_FILE); // at EOF
     fs.zw_close(h);
     assert_eq!(fs.zw_read_file(h, None, 4).0, STATUS_INVALID_HANDLE); // closed
+}
+
+#[test]
+fn read_file_into_uses_and_advances_file_position() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let h = fs
+        .zw_create_file(r"\??\C:\Temp\f", FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0)
+        .handle;
+    assert_eq!(fs.zw_write_file(h, None, b"abcdef").0, STATUS_SUCCESS);
+    fs.zw_close(h);
+
+    let h = fs
+        .zw_create_file(r"\??\C:\Temp\f", FILE_READ_DATA, 0, 0, FILE_OPEN, 0)
+        .handle;
+    let mut out = [0u8; 4];
+    assert_eq!(fs.zw_read_file_into(h, None, &mut out).0, STATUS_SUCCESS);
+    assert_eq!(&out, b"abcd");
+    assert_eq!(fs.current_offset(h), Some(4));
+    let (status, read) = fs.zw_read_file_into(h, None, &mut out);
+    assert_eq!((status, read), (STATUS_SUCCESS, 2));
+    assert_eq!(&out[..read], b"ef");
+    assert_eq!(
+        fs.zw_read_file_into(h, None, &mut out).0,
+        STATUS_END_OF_FILE
+    );
+}
+
+#[test]
+fn copied_file_chunks_share_provisioned_source_until_modified() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", b"0123456789"));
+    assert!(fs.provision_directory(r"\??\C:\profiles\Administrator"));
+    assert_eq!(fs.unique_data_blobs(), 1);
+
+    let source = fs.zw_create_file(
+        r"\??\C:\profiles\Default User\ntuser.dat",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        0,
+    );
+    let dest = fs.zw_create_file(
+        r"\??\C:\profiles\Administrator\ntuser.dat",
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        0,
+    );
+    let mut chunk = [0u8; 4];
+    loop {
+        let (status, read) = fs.zw_read_file_into(source.handle, None, &mut chunk);
+        if status == STATUS_END_OF_FILE {
+            break;
+        }
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(
+            fs.zw_write_file(dest.handle, None, &chunk[..read]),
+            (STATUS_SUCCESS, read)
+        );
+    }
+
+    assert_eq!(fs.unique_data_blobs(), 1);
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\Administrator\ntuser.dat"),
+        Some(&b"0123456789"[..])
+    );
+
+    assert_eq!(
+        fs.zw_write_file(dest.handle, Some(2), b"xx"),
+        (STATUS_SUCCESS, 2)
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\Default User\ntuser.dat"),
+        Some(&b"0123456789"[..])
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\Administrator\ntuser.dat"),
+        Some(&b"01xx456789"[..])
+    );
 }
 
 #[test]

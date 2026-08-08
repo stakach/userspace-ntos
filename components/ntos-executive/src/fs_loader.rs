@@ -611,11 +611,10 @@ impl DemandLoadError {
 /// DLL (no code-path difference — it operates on the `PeFile` slice + the registry).
 ///
 /// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
-/// survives the per-syscall reset). `dll_pe_store` is a `service_sec_image` stack local (also not the
-/// bump heap). The ONLY bump-heap allocations here are the registry's inline slot fill (no growth —
-/// `activate` writes in place). So the caller need only advance `heap_mark` for any transient it
-/// itself allocated around this call; `demand_load_dll_result`'s own state is inherently reset-safe.
-/// This is the `overlay_dirty` precedent, minimized.
+/// survives the per-syscall reset). `dll_pe_store` is pre-sized before the service-loop heap mark, and
+/// `PeFile` keeps section metadata inline, so assigning `Some(pe)` does not allocate. The registry
+/// slot was also reserved before the mark; `activate` only writes inline metadata. Transient path,
+/// import, and relocation vectors from this syscall are reclaimed by the normal per-syscall rewind.
 ///
 /// # Safety
 /// `store` must point at a live `[Option<PeFile>; N]` whose slots outlive the service loop; `reg`

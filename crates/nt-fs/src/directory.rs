@@ -424,15 +424,19 @@ fn align8(value: usize) -> usize {
     (value + 7) & !7
 }
 
-pub fn query_directory(
+pub fn query_directory_by_index<F>(
     state: &mut DirectoryQueryState,
-    entries: &[DirectoryEntry],
+    entry_count: usize,
+    mut entry_at: F,
     information_class: u32,
     return_single_entry: bool,
     pattern: Option<&[u16]>,
     restart_scan: bool,
     output: &mut [u8],
-) -> DirectoryQueryResult {
+) -> DirectoryQueryResult
+where
+    F: FnMut(usize) -> Option<DirectoryEntry>,
+{
     let Some(layout) = record_layout(information_class) else {
         return DirectoryQueryResult {
             status: STATUS_INVALID_INFO_CLASS,
@@ -470,9 +474,14 @@ pub fn query_directory(
     let mut written = 0usize;
     let mut information = 0usize;
     let mut previous_record = None;
-    while cursor < entries.len() {
-        let entry = &entries[cursor];
-        if !entry_matches(state.pattern(), entry) {
+    while cursor < entry_count {
+        let Some(entry) = entry_at(cursor) else {
+            return DirectoryQueryResult {
+                status: STATUS_INSUFFICIENT_RESOURCES,
+                information: 0,
+            };
+        };
+        if !entry_matches(state.pattern(), &entry) {
             cursor += 1;
             state.cursor = cursor as u32;
             continue;
@@ -482,7 +491,7 @@ pub fn query_directory(
         let stride = align8(record_bytes);
         if record_bytes > output.len() - written {
             if written == 0 {
-                encode_fixed(&mut output[..layout.minimum_size], layout, entry);
+                encode_fixed(&mut output[..layout.minimum_size], layout, &entry);
                 let copied = copy_name(output, layout.name_offset, entry.name());
                 return DirectoryQueryResult {
                     status: STATUS_BUFFER_OVERFLOW,
@@ -497,7 +506,7 @@ pub fn query_directory(
         encode_fixed(
             &mut output[written..written + layout.minimum_size],
             layout,
-            entry,
+            &entry,
         );
         copy_name(
             &mut output[written..written + record_bytes],
@@ -529,6 +538,27 @@ pub fn query_directory(
             information,
         }
     }
+}
+
+pub fn query_directory(
+    state: &mut DirectoryQueryState,
+    entries: &[DirectoryEntry],
+    information_class: u32,
+    return_single_entry: bool,
+    pattern: Option<&[u16]>,
+    restart_scan: bool,
+    output: &mut [u8],
+) -> DirectoryQueryResult {
+    query_directory_by_index(
+        state,
+        entries.len(),
+        |index| entries.get(index).copied(),
+        information_class,
+        return_single_entry,
+        pattern,
+        restart_scan,
+        output,
+    )
 }
 
 #[cfg(test)]
