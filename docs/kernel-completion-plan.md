@@ -1362,3 +1362,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: this removes one hardcoded process-information answer, but the desktop frontier
   remains the explorer shell icon/image-list path before shell chrome paint begin/end proof.
+- GDI DIB-section marshal cleanup. `NtGdiCreateDIBSection` now stages the caller's full
+  `BITMAPINFO` probe span for isolated win32k instead of copying only the declared fixed header. The
+  shared `nt-kernel-exec` helper mirrors ReactOS win32k's `DIB_BitmapInfoSize` calculation for RGB,
+  palette-index, bitfields, and core-header layouts, with host tests covering the ABI edge cases.
+  Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec gdi_bitmap --lib`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-dib-full-bmi-20260808.log`. Result: the boot remains green through genuine desktop
+  rendering, `exec_msgina_logon_dialog_painted` passes, explorer spawns and leaves 1135 non-bg
+  framebuffer pixels, and the run stays at `288/291`. Review adjustment: the shell icon failure is
+  not solved by BMI staging; continue at explorer's failed small `IDI_SHELL_DOCUMENT` load,
+  invalid image list, missing register-window-message capture, second shell COM class open, and
+  absent explorer paint begin/end proof.

@@ -104,6 +104,7 @@ const CREATE_DIB_SECTION_FAIL_MISSING_SP: u64 = 1;
 const CREATE_DIB_SECTION_FAIL_STACK_TAIL: u64 = 2;
 const CREATE_DIB_SECTION_FAIL_LAYOUT: u64 = 3;
 const CREATE_DIB_SECTION_FAIL_BMI_COPY: u64 = 4;
+const CREATE_DIB_SECTION_FAIL_BMI_SIZE: u64 = 5;
 const GET_ICON_INFO_FAIL_MISSING_SP: u64 = 1;
 const GET_ICON_INFO_FAIL_STACK_TAIL: u64 = 2;
 const GET_ICON_INFO_FAIL_DESC_COPY: u64 = 3;
@@ -8764,25 +8765,8 @@ pub(crate) unsafe fn service_sec_image(
                                 create_dib_section_probe_aux2 = cap;
                             }
                             let staged_bmi = base;
-                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
-                                match align_up_u64(cj_header, 8) {
-                                    Some(offset) if offset + 8 <= cap => base + offset,
-                                    _ => {
-                                        layout_ok = false;
-                                        create_dib_section_probe_failure =
-                                            CREATE_DIB_SECTION_FAIL_LAYOUT;
-                                        create_dib_section_probe_aux0 = cj_header;
-                                        create_dib_section_probe_aux1 = 8;
-                                        create_dib_section_probe_aux2 = cap;
-                                        0
-                                    }
-                                }
-                            } else {
-                                0
-                            };
-                            if !layout_ok {
-                                create_dib_section_probe_failed = true;
-                            } else {
+                            let mut staged_bmi_bytes = cj_header;
+                            if layout_ok {
                                 core::ptr::write_bytes(
                                     base as *mut u8,
                                     0,
@@ -8796,18 +8780,86 @@ pub(crate) unsafe fn service_sec_image(
                                     &reg,
                                     &dll_pes,
                                 );
-                                let bmi_out = core::slice::from_raw_parts_mut(
+                                let header_out = core::slice::from_raw_parts_mut(
                                     staged_bmi as *mut u8,
                                     cj_header as usize,
                                 );
-                                if img_spawn::client_copyin_mapped(
+                                if !img_spawn::client_copyin_mapped(
                                     pi as u64,
                                     a3,
-                                    bmi_out,
+                                    header_out,
                                     filled_pages,
                                     faults as usize,
                                     scratch_base,
                                 ) {
+                                    layout_ok = false;
+                                    create_dib_section_probe_failure =
+                                        CREATE_DIB_SECTION_FAIL_BMI_COPY;
+                                    create_dib_section_probe_aux0 = a3;
+                                    create_dib_section_probe_aux1 = cj_header;
+                                } else {
+                                    match nt_kernel_exec::gdi_bitmap::bitmap_info_size(
+                                        &*header_out,
+                                        i_usage as u32,
+                                    ) {
+                                        Some(bytes) if bytes as u64 >= 12 && bytes as u64 <= cap => {
+                                            staged_bmi_bytes = bytes as u64;
+                                        }
+                                        _ => {
+                                            layout_ok = false;
+                                            create_dib_section_probe_failure =
+                                                CREATE_DIB_SECTION_FAIL_BMI_SIZE;
+                                            create_dib_section_probe_aux0 = a3;
+                                            create_dib_section_probe_aux1 = cj_header;
+                                            create_dib_section_probe_aux2 = i_usage;
+                                        }
+                                    }
+                                }
+                            }
+                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
+                                match align_up_u64(staged_bmi_bytes, 8) {
+                                    Some(offset) if offset + 8 <= cap => base + offset,
+                                    _ => {
+                                        layout_ok = false;
+                                        create_dib_section_probe_failure =
+                                            CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                        create_dib_section_probe_aux0 = staged_bmi_bytes;
+                                        create_dib_section_probe_aux1 = 8;
+                                        create_dib_section_probe_aux2 = cap;
+                                        0
+                                    }
+                                }
+                            } else {
+                                0
+                            };
+                            if !layout_ok {
+                                create_dib_section_probe_failed = true;
+                            } else {
+                                let bmi_copied = if staged_bmi_bytes <= cj_header {
+                                    true
+                                } else {
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        a3,
+                                        staged_bmi_bytes as usize,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                    );
+                                    let bmi_out = core::slice::from_raw_parts_mut(
+                                        staged_bmi as *mut u8,
+                                        staged_bmi_bytes as usize,
+                                    );
+                                    img_spawn::client_copyin_mapped(
+                                        pi as u64,
+                                        a3,
+                                        bmi_out,
+                                        filled_pages,
+                                        faults as usize,
+                                        scratch_base,
+                                    )
+                                };
+                                if bmi_copied {
                                     d_a2 = a2 as u32 as u64;
                                     d_a3 = staged_bmi;
                                     create_dib_section_stack_args =
@@ -8833,6 +8885,8 @@ pub(crate) unsafe fn service_sec_image(
                                         print_hex(i_usage as u32);
                                         print_str(b" header=");
                                         print_u64(cj_header);
+                                        print_str(b" info=");
+                                        print_u64(staged_bmi_bytes);
                                         print_str(b" out=0x");
                                         print_hex_u64(client_bits_out);
                                         print_str(b" staged=0x");
@@ -8846,7 +8900,7 @@ pub(crate) unsafe fn service_sec_image(
                                     create_dib_section_probe_failure =
                                         CREATE_DIB_SECTION_FAIL_BMI_COPY;
                                     create_dib_section_probe_aux0 = a3;
-                                    create_dib_section_probe_aux1 = cj_header;
+                                    create_dib_section_probe_aux1 = staged_bmi_bytes;
                                 }
                             }
                         }

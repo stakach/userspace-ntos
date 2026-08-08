@@ -17,6 +17,7 @@ pub mod dbg;
 mod dispatcher_wait;
 mod dpc;
 mod event;
+pub mod gdi_bitmap;
 mod interrupt;
 mod irql;
 pub mod kevent;
