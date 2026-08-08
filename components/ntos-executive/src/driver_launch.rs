@@ -388,16 +388,12 @@ struct CompletedWrite {
     info: u64,
 }
 
-const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
-    irp: 0,
-    iosl: 0,
-    file_object: 0,
-    data: 0,
-    fid: 0,
-    major: 0,
-    owns_fo: false,
-    _pad: [0; 6],
-};
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PendingIrpNode {
+    next: u64,
+    entry: PendingIrp,
+}
 const EMPTY_COMPLETED_READ: CompletedRead = CompletedRead {
     seq: 0,
     fid: 0,
@@ -416,12 +412,11 @@ const EMPTY_COMPLETED_WRITE: CompletedWrite = CompletedWrite {
 
 const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
 const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
-const FSD_PENDING_IRP_CAP: usize = 128;
 const FSD_COMPLETED_WRITE_CAP: usize = 128;
 const FSD_COMPLETED_READ_CAP: usize = 30;
-const FSD_PENDING_IRPS_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x10;
+const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
 const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(
-    FSD_PENDING_IRPS_OFF + core::mem::size_of::<PendingIrp>() as u64 * FSD_PENDING_IRP_CAP as u64,
+    FSD_RUNTIME_TABLES_OFF + 0x10,
     8,
 );
 const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
@@ -450,11 +445,8 @@ unsafe fn next_completion_seq(data_base: u64) -> u64 {
 }
 
 #[inline]
-unsafe fn pending_irp_slot(data_base: u64, index: usize) -> *mut PendingIrp {
-    (data_base
-        + FSD_PENDING_IRPS_OFF
-        + (index as u64) * core::mem::size_of::<PendingIrp>() as u64)
-        as *mut PendingIrp
+unsafe fn pending_irp_head(data_base: u64) -> *mut u64 {
+    (data_base + FSD_PENDING_IRP_HEAD_OFF) as *mut u64
 }
 
 #[inline]
@@ -473,31 +465,70 @@ unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRea
         as *mut CompletedRead
 }
 
+#[inline]
+unsafe fn pending_irp_node_valid(node: u64) -> bool {
+    let pool_start = FSD_POOL_VADDR + POOL_DATA_OFF;
+    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+    node >= pool_start
+        && node & 7 == 0
+        && node
+            .checked_add(core::mem::size_of::<PendingIrpNode>() as u64)
+            .is_some_and(|end| end <= pool_end)
+}
+
 unsafe fn pending_irp_exists(irp: u64) -> bool {
-    (0..FSD_PENDING_IRP_CAP).any(|index| read_volatile(pending_irp_slot(FSD_DATA_VADDR, index)).irp == irp)
+    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return false;
+        }
+        let entry = read_volatile((node + 8) as *const PendingIrp);
+        if entry.irp == irp {
+            return true;
+        }
+        node = read_volatile(node as *const u64);
+        steps += 1;
+    }
+    false
 }
 
 unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
-    for index in 0..FSD_PENDING_IRP_CAP {
-        let ptr = pending_irp_slot(FSD_DATA_VADDR, index);
-        let slot = read_volatile(ptr);
-        if slot.irp == irp {
-            write_volatile(ptr, EMPTY_PENDING_IRP);
-            return Some(slot);
+    let head = pending_irp_head(FSD_DATA_VADDR);
+    let mut prev = head;
+    let mut node = read_volatile(head);
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return None;
         }
+        let next = read_volatile(node as *const u64);
+        let entry = read_volatile((node + 8) as *const PendingIrp);
+        if entry.irp == irp {
+            write_volatile(prev, next);
+            pool_free(node);
+            return Some(entry);
+        }
+        prev = node as *mut u64;
+        node = next;
+        steps += 1;
     }
     None
 }
 
 unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
-    for index in 0..FSD_PENDING_IRP_CAP {
-        let ptr = pending_irp_slot(FSD_DATA_VADDR, index);
-        if read_volatile(ptr).irp == 0 {
-            write_volatile(ptr, entry);
-            return true;
-        }
+    let node = pool_alloc(core::mem::size_of::<PendingIrpNode>() as u64);
+    if node == 0 {
+        return false;
     }
-    false
+    let head = pending_irp_head(FSD_DATA_VADDR);
+    let old = read_volatile(head);
+    write_volatile(
+        node as *mut PendingIrpNode,
+        PendingIrpNode { next: old, entry },
+    );
+    write_volatile(head, node);
+    true
 }
 
 unsafe fn insert_completed_write(fid: u64, status: u32, info: u64) -> bool {

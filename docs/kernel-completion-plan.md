@@ -144,8 +144,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The old fixed
    object-namespace ceiling is also gone: object entries now grow by checked reserve, so late debug
    objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
-   slots. The latest boot reaches genuine explorer shell chrome with every dbgk, user-callback,
-   win32k nested-transport, and VM pool-headroom proof green (`290/290`). Continue from the larger
+   slots. The latest FSD transport cleanup moves past the profile hive/user shell activation
+   regression again, but the current frontier is explorer shell chrome after genuine explorer spawn:
+   `NtQueryInformationProcess` progress, register-window-message capture, both shell COM classes, and
+   paint begin/end proof need real behavior rather than fallback gates. Continue from the larger
    completion plan rather than adding more boot-frontier special cases.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
@@ -1336,3 +1338,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   userinit/explorer gates (`273/291`). Review adjustment: A3/A4 is no longer blocked by the SCM/LSA
   named-pipe pending-read path; next work is the real `NtLoadKey`/user profile hive lifecycle that
   Winlogon needs before `WlxActivateUserShell` reads `Userinit`.
+- Hosted FSD pending-IRP capacity slice. The hosted FSD no longer stores parked IRPs in a fixed
+  128-entry DATA table. Pending IRPs now live in a pool-backed per-instance linked list, while
+  completed read/write records stay in the DATA arena used by the executive redrive path. This keeps
+  long-lived NPFS/SCM/DCOM traffic from failing a real dispatch with `STATUS_INSUFFICIENT_RESOURCES`
+  once explorer activity stretches the boot. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-pending-irp-list-20260808.log`. Result: the previous `NtLoadKey` profile frontier is
+  gone (`exec_ntloadkey_serviced`, `exec_winlogon_user_shell_activated`,
+  `exec_userinit_process_spawned`, and `exec_explorer_process_spawned` pass), real explorer pixels
+  are visible again, and the run advances to `288/291`. Review adjustment: the next frontier is not
+  an FSD fallback; inspect the real userinit/explorer path around repeated `NtQueryInformationProcess`
+  calls, missing explorer `RegisterWindowMessage` captures, the second shell COM class, and
+  `WM_PAINT` begin/end dispatch.
