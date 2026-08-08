@@ -938,3 +938,84 @@ fn fixed_vm_map_query_basic_splits_on_page_protection_override() {
         0x1000
     );
 }
+
+#[test]
+fn committed_range_table_queries_and_coalesces_runtime_mappings() {
+    let mut table = VmCommittedRangeTable::<4>::new();
+    table
+        .register(VmCommittedRange {
+            base: 0x1600_0000,
+            size: 0x1000,
+            allocation_base: 0x1600_0000,
+            allocation_protect: PAGE_READWRITE,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        })
+        .unwrap();
+    table
+        .register(VmCommittedRange {
+            base: 0x1600_1000,
+            size: 0x1000,
+            allocation_base: 0x1600_0000,
+            allocation_protect: PAGE_READWRITE,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        })
+        .unwrap();
+
+    assert_eq!(table.range_count(), 1);
+    assert_eq!(
+        table.query_basic(0x1600_0123).unwrap(),
+        VmBasicInformation {
+            base_address: 0x1600_0000,
+            allocation_base: 0x1600_0000,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x2000,
+            state: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        }
+    );
+    assert_eq!(table.query_basic(0x1600_1000).unwrap().region_size, 0x1000);
+}
+
+#[test]
+fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
+    let mut table = VmCommittedRangeTable::<4>::new();
+    table
+        .register(VmCommittedRange::mapped(0x2000_0000, 0x2000, PAGE_READONLY))
+        .unwrap();
+    table
+        .register(VmCommittedRange::mapped(0x3000_0000, 0x1000, PAGE_READONLY))
+        .unwrap();
+
+    assert_eq!(
+        table.register(VmCommittedRange::mapped(0x2000_1000, 0x1000, PAGE_READONLY,)),
+        Err(STATUS_CONFLICTING_ADDRESSES)
+    );
+    assert_eq!(table.next_base_after(0x1000_0000), Some(0x2000_0000));
+    assert_eq!(table.next_base_after(0x2000_0000), Some(0x3000_0000));
+    assert!(table.query_basic(0x2800_0000).is_none());
+}
+
+#[test]
+fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
+    let mut table = VmCommittedRangeTable::<4>::new();
+    assert_eq!(
+        table.register(VmCommittedRange::private(
+            u64::MAX - 0xfff,
+            0x2000,
+            PAGE_READWRITE
+        )),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        table.register(VmCommittedRange::private(0x1001, 0x1000, PAGE_READWRITE)),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        table.register(VmCommittedRange::private(0x1000, 0x800, PAGE_READWRITE)),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(table.range_count(), 0);
+}

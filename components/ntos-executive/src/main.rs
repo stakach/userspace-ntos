@@ -1378,6 +1378,77 @@ const VM_REGION_CAPACITY: usize = 64;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
     [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
+const PROCESS_COMMITTED_MAPPING_CAPACITY: usize = 32;
+static mut PROCESS_COMMITTED_MAPPINGS:
+    [nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>; MAX_PI] =
+    [const { nt_address_space::VmCommittedRangeTable::new() }; MAX_PI];
+
+pub(crate) unsafe fn process_committed_mapping_register(
+    pi: u64,
+    range: nt_address_space::VmCommittedRange,
+) -> bool {
+    if pi as usize >= MAX_PI {
+        return false;
+    }
+    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
+        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    match (*table).register(range) {
+        Ok(()) => {
+            note_high_water(&VM_COMMITTED_MAPPING_HW, (*table).range_count() as u64);
+            true
+        }
+        Err(status) => {
+            if VM_COMMITTED_MAPPING_REGISTRATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[vm-map] committed mapping registration failed pi=");
+                print_u64(pi);
+                print_str(b" base=0x");
+                print_hex((range.base >> 32) as u32);
+                print_hex(range.base as u32);
+                print_str(b" size=0x");
+                print_hex((range.size >> 32) as u32);
+                print_hex(range.size as u32);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+            }
+            false
+        }
+    }
+}
+
+pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
+    if pi >= MAX_PI {
+        return;
+    }
+    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
+        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi);
+    core::ptr::write(table, nt_address_space::VmCommittedRangeTable::new());
+}
+
+pub(crate) unsafe fn process_committed_mapping_basic_information(
+    pi: u64,
+    page: u64,
+) -> Option<nt_address_space::VmBasicInformation> {
+    if pi as usize >= MAX_PI {
+        return None;
+    }
+    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
+        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    (*table).query_basic(page)
+}
+
+pub(crate) unsafe fn process_committed_mapping_next_base_after(pi: u64, page: u64) -> Option<u64> {
+    if pi as usize >= MAX_PI {
+        return None;
+    }
+    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
+        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    (*table).next_base_after(page)
+}
 
 const GENERIC_SECTION_BACKING_NONE: u8 = 0;
 const GENERIC_SECTION_BACKING_ANON: u8 = 1;
@@ -4750,6 +4821,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let slots_available = root_slot_available_count();
     let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
+    let committed_mappings = VM_COMMITTED_MAPPING_HW.load(Ordering::Relaxed);
+    let committed_mapping_fails = VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed);
     let protection_overrides = VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed);
     let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
     print_pool_census(b"gate");
@@ -4763,6 +4836,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && slots_total != 0
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
+            && committed_mappings * 4 < PROCESS_COMMITTED_MAPPING_CAPACITY as u64 * 3
             && protection_overrides * 4
                 < nt_address_space::VM_PROTECTION_OVERRIDE_CAPACITY as u64 * 3
             && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
@@ -4771,6 +4845,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && slots_available >= 2048
             // … with nothing having been refused by any of them.
             && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
+            && committed_mapping_fails == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
             && VM_FAIL_PT.load(Ordering::Relaxed) == 0
             && VM_FAIL_FRAME.load(Ordering::Relaxed) == 0
@@ -7117,6 +7192,9 @@ pub(crate) static VM_FAIL_ALIAS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static VM_FAIL_REGISTRY: AtomicU64 = AtomicU64::new(0);
 /// High-water of the per-process VAD extent count (`VM_REGION_CAPACITY`).
 pub(crate) static VM_REGION_HW: AtomicU64 = AtomicU64::new(0);
+/// High-water of per-process committed mappings outside the private VAD allocator.
+pub(crate) static VM_COMMITTED_MAPPING_HW: AtomicU64 = AtomicU64::new(0);
+pub(crate) static VM_COMMITTED_MAPPING_REGISTRATION_FAILS: AtomicU64 = AtomicU64::new(0);
 /// High-water of private per-page protection overrides.
 pub(crate) static VM_PROTECTION_OVERRIDE_HW: AtomicU64 = AtomicU64::new(0);
 /// User stack VADs released by thread teardown (`TEB.FreeStackOnTermination` semantics).
@@ -7232,6 +7310,12 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(VM_REGION_HW.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(VM_REGION_CAPACITY as u64);
+    print_str(b" committed-map=");
+    print_u64(VM_COMMITTED_MAPPING_HW.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(PROCESS_COMMITTED_MAPPING_CAPACITY as u64);
+    print_str(b" committed-map-fails=");
+    print_u64(VM_COMMITTED_MAPPING_REGISTRATION_FAILS.load(Ordering::Relaxed));
     print_str(b" prot-ovr=");
     print_u64(VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed));
     print_str(b"/");

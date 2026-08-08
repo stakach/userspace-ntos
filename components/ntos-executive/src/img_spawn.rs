@@ -39,6 +39,20 @@ unsafe fn zero_scratch_page(va: u64) {
     core::ptr::write_bytes(va as *mut u8, 0, 0x1000);
 }
 
+unsafe fn register_spawn_private_mapping(pi: u64, base: u64, size: u64, protect: u32) {
+    let _ = process_committed_mapping_register(
+        pi,
+        nt_address_space::VmCommittedRange::private(base, size, protect),
+    );
+}
+
+unsafe fn register_spawn_mapped_mapping(pi: u64, base: u64, size: u64, protect: u32) {
+    let _ = process_committed_mapping_register(
+        pi,
+        nt_address_space::VmCommittedRange::mapped(base, size, protect),
+    );
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) pml4: u64,
@@ -515,8 +529,19 @@ pub(crate) unsafe fn spawn_sec_image(
             csrss_frame_put(pi, STACK_BASE + i * 0x1000, f);
         }
     }
+    if setup_env {
+        register_spawn_private_mapping(
+            pi,
+            STACK_BASE,
+            STACK_FRAMES * 0x1000,
+            nt_address_space::PAGE_READWRITE,
+        );
+    }
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    if setup_env {
+        register_spawn_private_mapping(pi, IPCBUF_VADDR, 0x1000, nt_address_space::PAGE_READWRITE);
+    }
     // A Windows process environment so the image's startup runs: a TEB (GS anchor), a PEB whose
     // ProcessParameters (+0x20) points at a zeroed RTL_USER_PROCESS_PARAMETERS, and a trampoline
     // that loads RCX=PEB then jumps to the entry (the entry expects RCX = PEB). Each page is
@@ -586,6 +611,7 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
         let _ = page_map(copy_cap(acs_frame), acs_va, RW_NX, pml4);
+        register_spawn_private_mapping(pi, acs_va, 0x1000, nt_address_space::PAGE_READWRITE);
         // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
         // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
         // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
@@ -613,6 +639,12 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x7000 + 0x08) as *mut u64, SMSS_DESKINFO_VA + 0x1000); // pvDesktopLimit
         core::ptr::write_volatile((scr + 0x7000 + 0x10) as *mut u64, SMSS_DESKINFO_VA + 0x800); // spwnd -> zeroed WND
         let _ = page_map(copy_cap(deskinfo), SMSS_DESKINFO_VA, RW_NX, pml4);
+        register_spawn_private_mapping(
+            pi,
+            SMSS_DESKINFO_VA,
+            0x1000,
+            nt_address_space::PAGE_READWRITE,
+        );
         // TEB.Win32ThreadInfo (x64 TEB+0x78): user32 `GetThreadDesktopInfo()` first calls
         // `GetW32ThreadInfo()` (reads [TEB+0x78]) and returns NULL if it is NULL — SHORT-CIRCUITING
         // before it ever reads pDeskInfo (so a valid pDeskInfo alone doesn't stop the crash). Seed it
@@ -634,6 +666,12 @@ pub(crate) unsafe fn spawn_sec_image(
             crate::WL_TEB2_PML4.store(pml4, core::sync::atomic::Ordering::Relaxed);
         }
         csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
+        register_spawn_private_mapping(
+            pi,
+            SMSS_TEB_VA,
+            0x2000,
+            nt_address_space::PAGE_READWRITE,
+        );
         // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's
         // TEB), but is mapped READ-ONLY there and copy-on-written on the first store. See
         // `W32_CLIENT_TEB_TAIL_PROTECTED`.
@@ -736,6 +774,12 @@ pub(crate) unsafe fn spawn_sec_image(
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
         // synthetic success.
         csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000);
+        register_spawn_private_mapping(
+            pi,
+            SMSS_PEB_VA,
+            0x1000,
+            nt_address_space::PAGE_READWRITE,
+        );
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
         let nls_pt = alloc_slot();
@@ -761,6 +805,12 @@ pub(crate) unsafe fn spawn_sec_image(
             for i in 0..frames {
                 let _ = page_map(copy_cap(start + i), va + i * 0x1000, RW_NX, pml4);
             }
+            register_spawn_mapped_mapping(
+                pi,
+                va,
+                frames * 0x1000,
+                nt_address_space::PAGE_READWRITE,
+            );
         }
         // Process parameters: a real RTL_USER_PROCESS_PARAMETERS. LdrpInitializeProcess reads
         // DllPath (@0x50) and requires DllPath.Length > 0 (else "Error while retrieving buffer for
@@ -858,6 +908,12 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((pp + 0x80) as *mut u64, SMSS_PARAMS_VA + 0x1000); // Environment
         let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
         let _ = page_map(copy_cap(env_frame), SMSS_PARAMS_VA + 0x1000, RW_NX, pml4);
+        register_spawn_private_mapping(
+            pi,
+            SMSS_PARAMS_VA,
+            0x2000,
+            nt_address_space::PAGE_READWRITE,
+        );
         if pi == 0 {
             let flags = core::ptr::read_volatile((pp + 0x08) as *const u32);
             let env = core::ptr::read_volatile((pp + 0x80) as *const u64);
@@ -959,6 +1015,12 @@ pub(crate) unsafe fn spawn_sec_image(
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
         let _ = page_map(copy_cap(tramp), SMSS_TRAMP_VA, /* RX */ 2, pml4);
+        register_spawn_private_mapping(
+            pi,
+            SMSS_TRAMP_VA,
+            0x1000,
+            nt_address_space::PAGE_EXECUTE_READ,
+        );
         SMSS_TRAMP_VA
     } else {
         PE_LOAD_BASE + pe.entry_point_rva() as u64

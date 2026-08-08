@@ -3633,6 +3633,7 @@ pub(crate) unsafe fn service_sec_image(
             vm_maps.add(index),
             nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
         );
+        process_committed_mapping_reset(index);
     }
     VM_FREE_FRAME_N = 0;
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured

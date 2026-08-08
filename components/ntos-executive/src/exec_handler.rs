@@ -41,98 +41,6 @@ struct RegistryKeyStats {
     max_value_data_bytes: u32,
 }
 
-#[derive(Clone, Copy)]
-struct MemoryBasicRange {
-    base: u64,
-    size: u64,
-    allocation_base: u64,
-    allocation_protect: u32,
-    protect: u32,
-    state: u32,
-    type_: u32,
-}
-
-impl MemoryBasicRange {
-    const fn private(base: u64, size: u64, protect: u32) -> Self {
-        Self {
-            base,
-            size,
-            allocation_base: base,
-            allocation_protect: protect,
-            protect,
-            state: nt_address_space::MEM_COMMIT,
-            type_: nt_address_space::MEM_PRIVATE,
-        }
-    }
-
-    const fn mapped(base: u64, size: u64, protect: u32) -> Self {
-        Self {
-            base,
-            size,
-            allocation_base: base,
-            allocation_protect: protect,
-            protect,
-            state: nt_address_space::MEM_COMMIT,
-            type_: nt_address_space::MEM_MAPPED,
-        }
-    }
-
-    fn contains(self, page: u64) -> bool {
-        page >= self.base && page < self.base + self.size
-    }
-
-    fn info_at(self, page: u64) -> nt_address_space::VmBasicInformation {
-        nt_address_space::VmBasicInformation {
-            base_address: page,
-            allocation_base: self.allocation_base,
-            allocation_protect: self.allocation_protect,
-            region_size: self.base + self.size - page,
-            state: self.state,
-            protect: self.protect,
-            type_: self.type_,
-        }
-    }
-}
-
-const SPAWN_STATIC_MEMORY_RANGES: [MemoryBasicRange; 8] = [
-    MemoryBasicRange::private(ACS_PAGE_VA, 0x1000, nt_address_space::PAGE_READWRITE),
-    MemoryBasicRange::private(SMSS_PARAMS_VA, 0x2000, nt_address_space::PAGE_READWRITE),
-    MemoryBasicRange::private(SMSS_DESKINFO_VA, 0x1000, nt_address_space::PAGE_READWRITE),
-    MemoryBasicRange::private(SMSS_TRAMP_VA, 0x1000, nt_address_space::PAGE_EXECUTE_READ),
-    MemoryBasicRange::private(IPCBUF_VADDR, 0x1000, nt_address_space::PAGE_READWRITE),
-    MemoryBasicRange::mapped(
-        NLS_SMSS_ANSI_VA,
-        NLS_ANSI_FRAMES * 0x1000,
-        nt_address_space::PAGE_READWRITE,
-    ),
-    MemoryBasicRange::mapped(
-        NLS_SMSS_OEM_VA,
-        NLS_OEM_FRAMES * 0x1000,
-        nt_address_space::PAGE_READWRITE,
-    ),
-    MemoryBasicRange::mapped(
-        NLS_SMSS_CASE_VA,
-        NLS_CASE_FRAMES * 0x1000,
-        nt_address_space::PAGE_READWRITE,
-    ),
-];
-
-fn static_spawn_mapping_at(page: u64) -> Option<nt_address_space::VmBasicInformation> {
-    SPAWN_STATIC_MEMORY_RANGES
-        .iter()
-        .copied()
-        .find(|range| range.contains(page))
-        .map(|range| range.info_at(page))
-}
-
-fn static_spawn_mapping_next_base_after(page: u64) -> Option<u64> {
-    SPAWN_STATIC_MEMORY_RANGES
-        .iter()
-        .filter(|range| range.base > page)
-        .map(|range| range.base)
-        .min()
-}
-
 unsafe fn registered_frame_basic_information(
     pi: usize,
     page: u64,
@@ -2845,6 +2753,7 @@ impl ExecNtHandler {
         }
         self.temporary_process_slots[pi] = 0;
         self.process_vspaces[pi] = 0;
+        unsafe { process_committed_mapping_reset(pi) };
         self.clear_hosted_tp_worker_windows(pi);
     }
 
@@ -7644,11 +7553,11 @@ impl ExecNtHandler {
             return vm_map.query_basic(page, USER_ADDRESS_LIMIT);
         }
 
-        if let Some(info) = registered_frame_basic_information(target_pi, page) {
+        if let Some(info) = process_committed_mapping_basic_information(target_pi as u64, page) {
             return Ok(info);
         }
 
-        if let Some(info) = static_spawn_mapping_at(page) {
+        if let Some(info) = registered_frame_basic_information(target_pi, page) {
             return Ok(info);
         }
 
@@ -7672,10 +7581,10 @@ impl ExecNtHandler {
                 }
             }
         }
-        if let Some(candidate) = csrss_frame_next_page_after(target_pi as u64, page) {
+        if let Some(candidate) = process_committed_mapping_next_base_after(target_pi as u64, page) {
             next = next.min(candidate);
         }
-        if let Some(candidate) = static_spawn_mapping_next_base_after(page) {
+        if let Some(candidate) = csrss_frame_next_page_after(target_pi as u64, page) {
             next = next.min(candidate);
         }
         if KUSER_VA > page && kuser_page_alias_get(target_pi) != 0 {

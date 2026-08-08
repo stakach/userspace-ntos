@@ -296,6 +296,177 @@ impl VmBasicInformation {
     }
 }
 
+/// A committed user mapping that is not owned by the private VAD allocator.
+///
+/// This records process-lifetime runtime pages, mapped sections, and other fixed VA mappings at
+/// the point the kernel actually maps them. It is deliberately separate from `VmRegionMap`: those
+/// maps own the allocatable private heap range, while these ranges can live anywhere in user space.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmCommittedRange {
+    pub base: u64,
+    pub size: u64,
+    pub allocation_base: u64,
+    pub allocation_protect: u32,
+    pub protect: u32,
+    pub type_: u32,
+}
+
+impl VmCommittedRange {
+    pub const fn private(base: u64, size: u64, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            allocation_base: base,
+            allocation_protect: protect,
+            protect,
+            type_: MEM_PRIVATE,
+        }
+    }
+
+    pub const fn mapped(base: u64, size: u64, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            allocation_base: base,
+            allocation_protect: protect,
+            protect,
+            type_: MEM_MAPPED,
+        }
+    }
+
+    pub fn end(self) -> u64 {
+        self.base.saturating_add(self.size)
+    }
+
+    fn contains(self, page: u64) -> bool {
+        page >= self.base && page < self.end()
+    }
+
+    fn contiguous_with(self, next: Self) -> bool {
+        self.end() == next.base
+            && self.allocation_base == next.allocation_base
+            && self.allocation_protect == next.allocation_protect
+            && self.protect == next.protect
+            && self.type_ == next.type_
+    }
+
+    fn info_at(self, page: u64) -> VmBasicInformation {
+        VmBasicInformation {
+            base_address: page,
+            allocation_base: self.allocation_base,
+            allocation_protect: self.allocation_protect,
+            region_size: self.end() - page,
+            state: MEM_COMMIT,
+            protect: self.protect,
+            type_: self.type_,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct VmCommittedRangeTable<const N: usize> {
+    ranges: [Option<VmCommittedRange>; N],
+}
+
+impl<const N: usize> VmCommittedRangeTable<N> {
+    pub const fn new() -> Self {
+        Self { ranges: [None; N] }
+    }
+
+    pub fn range_count(&self) -> usize {
+        self.ranges.iter().filter(|range| range.is_some()).count()
+    }
+
+    pub fn register(&mut self, range: VmCommittedRange) -> Result<(), u32> {
+        let Some(end) = range.base.checked_add(range.size) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if range.base & (PAGE_SIZE - 1) != 0
+            || range.size == 0
+            || range.size & (PAGE_SIZE - 1) != 0
+            || end <= range.base
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if self.ranges.iter().flatten().any(|current| {
+            range.base < current.end() && current.base < range.end() && *current != range
+        }) {
+            return Err(STATUS_CONFLICTING_ADDRESSES);
+        }
+        if self
+            .ranges
+            .iter()
+            .flatten()
+            .any(|current| *current == range)
+        {
+            return Ok(());
+        }
+        let slot = self
+            .ranges
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *slot = Some(range);
+        self.normalize();
+        Ok(())
+    }
+
+    pub fn query_basic(&self, address: u64) -> Option<VmBasicInformation> {
+        let page = address & !(PAGE_SIZE - 1);
+        self.ranges
+            .iter()
+            .flatten()
+            .copied()
+            .find(|range| range.contains(page))
+            .map(|range| range.info_at(page))
+    }
+
+    pub fn next_base_after(&self, address: u64) -> Option<u64> {
+        self.ranges
+            .iter()
+            .flatten()
+            .filter(|range| range.base > address)
+            .map(|range| range.base)
+            .min()
+    }
+
+    fn normalize(&mut self) {
+        for left in 0..N {
+            for right in left + 1..N {
+                let swap = match (self.ranges[left], self.ranges[right]) {
+                    (None, Some(_)) => true,
+                    (Some(a), Some(b)) => b.base < a.base,
+                    _ => false,
+                };
+                if swap {
+                    self.ranges.swap(left, right);
+                }
+            }
+        }
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read < N {
+            let Some(mut current) = self.ranges[read] else {
+                break;
+            };
+            read += 1;
+            while read < N {
+                let Some(next) = self.ranges[read] else {
+                    break;
+                };
+                if !current.contiguous_with(next) {
+                    break;
+                }
+                current.size += next.size;
+                read += 1;
+            }
+            self.ranges[write] = Some(current);
+            write += 1;
+        }
+        self.ranges[write..].fill(None);
+    }
+}
+
 /// A per-private-page protection override. ReactOS `MiProtectVirtualMemory` changes PTE
 /// protections for private pages; it does not split the VAD node for every protected subrange.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
