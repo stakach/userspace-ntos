@@ -145,10 +145,15 @@ pub fn direct_copy_plan(
     })
 }
 
-/// Split a well-formed UTF-16LE `REG_MULTI_SZ` into byte ranges that include each string's NUL.
-/// The final empty-string terminator is not returned.
+/// Split a UTF-16LE `REG_MULTI_SZ` the way ReactOS' `RtlpCallQueryRegistryRoutine` walks it:
+/// each returned byte range includes that string's NUL, and the last two UTF-16 code units in the
+/// caller-supplied length are treated as the terminating empty-string area.
+///
+/// This deliberately uses the value's explicit byte length instead of requiring the buffer to end in
+/// a perfectly formed double-NUL. Native callers encounter malformed single-NUL registry data, and
+/// ReactOS/NT skip the trailing unterminated tail instead of failing the whole query.
 pub fn multi_sz_ranges(value: &[u8]) -> Result<Vec<Range<usize>>, u32> {
-    if value.len() < 4 || value.len() & 1 != 0 || value[value.len() - 4..] != [0, 0, 0, 0] {
+    if value.len() < 4 || value.len() & 1 != 0 {
         return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     let units = value.len() / 2;
@@ -463,14 +468,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_multi_sz_without_overread() {
+    fn multi_sz_split_uses_reactos_length_bound_for_malformed_tails() {
+        let mut single_nul_tail = Vec::new();
+        for unit in ['A' as u16, 0, 'B' as u16, 0, 'C' as u16] {
+            single_nul_tail.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(multi_sz_ranges(&single_nul_tail), Ok(vec![0..4, 4..8]));
+    }
+
+    #[test]
+    fn rejects_multi_sz_shapes_that_cannot_be_walked() {
         assert_eq!(multi_sz_ranges(&[]), Err(STATUS_OBJECT_TYPE_MISMATCH));
         assert_eq!(
             multi_sz_ranges(&[b'A', 0, 0]),
             Err(STATUS_OBJECT_TYPE_MISMATCH)
         );
         assert_eq!(
-            multi_sz_ranges(&[b'A', 0, b'B', 0, 0, 0]),
+            multi_sz_ranges(&[b'A', 0, b'B', 0, b'C', 0, b'D', 0]),
             Err(STATUS_OBJECT_TYPE_MISMATCH)
         );
     }

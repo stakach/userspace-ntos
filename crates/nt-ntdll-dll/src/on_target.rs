@@ -9048,8 +9048,10 @@ const STATUS_NO_MORE_ENTRIES: u64 = 0x8000_001A;
 const RTL_QUERY_REGISTRY_SUBKEY: u32 = 0x01;
 const RTL_QUERY_REGISTRY_TOPKEY: u32 = 0x02;
 const RTL_QUERY_REGISTRY_REQUIRED: u32 = 0x04;
+const RTL_QUERY_REGISTRY_NOVALUE: u32 = 0x08;
 const RTL_QUERY_REGISTRY_NOEXPAND: u32 = 0x10;
 const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
+const RTL_QUERY_REGISTRY_DELETE: u32 = 0x40;
 
 /// RTL_REGISTRY_* RelativeTo bases (the subset smss uses).
 const RTL_REGISTRY_HANDLE: u32 = 0x4000_0000;
@@ -9317,16 +9319,6 @@ unsafe fn build_oa(
 ///
 /// # Safety
 /// On-target hosted-process syscall.
-#[cfg(target_arch = "x86_64")]
-unsafe fn open_key_utf16(root: u64, name: &[u16]) -> u64 {
-    let (status, handle) = unsafe { open_key_utf16_status(root, name) };
-    if status == STATUS_SUCCESS_U as u32 {
-        handle
-    } else {
-        0
-    }
-}
-
 /// Open a UTF-16 registry path and preserve the native status for compatibility helpers.
 #[cfg(target_arch = "x86_64")]
 unsafe fn open_key_utf16_status(root: u64, name: &[u16]) -> (u32, u64) {
@@ -10593,15 +10585,19 @@ pub unsafe fn rtl_query_registry_values(
             current_key = base_key;
         }
 
-        if (entry.flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 && entry.name != 0 {
+        if (entry.flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 {
+            if entry.name == 0 {
+                status = STATUS_INVALID_PARAMETER_U32;
+                break;
+            }
             // Open the named subkey relative to the base, then enumerate its values.
             // SAFETY: entry.name is a NUL-terminated UTF-16 string.
             let nlen = unsafe { wlen(entry.name as *const u16) };
             // SAFETY: [name, name+nlen) is the string.
             let nslice = unsafe { core::slice::from_raw_parts(entry.name as *const u16, nlen) };
             // SAFETY: on-target subkey open.
-            let sub = unsafe { open_key_utf16(base_key, nslice) };
-            if sub != 0 {
+            let (open_status, sub) = unsafe { open_key_utf16_status(base_key, nslice) };
+            if (open_status as i32) >= 0 {
                 current_key = sub;
                 if entry.query_routine != 0 {
                     // ProcessValues: enumerate every value, dispatch the routine.
@@ -10616,7 +10612,13 @@ pub unsafe fn rtl_query_registry_values(
                         } {
                             Ok(info) => info,
                             Err(error) if error == STATUS_NO_MORE_ENTRIES as u32 => {
-                                status = STATUS_SUCCESS_U as u32;
+                                status = if index == 0
+                                    && (entry.flags & RTL_QUERY_REGISTRY_REQUIRED) != 0
+                                {
+                                    STATUS_OBJECT_NAME_NOT_FOUND_U32
+                                } else {
+                                    STATUS_SUCCESS_U as u32
+                                };
                                 break;
                             }
                             Err(error) => {
@@ -10659,11 +10661,31 @@ pub unsafe fn rtl_query_registry_values(
                             status = st2;
                             break;
                         }
+                        if (entry.flags & RTL_QUERY_REGISTRY_DELETE) != 0 {
+                            let name_len = parsed.name.len();
+                            let mut name_us = [0u64; 2];
+                            name_us[0] = name_len as u64 | ((name_len as u64) << 16);
+                            name_us[1] = name_buf.as_ptr() as u64;
+                            let delete_status = unsafe {
+                                syscall4(
+                                    SSN_NT_DELETE_VALUE_KEY,
+                                    current_key,
+                                    name_us.as_ptr() as u64,
+                                    0,
+                                    0,
+                                ) as u32
+                            };
+                            if (delete_status as i32) < 0 {
+                                status = delete_status;
+                                break;
+                            }
+                            continue;
+                        }
                         index += 1;
                     }
                 }
-            } else if (entry.flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
-                status = 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+            } else {
+                status = open_status;
             }
         } else if entry.name != 0 {
             // A named value under the current key: NtQueryValueKey.
@@ -10702,6 +10724,16 @@ pub unsafe fn rtl_query_registry_values(
                             };
                             if (st2 as i32) < 0 {
                                 status = st2;
+                            } else if (entry.flags & RTL_QUERY_REGISTRY_DELETE) != 0 {
+                                let _ = unsafe {
+                                    syscall4(
+                                        SSN_NT_DELETE_VALUE_KEY,
+                                        current_key,
+                                        oa_us.as_ptr() as u64,
+                                        0,
+                                        0,
+                                    )
+                                };
                             }
                         }
                         Err(error) => status = error,
@@ -10715,6 +10747,25 @@ pub unsafe fn rtl_query_registry_values(
                     }
                 }
                 Err(error) => status = error,
+            }
+        } else if (entry.flags & RTL_QUERY_REGISTRY_NOVALUE) != 0 {
+            if entry.query_routine != 0 {
+                let routine: OnTargetQueryRoutine = unsafe {
+                    core::mem::transmute::<u64, OnTargetQueryRoutine>(entry.query_routine)
+                };
+                let st2 = unsafe {
+                    routine(
+                        core::ptr::null::<u16>() as u64,
+                        REG_NONE,
+                        core::ptr::null::<u8>() as u64,
+                        0,
+                        context,
+                        entry.entry_context,
+                    )
+                };
+                if (st2 as i32) < 0 {
+                    status = st2;
+                }
             }
         }
 

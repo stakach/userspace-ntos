@@ -147,9 +147,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
    `KeyBasicInformation`, `KeyNodeInformation`, `KeyFullInformation`, `KeyNameInformation`,
-   `KeyCachedInformation`, and `KeyFlagsInformation` with NT buffer-retry statuses. D2/D4 still need
-   the Configuration Manager/Hive Manager to become the live authority for mutable hives, durable
-   setup/profile state, and remaining long-lived registry data.
+   `KeyCachedInformation`, and `KeyFlagsInformation` with NT buffer-retry statuses. ntdll's
+   `RtlQueryRegistryValues` now also handles ReactOS SCM/group-list registry shapes: strict SUBKEY
+   opens, required empty enumeration failure, NOVALUE callbacks, DELETE-on-query, and
+   ReactOS-compatible length-bounded `REG_MULTI_SZ` walking. D2/D4 still need the Configuration
+   Manager/Hive Manager to become the live authority for mutable hives, durable setup/profile state,
+   and remaining long-lived registry data.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -1295,3 +1298,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: run the next single boot proof and inspect whether services.exe now advances
   farther through SCM database/HKCR handling toward a real non-bootstrap service child spawn; keep
   the proof dynamic and do not add service-name or executable-name launch policy.
+- ntdll registry-query compatibility slice. `RtlQueryRegistryValues` now implements the remaining
+  ReactOS SCM-facing flags instead of silently skipping them: `RTL_QUERY_REGISTRY_SUBKEY` propagates
+  real `NtOpenKey` failures and rejects missing names, required empty subkey enumeration returns
+  `STATUS_OBJECT_NAME_NOT_FOUND`, `RTL_QUERY_REGISTRY_NOVALUE` dispatches the query routine with
+  `REG_NONE`, and `RTL_QUERY_REGISTRY_DELETE` routes through `NtDeleteValueKey` for named and
+  enumerated values. The host-side `REG_MULTI_SZ` splitter now matches ReactOS' explicit-length walk
+  and skips malformed trailing tails instead of requiring a perfect double-NUL terminator. Validation:
+  `cargo test -p nt-ntdll rtl::registry --lib`, `./scripts/build_ntdll_dll.sh`,
+  `git diff --check`, and boot proof `.tmp/boot-rtlqueryregistryvalues-rerun-20260808.log`
+  (`290/290`, user-callback transport drained, LSA worker route green, explorer shell chrome green).
+  Review adjustment: continue A3/A4 at the live SCM auto-start frontier; the gate still proves
+  registry-selected launch specs but not yet a non-bootstrap `svchost.exe` child from services.exe's
+  ordinary CreateProcess path.
