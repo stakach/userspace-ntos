@@ -182,21 +182,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `.tmp/boot-pte-protect-overrides-20260808.log` is fully green at `291/291`: `exec_vm_pool_headroom`
    passes with `vad=40/64`, `prot-ovr=9/128`, and `51631 KiB` root-Untyped free, while genuine
    explorer shell chrome still paints `34873` non-background pixels. `NtQueryVirtualMemory`
-  `MemoryBasicInformation` now uses the live VM authorities instead of the old committed-private
-  shim: private VADs report reserve/commit/protection overrides, generic section views report
-  `MEM_MAPPED`, loaded images/DLLs report `MEM_IMAGE` by PE section rights, registered client-frame
-  mappings and spawn-created bootstrap pages report their real ranges, and `MEM_FREE` spans are
-  bounded by the next known mapping. Boot proof
-  `.tmp/boot-query-virtual-memory-rerun-20260808.log` is fully green at `291/291` with `vad=40/64`,
-  `prot-ovr=9/128`, `51457 KiB` root-Untyped free, and explorer shell chrome still paints `34873`
-  non-background pixels. Spawn-created bootstrap mappings now register in a per-process committed
-  mapping table at their real map sites, and the old query-only static spawn mapping catalog is
-  removed. Boot proof `.tmp/boot-committed-mapping-table-gated-rerun2-20260808.log` is fully green
-  at `291/291` with `committed-map=11/32`, `committed-map-fails=0`, and explorer shell chrome still
-  paints `34873` non-background pixels. Continue the plan from the remaining structural debt rather
-  than shell-paint scaffolding: A4's SCM pipe/listener special coordination, B3's real video/driver
-  binding, C1/C2/C3 image/data section views and remaining runtime fixed mappings into
-  per-process VAD/view ownership, and D1/D2 mutable registry/filesystem authority.
+   `MemoryBasicInformation` now uses the live VM authorities instead of the old committed-private
+   shim: private VADs report reserve/commit/protection overrides, generic section views report
+   `MEM_MAPPED`, loaded images/DLLs report `MEM_IMAGE` by PE section rights, registered client-frame
+   mappings and spawn-created bootstrap pages report their real ranges, and `MEM_FREE` spans are
+   bounded by the next known mapping. Boot proof
+   `.tmp/boot-query-virtual-memory-rerun-20260808.log` is fully green at `291/291` with `vad=40/64`,
+   `prot-ovr=9/128`, `51457 KiB` root-Untyped free, and explorer shell chrome still paints `34873`
+   non-background pixels. Spawn-created bootstrap mappings now register in a per-process committed
+   mapping table at their real map sites, and the old query-only static spawn mapping catalog is
+   removed. Boot proof `.tmp/boot-committed-mapping-table-gated-rerun2-20260808.log` is fully green
+   at `291/291` with `committed-map=11/32`, `committed-map-fails=0`, and explorer shell chrome still
+   paints `34873` non-background pixels. C3's first view-ownership slice now records main
+   executable images, hosted ntdll, SEC_IMAGE DLL views, and generic data-section views in the same
+   per-process committed mapping table, removes mapped-view records on `NtUnmapViewOfSection`, and
+   retires the old generic-section `NtQueryVirtualMemory` query branch. Boot proof
+   `.tmp/boot-committed-image-views-20260808.log` is fully green at `291/291` with
+   `committed-map=85/128`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
+   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
+   B3's real video/driver binding, C3 section-granular image protections and fault ownership, and
+   D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1568,3 +1574,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `sc pool exhausted`, local-worker exhaustion, and allocator-panic frontiers are gone. Review
   adjustment: continue the structural plan from C3 image/data section view ownership and A4
   remaining SCM pipe/listener coordination, rather than adding shell-specific scaffolding.
+- C3 committed image/data view ownership slice. `VmCommittedRange` now has a `MEM_IMAGE`
+  constructor and exact-base unregister support, and the executive records real view ownership for
+  main executable images, hosted ntdll, SEC_IMAGE DLL maps, and generic data-section maps in the
+  per-process committed mapping table. `NtQueryVirtualMemory` now asks that table for mapped data
+  views instead of the old generic-section query branch, `NtUnmapViewOfSection` removes the
+  committed view record for generic and DLL image unmaps, and map paths fail with
+  `STATUS_INSUFFICIENT_RESOURCES` when the committed-view table cannot publish the view. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-committed-image-views-20260808.log`. Result: the full executive gate is
+  `291/291`; `committed-map=85/128`, `committed-map-fails=0`, `exec_vm_pool_headroom` remains green,
+  Dbgk remains `bits=0x1fff`, and explorer shell chrome still paints `34873` non-background pixels.
+  Review adjustment: finish C3 by making image views section-granular in committed state and using
+  the same mapped-view authority for fault/protect/unmap across image and data sections.

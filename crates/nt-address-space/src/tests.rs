@@ -999,6 +999,33 @@ fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
 }
 
 #[test]
+fn committed_range_table_reports_image_views_and_unregisters_by_base() {
+    let mut table = VmCommittedRangeTable::<4>::new();
+    let image = VmCommittedRange::image(0x8000_0000, 0x3000, PAGE_EXECUTE_READ);
+    table.register(image).unwrap();
+    table
+        .register(VmCommittedRange::mapped(0x9000_0000, 0x1000, PAGE_READONLY))
+        .unwrap();
+
+    assert_eq!(
+        table.query_basic(0x8000_0123).unwrap(),
+        VmBasicInformation {
+            base_address: 0x8000_0000,
+            allocation_base: 0x8000_0000,
+            allocation_protect: PAGE_EXECUTE_WRITECOPY,
+            region_size: 0x3000,
+            state: MEM_COMMIT,
+            protect: PAGE_EXECUTE_READ,
+            type_: MEM_IMAGE,
+        }
+    );
+    assert_eq!(table.unregister_base(0x8000_0000), Some(image));
+    assert!(table.query_basic(0x8000_0123).is_none());
+    assert_eq!(table.range_count(), 1);
+    assert_eq!(table.unregister_base(0x8000_1000), None);
+}
+
+#[test]
 fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
     let mut table = VmCommittedRangeTable::<4>::new();
     assert_eq!(

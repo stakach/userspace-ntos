@@ -7566,19 +7566,8 @@ impl ExecNtHandler {
             }
         }
 
-        let generic_sections = &*ctx.generic_sections;
-        if let Some((section_index, view)) = generic_sections.view_for_page(target_pi, page) {
-            if generic_sections.section(section_index).is_some() {
-                return Ok(nt_address_space::VmBasicInformation {
-                    base_address: page,
-                    allocation_base: view.base,
-                    allocation_protect: view.protection,
-                    region_size: view.base + view.size - page,
-                    state: nt_address_space::MEM_COMMIT,
-                    protect: view.protection,
-                    type_: nt_address_space::MEM_MAPPED,
-                });
-            }
+        if let Some(info) = process_committed_mapping_basic_information(target_pi as u64, page) {
+            return Ok(info);
         }
 
         let vm_map = &*((core::ptr::addr_of!(PROCESS_VM_REGIONS)
@@ -7588,19 +7577,12 @@ impl ExecNtHandler {
             return vm_map.query_basic(page, USER_ADDRESS_LIMIT);
         }
 
-        if let Some(info) = process_committed_mapping_basic_information(target_pi as u64, page) {
-            return Ok(info);
-        }
-
         if let Some(info) = registered_frame_basic_information(target_pi, page) {
             return Ok(info);
         }
 
         let mut next = USER_ADDRESS_LIMIT;
         if let Some(candidate) = vm_map.next_extent_base_after(page) {
-            next = next.min(candidate);
-        }
-        if let Some(candidate) = generic_sections.next_view_base_after(target_pi, page) {
             next = next.min(candidate);
         }
         if procs[target_pi].img_end > PE_LOAD_BASE && PE_LOAD_BASE > page {
@@ -15670,7 +15652,23 @@ impl ExecNtHandler {
                                 page += 0x1000;
                             }
                             core::ptr::write(vm_map, *after);
+                            let _ =
+                                process_committed_mapping_unregister(target_pi as u64, view.base);
                             let _ = generic_sections.unmap_view(target_pi, view.base);
+                            return 0;
+                        }
+                    }
+                }
+                if let Some(ctx) = self.loop_ctx {
+                    let reg = &mut *ctx.reg;
+                    if let Some((slot, _)) = reg.dll_for_page(target_pi, base) {
+                        let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
+                        if reg.clear_mapped(target_pi, slot) {
+                            let _ = process_committed_mapping_unregister(
+                                target_pi as u64,
+                                image_base,
+                            );
+                            self.dbgk_module_unload(target_pi, image_base);
                             return 0;
                         }
                     }
@@ -18560,8 +18558,19 @@ impl ExecNtHandler {
                                 }
                             }
                         }
-                        reg.set_mapped(self.pi, i);
                         let ext = image_extent(cpe);
+                        reg.set_mapped(self.pi, i);
+                        if !process_committed_mapping_register(
+                            self.pi as u64,
+                            nt_address_space::VmCommittedRange::image(
+                                dbase,
+                                ext,
+                                nt_address_space::PAGE_EXECUTE_READ,
+                            ),
+                        ) {
+                            let _ = reg.clear_mapped(self.pi, i);
+                            return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                        }
                         csrss_out_write(self.pi as u64, get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
                         let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                         if vs_ptr != 0 {
@@ -18827,6 +18836,18 @@ impl ExecNtHandler {
                         section_offset,
                         view_protection,
                     ) {
+                        core::ptr::write(vm_map, *before);
+                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    if !process_committed_mapping_register(
+                        target_pi as u64,
+                        nt_address_space::VmCommittedRange::mapped(
+                            plan.base,
+                            plan.size,
+                            view_protection,
+                        ),
+                    ) {
+                        let _ = generic_sections.unmap_view(target_pi, plan.base);
                         core::ptr::write(vm_map, *before);
                         return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                     }

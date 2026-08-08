@@ -334,6 +334,17 @@ impl VmCommittedRange {
         }
     }
 
+    pub const fn image(base: u64, size: u64, protect: u32) -> Self {
+        Self {
+            base,
+            size,
+            allocation_base: base,
+            allocation_protect: PAGE_EXECUTE_WRITECOPY,
+            protect,
+            type_: MEM_IMAGE,
+        }
+    }
+
     pub fn end(self) -> u64 {
         self.base.saturating_add(self.size)
     }
@@ -409,6 +420,16 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         *slot = Some(range);
         self.normalize();
         Ok(())
+    }
+
+    pub fn unregister_base(&mut self, base: u64) -> Option<VmCommittedRange> {
+        let slot = self
+            .ranges
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|range| range.base == base))?;
+        let removed = slot.take();
+        self.normalize();
+        removed
     }
 
     pub fn query_basic(&self, address: u64) -> Option<VmBasicInformation> {

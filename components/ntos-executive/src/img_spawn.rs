@@ -21,6 +21,8 @@ pub(crate) static OUR_KI_USER_APC_DISPATCHER_RVA: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OUR_TP_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of ntdll's completion-only worker, hosted separately from the timer/wait scheduler.
 pub(crate) static OUR_TP_COMPLETION_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
+/// Page-aligned extent of the single hosted ntdll image mapped into every process.
+pub(crate) static OUR_NTDLL_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE
@@ -50,6 +52,20 @@ unsafe fn register_spawn_mapped_mapping(pi: u64, base: u64, size: u64, protect: 
     let _ = process_committed_mapping_register(
         pi,
         nt_address_space::VmCommittedRange::mapped(base, size, protect),
+    );
+}
+
+unsafe fn register_spawn_image_mapping(pi: u64, base: u64, size: u64) {
+    assert!(
+        process_committed_mapping_register(
+            pi,
+            nt_address_space::VmCommittedRange::image(
+                base,
+                size,
+                nt_address_space::PAGE_EXECUTE_READ,
+            ),
+        ),
+        "spawn image committed mapping table exhausted"
     );
 }
 
@@ -482,9 +498,13 @@ pub(crate) unsafe fn spawn_sec_image(
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, image_extent(pe));
+    let main_image_size = image_extent(pe);
+    let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, main_image_size);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
+    }
+    if setup_env {
+        register_spawn_image_mapping(pi, PE_LOAD_BASE, main_image_size);
     }
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
@@ -498,6 +518,11 @@ pub(crate) unsafe fn spawn_sec_image(
         let npt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
         let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
+        if setup_env {
+            let ntdll_image_size = OUR_NTDLL_IMAGE_SIZE.load(Ordering::Relaxed);
+            assert!(ntdll_image_size != 0, "hosted ntdll image size not published");
+            register_spawn_image_mapping(pi, ntdll_base, ntdll_image_size);
+        }
     }
     if setup_env {
         assert!(ensure_executive_paging(stack_mirror));
