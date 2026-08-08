@@ -1033,6 +1033,13 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
             type_: MEM_IMAGE,
         }
     );
+    assert_eq!(
+        table.image_allocation_for_page(0x8000_2123),
+        Some(VmImageAllocation {
+            allocation_base: 0x8000_0000,
+            allocation_end: 0x8000_3000,
+        })
+    );
     assert_eq!(table.unregister_base(0x8000_0000), Some(headers));
     assert!(table.query_basic(0x8000_0123).is_none());
     assert_eq!(
@@ -1041,6 +1048,7 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
     );
     assert_eq!(table.unregister_allocation_base(0x8000_0000), 1);
     assert!(table.query_basic(0x8000_1000).is_none());
+    assert_eq!(table.image_allocation_for_page(0x8000_1000), None);
     assert_eq!(table.range_count(), 1);
     assert_eq!(table.unregister_base(0x8000_1000), None);
 }

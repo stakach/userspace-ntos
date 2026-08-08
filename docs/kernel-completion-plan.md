@@ -205,10 +205,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    uses PE/global-DLL image query shortcuts, and DLL unmap removes all runs under the image
    allocation base. Boot proof `.tmp/boot-section-granular-image-views-20260809.log` is fully green
    at `291/291` with `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom`
-   green, and explorer shell chrome still painting `34873` non-background pixels. Continue the plan
-   from the remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener
-   special coordination, B3's real video/driver binding, C3 fault/protect ownership through the same
-   mapped-view authority, and D1/D2 mutable registry/filesystem authority.
+   green, and explorer shell chrome still painting `34873` non-background pixels. The follow-up C3
+   fault-owner slice now routes image page faults through the per-process committed image allocation
+   table; PE/global-DLL state only selects backing bytes after committed-view ownership is proven.
+   Hosted SEC_IMAGE VSpace creation also clears stale committed-view records so reused diagnostic
+   slots cannot leak prior address-space state into a live process. Boot proof
+   `.tmp/boot-committed-image-fault-owner-20260809-r2.log` is fully green at `291/291` with
+   `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
+   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
+   B3's real video/driver binding, C3 mapped-data dirty/writeback and mapped-image protect
+   ownership, C4 regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1615,3 +1622,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   still paints `34873` non-background pixels. Review adjustment: finish C3 by routing image fault
   ownership and mapped-image protect decisions through the same mapped-view authority, then add the
   C4 overlap/decommit/protect/view-teardown regression gates.
+
+- C3 committed image fault-owner slice. `VmCommittedRangeTable` now reports the image allocation that
+  owns a faulting page, including the allocation base and the highest committed image run for that
+  allocation. The executive demand-fault path uses that committed-view ownership before selecting
+  the backing PE bytes, eliminating direct main-image/ntdll/DLL page-range routing in the image fault
+  path. Hosted SEC_IMAGE spawn now resets the process committed-view table at fresh VSpace creation,
+  which removes stale ranges left by earlier diagnostic slots without allowing duplicate
+  registrations. Validation: `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-committed-image-fault-owner-20260809-r2.log`. Result: kernel specs pass,
+  the full executive gate is `291/291`, `committed-map=233/512`, `committed-map-fails=0`,
+  `exec_vm_pool_headroom` is green with `52069 KiB` root-Untyped free, and explorer shell chrome
+  still paints `34873` non-background pixels. Review adjustment: continue C3 with mapped data-section
+  dirty/writeback ownership and mapped-image protect semantics, then close the C4 regression gates.

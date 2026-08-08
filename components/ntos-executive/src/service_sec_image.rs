@@ -3650,11 +3650,11 @@ pub(crate) unsafe fn service_sec_image(
         );
         process_committed_mapping_reset(index);
     }
+    assert!(
+        img_spawn::register_image_committed_mappings(0, smss_pe, PE_LOAD_BASE),
+        "smss image committed mapping table exhausted after reset"
+    );
     if ntdll.is_some() {
-        assert!(
-            img_spawn::register_image_committed_mappings(0, smss_pe, PE_LOAD_BASE),
-            "smss image committed mapping table exhausted after reset"
-        );
         if let Some((ntdll_base, ntdll_pe)) = ntdll {
             assert!(
                 img_spawn::register_image_committed_mappings(0, ntdll_pe, ntdll_base),
@@ -5410,22 +5410,40 @@ pub(crate) unsafe fn service_sec_image(
                     park_and_log!(pi, b"section-fault", m0, addr);
                 }
             }
-            // Route to whichever image contains the faulting page.
-            let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
-                (PE_LOAD_BASE, pe)
-            } else if nt_base != 0 && page >= nt_base && page < nt_end {
-                ntfaults += 1;
-                (nt_base, ntdll.unwrap().1)
-            } else if let Some((i, _)) = if pi >= 1 {
-                reg.dll_for_page(pi, page)
-            } else {
-                None
-            } {
-                // A mapped registry DLL (csrsrv/basesrv/winsrv/Win32 stack) in a DLL-loading
-                // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from that DLL's
-                // parsed PE. csrsrv sits at its preferred ImageBase (no relocation); the others are
-                // loader-relocated to their fixed bases. The registry resolves which one owns the page.
-                (reg.base(i), dll_pes[i].as_ref().unwrap())
+            // Route image faults through the committed view table. The table proves that this
+            // process owns an image allocation at the faulting page; PE globals/registry state only
+            // identify the bytes used to fill that committed view.
+            let (base, img_hi, tpe) =
+                if let Some(image_owner) = process_committed_image_allocation(pi as u64, page) {
+                    let base = image_owner.allocation_base;
+                    let tpe = if base == PE_LOAD_BASE {
+                        pe
+                    } else if nt_base != 0 && base == nt_base {
+                        ntfaults += 1;
+                        ntdll.unwrap().1
+                    } else if let Some((i, _)) = if pi >= 1 {
+                        reg.dll_for_page(pi, base)
+                    } else {
+                        None
+                    } {
+                        // A mapped registry DLL (csrsrv/basesrv/winsrv/Win32 stack) in a DLL-loading
+                        // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from
+                        // that DLL's parsed PE. The committed view table resolves ownership; the
+                        // registry maps the allocation base to the parsed PE bytes.
+                        dll_pes[i].as_ref().unwrap()
+                    } else {
+                        print_str(b"[vmf-image-owner] no PE for committed image allocation pi=");
+                        print_u64(pi as u64);
+                        print_str(b" base=0x");
+                        print_hex((base >> 32) as u32);
+                        print_hex(base as u32);
+                        print_str(b" page=0x");
+                        print_hex((page >> 32) as u32);
+                        print_hex(page as u32);
+                        print_str(b"\n");
+                        park_and_log!(pi, b"image-owner", m0, addr)
+                    };
+                    (base, image_owner.allocation_end, tpe)
             } else {
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
@@ -5675,22 +5693,13 @@ pub(crate) unsafe fn service_sec_image(
             // preservation — so when the process resumes it finds the next pages already present and
             // does NOT re-fault them. This cuts the per-process round-trip count by ~BATCH×.
             //
-            // The `end` bound is the containing image's extent (main image → img_end; a registered
-            // DLL → base + image_size; ntdll → nt_end). Extra pages are only PRE-filled when they are
-            // genuinely unmapped in THIS process — a per-process page not yet in `filled_pages`, and a
-            // shared-text page not yet in the global `dll_cache` — so we never double-map. The
-            // FAULTING page (batch index 0) keeps the full original logic incl. the shared-cache HIT
-            // path; extra pages take the fresh-fill path (a shared page already cached is left to a
-            // normal later fault — correct, just unbatched).
-            let img_hi = if base == PE_LOAD_BASE {
-                img_end
-            } else if base == nt_base {
-                nt_end
-            } else if let Some((di, _)) = reg.dll_for_page(pi, page) {
-                reg.base(di) + reg.get(di).map(|d| d.image_size).unwrap_or(0)
-            } else {
-                base
-            };
+            // The `img_hi` bound comes from the committed image allocation that owns the faulting
+            // page. Extra pages are only PRE-filled when they are genuinely unmapped in THIS process
+            // — a per-process page not yet in `filled_pages`, and a shared-text page not yet in the
+            // global `dll_cache` — so we never double-map. The FAULTING page (batch index 0) keeps
+            // the full original logic incl. the shared-cache HIT path; extra pages take the fresh-fill
+            // path (a shared page already cached is left to a normal later fault — correct, just
+            // unbatched).
             // Prefetch a bounded forward window from the page the process actually touched. Whole-image
             // eager mapping made every untouched section resident and retained one root-CNode cap for
             // each scratch mapping plus one for each process mapping. A broad LSASS dependency scan

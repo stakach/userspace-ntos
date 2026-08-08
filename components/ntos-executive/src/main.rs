@@ -1472,6 +1472,19 @@ pub(crate) unsafe fn process_committed_mapping_basic_information(
     (*table).query_basic(page)
 }
 
+pub(crate) unsafe fn process_committed_image_allocation(
+    pi: u64,
+    page: u64,
+) -> Option<nt_address_space::VmImageAllocation> {
+    if pi as usize >= MAX_PI {
+        return None;
+    }
+    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
+        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    (*table).image_allocation_for_page(page)
+}
+
 pub(crate) unsafe fn process_committed_mapping_next_base_after(pi: u64, page: u64) -> Option<u64> {
     if pi as usize >= MAX_PI {
         return None;

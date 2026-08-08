@@ -541,6 +541,10 @@ pub(crate) unsafe fn spawn_sec_image(
     // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
     let _ = vspace_assign_asid(pml4);
+    // A newly allocated hosted VSpace owns a fresh NT committed-view table. Hosted slots are reused by
+    // early diagnostics and later live processes, so stale ranges must be cleared at the address-space
+    // creation boundary before spawn registers image and environment views.
+    process_committed_mapping_reset(pi as usize);
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();

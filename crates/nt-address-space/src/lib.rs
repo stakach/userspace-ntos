@@ -311,6 +311,12 @@ pub struct VmCommittedRange {
     pub type_: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmImageAllocation {
+    pub allocation_base: u64,
+    pub allocation_end: u64,
+}
+
 impl VmCommittedRange {
     pub const fn private(base: u64, size: u64, protect: u32) -> Self {
         Self {
@@ -461,6 +467,27 @@ impl<const N: usize> VmCommittedRangeTable<N> {
             .copied()
             .find(|range| range.contains(page))
             .map(|range| range.info_at(page))
+    }
+
+    pub fn image_allocation_for_page(&self, address: u64) -> Option<VmImageAllocation> {
+        let page = address & !(PAGE_SIZE - 1);
+        let allocation_base = self
+            .ranges
+            .iter()
+            .flatten()
+            .find(|range| range.type_ == MEM_IMAGE && range.contains(page))?
+            .allocation_base;
+        let allocation_end = self
+            .ranges
+            .iter()
+            .flatten()
+            .filter(|range| range.type_ == MEM_IMAGE && range.allocation_base == allocation_base)
+            .map(|range| range.end())
+            .max()?;
+        Some(VmImageAllocation {
+            allocation_base,
+            allocation_end,
+        })
     }
 
     pub fn next_base_after(&self, address: u64) -> Option<u64> {
