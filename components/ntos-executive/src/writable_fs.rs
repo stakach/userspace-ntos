@@ -420,6 +420,14 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
     (status, written)
 }
 
+/// `NtFlushBuffersFile` on a writable-volume file object.
+pub(crate) unsafe fn flush(file_id: u64) -> u32 {
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
+    };
+    fs.zw_flush_buffers_file(file_id)
+}
+
 /// `NtQueryInformationFile` metadata for a writable-volume file object.
 pub(crate) unsafe fn standard_information(file_id: u64) -> Option<nt_fs::StandardInformation> {
     writable_fs()?.zw_query_standard_information(file_id)

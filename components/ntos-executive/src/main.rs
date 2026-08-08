@@ -1636,6 +1636,7 @@ struct GenericSectionPage {
     section_index: usize,
     page_index: u64,
     frame: u64,
+    dirty: bool,
 }
 
 impl GenericSectionPage {
@@ -1645,6 +1646,7 @@ impl GenericSectionPage {
             section_index: usize::MAX,
             page_index: 0,
             frame: 0,
+            dirty: false,
         }
     }
 }
@@ -1837,11 +1839,59 @@ impl GenericSectionTable {
                     section_index,
                     page_index,
                     frame,
+                    dirty: false,
                 };
                 return true;
             }
         }
         false
+    }
+
+    pub(crate) fn mark_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
+        for page in &mut self.pages {
+            if page.live && page.section_index == section_index && page.page_index == page_index {
+                page.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn clear_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
+        for page in &mut self.pages {
+            if page.live && page.section_index == section_index && page.page_index == page_index {
+                page.dirty = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn next_dirty_page_for_view(
+        &self,
+        view: GenericSectionView,
+        section: GenericSection,
+    ) -> Option<(u64, u64, u64, usize)> {
+        let view_start = view.section_offset;
+        let view_end = view.section_offset.saturating_add(view.size);
+        for page in &self.pages {
+            if !page.live || !page.dirty || page.section_index != view.section_index {
+                continue;
+            }
+            let page_offset = page.page_index.saturating_mul(0x1000);
+            if page_offset < view_start || page_offset >= view_end {
+                continue;
+            }
+            let len = section
+                .size
+                .saturating_sub(page_offset)
+                .min(0x1000) as usize;
+            if len == 0 {
+                continue;
+            }
+            return Some((page.page_index, page.frame, page_offset, len));
+        }
+        None
     }
 }
 

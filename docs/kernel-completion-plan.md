@@ -218,10 +218,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    with the live committed protection, and the stale per-view protection field is gone. Boot proof
    `.tmp/boot-committed-mapped-protect-20260809.log` is fully green at `291/291` with
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
-   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
-   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, C3 mapped-data dirty/writeback ownership plus MEM_IMAGE
-   protect/COW semantics, C4 regressions, and D1/D2 mutable registry/filesystem authority.
+   shell chrome still painting `34873` non-background pixels. The current dirty/writeback slice adds
+   host-tested mapped-view write-fault policy, maps writable data-section pages read-only until a
+   real store fault promotes them, records dirty overlay-backed section pages beside the shared
+   frame, and writes those dirty pages back through the writable filesystem before generic view
+   teardown. Boot proof `.tmp/boot-generic-section-dirty-writeback-20260809.log` is fully green at
+   `291/291` with `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green,
+   and explorer shell chrome still painting `34873` non-background pixels. Continue the plan from
+   the remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
+   coordination, B3's real video/driver binding, a dedicated C4 overlay-backed mapped-writeback gate,
+   MEM_IMAGE protect/COW semantics, broader C4 regressions, and D1/D2 mutable registry/filesystem
+   authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1661,3 +1668,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   still paints `34873` non-background pixels. Review adjustment: remaining C3 work is mapped
   data-section dirty/writeback ownership plus MEM_IMAGE protect/COW semantics, then the C4
   overlap/decommit/protect/view-teardown regression gates.
+
+- C3 generic data-section dirty/writeback slice. `nt-address-space` now has a host-tested
+  `mapped_view_fault_plan` that maps write-through data views read-only on read faults and requests
+  dirty promotion on real write faults. The executive generic section fault path consumes the x86
+  page-fault write bit, promotes resident writable data-section pages to their committed protection
+  only after a write fault, and marks overlay-backed shared section frames dirty. Generic view
+  teardown now writes dirty overlay-backed section pages through `writable_fs::write`, flushes the
+  file object, and clears dirty state only after the write succeeds; failures return the real status
+  and leave the view mapped. `NtProtectVirtualMemory` for resident mapped views now installs the
+  read-only probe protection for write-through protections so later writes still take the dirty
+  path. Validation: `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-generic-section-dirty-writeback-20260809.log`. Result: kernel specs
+  pass, the full executive gate is `291/291`, `committed-map=233/512`,
+  `committed-map-fails=0`, `exec_vm_pool_headroom` is green with `52419 KiB` root-Untyped free, and
+  explorer shell chrome still paints `34873` non-background pixels. Review adjustment: add the
+  explicit C4 regression gate that maps an overlay-backed file, dirties bytes through the mapped
+  view, unmaps or flushes the view, and verifies the backing file bytes. After that, continue with
+  MEM_IMAGE protect/COW semantics and the remaining overlap/decommit/protect/view-teardown gates.

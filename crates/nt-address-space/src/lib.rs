@@ -325,6 +325,39 @@ pub struct VmCommittedProtectPlan {
     pub new_protection: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmMappedViewFaultPlan {
+    pub map_protection: u32,
+    pub mark_dirty: bool,
+}
+
+pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedViewFaultPlan {
+    let base = protection & 0xff;
+    let modifiers = protection & !0xff;
+    match base {
+        PAGE_READWRITE => VmMappedViewFaultPlan {
+            map_protection: if write_fault {
+                protection
+            } else {
+                PAGE_READONLY | modifiers
+            },
+            mark_dirty: write_fault,
+        },
+        PAGE_EXECUTE_READWRITE => VmMappedViewFaultPlan {
+            map_protection: if write_fault {
+                protection
+            } else {
+                PAGE_EXECUTE_READ | modifiers
+            },
+            mark_dirty: write_fault,
+        },
+        _ => VmMappedViewFaultPlan {
+            map_protection: protection,
+            mark_dirty: false,
+        },
+    }
+}
+
 impl VmCommittedRange {
     pub const fn private(base: u64, size: u64, protect: u32) -> Self {
         Self {

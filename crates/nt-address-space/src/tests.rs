@@ -1095,6 +1095,45 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
 }
 
 #[test]
+fn mapped_view_fault_plan_tracks_write_fault_promotion() {
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_READWRITE, false),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_READONLY,
+            mark_dirty: false,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_READWRITE, true),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_READWRITE,
+            mark_dirty: true,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_EXECUTE_READWRITE, false),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READ,
+            mark_dirty: false,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_EXECUTE_READWRITE | PAGE_GUARD, true),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READWRITE | PAGE_GUARD,
+            mark_dirty: true,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_WRITECOPY, true),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_WRITECOPY,
+            mark_dirty: false,
+        }
+    );
+}
+
+#[test]
 fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
     let mut table = VmCommittedRangeTable::<4>::new();
     assert_eq!(

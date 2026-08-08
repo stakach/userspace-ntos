@@ -7415,11 +7415,17 @@ impl ExecNtHandler {
                     if old.protect != new.protect
                         && csrss_frame_get_exact(target_pi as u64, page).0 != 0
                     {
+                        let old_page_protection =
+                            nt_address_space::mapped_view_fault_plan(old.protect, false)
+                                .map_protection;
+                        let new_page_protection =
+                            nt_address_space::mapped_view_fault_plan(new.protect, false)
+                                .map_protection;
                         if let Err(status) = vm_reprotect_private_page(
                             target_pi,
                             page,
-                            old.protect,
-                            new.protect,
+                            old_page_protection,
+                            new_page_protection,
                             target.pml4,
                         ) {
                             map_status = status;
@@ -7439,11 +7445,17 @@ impl ExecNtHandler {
                         if old.protect != new.protect
                             && csrss_frame_get_exact(target_pi as u64, page).0 != 0
                         {
+                            let old_page_protection =
+                                nt_address_space::mapped_view_fault_plan(old.protect, false)
+                                    .map_protection;
+                            let new_page_protection =
+                                nt_address_space::mapped_view_fault_plan(new.protect, false)
+                                    .map_protection;
                             let _ = vm_reprotect_private_page(
                                 target_pi,
                                 page,
-                                new.protect,
-                                old.protect,
+                                new_page_protection,
+                                old_page_protection,
                                 target.pml4,
                             );
                         }
@@ -15629,6 +15641,17 @@ impl ExecNtHandler {
                         generic_sections.view_for_page(target_pi, base)
                     {
                         if view.base == base {
+                            let writeback = match service_generic_section_writeback_view(
+                                generic_sections,
+                                view,
+                                ctx.scratch_base,
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(status) => return status,
+                            };
+                            if writeback != 0 {
+                                self.writable_fs_dirty = true;
+                            }
                             let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
                                 as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
                                 .add(target_pi);
