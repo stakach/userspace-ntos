@@ -64,7 +64,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   decommit, release, protect, query, and unmap semantics.
 - `[~]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
   and dirty writeback.
-- `[ ]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
+- `[~]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
   `MEM_TOP_DOWN`, guard/no-access faults, and view teardown.
 
 ### D. Registry And Filesystem Durability
@@ -224,11 +224,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
    frame, and writes those dirty pages back through the writable filesystem before generic view
    teardown. Boot proof `.tmp/boot-generic-section-dirty-writeback-20260809.log` is fully green at
    `291/291` with `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green,
-   and explorer shell chrome still painting `34873` non-background pixels. Continue the plan from
-   the remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
-   coordination, B3's real video/driver binding, a dedicated C4 overlay-backed mapped-writeback gate,
-   MEM_IMAGE protect/COW semantics, broader C4 regressions, and D1/D2 mutable registry/filesystem
-   authority.
+   and explorer shell chrome still painting `34873` non-background pixels. The follow-up C4 proof
+   now adds a dedicated overlay-backed mapped-section writeback gate: a post-quiesce selftest creates
+   a real writable-overlay file, attaches it to a generic data section, fills a real shared section
+   frame, marks that page dirty, runs the production `service_generic_section_writeback_view` path,
+   and requires read-back of the mapped-section payload through `exec_mapped_section_writeback`.
+   Boot proof `.tmp/boot-mapped-section-writeback-gate-20260809.log` is fully green at `292/292`:
+   `exec_mapped_section_writeback` passes with proof `0x7f/0x7f`, `22` bytes written and read back,
+   `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
+   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
+   B3's real video/driver binding, MEM_IMAGE protect/COW semantics, broader C4 regressions, and
+   D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns

@@ -3900,6 +3900,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     unsafe { winlogon_profile_copied_spec(passed) };
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
+    mapped_section_writeback_spec(passed);
     vm_pool_headroom_spec(passed);
     unsafe { teb_tail_protected_spec(passed) };
     unsafe { lsarpc_connection_worker_spec(passed) };
@@ -4917,6 +4918,28 @@ fn vspace_asid_unmap_spec(passed: &mut u64) {
             // … and across the whole boot no private map was refused and no unmap errored.
             && map_fails == 0
             && unmap_fails == 0,
+        passed,
+    );
+}
+
+fn mapped_section_writeback_spec(passed: &mut u64) {
+    let proof = MAPPED_SECTION_WRITEBACK_SELFTEST.load(Ordering::Relaxed);
+    let bytes = MAPPED_SECTION_WRITEBACK_BYTES.load(Ordering::Relaxed);
+    let status = MAPPED_SECTION_WRITEBACK_STATUS.load(Ordering::Relaxed) as u32;
+    print_str(b"[section-writeback] selftest=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(MAPPED_SECTION_WRITEBACK_ALL as u32);
+    print_str(b" bytes=");
+    print_u64(bytes);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    check(
+        b"exec_mapped_section_writeback",
+        proof == MAPPED_SECTION_WRITEBACK_ALL
+            && bytes == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64
+            && status == nt_fs::STATUS_SUCCESS,
         passed,
     );
 }
@@ -8378,6 +8401,23 @@ pub(crate) const VM_UNMAP_SELFTEST_CLEAN: u64 = 0x20;
 pub(crate) const VM_UNMAP_SELFTEST_ALL: u64 = 0x3f;
 pub(crate) static VM_UNMAP_SELFTEST: AtomicU64 = AtomicU64::new(0);
 
+// --- MAPPED-DATA SECTION WRITEBACK SELF-TEST ----------------------------------------------------
+const MAPPED_SECTION_WRITEBACK_CREATED: u64 = 0x01;
+const MAPPED_SECTION_WRITEBACK_SEEDED: u64 = 0x02;
+const MAPPED_SECTION_WRITEBACK_VIEW: u64 = 0x04;
+const MAPPED_SECTION_WRITEBACK_FRAME: u64 = 0x08;
+const MAPPED_SECTION_WRITEBACK_DIRTY: u64 = 0x10;
+const MAPPED_SECTION_WRITEBACK_WRITTEN: u64 = 0x20;
+const MAPPED_SECTION_WRITEBACK_READBACK: u64 = 0x40;
+const MAPPED_SECTION_WRITEBACK_ALL: u64 = 0x7f;
+static MAPPED_SECTION_WRITEBACK_RAN: AtomicBool = AtomicBool::new(false);
+static MAPPED_SECTION_WRITEBACK_SELFTEST: AtomicU64 = AtomicU64::new(0);
+static MAPPED_SECTION_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAPPED_SECTION_WRITEBACK_STATUS: AtomicU64 =
+    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+static mut MAPPED_SECTION_WRITEBACK_TABLE: GenericSectionTable = GenericSectionTable::new();
+const MAPPED_SECTION_WRITEBACK_PAYLOAD: &[u8] = b"section writeback data";
+
 /// Commit → decommit → RE-COMMIT one private page in a hosted process's VSpace, on the real
 /// `vm_map_private_page` / `vm_unmap_private_page` path, at a VA the VAD allocator never reaches
 /// (the very top of the private window — placements run upward from `SMSS_ALLOC_VA` and the boot's
@@ -8436,6 +8476,192 @@ pub(crate) unsafe fn private_vm_unmap_selftest(pi: usize, pml4: u64, scratch_bas
     print_hex(first as u32);
     print_str(b" second-frame=0x");
     print_hex(second as u32);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    const RELATIVE_PATH: &[u8] = b".mapped-section-writeback.bin";
+    const INITIAL: &[u8] = b"section writeback seed";
+    if scratch_base == 0
+        || MAPPED_SECTION_WRITEBACK_RAN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let mut proof = 0u64;
+    let mut status: u32;
+    let mut bytes_written = 0u64;
+    let mut frame = 0u64;
+    let mut file_id = 0u64;
+    let mut section_index = usize::MAX;
+    let table = &mut *core::ptr::addr_of_mut!(MAPPED_SECTION_WRITEBACK_TABLE);
+    table.reset();
+    let cleanup = |table: &mut GenericSectionTable,
+                   section_index: usize,
+                   frame: u64,
+                   file_id: u64| unsafe {
+        if section_index != usize::MAX {
+            table.clear_section(section_index);
+        }
+        if frame != 0 {
+            vm_frame_release(frame, 0);
+        }
+        if file_id != 0 {
+            crate::writable_fs::close(file_id);
+        }
+    };
+
+    let (create_status, created_file, _info) = crate::writable_fs::create(
+        RELATIVE_PATH,
+        nt_fs::FILE_READ_DATA | nt_fs::FILE_WRITE_DATA,
+        0,
+        0,
+        nt_fs::FILE_OVERWRITE_IF,
+        nt_fs::FILE_NON_DIRECTORY_FILE,
+    );
+    status = create_status;
+    let Some(created_file_id) = created_file else {
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    };
+    file_id = created_file_id;
+    proof |= MAPPED_SECTION_WRITEBACK_CREATED;
+
+    let (seed_status, seeded) = crate::writable_fs::write(file_id, Some(0), INITIAL);
+    status = seed_status;
+    if seed_status != nt_fs::STATUS_SUCCESS || seeded != INITIAL.len() {
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    proof |= MAPPED_SECTION_WRITEBACK_SEEDED;
+
+    let Some(created_section) = table.create(
+        0,
+        0,
+        MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64,
+        nt_address_space::PAGE_READWRITE,
+        GenericSectionBacking::overlay(file_id),
+    ) else {
+        status = STATUS_UNSUCCESSFUL;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    };
+    section_index = created_section;
+    let view_base = PRIVATE_VM_LIMIT - 0x20_0000;
+    if !table.map_view(0, section_index, view_base, 0x1000, 0) {
+        status = STATUS_UNSUCCESSFUL;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    let Some((_view_section, view)) = table.view_for_page(0, view_base) else {
+        status = STATUS_UNSUCCESSFUL;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    };
+    proof |= MAPPED_SECTION_WRITEBACK_VIEW;
+
+    match vm_frame_acquire(scratch_base) {
+        Ok(acquired) => frame = acquired,
+        Err(error) => {
+            status = error;
+            cleanup(table, section_index, frame, file_id);
+            MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+            MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+            MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+            return;
+        }
+    }
+    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x5000;
+    if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        status = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    core::ptr::copy_nonoverlapping(
+        MAPPED_SECTION_WRITEBACK_PAYLOAD.as_ptr(),
+        scratch as *mut u8,
+        MAPPED_SECTION_WRITEBACK_PAYLOAD.len(),
+    );
+    let _ = page_unmap_r(frame);
+    if !table.set_page_frame(section_index, 0, frame) {
+        status = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    proof |= MAPPED_SECTION_WRITEBACK_FRAME;
+    if !table.mark_page_dirty(section_index, 0) {
+        status = STATUS_UNSUCCESSFUL;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    proof |= MAPPED_SECTION_WRITEBACK_DIRTY;
+
+    match service_generic_section_writeback_view(table, view, scratch_base) {
+        Ok(written) => {
+            bytes_written = written;
+            if written == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64 {
+                proof |= MAPPED_SECTION_WRITEBACK_WRITTEN;
+            }
+        }
+        Err(error) => {
+            status = error;
+            cleanup(table, section_index, frame, file_id);
+            MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+            MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+            MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+            return;
+        }
+    }
+    let (read_status, read_back) = crate::writable_fs::read(
+        file_id,
+        Some(0),
+        MAPPED_SECTION_WRITEBACK_PAYLOAD.len(),
+    );
+    status = read_status;
+    if read_status == nt_fs::STATUS_SUCCESS
+        && read_back.as_slice() == MAPPED_SECTION_WRITEBACK_PAYLOAD
+    {
+        proof |= MAPPED_SECTION_WRITEBACK_READBACK;
+    }
+
+    cleanup(table, section_index, frame, file_id);
+    MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+    MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+    MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+    print_str(b"[section-writeback-selftest] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(MAPPED_SECTION_WRITEBACK_ALL as u32);
+    print_str(b" bytes=");
+    print_u64(bytes_written);
+    print_str(b" status=0x");
+    print_hex(status);
     print_str(b"\n");
 }
 

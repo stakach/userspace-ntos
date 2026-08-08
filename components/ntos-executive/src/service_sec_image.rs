@@ -12799,6 +12799,7 @@ pub(crate) unsafe fn service_sec_image(
             procs[logon_pi].pml4,
             procs[logon_pi].scratch_base,
         );
+        crate::mapped_section_writeback_selftest(procs[logon_pi].scratch_base);
     } else {
         print_str(b"[private-vm] no runtime-registered interactive logon process -> skipped\n");
     }
