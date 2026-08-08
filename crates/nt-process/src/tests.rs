@@ -2,6 +2,35 @@ use super::*;
 use nt_driver_test_fixtures::{minimal_pe, DEFAULT_IMAGE_BASE};
 
 #[test]
+fn client_ids_are_handle_shaped_and_globally_unique() {
+    let mut pm = ProcessManager::new();
+    let first_pid = pm.create_process("first.exe", None, None);
+    let second_pid = pm.create_process("second.exe", Some(first_pid), None);
+    let first_tid = pm.create_thread(first_pid, 0x1000, 0, false).unwrap();
+    let second_tid = pm.create_thread(second_pid, 0x2000, 0, false).unwrap();
+    let third_pid = pm.create_process("third.exe", Some(second_pid), None);
+    let third_tid = pm.create_thread(third_pid, 0x3000, 0, false).unwrap();
+
+    let ids = [
+        first_pid, second_pid, first_tid, second_tid, third_pid, third_tid,
+    ];
+    assert_eq!(ids, [4, 8, 12, 16, 20, 24]);
+    assert!(ids
+        .iter()
+        .all(|id| *id != 0 && *id % CLIENT_ID_GRANULARITY == 0));
+    for (index, id) in ids.iter().enumerate() {
+        assert!(!ids[index + 1..].contains(id));
+    }
+    assert_eq!(
+        pm.client_id(second_tid),
+        Some(ClientId {
+            unique_process: second_pid,
+            unique_thread: second_tid
+        })
+    );
+}
+
+#[test]
 fn process_thread_lifecycle_and_signal() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("test.exe", None, None);
@@ -1589,26 +1618,6 @@ fn protected_handle_close_fails_without_releasing_slot() {
 
     assert_eq!(pm.take_handle(pid, handle), Ok(object));
     assert_eq!(pm.lookup_handle(pid, handle), None);
-}
-
-#[test]
-fn append_only_handles_never_recycle_a_closed_value() {
-    // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
-    // executive's per-process DLL registry relies on (a recycled value would collide with a stale
-    // external binding to the old handle). Contrast `reserved_handle_table_never_reallocates`,
-    // which asserts the DEFAULT reuse behavior.
-    let mut pm = ProcessManager::new();
-    pm.set_handle_no_reuse(true);
-    let pid = pm.create_process("host.exe", None, None);
-    let h0 = pm.insert_handle(pid, HandleObject::Opaque(1), 0).unwrap();
-    let h1 = pm.insert_handle(pid, HandleObject::Opaque(2), 0).unwrap();
-    assert_eq!((h0, h1), (4, 8));
-    pm.close_handle(pid, 4).unwrap();
-    assert_eq!(pm.lookup_handle(pid, 4), None);
-    // The next insert APPENDS (value 12) — it does NOT recycle the freed value 4.
-    let h2 = pm.insert_handle(pid, HandleObject::Opaque(3), 0).unwrap();
-    assert_eq!(h2, 12);
-    assert_eq!(pm.lookup_handle(pid, 12), Some(HandleObject::Opaque(3)));
 }
 
 #[test]

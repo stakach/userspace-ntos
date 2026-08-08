@@ -117,7 +117,23 @@ pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
 
+/// NT client ids are handle-shaped values: non-zero multiples of four. ReactOS GDI also stores
+/// low-bit metadata in owner fields and masks it before comparing against `PsGetCurrentProcessId`.
+pub const CLIENT_ID_GRANULARITY: u32 = 4;
+const FIRST_CLIENT_ID: u32 = CLIENT_ID_GRANULARITY;
+
 pub const THREAD_USER_APC_QUEUE_CAP: usize = 16;
+
+#[inline]
+fn allocate_client_id(next: &mut u32) -> u32 {
+    let id = *next;
+    debug_assert!(id != 0);
+    debug_assert_eq!(id % CLIENT_ID_GRANULARITY, 0);
+    *next = id
+        .checked_add(CLIENT_ID_GRANULARITY)
+        .expect("nt-process ClientId space exhausted");
+    id
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserApc {
@@ -638,19 +654,10 @@ pub struct ProcessManager {
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     sections: Vec<Option<ImageSection>>,
-    next_pid: u32,
-    next_tid: u32,
+    next_cid: u32,
     next_asid: u32,
     /// win32k's registered callouts (`PsEstablishWin32Callouts`), once attached.
     win32_callouts: Option<Win32Callouts>,
-    /// When set, [`insert_handle`](Self::insert_handle) never reuses a freed (`None`) slot — it
-    /// always appends, so a process's handle VALUES stay **monotonic** for the lifetime of the run
-    /// (a closed value is never handed out again). A host that hands its returned dense values back
-    /// to a foreign process AND indexes external state by those values (e.g. the ntos executive's
-    /// per-process DLL registry) needs this: NT-style slot reuse would recycle a value while stale
-    /// external bindings to the old value still exist, mis-routing the next open. Default `false`
-    /// (real NT reuses freed handle slots). Path 1b of the nt-process convergence.
-    no_reuse: bool,
     /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
     dbgk: DebugObjectStore,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
@@ -669,8 +676,7 @@ pub struct ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         ProcessManager {
-            next_pid: 4, // pid 0=idle, 4=System by convention
-            next_tid: 4,
+            next_cid: FIRST_CLIENT_ID, // cid 0 is reserved; 4 is System by convention.
             next_asid: 1,
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
@@ -742,8 +748,7 @@ impl ProcessManager {
         parent: Option<ProcessId>,
         image_section: Option<SectionId>,
     ) -> ProcessId {
-        let pid = self.next_pid;
-        self.next_pid += 1;
+        let pid = allocate_client_id(&mut self.next_cid);
         let asid = self.next_asid;
         self.next_asid += 1;
         let state = if image_section.is_some() {
@@ -802,13 +807,6 @@ impl ProcessManager {
                 proc.handles.reserve(capacity - proc.handles.capacity());
             }
         }
-    }
-
-    /// Set append-only handle allocation (see the [`no_reuse`](ProcessManager) field): when `true`,
-    /// [`insert_handle`](Self::insert_handle) never reuses a freed slot, so per-process handle
-    /// VALUES stay monotonic (a closed value is never handed out again).
-    pub fn set_handle_no_reuse(&mut self, no_reuse: bool) {
-        self.no_reuse = no_reuse;
     }
 
     /// `pid`'s current handle-table capacity (reserved slots) — for a host to check headroom.
@@ -1022,8 +1020,7 @@ impl ProcessManager {
         if matches!(proc.state, ProcessState::Exiting | ProcessState::Terminated) {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
-        let tid = self.next_tid;
-        self.next_tid += 1;
+        let tid = allocate_client_id(&mut self.next_cid);
         proc.threads.insert(tid);
         if proc.main_thread.is_none() {
             proc.main_thread = Some(tid);
@@ -2644,11 +2641,7 @@ impl ProcessManager {
                 granted_access,
                 flags: HandleFlags::default(),
             };
-            let free = if self.no_reuse {
-                None // append-only: never recycle a freed value (see `no_reuse`)
-            } else {
-                proc.handles.iter().position(|e| e.is_none())
-            };
+            let free = proc.handles.iter().position(|e| e.is_none());
             match free {
                 Some(i) => {
                     proc.handles[i] = Some(entry);

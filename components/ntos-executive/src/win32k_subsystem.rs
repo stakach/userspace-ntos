@@ -351,6 +351,20 @@ pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
 /// does `ObReferenceObjectByHandle(hPowerRequestEvent, *ExEventObjectType)`; the dispatch loop
 /// materializes real typed `Event` objects for the two event-handle args (see `dispatch_loop`).
 pub const SSN_NT_USER_INITIALIZE_REAL: u64 = 0x125A;
+const SSN_GDI_CREATE_COMPATIBLE_BITMAP: u64 = 0x104A;
+const SSN_GDI_CREATE_COMPATIBLE_DC: u64 = 0x1054;
+const SSN_GDI_CREATE_BITMAP: u64 = 0x106C;
+const SSN_GDI_CREATE_DIB_SECTION: u64 = 0x109B;
+const SSN_GDI_CREATE_DIBITMAP_INTERNAL: u64 = 0x10A0;
+const SSN_GDI_OPEN_DCW: u64 = 0x10DE;
+const GDI_HANDLE_TYPE_MASK: u32 = 0x007f_0000;
+const GDI_HANDLE_BASETYPE_MASK: u32 = 0x001f_0000;
+const GDI_ENTRY_PROCESS_ID_OFF: u64 = 0x08;
+const GDI_ENTRY_TYPE_OFF: u64 = 0x0C;
+const GDI_ENTRY_USER_DATA_OFF: u64 = 0x10;
+const GDI_ENTRY_UPPER_SHIFT: u32 = 16;
+const GDI_OBJECT_TYPE_DC: u32 = 0x0001_0000;
+const GDI_OBJECT_TYPE_BITMAP: u32 = 0x0005_0000;
 
 /// Fix (B) self-test SSN — a SYNTHETIC dispatch (well outside win32k's real 740-entry SSDT) whose
 /// handler deliberately READS an un-demand-paged data page in this component's VSpace. The read
@@ -407,6 +421,7 @@ const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
 /// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
 /// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
@@ -6996,6 +7011,81 @@ unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u
     flush() as u32 as u64
 }
 
+fn expected_gdi_return_type(ssn: u64) -> Option<u32> {
+    match ssn {
+        SSN_GDI_OPEN_DCW | SSN_GDI_CREATE_COMPATIBLE_DC => Some(GDI_OBJECT_TYPE_DC),
+        SSN_GDI_CREATE_COMPATIBLE_BITMAP
+        | SSN_GDI_CREATE_BITMAP
+        | SSN_GDI_CREATE_DIB_SECTION
+        | SSN_GDI_CREATE_DIBITMAP_INTERNAL => Some(GDI_OBJECT_TYPE_BITMAP),
+        _ => None,
+    }
+}
+
+unsafe fn observe_gdi_handle_return(ssn: u64, handle: u64) {
+    let Some(expected_type) = expected_gdi_return_type(ssn) else {
+        return;
+    };
+    if handle == 0 {
+        return;
+    }
+
+    let table_base = read_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *const u64);
+    let table_size = read_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *const u64);
+    let index = handle & (GDI_HANDLE_COUNT - 1);
+    let offset = index * GDI_TABLE_ENTRY_SIZE;
+    if table_base == 0 || offset + GDI_TABLE_ENTRY_SIZE > table_size {
+        return;
+    }
+
+    let entry = table_base + offset;
+    let entry_pid = read_volatile((entry + GDI_ENTRY_PROCESS_ID_OFF) as *const u32);
+    let entry_type = read_volatile((entry + GDI_ENTRY_TYPE_OFF) as *const u32);
+    let user_data = read_volatile((entry + GDI_ENTRY_USER_DATA_OFF) as *const u64);
+    let handle_type = (handle as u32) & GDI_HANDLE_TYPE_MASK;
+    let gdi32_entry_type = entry_type.wrapping_shl(GDI_ENTRY_UPPER_SHIFT) & GDI_HANDLE_TYPE_MASK;
+    let current_pid = WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed) as u32;
+    let owner_pid = entry_pid & !1;
+    let type_ok = handle_type == expected_type
+        && gdi32_entry_type == expected_type
+        && (entry_type & GDI_HANDLE_BASETYPE_MASK) == (expected_type & GDI_HANDLE_BASETYPE_MASK);
+    let owner_ok = owner_pid == current_pid;
+    let user_data_ok = expected_type != GDI_OBJECT_TYPE_DC || user_data != 0;
+    let mismatch = !type_ok || !owner_ok || !user_data_ok;
+    if !mismatch {
+        return;
+    }
+
+    let pi = current_client_index();
+    let mismatch_trace = WIN32K_GDI_HANDLE_MISMATCH_TRACES.fetch_add(1, Ordering::Relaxed);
+    if mismatch_trace >= 64 {
+        return;
+    }
+
+    print_str(b"[gdi-entry] ssn=0x");
+    print_hex(ssn as u32);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" pid=0x");
+    print_hex(current_pid);
+    print_str(b" h=0x");
+    print_hex(handle as u32);
+    print_str(b" idx=0x");
+    print_hex(index as u32);
+    print_str(b" htype=0x");
+    print_hex(handle_type);
+    print_str(b" etype=0x");
+    print_hex(entry_type);
+    print_str(b" gdi32-type=0x");
+    print_hex(gdi32_entry_type);
+    print_str(b" owner=0x");
+    print_hex(entry_pid);
+    print_str(b" user=0x");
+    print_hex((user_data >> 32) as u32);
+    print_hex(user_data as u32);
+    print_str(b" BAD\n");
+}
+
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
 /// invoke its handler with the correct win64 register/stack args. Returns the pointer-width handler
 /// result (or `STATUS_INVALID_SYSTEM_SERVICE` in the low 32 bits if the SSN is invalid).
@@ -7327,6 +7417,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         _ => return STATUS_INVALID_SYSTEM_SERVICE,
     };
+    observe_gdi_handle_return(ssn, ret);
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
     //
     // ROOT CAUSE (instruction-confirmed, NtUserSwitchDesktop RVA 0x6c2f8/0x6c579): winlogon's switch is

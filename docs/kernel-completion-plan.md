@@ -144,11 +144,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
    syscall reply is suppressed while the APC context carries `STATUS_USER_APC`. The old fixed
    object-namespace ceiling is also gone: object entries now grow by checked reserve, so late debug
    objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
-   slots. The latest FSD transport cleanup moves past the profile hive/user shell activation
-   regression again, but the current frontier is explorer shell chrome after genuine explorer spawn:
-   `NtQueryInformationProcess` progress, register-window-message capture, both shell COM classes, and
-   paint begin/end proof need real behavior rather than fallback gates. Continue from the larger
-   completion plan rather than adding more boot-frontier special cases.
+   slots. The latest FSD transport and handle-lifetime cleanup moves past the profile hive/user
+   shell activation regression and the explorer icon/image-list wall again. Explorer now captures
+   register-window messages, serves all required shell COM classes, redirects real api0 callbacks,
+   installs WndProcs from client code, produces direct GDI returns, and leaves a wide non-background
+   framebuffer span. The current frontier is the strict shell chrome paint lifecycle: explorer
+   reports `BeginPaint`/`EndPaint` as `17/16`, so the remaining work is the one unmatched paint
+   completion or stale paint accounting, not a fallback shell/COM/imagelist route. Continue from the
+   larger completion plan rather than adding more boot-frontier special cases.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1376,3 +1379,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   not solved by BMI staging; continue at explorer's failed small `IDI_SHELL_DOCUMENT` load,
   invalid image list, missing register-window-message capture, second shell COM class open, and
   absent explorer paint begin/end proof.
+- ClientId and handle-lifetime cleanup. `nt-process` now allocates process and thread ClientIds from
+  one NT handle-shaped namespace: non-zero multiples of four shared between PIDs and TIDs. This
+  matches the owner-id shape ReactOS GDI expects after masking low metadata bits. The executive no
+  longer enables the old append-only per-process handle allocator; handle slots can be reused like
+  NT, and the DLL registry now clears process-local file/section handle bindings after a successful
+  `NtClose` so recycled handle values cannot resolve through stale DLL state. A bounded mismatch-only
+  GDI handle-table observer remains to catch future owner/type regressions without normal success
+  spam. Validation: `cargo fmt --all`, `cargo test -p nt-dll-registry`,
+  `cargo test -p nt-process`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and boot proof
+  `.tmp/boot-handle-reuse-20260808.log`. Result: the previous GDI owner mismatch, `IDI_SHELL_DOCUMENT`
+  load failure, invalid image list, and allocator panic are gone. Explorer captures three register
+  window messages, serves all required shell COM classes, reaches `BeginPaint`/`EndPaint` at `17/16`,
+  produces 54 direct GDI returns, flushes 112 batch records, and leaves 34873 non-background
+  framebuffer pixels over a full-width lower-screen span. The run exits normally at `286/291`; the
+  remaining desktop frontier is the unmatched explorer paint completion that keeps
+  `exec_explorer_shell_chrome_painted` red, plus the pre-existing callback/dead-client/LSA-worker
+  accounting gates.

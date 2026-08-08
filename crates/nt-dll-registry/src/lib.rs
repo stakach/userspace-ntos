@@ -299,6 +299,21 @@ impl Registry {
         }
     }
 
+    /// Clear a closed NtOpenFile handle from process `pi`'s DLL bindings. This deliberately does
+    /// not grow the per-pi store: closing an unknown handle must be a read-only miss.
+    pub fn clear_file_handle(&mut self, pi: usize, handle: u64) -> Option<usize> {
+        if handle == 0 {
+            return None;
+        }
+        for (i, d) in self.dlls.iter_mut().enumerate() {
+            if d.file_handle.get(pi).copied() == Some(handle) {
+                d.file_handle[pi] = 0;
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// The DLL a (non-zero) file handle belongs to, **within process `pi`'s handle namespace**.
     /// The same handle VALUE in a different process is a different handle, so the lookup is scoped
     /// to `pi` and never matches another process's identical value.
@@ -325,6 +340,21 @@ impl Registry {
         if let Some(d) = self.dlls.get_mut(i) {
             *slot_mut(&mut d.section_handle, pi) = handle;
         }
+    }
+
+    /// Clear a closed NtCreateSection handle from process `pi`'s DLL bindings without extending any
+    /// per-pi vectors for handles that were never recorded.
+    pub fn clear_section_handle(&mut self, pi: usize, handle: u64) -> Option<usize> {
+        if handle == 0 {
+            return None;
+        }
+        for (i, d) in self.dlls.iter_mut().enumerate() {
+            if d.section_handle.get(pi).copied() == Some(handle) {
+                d.section_handle[pi] = 0;
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// The DLL a (non-zero) section handle belongs to, **within process `pi`'s handle namespace**.
@@ -565,9 +595,15 @@ mod tests {
         r.set_file_handle(1, 1, 0x5a5a_0007); // csrss (pi 1) opens basesrv
         assert_eq!(r.index_for_file(1, 0x5a5a_0007), Some(1));
         assert_eq!(r.index_for_file(1, 0x1234), None);
+        assert_eq!(r.clear_file_handle(1, 0x5a5a_0007), Some(1));
+        assert_eq!(r.index_for_file(1, 0x5a5a_0007), None);
+        assert_eq!(r.clear_file_handle(1, 0x5a5a_0007), None);
         r.set_section_handle(1, 1, 0x5a5a_0009);
         assert_eq!(r.index_for_section(1, 0x5a5a_0009), Some(1));
         assert_eq!(r.index_for_section(1, 0), None);
+        assert_eq!(r.clear_section_handle(1, 0x5a5a_0009), Some(1));
+        assert_eq!(r.index_for_section(1, 0x5a5a_0009), None);
+        assert_eq!(r.clear_section_handle(1, 0x5a5a_0009), None);
     }
 
     #[test]
@@ -624,6 +660,28 @@ mod tests {
         assert_eq!(r.index_for_file(0, 0x1000 + 23), None);
         // Unset dll/pi combos still read 0.
         assert_eq!(r.file_handle(23, 1), 0); // pi 23 never opened basesrv (dll 1)
+    }
+
+    #[test]
+    fn cleared_handles_do_not_poison_reused_handle_values() {
+        let mut r = seeded();
+
+        r.set_file_handle(1, 0, 0x4);
+        assert_eq!(r.index_for_file(1, 0x4), Some(0));
+        assert_eq!(r.clear_file_handle(1, 0x4), Some(0));
+        assert_eq!(r.index_for_file(1, 0x4), None);
+
+        r.set_file_handle(1, 2, 0x4);
+        assert_eq!(r.index_for_file(1, 0x4), Some(2));
+        assert_eq!(r.index_for_section(1, 0x4), None);
+
+        r.set_section_handle(1, 1, 0x8);
+        assert_eq!(r.index_for_section(1, 0x8), Some(1));
+        assert_eq!(r.clear_section_handle(1, 0x8), Some(1));
+        assert_eq!(r.index_for_section(1, 0x8), None);
+
+        r.set_section_handle(1, 0, 0x8);
+        assert_eq!(r.index_for_section(1, 0x8), Some(0));
     }
 
     #[test]

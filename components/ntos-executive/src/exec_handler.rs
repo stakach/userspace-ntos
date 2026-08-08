@@ -687,7 +687,6 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3] =
         [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
 
-    pm.set_handle_no_reuse(true);
     pm.reserve_modules(64);
     PM_PROC_COUNT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
@@ -3493,17 +3492,10 @@ impl ExecNtHandler {
         Ok(child_pi)
     }
     /// Mint an executive handle for the CURRENT process (`self.pi`) and record it in that process's
-    /// real EPROCESS handle table (path 1 of the nt-process convergence). Behaviour-preserving: the
-    /// returned VALUE is still the global monotonic `next_handle` (so the reg/LPC/win32k consumers
-    /// that match on handle values are unchanged), but the durable per-process table now OWNS the
-    /// handle — tagged with the value in a `HandleObject::Opaque` so `NtClose` can free it. Capacity
-    /// growth is centralized in [`insert_process_handle`], which pins the bump-heap mark before reset.
+    /// real EPROCESS handle table. The returned value is the process-local NT handle
+    /// (`(slot + 1) * 4`); consumers that need side state must key it by process and clear it on the
+    /// matching successful `NtClose`.
     pub(crate) fn mint_handle(&mut self) -> u64 {
-        // Path 1b: return the process-LOCAL dense value the EPROCESS handle table allocates
-        // (real NT `(slot+1)*4`), not a global monotonic value. Two processes each get their own
-        // 0x4, 0x8, … namespace; cross-process collisions are resolved by the per-pi-keyed
-        // consumers (DLL registry) + pi-scoped scalar comparisons. Append-only (no_reuse) keeps
-        // each value monotonic for the run so external bindings never see a recycled value.
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
             if let Ok(h) = self.insert_process_handle(pid, nt_process::HandleObject::Opaque(0), 0) {
                 return h as u64;
@@ -11109,14 +11101,12 @@ impl ExecNtHandler {
         _out: &mut alloc::vec::Vec<u8>,
     ) -> u32 {
         match ctx.service {
-            // NtClose(Handle[R10]=args[0]): free the handle in the caller's REAL EPROCESS handle
-            // table by its SLOT (path 1b — the value IS the dense per-process table handle now, so
-            // close by value directly; no value-tag scan). Append-only allocation means the freed
-            // slot is NOT recycled, so a later open never reuses a closed value (keeping external
-            // bindings — the per-pi DLL registry — consistent). Handles explicitly marked
-            // protect-from-close now fail like NT; a close of a handle the executive doesn't own
-            // stays benign for the hosted boot path. A win32k USER-object handle is closed through
-            // that owning table so a duplicated desktop handle has an independent lifetime.
+            // NtClose(Handle[R10]=args[0]): free the caller's real EPROCESS handle-table slot. The
+            // slot may be reused by a later open, so process-scoped side maps clear their binding
+            // only after the owning handle successfully closes. Handles explicitly marked
+            // protect-from-close fail like NT; a close of a handle the executive doesn't own stays
+            // benign for the hosted boot path. A win32k USER-object handle is closed through that
+            // owning table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
                 let mut closed = false;
                 if let Some(loop_ctx) = self.loop_ctx {
@@ -11128,6 +11118,15 @@ impl ExecNtHandler {
                     match self.close_process_handle_checked(pid, args[0]) {
                         Ok(was_closed) => closed = was_closed,
                         Err(status) => return status,
+                    }
+                }
+                if closed {
+                    if let Some(loop_ctx) = self.loop_ctx {
+                        unsafe {
+                            let reg = &mut *loop_ctx.reg;
+                            let _ = reg.clear_file_handle(self.pi, args[0]);
+                            let _ = reg.clear_section_handle(self.pi, args[0]);
+                        }
                     }
                 }
                 if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
