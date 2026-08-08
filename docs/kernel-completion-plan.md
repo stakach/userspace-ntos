@@ -58,9 +58,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### C. Memory Manager And VAD Correctness
 
-- `[ ]` C1: Compare live executive `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`,
+- `[~]` C1: Compare live executive `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`,
   `NtProtectVirtualMemory`, `NtMapViewOfSection`, and fault handling with `nt-address-space`.
-- `[ ]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
+- `[~]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
   decommit, release, protect, query, and unmap semantics.
 - `[ ]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
   and dirty writeback.
@@ -168,9 +168,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `win32k_dispatch_loop_roundtrip`, `win32k_dispatch_fault_via_reply_cap`,
    `exec_vm_pool_headroom`, `exec_desktop_shell_frontier`, and
    `exec_explorer_shell_chrome_painted` all pass, with no stale or unregistered user-callback
-   requests. Continue the plan from the remaining structural debt rather than shell-paint
-   scaffolding: A4's SCM pipe/listener special coordination, B3's real video/driver binding, C1/C2
-   VAD correctness, and D1/D2 mutable registry/filesystem authority.
+  requests. The next C1/C2 slice replaces the old `NtProtectVirtualMemory` success shim with a real
+  private-memory path: ReactOS-compatible argument validation, process-handle access checks,
+  committed-range validation, old-protect/base/size writeback, and seL4 page-right reprotection.
+  The first real implementation exposed that protection changes must be modeled as PTE-level state,
+  not VAD extent splits. `nt-address-space` now keeps private allocation/commit extents separate
+  from per-page protection overrides, clears overrides on release/decommit/recommit, and the
+  executive pool census tracks those overrides as `prot-ovr`. Boot proof
+  `.tmp/boot-pte-protect-overrides-20260808.log` is fully green at `291/291`: `exec_vm_pool_headroom`
+  passes with `vad=40/64`, `prot-ovr=9/128`, and `51631 KiB` root-Untyped free, while genuine
+  explorer shell chrome still paints `34873` non-background pixels. Continue the plan from the
+  remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
+  coordination, B3's real video/driver binding, the rest of C1/C2/C3 VAD and section-view
+  correctness, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1480,3 +1490,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   registry-full, or unregistered user-callback request warnings. Review adjustment: the shell/frontier
   gates are green; continue with the remaining structural plan items instead of adding paint-path
   scaffolding.
+- Private `NtProtectVirtualMemory` and PTE-style protection overrides. `nt-address-space` now
+  validates ReactOS `NtProtectVirtualMemory` protection arguments, rejects private write-copy
+  protects, requires the protected range to be committed within one allocation, returns the first
+  page's old effective protection, and records protection changes as per-page overrides rather than
+  splitting allocation/commit extents. The executive syscall now probes/writes the real out
+  parameters, resolves the target process with `PROCESS_VM_OPERATION`, remaps changed private pages
+  with seL4 rights, rolls back on remap failure, and tracks override high-water in the pool census.
+  Validation: `cargo test -p nt-address-space`, `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-pte-protect-overrides-20260808.log`. Result: the full executive gate is
+  `291/291`; the prior VAD-fragmentation red gate is gone with `vad=40/64`, `prot-ovr=9/128`,
+  `exec_vm_pool_headroom` green, and explorer shell chrome still paints `34873` non-background
+  pixels. Review adjustment: continue C1/C2 with query/protect coverage for mapped section views and
+  the larger C3 move of image/data section views into the VAD/fault model.

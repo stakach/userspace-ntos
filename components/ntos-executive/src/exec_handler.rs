@@ -7274,12 +7274,20 @@ impl ExecNtHandler {
         memory: SyscallUserMemory,
     ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
         let base_ptr = args[1];
         let size_ptr = args[2];
+        let new_protection = args[3] as u32;
         let oldprot_ptr = args[4];
+        if let Err(status) = nt_address_space::validate_protect_parameters(new_protection) {
+            return status;
+        }
         if !self.user_memory_probe_output(memory, base_ptr, 8)
             || !self.user_memory_probe_output(memory, size_ptr, 8)
-            || (oldprot_ptr != 0 && !self.user_memory_probe_output(memory, oldprot_ptr, 4))
+            || oldprot_ptr == 0
+            || !self.user_memory_probe_output(memory, oldprot_ptr, 4)
         {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -7293,23 +7301,110 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
         let size = u64::from_le_bytes(word);
-        if oldprot_ptr != 0 && !self.user_memory_write(memory, oldprot_ptr, &0x04u32.to_le_bytes())
-        {
-            return STATUS_ACCESS_VIOLATION;
+        if base > HIGHEST_USER_ADDRESS {
+            return nt_address_space::STATUS_INVALID_PARAMETER_2;
+        }
+        if HIGHEST_USER_ADDRESS - base < size || size == 0 {
+            return STATUS_INVALID_PARAMETER_3;
         }
 
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
+                Ok(target) => target,
+                Err(status) => return status,
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
+        let procs = &mut *ctx.procs;
+        let target = procs[target_pi];
+        if target.pml4 == 0 || target.scratch_base == 0 {
+            return nt_process::STATUS_INVALID_HANDLE;
+        }
+        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+            .add(target_pi);
+        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+        *before = core::ptr::read(vm_map);
+        *after = *before;
+        let plan = match after.protect(base, size, new_protection) {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
+        crate::note_high_water(
+            &crate::VM_PROTECTION_OVERRIDE_HW,
+            after.protection_override_count() as u64,
+        );
+        let mut page = plan.base;
+        let mut changed_end = plan.base;
+        let mut map_status = 0u32;
+        while page < plan.base + plan.size {
+            let old_protection = before.protection_at(page);
+            let new_protection = after.protection_at(page);
+            if let (Some(old_protection), Some(new_protection)) = (old_protection, new_protection)
+            {
+                if old_protection != new_protection {
+                    if let Err(status) = vm_reprotect_private_page(
+                        target_pi,
+                        page,
+                        old_protection,
+                        new_protection,
+                        target.pml4,
+                    ) {
+                        map_status = status;
+                        break;
+                    }
+                }
+            }
+            page += 0x1000;
+            changed_end = page;
+        }
+        if map_status != 0 {
+            page = plan.base;
+            while page < changed_end {
+                if let (Some(old_protection), Some(new_protection)) =
+                    (before.protection_at(page), after.protection_at(page))
+                {
+                    if old_protection != new_protection {
+                        let _ = vm_reprotect_private_page(
+                            target_pi,
+                            page,
+                            new_protection,
+                            old_protection,
+                            target.pml4,
+                        );
+                    }
+                }
+                page += 0x1000;
+            }
+            return map_status;
+        }
+        core::ptr::write(vm_map, *after);
         let registry_slot = self
             .loop_ctx
-            .and_then(|ctx| (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot));
+            .and_then(|ctx| (&*ctx.reg).dll_for_page(plan.base).map(|(slot, _)| slot));
         loader_trace_record(
             self.pi,
             LoaderOp::ProtectVirtualMemory,
             0,
             registry_slot,
-            base,
-            size,
+            plan.base,
+            plan.size,
             b"",
         );
+        let _ = self.user_memory_write(memory, oldprot_ptr, &plan.old_protection.to_le_bytes());
+        let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
+        let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
         0
     }
 

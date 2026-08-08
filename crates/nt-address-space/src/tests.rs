@@ -696,3 +696,132 @@ fn fixed_vm_map_reports_committed_access_permissions() {
     assert!(map.permits_write(writable.base));
     assert!(!map.permits_read(0xF_0000));
 }
+
+#[test]
+fn fixed_vm_map_protect_rounds_range_and_returns_old_protection() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+
+    let protected = map
+        .protect(allocation.base + 0x108, 0x800, PAGE_READONLY)
+        .unwrap();
+    assert_eq!(
+        protected,
+        VmProtectPlan {
+            base: allocation.base,
+            size: 0x1000,
+            old_protection: PAGE_READWRITE,
+            new_protection: PAGE_READONLY,
+        }
+    );
+    assert_eq!(map.extent_count(), 1);
+    assert_eq!(map.protection_override_count(), 1);
+    assert_eq!(map.protection_at(allocation.base), Some(PAGE_READONLY));
+    assert_eq!(
+        map.extent_at(allocation.base).unwrap().protection,
+        PAGE_READWRITE
+    );
+    assert!(!map.permits_write(allocation.base));
+    assert!(map.permits_write(allocation.base + 0x1000));
+
+    let mixed = map.protect(allocation.base, 0x2000, PAGE_NOACCESS).unwrap();
+    assert_eq!(mixed.old_protection, PAGE_READONLY);
+    assert_eq!(mixed.size, 0x2000);
+    assert_eq!(map.extent_count(), 1);
+    assert_eq!(map.protection_override_count(), 2);
+    assert!(!map.permits_read(allocation.base));
+    assert!(!map.permits_read(allocation.base + 0x1000));
+    assert!(map.permits_write(allocation.base + 0x2000));
+}
+
+#[test]
+fn fixed_vm_map_protect_rejects_uncommitted_and_cross_allocation_ranges() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let reserved = map
+        .allocate(None, 0x2000, MEM_RESERVE, PAGE_NOACCESS)
+        .unwrap();
+    assert_eq!(
+        map.protect(reserved.base, 0x1000, PAGE_READWRITE),
+        Err(STATUS_NOT_COMMITTED)
+    );
+
+    let first = map
+        .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    let second = map
+        .allocate(
+            Some(first.base + 0x10000),
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(
+        map.protect(first.base, second.base - first.base + 0x1000, PAGE_READONLY),
+        Err(STATUS_CONFLICTING_ADDRESSES)
+    );
+}
+
+#[test]
+fn fixed_vm_map_protect_validation_matches_reactos_private_path() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    assert_eq!(
+        validate_protect_parameters(PAGE_READWRITE | PAGE_GUARD),
+        Ok(())
+    );
+    assert_eq!(
+        validate_protect_parameters(PAGE_READWRITE | PAGE_WRITECOMBINE),
+        Err(STATUS_INVALID_PAGE_PROTECTION)
+    );
+    assert_eq!(
+        map.protect(allocation.base, 0x1000, PAGE_WRITECOPY),
+        Err(STATUS_INVALID_PARAMETER_4)
+    );
+    assert_eq!(
+        map.protect(allocation.base, 0, PAGE_READONLY),
+        Err(STATUS_INVALID_PARAMETER_3)
+    );
+}
+
+#[test]
+fn fixed_vm_map_protect_clears_overrides_on_default_recommit_and_free() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+
+    map.protect(allocation.base, 0x2000, PAGE_READONLY).unwrap();
+    assert_eq!(map.extent_count(), 1);
+    assert_eq!(map.protection_override_count(), 2);
+    assert!(!map.permits_write(allocation.base));
+    assert!(!map.permits_write(allocation.base + 0x1000));
+
+    map.protect(allocation.base, 0x1000, PAGE_READWRITE)
+        .unwrap();
+    assert_eq!(map.protection_override_count(), 1);
+    assert!(map.permits_write(allocation.base));
+    assert!(!map.permits_write(allocation.base + 0x1000));
+
+    map.free(allocation.base + 0x1000, 0x1000, MEM_DECOMMIT)
+        .unwrap();
+    assert_eq!(map.protection_override_count(), 0);
+    map.allocate(
+        Some(allocation.base + 0x1000),
+        0x1000,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    assert!(map.permits_write(allocation.base + 0x1000));
+
+    map.protect(allocation.base, 0x1000, PAGE_READONLY).unwrap();
+    assert_eq!(map.protection_override_count(), 1);
+    map.free(allocation.base, 0, MEM_RELEASE).unwrap();
+    assert_eq!(map.extent_count(), 0);
+    assert_eq!(map.protection_override_count(), 0);
+}

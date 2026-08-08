@@ -4742,6 +4742,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let slots_available = root_slot_available_count();
     let registry = CSRSS_FRAME_HW.load(Ordering::Relaxed);
     let vad = VM_REGION_HW.load(Ordering::Relaxed);
+    let protection_overrides = VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed);
     let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
     print_pool_census(b"gate");
     check(
@@ -4754,6 +4755,8 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && slots_total != 0
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
             && vad * 4 < VM_REGION_CAPACITY as u64 * 3
+            && protection_overrides * 4
+                < nt_address_space::VM_PROTECTION_OVERRIDE_CAPACITY as u64 * 3
             && free_list * 4 < VM_FREE_FRAME_CAPACITY as u64 * 3
             // ROOT-CSPACE SLOTS ARE THE BINDING CONSTRAINT. Measure real availability: slots left in
             // the bump range plus deleted root slots returned through the recycle stack.
@@ -7091,6 +7094,8 @@ pub(crate) static VM_FAIL_ALIAS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static VM_FAIL_REGISTRY: AtomicU64 = AtomicU64::new(0);
 /// High-water of the per-process VAD extent count (`VM_REGION_CAPACITY`).
 pub(crate) static VM_REGION_HW: AtomicU64 = AtomicU64::new(0);
+/// High-water of private per-page protection overrides.
+pub(crate) static VM_PROTECTION_OVERRIDE_HW: AtomicU64 = AtomicU64::new(0);
 /// User stack VADs released by thread teardown (`TEB.FreeStackOnTermination` semantics).
 pub(crate) static USER_STACK_VAD_RELEASES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_STACK_VAD_RELEASE_FAILS: AtomicU64 = AtomicU64::new(0);
@@ -7204,6 +7209,10 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(VM_REGION_HW.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(VM_REGION_CAPACITY as u64);
+    print_str(b" prot-ovr=");
+    print_u64(VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(nt_address_space::VM_PROTECTION_OVERRIDE_CAPACITY as u64);
     print_str(b" stack-vad-free=");
     print_u64(USER_STACK_VAD_RELEASES.load(Ordering::Relaxed));
     print_str(b"/");

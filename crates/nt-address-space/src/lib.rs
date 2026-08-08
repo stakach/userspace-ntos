@@ -89,6 +89,7 @@ pub const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 pub const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 pub const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 pub const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
+pub const STATUS_NOT_COMMITTED: u32 = 0xC000_002D;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -112,6 +113,7 @@ pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 pub const PAGE_GUARD: u32 = 0x100;
 pub const PAGE_NOCACHE: u32 = 0x200;
 pub const PAGE_WRITECOMBINE: u32 = 0x400;
+pub const VM_PROTECTION_OVERRIDE_CAPACITY: usize = 128;
 
 fn writable(p: u32) -> bool {
     p == PAGE_READWRITE
@@ -141,6 +143,26 @@ fn valid_allocate_protection(protection: u32) -> bool {
         && !(protection & PAGE_NOCACHE != 0
             && protection & (PAGE_NOACCESS | PAGE_WRITECOMBINE) != 0)
         && !(protection & PAGE_WRITECOMBINE != 0 && base == PAGE_NOACCESS)
+}
+
+/// Validate the argument-only protection mask accepted by ReactOS `NtProtectVirtualMemory`.
+pub fn validate_protect_parameters(protection: u32) -> Result<(), u32> {
+    let base = protection & !(PAGE_GUARD | PAGE_NOCACHE);
+    if matches!(
+        base,
+        PAGE_NOACCESS
+            | PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    ) {
+        Ok(())
+    } else {
+        Err(STATUS_INVALID_PAGE_PROTECTION)
+    }
 }
 
 /// Validate the argument-only part of ReactOS `NtAllocateVirtualMemory`, before user-pointer
@@ -234,6 +256,23 @@ pub struct VmFreePlan {
     pub free_type: u32,
 }
 
+/// The normalized private-memory range changed by `NtProtectVirtualMemory`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmProtectPlan {
+    pub base: u64,
+    pub size: u64,
+    pub old_protection: u32,
+    pub new_protection: u32,
+}
+
+/// A per-private-page protection override. ReactOS `MiProtectVirtualMemory` changes PTE
+/// protections for private pages; it does not split the VAD node for every protected subrange.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct VmProtectionOverride {
+    page: u64,
+    protection: u32,
+}
+
 /// Fixed-capacity private VAD policy for the executive. This deliberately owns no `Vec` or
 /// `BTreeMap`: syscall dispatch rewinds its transient bump heap after every call.
 #[derive(Copy, Clone)]
@@ -241,6 +280,7 @@ pub struct VmRegionMap<const N: usize> {
     lower_bound: u64,
     upper_bound: u64,
     extents: [Option<VmExtent>; N],
+    protection_overrides: [Option<VmProtectionOverride>; VM_PROTECTION_OVERRIDE_CAPACITY],
 }
 
 impl<const N: usize> VmRegionMap<N> {
@@ -249,6 +289,7 @@ impl<const N: usize> VmRegionMap<N> {
             lower_bound,
             upper_bound,
             extents: [None; N],
+            protection_overrides: [None; VM_PROTECTION_OVERRIDE_CAPACITY],
         }
     }
 
@@ -267,27 +308,48 @@ impl<const N: usize> VmRegionMap<N> {
             .find(|extent| address >= extent.base && address < extent.end())
     }
 
+    pub fn protection_override_count(&self) -> usize {
+        self.protection_overrides
+            .iter()
+            .filter(|override_slot| override_slot.is_some())
+            .count()
+    }
+
+    fn protection_override_index(&self, page: u64) -> Option<usize> {
+        self.protection_overrides
+            .iter()
+            .position(|override_slot| override_slot.is_some_and(|entry| entry.page == page))
+    }
+
+    fn override_protection_at(&self, address: u64) -> Option<u32> {
+        let page = address & !(PAGE_SIZE - 1);
+        self.protection_override_index(page)
+            .and_then(|index| self.protection_overrides[index].map(|entry| entry.protection))
+    }
+
+    pub fn protection_at(&self, address: u64) -> Option<u32> {
+        let extent = self.extent_at(address)?;
+        (extent.state == VmExtentState::Committed).then(|| {
+            self.override_protection_at(address)
+                .unwrap_or(extent.protection)
+        })
+    }
+
     pub fn is_committed(&self, address: u64) -> bool {
         self.extent_at(address)
             .is_some_and(|extent| extent.state == VmExtentState::Committed)
     }
 
     pub fn permits_read(&self, address: u64) -> bool {
-        self.extent_at(address).is_some_and(|extent| {
-            extent.state == VmExtentState::Committed
-                && extent.protection & PAGE_GUARD == 0
-                && extent.protection & 0xff != PAGE_NOACCESS
+        self.protection_at(address).is_some_and(|protection| {
+            protection & PAGE_GUARD == 0 && protection & 0xff != PAGE_NOACCESS
         })
     }
 
     pub fn permits_write(&self, address: u64) -> bool {
-        self.extent_at(address).is_some_and(|extent| {
-            extent.state == VmExtentState::Committed
-                && extent.protection & PAGE_GUARD == 0
-                && matches!(
-                    extent.protection & 0xff,
-                    PAGE_READWRITE | PAGE_EXECUTE_READWRITE
-                )
+        self.protection_at(address).is_some_and(|protection| {
+            protection & PAGE_GUARD == 0
+                && matches!(protection & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
         })
     }
 
@@ -377,6 +439,43 @@ impl<const N: usize> VmRegionMap<N> {
         for (slot, extent) in self.extents.iter_mut().zip(extents.into_iter()) {
             *slot = Some(extent);
         }
+    }
+
+    fn clear_protection_overrides(&mut self, base: u64, end: u64) {
+        for override_slot in &mut self.protection_overrides {
+            if override_slot.is_some_and(|entry| entry.page >= base && entry.page < end) {
+                *override_slot = None;
+            }
+        }
+    }
+
+    fn set_page_protection_override(
+        &mut self,
+        page: u64,
+        default_protection: u32,
+        new_protection: u32,
+    ) -> Result<(), u32> {
+        if let Some(index) = self.protection_override_index(page) {
+            self.protection_overrides[index] =
+                (new_protection != default_protection).then_some(VmProtectionOverride {
+                    page,
+                    protection: new_protection,
+                });
+            return Ok(());
+        }
+        if new_protection == default_protection {
+            return Ok(());
+        }
+        let slot = self
+            .protection_overrides
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *slot = Some(VmProtectionOverride {
+            page,
+            protection: new_protection,
+        });
+        Ok(())
     }
 
     fn find_free_below(&self, size: u64, upper_bound: u64, top_down: bool) -> Option<u64> {
@@ -602,6 +701,7 @@ impl<const N: usize> VmRegionMap<N> {
                 },
             })?;
             self.normalize();
+            self.clear_protection_overrides(base, end);
             Ok(VmAllocatePlan {
                 base,
                 size: end - base,
@@ -627,6 +727,7 @@ impl<const N: usize> VmRegionMap<N> {
                 end,
                 Some((VmExtentState::Committed, Some(protection))),
             )?;
+            self.clear_protection_overrides(base, end);
             Ok(VmAllocatePlan {
                 base,
                 size: end - base,
@@ -668,6 +769,7 @@ impl<const N: usize> VmRegionMap<N> {
             end,
             (free_type == MEM_DECOMMIT).then_some((VmExtentState::Reserved, None)),
         )?;
+        self.clear_protection_overrides(base, end);
         if free_type == MEM_RELEASE {
             for extent in self.extents.iter_mut().flatten() {
                 if extent.allocation_base == allocation_base && extent.base >= end {
@@ -680,6 +782,64 @@ impl<const N: usize> VmRegionMap<N> {
             base,
             size: end - base,
             free_type,
+        })
+    }
+
+    /// Apply ReactOS private-VAD protection policy and return the normalized pages to reprotect.
+    pub fn protect(
+        &mut self,
+        requested_base: u64,
+        requested_size: u64,
+        new_protection: u32,
+    ) -> Result<VmProtectPlan, u32> {
+        validate_protect_parameters(new_protection)?;
+        let new_base_protection = new_protection & 0xff;
+        if matches!(new_base_protection, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY) {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        if requested_size == 0 {
+            return Err(STATUS_INVALID_PARAMETER_3);
+        }
+        let base = requested_base & !(PAGE_SIZE - 1);
+        let end = Self::align_up(
+            requested_base
+                .checked_add(requested_size)
+                .ok_or(STATUS_INVALID_PARAMETER_3)?,
+            PAGE_SIZE,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER_3)?;
+        if end <= base {
+            return Err(STATUS_INVALID_PARAMETER_3);
+        }
+        let first = self.extent_at(base).ok_or(STATUS_CONFLICTING_ADDRESSES)?;
+        let allocation_base = first.allocation_base;
+        let old_protection = self.protection_at(base).unwrap_or(first.protection);
+        let mut position = base;
+        while position < end {
+            let extent = self
+                .extent_at(position)
+                .ok_or(STATUS_CONFLICTING_ADDRESSES)?;
+            if extent.allocation_base != allocation_base {
+                return Err(STATUS_CONFLICTING_ADDRESSES);
+            }
+            if extent.state != VmExtentState::Committed {
+                return Err(STATUS_NOT_COMMITTED);
+            }
+            position = extent.end().min(end);
+        }
+        let mut next = *self;
+        let mut page = base;
+        while page < end {
+            let default_protection = self.extent_at(page).unwrap().protection;
+            next.set_page_protection_override(page, default_protection, new_protection)?;
+            page += PAGE_SIZE;
+        }
+        *self = next;
+        Ok(VmProtectPlan {
+            base,
+            size: end - base,
+            old_protection,
+            new_protection,
         })
     }
 }
