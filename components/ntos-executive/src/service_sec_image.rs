@@ -24,6 +24,11 @@ static USER_CALLBACK_DEFERRED_RETURNS_FULL: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEFERRED_RETURNS_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CONTEXT_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_STILL_EMPTY: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +134,47 @@ const CURSORDATA_AJIFRATE_OFF: usize = 0x78;
 const CURSORF_ACON: u32 = 0x0008;
 const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
+const GUI_MESSAGE_WAITER_N: usize = 16;
+
+#[derive(Clone, Copy)]
+struct GuiMessageWaiter {
+    used: bool,
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    queue_event_body: u64,
+    msg_ptr: u64,
+    hwnd_filter: u64,
+    filter_min: u64,
+    filter_max: u64,
+    caller_sp: u64,
+    reply_cap: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+}
+
+impl GuiMessageWaiter {
+    const EMPTY: Self = Self {
+        used: false,
+        pi: 0,
+        badge: 0,
+        tid: 0,
+        queue_event_body: 0,
+        msg_ptr: 0,
+        hwnd_filter: 0,
+        filter_min: 0,
+        filter_max: 0,
+        caller_sp: 0,
+        reply_cap: 0,
+        resume_ip: 0,
+        resume_sp: 0,
+        resume_flags: 0,
+    };
+}
+
+static mut GUI_MESSAGE_WAITERS: [GuiMessageWaiter; GUI_MESSAGE_WAITER_N] =
+    [GuiMessageWaiter::EMPTY; GUI_MESSAGE_WAITER_N];
 
 #[derive(Clone, Copy)]
 struct DeferredCallbackReturn {
@@ -6878,6 +6924,13 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
             let mut park_pipe_is_write = false;
+            let mut gui_message_wait_park_request = false;
+            let mut gui_message_wait_queue_event_body: u64 = 0;
+            let mut gui_message_wait_msg_ptr: u64 = 0;
+            let mut gui_message_wait_hwnd_filter: u64 = 0;
+            let mut gui_message_wait_filter_min: u64 = 0;
+            let mut gui_message_wait_filter_max: u64 = 0;
+            let mut gui_message_wait_caller_sp: u64 = 0;
             // ★ Dbgk TARGET-SIDE BLOCK request (syscall flavour) latched out of the handler:
             // a debug event was posted from THIS syscall arm and NT blocks the reporting thread on
             // the debugger's continue. Consumed at the reply site (the reply-cap steal needs
@@ -8287,10 +8340,12 @@ pub(crate) unsafe fn service_sec_image(
                         peb_mirror,
                         scratch_base,
                     );
+                    let peek_arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                    core::ptr::write_bytes(peek_arg as *mut u8, 0, WIN32K_MSG_BYTES);
                     let peek = dispatch_win32k_for_client(
                         &mut nt_handler,
                         nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
-                        get_recv_mr(9),
+                        peek_arg,
                         m3,
                         get_recv_mr(7),
                         get_recv_mr(8),
@@ -8298,8 +8353,12 @@ pub(crate) unsafe fn service_sec_image(
                         &[0u64], // wRemoveMsg = PM_NOREMOVE: look, do not consume
                         client,
                     );
+                    let peek_callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+                    if peek_callback_suspended {
+                        let _ = win32k_glue::cancel_suspended_user_callback();
+                    }
                     GET_MESSAGE_PREFLIGHT_PEEKS.fetch_add(1, Ordering::Relaxed);
-                    if peek.0 == 0 {
+                    if peek_callback_suspended || !peek.1 || peek.0 == 0 {
                         let main_tid = nt_handler
                             .pm_main_tid_for_pi(pi)
                             .map(u64::from)
@@ -8320,51 +8379,84 @@ pub(crate) unsafe fn service_sec_image(
                             win32k_token_context(&nt_handler, pi),
                         ) {
                             let n = GET_MESSAGE_EMPTY_QUEUE_PARKS.fetch_add(1, Ordering::Relaxed);
-                            // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
-                            // of messages is the established terminal condition — it is the thread that
-                            // drives the logon, so its empty SAS loop means winlogon has nothing left.
-                            // A WORKER thread's pump running dry does NOT: measured, the profile copy
-                            // runs on the MAIN thread while worker badge 13 pumps the desktop, so
-                            // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
-                            // Park the worker and keep the loop running so the main thread advances;
-                            // the grace is BOUNDED so a boot where nothing else can run still reaches
-                            // the gate rather than blocking in the loop's recv forever.
-                            const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
-                            let winlogon_top_badge = hosted_top_badge_for_role(
-                                &nt_handler,
-                                nt_exe_image::HostedProcessRole::InteractiveLogon,
-                            )
-                            .expect("winlogon hosted metadata must be registered before GUI pump");
-                            let userinit_top_badge = hosted_top_badge_for_role(
-                                &nt_handler,
-                                nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
-                            )
-                            .expect("userinit hosted metadata must be registered before GUI pump");
-                            let defer = (badge != winlogon_top_badge
-                                && badge != userinit_top_badge
-                                && n < EMPTY_QUEUE_PARK_GRACE)
-                                || (owner_top_badge_for(&nt_handler, badge) != userinit_top_badge
-                                    && userinit_shell_frontier_pending(
-                                        &nt_handler,
-                                        crash_parked,
-                                        wait_parked,
-                                    ));
-                            if n < 8 {
-                                print_str(b"[wl-main] blocking GetMessage on an EMPTY queue (pi=");
-                                print_u64(pi as u64);
-                                print_str(b" badge=");
-                                print_u64(badge);
-                                print_str(b" hwnd-filter=0x");
-                                print_hex(m3 as u32);
-                                print_str(if defer {
-                                    b") -> parking this thread, loop continues\n"
-                                } else {
-                                    b") -> parking instead of hanging win32k\n"
-                                });
+                            let queue_event_body = if shell_gui_client {
+                                win32k_subsystem::current_thread_queue_event_body().unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            if shell_gui_client && queue_event_body != 0 {
+                                gui_message_wait_park_request = true;
+                                gui_message_wait_queue_event_body = queue_event_body;
+                                gui_message_wait_msg_ptr = get_recv_mr(9);
+                                gui_message_wait_hwnd_filter = m3;
+                                gui_message_wait_filter_min = get_recv_mr(7);
+                                gui_message_wait_filter_max = get_recv_mr(8);
+                                gui_message_wait_caller_sp = sp;
+                                if n < 16 {
+                                    print_str(
+                                        b"[gui-msg-wait] blocking shell GetMessage on empty queue (pi=",
+                                    );
+                                    print_u64(pi as u64);
+                                    print_str(b" badge=");
+                                    print_u64(badge);
+                                    print_str(b" hwnd-filter=0x");
+                                    print_hex(m3 as u32);
+                                    print_str(b") -> queue-event park\n");
+                                }
+                            } else {
+                                // ★ WHOSE park ends the boot. winlogon's MAIN thread (badge 4) running out
+                                // of messages is the established terminal condition — it is the thread that
+                                // drives the logon, so its empty SAS loop means winlogon has nothing left.
+                                // A WORKER thread's pump running dry does NOT: measured, the profile copy
+                                // runs on the MAIN thread while worker badge 13 pumps the desktop, so
+                                // quiescing on the worker's park CUT THE `CopyDirectory` OFF MID-TREE.
+                                // Park the worker and keep the loop running so the main thread advances;
+                                // the grace is BOUNDED so a boot where nothing else can run still reaches
+                                // the gate rather than blocking in the loop's recv forever.
+                                const EMPTY_QUEUE_PARK_GRACE: u64 = 3;
+                                let winlogon_top_badge = hosted_top_badge_for_role(
+                                    &nt_handler,
+                                    nt_exe_image::HostedProcessRole::InteractiveLogon,
+                                )
+                                .expect(
+                                    "winlogon hosted metadata must be registered before GUI pump",
+                                );
+                                let userinit_top_badge = hosted_top_badge_for_role(
+                                    &nt_handler,
+                                    nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+                                )
+                                .expect(
+                                    "userinit hosted metadata must be registered before GUI pump",
+                                );
+                                let defer = (badge != winlogon_top_badge
+                                    && badge != userinit_top_badge
+                                    && n < EMPTY_QUEUE_PARK_GRACE)
+                                    || (owner_top_badge_for(&nt_handler, badge)
+                                        != userinit_top_badge
+                                        && userinit_shell_frontier_pending(
+                                            &nt_handler,
+                                            crash_parked,
+                                            wait_parked,
+                                        ));
+                                if n < 8 {
+                                    print_str(
+                                        b"[wl-main] blocking GetMessage on an EMPTY queue (pi=",
+                                    );
+                                    print_u64(pi as u64);
+                                    print_str(b" badge=");
+                                    print_u64(badge);
+                                    print_str(b" hwnd-filter=0x");
+                                    print_hex(m3 as u32);
+                                    print_str(if defer {
+                                        b") -> parking this thread, loop continues\n"
+                                    } else {
+                                        b") -> parking instead of hanging win32k\n"
+                                    });
+                                }
+                                handled = false;
+                                wl_milestone_park = true;
+                                wl_park_defer_quiesce = defer;
                             }
-                            handled = false;
-                            wl_milestone_park = true;
-                            wl_park_defer_quiesce = defer;
                         }
                     }
                 }
@@ -11054,7 +11146,7 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
+                let (mut st, mut ok): (u64, bool) = if wl_milestone_park || gui_message_wait_park_request {
                     // This caller is intentionally parked without a provider dispatch. For GUI
                     // message waits this means the preflight PeekMessage proved the queue is empty,
                     // so dispatching the blocking GetMessage would park the single-threaded host
@@ -12137,12 +12229,30 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                if win32k_subsystem::take_local_event_signal_pending() {
-                    wait_wake_dispatcher_set(&mut nt_handler);
+                let mut local_event_signals = 0u64;
+                let mut gui_message_waits_woken = 0u64;
+                while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
+                    local_event_signals += 1;
+                    gui_message_waits_woken += gui_message_wait_redrive_event(
+                        &mut nt_handler,
+                        event_body,
+                        pfilled,
+                        procs,
+                    );
+                }
+                if local_event_signals != 0 {
+                    let _ = wait_wake_dispatcher_set(&mut nt_handler);
+                    if gui_message_waits_woken != 0 {
+                        bump_progress();
+                    }
                 }
                 // Throttle the status line for the same hot class-loop SSNs. Real provider walls
                 // still print, but an intentional wait-park is not a failed provider dispatch.
-                if !redirected_user_callback && !wl_milestone_park && (!ok || w32_log) {
+                if !redirected_user_callback
+                    && !wl_milestone_park
+                    && !gui_message_wait_park_request
+                    && (!ok || w32_log)
+                {
                     print_str(b"[win32k-svc] ");
                     print_str(win32k_client_label(&nt_handler, pi));
                     print_str(b" SSN 0x");
@@ -12273,6 +12383,8 @@ pub(crate) unsafe fn service_sec_image(
                         // logon-process access check would fail SetLogonNotifyWindow → InitializeSAS FALSE.)
                         print_str(b"[wl-main] winlogon registered logon-notify window (0x127c) = SAS window ready -> advancing to post-SAS setup\n");
                     }
+                } else if gui_message_wait_park_request {
+                    result = 0;
                 } else {
                     handled = false; // dispatch wall — stop with the SSN recorded
                     result = 0xC0000001;
@@ -12543,6 +12655,45 @@ pub(crate) unsafe fn service_sec_image(
             procs[pi].ntfaults = ntfaults;
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            if gui_message_wait_park_request {
+                if reply_main != 0
+                    && gui_message_wait_park(
+                        pi as u32,
+                        badge,
+                        current_tid,
+                        gui_message_wait_queue_event_body,
+                        gui_message_wait_msg_ptr,
+                        gui_message_wait_hwnd_filter,
+                        gui_message_wait_filter_min,
+                        gui_message_wait_filter_max,
+                        gui_message_wait_caller_sp,
+                        resume_ip,
+                        sp,
+                        flags,
+                    )
+                {
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    if pi_is_top_level(&nt_handler, badge) {
+                        mark_wait_parked!(pi, resume_ip);
+                    }
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                print_str(b"[gui-msg-wait] park unavailable -> GetMessage failure\n");
+                result = u64::MAX;
+            }
             if park_io_completion_port >= 0 && reply_main != 0 {
                 if park_io_completion_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
@@ -17067,6 +17218,295 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
         image_mirror,
         scratch_base,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn gui_message_wait_park(
+    pi: u32,
+    badge: u64,
+    tid: u64,
+    queue_event_body: u64,
+    msg_ptr: u64,
+    hwnd_filter: u64,
+    filter_min: u64,
+    filter_max: u64,
+    caller_sp: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    if queue_event_body == 0 || msg_ptr == 0 {
+        return false;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    let Some(slot) = (0..GUI_MESSAGE_WAITER_N).find(|&index| !table[index].used) else {
+        return false;
+    };
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh)) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
+        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
+    }) else {
+        return false;
+    };
+    table[slot] = GuiMessageWaiter {
+        used: true,
+        pi,
+        badge,
+        tid,
+        queue_event_body,
+        msg_ptr,
+        hwnd_filter,
+        filter_min,
+        filter_max,
+        caller_sp,
+        reply_cap: stolen,
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+    };
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
+    if n < 32 {
+        print_str(b"[gui-msg-wait] parked pi=");
+        print_u64(pi as u64);
+        print_str(b" badge=");
+        print_u64(badge);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" queue-event=0x");
+        print_hex_u64(queue_event_body);
+        print_str(b" msg=0x");
+        print_hex_u64(msg_ptr);
+        print_str(b"\n");
+    }
+    true
+}
+
+unsafe fn gui_message_wait_redrive_event(
+    nt_handler: &mut ExecNtHandler,
+    event_body: u64,
+    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec; MAX_PI],
+) -> u64 {
+    if event_body == 0 {
+        return 0;
+    }
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    let saved_badge = nt_handler.current_badge;
+    let saved_resume_ip = nt_handler.current_resume_ip;
+    let saved_sp = nt_handler.current_sp;
+    let saved_flags = nt_handler.current_flags;
+    let saved_ctx = nt_handler.loop_ctx.take();
+    let mut woken = 0u64;
+
+    for slot in 0..GUI_MESSAGE_WAITER_N {
+        let waiter = {
+            let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
+            table[slot]
+        };
+        if !waiter.used || waiter.queue_event_body != event_body {
+            continue;
+        }
+        let pi = waiter.pi as usize;
+        if pi >= MAX_PI {
+            continue;
+        }
+        GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
+        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, pi);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        W32_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+        nt_handler.pi = pi;
+        nt_handler.current_tid = waiter.tid;
+        nt_handler.current_badge = waiter.badge;
+        nt_handler.current_resume_ip = waiter.resume_ip;
+        nt_handler.current_sp = waiter.resume_sp;
+        nt_handler.current_flags = waiter.resume_flags;
+
+        let peb_mirror = hosted_peb_mirror_for_pi(pi);
+        let client_teb = nt_handler
+            .pm
+            .thread_teb(waiter.tid as nt_process::ThreadId)
+            .filter(|teb| *teb != 0)
+            .unwrap_or(SMSS_TEB_VA);
+        let client = win32k_client_context_for_thread(
+            nt_handler,
+            pi,
+            waiter.badge,
+            waiter.tid,
+            hosted_thread_tcb_or_zero(nt_handler, waiter.tid),
+            nt_handler.hosted_thread_role(waiter.tid),
+            client_teb,
+            peb_mirror,
+            scratch_base,
+        );
+        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
+        let peek = dispatch_win32k_for_client(
+            nt_handler,
+            nt_user_callback::NTUSER_PEEK_MESSAGE_SSN,
+            arg,
+            waiter.hwnd_filter,
+            waiter.filter_min,
+            waiter.filter_max,
+            waiter.caller_sp,
+            &[0u64],
+            client,
+        );
+        if win32k_glue::take_user_callback_pump_suspended() {
+            let _ = win32k_glue::cancel_suspended_user_callback();
+            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] callback during PeekMessage redrive pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b" -> keep parked\n");
+            }
+            continue;
+        }
+        if !peek.1 || peek.0 == 0 {
+            let n = GUI_MESSAGE_WAIT_STILL_EMPTY.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] redrive still empty pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b" queue-event=0x");
+                print_hex_u64(event_body);
+                print_str(b"\n");
+            }
+            continue;
+        }
+
+        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
+        let get = dispatch_win32k_for_client(
+            nt_handler,
+            nt_user_callback::NTUSER_GET_MESSAGE_SSN,
+            arg,
+            waiter.hwnd_filter,
+            waiter.filter_min,
+            waiter.filter_max,
+            waiter.caller_sp,
+            &[],
+            client,
+        );
+        if win32k_glue::take_user_callback_pump_suspended() {
+            let _ = win32k_glue::cancel_suspended_user_callback();
+            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] callback during GetMessage redrive pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b" -> keep parked\n");
+            }
+            continue;
+        }
+        if !get.1 {
+            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] GetMessage redrive WALL pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b" -> keep parked\n");
+            }
+            continue;
+        }
+
+        let staged_message = core::ptr::read_unaligned((arg + 8) as *const u32);
+        let should_copy_msg = get.0 != 0 || staged_message == WM_QUIT;
+        if !should_copy_msg {
+            let n = GUI_MESSAGE_WAIT_STILL_EMPTY.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] GetMessage redrive returned no message pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b"\n");
+            }
+            continue;
+        }
+        let output = core::slice::from_raw_parts(arg as *const u8, WIN32K_MSG_BYTES);
+        let copy_ok = img_spawn::client_copyout_mapped(
+            waiter.pi as u64,
+            waiter.msg_ptr,
+            output,
+            &pfilled[pi],
+            procs[pi].faults as usize,
+            scratch_base,
+        );
+        let status = if copy_ok { get.0 } else { u64::MAX };
+        set_reply_mr(15, waiter.resume_ip);
+        set_reply_mr(16, waiter.resume_sp);
+        set_reply_mr(17, waiter.resume_flags);
+        client_reply_on(waiter.reply_cap, 18, status, 0, 0, 0);
+        release_reply_pool_cap(waiter.reply_cap);
+        {
+            let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+            if table[slot].used && table[slot].reply_cap == waiter.reply_cap {
+                table[slot] = GuiMessageWaiter::EMPTY;
+            }
+        }
+        woken += 1;
+        let n = GUI_MESSAGE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            let hwnd = core::ptr::read_unaligned(arg as *const u64);
+            print_str(b"[gui-msg-wait] woke pi=");
+            print_u64(waiter.pi as u64);
+            print_str(b" badge=");
+            print_u64(waiter.badge);
+            print_str(b" hwnd=0x");
+            print_hex_u64(hwnd);
+            print_str(b" msg=0x");
+            print_hex(staged_message);
+            print_str(b" ret=0x");
+            print_hex(status as u32);
+            print_str(if copy_ok {
+                b"\n"
+            } else {
+                b" copyout-failed\n"
+            });
+        }
+    }
+
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    nt_handler.current_badge = saved_badge;
+    nt_handler.current_resume_ip = saved_resume_ip;
+    nt_handler.current_sp = saved_sp;
+    nt_handler.current_flags = saved_flags;
+    nt_handler.loop_ctx = saved_ctx;
+    woken
 }
 
 unsafe fn io_completion_park(

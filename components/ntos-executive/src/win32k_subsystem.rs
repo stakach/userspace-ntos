@@ -2115,7 +2115,7 @@ extern "win64" fn s_ke_set_event(event: u64, _increment: u64, _wait: u64) -> i32
         return 0;
     }
     let previous = unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) };
-    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+    record_local_event_signal(event);
     previous as i32
 }
 
@@ -2137,7 +2137,7 @@ extern "win64" fn s_ke_pulse_event(event: u64, _increment: u64, _wait: u64) -> i
         return 0;
     }
     let previous = unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) };
-    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+    record_local_event_signal(event);
     previous as i32
 }
 
@@ -3643,11 +3643,55 @@ static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x0000_0000_6E00_0000);
 static WIN32K_LOCAL_EVENT_SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
+const WIN32K_LOCAL_EVENT_SIGNAL_RING_N: usize = 128;
+static WIN32K_LOCAL_EVENT_SIGNAL_WRITE: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_READ: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_BODIES: [AtomicU64; WIN32K_LOCAL_EVENT_SIGNAL_RING_N] =
+    [const { AtomicU64::new(0) }; WIN32K_LOCAL_EVENT_SIGNAL_RING_N];
 static WIN32K_THREAD_QUEUE_EVENT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn take_local_event_signal_pending() -> bool {
-    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.swap(0, Ordering::Relaxed) != 0
+fn record_local_event_signal(event: u64) {
+    let write = WIN32K_LOCAL_EVENT_SIGNAL_WRITE.fetch_add(1, Ordering::Relaxed);
+    WIN32K_LOCAL_EVENT_SIGNAL_BODIES[write as usize % WIN32K_LOCAL_EVENT_SIGNAL_RING_N]
+        .store(event, Ordering::Relaxed);
+    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn take_local_event_signal_body() -> Option<u64> {
+    loop {
+        let pending = WIN32K_LOCAL_EVENT_SIGNAL_PENDING.load(Ordering::Relaxed);
+        if pending == 0 {
+            return None;
+        }
+        if WIN32K_LOCAL_EVENT_SIGNAL_PENDING
+            .compare_exchange(
+                pending,
+                pending - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let read = WIN32K_LOCAL_EVENT_SIGNAL_READ.fetch_add(1, Ordering::Relaxed);
+            let body = WIN32K_LOCAL_EVENT_SIGNAL_BODIES
+                [read as usize % WIN32K_LOCAL_EVENT_SIGNAL_RING_N]
+                .load(Ordering::Relaxed);
+            return (body != 0).then_some(body);
+        }
+    }
+}
+
+pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
+    let w32thread = current_w32thread();
+    if w32thread == 0 {
+        return None;
+    }
+    ensure_thread_queue_event(w32thread);
+    let body = read_volatile(
+        (w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *const u64,
+    );
+    (body != 0).then_some(body)
 }
 
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` for the routed client. The

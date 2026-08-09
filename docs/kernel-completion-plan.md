@@ -31,7 +31,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Boot proof `.tmp/boot-no-pipe-relisten-caps-20260810.log` reaches `[microtest done]` at `290/295`:
+Boot proof `.tmp/boot-dynamic-hive-flush-gate-20260810.log` reaches `[microtest done]` at
+`291/295`:
 winlogon authenticates, the real profile/SAM/USER-object-security path reaches `userinit.exe`,
 genuine `explorer.exe` launches, shell COM classes are served, explorer creates windows, and the
 harness reports `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`.
@@ -42,14 +43,22 @@ The fix is mechanism-owned rather than a shell paint shortcut: THREADINFO now ca
 message-queue client/server event pair expected by ReactOS `IntMsqSetWakeMask`, and native wait
 resolution accepts win32k event handles after process-local wait objects and dispatcher probes. That
 lets explorer's `MsgWaitForMultipleObjectsEx` wait on the queue event instead of failing before its
-desktop browser/tray path can continue.
+desktop browser/tray path can continue. The component pump can also park an empty blocking GUI
+`GetMessage` on the thread's real queue event and redrive it when win32k signals that event; this is
+generic queue-event machinery, not an explorer-specific message fabrication.
+
+Dynamic profile hive flush is now real for the current user hive path: `NtFlushKey` encodes the
+mounted `NtLoadKey` hive and atomically replaces the source `ntuser.dat`; `RegUnLoadKey` detaches the
+mount, and the next `NtLoadKey` remounts the checkpoint image. `exec_profile_ntuser_dat_present` and
+`exec_ntloadkey_serviced` are green on that path.
 
 Current red gates are `exec_kbd_layout_opened`, `exec_msgina_logon_dialog_created`,
-`exec_vm_pool_headroom`, `exec_ntloadkey_serviced`, and `exec_explorer_shell_chrome_painted`.
+`exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted`.
 Explorer still leaves broad non-background framebuffer evidence, but `BeginPaint`/`EndPaint`
 accounting is `0/0`; the next useful shell slice is the real explorer paint/update-region path, not
 a framebuffer-only proof. The broader structural queue remains A4 SCM pipe/listener cleanup, B3 real
-video/driver binding, C4 VM regression coverage, and D3/D4 durable hive/profile persistence.
+video/driver binding, C4 VM regression coverage, and remaining D3/D4 durable hive/profile
+persistence.
 
 ### A. SCM-Controlled Service Startup
 
@@ -119,7 +128,9 @@ video/driver binding, C4 VM regression coverage, and D3/D4 durable hive/profile 
   overlay shadows. Remaining D2 work is a final persistent-path overlay audit before D3
   flush/reboot proofs.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
-  hive, and writable filesystem overlay changes.
+  hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
+  `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
+  `NtUnloadKey`; remaining D3 work is system/boot hive backing plus explicit reboot proofs.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
 
@@ -2307,3 +2318,30 @@ video/driver binding, C4 VM regression coverage, and D3/D4 durable hive/profile 
   and `exec_explorer_process_spawned` passing. Review adjustment: A4 has one less hardcoded
   pipe/listener boundary; current frontier is real explorer shell paint plus VM headroom after durable
   namespace growth.
+
+- D3 dynamic profile-hive flush slice. `NtFlushKey` now checkpoints dirty dynamically loaded profile
+  hives by encoding the live `MutableHiveSet` hive and atomically replacing the source `ntuser.dat`
+  through the writable filesystem's temp-file plus `FileRenameInformation` path. `NtLoadKey` no
+  longer reattaches hidden overlay keys on remount; the overlay crate's detached-key model now keeps
+  volatile overlay state hidden until an explicit new create reuses an empty slot. The profile
+  `ntuser.dat` proof was updated to expect the post-`CreateUserHive` checkpoint image after
+  `RegFlushKey`, not byte identity with the original copied source. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core`, `cargo test -p nt-fs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and boot proof `.tmp/boot-dynamic-hive-flush-gate-20260810.log`. Result: `NtFlushKey` writes a
+  `130708B` dynamic hive checkpoint with `17` dirty cells; the first `NtLoadKey` reads `130674B`,
+  `NtUnloadKey` detaches the mount, the second `NtLoadKey` reads `130708B`, and both
+  `exec_profile_ntuser_dat_present` and `exec_ntloadkey_serviced` pass. Review adjustment: dynamic
+  profile hive flush/remount is closed for this path; D3 still needs boot/system hive backing and
+  explicit reboot persistence proofs.
+
+- Win32k GUI queue-event wait slice. The component pump can now park an empty blocking GUI
+  `GetMessage` on the calling thread's real win32k queue event, steal a reply cap, and redrive
+  `PeekMessage`/`GetMessage` when win32k signals that queue event. Win32k local event signals are
+  recorded with their event bodies instead of a single pending bit, so multiple queue events can
+  wake their own waiters. This is generic queue-event wait machinery and does not synthesize shell
+  messages. Validation is included in `.tmp/boot-dynamic-hive-flush-gate-20260810.log`, which still
+  reaches the desktop at `291/295` with no callback, pipe-listener, or win32k transport regression.
+  Review adjustment: the shell frontier remains honest: explorer still has direct GDI returns and a
+  broad non-background framebuffer span, but `BeginPaint`/`EndPaint` remains `0/0`; continue at the
+  real explorer update-region/paint boundary.
