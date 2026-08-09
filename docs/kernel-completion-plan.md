@@ -2210,3 +2210,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the next D3 work is the durable backing decision for mutable hive checkpoints:
   either add a real `regf` writer or make loaded hives boot from the `nt-hive-core` image/log
   provider before any syscall claims reboot persistence.
+
+- D3 mutable hive checkpoint/load slice. `NtSaveKey` now prefers the live mounted mutable-hive root
+  and writes an `nt-hive-core` image instead of saving stale borrowed `regf` bytes after runtime
+  mutation. `NtLoadKey` still accepts ordinary ReactOS/Windows `regf` hives, but also accepts saved
+  `nt-hive-core` images and mounts them as mutable-only hives under `HKEY_USERS\<SID>`. The dynamic
+  mount table now distinguishes borrowed-regf mounts from mutable-only checkpoint mounts, while
+  hosted-process opens continue to resolve through `MutableHiveSet` before any borrowed fallback.
+  Validation `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: this closes the save/load format loop for dynamically loaded profile hives; D3
+  still needs a reboot proof and a boot-hive backing strategy before SYSTEM/SOFTWARE/SAM/SECURITY
+  persistence can be claimed end to end.

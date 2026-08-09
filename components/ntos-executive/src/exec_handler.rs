@@ -1051,7 +1051,7 @@ impl ExecNtHandler {
                     canon: alloc::string::String::from(r"\registry\user\.default"),
                     mount: alloc::string::String::from(hive_mount(HIVE_SEL_USER_DEFAULT)),
                     file: alloc::string::String::from(r"\SystemRoot\System32\config\default"),
-                    hive,
+                    hive: Some(hive),
                     slot: None,
                     dynamic: false,
                 });
@@ -1098,7 +1098,8 @@ impl ExecNtHandler {
             print_u64(
                 hive_mounts
                     .first()
-                    .map_or(0, |m| m.hive.subkeys(m.hive.root()).len() as u64),
+                    .and_then(|m| m.hive.as_ref())
+                    .map_or(0, |hive| hive.subkeys(hive.root()).len() as u64),
             );
             print_str(b")\n");
         }
@@ -1654,7 +1655,12 @@ impl ExecNtHandler {
             HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
             HIVE_SEL_SAM => self.sam_hive.as_ref()?,
             HIVE_SEL_SYSTEM => self.hive.as_ref()?,
-            _ => &self.hive_mounts.iter().find(|m| m.sel == sel)?.hive,
+            _ => self
+                .hive_mounts
+                .iter()
+                .find(|m| m.sel == sel)?
+                .hive
+                .as_ref()?,
         };
         Some((hive, hive_cell(target)))
     }
@@ -1726,8 +1732,18 @@ impl ExecNtHandler {
     pub(crate) fn resolve_user_key(&self, full_path: &str) -> Option<KeyRef> {
         let canon = nt_hive_core::canon_path(full_path);
         for mount in &self.hive_mounts {
+            let Some(hive) = mount.hive.as_ref() else {
+                if canon == mount.canon
+                    || canon
+                        .strip_prefix(mount.canon.as_str())
+                        .is_some_and(|rest| rest.starts_with('\\'))
+                {
+                    return None;
+                }
+                continue;
+            };
             if canon == mount.canon {
-                return Some(mount.sel | mount.hive.root());
+                return Some(mount.sel | hive.root());
             }
             let Some(rest) = canon
                 .strip_prefix(mount.canon.as_str())
@@ -1737,7 +1753,7 @@ impl ExecNtHandler {
             };
             // The mount OWNS this path: it resolves here or nowhere (never fall through to a
             // different mount, which would let `\Registry\User\<sid>\x` answer out of `.Default`).
-            return mount.hive.open_key(rest).map(|cell| mount.sel | cell);
+            return hive.open_key(rest).map(|cell| mount.sel | cell);
         }
         None
     }
@@ -2100,28 +2116,11 @@ impl ExecNtHandler {
         None
     }
 
-    fn save_key_image_bytes(&self, key: KeyRef) -> Result<&[u8], u32> {
+    unsafe fn nt_save_key(&mut self, key_handle: u64, file_handle: u64) -> u32 {
+        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-
-        if is_virtual_registry_key(key)
-            || overlay_key_idx(key).is_some()
-            || key == MACHINE_ROOT_KEY
-            || key == USER_ROOT_KEY
-        {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        let (hive, cell) = self.base_hive(key).ok_or(STATUS_INVALID_HANDLE)?;
-        if cell != hive.root() {
-            NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_NOT_IMPLEMENTED);
-        }
-        Ok(hive.bytes())
-    }
-
-    unsafe fn nt_save_key(&mut self, key_handle: u64, file_handle: u64) -> u32 {
-        const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const KEY_READ: u32 = 0x0002_0019;
         NT_SAVE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -2143,9 +2142,34 @@ impl ExecNtHandler {
             Ok(key) => key,
             Err(status) => return status,
         };
-        let image = match self.save_key_image_bytes(key) {
-            Ok(image) => image,
-            Err(status) => return status,
+        if is_virtual_registry_key(key)
+            || overlay_key_idx(key).is_some()
+            || key == MACHINE_ROOT_KEY
+            || key == USER_ROOT_KEY
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+        let owned_image;
+        let image = if let Some(mutable_key) = self.mutable_registry_key(key) {
+            let Some(hive) = self.mutable_hives.hive(mutable_key.hive) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            if mutable_key.key != hive.root() {
+                NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+                return STATUS_NOT_IMPLEMENTED;
+            }
+            owned_image = nt_hive_core::encode_image(hive);
+            owned_image.as_slice()
+        } else {
+            let (hive, cell) = match self.base_hive(key) {
+                Some(hive) => hive,
+                None => return STATUS_INVALID_HANDLE,
+            };
+            if cell != hive.root() {
+                NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+                return STATUS_NOT_IMPLEMENTED;
+            }
+            hive.bytes()
         };
         let image_len = image.len();
 
@@ -2284,13 +2308,25 @@ impl ExecNtHandler {
         // SAFETY: the slot is a `'static` array; the borrow lives exactly as long as the mount.
         let bytes: &'static [u8] =
             core::slice::from_raw_parts((*core::ptr::addr_of!(USER_HIVE_BUF))[slot].as_ptr(), len);
-        let Some(hive) = RegfHive::new(bytes) else {
-            print_str(b"[cm-load] NtLoadKey: not a regf hive (");
-            print_u64(len as u64);
-            print_str(b" bytes)\n");
-            return STATUS_REGISTRY_CORRUPT;
+        let regf_hive = RegfHive::new(bytes);
+        let mut core_hive = None;
+        let root_subkeys = if let Some(ref hive) = regf_hive {
+            hive.subkeys(hive.root()).len() as u64
+        } else {
+            match nt_hive_core::decode_image(bytes) {
+                Ok(hive) => {
+                    let root_subkeys = hive.subkey_count(hive.root()) as u64;
+                    core_hive = Some(hive);
+                    root_subkeys
+                }
+                Err(_) => {
+                    print_str(b"[cm-load] NtLoadKey: not a regf/core hive (");
+                    print_u64(len as u64);
+                    print_str(b" bytes)\n");
+                    return STATUS_REGISTRY_CORRUPT;
+                }
+            }
         };
-        let root_subkeys = hive.subkeys(hive.root()).len() as u64;
         USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
         let reattached = self.overlay.reattach_subtree(&canon);
         if reattached != 0 {
@@ -2302,13 +2338,17 @@ impl ExecNtHandler {
             print_ascii_str(&full);
             print_str(b"\n");
         }
-        mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, &hive);
+        if let Some(ref hive) = regf_hive {
+            mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, hive);
+        } else if let Some(hive) = core_hive {
+            self.mutable_hives.mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
+        }
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
             canon,
             mount: full,
             file: file_name,
-            hive,
+            hive: regf_hive,
             slot: Some(slot),
             dynamic: true,
         });
@@ -2335,11 +2375,17 @@ impl ExecNtHandler {
         let mut env_path = self.hive_mounts[self.hive_mounts.len() - 1].mount.clone();
         env_path.push_str("\\Environment");
         let mounted_temp = self
-            .resolve_key(&env_path)
-            .and_then(|key| self.registry_value(key, "TEMP"));
+            .mutable_registry_value_by_path(&env_path, "TEMP")
+            .or_else(|| {
+                self.resolve_key(&env_path)
+                    .and_then(|key| self.registry_value(key, "TEMP"))
+            });
         let default_temp = self
-            .resolve_key(r"\Registry\User\.Default\Environment")
-            .and_then(|key| self.registry_value(key, "TEMP"));
+            .mutable_registry_value_by_path(r"\Registry\User\.Default\Environment", "TEMP")
+            .or_else(|| {
+                self.resolve_key(r"\Registry\User\.Default\Environment")
+                    .and_then(|key| self.registry_value(key, "TEMP"))
+            });
         match (&mounted_temp, &default_temp) {
             (Some((ty, data)), Some((dty, ddata)))
                 if !data.is_empty() && ty == dty && data == ddata =>
@@ -13548,10 +13594,11 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS: live authority is coherent; durable checkpointing is D3.
             }
             // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive root to a caller-opened file.
-            // The root-hive case writes the real borrowed `regf` image; subkey export is left as a
-            // visible STATUS_NOT_IMPLEMENTED until the Configuration Manager owns a subtree serializer.
+            // Mutable hive roots write their live `nt-hive-core` image; borrowed-regf roots without
+            // a mutable authority retain the raw-image path. Subkey export is left as a visible
+            // STATUS_NOT_IMPLEMENTED until the Configuration Manager owns a subtree serializer.
             NativeService::NtSaveKey => unsafe { self.nt_save_key(args[0], args[1]) },
-            // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user `regf` hive at
+            // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user hive at
             // `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW` and `LoadUserProfileW` usually go
             // through the base APIs (`RegLoadKeyW`/`RegUnLoadKeyW`), but the ntdll-visible variants
             // are backed by the same real CM path instead of being left as gaps.

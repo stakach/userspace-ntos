@@ -1075,7 +1075,7 @@ pub const SSN_NT_FLUSH_KEY: u64 = 83;
 pub const NT_FLUSH_KEY_SERVICED: bool = true;
 /// `NtSaveKey(IN HANDLE KeyHandle, IN HANDLE FileHandle)` — `ntoskrnl/config/ntapi.c:1634`
 /// (`sysfuncs.lst` line 216 -> SSN 215, two arguments). Root mounted hives can be saved by writing
-/// their borrowed `regf` image to a writable FILE_OBJECT; subkey save still requires a subtree
+/// their live mutable-hive image to a writable FILE_OBJECT; subkey save still requires a subtree
 /// serializer and fails visibly instead of reporting success.
 pub const SSN_NT_SAVE_KEY: u64 = 215;
 /// **FILE_OBJECT LIFETIME switch** (bypass experiment for `exec_npfs_file_object_lifetime` +
@@ -13516,8 +13516,11 @@ pub(crate) struct HiveMount {
     pub(crate) mount: alloc::string::String,
     /// The NT file path `NtLoadKey` read the hive out of (empty for a boot mount).
     pub(crate) file: alloc::string::String,
-    /// The read-only navigator over this mount's bytes.
-    pub(crate) hive: RegfHive<'static>,
+    /// The read-only navigator over this mount's bytes when it came from a `regf` image.
+    ///
+    /// Hives loaded from an `nt-hive-core` checkpoint are mutable-only: `MutableHiveSet` owns their
+    /// cells, and ordinary opens resolve through that authority before the borrowed-regf fallback.
+    pub(crate) hive: Option<RegfHive<'static>>,
     /// Which static hive slot backs it (dynamic mounts only), so `NtUnloadKey` can free it.
     pub(crate) slot: Option<usize>,
     /// `true` iff created by `NtLoadKey` — the only mounts `NtUnloadKey` may detach.
@@ -15579,8 +15582,8 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REG_FLUSH_KEY_MUTABLE: AtomicU64 = AtomicU64::new(0);
 /// Dirty mutable-hive cells observed by the most recent mutable-key flush.
 pub(crate) static REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS: AtomicU64 = AtomicU64::new(0);
-/// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots whose raw `regf` image
-/// can be written to a writable overlay FILE_OBJECT; everything else returns the real refusal.
+/// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots whose live image can be
+/// written to a writable overlay FILE_OBJECT; everything else returns the real refusal.
 pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_ROOT_SAVED: AtomicU64 = AtomicU64::new(0);
@@ -17260,7 +17263,7 @@ fn build_nt_table() -> NativeServiceTable {
                 },
             ),
             (NativeService::NtSaveKey, SSN_NT_SAVE_KEY as u32),
-            // ★ `NtLoadKey` / `NtUnloadKey` — mount a per-user `regf` hive at `HKEY_USERS\<SID>`.
+            // ★ `NtLoadKey` / `NtUnloadKey` — mount a per-user hive at `HKEY_USERS\<SID>`.
             // BYPASS EXPERIMENT SWITCH: flip `NT_LOAD_KEY_SERVICED` to `false` and both SSNs leave
             // the table exactly as before this batch -> `userenv!CreateUserProfileExW`'s
             // `RegLoadKeyW` reaches an UNSERVICED SSN, which parks winlogon.
