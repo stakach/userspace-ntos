@@ -15205,10 +15205,11 @@ impl ExecNtHandler {
                         // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
                         // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
                         // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
-                        if status == 0
-                            && !is_virtual_registry_key(key)
-                            && hive_sel(key) == HIVE_SEL_SOFTWARE
-                        {
+                        let served_from_software = self
+                            .mutable_registry_key(key)
+                            .is_some_and(|key| key.hive == HIVE_SEL_SOFTWARE)
+                            || (!is_virtual_registry_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE);
+                        if status == 0 && served_from_software {
                             SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
                             if self.current_process_is_winlogon() && name_lc == "profilesdirectory" {
                                 WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
@@ -17659,6 +17660,51 @@ impl ExecNtHandler {
                 } else if args[0] == u64::MAX {
                     return nt_process::STATUS_INVALID_HANDLE;
                 }
+                let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
+                    (args[0] <= u32::MAX as u64)
+                        .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
+                        .flatten()
+                });
+                if !matches!(
+                    native_handle_object,
+                    Some(nt_process::HandleObject::RegistryKey(_))
+                ) {
+                    if let Some(granted) =
+                        unsafe { crate::win32k_subsystem::user_object_granted_access(args[0]) }
+                    {
+                        if granted & required_access != required_access {
+                            return nt_security::STATUS_ACCESS_DENIED;
+                        }
+                        let current = unsafe {
+                            crate::win32k_subsystem::user_object_security_descriptor(args[0])
+                        }
+                        .unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
+                        let descriptor = match nt_security::query_security_descriptor_bytes(
+                            current,
+                            security_information,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        if args[4] == 0
+                            || !self.xas_write_u32(
+                                args[4],
+                                descriptor.len().min(u32::MAX as usize) as u32,
+                            )
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                            return STATUS_BUFFER_TOO_SMALL;
+                        }
+                        if !self.probe_user_output(args[2], descriptor.len())
+                            || !self.xas_try_write_buf(args[2], &descriptor)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        return 0;
+                    }
+                }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
                     Err(status) => return status,
@@ -17778,6 +17824,49 @@ impl ExecNtHandler {
                     }
                 } else if args[0] == u64::MAX {
                     return nt_process::STATUS_INVALID_HANDLE;
+                }
+                let native_handle_object = self.pm_pid_for_pi(self.pi).and_then(|pid| {
+                    (args[0] <= u32::MAX as u64)
+                        .then(|| self.pm.lookup_handle(pid, args[0] as nt_process::Handle))
+                        .flatten()
+                });
+                if !matches!(
+                    native_handle_object,
+                    Some(nt_process::HandleObject::RegistryKey(_))
+                ) {
+                    if let Some(granted) =
+                        unsafe { crate::win32k_subsystem::user_object_granted_access(args[0]) }
+                    {
+                        if granted & required_access != required_access {
+                            return nt_security::STATUS_ACCESS_DENIED;
+                        }
+                        let memory = ExecClientMemory { handler: self };
+                        let modification =
+                            match nt_security::capture_security_descriptor_bytes(&memory, args[2]) {
+                                Ok(descriptor) => descriptor,
+                                Err(status) => return status,
+                            };
+                        let current = unsafe {
+                            crate::win32k_subsystem::user_object_security_descriptor(args[0])
+                        }
+                        .unwrap_or(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
+                        let updated = match nt_security::set_security_descriptor_bytes(
+                            current,
+                            security_information,
+                            &modification,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        if unsafe {
+                            crate::win32k_subsystem::set_user_object_security_descriptor(
+                                args[0], &updated,
+                            )
+                        } {
+                            return 0;
+                        }
+                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                    }
                 }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,

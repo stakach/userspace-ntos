@@ -789,7 +789,9 @@ const STATUS_UNKNOWN_REVISION_I32: i32 = 0xC000_0058u32 as i32;
 const STATUS_REVISION_MISMATCH_I32: i32 = 0xC000_0059u32 as i32;
 const STATUS_INVALID_ACL_I32: i32 = 0xC000_0077u32 as i32;
 const STATUS_INVALID_SID_I32: i32 = 0xC000_0078u32 as i32;
+const STATUS_INVALID_SECURITY_DESCR_I32: i32 = 0xC000_0079u32 as i32;
 const STATUS_ALLOTTED_SPACE_EXCEEDED_I32: i32 = 0xC000_0099u32 as i32;
+const STATUS_INSUFFICIENT_RESOURCES_I32: i32 = 0xC000_009Au32 as i32;
 const STATUS_BAD_DESCRIPTOR_FORMAT_I32: i32 = 0xC000_00E7u32 as i32;
 const WIN32K_PRIMARY_TOKEN_MAGIC: u64 = 0x544f_4b45_4e4c_5549; // "TOKENLUI"
 const WIN32K_PRIMARY_TOKEN_BYTES: u64 = 0x70;
@@ -818,6 +820,7 @@ const SE_OWNER_DEFAULTED: u16 = 0x0001;
 const SE_GROUP_DEFAULTED: u16 = 0x0002;
 const SE_DACL_PRESENT: u16 = 0x0004;
 const SE_DACL_DEFAULTED: u16 = 0x0008;
+const SE_SACL_PRESENT: u16 = 0x0010;
 const SE_SELF_RELATIVE: u16 = 0x8000;
 const ACL_HEADER_BYTES: usize = 8;
 const ACL_REVISION_MIN: u64 = 2;
@@ -1874,6 +1877,21 @@ pub(crate) unsafe fn duplicate_user_object_handle(handle: u64) -> Option<u64> {
 /// while any other handle aliases it.
 pub(crate) unsafe fn close_user_object_handle(handle: u64) -> bool {
     (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).close(handle)
+}
+
+/// Return the access mask granted to a modeled USER object handle.
+pub(crate) unsafe fn user_object_granted_access(handle: u64) -> Option<u32> {
+    (*core::ptr::addr_of!(OBJ_TABLE)).granted_access(handle)
+}
+
+/// Return the stored self-relative security descriptor for a modeled USER object handle.
+pub(crate) unsafe fn user_object_security_descriptor(handle: u64) -> Option<&'static [u8]> {
+    (*core::ptr::addr_of!(OBJ_TABLE)).security_descriptor(handle)
+}
+
+/// Replace the stored self-relative security descriptor for a modeled USER object handle.
+pub(crate) unsafe fn set_user_object_security_descriptor(handle: u64, descriptor: &[u8]) -> bool {
+    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).set_security_descriptor(handle, descriptor)
 }
 
 pub(crate) unsafe fn switch_desktop_would_change_input_desktop(hdesk: u64) -> bool {

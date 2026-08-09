@@ -124,6 +124,58 @@ pub const OB_EVENTS_LEN: usize = 4;
 pub const OB_ALIASES_LEN: usize = 8;
 /// Keep duplicate aliases disjoint from both native EPROCESS handles and win32k's dense Ob handles.
 pub const OB_ALIAS_HANDLE_BASE: u64 = 0x7FF0_0000;
+/// Maximum self-relative security descriptor bytes stored for one modeled USER object.
+pub const OB_SECURITY_DESCRIPTOR_MAX: usize = 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ObjectEntry {
+    kind: ObKind,
+    body: u64,
+    security_len: usize,
+    security: [u8; OB_SECURITY_DESCRIPTOR_MAX],
+}
+
+impl ObjectEntry {
+    const fn new(kind: ObKind, body: u64) -> Self {
+        Self {
+            kind,
+            body,
+            security_len: 0,
+            security: [0; OB_SECURITY_DESCRIPTOR_MAX],
+        }
+    }
+
+    fn with_security(kind: ObKind, body: u64, descriptor: Option<&[u8]>) -> Option<Self> {
+        let mut entry = Self::new(kind, body);
+        if let Some(descriptor) = descriptor {
+            if !entry.set_security_descriptor(descriptor) {
+                return None;
+            }
+        }
+        Some(entry)
+    }
+
+    fn pair(self) -> (ObKind, u64) {
+        (self.kind, self.body)
+    }
+
+    fn set_body(&mut self, body: u64) {
+        self.body = body;
+    }
+
+    fn security_descriptor(&self) -> Option<&[u8]> {
+        (self.security_len != 0).then_some(&self.security[..self.security_len])
+    }
+
+    fn set_security_descriptor(&mut self, descriptor: &[u8]) -> bool {
+        if descriptor.len() > self.security.len() {
+            return false;
+        }
+        self.security[..descriptor.len()].copy_from_slice(descriptor);
+        self.security_len = descriptor.len();
+        true
+    }
+}
 
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
@@ -132,11 +184,11 @@ pub const OB_ALIAS_HANDLE_BASE: u64 = 0x7FF0_0000;
 /// distinguishable from any handle *not* in the table (e.g. win32k's process-connect handle, which
 /// the caller resolves via an `EPROCESS` fallback). Single-threaded host: a plain struct suffices.
 pub struct ObHandleTable {
-    slots: [Option<(ObKind, u64)>; OB_TABLE_LEN],
+    slots: [Option<ObjectEntry>; OB_TABLE_LEN],
     next: usize,
-    /// Latches `ObCreateObject`'s (kind, body) so the following `ObInsertObject` — which receives
-    /// only the object pointer, not its type — can register it under a fresh handle.
-    pending: Option<(ObKind, u64)>,
+    /// Latches `ObCreateObject`'s body, type, and captured security descriptor so the following
+    /// `ObInsertObject` can register it under a fresh handle.
+    pending: Option<ObjectEntry>,
     /// The one input window station once created; a later `ObOpenObjectByName(WINSTA)` OPENs it
     /// (returns this handle) instead of reporting NOT_FOUND (which would create a duplicate).
     winsta_handle: u64,
@@ -211,7 +263,7 @@ impl ObHandleTable {
             .map(|(_, b)| *b)
     }
 
-    fn register_inner(&mut self, kind: ObKind, body: u64, cache_window_station: bool) -> u64 {
+    fn register_entry(&mut self, entry: ObjectEntry, cache_window_station: bool) -> u64 {
         let idx = (1..self.next)
             .find(|&idx| self.slots[idx].is_none())
             .unwrap_or(self.next);
@@ -221,7 +273,9 @@ impl ObHandleTable {
         if idx == self.next {
             self.next = idx + 1;
         }
-        self.slots[idx] = Some((kind, body));
+        let kind = entry.kind;
+        let body = entry.body;
+        self.slots[idx] = Some(entry);
         let handle = (idx as u64) << 2;
         if cache_window_station && kind == ObKind::WindowStation {
             self.winsta_handle = handle;
@@ -230,18 +284,53 @@ impl ObHandleTable {
         handle
     }
 
+    fn register_inner(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        cache_window_station: bool,
+        descriptor: Option<&[u8]>,
+    ) -> u64 {
+        let Some(entry) = ObjectEntry::with_security(kind, body, descriptor) else {
+            return 0;
+        };
+        self.register_entry(entry, cache_window_station)
+    }
+
     /// Register `body` under `kind` at a fresh slot and return its client-visible `HANDLE`
     /// (`idx << 2`), or 0 if the table is full. A `WindowStation` registration is also cached as
     /// the single input window station.
     pub fn register(&mut self, kind: ObKind, body: u64) -> u64 {
-        self.register_inner(kind, body, true)
+        self.register_inner(kind, body, true, None)
+    }
+
+    /// Register `body` with an initial self-relative security descriptor captured from the caller's
+    /// `OBJECT_ATTRIBUTES`.
+    pub fn register_with_security(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        descriptor: Option<&[u8]>,
+    ) -> u64 {
+        self.register_inner(kind, body, true, descriptor)
     }
 
     /// Register `body` under `kind` without changing the cached input window station. Noninteractive
     /// service window stations are real `WindowStation` objects, but they must not replace WinSta0
     /// as the interactive station later host code uses for GUI-client inheritance.
     pub fn register_uncached(&mut self, kind: ObKind, body: u64) -> u64 {
-        self.register_inner(kind, body, false)
+        self.register_inner(kind, body, false, None)
+    }
+
+    /// Register `body` with an initial security descriptor without replacing the cached input window
+    /// station.
+    pub fn register_uncached_with_security(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        descriptor: Option<&[u8]>,
+    ) -> u64 {
+        self.register_inner(kind, body, false, descriptor)
     }
 
     /// Find a canonical handle for an object body of the expected kind.
@@ -250,7 +339,7 @@ impl ObHandleTable {
             return None;
         }
         for (idx, slot) in self.slots.iter().enumerate().skip(1) {
-            if slot == &Some((kind, body)) {
+            if slot.is_some_and(|entry| entry.kind == kind && entry.body == body) {
                 return Some((idx as u64) << 2);
             }
         }
@@ -302,7 +391,7 @@ impl ObHandleTable {
         let idx = (handle >> 2) as usize;
         if idx != 0 && idx < self.next {
             if let Some(entry) = self.slots.get(idx).copied().flatten() {
-                return Some(entry);
+                return Some(entry.pair());
             }
         }
         self.lookup_event(handle).map(|body| (ObKind::Event, body))
@@ -313,25 +402,98 @@ impl ObHandleTable {
         self.lookup(handle).map(|(_, body)| body).unwrap_or(0)
     }
 
+    fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
+        if handle >= OB_ALIAS_HANDLE_BASE && handle & 0b11 == 0 {
+            let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
+            let (kind, body) = self.aliases.get(index).copied().flatten()?;
+            return self
+                .slots
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, slot)| {
+                    slot.is_some_and(|entry| entry.kind == kind && entry.body == body)
+                })
+                .map(|(idx, _)| idx);
+        }
+        let idx = (handle >> 2) as usize;
+        if idx != 0 && idx < self.next && self.slots.get(idx)?.is_some() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Return the USER-object handle grant that win32k's Ob layer assigned at create/open time.
+    pub fn granted_access(&self, handle: u64) -> Option<u32> {
+        self.lookup(handle).map(|(kind, _)| match kind {
+            // winuser.h: WINSTA_ALL_ACCESS / DESKTOP_ALL_ACCESS.
+            ObKind::WindowStation => 0x000f_037f,
+            ObKind::Desktop => 0x000f_01ff,
+            ObKind::Event => 0x001f_0003,
+            ObKind::Other => u32::MAX,
+        })
+    }
+
+    /// Stored self-relative security descriptor for a modeled Desktop/WindowStation object.
+    pub fn security_descriptor(&self, handle: u64) -> Option<&[u8]> {
+        let idx = self.canonical_slot_index(handle)?;
+        self.slots[idx]
+            .as_ref()
+            .and_then(ObjectEntry::security_descriptor)
+    }
+
+    /// Replace the object's self-relative security descriptor.
+    pub fn set_security_descriptor(&mut self, handle: u64, descriptor: &[u8]) -> bool {
+        let Some(idx) = self.canonical_slot_index(handle) else {
+            return false;
+        };
+        self.slots[idx]
+            .as_mut()
+            .is_some_and(|entry| entry.set_security_descriptor(descriptor))
+    }
+
     /// Latch a (kind, body) from `ObCreateObject` for the following `ObInsertObject`.
     pub fn latch_pending(&mut self, kind: ObKind, body: u64) {
-        self.pending = Some((kind, body));
+        self.pending = Some(ObjectEntry::new(kind, body));
+    }
+
+    /// Latch a (kind, body, security descriptor) from `ObCreateObject` for the following
+    /// `ObInsertObject`. Returns `false` if the descriptor is too large for the modeled object header.
+    pub fn latch_pending_with_security(
+        &mut self,
+        kind: ObKind,
+        body: u64,
+        descriptor: Option<&[u8]>,
+    ) -> bool {
+        let Some(entry) = ObjectEntry::with_security(kind, body, descriptor) else {
+            return false;
+        };
+        self.pending = Some(entry);
+        true
+    }
+
+    fn insert_pending_inner(&mut self, object: u64, cache_window_station: bool) -> u64 {
+        let entry = match self.pending.take() {
+            Some(mut entry) => {
+                entry.set_body(object);
+                entry
+            }
+            None => ObjectEntry::new(ObKind::Other, object),
+        };
+        self.register_entry(entry, cache_window_station)
     }
 
     /// Register the latched object under a fresh handle (`ObInsertObject`). Uses the kind latched by
     /// [`latch_pending`](Self::latch_pending), defaulting to [`ObKind::Other`] if none was latched,
     /// clears the latch, and returns the new handle.
     pub fn insert_pending(&mut self, object: u64) -> u64 {
-        let kind = self.pending.map(|(k, _)| k).unwrap_or(ObKind::Other);
-        self.pending = None;
-        self.register(kind, object)
+        self.insert_pending_inner(object, true)
     }
 
     /// Register the latched object without replacing the cached input window station.
     pub fn insert_pending_uncached(&mut self, object: u64) -> u64 {
-        let kind = self.pending.map(|(k, _)| k).unwrap_or(ObKind::Other);
-        self.pending = None;
-        self.register_uncached(kind, object)
+        self.insert_pending_inner(object, false)
     }
 
     /// The cached input window-station handle (0 if none has been created yet).
@@ -597,6 +759,44 @@ mod tests {
     }
 
     #[test]
+    fn user_object_security_is_shared_by_aliases() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::WindowStation, 0x5700_0000);
+        let alias = t.duplicate(original).unwrap();
+        let descriptor = [0x01, 0x00, 0x04, 0x80, 0x14, 0x00, 0x00, 0x00];
+
+        assert_eq!(t.security_descriptor(original), None);
+        assert!(t.set_security_descriptor(alias, &descriptor));
+        assert_eq!(t.security_descriptor(original), Some(descriptor.as_slice()));
+        assert_eq!(t.security_descriptor(alias), Some(descriptor.as_slice()));
+
+        assert!(t.close(alias));
+        assert_eq!(t.security_descriptor(original), Some(descriptor.as_slice()));
+        assert_eq!(t.security_descriptor(alias), None);
+    }
+
+    #[test]
+    fn user_object_security_rejects_oversized_descriptors() {
+        let mut t = ObHandleTable::new();
+        let handle = t.register(ObKind::Desktop, 0xD00D_0000);
+        let oversized = [0xAA; OB_SECURITY_DESCRIPTOR_MAX + 1];
+
+        assert!(!t.set_security_descriptor(handle, &oversized));
+        assert_eq!(t.security_descriptor(handle), None);
+    }
+
+    #[test]
+    fn user_object_granted_access_tracks_kind() {
+        let mut t = ObHandleTable::new();
+        let desk = t.register(ObKind::Desktop, 0xD00D_0000);
+        let winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+
+        assert_eq!(t.granted_access(desk), Some(0x000f_01ff));
+        assert_eq!(t.granted_access(winsta), Some(0x000f_037f));
+        assert_eq!(t.granted_access(0), None);
+    }
+
+    #[test]
     fn unknown_and_null_handles_do_not_resolve() {
         let mut t = ObHandleTable::new();
         let h = t.register(ObKind::Desktop, 0x1000);
@@ -616,6 +816,22 @@ mod tests {
         // The latch is consumed; a bare insert with no latch defaults to Other.
         let h2 = t.insert_pending(0x8800_0000);
         assert_eq!(t.lookup(h2), Some((ObKind::Other, 0x8800_0000)));
+    }
+
+    #[test]
+    fn create_then_insert_preserves_initial_security() {
+        let mut t = ObHandleTable::new();
+        let descriptor = [0x01, 0x00, 0x04, 0x80, 0x14, 0x00, 0x00, 0x00];
+
+        assert!(t.latch_pending_with_security(
+            ObKind::WindowStation,
+            0x7700_0000,
+            Some(&descriptor)
+        ));
+        let h = t.insert_pending(0x7700_0000);
+
+        assert_eq!(t.lookup(h), Some((ObKind::WindowStation, 0x7700_0000)));
+        assert_eq!(t.security_descriptor(h), Some(descriptor.as_slice()));
     }
 
     #[test]
