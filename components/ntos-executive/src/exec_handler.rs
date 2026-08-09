@@ -15194,19 +15194,26 @@ impl ExecNtHandler {
                     && fid != 0
                 {
                     let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
-                    if table
-                        .arm(nt_io_manager::AsyncListen {
-                            server_file_id: fid,
-                            event_obj_idx,
-                            pi: self.pi as u32,
-                            tid: self.current_tid,
-                            badge: self.current_badge,
-                            iosb_va: iosb,
-                            // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
-                            // client connect completes ONLY the matching-name listen.
-                            name_hash: crate::pipe_fid_name_hash(fid),
-                        })
-                        .is_some()
+                    let already_armed = table.armed(fid);
+                    let retain_status = if already_armed {
+                        Ok(())
+                    } else {
+                        self.file_completion.retain_file(fid)
+                    };
+                    if retain_status.is_ok()
+                        && table
+                            .arm(nt_io_manager::AsyncListen {
+                                server_file_id: fid,
+                                event_obj_idx,
+                                pi: self.pi as u32,
+                                tid: self.current_tid,
+                                badge: self.current_badge,
+                                iosb_va: iosb,
+                                // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
+                                // client connect completes ONLY the matching-name listen.
+                                name_hash: crate::pipe_fid_name_hash(fid),
+                            })
+                            .is_some()
                     {
                         crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
                         print_str(b"[pipe-listen] ARMED server fid=0x");
@@ -15216,9 +15223,17 @@ impl ExecNtHandler {
                         print_str(b" pi=");
                         print_u64(self.pi as u64);
                         print_str(b"\n");
+                        // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
+                        self.pipe_listen_fid = fid;
+                    } else {
+                        if !already_armed && retain_status.is_ok() {
+                            self.release_file_reference(fid);
+                        }
+                        status = retain_status
+                            .err()
+                            .unwrap_or(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                            as u64;
                     }
-                    // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
-                    self.pipe_listen_fid = fid;
                 }
                 if iosb != 0 && self.pipe_park_fid == 0 && self.pipe_listen_fid == 0 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());

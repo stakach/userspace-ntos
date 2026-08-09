@@ -18642,6 +18642,7 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
         }
         completed += 1;
         PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
+        nt_handler.release_file_reference(l.server_file_id);
     }
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);

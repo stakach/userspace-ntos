@@ -861,6 +861,28 @@ impl<const N: usize> AsyncListenTable<N> {
         count
     }
 
+    /// Cancel all pending listens issued by `tid`, copying each removed server file id into `out`.
+    ///
+    /// The executive retains the listen's `FILE_OBJECT` while the IRP is pending; callers use the
+    /// returned ids to release those references after cancellation. Returns the number of removed
+    /// listens. If `out` is shorter than the number removed, excess ids are dropped from the copy but
+    /// still counted.
+    pub fn cancel_thread_collect_file_ids(&mut self, tid: u64, out: &mut [u64]) -> usize {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if let Some(listen) = *slot {
+                if listen.tid == tid {
+                    if count < out.len() {
+                        out[count] = listen.server_file_id;
+                    }
+                    *slot = None;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Record a pending async listen. If an entry already exists for `server_file_id`, it is REPLACED
     /// (a re-armed listen after a prior completion updates the event/iosb). Returns the slot index, or
     /// `None` if the table is full.
@@ -1572,6 +1594,23 @@ mod tests {
         t.arm(other).unwrap();
 
         assert_eq!(t.cancel_thread(77), 1);
+        assert!(!t.has_thread(77));
+        assert!(t.has_thread(88));
+        assert!(t.armed(0xB));
+    }
+
+    #[test]
+    fn async_listen_cancel_thread_collects_retained_file_ids() {
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al(0xA, 1)).unwrap();
+        t.arm(al(0xC, 3)).unwrap();
+        let mut other = al(0xB, 2);
+        other.tid = 88;
+        t.arm(other).unwrap();
+
+        let mut ids = [0u64; 8];
+        assert_eq!(t.cancel_thread_collect_file_ids(77, &mut ids), 2);
+        assert_eq!(&ids[..2], &[0xA, 0xC]);
         assert!(!t.has_thread(77));
         assert!(t.has_thread(88));
         assert!(t.armed(0xB));

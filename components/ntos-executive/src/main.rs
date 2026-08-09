@@ -12656,7 +12656,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
     release_hosted_thread_mechanism_caps(0, spawn.mechanism());
 }
 
-unsafe fn pipe_io_cancel_thread(tid: u64) {
+unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let mut reply_caps = [0u64; PIPE_WAITER_N];
     let mut count = 0usize;
@@ -12673,7 +12673,14 @@ unsafe fn pipe_io_cancel_thread(tid: u64) {
             release_reply_pool_cap(reply_caps[index]);
         }
     }
-    let _ = (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).cancel_thread(tid);
+    let listens = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+    let mut listen_file_ids = [0u64; PIPE_ASYNC_LISTEN_N];
+    let listen_count = listens.cancel_thread_collect_file_ids(tid, &mut listen_file_ids);
+    for index in 0..listen_count.min(listen_file_ids.len()) {
+        if listen_file_ids[index] != 0 {
+            handler.release_file_reference(listen_file_ids[index]);
+        }
+    }
 }
 
 unsafe fn terminate_hosted_thread_mechanism(
@@ -12686,7 +12693,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_timer_rearm(delay_queue);
     wait_cancel_thread(tid);
     keyed_wait_cancel_thread(tid);
-    pipe_io_cancel_thread(tid);
+    pipe_io_cancel_thread(tid, handler);
     let abandoned_mutants = handler.abandon_mutants_for_thread(tid);
     if abandoned_mutants != 0 {
         print_str(b"[thread-term] abandoned mutants tid=");
