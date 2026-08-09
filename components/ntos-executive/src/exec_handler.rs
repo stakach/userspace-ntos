@@ -7608,6 +7608,17 @@ impl ExecNtHandler {
             )
     }
 
+    fn is_thread_security_handle(&self, caller: nt_process::ProcessId, handle: u64) -> bool {
+        if handle == u64::MAX - 1 {
+            return true;
+        }
+        handle <= u32::MAX as u64
+            && matches!(
+                self.pm.lookup_handle(caller, handle as nt_process::Handle),
+                Some(nt_process::HandleObject::Thread(_))
+            )
+    }
+
     fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
         self.process_mechanisms
             .pi_for_pid(pid)
@@ -17657,6 +17668,41 @@ impl ExecNtHandler {
                         }
                         return 0;
                     }
+                    if self.is_thread_security_handle(caller_pid, args[0]) {
+                        let current = match self.pm.thread_security_descriptor(
+                            caller_pid,
+                            self.current_tid as nt_process::ThreadId,
+                            args[0],
+                            required_access,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        let descriptor = match nt_security::query_security_descriptor_bytes(
+                            current,
+                            security_information,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        if args[4] == 0
+                            || !self.xas_write_u32(
+                                args[4],
+                                descriptor.len().min(u32::MAX as usize) as u32,
+                            )
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                            return STATUS_BUFFER_TOO_SMALL;
+                        }
+                        if !self.probe_user_output(args[2], descriptor.len())
+                            || !self.xas_try_write_buf(args[2], &descriptor)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        return 0;
+                    }
                 } else if args[0] == u64::MAX {
                     return nt_process::STATUS_INVALID_HANDLE;
                 }
@@ -17811,6 +17857,44 @@ impl ExecNtHandler {
                         };
                         return match self.pm.set_process_security_descriptor(
                             caller_pid,
+                            args[0],
+                            required_access,
+                            updated,
+                        ) {
+                            Ok(()) => {
+                                self.process_dirty = true;
+                                0
+                            }
+                            Err(status) => status,
+                        };
+                    }
+                    if self.is_thread_security_handle(caller_pid, args[0]) {
+                        let current = match self.pm.thread_security_descriptor(
+                            caller_pid,
+                            self.current_tid as nt_process::ThreadId,
+                            args[0],
+                            required_access,
+                        ) {
+                            Ok(descriptor) => alloc::vec::Vec::from(descriptor),
+                            Err(status) => return status,
+                        };
+                        let memory = ExecClientMemory { handler: self };
+                        let modification =
+                            match nt_security::capture_security_descriptor_bytes(&memory, args[2]) {
+                                Ok(descriptor) => descriptor,
+                                Err(status) => return status,
+                            };
+                        let updated = match nt_security::set_security_descriptor_bytes(
+                            &current,
+                            security_information,
+                            &modification,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        return match self.pm.set_thread_security_descriptor(
+                            caller_pid,
+                            self.current_tid as nt_process::ThreadId,
                             args[0],
                             required_access,
                             updated,

@@ -2193,6 +2193,214 @@ unsafe fn object_attributes_name_leaf_eq_ascii(object_attributes: u64, leaf: &[u
     true
 }
 
+struct CapturedUserObjectSecurityDescriptor {
+    len: usize,
+    bytes: [u8; nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX],
+}
+
+impl CapturedUserObjectSecurityDescriptor {
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX],
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+unsafe fn copy_component_bytes_to_slice(dst: &mut [u8], offset: usize, src: u64, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        dst[offset + i] = read_volatile((src + i as u64) as *const u8);
+        i += 1;
+    }
+}
+
+fn write_slice_u16(dst: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    dst[offset] = bytes[0];
+    dst[offset + 1] = bytes[1];
+}
+
+fn write_slice_u32(dst: &mut [u8], offset: usize, value: u32) {
+    let bytes = value.to_le_bytes();
+    dst[offset] = bytes[0];
+    dst[offset + 1] = bytes[1];
+    dst[offset + 2] = bytes[2];
+    dst[offset + 3] = bytes[3];
+}
+
+fn checked_self_relative_component_end(offset: u32, len: usize) -> Option<usize> {
+    if offset == 0 {
+        return Some(SECURITY_DESCRIPTOR_RELATIVE_BYTES);
+    }
+    let offset = offset as usize;
+    if offset < SECURITY_DESCRIPTOR_RELATIVE_BYTES {
+        return None;
+    }
+    offset.checked_add(len)
+}
+
+unsafe fn self_relative_security_descriptor_len(sd: u64, control: u16) -> Result<usize, i32> {
+    let mut total = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
+    for offset in [
+        read_unaligned((sd + SD_REL_OWNER_OFF) as *const u32),
+        read_unaligned((sd + SD_REL_GROUP_OFF) as *const u32),
+    ] {
+        if offset != 0 {
+            let component = sd
+                .checked_add(offset as u64)
+                .ok_or(STATUS_INVALID_SECURITY_DESCR_I32)?;
+            let Some(len) = sid_len_from_ptr(component) else {
+                return Err(STATUS_INVALID_SID_I32);
+            };
+            let Some(end) = checked_self_relative_component_end(offset, len) else {
+                return Err(STATUS_INVALID_SECURITY_DESCR_I32);
+            };
+            total = total.max(end);
+        }
+    }
+
+    for (present, offset) in [
+        (
+            control & SE_SACL_PRESENT != 0,
+            read_unaligned((sd + SD_REL_SACL_OFF) as *const u32),
+        ),
+        (
+            control & SE_DACL_PRESENT != 0,
+            read_unaligned((sd + SD_REL_DACL_OFF) as *const u32),
+        ),
+    ] {
+        if !present {
+            if offset != 0 {
+                return Err(STATUS_INVALID_SECURITY_DESCR_I32);
+            }
+            continue;
+        }
+        if offset == 0 {
+            continue;
+        }
+        let component = sd
+            .checked_add(offset as u64)
+            .ok_or(STATUS_INVALID_SECURITY_DESCR_I32)?;
+        let Some(len) = acl_size_from_ptr(component) else {
+            return Err(STATUS_INVALID_ACL_I32);
+        };
+        let Some(end) = checked_self_relative_component_end(offset, len) else {
+            return Err(STATUS_INVALID_SECURITY_DESCR_I32);
+        };
+        total = total.max(end);
+    }
+
+    Ok(total)
+}
+
+unsafe fn capture_user_object_security_descriptor(
+    sd: u64,
+) -> Result<CapturedUserObjectSecurityDescriptor, i32> {
+    if sd == 0 {
+        return Err(STATUS_ACCESS_VIOLATION_I32);
+    }
+    if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+        return Err(STATUS_UNKNOWN_REVISION_I32);
+    }
+
+    let control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+    let mut captured = CapturedUserObjectSecurityDescriptor::empty();
+
+    if control & SE_SELF_RELATIVE != 0 {
+        let len = self_relative_security_descriptor_len(sd, control)?;
+        if len > captured.bytes.len() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
+        }
+        copy_component_bytes_to_slice(&mut captured.bytes, 0, sd, len);
+        captured.len = len;
+        return Ok(captured);
+    }
+
+    let owner = read_unaligned((sd + SD_OWNER_OFF) as *const u64);
+    let group = read_unaligned((sd + SD_GROUP_OFF) as *const u64);
+    let sacl = if control & SE_SACL_PRESENT != 0 {
+        read_unaligned((sd + SD_SACL_OFF) as *const u64)
+    } else {
+        0
+    };
+    let dacl = if control & SE_DACL_PRESENT != 0 {
+        read_unaligned((sd + SD_DACL_OFF) as *const u64)
+    } else {
+        0
+    };
+    let Some(owner_len) = sd_component_len_sid(owner) else {
+        return Err(STATUS_INVALID_SID_I32);
+    };
+    let Some(group_len) = sd_component_len_sid(group) else {
+        return Err(STATUS_INVALID_SID_I32);
+    };
+    let Some(sacl_len) = sd_component_len_acl(sacl) else {
+        return Err(STATUS_INVALID_ACL_I32);
+    };
+    let Some(dacl_len) = sd_component_len_acl(dacl) else {
+        return Err(STATUS_INVALID_ACL_I32);
+    };
+    let Some(total_len) = SECURITY_DESCRIPTOR_RELATIVE_BYTES
+        .checked_add(owner_len)
+        .and_then(|v| v.checked_add(group_len))
+        .and_then(|v| v.checked_add(sacl_len))
+        .and_then(|v| v.checked_add(dacl_len))
+    else {
+        return Err(STATUS_ALLOTTED_SPACE_EXCEEDED_I32);
+    };
+    if total_len > captured.bytes.len() {
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
+    }
+
+    captured.bytes[0] = read_volatile(sd as *const u8);
+    captured.bytes[1] = read_volatile((sd + 1) as *const u8);
+    write_slice_u16(
+        &mut captured.bytes,
+        SD_CONTROL_OFF as usize,
+        control | SE_SELF_RELATIVE,
+    );
+    let mut current = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
+    if sacl_len != 0 {
+        copy_component_bytes_to_slice(&mut captured.bytes, current, sacl, sacl_len);
+        write_slice_u32(&mut captured.bytes, SD_REL_SACL_OFF as usize, current as u32);
+        current += sacl_len;
+    }
+    if dacl_len != 0 {
+        copy_component_bytes_to_slice(&mut captured.bytes, current, dacl, dacl_len);
+        write_slice_u32(&mut captured.bytes, SD_REL_DACL_OFF as usize, current as u32);
+        current += dacl_len;
+    }
+    if owner_len != 0 {
+        copy_component_bytes_to_slice(&mut captured.bytes, current, owner, owner_len);
+        write_slice_u32(&mut captured.bytes, SD_REL_OWNER_OFF as usize, current as u32);
+        current += owner_len;
+    }
+    if group_len != 0 {
+        copy_component_bytes_to_slice(&mut captured.bytes, current, group, group_len);
+        write_slice_u32(&mut captured.bytes, SD_REL_GROUP_OFF as usize, current as u32);
+    }
+    captured.len = total_len;
+    Ok(captured)
+}
+
+unsafe fn object_attributes_security_descriptor(
+    object_attributes: u64,
+) -> Result<Option<CapturedUserObjectSecurityDescriptor>, i32> {
+    if object_attributes == 0 {
+        return Ok(None);
+    }
+    let sd = read_unaligned((object_attributes + 0x20) as *const u64);
+    if sd == 0 {
+        return Ok(None);
+    }
+    capture_user_object_security_descriptor(sd).map(Some)
+}
+
 unsafe fn current_token_authentication_id() -> u64 {
     current_process_context_index()
         .map(|index| WIN32K_PROCESS_CTX_TOKEN_AUTH[index].load(Ordering::Relaxed))
@@ -2257,11 +2465,22 @@ extern "win64" fn s_ob_open_object_by_name(
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
+                let security = match object_attributes_security_descriptor(object_attributes) {
+                    Ok(security) => security,
+                    Err(status) => return status,
+                };
                 let body = alloc_desktop_body();
                 if body == 0 {
-                    return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
-                let h = table.register(ObKind::Desktop, body);
+                let h = table.register_with_security(
+                    ObKind::Desktop,
+                    body,
+                    security.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+                );
+                if h == 0 {
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
+                }
                 if !handle.is_null() {
                     write_unaligned(handle, h);
                 }
@@ -2407,11 +2626,25 @@ extern "win64" fn s_ob_create_object(
         let size = (body_size as u32 as u64).max(0x40);
         let body = pool_alloc(size);
         if body == 0 {
-            return 0xC000_009Au32 as i32;
+            return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         let kind = classify_type(obj_type).unwrap_or(ObKind::Other);
-        table.latch_pending(kind, body);
+        let security = if matches!(kind, ObKind::Desktop | ObKind::WindowStation) {
+            match object_attributes_security_descriptor(object_attributes) {
+                Ok(security) => security,
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
+        if !table.latch_pending_with_security(
+            kind,
+            body,
+            security.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+        ) {
+            return STATUS_INSUFFICIENT_RESOURCES_I32;
+        }
         let uncached_winsta = kind == ObKind::WindowStation
             && object_attributes_name_contains_ascii(object_attributes, b"service-");
         WIN32K_PENDING_OB_UNCACHED_WINSTA.store(uncached_winsta as u64, Ordering::Relaxed);

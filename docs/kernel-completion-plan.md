@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 
 ## Objective
 
@@ -28,6 +28,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
 - `[x]` complete
 
 ## Workstreams
+
+### Current Desktop Frontier
+
+Boot proof `.tmp/boot-strict-win32k-context-rerun-20260810.log` reaches `[microtest done]` at
+`289/295`: winlogon authenticates, `WlxActivateUserShell` reads `Userinit` from the real SOFTWARE
+hive, `userinit.exe` starts, genuine `explorer.exe` launches, explorer installs client WndProcs,
+shell COM classes are served, and explorer leaves a broad non-background framebuffer span. The latest
+kernel-side cleanup also removes the stale published win32k thread-context import warning by matching
+published callback contexts against process and thread identity together.
+
+The remaining explorer chrome blocker is not process launch or callback registration: explorer still
+never calls `NtUserBeginPaint`/`NtUserEndPaint` (`begin/end=0/0`) and ReactOS reports
+`desktop.cpp:193` with `hres=80004005` before the explorer main thread parks on an empty message
+queue. The next useful slice is therefore the real desktop browser/tray message path that should
+create or invalidate a paintable shell window, not a paint-accounting shortcut.
 
 ### A. SCM-Controlled Service Startup
 

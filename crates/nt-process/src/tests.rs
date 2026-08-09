@@ -227,6 +227,66 @@ fn process_security_descriptor_uses_process_handle_access() {
 }
 
 #[test]
+fn thread_security_descriptor_uses_thread_handle_access() {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let current = pm.create_thread(caller, 0x1000, 0, false).unwrap();
+    let target = pm.create_thread(caller, 0x2000, 0, false).unwrap();
+    let read_only = pm
+        .insert_handle(caller, HandleObject::Thread(target), READ_CONTROL)
+        .unwrap();
+
+    assert_eq!(
+        pm.thread_security_descriptor(caller, current, u64::MAX - 1, READ_CONTROL)
+            .unwrap(),
+        &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]
+    );
+    assert_eq!(
+        pm.set_thread_security_descriptor(
+            caller,
+            current,
+            read_only as u64,
+            WRITE_DAC,
+            alloc::vec![]
+        ),
+        Err(STATUS_ACCESS_DENIED)
+    );
+
+    let writable = pm
+        .insert_handle(
+            caller,
+            HandleObject::Thread(target),
+            READ_CONTROL | WRITE_DAC,
+        )
+        .unwrap();
+    let empty_dacl_sd = alloc::vec![
+        1, 0, 0x04, 0x80, // revision, control: self-relative + DACL present
+        0, 0, 0, 0, // owner
+        0, 0, 0, 0, // group
+        0, 0, 0, 0, // SACL
+        20, 0, 0, 0, // DACL
+        2, 0, 8, 0, // ACL revision + size
+        0, 0, 0, 0, // ACE count + padding
+    ];
+    pm.set_thread_security_descriptor(
+        caller,
+        current,
+        writable as u64,
+        WRITE_DAC,
+        empty_dacl_sd.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        pm.thread_security_descriptor(caller, current, read_only as u64, READ_CONTROL)
+            .unwrap(),
+        empty_dacl_sd.as_slice()
+    );
+}
+
+#[test]
 fn queue_user_apc_requires_thread_set_context_access() {
     let mut pm = ProcessManager::new();
     let caller = pm.create_process("caller.exe", None, None);

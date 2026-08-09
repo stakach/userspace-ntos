@@ -356,9 +356,8 @@ fn published_context_matches_ids(
     expected_pid: u64,
     expected_tid: u64,
 ) -> bool {
-    (expected_pid == 0 && expected_tid == 0)
-        || (expected_pid != 0 && context.pid != 0 && context.pid == expected_pid)
-        || (expected_tid != 0 && context.tid != 0 && context.tid == expected_tid)
+    (expected_pid == 0 || (context.pid != 0 && context.pid == expected_pid))
+        && (expected_tid == 0 || (context.tid != 0 && context.tid == expected_tid))
 }
 
 unsafe fn capture_suspended_published_win32k_context(
@@ -439,8 +438,10 @@ pub(crate) unsafe fn take_suspended_published_win32k_context(
         let slot = core::ptr::read(slots.add(i));
         if slot.valid != 0
             && slot.pi == pi
-            && (pid == 0 || slot.pid == pid || slot.published.pid == pid)
-            && (tid == 0 || slot.tid == tid || slot.published.tid == 0 || slot.published.tid == tid)
+            && (pid == 0 || slot.pid == pid)
+            && (tid == 0 || slot.tid == tid)
+            && (pid == 0 || slot.published.pid == 0 || slot.published.pid == pid)
+            && (tid == 0 || slot.published.tid == 0 || slot.published.tid == tid)
         {
             core::ptr::write(slots.add(i), SuspendedPublishedContext::EMPTY);
             return Some(slot.published);

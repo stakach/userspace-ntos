@@ -635,6 +635,10 @@ pub struct NtThread {
     /// Active impersonation context. The thread owns a token reference independently of the user
     /// handle that assigned it.
     impersonation: Option<ImpersonationContext>,
+    /// Self-relative security descriptor applied through `NtQuerySecurityObject` /
+    /// `NtSetSecurityObject` on thread handles. Access checks use handle grants; this stores the
+    /// object descriptor that user-mode security setup can query or replace.
+    security_descriptor: Vec<u8>,
     pub suspend_count: u32,
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
@@ -1098,6 +1102,39 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Return the thread object's self-relative security descriptor after resolving a caller-local
+    /// thread handle. `NtCurrentThread()` resolves through `current_tid` and carries maximum
+    /// pseudo-handle access.
+    pub fn thread_security_descriptor(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<&[u8], u32> {
+        let tid = self.resolve_thread_handle(caller_pid, current_tid, handle, required_access)?;
+        self.threads
+            .get(&tid)
+            .map(|thread| thread.security_descriptor.as_slice())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Replace the thread object's self-relative security descriptor after the same thread-handle
+    /// access checks used by other thread syscalls.
+    pub fn set_thread_security_descriptor(
+        &mut self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        required_access: u32,
+        descriptor: Vec<u8>,
+    ) -> Result<(), u32> {
+        let tid = self.resolve_thread_handle(caller_pid, current_tid, handle, required_access)?;
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.security_descriptor = descriptor;
+        Ok(())
+    }
+
     /// Replace or clear a thread impersonation context. The returned context lets the caller
     /// release the old token reference after retaining the replacement.
     pub fn replace_thread_impersonation(
@@ -1162,6 +1199,7 @@ impl ProcessManager {
                 kernel_time_100ns: 0,
                 user_time_100ns: 0,
                 impersonation: None,
+                security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 suspend_count: 0,
                 win32_thread: None,
                 kernel_thread_object: None,
@@ -1853,6 +1891,7 @@ impl ProcessManager {
         thread.suspend_count = create_suspended as u32;
         thread.win32_thread = None;
         thread.teb_base = 0;
+        thread.security_descriptor = Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
         thread.break_on_termination = false;
         thread.disable_boost = false;
         thread.hide_from_debugger = false;
