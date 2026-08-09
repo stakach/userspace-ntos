@@ -318,8 +318,10 @@ const STATUS_PENDING: u32 = 0x0000_0103;
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
 const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
 const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
+const IRP_MJ_FILE_SYSTEM_CONTROL: u64 = major::IRP_MJ_FILE_SYSTEM_CONTROL as u64;
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
+const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` / `IRP_MJ_CLEANUP` — the requests that END an open (and therefore the ONLY
 /// requests that may destroy its FILE_OBJECT). See [`FILE_OBJECTS`].
 const IRP_MJ_CLOSE: u64 = 0x02;
@@ -339,11 +341,14 @@ struct PendingIrp {
     /// bytes under fid 0 and the parked reader would never be woken.
     fid: u64,
     major: u8,
+    /// This pending IRP completes with bytes for the caller's read/output buffer. `READ` and
+    /// `FSCTL_PIPE_TRANSCEIVE` both enter npfs's read queue and are completed by a peer write.
+    read_completion: bool,
     /// Whether THIS IRP owns the FILE_OBJECT block (a transient one, not the per-open object in
     /// [`FILE_OBJECTS`]). Only a transient FILE_OBJECT may be freed on completion — see
     /// [`fo_for_open`].
     owns_fo: bool,
-    _pad: [u8; 6],
+    _pad: [u8; 5],
 }
 
 static mut DATA_TRACE_COUNT: u32 = 0;
@@ -354,6 +359,11 @@ static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
 static mut POOL_LONG_WALKS: u32 = 0;
 static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
+
+#[inline]
+fn pending_irp_returns_read_bytes(major: u64, fsctl: u64) -> bool {
+    major == IRP_MJ_READ || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
+}
 
 // BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
 // read IRP in its inbound queue (QueueState=ReadEntries) and the EXECUTIVE parks the caller. The
@@ -1317,6 +1327,7 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 
 const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
@@ -4657,7 +4668,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
         // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
         // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
-        if slot.major as u64 == IRP_MJ_READ {
+        if slot.read_completion {
             let fid = slot.fid;
             // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
             // it). Fall back to our original buffer only if npfs left it in place.
@@ -7011,7 +7022,7 @@ pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
 /// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { IoStatus@0x30, CurrentLocation
 /// (CCHAR)@0x42, StackCount@0x43, AssociatedIrp.SystemBuffer@0x18, UserBuffer@0x70,
 /// Tail.Overlay.CurrentStackLocation@0xb8 }. IO_STACK_LOCATION { Major@0, Minor@1, Parameters(union)
-/// @0x08, DeviceObject@0x20, FileObject@0x30 }.
+/// @0x08, DeviceObject@0x28, FileObject@0x30 }.
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
     let minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
@@ -7094,7 +7105,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // IO_STACK_LOCATION. Parameters union @ +0x08:
     // Create/CreatePipe: SecurityContext@+0x08, Options@+0x10, ShareAccess@+0x1a, Parameters@+0x20.
     // Read/Write: Length@+0x08. SetFile: Length@+0x08, FileInformationClass@+0x10.
-    // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18.
+    // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18,
+    // Type3InputBuffer@+0x20. `Irp->UserBuffer` carries the output buffer.
     let iosl_len = if major == IRP_MJ_PNP {
         WDM_X64_IO_STACK_LOCATION_SIZE as u64 * 2
     } else {
@@ -7177,6 +7189,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             output_buffer_length: outlen as u32,
             input_buffer_length: inlen as u32,
             io_control_code: fsctl as u32,
+            type3_input_buffer: data,
         },
         IRP_MJ_PNP if minor == IRP_MN_START_DEVICE => {
             if inlen != 0 {
@@ -7315,6 +7328,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         fo_registered = false;
     }
     let irp_owns_fo = owns_fo && !fo_registered;
+    let read_completion = pending_irp_returns_read_bytes(major, fsctl);
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
@@ -7338,8 +7352,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             // carried in this request.
             fid: if file_id != 0 { file_id } else { fsctx },
             major: major as u8,
+            read_completion,
             owns_fo: irp_owns_fo,
-            _pad: [0; 6],
+            _pad: [0; 5],
         });
         if !inserted {
             pool_free(data);
@@ -7354,7 +7369,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
         }
     } else {
-        if major == IRP_MJ_READ {
+        if read_completion {
             let copy_len = info.min(outlen);
             let mut index = 0u64;
             while index < copy_len {
@@ -8952,18 +8967,19 @@ fn external_irp_parameters(
     }
 }
 
-fn dispatch_external_irp_to_driver_record(
+fn dispatch_external_irp_to_driver_record_result(
     driver_id: u64,
     major: u64,
     fsctl: u64,
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Option<(i32, u64)> {
-    let major = external_major(major)?;
+) -> Result<(i32, u64), u32> {
+    let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let input_len = external_len(in_data.len());
     let output_len = external_len(out.len());
-    let params = external_irp_parameters(major, fsctl, input_len, output_len)?;
+    let params =
+        external_irp_parameters(major, fsctl, input_len, output_len).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
     system_buffer.resize(in_data.len().max(out.len()), 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
@@ -8979,26 +8995,27 @@ fn dispatch_external_irp_to_driver_record(
             output_len,
             &mut system_buffer,
         )
-        .ok()?;
+        .map_err(|status| status.raw() as u32)?;
     let copy_len = (information as usize)
         .min(out.len())
         .min(system_buffer.len());
     out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-    Some((status.raw(), information))
+    Ok((status.raw(), information))
 }
 
-fn dispatch_external_irp_to_device_record(
+fn dispatch_external_irp_to_device_record_result(
     device_id: u64,
     major: u64,
     fsctl: u64,
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Option<(i32, u64)> {
-    let major = external_major(major)?;
+) -> Result<(i32, u64), u32> {
+    let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let input_len = external_len(in_data.len());
     let output_len = external_len(out.len());
-    let params = external_irp_parameters(major, fsctl, input_len, output_len)?;
+    let params =
+        external_irp_parameters(major, fsctl, input_len, output_len).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
     system_buffer.resize(in_data.len().max(out.len()), 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
@@ -9014,12 +9031,12 @@ fn dispatch_external_irp_to_device_record(
             output_len,
             &mut system_buffer,
         )
-        .ok()?;
+        .map_err(|status| status.raw() as u32)?;
     let copy_len = (information as usize)
         .min(out.len())
         .min(system_buffer.len());
     out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-    Some((status.raw(), information))
+    Ok((status.raw(), information))
 }
 
 fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {
@@ -10774,20 +10791,10 @@ pub(crate) fn device_id_by_name(path: &str) -> Option<u64> {
         .map(|device_id| device_id.raw())
 }
 
-fn device_id_by_object_id(object_id: u64) -> Option<u64> {
-    if object_id == 0 {
-        return None;
-    }
-    io_manager_mut()
-        .device_id_by_object_id(ObjectId(object_id))
-        .map(|device_id| device_id.raw())
-}
-
 /// Whether the driver-declared `\Device\NamedPipe` route is ready to serve IRPs.
 pub(crate) fn npfs_ready() -> bool {
     device_id_by_name("\\Device\\NamedPipe")
-        .and_then(instance_by_device_id)
-        .map(|(_, d)| d.ready)
+        .map(hosted_device_ready_for_dispatch)
         .unwrap_or(false)
 }
 
@@ -10815,8 +10822,7 @@ pub(crate) unsafe fn npfs_last_file_id() -> u64 {
 /// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame
 /// (buffered I/O); `out` receives the driver's output. Returns `None` if `inst` isn't ready.
 ///
-/// This is the private component transport engine. Public callers route through driver/device ids
-/// and Object Manager object ids.
+/// This is the private component transport engine. Public callers route through driver/device ids.
 unsafe fn dispatch_irp_for_instance(
     inst: usize,
     major: u64,
@@ -10945,50 +10951,62 @@ pub(crate) unsafe fn dispatch_irp_to_driver(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let (_, inst) = instance_by_driver_id(driver_id)?;
-    if !inst.ready || inst.driver_object == 0 {
-        return None;
-    }
-    if io_manager_mut().driver(DriverId(driver_id)).is_none() {
-        return None;
-    }
-    dispatch_external_irp_to_driver_record(driver_id, major, fsctl, file_id, in_data, out)
+    dispatch_irp_to_driver_result(driver_id, major, fsctl, file_id, in_data, out).ok()
 }
 
-/// Route one IRP to a launched device by its canonical device route id.
-pub(crate) unsafe fn dispatch_irp_to_device(
+pub(crate) unsafe fn dispatch_irp_to_driver_result(
+    driver_id: u64,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64), u32> {
+    let Some((_, inst)) = instance_by_driver_id(driver_id) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
+    if !inst.ready || inst.driver_object == 0 {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    }
+    if io_manager_mut().driver(DriverId(driver_id)).is_none() {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    }
+    dispatch_external_irp_to_driver_record_result(driver_id, major, fsctl, file_id, in_data, out)
+}
+
+pub(crate) unsafe fn dispatch_irp_to_device_result(
     device_id: u64,
     major: u64,
     fsctl: u64,
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
-) -> Option<(i32, u64)> {
-    let binding = hosted_device_binding_by_device_id(device_id)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)?;
+) -> Result<(i32, u64), u32> {
+    require_hosted_device_ready_for_dispatch(device_id)?;
+    dispatch_external_irp_to_device_record_result(device_id, major, fsctl, file_id, in_data, out)
+}
+
+fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
+    require_hosted_device_ready_for_dispatch(device_id).is_ok()
+}
+
+fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
+    let Some(binding) = hosted_device_binding_by_device_id(device_id) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
+    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
     if !inst.ready || inst.driver_id == 0 || binding.device_object == 0 {
-        return None;
+        return Err(STATUS_DEVICE_NOT_READY as u32);
     }
     if io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))
         .is_none()
     {
-        return None;
+        return Err(STATUS_DEVICE_NOT_READY as u32);
     }
-    dispatch_external_irp_to_device_record(device_id, major, fsctl, file_id, in_data, out)
-}
-
-/// Route one IRP to a launched device by the Object Manager Device object id.
-pub(crate) unsafe fn dispatch_irp_to_device_object(
-    object_id: u64,
-    major: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Option<(i32, u64)> {
-    let device_id = device_id_by_object_id(object_id)?;
-    dispatch_irp_to_device(device_id, major, fsctl, file_id, in_data, out)
+    Ok(())
 }
 
 unsafe fn dispatch_irp_to_named_device(
@@ -10999,16 +11017,19 @@ unsafe fn dispatch_irp_to_named_device(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let device_id = device_id_by_name(path)?;
-    let object_id = io_manager_mut()
-        .device(nt_io_manager::DeviceId(device_id))
-        .map(|device| device.object_id.0)
-        .unwrap_or(0);
-    if object_id != 0 {
-        dispatch_irp_to_device_object(object_id, major, fsctl, file_id, in_data, out)
-    } else {
-        dispatch_irp_to_device(device_id, major, fsctl, file_id, in_data, out)
-    }
+    dispatch_irp_to_named_device_result(path, major, fsctl, file_id, in_data, out).ok()
+}
+
+unsafe fn dispatch_irp_to_named_device_result(
+    path: &str,
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64), u32> {
+    let device_id = device_id_by_name(path).ok_or(STATUS_DEVICE_NOT_READY as u32)?;
+    dispatch_irp_to_device_result(device_id, major, fsctl, file_id, in_data, out)
 }
 
 /// Route one IRP to the driver-declared `\Device\NamedPipe` route. Kept as a semantic npfs wrapper
@@ -11021,4 +11042,14 @@ pub(crate) unsafe fn npfs_dispatch_irp(
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
     dispatch_irp_to_named_device("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
+}
+
+pub(crate) unsafe fn npfs_dispatch_irp_result(
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64), u32> {
+    dispatch_irp_to_named_device_result("\\Device\\NamedPipe", major, fsctl, file_id, in_data, out)
 }

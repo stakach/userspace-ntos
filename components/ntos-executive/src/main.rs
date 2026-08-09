@@ -15676,7 +15676,6 @@ static NT_WRITE_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_READ_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_FLUSH_BUFFERS_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_FLUSH_BUFFERS_FILE_PENDING_COUNT: AtomicU64 = AtomicU64::new(0);
-static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).

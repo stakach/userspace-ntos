@@ -60,6 +60,10 @@ pub const STATUS_PIPE_LISTENING: NtStatus = NtStatus(0xC000_00B3u32 as i32);
 pub const STATUS_PIPE_CONNECTED: NtStatus = NtStatus(0xC000_00B4u32 as i32);
 /// `STATUS_INSTANCE_NOT_AVAILABLE` (0xC00000AB): the max-instances limit hit.
 pub const STATUS_INSTANCE_NOT_AVAILABLE: NtStatus = NtStatus(0xC000_00ABu32 as i32);
+/// `STATUS_PENDING` (0x00000103): an async pipe read/write/transceive IRP is queued.
+pub const STATUS_PENDING: NtStatus = NtStatus(0x0000_0103);
+
+const FILE_PIPE_WAIT_NAME_OFFSET: usize = 14;
 
 /// The named-pipe connection state machine (`FILE_PIPE_*_STATE`,
 /// `NP_CCB.NamedPipeState`).
@@ -483,6 +487,9 @@ impl PipeRegistry {
     ) -> Result<(usize, Vec<u8>, bool), NtStatus> {
         let written = self.pipe_write(h, out)?;
         let (bytes, more) = self.pipe_read(h, max)?;
+        if bytes.is_empty() && max != 0 {
+            return Err(STATUS_PENDING);
+        }
         Ok((written, bytes, more))
     }
 
@@ -824,6 +831,30 @@ pub fn pipe_name_hash(name16: &[u16]) -> u64 {
     h
 }
 
+/// Decode the variable-sized `FILE_PIPE_WAIT_FOR_BUFFER` payload used by
+/// `FSCTL_PIPE_WAIT`. The returned name is the caller-provided pipe suffix; the
+/// object-manager/NPFS bridge is responsible for applying its namespace prefix.
+pub fn decode_pipe_wait_name(input: &[u8]) -> Result<Vec<u16>, NtStatus> {
+    if input.len() < FILE_PIPE_WAIT_NAME_OFFSET + 2 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let name_len = u32::from_le_bytes([input[8], input[9], input[10], input[11]]) as usize;
+    if name_len == 0
+        || name_len & 1 != 0
+        || name_len > 0xFFFE
+        || FILE_PIPE_WAIT_NAME_OFFSET
+            .checked_add(name_len)
+            .is_none_or(|end| end > input.len())
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let name = &input[FILE_PIPE_WAIT_NAME_OFFSET..FILE_PIPE_WAIT_NAME_OFFSET + name_len];
+    Ok(name
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .collect())
+}
+
 /// A fixed-capacity, heap-free, reset-safe table of pending async server listens. Same `.bss` static
 /// shape as [`PipeWaiterTable`]. One entry per server pipe end awaiting a client connect.
 #[derive(Clone, Debug)]
@@ -930,6 +961,17 @@ impl<const N: usize> AsyncListenTable<N> {
     /// Is there a pending listen on `server_file_id`?
     pub fn armed(&self, server_file_id: u64) -> bool {
         self.find(server_file_id).is_some()
+    }
+
+    /// Is there a pending listen matching `name_hash` without consuming it?
+    ///
+    /// This is the `FSCTL_PIPE_WAIT` check: user mode asks whether a named pipe has a listening
+    /// instance before it opens the client end. Matching follows the same wildcard contract as
+    /// [`complete_by_name`], but leaves the pending listen armed for the later client create.
+    pub fn armed_name(&self, name_hash: u64) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.is_some_and(|l| name_hash == 0 || l.name_hash == 0 || l.name_hash == name_hash)
+        })
     }
 
     /// Complete + free the listen on `server_file_id` (a client connected). Returns the completed
@@ -1399,6 +1441,25 @@ mod tests {
     }
 
     #[test]
+    fn transceive_without_reply_pends_after_queuing_request() {
+        let mut r = dx();
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
+        let s = r.create_server_pipe("ntcontrol", params).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("ntcontrol").unwrap();
+
+        assert_eq!(r.transceive(c, b"svc-control", 4), Err(STATUS_PENDING));
+
+        let (request, more) = r.pipe_read(s, 64).unwrap();
+        assert_eq!(&request, b"svc-control");
+        assert!(!more);
+        assert_eq!(r.readable_bytes(c).unwrap(), 0);
+    }
+
+    #[test]
     fn message_mode_reads_one_message_at_a_time() {
         let mut r = dx();
         let p = PipeParams {
@@ -1662,6 +1723,59 @@ mod tests {
         let unknown: std::vec::Vec<u16> = "\\nope".encode_utf16().collect();
         assert!(t.complete_by_name(pipe_name_hash(&unknown)).is_none());
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn async_listen_armed_name_peeks_without_consuming() {
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
+
+        assert!(t.armed_name(pipe_name_hash(&ntsvcs)));
+        assert!(!t.armed_name(pipe_name_hash(&lsarpc)));
+        assert_eq!(t.len(), 1, "wait probing must not consume the listen");
+
+        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
+        assert_eq!(done.server_file_id, 0xA);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn decode_pipe_wait_name_reads_variable_suffix() {
+        let name: std::vec::Vec<u16> = "net\\NtControlPipe1".encode_utf16().collect();
+        let mut input = std::vec![0u8; FILE_PIPE_WAIT_NAME_OFFSET + name.len() * 2];
+        input[8..12].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+        input[12] = 1;
+        for (index, unit) in name.iter().enumerate() {
+            input[FILE_PIPE_WAIT_NAME_OFFSET + index * 2
+                ..FILE_PIPE_WAIT_NAME_OFFSET + index * 2 + 2]
+                .copy_from_slice(&unit.to_le_bytes());
+        }
+
+        assert_eq!(decode_pipe_wait_name(&input).unwrap(), name);
+    }
+
+    #[test]
+    fn decode_pipe_wait_name_rejects_malformed_lengths() {
+        assert_eq!(
+            decode_pipe_wait_name(&[0u8; FILE_PIPE_WAIT_NAME_OFFSET]).unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
+
+        let mut odd = [0u8; FILE_PIPE_WAIT_NAME_OFFSET + 3];
+        odd[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            decode_pipe_wait_name(&odd).unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
+
+        let mut overrun = [0u8; FILE_PIPE_WAIT_NAME_OFFSET + 2];
+        overrun[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            decode_pipe_wait_name(&overrun).unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
     }
 
     #[test]

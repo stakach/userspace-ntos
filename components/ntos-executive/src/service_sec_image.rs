@@ -18457,8 +18457,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 &[],
                 &mut output,
             ) {
-                Some((st, info, _)) => (st as u32, info),
-                None => continue,
+                Ok((st, info, _)) => (st as u32, info),
+                Err(_) => continue,
             }
         } else {
             continue;

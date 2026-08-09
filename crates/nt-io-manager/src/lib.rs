@@ -57,12 +57,13 @@ pub use irp::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pipe::{
-    pipe_name_hash, AsyncListen, AsyncListenTable, PipeConnection, PipeEnd, PipeFcb, PipeHandle,
-    PipeParams, PipeRegistry, PipeState, PipeWaiter, PipeWaiterTable, FILE_PIPE_BYTE_STREAM_MODE,
-    FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END, FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND,
-    FILE_PIPE_MESSAGE_MODE, FILE_PIPE_MESSAGE_TYPE, FILE_PIPE_OUTBOUND, FILE_PIPE_SERVER_END,
-    STATUS_INSTANCE_NOT_AVAILABLE, STATUS_PIPE_BUSY, STATUS_PIPE_CONNECTED,
-    STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING, STATUS_PIPE_NOT_AVAILABLE,
+    decode_pipe_wait_name, pipe_name_hash, AsyncListen, AsyncListenTable, PipeConnection, PipeEnd,
+    PipeFcb, PipeHandle, PipeParams, PipeRegistry, PipeState, PipeWaiter, PipeWaiterTable,
+    FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,
+    FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND, FILE_PIPE_MESSAGE_MODE, FILE_PIPE_MESSAGE_TYPE,
+    FILE_PIPE_OUTBOUND, FILE_PIPE_SERVER_END, STATUS_INSTANCE_NOT_AVAILABLE, STATUS_PIPE_BUSY,
+    STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
+    STATUS_PIPE_NOT_AVAILABLE,
 };
 pub use store::{GenStore, IoId};
 pub use wdm_x64::{
@@ -2197,6 +2198,7 @@ mod tests {
                     output_buffer_length: 0x10,
                     input_buffer_length: 0x20,
                     io_control_code: 0x333000,
+                    type3_input_buffer: 0x6666,
                 },
             },
         )
@@ -2206,7 +2208,8 @@ mod tests {
         assert_eq!(le_u32(&stack, 0x08), 0x10);
         assert_eq!(le_u32(&stack, 0x10), 0x20);
         assert_eq!(le_u32(&stack, 0x18), 0x333000);
-        assert_eq!(le_u64(&stack, 0x20), 0x4444);
+        assert_eq!(le_u64(&stack, 0x20), 0x6666);
+        assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
 
         write_wdm_io_stack_location(
@@ -2229,6 +2232,7 @@ mod tests {
         assert_eq!(le_u32(&stack, 0x10), 3 << 24);
         assert_eq!(le_u16(&stack, 0x1a), 3);
         assert_eq!(le_u64(&stack, 0x20), 0x8888);
+        assert_eq!(le_u64(&stack, 0x28), 0x4444);
         assert_eq!(le_u64(&stack, 0x30), 0x5555);
 
         write_wdm_io_stack_location(
@@ -2249,7 +2253,7 @@ mod tests {
         assert_eq!(stack[0x01], 0);
         assert_eq!(le_u64(&stack, 0x08), 0xAAAA);
         assert_eq!(le_u64(&stack, 0x10), 0xBBBB);
-        assert_eq!(le_u64(&stack, 0x20), 0x4444);
+        assert_eq!(le_u64(&stack, 0x28), 0x4444);
     }
 
     #[test]

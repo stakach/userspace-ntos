@@ -557,6 +557,11 @@ pub enum HandleObject {
     Section(SectionId),
     /// An I/O Manager `FILE_OBJECT`. The identifier belongs to the backing filesystem service.
     File(u64),
+    /// An I/O Manager `FILE_OBJECT` plus the device route that owned it at create/open time.
+    RoutedFile {
+        file_id: u64,
+        device_id: u64,
+    },
     /// A read-only file on the executive's mounted FAT volume.
     DiskFile {
         first_cluster: u32,

@@ -92,6 +92,7 @@ pub enum WdmIoStackParameters {
         output_buffer_length: u32,
         input_buffer_length: u32,
         io_control_code: u32,
+        type3_input_buffer: u64,
     },
     PnpStartDevice {
         allocated_resources: u64,
@@ -219,7 +220,7 @@ pub fn write_wdm_io_stack_location(
     zero(bytes);
     put_u8(bytes, 0x00, init.major);
     put_u8(bytes, 0x01, init.minor);
-    put_u64(bytes, 0x20, init.device_object);
+    put_u64(bytes, 0x28, init.device_object);
     put_u64(bytes, 0x30, init.file_object);
     match init.parameters {
         WdmIoStackParameters::None => {}
@@ -250,10 +251,12 @@ pub fn write_wdm_io_stack_location(
             output_buffer_length,
             input_buffer_length,
             io_control_code,
+            type3_input_buffer,
         } => {
             put_u32(bytes, 0x08, output_buffer_length);
             put_u32(bytes, 0x10, input_buffer_length);
             put_u32(bytes, 0x18, io_control_code);
+            put_u64(bytes, 0x20, type3_input_buffer);
         }
         WdmIoStackParameters::PnpStartDevice {
             allocated_resources,
