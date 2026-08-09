@@ -120,11 +120,59 @@ pub const PAGE_WRITECOMBINE: u32 = 0x400;
 pub const VM_PROTECTION_OVERRIDE_CAPACITY: usize = 128;
 pub const MEMORY_BASIC_INFORMATION_X64_SIZE: usize = 0x30;
 
+fn base_protection(p: u32) -> u32 {
+    p & 0xff
+}
+
+fn readable(p: u32) -> bool {
+    matches!(
+        base_protection(p),
+        PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
 fn writable(p: u32) -> bool {
-    p == PAGE_READWRITE
+    matches!(base_protection(p), PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+}
+
+fn executable(p: u32) -> bool {
+    matches!(
+        base_protection(p),
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+fn protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool {
+    if protection & PAGE_GUARD != 0 || base_protection(protection) == PAGE_NOACCESS {
+        return false;
+    }
+    match access {
+        FaultAccess::Read | FaultAccess::Lock => readable(protection),
+        FaultAccess::Write => writable(protection),
+        FaultAccess::Execute => executable(protection),
+    }
+}
+
+fn image_protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool {
+    if protection & PAGE_GUARD != 0 || base_protection(protection) == PAGE_NOACCESS {
+        return false;
+    }
+    match access {
+        FaultAccess::Read | FaultAccess::Lock => readable(protection),
+        FaultAccess::Write => matches!(
+            base_protection(protection),
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+        ),
+        FaultAccess::Execute => executable(protection),
+    }
 }
 fn valid_prot(p: u32) -> bool {
-    matches!(p, PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE)
+    valid_allocate_protection(p)
 }
 
 fn valid_allocate_protection(protection: u32) -> bool {
@@ -364,12 +412,15 @@ pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedVie
     }
 }
 
-pub fn mapped_view_fault_access_status(protection: u32, write_fault: bool) -> Result<(), u32> {
-    let base = protection & 0xff;
-    if protection & PAGE_GUARD != 0 || base == PAGE_NOACCESS {
+pub fn mapped_view_fault_access_status(protection: u32, access: FaultAccess) -> Result<(), u32> {
+    if !protection_allows_fault_access(protection, access) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
-    if write_fault && !matches!(base, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+    Ok(())
+}
+
+pub fn image_view_fault_access_status(protection: u32, access: FaultAccess) -> Result<(), u32> {
+    if !image_protection_allows_fault_access(protection, access) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     Ok(())
@@ -1624,11 +1675,8 @@ impl AddressSpace {
                 Self::page_valid_len(v, page_base),
             ),
         };
-        if prot == PAGE_NOACCESS {
+        if !protection_allows_fault_access(prot, access) {
             return STATUS_ACCESS_VIOLATION;
-        }
-        if access == FaultAccess::Write && !writable(prot) {
-            return STATUS_ACCESS_VIOLATION; // write to read-only (spec §12.4)
         }
         let vpn = page_base / PAGE_SIZE;
         let resident = self
@@ -1664,7 +1712,7 @@ impl AddressSpace {
             None => return STATUS_ACCESS_VIOLATION,
             Some(v) => v.protection,
         };
-        if prot == PAGE_NOACCESS || (access == FaultAccess::Write && !writable(prot)) {
+        if !protection_allows_fault_access(prot, access) {
             return STATUS_ACCESS_VIOLATION;
         }
         let vpn = page_base / PAGE_SIZE;

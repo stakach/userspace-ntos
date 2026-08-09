@@ -261,11 +261,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    with real `STATUS_ACCESS_VIOLATION` before any page is demand-filled. Boot proof
    `.tmp/boot-mapped-view-fault-access-20260809.log` is fully green at `293/293` with
    `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
-   and `exec_explorer_shell_chrome_painted` all passing. Continue the plan from the remaining
+   and `exec_explorer_shell_chrome_painted` all passing. The follow-up C4 execute-fault access slice
+   extends the same verdict model to read/write/execute faults: `nt-address-space` now rejects
+   mapped and image NX instruction fetches before fill, allows executable mappings only for the
+   executable protection family, preserves image writecopy COW access, and lets the live executive
+   decode the x86 page-fault access kind instead of treating every non-write fault as a read. Boot
+   proof `.tmp/boot-execute-fault-access-20260809.log` is fully green at `293/293`, including
+   `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
+   and `exec_explorer_shell_chrome_painted`. Continue the plan from the remaining
    structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, true mapped data-section writecopy COW, execute/NX fault
-   verdicts, broader C4 overlap/decommit/protect regressions, and D1/D2 mutable registry/filesystem
-   authority.
+   B3's real video/driver binding, true mapped data-section writecopy COW, broader C4
+   overlap/decommit/protect regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1826,3 +1832,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   shell chrome still paints `34873` non-background pixels. Review adjustment: next C4 work is true
   mapped data-section writecopy COW and execute/NX fault verdicts, then broader private/mapped
   protect, decommit, release, overlap, and `MEM_TOP_DOWN` matrix gates.
+
+- C4 execute-fault access slice. `FaultAccess::Execute` is now part of the host-tested protection
+  verdict path instead of being ignored by the VAD fault resolver. `nt-address-space` accepts
+  executable faults only for the `PAGE_EXECUTE*` family, rejects data reads from `PAGE_EXECUTE`,
+  accepts writes through `PAGE_EXECUTE_READWRITE`, keeps mapped data-section writecopy writes
+  denied until true mapped COW exists, and adds an image-specific access verdict that still allows
+  image writecopy COW. The executive decodes the x86 page-fault error code into
+  read/write/execute access for generic section faults, and applies the image access verdict to the
+  actual faulting image page before any fill or COW promotion. Validation: `cargo fmt --all`,
+  `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-execute-fault-access-20260809.log`. Result: kernel specs pass, the full executive gate
+  is `293/293`, `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`,
+  `exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted` all remain green,
+  `ut-free=52327KiB`, `image-mapcaps=7749`, `vad=40/96`, `committed-map=233/512`, and explorer
+  shell chrome still paints `34873` non-background pixels. Review adjustment: the remaining C4
+  work is true mapped data-section writecopy COW plus the broader private/mapped protect,
+  decommit, release, overlap, and `MEM_TOP_DOWN` matrix gates.

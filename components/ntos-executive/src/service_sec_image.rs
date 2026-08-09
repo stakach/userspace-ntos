@@ -789,8 +789,9 @@ unsafe fn service_generic_section_fault(
     page: u64,
     pml4: u64,
     scratch_base: u64,
-    write_fault: bool,
+    fault_access: nt_address_space::FaultAccess,
 ) -> Result<bool, u32> {
+    let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let Some((section_index, view)) = generic_sections.view_for_page(pi, page) else {
         return Ok(false);
     };
@@ -805,7 +806,7 @@ unsafe fn service_generic_section_fault(
     if view_info.type_ != nt_address_space::MEM_MAPPED {
         return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
     }
-    nt_address_space::mapped_view_fault_access_status(view_info.protect, write_fault)?;
+    nt_address_space::mapped_view_fault_access_status(view_info.protect, fault_access)?;
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
         if write_fault && fault_plan.mark_dirty {
@@ -877,6 +878,16 @@ unsafe fn service_generic_section_fault(
         print_str(b"\n");
     }
     Ok(true)
+}
+
+fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAccess {
+    if error_code & 0x10 != 0 {
+        nt_address_space::FaultAccess::Execute
+    } else if error_code & 0x2 != 0 {
+        nt_address_space::FaultAccess::Write
+    } else {
+        nt_address_space::FaultAccess::Read
+    }
 }
 
 #[inline(never)]
@@ -5523,7 +5534,7 @@ pub(crate) unsafe fn service_sec_image(
                 page,
                 pml4,
                 scratch_base,
-                m3 & 0x2 != 0,
+                vm_fault_access_from_x86_error(m3),
             ) {
                 Ok(true) => {
                     bump_progress();
@@ -5894,9 +5905,30 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     break;
                 }
+                let image_fault_access = vm_fault_access_from_x86_error(m3);
+                if is_fault_page {
+                    if let Err(status) = nt_address_space::image_view_fault_access_status(
+                        image_view_info.protect,
+                        image_fault_access,
+                    ) {
+                        print_str(b"[vmf-image-protect] denied image fault access pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b" protect=0x");
+                        print_hex(image_view_info.protect);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        image_protect_failed = true;
+                        allocation_failed = true;
+                        break;
+                    }
+                }
                 let image_fault_plan = nt_address_space::image_view_fault_plan(
                     image_view_info.protect,
-                    is_fault_page && (m3 & 0x2 != 0),
+                    is_fault_page && image_fault_access == nt_address_space::FaultAccess::Write,
                 );
                 let image_map_rights = vm_page_rights(image_fault_plan.map_protection);
                 let image_map_writable = matches!(

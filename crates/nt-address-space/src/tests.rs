@@ -211,7 +211,40 @@ fn access_violations() {
         STATUS_ACCESS_VIOLATION
     );
     assert_eq!(a.fault(ro, FaultAccess::Read, &mut cache), STATUS_SUCCESS); // read is fine
-                                                                            // A NOACCESS view rejects everything.
+                                                                            // An execute-only view accepts fetches but rejects data reads.
+    let (_, exec_only) = a
+        .reserve_view(
+            None,
+            4,
+            PAGE_EXECUTE,
+            ViewType::MappedDataSection,
+            Some(1),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        a.fault(exec_only, FaultAccess::Execute, &mut cache),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        a.fault(exec_only, FaultAccess::Read, &mut cache),
+        STATUS_ACCESS_VIOLATION
+    );
+    let (_, exec_rw) = a
+        .reserve_view(
+            None,
+            4,
+            PAGE_EXECUTE_READWRITE,
+            ViewType::MappedDataSection,
+            Some(1),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        a.fault(exec_rw, FaultAccess::Write, &mut cache),
+        STATUS_SUCCESS
+    );
+    // A NOACCESS view rejects everything.
     let (_, na) = a
         .reserve_view(
             None,
@@ -1199,31 +1232,67 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
 #[test]
 fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_READONLY, false),
+        mapped_view_fault_access_status(PAGE_READONLY, FaultAccess::Read),
         Ok(())
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_READONLY, true),
+        mapped_view_fault_access_status(PAGE_READONLY, FaultAccess::Write),
         Err(STATUS_ACCESS_VIOLATION)
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_READWRITE, true),
+        mapped_view_fault_access_status(PAGE_READWRITE, FaultAccess::Write),
         Ok(())
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_EXECUTE_READWRITE, true),
+        mapped_view_fault_access_status(PAGE_EXECUTE_READWRITE, FaultAccess::Write),
         Ok(())
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_NOACCESS, false),
+        mapped_view_fault_access_status(PAGE_READWRITE, FaultAccess::Execute),
         Err(STATUS_ACCESS_VIOLATION)
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_READWRITE | PAGE_GUARD, false),
+        mapped_view_fault_access_status(PAGE_EXECUTE_READ, FaultAccess::Execute),
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_EXECUTE, FaultAccess::Read),
         Err(STATUS_ACCESS_VIOLATION)
     );
     assert_eq!(
-        mapped_view_fault_access_status(PAGE_WRITECOPY, true),
+        mapped_view_fault_access_status(PAGE_NOACCESS, FaultAccess::Read),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_READWRITE | PAGE_GUARD, FaultAccess::Read),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_WRITECOPY, FaultAccess::Write),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}
+
+#[test]
+fn image_view_fault_access_supports_execute_and_writecopy_cow() {
+    assert_eq!(
+        image_view_fault_access_status(PAGE_EXECUTE_READ, FaultAccess::Execute),
+        Ok(())
+    );
+    assert_eq!(
+        image_view_fault_access_status(PAGE_READONLY, FaultAccess::Execute),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        image_view_fault_access_status(PAGE_WRITECOPY, FaultAccess::Write),
+        Ok(())
+    );
+    assert_eq!(
+        image_view_fault_access_status(PAGE_EXECUTE_WRITECOPY, FaultAccess::Write),
+        Ok(())
+    );
+    assert_eq!(
+        image_view_fault_access_status(PAGE_EXECUTE | PAGE_GUARD, FaultAccess::Execute),
         Err(STATUS_ACCESS_VIOLATION)
     );
 }
