@@ -92,9 +92,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
   keys now also own real self-relative security descriptor metadata: `NtCreateKey` captures initial
   descriptors, `NtSetSecurityObject` merges selected components into mounted mutable hives/volatile
   overlay keys, and `NtQuerySecurityObject` returns sized descriptor data instead of relying on a
-  no-op success path. The normal-boot `HKLM\SYSTEM\Setup` and `.Default` locale setup writes now
-  mutate the mounted hives directly instead of creating overlay shadows. Remaining D2 work is any
-  still-overlay-backed persistent paths.
+  no-op success path. The normal-boot `HKLM\SYSTEM\Setup`, `.Default` locale setup writes, and
+  explorer HKCR shell COM class seeding now mutate the mounted hives directly instead of creating
+  overlay shadows. Remaining D2 work is a final persistent-path overlay audit before D3
+  flush/reboot proofs.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
@@ -2185,3 +2186,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: continue the D2 overlay audit with SOFTWARE/HKCR shell COM seeding and any
   remaining setup/profile provisioning, then move to D3 flush/reboot proofs once persistent overlay
   writes are gone.
+
+- D2 shell COM mutable-hive seeding slice. The ReactOS `.rgs` parser in `nt-hive-core` is now
+  decoupled from `RegistryOverlay` behind a host-tested seed target, with public entry points for
+  both volatile overlay use and mounted `MutableHiveSet` use. The executive now provisions explorer's
+  HKCR shell COM classes into `\Registry\Machine\Software\Classes` through the mounted mutable
+  SOFTWARE hive and marks `mutable_hives_dirty` when the expected class mask materializes; it no
+  longer creates SOFTWARE/HKCR overlay shadows for this installed-system setup state. Validation:
+  `cargo fmt --all`, `cargo test -p nt-hive-core`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the known setup/class persistent provisioning paths are now mutable-hive owned.
+  Finish D2 with a focused audit for any remaining non-volatile overlay writes, then start D3
+  explicit flush/reboot persistence proofs.

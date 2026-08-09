@@ -22,8 +22,10 @@ mod reactos_registration;
 
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{
-    seed_reactos_explorer_shell_com_classes, utf16le_sz, ReactOsComClassRegistrationScript,
-    CLSID_REBAR_BAND_SITE, CLSID_START_MENU, REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
+    seed_reactos_explorer_shell_com_classes,
+    seed_reactos_explorer_shell_com_classes_in_mutable_hives, utf16le_sz,
+    ReactOsComClassRegistrationScript, CLSID_REBAR_BAND_SITE, CLSID_START_MENU,
+    REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU,
     REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS,
 };
