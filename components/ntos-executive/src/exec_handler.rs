@@ -3075,6 +3075,9 @@ impl ExecNtHandler {
         if Self::is_dynamic_user_volatile_env_canon(&canon) {
             USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
         }
+        if key.hive == HIVE_SEL_SYSTEM && is_keyboard_layout_key(&canon) {
+            KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
         if key.hive == HIVE_SEL_SOFTWARE {
             SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
             if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
@@ -3102,6 +3105,9 @@ impl ExecNtHandler {
             USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
         }
         let sel = hive_sel(key);
+        if sel == HIVE_SEL_SYSTEM && is_keyboard_layout_key(&canon) {
+            KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
         if sel == HIVE_SEL_SOFTWARE {
             SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
             if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
@@ -14235,39 +14241,6 @@ impl ExecNtHandler {
                         if root_dir == 0 && full.eq_ignore_ascii_case("SAM") {
                             SAM_CONNECT_NULL_ROOT_MISS.fetch_add(1, Ordering::Relaxed);
                         }
-                    }
-                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
-                }
-                // Early keyboard-layout open. advapi32's HKLM predefined-root handle does not always
-                // arrive as RootDirectory on this path, so accept either the sentinel-relative form
-                // or a machine-relative absolute name, but resolve only the exact real SYSTEM hive key.
-                let mut keyboard_layout_full = None;
-                if root_target == Some(MACHINE_ROOT_KEY) && is_keyboard_layout_key(&path) {
-                    let mut full = alloc::string::String::from(r"\Registry\Machine\");
-                    full.push_str(&path);
-                    keyboard_layout_full = Some(full);
-                } else if root_target.is_none() && is_keyboard_layout_key(&path) {
-                    let comps = Self::key_components(&path);
-                    if comps.len() >= 2
-                        && comps[0].eq_ignore_ascii_case("Registry")
-                        && comps[1].eq_ignore_ascii_case("Machine")
-                    {
-                        keyboard_layout_full = Some(path.clone());
-                    } else {
-                        let mut full = alloc::string::String::from(r"\Registry\Machine\");
-                        full.push_str(&path);
-                        keyboard_layout_full = Some(full);
-                    }
-                }
-                if let Some(full) = keyboard_layout_full {
-                    if let Some(status) =
-                        self.open_registry_full_path(&full, args[1] as u32, args[0])
-                    {
-                        if status != 0 {
-                            return status;
-                        }
-                        KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                        return 0;
                     }
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }

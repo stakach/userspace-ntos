@@ -15396,9 +15396,8 @@ const REG_OPENED_EXISTING_KEY: u32 = 2;
 
 /// True if `path` is exactly the SYSTEM hive `...\Control\Keyboard Layouts\<klid>` subkey (the
 /// plural "Keyboard Layouts" under `Control`, distinct from the singular HKCU
-/// `Keyboard Layout\Preload`/`Substitutes`). Matched case-insensitively; this is the only early
-/// machine-root sentinel subkey winlogon's keyboard init resolves before the broader hosted-machine
-/// registry route is active.
+/// `Keyboard Layout\Preload`/`Substitutes`). Matched case-insensitively for proof accounting after
+/// the normal registry resolver has opened a real mounted-hive key.
 fn is_keyboard_layout_key(path: &str) -> bool {
     let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
     let tail: &[&str] = if comps.len() >= 2
@@ -15523,8 +15522,9 @@ pub(crate) fn is_lsa_hive_path(path: &str) -> bool {
     let lc = path.to_ascii_lowercase();
     lc.starts_with(r"\registry\machine\security") || lc.starts_with(r"\registry\machine\sam")
 }
-/// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced (drives the `exec_kbd_layout_opened`
-/// spec — proves winlogon's InitKeyboardLayouts fallback reached its layout key).
+/// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced by the normal registry authority.
+/// Drives `exec_kbd_layout_opened`; proves ReactOS keyboard initialization reached the real SYSTEM
+/// hive layout key without a special open path.
 static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Count of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` opens satisfied through the
 /// real SOFTWARE hive. Proves winlogon crossed the msgina GINA-init wall.
@@ -23771,10 +23771,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             && CSR_RENDEZVOUS_FAILURES.load(Ordering::Relaxed) == 0,
                         &mut passed,
                     );
-                    // P5 — winlogon's InitKeyboardLayouts fallback reached its layout key: the
-                    // paint-safe MACHINE_ROOT sentinel let RegOpenKeyExW(HKLM\...\Keyboard
-                    // Layouts\00000409) SUCCEED (the previously-fatal open), so winlogon runs past
-                    // InitKeyboardLayouts toward StartRpcServer/StartServicesManager.
+                    // P5 — ReactOS keyboard initialization reached its real SYSTEM-hive layout key.
+                    // The proof is counted by the common registry open authority, not by a
+                    // keyboard-specific NtOpenKey branch.
                     check(
                         b"exec_kbd_layout_opened",
                         KBD_LAYOUT_KEY_OPENED.load(Ordering::Relaxed) >= 1,
