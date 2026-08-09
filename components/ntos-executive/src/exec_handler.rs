@@ -1382,9 +1382,8 @@ impl ExecNtHandler {
     /// text-mode/live setup (`SetupType=1`, `SystemSetupInProgress=1`, `CmdLine=setup -mini`).
     /// By this point our boot image has already materialised the installed pieces that setup would
     /// have produced for the current frontier: writable profiles, a user hive, locale, and SOFTWARE
-    /// profile state. Shadow the setup values through the ordinary registry overlay so
-    /// services.exe's real `CheckForLiveCD` path observes a normal installed boot and reaches
-    /// `ScmAutoStartServices`.
+    /// profile state. Write those setup values into the live mutable SYSTEM hive so services.exe's
+    /// real `CheckForLiveCD` path observes a normal installed boot and reaches `ScmAutoStartServices`.
     fn provision_normal_system_setup_state(&mut self) {
         const REG_SZ: u32 = 1;
         const REG_DWORD: u32 = 4;
@@ -1393,19 +1392,32 @@ impl ExecNtHandler {
             print_str(b"[setup-state] HKLM\\SYSTEM\\Setup absent -> normal-boot state not provisioned\n");
             return;
         }
-        let canon = self.overlay_canon(SETUP_KEY);
-        let (index, _) = self.overlay.create(&canon);
-        self.overlay
-            .set_value(index, "SetupType", REG_DWORD, &0u32.to_le_bytes());
-        self.overlay.set_value(
-            index,
+        let mut all_set = self.set_mutable_registry_value_by_path(
+            SETUP_KEY,
+            "SetupType",
+            REG_DWORD,
+            &0u32.to_le_bytes(),
+        );
+        all_set &= self.set_mutable_registry_value_by_path(
+            SETUP_KEY,
             "SystemSetupInProgress",
             REG_DWORD,
             &0u32.to_le_bytes(),
         );
-        self.overlay
-            .set_value(index, "CmdLine", REG_SZ, &registry_sz_bytes(""));
-        print_str(b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned\n");
+        all_set &= self.set_mutable_registry_value_by_path(
+            SETUP_KEY,
+            "CmdLine",
+            REG_SZ,
+            &registry_sz_bytes(""),
+        );
+        if !all_set {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
+            return;
+        }
+        self.mutable_hives_dirty = true;
+        print_str(
+            b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned in mutable hive\n",
+        );
     }
 
     fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {
@@ -1489,10 +1501,16 @@ impl ExecNtHandler {
             print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
             return;
         }
-        let canon = self.overlay_canon(USER_INTERNATIONAL);
-        let (index, _) = self.overlay.create(&canon);
-        self.overlay
-            .set_value(index, "Locale", REG_SZ, &language_id);
+        if !self.set_mutable_registry_value_by_path(
+            USER_INTERNATIONAL,
+            "Locale",
+            REG_SZ,
+            &language_id,
+        ) {
+            print_str(b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n");
+            return;
+        }
+        self.mutable_hives_dirty = true;
         DEFAULT_USER_LOCALE_BYTES.store(language_id.len() as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
@@ -2782,6 +2800,23 @@ impl ExecNtHandler {
         let key = self.mutable_registry_key_by_path(full_path)?;
         let (ty, data) = self.mutable_hives.query_value(key, name)?;
         Some((ty as u32, data.to_vec()))
+    }
+
+    fn set_mutable_registry_value_by_path(
+        &mut self,
+        full_path: &str,
+        name: &str,
+        ty: u32,
+        data: &[u8],
+    ) -> bool {
+        let Some(key) = self.mutable_registry_key_by_path(full_path) else {
+            return false;
+        };
+        let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
+            return false;
+        };
+        self.mutable_hives
+            .set_value(key, name, value_type, data.to_vec())
     }
 
     fn mutable_registry_value(

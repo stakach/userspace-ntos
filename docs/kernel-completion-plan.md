@@ -92,7 +92,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
   keys now also own real self-relative security descriptor metadata: `NtCreateKey` captures initial
   descriptors, `NtSetSecurityObject` merges selected components into mounted mutable hives/volatile
   overlay keys, and `NtQuerySecurityObject` returns sized descriptor data instead of relying on a
-  no-op success path. Remaining D2 work is any still-overlay-backed persistent paths.
+  no-op success path. The normal-boot `HKLM\SYSTEM\Setup` and `.Default` locale setup writes now
+  mutate the mounted hives directly instead of creating overlay shadows. Remaining D2 work is any
+  still-overlay-backed persistent paths.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
@@ -2171,3 +2173,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: D2 security/class metadata is now materially closed for live registry keys; the
   remaining D2 audit should look for persistent paths still forced through `RegistryOverlay`, then
   move to D3 explicit flush/reboot proofs.
+
+- D2 mounted setup-state overlay reduction slice. The executive no longer provisions
+  `HKLM\SYSTEM\Setup` normal-boot values or
+  `HKU\.DEFAULT\Control Panel\International\Locale` through `RegistryOverlay`. Both paths now use a
+  path-addressed mutable-hive setter and mark `mutable_hives_dirty`, so these installed-system setup
+  writes live in the same mounted hive authority as ordinary `NtSetValueKey` writes. The HARDWARE
+  hive remains overlay-backed because it is explicitly volatile runtime registry state. Validation:
+  `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: continue the D2 overlay audit with SOFTWARE/HKCR shell COM seeding and any
+  remaining setup/profile provisioning, then move to D3 flush/reboot proofs once persistent overlay
+  writes are gone.
