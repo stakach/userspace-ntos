@@ -7303,6 +7303,9 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.process_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                if take_object_namespace_growth_dirty() {
+                    pin_durable_heap_mark(&mut heap_mark);
+                }
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
                 // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
                 // contract as `overlay_dirty` — a mounted hive must outlive the syscall that

@@ -15580,17 +15580,6 @@ pub(crate) static WINLOGON_DEFAULT_PASSWORD_READS: AtomicU64 = AtomicU64::new(0)
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).
 static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
-/// BATCH 38 — bound the SCM (pi 3) `\ntsvcs` server-instance RE-CREATE loop. rpcrt4's ncacn_np
-/// listener re-posts a fresh NtCreateNamedPipeFile after every accepted connection so a new client can
-/// connect. With the RPC data plane now LIVE, winlogon's SCM conversation completes (bind→bind_ack→
-/// request→response) and winlogon then faults on the RPC response (a NEW downstream frontier), leaving
-/// the server with no live client — but its listener keeps re-creating `\ntsvcs` instances forever,
-/// which never quiesces (the boot cannot reach qemu_exit). Cap the re-creates: once the handshake has
-/// had ample instances, return STATUS_PIPE_NOT_AVAILABLE so the listener's re-listen fails and it parks
-/// (mirrors a real out-of-instances condition), letting the boot complete cleanly. The cap is generous
-/// (covers the full multi-PDU conversation + several re-listens) so it never truncates a live handshake.
-static SCM_NTSVCS_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
-const SCM_NTSVCS_CREATE_CAP: u64 = 24;
 /// Per-pi (index = pi & 7) named-pipe-create log throttle (BATCH 43). The SCM/LSA server re-listen
 /// loops fire the `[nt-create-named-pipe]` diagnostic ~24× each; serial writes dominate the per-round-
 /// trip cost under TCG. Print only the first few per pi, then suppress — reclaiming boot budget so the
@@ -15605,15 +15594,6 @@ static NAMED_PIPE_LOG_COUNT: [AtomicU64; 8] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-/// lsass' LSA RPC server (`\lsarpc`, pi 4) has the SAME unbounded server-instance re-create shape as
-/// the SCM `\ntsvcs` pipe: once winlogon crosses its msgina GINA init (BATCH 40) and drives further
-/// into its logon flow, lsass' LsarStartRpcServer keeps re-creating the `\lsarpc` server pipe with no
-/// live terminating client under TCG, so the boot never quiesces. Cap the re-creates identically →
-/// STATUS_PIPE_NOT_AVAILABLE so the LSA listener parks (mirrors out-of-instances) and the boot reaches
-/// the gate cleanly. Generous (covers the full LSA handshake + several re-listens); pi 4 + `\lsarpc`
-/// scoped so no other pipe is affected.
-static LSA_LSARPC_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
-const LSA_LSARPC_CREATE_CAP: u64 = 6;
 /// Count of live pipe syscalls (NtCreateNamedPipeFile/NtCreateFile/NtOpenFile/NtFsControlFile/
 /// Read/Write) that were ROUTED THROUGH the isolated npfs component (vs modeled-fake). Observability.
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
@@ -15673,13 +15653,34 @@ const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
+static OBJ_NS_GROWTH_DIRTY: AtomicU64 = AtomicU64::new(0);
+static OBJ_NS_GROWTHS: AtomicU64 = AtomicU64::new(0);
+
+fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: usize) {
+    OBJ_NS_GROWTH_DIRTY.store(1, Ordering::Relaxed);
+    let n = OBJ_NS_GROWTHS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        print_str(b"[obj-ns] grew capacity ");
+        print_u64(old_capacity as u64);
+        print_str(b" -> ");
+        print_u64(new_capacity as u64);
+        print_str(b" len=");
+        print_u64(len as u64);
+        print_str(b"\n");
+    }
+}
+
+fn take_object_namespace_growth_dirty() -> bool {
+    OBJ_NS_GROWTH_DIRTY.swap(0, Ordering::Relaxed) != 0
+}
 
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
-/// allocation, so the backing `Vec` (pre-reserved below the per-syscall heap mark) never
-/// reallocates and survives the bump-heap reset. NT object leaf names are allowed to be long enough
-/// for BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data;
-/// `payload` carries backing object identity for kinds whose state lives outside the namespace, such
-/// as LPC listen port handles.
+/// allocation. The backing `Vec` starts below the per-syscall heap mark; if real object-manager
+/// traffic outgrows that reserve, growth is marked durable so the service loop pins the new backing
+/// allocation before the next bump-heap reset. NT object leaf names are allowed to be long enough for
+/// BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data; `payload`
+/// carries backing object identity for kinds whose state lives outside the namespace, such as LPC
+/// listen port handles.
 #[derive(Clone, Copy)]
 struct ObjEntry {
     name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
@@ -15693,7 +15694,12 @@ struct ObjEntry {
 impl ObjEntry {
     fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
         if entries.len() == entries.capacity() {
+            let old_capacity = entries.capacity();
             entries.try_reserve(64).ok()?;
+            let new_capacity = entries.capacity();
+            if new_capacity > old_capacity {
+                mark_object_namespace_growth(old_capacity, new_capacity, entries.len());
+            }
         }
         let index = entries.len();
         entries.push(Self {

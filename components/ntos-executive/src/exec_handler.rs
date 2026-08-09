@@ -14791,52 +14791,9 @@ impl ExecNtHandler {
                         let b = w as u8;
                         nm_ascii[i] = if b.is_ascii_graphic() { b } else { b'.' };
                     }
-                    // BATCH 38: bound the SCM `\ntsvcs` server-instance re-create loop so the boot
-                    // quiesces after the (now-live) RPC round-trip. Past the cap, fail the create with
-                    // STATUS_PIPE_NOT_AVAILABLE (0xC00000AC) → rpcrt4's re-listen fails → the listener
-                    // parks. Name-scoped to `\ntsvcs` (SCM) and services.exe, so lsass/other pipes are unaffected.
-                    let is_ntsvcs = leaf.len() >= 7
-                        && leaf[1..7].iter().zip(b"ntsvcs".iter()).all(|(&w, &c)| w as u8 == c);
-                    if self.current_process_is_services() && is_ntsvcs {
-                        let n = SCM_NTSVCS_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if n >= SCM_NTSVCS_CREATE_CAP {
-                            if n == SCM_NTSVCS_CREATE_CAP {
-                                print_str(b"[nt-create-named-pipe] pi=3 \\ntsvcs re-create cap reached -> STATUS_PIPE_NOT_AVAILABLE (listener parks; boot quiesces)\n");
-                            }
-                            if iosb != 0 {
-                                self.xas_write_buf(iosb, &0xC00000ACu32.to_le_bytes()); // Status
-                                self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
-                            }
-                            self.queue_write(get_recv_mr(9), 0); // *FileHandle = NULL
-                            return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
-                        }
-                    }
-                    // BATCH 40: same re-create cap for lsass' `\lsarpc` LSA RPC server. Once
-                    // winlogon crosses msgina GINA init and drives its logon flow, lsass re-creates the
-                    // `\lsarpc` server pipe unboundedly (no live terminating client under TCG) → the boot
-                    // never quiesces. Cap → STATUS_PIPE_NOT_AVAILABLE → the LSA listener parks → gate.
-                    let is_lsarpc = leaf.len() >= 7
-                        && leaf[1..7].iter().zip(b"lsarpc".iter()).all(|(&w, &c)| w as u8 == c);
-                    if self.current_process_is_lsass() && is_lsarpc {
-                        let n = LSA_LSARPC_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if n >= LSA_LSARPC_CREATE_CAP {
-                            if n == LSA_LSARPC_CREATE_CAP {
-                                print_str(b"[nt-create-named-pipe] pi=4 \\lsarpc re-create cap reached -> STATUS_PIPE_NOT_AVAILABLE (LSA listener parks; boot quiesces)\n");
-                            }
-                            if iosb != 0 {
-                                self.xas_write_buf(iosb, &0xC00000ACu32.to_le_bytes()); // Status
-                                self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
-                            }
-                            self.queue_write(get_recv_mr(9), 0); // *FileHandle = NULL
-                            return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
-                        }
-                    }
-                    // BATCH 43: throttle this per-create diagnostic. The SCM `\ntsvcs` (and `\lsarpc`)
-                    // server-instance re-listen loop fires it ~24× each; serial writes are the dominant
-                    // per-round-trip cost under TCG, and once winlogon CROSSES its win32k class wall
-                    // (BATCH 43) the heavier real SAS-window work + these repeated log lines no longer fit
-                    // the 620s boot budget. Print only the FIRST 3 creates per pi (enough to prove the
-                    // server FCB path), then suppress — reclaiming budget so the boot quiesces + gates.
+                    // Throttle repeated server-pipe diagnostics. RPC servers are allowed to re-listen;
+                    // the log only needs enough samples to prove the FCB path without dominating TCG
+                    // runtime.
                     {
                         let n = NAMED_PIPE_LOG_COUNT[self.pi & 7].fetch_add(1, Ordering::Relaxed);
                         if n < 3 {

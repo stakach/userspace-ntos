@@ -31,19 +31,25 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Boot proof `.tmp/boot-wait-object-win32k-event-20260810.log` restores the desktop frontier:
+Boot proof `.tmp/boot-no-pipe-relisten-caps-20260810.log` reaches `[microtest done]` at `290/295`:
 winlogon authenticates, the real profile/SAM/USER-object-security path reaches `userinit.exe`,
 genuine `explorer.exe` launches, shell COM classes are served, explorer creates windows, and the
 harness reports `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`.
-The previous `desktop.cpp:193`/`hres=80004005` blocker is gone.
+The previous `desktop.cpp:193`/`hres=80004005` blocker is gone, and the old `\ntsvcs`/`\lsarpc`
+process/name-scoped pipe re-listen caps are no longer present.
 
 The fix is mechanism-owned rather than a shell paint shortcut: THREADINFO now carries the real
 message-queue client/server event pair expected by ReactOS `IntMsqSetWakeMask`, and native wait
 resolution accepts win32k event handles after process-local wait objects and dispatcher probes. That
 lets explorer's `MsgWaitForMultipleObjectsEx` wait on the queue event instead of failing before its
-desktop browser/tray path can continue. The next useful work should return to structural debt:
-A4 SCM pipe/listener coordination, B3 real video/driver binding, broader C4 VM regression coverage,
-and D3/D4 durable hive/profile persistence.
+desktop browser/tray path can continue.
+
+Current red gates are `exec_kbd_layout_opened`, `exec_msgina_logon_dialog_created`,
+`exec_vm_pool_headroom`, `exec_ntloadkey_serviced`, and `exec_explorer_shell_chrome_painted`.
+Explorer still leaves broad non-background framebuffer evidence, but `BeginPaint`/`EndPaint`
+accounting is `0/0`; the next useful shell slice is the real explorer paint/update-region path, not
+a framebuffer-only proof. The broader structural queue remains A4 SCM pipe/listener cleanup, B3 real
+video/driver binding, C4 VM regression coverage, and D3/D4 durable hive/profile persistence.
 
 ### A. SCM-Controlled Service Startup
 
@@ -2273,8 +2279,8 @@ and D3/D4 durable hive/profile persistence.
   the real paint-dispatch or update-region boundary that keeps shell chrome from proving through the
   normal win32k paint path.
 
-- Win32k queue-event wait bridge. The explorer shell frontier moved from a framebuffer-only span back
-  to a genuine desktop paint proof. Hosted THREADINFO setup now seeds the ReactOS
+- Win32k queue-event wait bridge. The desktop wait frontier moved past the `desktop.cpp:193`
+  failure and back to a genuine win32k desktop paint proof. Hosted THREADINFO setup now seeds the ReactOS
   `hEventQueueClient`/`pEventQueueServer` pair with a local synchronization event, so
   `NtUserxMsqSetWakeMask` can return a waitable message-queue event. Native wait-object resolution
   now checks process-local process/thread/file handles first, probes dispatcher events/semaphores/
@@ -2283,6 +2289,21 @@ and D3/D4 durable hive/profile persistence.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
   and boot proof `.tmp/boot-wait-object-win32k-event-20260810.log`, which ends with `SUCCESS -- the
   ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review adjustment: the immediate
-  shell-paint blocker is closed without adding a paint-accounting fallback; resume A4 SCM
-  pipe/listener cleanup, B3 real video/driver binding, C4 VM regression coverage, or D3/D4 durability
-  work.
+  wait/dispatcher blocker is closed without adding a paint-accounting fallback; the later
+  `.tmp/boot-no-pipe-relisten-caps-20260810.log` full gate still shows explorer shell chrome red at
+  `BeginPaint`/`EndPaint=0/0`, so keep the shell-paint work honest.
+
+- A4 pipe-listener cap cleanup. The executive no longer returns process/name-scoped
+  `STATUS_PIPE_NOT_AVAILABLE` for `services.exe` `\ntsvcs` or `lsass.exe` `\lsarpc` re-listen loops.
+  Those caps were old quiesce scaffolding; the current boot reaches the gate through the generic
+  pipe-listen, pipe-park, and process quiesce machinery without those injected failures. The
+  object-namespace growth path now marks dynamic namespace backing-store growth as durable and pins
+  the service heap mark on the next loop tick, so namespace expansion is not invalidated by the
+  bump-heap reset. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and boot proof `.tmp/boot-no-pipe-relisten-caps-20260810.log`, which reaches `[microtest done]`
+  at `290/295`, with no `re-create cap` messages and with `exec_win32k_desktop_painted`,
+  `exec_desktop_shell_frontier`, `exec_winlogon_user_shell_activated`, `exec_userinit_process_spawned`,
+  and `exec_explorer_process_spawned` passing. Review adjustment: A4 has one less hardcoded
+  pipe/listener boundary; current frontier is real explorer shell paint plus VM headroom after durable
+  namespace growth.
