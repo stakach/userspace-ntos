@@ -2480,6 +2480,7 @@ impl ExecNtHandler {
             self.mutable_hives
                 .mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
         }
+        self.mutable_hives_dirty = true;
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
             canon,
@@ -2762,7 +2763,9 @@ impl ExecNtHandler {
         if let Some(slot) = mount.slot {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
-        let _ = self.mutable_hives.unmount(&mount.mount);
+        if self.mutable_hives.unmount(&mount.mount).is_some() {
+            self.mutable_hives_dirty = true;
+        }
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
             if entry.as_ref().is_some_and(|key| key.hive == mount.sel) {
@@ -2998,8 +3001,13 @@ impl ExecNtHandler {
         let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
             return false;
         };
-        self.mutable_hives
-            .set_value(key, name, value_type, data.to_vec())
+        let updated = self
+            .mutable_hives
+            .set_value(key, name, value_type, data.to_vec());
+        if updated {
+            self.mutable_hives_dirty = true;
+        }
+        updated
     }
 
     fn registry_value_with<R>(

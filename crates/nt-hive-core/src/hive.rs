@@ -44,7 +44,7 @@ pub(crate) struct KeyCell {
     pub id: CellId,
     pub parent: Option<CellId>,
     pub name: String,
-    pub subkeys: Vec<(String, CellId)>, // (folded name, id)
+    pub subkeys: Vec<CellId>,
     pub values: Vec<CellId>,
     pub class_name: Option<String>,
     pub security_descriptor: Option<Vec<u8>>,
@@ -69,10 +69,6 @@ pub(crate) enum Cell {
 pub enum DeleteKeyError {
     NotFound,
     CannotDelete,
-}
-
-pub(crate) fn fold(name: &str) -> String {
-    name.to_ascii_lowercase()
 }
 
 /// A mounted registry subtree as a cell arena (spec §6.1).
@@ -244,8 +240,11 @@ impl Hive {
         self.key(parent)?
             .subkeys
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, id)| *id)
+            .find(|id| {
+                self.key(**id)
+                    .is_some_and(|child| child.name.eq_ignore_ascii_case(name))
+            })
+            .copied()
     }
 
     /// `ZwOpenKey` — resolve a relative path within the hive to a key cell.
@@ -264,8 +263,7 @@ impl Hive {
         }
         self.sequence += 1;
         let id = self.alloc_key(Some(parent), name);
-        let folded = fold(name);
-        self.key_mut(parent).unwrap().subkeys.push((folded, id));
+        self.key_mut(parent).unwrap().subkeys.push(id);
         self.mark_dirty(parent);
         self.mark_dirty(id);
         id
@@ -639,7 +637,7 @@ impl Hive {
         self.sequence += 1;
         let seq = self.sequence;
         if let Some(parent) = self.key_mut(parent_id) {
-            parent.subkeys.retain(|(_, child)| *child != key);
+            parent.subkeys.retain(|child| *child != key);
             parent.last_write_sequence = seq;
             self.mark_dirty(parent_id);
         } else {
@@ -693,7 +691,7 @@ impl Hive {
             .map(|k| {
                 k.subkeys
                     .iter()
-                    .filter_map(|(_, id)| self.key(*id).map(|c| c.name.clone()))
+                    .filter_map(|id| self.key(*id).map(|c| c.name.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -716,12 +714,12 @@ impl Hive {
 
     /// Borrow the original-case name of the immediate subkey at `index`.
     pub fn subkey_name_by_index(&self, key: CellId, index: usize) -> Option<&str> {
-        let child = self.key(key)?.subkeys.get(index)?.1;
+        let child = *self.key(key)?.subkeys.get(index)?;
         self.key(child).map(|k| k.name.as_str())
     }
 
     pub fn subkey_class_by_index(&self, key: CellId, index: usize) -> Option<&str> {
-        let child = self.key(key)?.subkeys.get(index)?.1;
+        let child = *self.key(key)?.subkeys.get(index)?;
         self.key_class(child)
     }
 

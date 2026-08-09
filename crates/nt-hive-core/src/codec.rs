@@ -1,7 +1,6 @@
 //! Hive image + log codecs (spec §11-§12). Versioned, checksummed, explicit TLV (never Rust
 //! struct layout), reusing the `nt-config-store` byte primitives + CRC-32C.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_store::codec::{crc32c, Reader, Writer};
@@ -358,21 +357,21 @@ impl Hive {
     }
     /// Rebuild every key's subkey list from the parent links (spec §11.4).
     fn relink_subkeys(&mut self) {
-        let links: Vec<(CellId, String, CellId)> = self
+        let links: Vec<(CellId, CellId)> = self
             .cells
             .iter()
             .filter_map(|c| match c {
-                Some(Cell::Key(k)) => k.parent.map(|p| (p, crate::hive::fold(&k.name), k.id)),
+                Some(Cell::Key(k)) => k.parent.map(|p| (p, k.id)),
                 _ => None,
             })
             .collect();
-        for (parent, folded, id) in links {
+        for (parent, id) in links {
             if let Some(Cell::Key(k)) = self
                 .cells
                 .get_mut(parent.0 as usize)
                 .and_then(|c| c.as_mut())
             {
-                k.subkeys.push((folded, id));
+                k.subkeys.push(id);
             }
         }
     }
