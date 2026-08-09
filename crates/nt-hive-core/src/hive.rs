@@ -279,6 +279,33 @@ impl Hive {
         }
     }
 
+    /// `ZwDeleteValueKey` — remove a named value from a key cell.
+    pub fn delete_value(&mut self, key: CellId, name: &str) -> bool {
+        let folded = fold(name);
+        let Some((pos, value_id)) = self.key(key).and_then(|k| {
+            k.values
+                .iter()
+                .enumerate()
+                .find(|(_, vid)| self.value(**vid).is_some_and(|v| fold(&v.name) == folded))
+                .map(|(pos, vid)| (pos, *vid))
+        }) else {
+            return false;
+        };
+        self.sequence += 1;
+        let seq = self.sequence;
+        let Some(parent) = self.key_mut(key) else {
+            return false;
+        };
+        parent.values.remove(pos);
+        parent.last_write_sequence = seq;
+        if let Some(cell) = self.cells.get_mut(value_id.0 as usize) {
+            *cell = None;
+        }
+        self.mark_dirty(key);
+        self.mark_dirty(value_id);
+        true
+    }
+
     /// `ZwQueryValueKey` — read a named value (type + data).
     pub fn query_value(&self, key: CellId, name: &str) -> Option<(RegistryValueType, &[u8])> {
         let folded = fold(name);
@@ -519,6 +546,11 @@ impl MutableHiveSet {
     ) -> bool {
         self.hive_mut(key.hive)
             .is_some_and(|hive| hive.set_value(key.key, name, value_type, data))
+    }
+
+    pub fn delete_value(&mut self, key: ResolvedHiveKey, name: &str) -> bool {
+        self.hive_mut(key.hive)
+            .is_some_and(|hive| hive.delete_value(key.key, name))
     }
 
     pub fn query_value(

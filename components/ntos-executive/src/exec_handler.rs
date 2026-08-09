@@ -2658,26 +2658,6 @@ impl ExecNtHandler {
             || self.resolve_key(canon).is_some()
     }
 
-    fn registry_shadow_key(&mut self, target: KeyRef) -> Result<usize, u32> {
-        if let Some(index) = overlay_key_idx(target) {
-            return self
-                .overlay
-                .path(index)
-                .map(|_| index)
-                .ok_or(0xC000_0008u32);
-        }
-        let path = self.registry_target_path(target).ok_or(0xC000_0008u32)?;
-        if let Some(index) = self.overlay.find(&path) {
-            return Ok(index);
-        }
-        if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
-            return Err(0xC000_009A);
-        }
-        let (index, _) = self.overlay.create_owned(path);
-        self.overlay_dirty = true;
-        Ok(index)
-    }
-
     fn registry_value(&self, target: KeyRef, name: &str) -> Option<(u32, alloc::vec::Vec<u8>)> {
         if let Some(index) = self.registry_overlay_index(target) {
             if self.overlay.value_is_deleted(index, name) {
@@ -13377,15 +13357,24 @@ impl ExecNtHandler {
                 if self.registry_value(key, &name).is_none() {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                let index = match self.registry_shadow_key(key) {
-                    Ok(index) => index,
-                    Err(status) => return status,
-                };
-                if !self.overlay.delete_value(index, &name) {
+                if let Some(index) = self.registry_overlay_index(key) {
+                    if !self.overlay.delete_value(index, &name) {
+                        return 0xC000_0008;
+                    }
+                    self.overlay_dirty = true;
+                    return 0;
+                }
+                if let Some(mutable_key) = self.mutable_registry_key(key) {
+                    if !self.mutable_hives.delete_value(mutable_key, &name) {
+                        return 0xC000_0008;
+                    }
+                    self.mutable_hives_dirty = true;
+                    return 0;
+                }
+                if overlay_key_idx(key).is_some() {
                     return 0xC000_0008;
                 }
-                self.overlay_dirty = true;
-                0
+                0xC000_0002
             },
             // NtEnumerateValueKey(KeyHandle[0], Index[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). Enumerate the value at Index from the real hive + copy the

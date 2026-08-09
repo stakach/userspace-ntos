@@ -13,6 +13,9 @@ fn hive_create_open_set_query() {
     h.set_value(key, "Greeting", RegistryValueType::Sz, alloc::vec![1, 0]);
     assert_eq!(h.query_dword(key, "answer"), Some(42));
     assert!(h.query_value(key, "Greeting").is_some());
+    assert!(h.delete_value(key, "greeting"));
+    assert_eq!(h.query_value(key, "Greeting"), None);
+    assert!(!h.delete_value(key, "greeting"));
     assert_eq!(
         h.key_path(key).as_deref(),
         Some(r"\CurrentControlSet\Services\Test\Parameters")
@@ -100,6 +103,9 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
             .map(|(ty, data)| (ty, data.to_vec())),
         Some((RegistryValueType::Dword, 2u32.to_le_bytes().to_vec()))
     );
+    assert!(set.delete_value(svc, "Start"));
+    assert!(set.query_value(svc, "start").is_none());
+    assert!(!set.delete_value(svc, "Start"));
 
     let opened = set
         .resolve_key(r"\registry\machine\system\controlset001\services\rpcss")
