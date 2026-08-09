@@ -464,6 +464,115 @@ fn fixed_vm_map_front_release_rebases_surviving_vad() {
 }
 
 #[test]
+fn fixed_vm_map_middle_release_rebases_queries_and_reuses_gap() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x80_0000);
+    let allocation = map
+        .allocate(
+            Some(0x20000),
+            0x30000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(
+        allocation,
+        VmAllocatePlan {
+            base: 0x20000,
+            size: 0x30000,
+        }
+    );
+
+    let released = map.free(0x30000, 0x10000, MEM_RELEASE).unwrap();
+    assert_eq!(
+        released,
+        VmFreePlan {
+            base: 0x30000,
+            size: 0x10000,
+            free_type: MEM_RELEASE,
+        }
+    );
+    assert_eq!(
+        map.query_basic(0x20000, 0x80_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x20000,
+            allocation_base: 0x20000,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x10000,
+            state: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        }
+    );
+    assert_eq!(
+        map.query_basic(0x30000, 0x80_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x30000,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: 0x10000,
+            state: MEM_FREE,
+            protect: PAGE_NOACCESS,
+            type_: 0,
+        }
+    );
+    assert_eq!(
+        map.query_basic(0x40000, 0x80_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x40000,
+            allocation_base: 0x40000,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x10000,
+            state: MEM_COMMIT,
+            protect: PAGE_READWRITE,
+            type_: MEM_PRIVATE,
+        }
+    );
+
+    let reused = map
+        .allocate(
+            Some(0x30000),
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READONLY,
+        )
+        .unwrap();
+    assert_eq!(
+        reused,
+        VmAllocatePlan {
+            base: 0x30000,
+            size: 0x2000,
+        }
+    );
+    assert_eq!(
+        map.query_basic(0x32000, 0x80_0000).unwrap().region_size,
+        0xe000
+    );
+    let right = map.free(0x40fff, 0, MEM_RELEASE).unwrap();
+    assert_eq!(right.base, 0x40000);
+    assert_eq!(right.size, 0x10000);
+    assert!(map.extent_at(0x20000).is_some());
+    assert!(map.extent_at(0x30000).is_some());
+    assert!(map.extent_at(0x40000).is_none());
+}
+
+#[test]
+fn fixed_vm_map_middle_release_capacity_failure_preserves_state() {
+    let mut map = VmRegionMap::<1>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+
+    assert_eq!(
+        map.free(allocation.base + 0x1000, 0x1000, MEM_RELEASE),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(map.extent_count(), 1);
+    assert!(map.is_committed(allocation.base));
+    assert!(map.is_committed(allocation.base + 0x1000));
+    assert!(map.is_committed(allocation.base + 0x2000));
+}
+
+#[test]
 fn fixed_vm_map_null_commit_reserves_and_commit_updates_protection() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let implicit = map

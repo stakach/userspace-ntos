@@ -275,9 +275,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `.tmp/boot-callback-invalid-header-20260809.log` is fully green at `294/294`, including
    `exec_mapped_section_writecopy_cow_isolated`, callback/LSA route gates, VM pool headroom, and
    explorer shell chrome. Continue the plan from the remaining structural debt rather than
-   shell-paint scaffolding: A4's SCM pipe/listener special coordination, B3's real video/driver
-   binding, broader C4 private/mapped protect, partial decommit/release, overlap, `MEM_TOP_DOWN`,
-   guard/no-access regressions, and D1/D2 mutable registry/filesystem authority.
+   shell-paint scaffolding. The latest host-side C4 regression slice now pins middle
+   `MEM_RELEASE` behavior: right-side VAD rebasing, free-gap query reporting, reuse of the released
+   hole, zero-size release of the rebased survivor, and failed split state preservation under
+   bounded VAD capacity. Continue with A4's SCM pipe/listener special coordination, B3's real
+   video/driver binding, broader C4 private/mapped protect, partial decommit, overlap,
+   `MEM_TOP_DOWN`, guard/no-access regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1895,3 +1898,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
   and `./components/ntos-executive/build.sh`. Review adjustment: continue the syscall ABI-width
   audit at each native boundary, especially services still mixing dispatcher-captured arguments with
   manual stack reads.
+
+- C4 private VAD partial release regression slice. The host VM map tests now cover middle
+  `MEM_RELEASE` splitting in the private VAD policy: the left survivor keeps its original
+  allocation base, the right survivor is rebased to the page after the released hole,
+  `NtQueryVirtualMemory`-style basic queries report the hole as `MEM_FREE` up to the next VAD, a
+  new allocation can reuse the released range, and zero-size `MEM_RELEASE` against the rebased
+  right survivor tears down only that survivor. A bounded-capacity failure test also proves a middle
+  release that cannot allocate the second survivor returns `STATUS_INSUFFICIENT_RESOURCES` without
+  mutating the original committed allocation. Validation: `cargo fmt --all` and
+  `cargo test -p nt-address-space` with `43` tests passing. Review adjustment: partial
+  `MEM_RELEASE` now has host-side regression coverage; continue the C4 matrix with partial
+  decommit query/protect interactions, mapped/private protect gates, overlap, `MEM_TOP_DOWN`, and
+  guard/no-access behavior.
