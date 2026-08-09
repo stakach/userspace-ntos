@@ -291,10 +291,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    exhaustion as transactional failures. The latest `MEM_TOP_DOWN` slice pins high-address
    placement through occupied top ranges and free-gap query reporting after top-down allocation.
    The latest overlap-authority slices add host-tested committed-range overlap selection, bounded
-   lower/upper private VAD auto-placement, and executive retry around committed mappings, KUSER
-   aliases, or unowned registered frames before private allocation/generic data-section map-view
-   publication. Continue with the C4 live boot/selftest proof for cross-authority placement, then
-   return to A4/B3 or D1/D2 mutable registry/filesystem authority.
+   lower/upper private VAD auto-placement, executive retry around committed mappings, KUSER aliases,
+   or unowned registered frames before private allocation/generic data-section map-view publication,
+   and a live boot gate for cross-authority placement retry. Continue with A4 SCM pipe/listener
+   cleanup, B3 real video miniport hosting, or D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1996,3 +1996,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: add a live executive/boot proof that exercises or at least guards the
   cross-authority retry path; then resume A4 SCM pipe/listener cleanup, B3 real video miniport
   hosting, or D1/D2 mutable registry/filesystem authority.
+
+- C4 cross-authority placement live proof slice. The executive gate now includes
+  `exec_vm_cross_authority_placement_retry`, a live selftest that creates separate private-VAD and
+  committed-fixed authorities and proves bottom-up auto-placement skips upward, `MEM_TOP_DOWN`
+  skips downward, explicit-base collisions remain conflicting, and the selected retry gaps are clean.
+  Boot proof `.tmp/boot-cross-authority-placement-retry-20260809.log` is fully green at `295/295`:
+  the new gate passes with proof `0x0f/0x0f`, `exec_vm_pool_headroom` remains green with
+  `52240 KiB` root-Untyped free, `committed-map=233/512`, `committed-map-fails=0`,
+  `exec_explorer_shell_chrome_painted` passes, and explorer shell chrome still paints `34873`
+  non-background pixels. Validation also includes `cargo fmt --all`,
+  `cargo test -p nt-address-space` with `50` tests passing, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: C4 overlap/placement is now guarded host-side and live; resume A4 SCM
+  pipe/listener cleanup, B3 real video miniport hosting, or D1/D2 mutable registry/filesystem
+  authority.

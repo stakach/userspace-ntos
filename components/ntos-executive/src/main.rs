@@ -8626,6 +8626,137 @@ static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 =
     AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
 const IMAGE_WRITECOPY_COW_PATTERN: &[u8] = b"image writecopy shared source bytes";
 
+// --- CROSS-AUTHORITY VM PLACEMENT SELF-TEST ----------------------------------------------------
+const VM_CROSS_AUTH_RETRY_BOTTOM_UP: u64 = 0x01;
+const VM_CROSS_AUTH_RETRY_TOP_DOWN: u64 = 0x02;
+const VM_CROSS_AUTH_RETRY_EXPLICIT_CONFLICT: u64 = 0x04;
+const VM_CROSS_AUTH_RETRY_FIXED_GAP_CLEAN: u64 = 0x08;
+const VM_CROSS_AUTH_RETRY_ALL: u64 = 0x0f;
+
+fn align_up_allocation_granularity(value: u64) -> Option<u64> {
+    value
+        .checked_add(nt_address_space::ALLOCATION_GRANULARITY - 1)
+        .map(|value| value & !(nt_address_space::ALLOCATION_GRANULARITY - 1))
+}
+
+fn vm_cross_authority_placement_retry_selftest() -> (u64, u64, u64) {
+    const LOWER: u64 = 0x10000;
+    const UPPER: u64 = 0x10_0000;
+    const PAGE: u64 = 0x1000;
+    let mut proof = 0u64;
+
+    let before = nt_address_space::VmRegionMap::<4>::new(LOWER, UPPER);
+    let mut fixed = nt_address_space::VmCommittedRangeTable::<4>::new();
+    if fixed
+        .register(nt_address_space::VmCommittedRange::mapped(
+            LOWER,
+            PAGE,
+            nt_address_space::PAGE_READONLY,
+        ))
+        .is_err()
+    {
+        return (proof, 0, 0);
+    }
+
+    let mut bottom_selected = 0u64;
+    let mut lower_bound = 0u64;
+    for _ in 0..4 {
+        let mut after = before;
+        let Ok(plan) = after.allocate_between(
+            None,
+            PAGE,
+            nt_address_space::MEM_RESERVE | nt_address_space::MEM_COMMIT,
+            nt_address_space::PAGE_READWRITE,
+            lower_bound,
+            UPPER,
+        ) else {
+            break;
+        };
+        match fixed.first_overlap_range(plan.base, plan.size).ok().flatten() {
+            Some(range) => {
+                let Some(next_lower) = align_up_allocation_granularity(range.end()) else {
+                    break;
+                };
+                lower_bound = next_lower;
+            }
+            None => {
+                bottom_selected = plan.base;
+                break;
+            }
+        }
+    }
+    if bottom_selected == LOWER + nt_address_space::ALLOCATION_GRANULARITY {
+        proof |= VM_CROSS_AUTH_RETRY_BOTTOM_UP;
+    }
+
+    let mut top_fixed = nt_address_space::VmCommittedRangeTable::<4>::new();
+    if top_fixed
+        .register(nt_address_space::VmCommittedRange::mapped(
+            0xf_0000,
+            PAGE,
+            nt_address_space::PAGE_READONLY,
+        ))
+        .is_err()
+    {
+        return (proof, bottom_selected, 0);
+    }
+    let mut top_selected = 0u64;
+    let mut upper_bound = UPPER;
+    for _ in 0..4 {
+        let mut after = before;
+        let Ok(plan) = after.allocate_between(
+            None,
+            PAGE,
+            nt_address_space::MEM_RESERVE
+                | nt_address_space::MEM_COMMIT
+                | nt_address_space::MEM_TOP_DOWN,
+            nt_address_space::PAGE_READWRITE,
+            LOWER,
+            upper_bound,
+        ) else {
+            break;
+        };
+        match top_fixed
+            .first_overlap_range(plan.base, plan.size)
+            .ok()
+            .flatten()
+        {
+            Some(range) => upper_bound = upper_bound.min(range.base),
+            None => {
+                top_selected = plan.base;
+                break;
+            }
+        }
+    }
+    if top_selected == 0xe_0000 {
+        proof |= VM_CROSS_AUTH_RETRY_TOP_DOWN;
+    }
+
+    let mut explicit = before;
+    if explicit
+        .allocate_between(
+            Some(LOWER),
+            PAGE,
+            nt_address_space::MEM_RESERVE | nt_address_space::MEM_COMMIT,
+            nt_address_space::PAGE_READWRITE,
+            LOWER,
+            UPPER,
+        )
+        .ok()
+        .and_then(|plan| fixed.first_overlap_range(plan.base, plan.size).ok().flatten())
+        .is_some()
+    {
+        proof |= VM_CROSS_AUTH_RETRY_EXPLICIT_CONFLICT;
+    }
+    if fixed.first_overlap_range(bottom_selected, PAGE) == Ok(None)
+        && top_fixed.first_overlap_range(top_selected, PAGE) == Ok(None)
+    {
+        proof |= VM_CROSS_AUTH_RETRY_FIXED_GAP_CLEAN;
+    }
+
+    (proof, bottom_selected, top_selected)
+}
+
 /// Commit → decommit → RE-COMMIT one private page in a hosted process's VSpace, on the real
 /// `vm_map_private_page` / `vm_unmap_private_page` path, at a VA the VAD allocator never reaches
 /// (the very top of the private window — placements run upward from `SMSS_ALLOC_VA` and the boot's
@@ -19754,6 +19885,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_nt_query_time_monotonic",
         ut1 != 0 && ut2 >= ut1,
+        &mut passed,
+    );
+    let (cross_auth_retry, cross_auth_bottom, cross_auth_top) =
+        vm_cross_authority_placement_retry_selftest();
+    print_str(b"[ntos-exec] cross-authority VM placement retry proof=0x");
+    print_hex(cross_auth_retry as u32);
+    print_str(b"/0x");
+    print_hex(VM_CROSS_AUTH_RETRY_ALL as u32);
+    print_str(b" bottom=0x");
+    print_hex((cross_auth_bottom >> 32) as u32);
+    print_hex(cross_auth_bottom as u32);
+    print_str(b" top=0x");
+    print_hex((cross_auth_top >> 32) as u32);
+    print_hex(cross_auth_top as u32);
+    print_str(b"\n");
+    check(
+        b"exec_vm_cross_authority_placement_retry",
+        cross_auth_retry == VM_CROSS_AUTH_RETRY_ALL,
         &mut passed,
     );
 
