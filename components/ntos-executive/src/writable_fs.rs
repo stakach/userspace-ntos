@@ -83,7 +83,7 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// `dirs=45 files=31 bytes=5307` with `Default User` enumerating its real 17 records.
 pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 
-/// ★ THE SETUP STEP THE LIVECD SKIPS — `Default User\ntuser.dat`, from GENUINE ReactOS data.
+/// ★ THE SETUP STEP THE LIVECD SKIPS — `Default User\ntuser.dat`, from real setup hive state.
 ///
 /// `CreateUserProfileExW` copies `C:\Profiles\Default User` into the new profile and then calls
 /// `RegLoadKeyW(HKEY_USERS, <SID>, "<profile>\ntuser.dat")` (`profile.c:1088`). On this image that
@@ -92,9 +92,11 @@ pub(crate) const PROVISION_DEFAULT_USER_PROFILE: bool = true;
 /// (`base/setup/lib/registry.c`, `CreateUserHive`/`InstallHives`) copies
 /// `system32\config\default` — the `$$$PROTO.HIV` prototype, i.e. the very hive the kernel mounts
 /// as `HKEY_USERS\.DEFAULT` — into the Default User profile as `ntuser.dat`. This performs THAT
-/// step, with THAT file: the 139264 bytes the storage host already read BY PATH off
-/// `\reactos\system32\config\default` into `DEFHIVEBUF` ([`default_hive_bytes`]). Nothing is
-/// synthesised and nothing is fabricated — it is the image's own regf, byte for byte.
+/// step from THAT prototype hive. The executive first imports the genuine `config\default` regf into
+/// the live mutable hive authority, applies the installed-system setup writes ReactOS normally makes
+/// there, and serializes that live `.Default` hive image into the source profile. Nothing is answered
+/// by registry fallback: winlogon's real `CopyDirectory` copies an ordinary file, and `NtLoadKey`
+/// mounts the copied hive image.
 ///
 /// **Why the `Default User` profile and not the user's.** winlogon must stay the actor: dropping
 /// the file into `C:\Profiles\Administrator` directly would make `LoadUserProfileW`'s
@@ -117,6 +119,13 @@ pub(crate) const COPIED_PROFILE_NTUSER_DAT: &str = r"\??\C:\Profiles\Administrat
 /// Bytes of the `ntuser.dat` really provisioned into the `Default User` profile (0 = not present).
 pub(crate) static NTUSER_DAT_PROVISIONED: AtomicU64 = AtomicU64::new(0);
 
+/// The setup-provisioned `.Default` hive image to install into `Default User\ntuser.dat`.
+///
+/// This is populated by the registry setup path after the mutable `.Default` hive has received
+/// ReactOS setup's locale and shell-folder writes. If it is absent, no profile hive is provisioned:
+/// copying the raw `config\default` prototype would reintroduce the stale setup-state bug.
+static mut SETUP_DEFAULT_USER_NTUSER_IMAGE: Option<alloc::vec::Vec<u8>> = None;
+
 /// Is `path` a REAL regf hive on this volume? Checked by CONTENT, not by existence: the bytes must
 /// parse through the same `nt-hive-regf` navigator the registry mounts a hive with, AND its root
 /// must really enumerate subkeys (a zero-filled or truncated file cannot fake that). Returns the
@@ -131,14 +140,109 @@ pub(crate) fn regf_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
     }
 }
 
-/// [`regf_len_on`] against the LIVE mounted volume (the gate specs' read-back).
+fn hive_image_ok(bytes: &[u8]) -> bool {
+    if RegfHive::new(bytes).is_some_and(|hive| !hive.subkeys(hive.root()).is_empty()) {
+        return true;
+    }
+    nt_hive_core::decode_image(bytes)
+        .is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
+}
+
+/// Is `path` a mountable hive image on this volume? Accepts both real on-disk `regf` hives and this
+/// kernel's versioned mutable-hive checkpoints, matching `NtLoadKey`'s accepted source formats.
+pub(crate) fn hive_image_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
+    let regf_len = regf_len_on(fs, path);
+    if regf_len != 0 {
+        return regf_len;
+    }
+    let Some(bytes) = fs.file_bytes(path) else {
+        return 0;
+    };
+    if nt_hive_core::decode_image(bytes)
+        .is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
+    {
+        bytes.len()
+    } else {
+        0
+    }
+}
+
+/// Return the byte length of a value inside a hive image file on the writable volume.
+///
+/// This is a content proof for profile setup gates: the value must exist in the file winlogon copied
+/// and `NtLoadKey` mounted, not in an executive-side fallback table.
+pub(crate) fn hive_image_value_len_on(
+    fs: &nt_fs::FileSystem,
+    path: &str,
+    key_path: &str,
+    value_name: &str,
+) -> usize {
+    let Some(bytes) = fs.file_bytes(path) else {
+        return 0;
+    };
+    if let Some(regf) = RegfHive::new(bytes) {
+        return regf
+            .open_key(key_path)
+            .and_then(|key| regf.value(key, value_name))
+            .map_or(0, |(_, data)| data.len());
+    }
+    nt_hive_core::decode_image(bytes)
+        .ok()
+        .and_then(|hive| {
+            let key = hive.open_key(key_path)?;
+            hive.query_value(key, value_name)
+                .map(|(_, data)| data.len())
+        })
+        .unwrap_or(0)
+}
+
+/// [`hive_image_len_on`] against the LIVE mounted volume (the gate specs' read-back).
 ///
 /// # Safety
 /// Single-threaded executive; borrows the mounted volume for the duration of the read.
-pub(crate) unsafe fn regf_len_at(path: &str) -> usize {
+pub(crate) unsafe fn hive_image_len_at(path: &str) -> usize {
     match writable_fs() {
-        Some(fs) => regf_len_on(fs, path),
+        Some(fs) => hive_image_len_on(fs, path),
         None => 0,
+    }
+}
+
+/// [`hive_image_value_len_on`] against the LIVE mounted volume.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the read.
+pub(crate) unsafe fn hive_image_value_len_at(
+    path: &str,
+    key_path: &str,
+    value_name: &str,
+) -> usize {
+    match writable_fs() {
+        Some(fs) => hive_image_value_len_on(fs, path, key_path, value_name),
+        None => 0,
+    }
+}
+
+/// Publish the setup-provisioned `.Default` hive image that the profile source should expose as
+/// `Default User\ntuser.dat`.
+///
+/// # Safety
+/// Single-threaded executive during boot/profile setup. The stored image is immutable after
+/// publication except for replacing the whole vector with a newer setup snapshot.
+pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8>) -> bool {
+    if !PROVISION_NTUSER_DAT || image.is_empty() || !hive_image_ok(&image) {
+        return false;
+    }
+    let len = image.len() as u64;
+    *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
+    NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
+    if let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() {
+        let Some(bytes) = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref()
+        else {
+            return false;
+        };
+        fs.provision_file(DEFAULT_USER_NTUSER_DAT, bytes)
+    } else {
+        true
     }
 }
 
@@ -686,19 +790,21 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
         PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
     }
     // ★ THE SETUP STEP THE LIVECD SKIPS (see `PROVISION_NTUSER_DAT`): give the `Default User`
-    // profile the `ntuser.dat` setup would have made for it, from the image's OWN
-    // `system32\config\default` regf. Done here, on the SOURCE profile, so winlogon's own
-    // `CopyDirectory` is what puts it in the user's profile.
+    // profile the `ntuser.dat` setup would have made for it from the setup-provisioned mutable
+    // `.Default` checkpoint image. Do not copy raw `config\default`: that prototype lacks setup's
+    // installed-user writes and is the bug this path replaces.
     if PROVISION_NTUSER_DAT {
-        match default_hive_bytes() {
-            Some(hive) if RegfHive::new(hive).is_some() => {
+        let setup_image =
+            (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref();
+        match setup_image {
+            Some(hive) if hive_image_ok(hive) => {
                 if fs.provision_file(DEFAULT_USER_NTUSER_DAT, hive) {
                     files += 1;
                     bytes += hive.len() as u64;
                     NTUSER_DAT_PROVISIONED.store(hive.len() as u64, Ordering::Relaxed);
                 }
             }
-            _ => print_str(b"[profile-source] config\\default NOT staged -> no ntuser.dat\n"),
+            _ => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),
         }
         PROFILE_SOURCE_DIRS.store(dirs, Ordering::Relaxed);
         PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
@@ -720,10 +826,10 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     print_u64(PROFILE_SOURCE_PROBE_OK.load(Ordering::Relaxed));
     print_str(b" ntuser.dat=");
     print_u64(NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
-    print_str(b"B(regf-ok=");
-    // Read it back off the LIVE volume and parse it, so the claim "a real regf is in the source
-    // profile" is measured through the same navigator the registry will mount it with.
-    print_u64(regf_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
+    print_str(b"B(hive-ok=");
+    // Read it back off the LIVE volume and parse it, so the claim "a real hive image is in the
+    // source profile" is measured through the same navigator the registry will mount it with.
+    print_u64(hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
     print_str(b")\n");
 }
 

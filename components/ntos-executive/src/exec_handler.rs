@@ -1310,6 +1310,7 @@ impl ExecNtHandler {
         handler.provision_volatile_hardware_registry();
         unsafe { handler.provision_default_user_locale() };
         handler.provision_default_user_shell_folders();
+        handler.provision_default_user_ntuser_dat_image();
         handler.provision_normal_system_setup_state();
         handler.provision_reactos_explorer_shell_com_classes();
         handler
@@ -1531,6 +1532,35 @@ impl ExecNtHandler {
         print_str(b" User Shell Folders=");
         print_u64(stats.user_shell_folder_values as u64);
         print_str(b"\n");
+    }
+
+    /// Serialize the setup-provisioned `.Default` hive into the profile source's `ntuser.dat`.
+    ///
+    /// ReactOS setup creates `Default User\ntuser.dat` from the prototype hive after setup has
+    /// applied installed-user values. This executive has already imported the real `config\default`
+    /// regf into `MutableHiveSet` and applied the setup-owned locale/shell-folder writes there, so
+    /// the file winlogon copies must come from that mutable authority rather than stale raw regf
+    /// bytes.
+    fn provision_default_user_ntuser_dat_image(&mut self) {
+        let Some(hive) = self.mutable_hives.hive(HIVE_SEL_USER_DEFAULT) else {
+            print_str(b"[profile-setup] HKU\\.DEFAULT mutable hive absent -> no ntuser.dat image\n");
+            return;
+        };
+        let image = nt_hive_core::encode_image(hive);
+        if image.len() > USER_HIVE_SLOT_BYTES {
+            print_str(b"[profile-setup] HKU\\.DEFAULT image too large for NtLoadKey slot: ");
+            print_u64(image.len() as u64);
+            print_str(b"B\n");
+            return;
+        }
+        let len = image.len();
+        if unsafe { crate::writable_fs::set_default_user_ntuser_dat_image(image) } {
+            print_str(b"[profile-setup] Default User\\ntuser.dat <- mutable HKU\\.DEFAULT image ");
+            print_u64(len as u64);
+            print_str(b"B\n");
+        } else {
+            print_str(b"[profile-setup] Default User\\ntuser.dat image publication failed\n");
+        }
     }
 
     /// ═══ THE SECOND SETUP STEP THE LIVECD SKIPS — the default user's LOCALE ═══════════════════

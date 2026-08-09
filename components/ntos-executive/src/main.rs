@@ -4539,33 +4539,50 @@ unsafe fn explorer_framebuffer_final_readback() -> ExplorerFramebufferReadback {
 /// mounts as `HKEY_USERS\.DEFAULT` — into the Default User profile. This asserts that step ran,
 /// with that data, and that WINLOGON'S OWN `CopyDirectory` carried it into the user's profile.
 ///
-/// Every clause is CONTENT, not existence: both files must parse as `regf` hives through
-/// `nt-hive-regf` (the same navigator the registry mounts them with) AND their roots must really
-/// enumerate subkeys; and the destination's length must equal the source's, which only a real
-/// `CopyFileW` of the whole file produces.
+/// Every clause is CONTENT, not existence: both files must parse as mountable hive images (real
+/// `regf` or the mutable-hive checkpoint format `NtLoadKey` accepts) AND their roots must really
+/// enumerate subkeys; the destination's length must equal the source's, which only a real
+/// `CopyFileW` of the whole file produces; and the copied profile hive must contain setup-written
+/// values that the raw LiveCD prototype lacks.
 unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     use crate::writable_fs::*;
     let staged = NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed);
-    let source = regf_len_at(DEFAULT_USER_NTUSER_DAT) as u64;
-    let copied = regf_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
+    let source = hive_image_len_at(DEFAULT_USER_NTUSER_DAT) as u64;
+    let copied = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
+    let copied_appdata = hive_image_value_len_at(
+        COPIED_PROFILE_NTUSER_DAT,
+        r"software\microsoft\windows\currentversion\explorer\shell folders",
+        "AppData",
+    ) as u64;
+    let copied_locale = hive_image_value_len_at(
+        COPIED_PROFILE_NTUSER_DAT,
+        r"control panel\international",
+        "Locale",
+    ) as u64;
     print_str(b"[wl-ntuser] Default User\\ntuser.dat provisioned=");
     print_u64(staged);
-    print_str(b"B regf-parses=");
+    print_str(b"B hive-image-parses=");
     print_u64(source);
-    print_str(b"B -> copied to the profile as a regf of ");
+    print_str(b"B -> copied to the profile as a hive image of ");
     print_u64(copied);
-    print_str(b"B (source=config\\default ");
+    print_str(b"B (AppData=");
+    print_u64(copied_appdata);
+    print_str(b"B Locale=");
+    print_u64(copied_locale);
+    print_str(b"B raw-config-default=");
     print_u64(DEFAULT_HIVE_SIZE.load(Ordering::Relaxed));
     print_str(b"B)\n");
     check(
         b"exec_profile_ntuser_dat_present",
         !PROVISION_NTUSER_DAT
             || (staged > 0
-                // the SOURCE profile really holds the genuine hive, byte-length exact …
+                // the SOURCE profile really holds the setup hive image, byte-length exact …
                 && source == staged
-                && staged == DEFAULT_HIVE_SIZE.load(Ordering::Relaxed)
-                // … and winlogon's own CopyDirectory produced an equally real one in the profile.
-                && copied == source),
+                // … winlogon's own CopyDirectory produced an equally real one in the profile …
+                && copied == source
+                // … and the file contains setup-owned values, not just the raw LiveCD prototype.
+                && copied_appdata > 0
+                && copied_locale > 0),
         passed,
     );
 }
