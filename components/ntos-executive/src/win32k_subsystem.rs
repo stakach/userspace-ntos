@@ -452,6 +452,11 @@ const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
 const THREADINFO_PEVENT_QUEUE_SERVER_OFF: u64 = 0x140;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
+/// USER_MESSAGE_QUEUE offsets used by ReactOS `MsqInitializeMessageQueue`.
+const USER_MESSAGE_QUEUE_PTI_MOUSE_OFF: u64 = 0x28;
+const USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF: u64 = 0x30;
+const USER_MESSAGE_QUEUE_HARDWARE_MESSAGES_OFF: u64 = 0x38;
+const USER_MESSAGE_QUEUE_CTHREADS_OFF: u64 = 0xB0;
 
 /// win32k `.data` global `gpdeskInputDesktop` (desktop.c:52) RVA. `IntGetActiveDesktop()` returns it
 /// (desktop.c:1287); `co_IntShowDesktop` (winsta.c:340) derefs `Desktop->pDeskInfo->spwnd` and faults
@@ -8121,19 +8126,33 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     }
     // MessageQueue (THREADINFO+0x60): the paint/window-position path references the window's thread
     // and reads `pti->MessageQueue->QF_flags` (USER_MESSAGE_QUEUE+0xAC) — a NULL queue null-derefs in
-    // painting.c (RVA 0xb6a55). Provision a real zeroed USER_MESSAGE_QUEUE (References=1) with its
-    // HardwareMessagesListHead (+0x38) initialized. Since the desktop-window sends are intra-thread
-    // (gptiDesktopThread == the dispatch thread), win32k dispatches straight to DesktopWindowProc; the
-    // queue is used only for paint accounting (cPaintsReady, QF_flags), so a zeroed queue with valid
-    // list heads suffices. Real win32k creates this in CreateThreadInfo → MsqCreateMessageQueue.
-    if read_volatile((w32thread + 0x60) as *const u64) == 0 {
+    // painting.c (RVA 0xb6a55). Real win32k creates this in CreateThreadInfo -> MsqCreateMessageQueue
+    // and then MsqInitializeMessageQueue seeds the hardware-message list, ptiMouse/ptiKeyboard, and
+    // cThreads. Hosted THREADINFO placeholders need the same fields because later queue wake/paint
+    // paths are shared with normal win32k execution.
+    let mut mq = read_volatile((w32thread + 0x60) as *const u64);
+    if mq == 0 {
         let mq = pool_alloc(0x200); // USER_MESSAGE_QUEUE (~0xC0 + CaretInfo), zeroed
         if mq != 0 {
             write_volatile(mq as *mut u32, 1); // References = 1
-            let hw = mq + 0x38; // HardwareMessagesListHead
-            write_volatile(hw as *mut u64, hw);
-            write_volatile((hw + 8) as *mut u64, hw);
             write_volatile((w32thread + 0x60) as *mut u64, mq);
+        }
+    }
+    mq = read_volatile((w32thread + 0x60) as *const u64);
+    if mq != 0 {
+        if read_volatile(mq as *const u32) == 0 {
+            write_volatile(mq as *mut u32, 1);
+        }
+        let hw = mq + USER_MESSAGE_QUEUE_HARDWARE_MESSAGES_OFF;
+        ensure_list_head_initialized(hw);
+        if read_volatile((mq + USER_MESSAGE_QUEUE_PTI_MOUSE_OFF) as *const u64) == 0 {
+            write_volatile((mq + USER_MESSAGE_QUEUE_PTI_MOUSE_OFF) as *mut u64, w32thread);
+        }
+        if read_volatile((mq + USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF) as *const u64) == 0 {
+            write_volatile((mq + USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF) as *mut u64, w32thread);
+        }
+        if read_volatile((mq + USER_MESSAGE_QUEUE_CTHREADS_OFF) as *const u32) == 0 {
+            write_volatile((mq + USER_MESSAGE_QUEUE_CTHREADS_OFF) as *mut u32, 1);
         }
     }
     // pcti (THREADINFO+0x70): the paint path sets the thread's wake bits via
