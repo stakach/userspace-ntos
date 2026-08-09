@@ -5782,38 +5782,50 @@ impl ExecNtHandler {
         handle: u64,
         required_access: u32,
     ) -> Result<WaitObject, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
-        match self.event_index_for_handle(handle, required_access) {
-            Ok(index) => Ok(WaitObject::dispatcher(index)),
-            Err(STATUS_OBJECT_TYPE_MISMATCH) => {
-                match self.semaphore_index_for_handle(handle, required_access) {
-                    Ok(index) => Ok(WaitObject::dispatcher(index)),
-                    Err(STATUS_OBJECT_TYPE_MISMATCH) => {
-                        match self.mutant_index_for_handle(handle, required_access) {
-                            Ok(index) => Ok(WaitObject::dispatcher(index)),
-                            Err(STATUS_OBJECT_TYPE_MISMATCH) => self
-                                .process_thread_or_win32k_event_wait_object(
-                                    handle,
-                                    required_access,
-                                ),
-                            Err(status) => Err(status),
-                        }
-                    }
-                    Err(status) => Err(status),
-                }
-            }
-            Err(status) => Err(status),
+        if let Some(object) = self.process_thread_or_file_wait_object(handle, required_access)? {
+            return Ok(object);
         }
+        let mut saw_invalid_handle = false;
+        match self.event_index_for_handle(handle, required_access) {
+            Ok(index) => return Ok(WaitObject::dispatcher(index)),
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        match self.semaphore_index_for_handle(handle, required_access) {
+            Ok(index) => return Ok(WaitObject::dispatcher(index)),
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        match self.mutant_index_for_handle(handle, required_access) {
+            Ok(index) => return Ok(WaitObject::dispatcher(index)),
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
+        self.win32k_event_wait_object(handle).or_else(|_| {
+            Err(if saw_invalid_handle {
+                STATUS_INVALID_HANDLE
+            } else {
+                STATUS_OBJECT_TYPE_MISMATCH
+            })
+        })
     }
 
-    fn process_thread_or_win32k_event_wait_object(
+    fn process_thread_or_file_wait_object(
         &self,
         handle: u64,
         required_access: u32,
-    ) -> Result<WaitObject, u32> {
+    ) -> Result<Option<WaitObject>, u32> {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 
         let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
 
@@ -5821,7 +5833,8 @@ impl ExecNtHandler {
             return self
                 .pm
                 .resolve_process_handle(caller, handle, required_access)
-                .map(WaitObject::process);
+                .map(WaitObject::process)
+                .map(Some);
         }
         if handle == u64::MAX - 1 {
             return self
@@ -5832,7 +5845,11 @@ impl ExecNtHandler {
                     handle,
                     required_access,
                 )
-                .map(WaitObject::thread);
+                .map(WaitObject::thread)
+                .map(Some);
+        }
+        if handle > u32::MAX as u64 {
+            return Ok(None);
         }
 
         match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
@@ -5847,7 +5864,7 @@ impl ExecNtHandler {
                 if self.pm.process(pid).is_none() {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                Ok(WaitObject::process(pid))
+                Ok(Some(WaitObject::process(pid)))
             }
             Some(nt_process::HandleObject::Thread(tid)) => {
                 let granted = self
@@ -5860,7 +5877,7 @@ impl ExecNtHandler {
                 if self.pm.thread(tid).is_none() {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                Ok(WaitObject::thread(tid))
+                Ok(Some(WaitObject::thread(tid)))
             }
             Some(nt_process::HandleObject::File(file_id)) => {
                 let granted = self
@@ -5873,13 +5890,17 @@ impl ExecNtHandler {
                 if self.file_completion.is_signaled(file_id).is_err() {
                     return Err(STATUS_INVALID_HANDLE);
                 }
-                Ok(WaitObject::file(file_id))
+                Ok(Some(WaitObject::file(file_id)))
             }
-            Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
-            None => crate::win32k_subsystem::event_body_for_client_handle(handle)
-                .map(WaitObject::win32k_event_body)
-                .ok_or(STATUS_INVALID_HANDLE),
+            Some(_) | None => Ok(None),
         }
+    }
+
+    fn win32k_event_wait_object(&self, handle: u64) -> Result<WaitObject, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        crate::win32k_subsystem::event_body_for_client_handle(handle)
+            .map(WaitObject::win32k_event_body)
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     fn dispatcher_object_for_thread(

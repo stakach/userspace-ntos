@@ -444,6 +444,12 @@ const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
 /// THREADINFO->hdesk offset (`win32.h`: after `exitCode`, before `cPaintsReady`). Keep it consistent
 /// with `rpdesk`/`pDeskInfo` when preparing a real first `NtUserSetThreadDesktop` call.
 const THREADINFO_HDESK_OFF: u64 = 0xD8;
+/// THREADINFO->hEventQueueClient / ->pEventQueueServer offsets. ReactOS' `CreateThreadInfo` creates
+/// a synchronization event, stores the client handle at +0x138, then references it to a server KEVENT
+/// pointer at +0x140. `IntMsqSetWakeMask` returns the handle to user32 and `MsqWakeQueue` signals the
+/// server pointer.
+const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
+const THREADINFO_PEVENT_QUEUE_SERVER_OFF: u64 = 0x140;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
 
@@ -1965,6 +1971,84 @@ pub(crate) fn event_body_consume(body: u64) -> bool {
         }
     }
     true
+}
+
+unsafe fn register_win32k_local_event_body(body: u64) -> Option<u64> {
+    if body == 0 {
+        return None;
+    }
+    let handle = WIN32K_LOCAL_EVENT_HANDLE_NEXT.fetch_add(4, Ordering::Relaxed);
+    if (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).register_event(handle, body) {
+        Some(handle)
+    } else {
+        None
+    }
+}
+
+unsafe fn create_win32k_local_queue_event() -> Option<(u64, u64)> {
+    let body = pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64);
+    if body == 0 {
+        return None;
+    }
+    nt_kernel_exec::kevent::init_kevent(
+        body as *mut u8,
+        nt_kernel_exec::kevent::EventKind::Synchronization,
+        false,
+    );
+    register_win32k_local_event_body(body).map(|handle| (handle, body))
+}
+
+unsafe fn ensure_thread_queue_event(w32thread: u64) {
+    if w32thread == 0 {
+        return;
+    }
+    let handle_slot = (w32thread + THREADINFO_HEVENT_QUEUE_CLIENT_OFF) as *mut u64;
+    let server_slot = (w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *mut u64;
+    let handle = read_volatile(handle_slot);
+    let server = read_volatile(server_slot);
+    if handle != 0 && server != 0 {
+        return;
+    }
+
+    if server == 0 && handle != 0 {
+        if let Some(body) = event_body_for_client_handle(handle) {
+            write_volatile(server_slot, body);
+            return;
+        }
+    }
+
+    if handle == 0 && server != 0 {
+        if let Some(alias) = register_win32k_local_event_body(server) {
+            write_volatile(handle_slot, alias);
+            return;
+        }
+    }
+
+    if let Some((new_handle, new_server)) = create_win32k_local_queue_event() {
+        write_volatile(handle_slot, new_handle);
+        write_volatile(server_slot, new_server);
+        let n = WIN32K_THREAD_QUEUE_EVENT_SEEDS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] seeded message queue event pti=0x");
+            print_hex((w32thread >> 32) as u32);
+            print_hex(w32thread as u32);
+            print_str(b" handle=0x");
+            print_hex((new_handle >> 32) as u32);
+            print_hex(new_handle as u32);
+            print_str(b" server=0x");
+            print_hex((new_server >> 32) as u32);
+            print_hex(new_server as u32);
+            print_str(b"\n");
+        }
+    } else {
+        let n = WIN32K_THREAD_QUEUE_EVENT_SEEDS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: could not seed message queue event pti=0x");
+            print_hex((w32thread >> 32) as u32);
+            print_hex(w32thread as u32);
+            print_str(b"\n");
+        }
+    }
 }
 
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
@@ -3559,6 +3643,7 @@ static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x0000_0000_6E00_0000);
 static WIN32K_LOCAL_EVENT_SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_QUEUE_EVENT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn take_local_event_signal_pending() -> bool {
@@ -8018,6 +8103,11 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
             write_volatile((w32thread + 0x70) as *mut u64, pcti);
         }
     }
+    // hEventQueueClient / pEventQueueServer: user32's MsgWaitForMultipleObjectsEx asks win32k for
+    // this handle via NtUserxMsqSetWakeMask, and ReactOS signals the server KEVENT when queue bits
+    // change. A hosted THREADINFO without these fields can still survive direct PeekMessage calls, but
+    // it cannot participate in the real wait/wake path explorer uses while bringing up the desktop.
+    ensure_thread_queue_event(w32thread);
 }
 
 unsafe fn initialize_list_head(head: u64) {

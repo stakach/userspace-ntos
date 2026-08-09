@@ -31,18 +31,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Boot proof `.tmp/boot-strict-win32k-context-rerun-20260810.log` reaches `[microtest done]` at
-`289/295`: winlogon authenticates, `WlxActivateUserShell` reads `Userinit` from the real SOFTWARE
-hive, `userinit.exe` starts, genuine `explorer.exe` launches, explorer installs client WndProcs,
-shell COM classes are served, and explorer leaves a broad non-background framebuffer span. The latest
-kernel-side cleanup also removes the stale published win32k thread-context import warning by matching
-published callback contexts against process and thread identity together.
+Boot proof `.tmp/boot-wait-object-win32k-event-20260810.log` restores the desktop frontier:
+winlogon authenticates, the real profile/SAM/USER-object-security path reaches `userinit.exe`,
+genuine `explorer.exe` launches, shell COM classes are served, explorer creates windows, and the
+harness reports `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`.
+The previous `desktop.cpp:193`/`hres=80004005` blocker is gone.
 
-The remaining explorer chrome blocker is not process launch or callback registration: explorer still
-never calls `NtUserBeginPaint`/`NtUserEndPaint` (`begin/end=0/0`) and ReactOS reports
-`desktop.cpp:193` with `hres=80004005` before the explorer main thread parks on an empty message
-queue. The next useful slice is therefore the real desktop browser/tray message path that should
-create or invalidate a paintable shell window, not a paint-accounting shortcut.
+The fix is mechanism-owned rather than a shell paint shortcut: THREADINFO now carries the real
+message-queue client/server event pair expected by ReactOS `IntMsqSetWakeMask`, and native wait
+resolution accepts win32k event handles after process-local wait objects and dispatcher probes. That
+lets explorer's `MsgWaitForMultipleObjectsEx` wait on the queue event instead of failing before its
+desktop browser/tray path can continue. The next useful work should return to structural debt:
+A4 SCM pipe/listener coordination, B3 real video/driver binding, broader C4 VM regression coverage,
+and D3/D4 durable hive/profile persistence.
 
 ### A. SCM-Controlled Service Startup
 
@@ -2271,3 +2272,17 @@ create or invalidate a paintable shell window, not a paint-accounting shortcut.
   still failed because explorer `BeginPaint`/`EndPaint` accounting was `0/0`; next work should find
   the real paint-dispatch or update-region boundary that keeps shell chrome from proving through the
   normal win32k paint path.
+
+- Win32k queue-event wait bridge. The explorer shell frontier moved from a framebuffer-only span back
+  to a genuine desktop paint proof. Hosted THREADINFO setup now seeds the ReactOS
+  `hEventQueueClient`/`pEventQueueServer` pair with a local synchronization event, so
+  `NtUserxMsqSetWakeMask` can return a waitable message-queue event. Native wait-object resolution
+  now checks process-local process/thread/file handles first, probes dispatcher events/semaphores/
+  mutants without treating a missing process handle as final, then resolves win32k event handles by
+  object identity. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and boot proof `.tmp/boot-wait-object-win32k-event-20260810.log`, which ends with `SUCCESS -- the
+  ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review adjustment: the immediate
+  shell-paint blocker is closed without adding a paint-accounting fallback; resume A4 SCM
+  pipe/listener cleanup, B3 real video/driver binding, C4 VM regression coverage, or D3/D4 durability
+  work.
