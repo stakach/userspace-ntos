@@ -55,6 +55,28 @@ fn hive_borrowed_indexed_enumeration_preserves_names_and_data() {
 }
 
 #[test]
+fn hive_delete_key_removes_only_leaf_keys() {
+    let mut h = Hive::new(HiveKind::Software);
+    let parent = h.create_key(r"Classes\CLSID");
+    let child = h.create_key(r"Classes\CLSID\{11111111-2222-3333-4444-555555555555}");
+    h.set_value(child, "", RegistryValueType::Sz, b"C\0l\0s\0\0\0".to_vec());
+
+    assert_eq!(h.delete_key(h.root()), Err(DeleteKeyError::CannotDelete));
+    assert_eq!(h.delete_key(parent), Err(DeleteKeyError::CannotDelete));
+    assert_eq!(h.subkey_count(parent), 1);
+
+    assert_eq!(h.delete_key(child), Ok(()));
+    assert_eq!(
+        h.open_key(r"Classes\CLSID\{11111111-2222-3333-4444-555555555555}"),
+        None
+    );
+    assert_eq!(h.subkey_count(parent), 0);
+    assert_eq!(h.query_value(child, ""), None);
+    assert_eq!(h.delete_key(child), Err(DeleteKeyError::NotFound));
+    assert!(h.dirty_count() >= 3);
+}
+
+#[test]
 fn mount_table_currentcontrolset_resolver() {
     let mut mt = HiveMountTable::new();
     mt.mount(SYSTEM_HIVE_PATH, 1);
@@ -109,6 +131,15 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
     assert!(set.delete_value(svc, "Start"));
     assert!(set.query_value(svc, "start").is_none());
     assert!(!set.delete_value(svc, "Start"));
+
+    let transient = set
+        .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs\Parameters")
+        .expect("create transient service child");
+    assert_eq!(set.delete_key(svc), Err(DeleteKeyError::CannotDelete));
+    assert_eq!(set.delete_key(transient), Ok(()));
+    assert!(set
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs\Parameters")
+        .is_none());
 
     let opened = set
         .resolve_key(r"\registry\machine\system\controlset001\services\rpcss")

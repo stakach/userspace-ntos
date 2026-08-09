@@ -1153,8 +1153,11 @@ pub const SSN_NT_QUERY_SECTION: u64 = 175;
 pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
 /// NtClose — closes executive-owned entries in the caller's per-process handle table.
 pub const SSN_NT_CLOSE: u64 = 27;
-/// NtDeleteValueKey — smss deletes SAFEBOOT_OPTION from \Session Manager\Environment (sminit.c:2321).
-/// Registry writes aren't modelled (the regf hive is read-only) → best-effort no-op success.
+/// NtDeleteKey — RXACT and setup paths delete opened registry keys through the Configuration
+/// Manager, requiring DELETE access.
+pub const SSN_NT_DELETE_KEY: u64 = 66;
+/// NtDeleteValueKey — smss deletes SAFEBOOT_OPTION from \Session Manager\Environment
+/// (`sminit.c:2321`) and RXACT removes its replay log value.
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
 pub const SSN_NT_ACCESS_CHECK: u64 = 1;
@@ -17225,6 +17228,7 @@ fn build_nt_table() -> NativeServiceTable {
                 NativeService::NtAdjustPrivilegesToken,
                 SSN_NT_ADJUST_PRIV_TOKEN as u32,
             ),
+            (NativeService::NtDeleteKey, SSN_NT_DELETE_KEY as u32),
             (
                 NativeService::NtDeleteValueKey,
                 SSN_NT_DELETE_VALUE_KEY as u32,

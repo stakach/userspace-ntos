@@ -13362,6 +13362,50 @@ impl ExecNtHandler {
             NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key_ex(args[0], 0, args[1]) },
             NativeService::NtLoadDriver => unsafe { self.nt_load_driver(args[0]) },
             NativeService::NtUnloadDriver => unsafe { self.nt_unload_driver(args[0]) },
+            NativeService::NtDeleteKey => {
+                const DELETE_ACCESS: u32 = 0x0001_0000;
+                const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
+                let key = match self.resolve_registry_key(args[0], DELETE_ACCESS) {
+                    Ok(key) => key,
+                    Err(status) => return status,
+                };
+                if key == MACHINE_ROOT_KEY || key == USER_ROOT_KEY {
+                    return STATUS_CANNOT_DELETE;
+                }
+                if self.registry_key_stats(key).subkeys != 0 {
+                    return STATUS_CANNOT_DELETE;
+                }
+                if let Some(index) = overlay_key_idx(key) {
+                    let Some(path) = self.overlay.path(index).map(alloc::string::String::from)
+                    else {
+                        return 0xC000_0034;
+                    };
+                    if self.overlay.detach_subtree(&path) == 0 {
+                        return 0xC000_0034;
+                    }
+                    self.overlay_dirty = true;
+                    return 0;
+                }
+                let key_path = self.registry_target_path(key);
+                if let Some(mutable_key) = self.mutable_registry_key(key) {
+                    match self.mutable_hives.delete_key(mutable_key) {
+                        Ok(()) => {
+                            if let Some(path) = key_path.as_deref() {
+                                if self.overlay.detach_subtree(path) != 0 {
+                                    self.overlay_dirty = true;
+                                }
+                            }
+                            self.mutable_hives_dirty = true;
+                            return 0;
+                        }
+                        Err(nt_hive_core::DeleteKeyError::CannotDelete) => {
+                            return STATUS_CANNOT_DELETE;
+                        }
+                        Err(nt_hive_core::DeleteKeyError::NotFound) => return 0xC000_0034,
+                    }
+                }
+                0xC000_0022 // STATUS_ACCESS_DENIED: borrowed regf keys are read-only.
+            },
             NativeService::NtDeleteValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,

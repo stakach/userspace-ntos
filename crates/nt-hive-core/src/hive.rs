@@ -63,6 +63,12 @@ pub(crate) enum Cell {
     Value(ValueCell),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeleteKeyError {
+    NotFound,
+    CannotDelete,
+}
+
 pub(crate) fn fold(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -304,6 +310,47 @@ impl Hive {
         self.mark_dirty(key);
         self.mark_dirty(value_id);
         true
+    }
+
+    /// `ZwDeleteKey` — delete a leaf key and its values from the hive.
+    ///
+    /// NT refuses the hive root and keys that still have subkeys; callers that need a subtree
+    /// removal must enumerate/delete children first.
+    pub fn delete_key(&mut self, key: CellId) -> Result<(), DeleteKeyError> {
+        if key == self.root {
+            return Err(DeleteKeyError::CannotDelete);
+        }
+        let (parent_id, value_ids) = {
+            let Some(cell) = self.key(key) else {
+                return Err(DeleteKeyError::NotFound);
+            };
+            if !cell.subkeys.is_empty() || cell.parent.is_none() {
+                return Err(DeleteKeyError::CannotDelete);
+            }
+            (cell.parent.unwrap(), cell.values.clone())
+        };
+        self.sequence += 1;
+        let seq = self.sequence;
+        if let Some(parent) = self.key_mut(parent_id) {
+            parent.subkeys.retain(|(_, child)| *child != key);
+            parent.last_write_sequence = seq;
+            self.mark_dirty(parent_id);
+        } else {
+            return Err(DeleteKeyError::NotFound);
+        }
+        for value_id in value_ids {
+            if let Some(cell) = self.cells.get_mut(value_id.0 as usize) {
+                *cell = None;
+                self.mark_dirty(value_id);
+            }
+        }
+        if let Some(cell) = self.cells.get_mut(key.0 as usize) {
+            *cell = None;
+            self.mark_dirty(key);
+            Ok(())
+        } else {
+            Err(DeleteKeyError::NotFound)
+        }
     }
 
     /// `ZwQueryValueKey` — read a named value (type + data).
@@ -563,6 +610,12 @@ impl MutableHiveSet {
     pub fn delete_value(&mut self, key: ResolvedHiveKey, name: &str) -> bool {
         self.hive_mut(key.hive)
             .is_some_and(|hive| hive.delete_value(key.key, name))
+    }
+
+    pub fn delete_key(&mut self, key: ResolvedHiveKey) -> Result<(), DeleteKeyError> {
+        self.hive_mut(key.hive)
+            .ok_or(DeleteKeyError::NotFound)?
+            .delete_key(key.key)
     }
 
     pub fn query_value(

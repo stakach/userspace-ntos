@@ -84,8 +84,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
   PE-literal recovery names, HKEY_USERS, explorer HKCR, and hosted-process HKLM opens: volatile
   overlay keys first, mounted mutable hives second, and borrowed read-only `regf` only when no
   mutable mount owns the path. The old SECURITY/SAM/SOFTWARE boot-hive bypass switches were removed;
-  present hive images mount, absent images miss honestly. Remaining D2 work is subtree delete,
-  security/class metadata, and any still-overlay-backed persistent paths.
+  present hive images mount, absent images miss honestly. `NtDeleteKey` is now registered and
+  deletes leaf keys through the same authority, including mounted mutable hives, while root/non-leaf
+  keys return `STATUS_CANNOT_DELETE` and borrowed `regf` keys remain read-only. Remaining D2 work is
+  security/class metadata and any still-overlay-backed persistent paths.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
@@ -339,7 +341,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
    base mounted-hive view before falling back to the borrowed `RegfHive` reader. Mounted-key opens
    now use the same authority through `NtOpenKey`, including PE-recovered registry names and
    HKEY_USERS paths, and the old boot-hive bypass toggles have been removed instead of retained as
-   fallback routes.
+   fallback routes. `NtDeleteKey` is also registered at SSN 66 and deletes leaf keys in mounted
+   mutable hives or the volatile overlay with ReactOS/NT-style root and non-leaf refusal.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
