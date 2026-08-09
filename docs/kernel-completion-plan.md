@@ -295,9 +295,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    read-only `NtQueryDirectoryFile` width exception is gone and the genuine FAT path stayed inside
    the boot budget. `NtQueryFullAttributesFile` is now registered at its ReactOS SSN and implemented
    against the same writable-overlay/FAT path authorities as `NtQueryAttributesFile`; `NtOpenFile`
-   now consumes dispatcher-captured `ShareAccess`/`OpenOptions` instead of rereading stack slots. The
-   next slices should continue auditing remaining native stack arguments while the shell frontier
-   moves to real resource capacity instead of path-status failures.
+   now consumes dispatcher-captured `ShareAccess`/`OpenOptions` instead of rereading stack slots.
+   `NtFreeVirtualMemory` now probes the `PSIZE_T RegionSize` argument as a full eight-byte SIZE_T
+   before reading and writing it, matching the existing x64 return path instead of accepting a
+   four-byte writable tail. The next slices should continue auditing remaining native stack
+   arguments while the shell frontier moves to real resource capacity instead of path-status
+   failures.
 
 ## Review Log
 
@@ -1882,3 +1885,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: true mapped writecopy COW is closed; continue the broader C4 regression matrix
   for private/mapped protect, partial decommit/release, overlap, `MEM_TOP_DOWN`, guard/no-access
   verdicts, then D1/D2 durability authority plus the remaining A4/B3 cleanup.
+
+- Native syscall width audit slice. `NtFreeVirtualMemory` now probes `RegionSize` as an eight-byte
+  `PSIZE_T` before reading the size and returning the normalized size, matching the declared x64 NT
+  ABI and the adjacent allocate/protect syscall paths. This removes a partial-width output probe
+  that could accept a pointer whose first four bytes were writable while the eight-byte read/write
+  was not fully valid. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `./components/ntos-executive/build.sh`. Review adjustment: continue the syscall ABI-width
+  audit at each native boundary, especially services still mixing dispatcher-captured arguments with
+  manual stack reads.

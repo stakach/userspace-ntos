@@ -7917,7 +7917,7 @@ impl ExecNtHandler {
         }
         let base_ptr = args[1];
         let size_ptr = args[2];
-        if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 4) {
+        if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 8) {
             return STATUS_ACCESS_VIOLATION;
         }
         let mut word = [0u8; 8];
