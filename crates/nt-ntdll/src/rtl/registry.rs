@@ -179,6 +179,22 @@ pub fn multi_sz_ranges(value: &[u8]) -> Result<Vec<Range<usize>>, u32> {
     Ok(ranges)
 }
 
+/// ReactOS' named-value `RtlQueryRegistryValues` path appends one extra UTF-16 NUL to
+/// `REG_MULTI_SZ` data before calling `RtlpCallQueryRegistryRoutine`
+/// (`references/reactos/sdk/lib/rtl/registry.c:1183`). Build that transient dispatch buffer.
+pub fn query_multi_sz_dispatch_buffer(value: &[u8]) -> Result<Vec<u8>, u32> {
+    if value.len() & 1 != 0 {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    let capacity = value.len().checked_add(2).ok_or(STATUS_BUFFER_TOO_SMALL)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    out.extend_from_slice(value);
+    out.extend_from_slice(&[0, 0]);
+    Ok(out)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyValueFullInformation<'a> {
     pub value_type: u32,
@@ -474,6 +490,19 @@ mod tests {
             single_nul_tail.extend_from_slice(&unit.to_le_bytes());
         }
         assert_eq!(multi_sz_ranges(&single_nul_tail), Ok(vec![0..4, 4..8]));
+    }
+
+    #[test]
+    fn query_multi_sz_dispatch_buffer_appends_named_query_terminator() {
+        let mut single_final_nul = Vec::new();
+        for unit in ['A' as u16, 0, 'B' as u16, 0] {
+            single_final_nul.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(multi_sz_ranges(&single_final_nul), Ok(vec![0..4]));
+
+        let dispatch = query_multi_sz_dispatch_buffer(&single_final_nul).unwrap();
+        assert_eq!(multi_sz_ranges(&dispatch), Ok(vec![0..4, 4..8]));
+        assert_eq!(&dispatch[dispatch.len() - 4..], &[0, 0, 0, 0]);
     }
 
     #[test]

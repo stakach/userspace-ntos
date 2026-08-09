@@ -9788,6 +9788,7 @@ unsafe fn dispatch_value(
     data: *const u8,
     len: u32,
     context: u64,
+    append_query_multi_sz_nul: bool,
 ) -> u32 {
     use alloc::vec::Vec;
     // REG_MULTI_SZ split (skip if NOEXPAND) — faithful port of ReactOS `RtlpCallQueryRegistryRoutine`
@@ -9809,7 +9810,16 @@ unsafe fn dispatch_value(
         && len >= 4
         && !unsafe { name_is(name_ptr, b"ObjectDirectories") }
     {
-        let blob = unsafe { core::slice::from_raw_parts(data, len as usize) };
+        let raw_blob = unsafe { core::slice::from_raw_parts(data, len as usize) };
+        let dispatch_blob = if append_query_multi_sz_nul {
+            match nt_ntdll::rtl::registry::query_multi_sz_dispatch_buffer(raw_blob) {
+                Ok(blob) => Some(blob),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
+        let blob = dispatch_blob.as_deref().unwrap_or(raw_blob);
         let ranges = match nt_ntdll::rtl::registry::multi_sz_ranges(blob) {
             Ok(ranges) => ranges,
             Err(status) => return status,
@@ -9833,9 +9843,10 @@ unsafe fn dispatch_value(
                     &current_entry,
                     name_ptr,
                     REG_SZ,
-                    data.add(range.start),
+                    blob.as_ptr().add(range.start),
                     range.len() as u32,
                     context,
+                    false,
                 )
             };
             if (st as i32) < 0 {
@@ -10326,7 +10337,15 @@ unsafe fn open_registry_path_units(path: &[u16], desired_access: u32, key_handle
     }
     let mut oa = [0u8; 0x30];
     let mut us = [0u8; 0x10];
-    unsafe { build_oa(oa.as_mut_ptr(), us.as_mut_ptr(), 0, path.as_ptr(), path.len()) };
+    unsafe {
+        build_oa(
+            oa.as_mut_ptr(),
+            us.as_mut_ptr(),
+            0,
+            path.as_ptr(),
+            path.len(),
+        )
+    };
     unsafe {
         syscall4(
             SSN_NT_OPEN_KEY,
@@ -10428,10 +10447,7 @@ unsafe fn current_user_key_path_units() -> Result<alloc::vec::Vec<u16>, u32> {
     let sid_len = 8usize
         .checked_add(count.checked_mul(4).ok_or(STATUS_INVALID_SID)?)
         .ok_or(STATUS_INVALID_SID)?;
-    if sid_addr
-        .checked_add(sid_len)
-        .is_none_or(|addr| addr > end)
-    {
+    if sid_addr.checked_add(sid_len).is_none_or(|addr| addr > end) {
         return Err(STATUS_INVALID_SID);
     }
 
@@ -10670,6 +10686,7 @@ pub unsafe fn rtl_query_registry_values(
                                 parsed.data.as_ptr(),
                                 parsed.data.len() as u32,
                                 context,
+                                false,
                             )
                         };
                         if (st2 as i32) < 0 {
@@ -10735,6 +10752,7 @@ pub unsafe fn rtl_query_registry_values(
                                     parsed.data.as_ptr(),
                                     parsed.data.len() as u32,
                                     context,
+                                    true,
                                 )
                             };
                             if (st2 as i32) < 0 {
@@ -10853,6 +10871,7 @@ unsafe fn dispatch_default(entry: &QueryEntry, context: u64) -> u32 {
             entry.default_data as *const u8,
             len,
             context,
+            false,
         )
     }
 }
