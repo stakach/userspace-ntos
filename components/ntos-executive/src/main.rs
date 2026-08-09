@@ -5812,12 +5812,18 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_progress_census();
     let flushes = REG_FLUSH_KEY_CALLS.load(Ordering::Relaxed);
     let volatile_flushes = REG_FLUSH_KEY_VOLATILE.load(Ordering::Relaxed);
+    let mutable_flushes = REG_FLUSH_KEY_MUTABLE.load(Ordering::Relaxed);
+    let mutable_dirty_cells = REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
     print_str(b"[lsa-rpc] NtFlushKey calls=");
     print_u64(flushes);
     print_str(b" volatile=");
     print_u64(volatile_flushes);
+    print_str(b" mutable=");
+    print_u64(mutable_flushes);
+    print_str(b" mutable-dirty-cells=");
+    print_u64(mutable_dirty_cells);
     print_str(b" ActiveComputerName-created=");
     print_u64(active_name);
     print_str(b" RPCRT4_new_client-reached=");
@@ -5834,14 +5840,15 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     //     the live NT service table at the `sysfuncs.lst`-derived SSN 83 with its one-argument
     //     contract, it was actually CALLED on this boot, and every call resolved a real key handle
     //     through `resolve_registry_key` (a bad handle would have returned the real error instead).
-    //     At least one call was on a key that lives in the in-memory write overlay — `HvSyncHive`'s
-    //     `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`), the semantics we implement.
-    //     The counters CANNOT move if the SSN is unserviced: the caller parks instead.
+    //     At least one call was on a key that lives in a mounted mutable hive: the
+    //     ActiveComputerName path is now a real SYSTEM-hive write, not a registry-overlay shadow.
+    //     Volatile overlay flushes remain reported separately for the D4 volatile-hive cleanup. The
+    //     counters CANNOT move if the SSN is unserviced: the caller parks instead.
     let table_ok = nt_syscall_abi::ssn_of("NtFlushKey") == Some(83)
         && nt_syscall_abi::exact_argc_of("NtFlushKey") == Some(1);
     check(
         b"exec_reg_flush_key_serviced",
-        table_ok && flushes >= 1 && volatile_flushes >= 1,
+        table_ok && flushes >= 1 && mutable_flushes >= 1,
         passed,
     );
     // (2) lsass' `\pipe\lsarpc` rpcrt4 SERVER thread crossed the WHOLE handoff and reached
@@ -15566,9 +15573,12 @@ pub(crate) static SAM_CONNECT_NULL_ROOT_MISS: AtomicU64 = AtomicU64::new(0);
 /// connection via kernel32's `SetActiveComputerNameToRegistry`; with the SSN unserviced the server
 /// thread PARKED there and `RPCRT4_new_client` never spawned a per-connection worker.
 pub(crate) static REG_FLUSH_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
-/// Of those, the ones whose key lives in the in-memory write overlay — `HvSyncHive`'s
-/// `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`) verbatim.
+/// Of those, the ones whose key lives in the volatile registry overlay.
 pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones whose key lives in a mounted mutable hive.
+pub(crate) static REG_FLUSH_KEY_MUTABLE: AtomicU64 = AtomicU64::new(0);
+/// Dirty mutable-hive cells observed by the most recent mutable-key flush.
+pub(crate) static REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots whose raw `regf` image
 /// can be written to a writable overlay FILE_OBJECT; everything else returns the real refusal.
 pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);

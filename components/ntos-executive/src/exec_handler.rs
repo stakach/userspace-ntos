@@ -13523,31 +13523,29 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS
             },
             // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
-            // NT's own body is: reference the key object by handle (**no access mask** — it passes 0
-            // to `ObReferenceObjectByHandle`), fail `STATUS_KEY_DELETED` if the KCB is deleted, else
-            // `CmFlushKey(kcb, FALSE)`. `CmFlushKey` (`cmapi.c`) ends in `HvSyncHive`, and
-            // `HvSyncHive` (`sdk/lib/cmlib/hivewrt.c:466`) **returns TRUE immediately for a
-            // `HIVE_VOLATILE` hive** ("avoid any write operations on volatile hives") and likewise
-            // when the dirty vector holds no dirty block ("literally nothing to do").
-            //
-            // That is EXACTLY this host's registry: the mounted `regf` hives are READ-ONLY and every
-            // runtime key/value lives in the in-memory write overlay, which IS the store — there is
-            // no separate write-behind cache to drain and no backing file to sync. So the faithful
-            // answer is `STATUS_SUCCESS` after a REAL handle resolution, not a fabricated success:
-            // a bad handle still returns the real error (`resolve_registry_key`), the counter below
-            // proves the service actually ran, and nothing is claimed to have been persisted.
+            // NT references the key object by handle with no access mask, rejects deleted KCBs, then
+            // calls `CmFlushKey(kcb, FALSE)`. This host now has two live write authorities:
+            // volatile overlay keys, which match `HvSyncHive`'s volatile-hive early return, and
+            // mounted mutable hives, which are coherent immediately but still need D3's file-backed
+            // checkpoint/reboot proof. Keep the classifications explicit so the proof follows the
+            // current authority instead of the old overlay-only model.
             NativeService::NtFlushKey => {
                 let key = match self.resolve_registry_key(args[0], 0) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
                 REG_FLUSH_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
-                // A key that lives in the write overlay (rather than the read-only `regf` mount) is
-                // the volatile-hive case verbatim. Pure check — a flush must never CREATE anything.
                 if overlay_key_idx(key).is_some() {
                     REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
+                } else if let Some(mutable_key) = self.mutable_registry_key(key) {
+                    REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
+                    let dirty = self
+                        .mutable_hives
+                        .hive(mutable_key.hive)
+                        .map_or(0, |hive| hive.dirty_count());
+                    REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(dirty as u64, Ordering::Relaxed);
                 }
-                0 // STATUS_SUCCESS — HvSyncHive's volatile / no-dirty-block early return
+                0 // STATUS_SUCCESS: live authority is coherent; durable checkpointing is D3.
             }
             // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive root to a caller-opened file.
             // The root-hive case writes the real borrowed `regf` image; subkey export is left as a

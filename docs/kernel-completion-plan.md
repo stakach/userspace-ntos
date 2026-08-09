@@ -2198,3 +2198,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the known setup/class persistent provisioning paths are now mutable-hive owned.
   Finish D2 with a focused audit for any remaining non-volatile overlay writes, then start D3
   explicit flush/reboot persistence proofs.
+
+- D3 flush classification starter slice. `NtFlushKey` no longer documents or proves the old
+  overlay-only registry write model. The syscall now classifies every resolved flush target as
+  volatile overlay or mounted mutable hive, records mutable flushes and the dirty-cell count observed
+  on the mounted hive, and keeps bad handles on the real handle-resolution failure path. The
+  `exec_reg_flush_key_serviced` gate now expects the ActiveComputerName handoff to flush a mutable
+  SYSTEM-hive key, while volatile overlay flushes stay visible as D4 cleanup evidence. Validation
+  `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next D3 work is the durable backing decision for mutable hive checkpoints:
+  either add a real `regf` writer or make loaded hives boot from the `nt-hive-core` image/log
+  provider before any syscall claims reboot persistence.
