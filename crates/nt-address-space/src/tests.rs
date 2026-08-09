@@ -1316,6 +1316,34 @@ fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
 }
 
 #[test]
+fn committed_range_table_reports_range_overlap_without_touching_adjacent_gaps() {
+    let mut table = VmCommittedRangeTable::<4>::new();
+    table
+        .register(VmCommittedRange::mapped(0x2000_0000, 0x3000, PAGE_READONLY))
+        .unwrap();
+    table
+        .register(VmCommittedRange::mapped(
+            0x3000_0000,
+            0x1000,
+            PAGE_READWRITE,
+        ))
+        .unwrap();
+
+    assert_eq!(table.overlaps_range(0x2000_1000, 0x1000), Ok(true));
+    assert_eq!(table.overlaps_range(0x1fff_f000, 0x2000), Ok(true));
+    assert_eq!(table.overlaps_range(0x2000_3000, 0x1000), Ok(false));
+    assert_eq!(table.overlaps_range(0x2fff_f000, 0x1000), Ok(false));
+    assert_eq!(
+        table.overlaps_range(0x2000_0001, 0x1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        table.overlaps_range(0x2000_0000, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
 fn committed_range_table_protect_capacity_failure_preserves_state() {
     let mut table = VmCommittedRangeTable::<1>::new();
     table

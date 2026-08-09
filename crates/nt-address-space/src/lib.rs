@@ -604,6 +604,20 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         Ok(())
     }
 
+    pub fn overlaps_range(&self, base: u64, size: u64) -> Result<bool, u32> {
+        let Some(end) = base.checked_add(size) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if base & (PAGE_SIZE - 1) != 0 || size == 0 || size & (PAGE_SIZE - 1) != 0 || end <= base {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(self
+            .ranges
+            .iter()
+            .flatten()
+            .any(|range| base < range.end() && range.base < end))
+    }
+
     pub fn unregister_base(&mut self, base: u64) -> Option<VmCommittedRange> {
         let slot = self
             .ranges

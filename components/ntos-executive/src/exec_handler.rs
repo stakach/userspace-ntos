@@ -73,6 +73,47 @@ unsafe fn registered_frame_basic_information(
     })
 }
 
+unsafe fn registered_frame_range_overlaps_unowned_private_vad(
+    vm_map: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    pi: usize,
+    base: u64,
+    size: u64,
+) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return true;
+    };
+    if size == 0 || end <= base {
+        return true;
+    }
+    let mut page = base & !0xfffu64;
+    while page < end {
+        if csrss_frame_get_exact(pi as u64, page).0 != 0 && vm_map.extent_at(page).is_none() {
+            return true;
+        }
+        page = page.saturating_add(0x1000);
+    }
+    false
+}
+
+unsafe fn fixed_mapping_authority_range_overlaps(
+    vm_map: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    pi: usize,
+    base: u64,
+    size: u64,
+) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return true;
+    };
+    if size == 0 || end <= base {
+        return true;
+    }
+    if KUSER_VA < end && base < KUSER_VA + 0x1000 && kuser_page_alias_get(pi) != 0 {
+        return true;
+    }
+    process_committed_mapping_range_overlaps(pi as u64, base, size)
+        || registered_frame_range_overlaps_unowned_private_vad(vm_map, pi, base, size)
+}
+
 fn committed_mapping_effective_page_protection(
     info: nt_address_space::VmBasicInformation,
 ) -> u32 {
@@ -7238,6 +7279,9 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size) {
+            return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
+        }
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
@@ -18882,6 +18926,10 @@ impl ExecNtHandler {
                         Ok(plan) => plan,
                         Err(status) => return status,
                     };
+                    if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size)
+                    {
+                        return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
+                    }
                     if !generic_sections.map_view(
                         target_pi,
                         section_index,

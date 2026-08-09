@@ -1526,6 +1526,20 @@ pub(crate) unsafe fn process_committed_mapping_next_base_after(pi: u64, page: u6
     (*table).next_base_after(page)
 }
 
+pub(crate) unsafe fn process_committed_mapping_range_overlaps(
+    pi: u64,
+    base: u64,
+    size: u64,
+) -> bool {
+    if pi as usize >= MAX_PI {
+        return true;
+    }
+    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
+        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
+        .add(pi as usize);
+    (*table).overlaps_range(base, size).unwrap_or(true)
+}
+
 const GENERIC_SECTION_BACKING_NONE: u8 = 0;
 const GENERIC_SECTION_BACKING_ANON: u8 = 1;
 const GENERIC_SECTION_BACKING_DISK: u8 = 2;

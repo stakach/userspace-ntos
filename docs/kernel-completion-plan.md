@@ -290,7 +290,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    protect-rollback slice pins both private override exhaustion and committed mapped-range split
    exhaustion as transactional failures. The latest `MEM_TOP_DOWN` slice pins high-address
    placement through occupied top ranges and free-gap query reporting after top-down allocation.
-   Continue with the remaining C4 overlap matrix plus D1/D2 mutable registry/filesystem authority.
+   The latest overlap-authority slice adds a host-tested committed-range overlap predicate and makes
+   private allocation plus generic data-section map-view publication reject selected ranges already
+   owned by committed mappings, KUSER aliases, or unowned registered frames. Continue with the
+   remaining C4 cross-authority placement retry/live gate plus D1/D2 mutable registry/filesystem
+   authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1963,3 +1967,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
   by the next VAD. Validation: `cargo fmt --all` and `cargo test -p nt-address-space` with `48`
   tests passing. Review adjustment: top-down placement/query behavior is pinned host-side; continue
   C4 with overlap and cross-authority query/protect gates, then return to A4/B3 or D1/D2.
+
+- C4 cross-authority overlap guard slice. `VmCommittedRangeTable::overlaps_range` is now
+  host-tested for interior overlap, partial boundary overlap, adjacent free gaps, and invalid
+  unaligned/empty inputs. The executive exposes the same predicate for per-process committed mapping
+  tables and makes `NtAllocateVirtualMemory` plus generic data-section `NtMapViewOfSection` reject a
+  selected private VAD range before publication when that range is already owned by a committed
+  mapping, live KUSER alias, or registered client frame outside the existing private VAD authority.
+  Registered-frame overlap checking is ownership-aware so ordinary private recommit over existing
+  VAD-backed frames is not rejected, while unowned registered mappings still block private/generic
+  VAD publication. Validation: `cargo fmt --all`, `cargo test -p nt-address-space` with `49` tests
+  passing, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the remaining C4 overlap work is teaching auto-placement to retry around
+  fixed-authority ranges, or replacing that with a live executive gate proving the selected arenas
+  cannot collide; otherwise move back to A4/B3 or D1/D2.
