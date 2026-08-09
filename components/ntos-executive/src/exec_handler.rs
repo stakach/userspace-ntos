@@ -11,6 +11,10 @@ const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
@@ -33,6 +37,120 @@ const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
+
+fn print_sanitized_ascii(bytes: &[u8], limit: usize) {
+    for &byte in bytes.iter().take(limit) {
+        debug_put_char(if (0x20..0x7f).contains(&byte) {
+            byte
+        } else {
+            b'.'
+        });
+    }
+}
+
+fn trace_explorer_io_completion(
+    pi: usize,
+    op: &[u8],
+    handle: u64,
+    object_id: Option<u32>,
+    status: u32,
+    depth: Option<u32>,
+    timeout: i64,
+    key: u64,
+    apc: u64,
+    iosb: u64,
+) {
+    if pi != 6 {
+        return;
+    }
+    let n = EXPLORER_IO_COMPLETION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 192 {
+        return;
+    }
+    print_str(b"[explorer-iocp] ");
+    print_str(op);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b" object=");
+    match object_id {
+        Some(id) => print_u64(id as u64),
+        None => print_str(b"-"),
+    }
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" depth=");
+    match depth {
+        Some(depth) => print_u64(depth as u64),
+        None => print_str(b"-"),
+    }
+    print_str(b" timeout=");
+    print_u64(timeout as u64);
+    print_str(b" key=0x");
+    print_hex_u64(key);
+    print_str(b" apc=0x");
+    print_hex_u64(apc);
+    print_str(b" iosb=0x");
+    print_hex_u64(iosb);
+    print_str(b"\n");
+}
+
+fn trace_explorer_wait_object(
+    handler: &ExecNtHandler,
+    phase: &[u8],
+    handle: u64,
+    object: WaitObject,
+    timeout_ptr: u64,
+    status: u32,
+) {
+    if handler.pi != 6 {
+        return;
+    }
+    let n = EXPLORER_WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 192 {
+        return;
+    }
+    print_str(b"[explorer-wait-object] ");
+    print_str(phase);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b" object=");
+    print_str(object.describe());
+    print_str(b" id=");
+    print_u64(object.id());
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" timeout_ptr=0x");
+    print_hex_u64(timeout_ptr);
+    print_str(b" ready=");
+    print_u64(handler.wait_object_ready(object) as u64);
+    if object.kind() == WaitObject::KIND_DISPATCHER {
+        let index = object.id() as usize;
+        if let Some(entry) = handler.obj_ns.get(index) {
+            print_str(b" ns-kind=");
+            print_u64(entry.kind as u64);
+            print_str(b" name=\"");
+            print_sanitized_ascii(entry.name(), 48);
+            print_str(b"\"");
+        }
+        if let Some((kind, signaled)) = handler.events.query_existing(index as u64) {
+            print_str(b" event=");
+            print_str(match kind {
+                EventKind::Notification => b"notification",
+                EventKind::Synchronization => b"synchronization",
+            });
+            print_str(b" signaled=");
+            print_u64(signaled as u64);
+        } else if let Some((current, maximum)) = handler.semaphores.query(index as u64) {
+            print_str(b" semaphore current=");
+            print_u64(current as u64);
+            print_str(b" max=");
+            print_u64(maximum as u64);
+        } else if handler.mutants.contains(index as u64) {
+            print_str(b" mutant=1");
+        }
+    }
+    print_str(b"\n");
+}
 
 #[derive(Clone, Copy, Default)]
 struct RegistryKeyStats {
@@ -6459,6 +6577,43 @@ impl ExecNtHandler {
         } else {
             None
         };
+        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+        if self.pi == 6 {
+            let n = EXPLORER_TP_CREATE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+            if n < 96 {
+                print_str(b"[explorer-tp-create] ntdll_only=");
+                print_u64(ntdll_pool_worker_only as u64);
+                print_str(b" ctx=0x");
+                print_hex_u64(ctx_va);
+                print_str(b" rip=0x");
+                print_hex_u64(start.rip);
+                print_str(b" rcx=0x");
+                print_hex_u64(start.rcx);
+                print_str(b" rdx=0x");
+                print_hex_u64(start.rdx);
+                print_str(b" rsp=0x");
+                print_hex_u64(start.rsp);
+                print_str(b" initial_teb=0x");
+                print_hex_u64(initial_teb_va);
+                if let Some(initial_teb) = initial_teb {
+                    print_str(b" stack=(");
+                    print_hex_u64(initial_teb.stack_base);
+                    print_str(b",");
+                    print_hex_u64(initial_teb.stack_limit);
+                    print_str(b",");
+                    print_hex_u64(initial_teb.allocated_stack_base);
+                    print_str(b")");
+                }
+                print_str(b" preferred=");
+                match preferred_slot {
+                    Some(slot) => print_u64(slot as u64),
+                    None => print_str(b"-"),
+                }
+                print_str(b" suspended=");
+                print_u64(create_suspended as u64);
+                print_str(b"\n");
+            }
+        }
         if ntdll_pool_worker_only && preferred_slot.is_none() {
             return None;
         }
@@ -6504,7 +6659,6 @@ impl ExecNtHandler {
             return Some(0xC000_009A);
         };
 
-        let create_suspended = smss_stack_read(sp + 0x40) != 0;
         let Some((pool_slot, tid, handle)) =
             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
         else {
@@ -18247,6 +18401,7 @@ impl ExecNtHandler {
                 let alertable = args[1] as u8 != 0;
                 match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
+                        let timeout_ptr = args[2];
                         if alertable {
                             match unsafe { self.try_deliver_current_user_apc() } {
                                 Ok(true) => return 0x0000_00C0,
@@ -18255,6 +18410,7 @@ impl ExecNtHandler {
                             }
                         }
                         if self.wait_object_ready(object) {
+                            trace_explorer_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
                             print_str(b"[wait] pi=");
                             print_u64(self.pi as u64);
                             print_str(b" NtWaitForSingleObject(");
@@ -18265,7 +18421,6 @@ impl ExecNtHandler {
                             self.wait_object_consume(object);
                             return 0;
                         }
-                        let timeout_ptr = args[2];
                         if timeout_ptr != 0 {
                             let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
                             match nt_delay_execution::due_time(
@@ -18273,7 +18428,17 @@ impl ExecNtHandler {
                                 monotonic_time_100ns(),
                                 nt_system_time_100ns(),
                             ) {
-                                nt_delay_execution::Due::Immediate => return 0x102,
+                                nt_delay_execution::Due::Immediate => {
+                                    trace_explorer_wait_object(
+                                        self,
+                                        b"timeout-immediate",
+                                        handle,
+                                        object,
+                                        timeout_ptr,
+                                        0x102,
+                                    );
+                                    return 0x102;
+                                }
                                 nt_delay_execution::Due::Monotonic100ns(deadline) => {
                                     self.wait_deadline_100ns = deadline;
                                 }
@@ -18281,6 +18446,7 @@ impl ExecNtHandler {
                         }
                         // Unsignaled wait object → ask the loop to park this caller on it.
                         self.wait_park_event = object.raw() as i64;
+                        trace_explorer_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
                         print_str(b"[wait] pi=");
                         print_u64(self.pi as u64);
                         print_str(b" NtWaitForSingleObject(");
@@ -19201,7 +19367,24 @@ impl ExecNtHandler {
                     }
                 };
                 self.xas_write_buf(out_handle, &handle.to_le_bytes());
-                if created.created { nt_io_completion::STATUS_SUCCESS } else { STATUS_OBJECT_NAME_EXISTS }
+                let status = if created.created {
+                    nt_io_completion::STATUS_SUCCESS
+                } else {
+                    STATUS_OBJECT_NAME_EXISTS
+                };
+                trace_explorer_io_completion(
+                    self.pi,
+                    b"create",
+                    handle,
+                    Some(created.id),
+                    status,
+                    self.io_completion_ports.depth(created.id).ok(),
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                status
             },
             NativeService::NtOpenIoCompletion => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -19241,7 +19424,21 @@ impl ExecNtHandler {
                 const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
                 let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
                     Ok(id) => id,
-                    Err(status) => return status,
+                    Err(status) => {
+                        trace_explorer_io_completion(
+                            self.pi,
+                            b"set-resolve-failed",
+                            args[0],
+                            None,
+                            status,
+                            None,
+                            0,
+                            args[1],
+                            args[2],
+                            0,
+                        );
+                        return status;
+                    }
                 };
                 let packet = nt_io_completion::CompletionPacket {
                     key_context: args[1],
@@ -19249,19 +19446,58 @@ impl ExecNtHandler {
                     status: args[3] as u32,
                     information: args[4],
                 };
-                self.post_io_completion_packet(object_id, packet)
+                let status = self.post_io_completion_packet(object_id, packet);
+                trace_explorer_io_completion(
+                    self.pi,
+                    b"set",
+                    args[0],
+                    Some(object_id),
+                    status,
+                    self.io_completion_ports.depth(object_id).ok(),
+                    0,
+                    args[1],
+                    args[2],
+                    0,
+                );
+                status
             },
             NativeService::NtRemoveIoCompletion => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
                 let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
                     Ok(id) => id,
-                    Err(status) => return status,
+                    Err(status) => {
+                        trace_explorer_io_completion(
+                            self.pi,
+                            b"remove-resolve-failed",
+                            args[0],
+                            None,
+                            status,
+                            None,
+                            0,
+                            args[1],
+                            args[2],
+                            args[3],
+                        );
+                        return status;
+                    }
                 };
                 if !self.probe_user_output(args[1], 8)
                     || !self.probe_user_output(args[2], 8)
                     || !self.probe_user_output(args[3], 16)
                 {
+                    trace_explorer_io_completion(
+                        self.pi,
+                        b"remove-probe-failed",
+                        args[0],
+                        Some(object_id),
+                        STATUS_ACCESS_VIOLATION,
+                        self.io_completion_ports.depth(object_id).ok(),
+                        0,
+                        args[1],
+                        args[2],
+                        args[3],
+                    );
                     return STATUS_ACCESS_VIOLATION;
                 }
                 let timeout_interval = if args[4] == 0 {
@@ -19269,6 +19505,18 @@ impl ExecNtHandler {
                 } else {
                     let mut timeout = [0u8; 8];
                     if !self.xas_read(args[4], &mut timeout) {
+                        trace_explorer_io_completion(
+                            self.pi,
+                            b"remove-timeout-probe-failed",
+                            args[0],
+                            Some(object_id),
+                            STATUS_ACCESS_VIOLATION,
+                            self.io_completion_ports.depth(object_id).ok(),
+                            0,
+                            args[1],
+                            args[2],
+                            args[3],
+                        );
                         return STATUS_ACCESS_VIOLATION;
                     }
                     Some(i64::from_le_bytes(timeout))
@@ -19289,13 +19537,49 @@ impl ExecNtHandler {
                                 &packet.information.to_le_bytes(),
                             );
                         if copied {
+                            trace_explorer_io_completion(
+                                self.pi,
+                                b"remove-packet",
+                                args[0],
+                                Some(object_id),
+                                nt_io_completion::STATUS_SUCCESS,
+                                self.io_completion_ports.depth(object_id).ok(),
+                                timeout_interval.unwrap_or(0),
+                                packet.key_context,
+                                packet.apc_context,
+                                args[3],
+                            );
                             nt_io_completion::STATUS_SUCCESS
                         } else {
+                            trace_explorer_io_completion(
+                                self.pi,
+                                b"remove-packet-copy-failed",
+                                args[0],
+                                Some(object_id),
+                                STATUS_ACCESS_VIOLATION,
+                                self.io_completion_ports.depth(object_id).ok(),
+                                timeout_interval.unwrap_or(0),
+                                packet.key_context,
+                                packet.apc_context,
+                                args[3],
+                            );
                             STATUS_ACCESS_VIOLATION
                         }
                     }
                     Ok(nt_io_completion::RemoveResult::Empty(status)) => {
                         if status != nt_io_completion::STATUS_PENDING {
+                            trace_explorer_io_completion(
+                                self.pi,
+                                b"remove-empty",
+                                args[0],
+                                Some(object_id),
+                                status,
+                                self.io_completion_ports.depth(object_id).ok(),
+                                timeout_interval.unwrap_or(0),
+                                args[1],
+                                args[2],
+                                args[3],
+                            );
                             return status;
                         }
                         let deadline = match timeout_interval {
@@ -19306,6 +19590,18 @@ impl ExecNtHandler {
                                 nt_system_time_100ns(),
                             ) {
                                 nt_delay_execution::Due::Immediate => {
+                                    trace_explorer_io_completion(
+                                        self.pi,
+                                        b"remove-timeout-immediate",
+                                        args[0],
+                                        Some(object_id),
+                                        nt_io_completion::STATUS_TIMEOUT,
+                                        self.io_completion_ports.depth(object_id).ok(),
+                                        interval,
+                                        args[1],
+                                        args[2],
+                                        args[3],
+                                    );
                                     return nt_io_completion::STATUS_TIMEOUT;
                                 }
                                 nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
@@ -19320,9 +19616,35 @@ impl ExecNtHandler {
                             print_str(b"[nt-remove-io-completion] pi="); print_u64(self.pi as u64);
                             print_str(b" empty blocking wait -> reply-cap park armed\n");
                         }
+                        trace_explorer_io_completion(
+                            self.pi,
+                            b"remove-pending",
+                            args[0],
+                            Some(object_id),
+                            nt_io_completion::STATUS_PENDING,
+                            self.io_completion_ports.depth(object_id).ok(),
+                            timeout_interval.unwrap_or(0),
+                            args[1],
+                            args[2],
+                            args[3],
+                        );
                         nt_io_completion::STATUS_PENDING
                     }
-                    Err(status) => status,
+                    Err(status) => {
+                        trace_explorer_io_completion(
+                            self.pi,
+                            b"remove-error",
+                            args[0],
+                            Some(object_id),
+                            status,
+                            self.io_completion_ports.depth(object_id).ok(),
+                            timeout_interval.unwrap_or(0),
+                            args[1],
+                            args[2],
+                            args[3],
+                        );
+                        status
+                    }
                 }
             },
             NativeService::NtQueryIoCompletion => unsafe {
@@ -19567,6 +19889,38 @@ impl ExecNtHandler {
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                if nt_fs::is_named_pipe_path(&name16)
+                    && (self.pi == 2 || self.pi == 3 || self.pi == 7)
+                {
+                    let trace = PIPE_CREATE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                    if trace < 64 || status != nt_fs::STATUS_SUCCESS {
+                        print_str(b"[pipe-create] #");
+                        print_u64(trace);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" access=0x");
+                        print_hex(args[1] as u32);
+                        print_str(b" share=0x");
+                        print_hex(args[6] as u32);
+                        print_str(b" disposition=0x");
+                        print_hex(args[7] as u32);
+                        print_str(b" options=0x");
+                        print_hex(args[8] as u32);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b" info=");
+                        print_u64(info);
+                        print_str(b" name=\"");
+                        for &unit in name16.iter().take(96) {
+                            debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                unit as u8
+                            } else {
+                                b'?'
+                            });
+                        }
+                        print_str(b"\"\n");
+                    }
                 }
                 if self.current_process_is_winlogon()
                     && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 40

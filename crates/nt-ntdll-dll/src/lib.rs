@@ -1260,6 +1260,10 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 #[used]
 static KEEP_SECURITY_EXPORTS: unsafe extern "C" fn() = security_exports::SECURITY_EXPORT_ANCHOR_FN;
 
+/// Anchor private on-target entrypoints that are still discovered dynamically from ntdll exports.
+#[used]
+static KEEP_ON_TARGET_EXPORTS: unsafe extern "C" fn() = on_target::ON_TARGET_EXPORT_ANCHOR_FN;
+
 /// The Step-4.A observable marker bytes, emitted via the `int 0x2d` DebugService (`PRINT`) the
 /// kernel forwards to serial as `[dbg] ...` (see `project_smss_sec_image` +
 /// `rust-micro/src/arch/x86_64/exceptions.rs`). Seeing this line in the boot log PROVES our Rust

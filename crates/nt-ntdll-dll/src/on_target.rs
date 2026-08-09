@@ -7798,6 +7798,21 @@ pub unsafe extern "system" fn rtlp_completion_worker_thread(parameter: *mut c_vo
     }
 }
 
+#[used]
+pub static ON_TARGET_EXPORT_ANCHOR_FN: unsafe extern "C" fn() = on_target_export_anchor;
+
+/// Retain private on-target entrypoints that the executive discovers from ntdll's export table.
+///
+/// # Safety
+/// Never called; it only takes export addresses so linker DCE keeps the symbols.
+pub unsafe extern "C" fn on_target_export_anchor() {
+    let anchors: &[usize] = &[
+        rtlp_worker_thread as usize,
+        rtlp_completion_worker_thread as usize,
+    ];
+    core::hint::black_box(anchors);
+}
+
 pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u32 {
     if function == 0 {
         return STATUS_INVALID_PARAMETER_U32;

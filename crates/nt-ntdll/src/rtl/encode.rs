@@ -4,6 +4,52 @@
 //! ReactOS obfuscates stored pointers with a process-owned `ULONG` cookie. On x64 that cookie is
 //! zero-extended and XORed with the pointer; decode is the same operation.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Process-local cache for the kernel-owned `ProcessCookie`.
+///
+/// The cookie is still obtained from the kernel; this only keeps hot ntdll helpers such as
+/// `RtlEncodePointer` and vectored exception dispatch from re-entering the kernel after the stable
+/// per-process value has been learned.
+pub struct ProcessCookieCache {
+    cookie: AtomicU32,
+}
+
+impl ProcessCookieCache {
+    pub const fn new() -> Self {
+        Self {
+            cookie: AtomicU32::new(0),
+        }
+    }
+
+    pub fn get(&self) -> Option<u32> {
+        let cookie = self.cookie.load(Ordering::Acquire);
+        (cookie != 0).then_some(cookie)
+    }
+
+    pub fn get_or_init_with(&self, query: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        if let Some(cookie) = self.get() {
+            return Some(cookie);
+        }
+
+        let cookie = query().filter(|cookie| *cookie != 0)?;
+        match self
+            .cookie
+            .compare_exchange(0, cookie, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Some(cookie),
+            Err(existing) if existing != 0 => Some(existing),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Default for ProcessCookieCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn encode_pointer(ptr: u64, cookie: u32) -> u64 {
     ptr ^ u64::from(cookie)
 }
@@ -112,6 +158,40 @@ mod tests {
         );
         assert_eq!(encode_pointer(0, cookie), u64::from(cookie));
         assert_eq!(encode_pointer(pointer, cookie) >> 32, pointer >> 32);
+    }
+
+    #[test]
+    fn process_cookie_cache_queries_once_after_success() {
+        let cache = ProcessCookieCache::new();
+        let calls = core::cell::Cell::new(0u32);
+
+        assert_eq!(
+            cache.get_or_init_with(|| {
+                calls.set(calls.get() + 1);
+                Some(0x1122_3344)
+            }),
+            Some(0x1122_3344)
+        );
+        assert_eq!(
+            cache.get_or_init_with(|| {
+                calls.set(calls.get() + 1);
+                Some(0x5566_7788)
+            }),
+            Some(0x1122_3344)
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn process_cookie_cache_retries_until_nonzero_success() {
+        let cache = ProcessCookieCache::new();
+        assert_eq!(cache.get_or_init_with(|| None), None);
+        assert_eq!(cache.get_or_init_with(|| Some(0)), None);
+        assert_eq!(
+            cache.get_or_init_with(|| Some(0xBB40_E64E)),
+            Some(0xBB40_E64E)
+        );
+        assert_eq!(cache.get(), Some(0xBB40_E64E));
     }
 
     #[test]

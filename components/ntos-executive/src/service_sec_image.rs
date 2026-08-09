@@ -13,6 +13,7 @@ static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static SERVICES_NQIP_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_DIRTY_MARKS: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_WRITEBACKS: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +29,7 @@ static GUI_MESSAGE_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_WOKEN: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_STILL_EMPTY: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAIT_READY_REDRIVES: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_TRACE: AtomicU64 = AtomicU64::new(0);
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +43,7 @@ static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static SET_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEFER_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -49,6 +52,7 @@ static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static USER_RECT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -84,11 +88,17 @@ const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
+const WIN32K_RECT_STAGE_BYTES: usize = 16;
 const NTGDI_BIT_BLT_SSN: u64 = 0x1008;
+const NTUSER_INVALIDATE_RECT_SSN: u64 = 0x1004;
+const NTUSER_REDRAW_WINDOW_SSN: u64 = 0x1012;
 const NTUSER_BEGIN_PAINT_SSN: u64 = 0x1016;
 const NTUSER_END_PAINT_SSN: u64 = 0x1018;
 const NTUSER_MESSAGE_CALL_SSN: u64 = 0x1007;
+const NTUSER_SET_WINDOW_POS_SSN: u64 = 0x1023;
 const NTUSER_DEFER_WINDOW_POS_SSN: u64 = 0x1052;
+const NTUSER_GET_UPDATE_RECT_SSN: u64 = 0x1053;
+const NTUSER_VALIDATE_RECT_SSN: u64 = 0x10d1;
 const NTGDI_STRETCH_BLT_SSN: u64 = 0x1030;
 const NTGDI_LINE_TO_SSN: u64 = 0x1040;
 const NTGDI_PAT_BLT_SSN: u64 = 0x1059;
@@ -4143,7 +4153,6 @@ pub(crate) unsafe fn service_sec_image(
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
     let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
     let mut last_progress_t = monotonic_time_100ns();
-    let mut callback_backstop_start_t = 0u64;
     // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
@@ -4273,53 +4282,8 @@ pub(crate) unsafe fn service_sec_image(
         // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
         unsafe { allocator::reset_to(heap_mark) };
         iters += 1;
-        // With the per-syscall heap reset above, smss now runs all the way through the ntdll
-        // loader + Session Manager SmpInit — enumerating its real registry (NtOpenKey/
-        // NtEnumerateValueKey/NtClose) — to a NATURAL stop: SmpInit fails at the missing \??
-        // DosDevices object namespace and smss winds down into an unserviced syscall (stop_ssn),
-        // ~290 iters, a few seconds. This ceiling is only a safety backstop against a future
-        // genuine infinite loop; the run stops well before it. NOTE: with FOUR hosted processes
-        // (smss/csrss/winlogon/services) multiplexing through this ONE service loop, the shared
-        // budget now covers services' full DllMain/CRT bring-up too — raised 3000→5000 so services
-        // reaches its real SCM entry (ScmMain) rather than starving at the old ceiling. Verified
-        // each process still PROGRESSES (new SSNs / advancing demand-faults), not spinning.
-        // BATCH 20: services.exe now SPAWNS (winlogon's CreateProcessInternalW no longer bails — the
-        // relative-path fix) and runs its FULL ntdll loader — but it pulls in an ENORMOUS dependency
-        // tree (57 modules: crypt32/dbghelp/libtiff/wintrust/…), each snapping+relocating hundreds of
-        // pages via demand faults. Under TCG (~4 faults/s) fully loading services would take >2000s.
-        // The gate-relevant work (winlogon → SwitchDesktop → paint + services SPAWNING + its loader
-        // STARTING) is complete well before that. Cap at 5000 iters so the boot TERMINATES in-budget
-        // and the specs (incl. exec_services_spawned) run; services' full SCM bring-up is the next
-        // batch's frontier. Backstop only — each process still PROGRESSES (advancing faults), not
-        // spinning (verified: cr2 sweeps the whole DLL space at the loader's snap RIP, never repeats).
-        // BATCH 22: the demand-fault BATCH bulk-fill (fill a run of consecutive same-image pages per
-        // fault-EP round-trip) + the scratch-VA decoupling cut the per-page round-trip cost ~3× (boot
-        // 106s→~35s @5000 iters). With the per-process fault cost now bounded (FAULT_CAP + batching),
-        // the iters backstop is lifted so lsass's full LSA-init DLL tree (lsasrv/samsrv/msv1_0 + deps)
-        // can grind to LSA_RPC_SERVER_ACTIVE inside the 500s TCG budget → winlogon WaitForLsass wake →
-        // InitializeSAS → SwitchDesktop → the 0x003a6ea5 paint. Still a runaway backstop, not the
-        // functional terminus. Once real explorer callback churn exists, the backstop may land in the
-        // middle of a nested user-callback return chain; wait for the transport to drain before
-        // entering the post-loop proof injections.
-        if iters > 60000 {
-            if defer_quiesce_for_active_user_callbacks(b"iteration-backstop") {
-                let now = monotonic_time_100ns();
-                if callback_backstop_start_t == 0 {
-                    callback_backstop_start_t = now;
-                }
-                if now.wrapping_sub(callback_backstop_start_t) >= 20 * 10_000_000 {
-                    print_str(
-                        b"[quiesce] iteration backstop expired with win32k callbacks still active -> run gate\n",
-                    );
-                    stop = m1;
-                    break;
-                }
-            } else {
-                print_str(b"[quiesce] iteration backstop reached with callback transport idle -> run gate\n");
-                stop = m1;
-                break;
-            }
-        }
+        // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
+        // historical boot-frontier count; quiesce is driven by wait/crash/stall predicates above.
         // Select the hosted process this fault/syscall came from (0 = smss, CSRSS_BADGE = csrss) and
         // LOAD its state into the working locals. pml4/scratch_base/img_end/pe are immutable per
         // process (shadow the params); faults/first/ntfaults/filled_pages are mutable (SAVED back
@@ -7091,6 +7055,48 @@ pub(crate) unsafe fn service_sec_image(
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                     result = res.status as u64;
+                    if pi == 3 && m0 == 161 {
+                        let trace = SERVICES_NQIP_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if trace < 24 || trace.is_power_of_two() {
+                            print_str(b"[services-nqip] #");
+                            print_u64(trace);
+                            print_str(b" badge=");
+                            print_u64(badge);
+                            print_str(b" handle=0x");
+                            print_hex_u64(argv[0]);
+                            print_str(b" class=");
+                            print_u64(argv[1]);
+                            print_str(b" buf=0x");
+                            print_hex_u64(argv[2]);
+                            print_str(b" len=0x");
+                            print_hex_u64(argv[3]);
+                            print_str(b" retlen=0x");
+                            print_hex_u64(argv[4]);
+                            print_str(b" status=0x");
+                            print_hex(result as u32);
+                            if (argv[1] == 12 || argv[1] == 36) && argv[2] != 0 {
+                                let mut value_bytes = [0u8; 4];
+                                if client_copyin_mapped(
+                                    pi as u64,
+                                    argv[2],
+                                    &mut value_bytes,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ) {
+                                    print_str(b" value=0x");
+                                    print_hex(u32::from_le_bytes(value_bytes));
+                                } else {
+                                    print_str(b" value=<unreadable>");
+                                }
+                            }
+                            print_str(b" sp=0x");
+                            print_hex_u64(sp);
+                            print_str(b" resume-ip=0x");
+                            print_hex_u64(resume_ip);
+                            print_str(b"\n");
+                        }
+                    }
                     if nt_handler.user_apc_redirected {
                         redirected_user_apc = true;
                     }
@@ -8745,6 +8751,8 @@ pub(crate) unsafe fn service_sec_image(
                 let mut ext_text_out_probe_failed = false;
                 let mut paintstruct_copyout = (0u64, 0u64);
                 let mut paintstruct_probe_failed = false;
+                let mut user_rect_copyout = (0u64, 0u64);
+                let mut user_rect_probe_failed = false;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -8760,6 +8768,9 @@ pub(crate) unsafe fn service_sec_image(
                 let mut message_call_stack_arg_count = 0usize;
                 let mut message_call_copyout = (0u64, 0u64, 0usize);
                 let mut message_call_probe_failed = false;
+                let mut set_window_pos_stack_args = [0u64; 3];
+                let mut set_window_pos_stack_arg_count = 0usize;
+                let mut set_window_pos_probe_failed = false;
                 let mut defer_window_pos_stack_args = [0u64; 4];
                 let mut defer_window_pos_stack_arg_count = 0usize;
                 let mut defer_window_pos_probe_failed = false;
@@ -9972,6 +9983,101 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
+                } else if matches!(
+                    m0,
+                    NTUSER_INVALIDATE_RECT_SSN
+                        | NTUSER_REDRAW_WINDOW_SSN
+                        | NTUSER_VALIDATE_RECT_SSN
+                ) {
+                    // These USER paint-region calls take an optional caller-owned RECT input.
+                    // ReactOS probes/copies it before mutating update regions; in the split
+                    // kernel that copy belongs at the executive/win32k boundary.
+                    let rect_ptr = a1;
+                    let rect_needed = rect_ptr != 0
+                        && !(matches!(
+                            m0,
+                            NTUSER_INVALIDATE_RECT_SSN | NTUSER_VALIDATE_RECT_SSN
+                        ) && a0 == 0);
+                    if rect_needed {
+                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
+                        prefill_client_copyin_dll_range_pages(
+                            pi as u64,
+                            rect_ptr,
+                            WIN32K_RECT_STAGE_BYTES,
+                            scratch_base,
+                            &reg,
+                            &dll_pes,
+                        );
+                        let input = core::slice::from_raw_parts_mut(
+                            arg as *mut u8,
+                            WIN32K_RECT_STAGE_BYTES,
+                        );
+                        if img_spawn::client_copyin_mapped(
+                            pi as u64,
+                            rect_ptr,
+                            input,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            d_a1 = arg;
+                            let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                            if n < 48 {
+                                print_str(b"[w32marshal] USER RECT input pi=");
+                                print_u64(pi as u64);
+                                print_str(b" ssn=0x");
+                                print_hex(m0 as u32);
+                                print_str(b" hwnd=0x");
+                                print_hex_u64(a0);
+                                print_str(b" rect=0x");
+                                print_hex_u64(rect_ptr);
+                                let left = core::ptr::read_unaligned(arg as *const u32);
+                                let top =
+                                    core::ptr::read_unaligned((arg + 4) as *const u32);
+                                let right =
+                                    core::ptr::read_unaligned((arg + 8) as *const u32);
+                                let bottom =
+                                    core::ptr::read_unaligned((arg + 12) as *const u32);
+                                print_str(b" value=(");
+                                print_hex(left);
+                                print_str(b",");
+                                print_hex(top);
+                                print_str(b",");
+                                print_hex(right);
+                                print_str(b",");
+                                print_hex(bottom);
+                                print_str(b")");
+                                print_str(b" staged=0x");
+                                print_hex_u64(arg);
+                                print_str(b"\n");
+                            }
+                        } else {
+                            user_rect_probe_failed = true;
+                        }
+                    }
+                } else if m0 == NTUSER_GET_UPDATE_RECT_SSN {
+                    // NtUserGetUpdateRect writes a RECTL to the caller after
+                    // co_UserGetUpdateRect, even when the return value is FALSE. Stage the output
+                    // so win32k writes provider-owned memory, then copy it back after dispatch.
+                    if d_a1 != 0 {
+                        let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                        core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
+                        d_a1 = arg;
+                        user_rect_copyout = (a1, arg);
+                        let n = USER_RECT_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 48 {
+                            print_str(b"[w32marshal] NtUserGetUpdateRect pi=");
+                            print_u64(pi as u64);
+                            print_str(b" hwnd=0x");
+                            print_hex_u64(a0);
+                            print_str(b" rect=0x");
+                            print_hex_u64(a1);
+                            print_str(b" staged=0x");
+                            print_hex_u64(arg);
+                            print_str(b"\n");
+                        }
+                    }
                 } else if m0 == NTUSER_BEGIN_PAINT_SSN {
                     // NtUserBeginPaint writes a caller-owned PAINTSTRUCT after IntBeginPaint returns.
                     // Stage that out-param in the shared win32k argument page so isolated win32k never
@@ -10190,6 +10296,63 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == NTUSER_MESSAGE_CALL_SSN {
                     message_call_probe_failed = true;
+                } else if m0 == NTUSER_SET_WINDOW_POS_SSN && sp != 0 {
+                    // NtUserSetWindowPos' cx/cy/uFlags tail is part of the syscall trap frame.
+                    // Stage it explicitly so isolated win32k consumes the real geometry rather
+                    // than probing a hosted user stack from the wrong VSpace.
+                    let mut tail = [0u64; 3];
+                    let mut tail_ok = true;
+                    let mut i = 0usize;
+                    while i < tail.len() {
+                        match client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28 + i as u64 * 8,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            Some(value) => tail[i] = value,
+                            None => {
+                                tail_ok = false;
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    if tail_ok {
+                        d_a2 = a2 as i32 as i64 as u64;
+                        d_a3 = a3 as i32 as i64 as u64;
+                        set_window_pos_stack_args = [
+                            tail[0] as i32 as i64 as u64,
+                            tail[1] as i32 as i64 as u64,
+                            tail[2] as u32 as u64,
+                        ];
+                        set_window_pos_stack_arg_count = set_window_pos_stack_args.len();
+                        let n = SET_WINDOW_POS_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 {
+                            print_str(b"[w32marshal] NtUserSetWindowPos pi=");
+                            print_u64(pi as u64);
+                            print_str(b" hwnd=0x");
+                            print_hex_u64(a0);
+                            print_str(b" after=0x");
+                            print_hex_u64(a1);
+                            print_str(b" pos=");
+                            print_u64(d_a2 as i32 as i64 as u64);
+                            print_str(b",");
+                            print_u64(d_a3 as i32 as i64 as u64);
+                            print_str(b" size=");
+                            print_u64(set_window_pos_stack_args[0] as i32 as i64 as u64);
+                            print_str(b"x");
+                            print_u64(set_window_pos_stack_args[1] as i32 as i64 as u64);
+                            print_str(b" flags=0x");
+                            print_hex(set_window_pos_stack_args[2] as u32);
+                            print_str(b"\n");
+                        }
+                    } else {
+                        set_window_pos_probe_failed = true;
+                    }
+                } else if m0 == NTUSER_SET_WINDOW_POS_SSN {
+                    set_window_pos_probe_failed = true;
                 } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN && sp != 0 {
                     // NtUserDeferWindowPos' final four scalar arguments are part of the syscall
                     // trap frame on NT. Isolated win32k cannot rely on a hosted caller stack being
@@ -11326,6 +11489,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if user_rect_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] USER RECT probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" ssn=0x");
+                        print_hex(m0 as u32);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a0);
+                        print_str(b" rect=0x");
+                        print_hex_u64(a1);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if paintstruct_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -11385,6 +11562,18 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex_u64(a0);
                         print_str(b" msg=0x");
                         print_hex(a1 as u32);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
+                } else if set_window_pos_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserSetWindowPos stack probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" hwnd=0x");
+                        print_hex_u64(a0);
                         print_str(b" sp=0x");
                         print_hex_u64(sp);
                         print_str(b" -> FALSE\n");
@@ -11521,6 +11710,8 @@ pub(crate) unsafe fn service_sec_image(
                             == load_keyboard_layout_stack_args.len();
                     let message_call_staged_stack = m0 == NTUSER_MESSAGE_CALL_SSN
                         && message_call_stack_arg_count == message_call_stack_args.len();
+                    let set_window_pos_staged_stack = m0 == NTUSER_SET_WINDOW_POS_SSN
+                        && set_window_pos_stack_arg_count == set_window_pos_stack_args.len();
                     let defer_window_pos_staged_stack = m0 == NTUSER_DEFER_WINDOW_POS_SSN
                         && defer_window_pos_stack_arg_count == defer_window_pos_stack_args.len();
                     // Keep the original SP in the dispatch context for callback/completion
@@ -11555,6 +11746,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &load_keyboard_layout_stack_args)
                     } else if message_call_staged_stack {
                         (sp, &message_call_stack_args)
+                    } else if set_window_pos_staged_stack {
+                        (sp, &set_window_pos_stack_args)
                     } else if defer_window_pos_staged_stack {
                         (sp, &defer_window_pos_stack_args)
                     } else {
@@ -11725,6 +11918,35 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(a0);
                                 print_str(b" ps=0x");
                                 print_hex_u64(client_ps);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if m0 == NTUSER_GET_UPDATE_RECT_SSN && r.1 && user_rect_copyout.0 != 0 {
+                        let (client_rect, staged_rect) = user_rect_copyout;
+                        let rect_ok = img_spawn::client_copyout_mapped(
+                            pi as u64,
+                            client_rect,
+                            core::slice::from_raw_parts(
+                                staged_rect as *const u8,
+                                WIN32K_RECT_STAGE_BYTES,
+                            ),
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if !rect_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtUserGetUpdateRect RECT copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" hwnd=0x");
+                                print_hex_u64(a0);
+                                print_str(b" rect=0x");
+                                print_hex_u64(client_rect);
                                 print_str(b"\n");
                             }
                             r = (0, true);
@@ -12229,21 +12451,23 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                let mut local_event_signals = 0u64;
-                let mut gui_message_waits_woken = 0u64;
-                while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
-                    local_event_signals += 1;
-                    gui_message_waits_woken += gui_message_wait_redrive_event(
-                        &mut nt_handler,
-                        event_body,
-                        pfilled,
-                        procs,
-                    );
-                }
-                if local_event_signals != 0 {
-                    let _ = wait_wake_dispatcher_set(&mut nt_handler);
-                    if gui_message_waits_woken != 0 {
-                        bump_progress();
+                if !gui_message_wait_park_request {
+                    let mut local_event_signals = 0u64;
+                    let mut gui_message_waits_woken = 0u64;
+                    while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
+                        local_event_signals += 1;
+                        gui_message_waits_woken += gui_message_wait_redrive_event(
+                            &mut nt_handler,
+                            event_body,
+                            pfilled,
+                            procs,
+                        );
+                    }
+                    if local_event_signals != 0 {
+                        let _ = wait_wake_dispatcher_set(&mut nt_handler);
+                        if gui_message_waits_woken != 0 {
+                            bump_progress();
+                        }
                     }
                 }
                 // Throttle the status line for the same hot class-loop SSNs. Real provider walls
@@ -12672,6 +12896,45 @@ pub(crate) unsafe fn service_sec_image(
                         flags,
                     )
                 {
+                    let mut local_event_signals = 0u64;
+                    let mut gui_message_waits_woken = 0u64;
+                    while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
+                        local_event_signals += 1;
+                        gui_message_waits_woken += gui_message_wait_redrive_event(
+                            &mut nt_handler,
+                            event_body,
+                            pfilled,
+                            procs,
+                        );
+                    }
+                    if gui_message_wait_queue_event_body != 0
+                        && win32k_subsystem::event_body_ready(gui_message_wait_queue_event_body)
+                    {
+                        GUI_MESSAGE_WAIT_READY_REDRIVES.fetch_add(1, Ordering::Relaxed);
+                        gui_message_waits_woken += gui_message_wait_redrive_event(
+                            &mut nt_handler,
+                            gui_message_wait_queue_event_body,
+                            pfilled,
+                            procs,
+                        );
+                    }
+                    if local_event_signals != 0 || gui_message_waits_woken != 0 {
+                        let _ = wait_wake_dispatcher_set(&mut nt_handler);
+                        if gui_message_waits_woken != 0 {
+                            bump_progress();
+                        }
+                    }
+                    if gui_message_wait_was_replied(gui_message_wait_queue_event_body, pi as u32, badge) {
+                        let received =
+                            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                        badge = received.0;
+                        mi = received.1;
+                        m0 = received.2;
+                        m1 = received.3;
+                        m2 = received.4;
+                        m3 = received.5;
+                        continue;
+                    }
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
@@ -17288,6 +17551,17 @@ unsafe fn gui_message_wait_park(
     true
 }
 
+unsafe fn gui_message_wait_was_replied(queue_event_body: u64, pi: u32, badge: u64) -> bool {
+    let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
+    !(0..GUI_MESSAGE_WAITER_N).any(|slot| {
+        let waiter = table[slot];
+        waiter.used
+            && waiter.queue_event_body == queue_event_body
+            && waiter.pi == pi
+            && waiter.badge == badge
+    })
+}
+
 unsafe fn gui_message_wait_redrive_event(
     nt_handler: &mut ExecNtHandler,
     event_body: u64,
@@ -17458,6 +17732,7 @@ unsafe fn gui_message_wait_redrive_event(
             scratch_base,
         );
         let status = if copy_ok { get.0 } else { u64::MAX };
+        win32k_subsystem::event_body_consume(event_body);
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);

@@ -4812,10 +4812,10 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
 /// first store is copy-on-written into a private shadow, which makes the whole mapping-borne class
 /// structurally impossible — measured cost zero, and its counters are what proves win32k innocent
 /// rather than merely unaccused. **The enforced invariant**: the page is also mapped read-only in
-/// WINLOGON's own VSpace, `RtlNtStatusToDosError`'s `TEB.LastStatusValue` store (ntdll+0x1c2c2, by
-/// far the most frequent writer) is emulated in place so the protection stays continuously armed,
-/// every other client store is reported with its RIP, and the descriptor invariant is re-asserted on
-/// every service-loop event.
+/// WINLOGON's own VSpace, `RtlNtStatusToDosError`'s `TEB.LastStatusValue` store (derived at boot from
+/// the loaded ntdll image, because this RVA moves across builds) is emulated in place so the
+/// protection stays continuously armed, every other client store is reported with its RIP, and the
+/// descriptor invariant is re-asserted on every service-loop event.
 ///
 /// The assertions, and why each generalises:
 ///  * the 64-byte spawn CANARY at `TEB+0x1FC0` is byte-for-byte what the spawn wrote. ★ THIS is the
@@ -8125,6 +8125,7 @@ pub(crate) static WL_TEB2_EMULATED: AtomicU64 = AtomicU64::new(0);
 static WL_TEB2_PROTECT_REPORTS: AtomicU64 = AtomicU64::new(0);
 static WL_TEB2_PROTECT_FAILS: AtomicU64 = AtomicU64::new(0);
 const WL_TEB2_MAX_CYCLES: u64 = 60_000;
+static RTL_LAST_STATUS_STORE_RVA: AtomicU64 = AtomicU64::new(0);
 
 /// ★ THE ENFORCED INVARIANT. `TEB.StaticUnicodeString` is a per-thread SCRATCH descriptor whose
 /// shape (`MaximumLength == sizeof(StaticUnicodeBuffer)`, `Buffer == &StaticUnicodeBuffer`) is set
@@ -8198,34 +8199,54 @@ pub(crate) unsafe fn wl_teb2_protect() {
     }
 }
 
-/// `RtlNtStatusToDosError` + 0x12 — `mov [rax+0x1250], ecx`, the 4-byte `TEB.LastStatusValue`
-/// store. It is BY FAR the most frequent write to the tail page (every failing syscall makes one)
-/// and it is entirely legitimate, so the watch EMULATES it — writes the value through the
-/// executive's alias and steps the client past the instruction — instead of dropping the protection
-/// for it. That is what lets the page stay continuously protected long enough to catch the RARE
-/// store that actually lands on the descriptor.
-const RTL_LAST_STATUS_STORE_RVA: u64 = 0x1c2c2;
+/// `RtlNtStatusToDosError`'s `mov [rax+0x1250], ecx`, the 4-byte `TEB.LastStatusValue` store. It is
+/// BY FAR the most frequent write to the tail page (every failing syscall makes one) and it is
+/// entirely legitimate. The watch recognizes it so the logs can distinguish normal status traffic
+/// from descriptor writes, but it still lets the real client instruction execute after the page is
+/// remapped writable. That keeps the boundary honest: no synthesized register surgery on a live
+/// client thread, and the RVA is still derived from the loaded ntdll image at boot.
 const RTL_LAST_STATUS_STORE_LEN: u64 = 6;
+const RTL_LAST_STATUS_STORE_OPCODE: [u8; RTL_LAST_STATUS_STORE_LEN as usize] =
+    [0x89, 0x88, 0x50, 0x12, 0x00, 0x00];
+
+unsafe fn derive_rtl_last_status_store_rva(pe: &nt_pe_loader::PeFile) -> u64 {
+    let Some(rtl_nt_status_to_dos_error) = pe.exports().ok().and_then(|exports| {
+        exports
+            .into_iter()
+            .find(|export| export.name == "RtlNtStatusToDosError")
+            .map(|export| export.rva)
+    }) else {
+        return 0;
+    };
+    let mut offset = 0u32;
+    while offset < 0x100 {
+        let candidate = rtl_nt_status_to_dos_error.wrapping_add(offset);
+        let mut matched = true;
+        for (index, expected) in RTL_LAST_STATUS_STORE_OPCODE.iter().enumerate() {
+            if img_spawn::pe_byte_at_rva(pe, candidate.wrapping_add(index as u32))
+                != Some(*expected)
+            {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return candidate as u64;
+        }
+        offset += 1;
+    }
+    0
+}
 
 /// A client store into the protected tail: report WHO (RIP + the byte it aimed at), drop the
 /// protection so the instruction can complete, and let the loop re-arm it. Returns true if the store
-/// was emulated in place (protection retained).
-pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool {
+/// was emulated in place (currently never; the natural write path is intentional).
+pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, _tcb: u64) -> bool {
     let offset = addr & 0xFFF;
-    if tcb != 0 && offset == 0x250 && ip == NTDLL_BASE.wrapping_add(RTL_LAST_STATUS_STORE_RVA) {
-        let mut registers = [0u64; 20];
-        win32k_glue::tcb_read_regs20(tcb, &mut registers);
-        if registers[0] == ip {
-            core::ptr::write_volatile(
-                (WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x250) as *mut u32,
-                registers[5] as u32,
-            );
-            if win32k_glue::rewind_fault_ip(tcb, ip + RTL_LAST_STATUS_STORE_LEN) {
-                WL_TEB2_EMULATED.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-        }
-    }
+    let last_status_store_rva = RTL_LAST_STATUS_STORE_RVA.load(Ordering::Relaxed);
+    let last_status_store = offset == 0x250
+        && last_status_store_rva != 0
+        && ip == NTDLL_BASE.wrapping_add(last_status_store_rva);
     let n = WL_TEB2_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
     let descriptor = (0x258..0x268).contains(&offset);
     if n < 48 || descriptor {
@@ -8241,6 +8262,9 @@ pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool 
         print_hex(ip.wrapping_sub(NTDLL_BASE) as u32);
         print_str(b" image+0x");
         print_hex(ip.wrapping_sub(PE_LOAD_BASE) as u32);
+        if last_status_store {
+            print_str(b" last-status");
+        }
         print_str(b" #");
         print_u64(n);
         print_str(b"\n");
@@ -23567,6 +23591,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let rtl_last_status_store_rva = derive_rtl_last_status_store_rva(&ntdll_pe);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
@@ -23580,8 +23605,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_COMPLETION_WORKER_RVA
                         .store(tp_completion_worker_rva, Ordering::Relaxed);
+                    RTL_LAST_STATUS_STORE_RVA.store(rtl_last_status_store_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
+                    print_str(b" RtlLastStatusStore RVA=0x");
+                    print_hex(rtl_last_status_store_rva as u32);
                     print_str(b"\n");
                     let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a

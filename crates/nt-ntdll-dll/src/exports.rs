@@ -91,6 +91,8 @@ static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
 static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static RTL_PROCESS_COOKIE: nt_ntdll::rtl::encode::ProcessCookieCache =
+    nt_ntdll::rtl::encode::ProcessCookieCache::new();
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn ldr_shutdown_in_progress() -> bool {
@@ -21462,13 +21464,17 @@ pub unsafe extern "system" fn rtl_decode_system_pointer(ptr: *mut c_void) -> *mu
 }
 
 pub(crate) fn process_cookie() -> Option<u32> {
+    RTL_PROCESS_COOKIE.get_or_init_with(query_process_cookie)
+}
+
+fn query_process_cookie() -> Option<u32> {
     type Query = unsafe extern "system" fn(isize, u32, *mut u32, u32, *mut u32) -> NtStatus;
     let query: Query = unsafe {
         core::mem::transmute(nt_ntdll::trap_stubs::nt_query_information_process as *const ())
     };
     let mut cookie = 0u32;
     let status = unsafe { query(-1, 36, &mut cookie, 4, core::ptr::null_mut()) };
-    (status == STATUS_SUCCESS).then_some(cookie)
+    (status == STATUS_SUCCESS && cookie != 0).then_some(cookie)
 }
 
 // ---- time family (host-tested nt_ntdll::rtl::time) -----------------------------------------------
