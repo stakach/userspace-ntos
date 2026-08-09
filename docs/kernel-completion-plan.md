@@ -71,11 +71,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 - `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
-  `NtSaveKey` and writable-overlay `FileRenameInformation` are now real; D2/D3 still own live hive
-  authority plus explicit flush/reboot persistence proofs.
+  `NtSaveKey`, writable-overlay `FileRenameInformation`, and file-backed hive atomic image
+  replacement are now real; D2/D3 still own live hive authority plus explicit system/user flush and
+  reboot persistence proofs.
 - `[~]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors.
-- `[ ]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
+- `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
@@ -318,7 +319,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    host-tested: real read-only `regf` trees can be imported into clean mutable `Hive` arenas and
    checkpointed/rebooted through `HiveManager`. A host-tested `MutableHiveSet` now also owns mounted
    mutable hives behind the NT registry namespace, including `CurrentControlSet` resolution,
-   create/set/query, longest-mount selection, and unmount.
+   create/set/query, longest-mount selection, and unmount. The real file-backed Hive I/O provider
+   now installs primary images with temporary-file plus `FileRenameInformation` replacement and
+   reports real log length; the obsolete inert `nt-hive-core` placeholder provider is gone.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2081,3 +2084,19 @@ in SCM, user-mode system processes, and our ntdll where possible.
   real `regf` bytes into clean mutable hives, and resolving/mutating those hives by NT registry path.
   The next D2 work should instantiate this beside the current `RegfHive`/`RegistryOverlay` state and
   move one syscall write path onto it.
+
+- D3 file-backed hive image atomicity slice. `nt-fs::NtFileHiveIoProvider` now honors the
+  `HiveManager` primary-image atomic-write contract by checkpointing to a temporary sibling and
+  installing it through the real `FileRenameInformation` replace path, instead of overwriting the
+  live hive image in place. Provider status now reports real `.LOG` length, and the obsolete inert
+  `nt-hive-core::NtFileHiveIoProvider` placeholder plus its NotSupported test/doc language have
+  been removed so the only `NtFileHiveIoProvider` in the tree is the filesystem-backed one. Host
+  tests prove replace-install leaves no temp file, log length is observable/truncatable, and a temp
+  write failure preserves the previously committed hive image. Validation: `cargo fmt --all`,
+  `cargo test -p nt-fs` with `42` tests passing, `cargo test -p nt-hive-core` with `31` library
+  tests plus `4` `gen_hive` tests passing, `cargo test -p nt-hive-regf` with `11` tests passing, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: finish D2 by instantiating `MutableHiveSet` beside the current executive
+  `RegfHive`/`RegistryOverlay` state and migrating one registry write syscall onto the live hive
+  authority; D3 still needs explicit system/user hive and writable-overlay reboot proofs in the
+  executive.

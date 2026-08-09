@@ -13,7 +13,7 @@ use crate::hive::{Hive, HiveKind};
 pub enum HiveIoError {
     /// The backend injected a fault / the medium is unavailable.
     Io,
-    /// The provider is compiled but has no storage yet (e.g. the future NtFile provider).
+    /// The provider cannot support this operation.
     NotSupported,
 }
 
@@ -164,44 +164,6 @@ impl HiveIoProvider for FaultInjectionHiveIoProvider {
     }
     fn get_status(&self) -> HiveIoStatus {
         self.inner.get_status()
-    }
-}
-
-/// The future `\SystemRoot\System32\Config\SYSTEM` file-backed provider (spec §10.6). Compiled
-/// but inert until the filesystem/storage service exists — every op is `NotSupported`.
-#[derive(Default)]
-pub struct NtFileHiveIoProvider;
-
-impl HiveIoProvider for NtFileHiveIoProvider {
-    fn provider_kind(&self) -> HiveIoProviderKind {
-        HiveIoProviderKind::NtFile
-    }
-    fn read_primary_image(&mut self) -> Result<Option<Vec<u8>>, HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn write_primary_image_atomic(&mut self, _: &[u8]) -> Result<(), HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn append_log_record(&mut self, _: &[u8]) -> Result<(), HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn truncate_log(&mut self) -> Result<(), HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn flush_image(&mut self) -> Result<(), HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn flush_log(&mut self) -> Result<(), HiveIoError> {
-        Err(HiveIoError::NotSupported)
-    }
-    fn get_status(&self) -> HiveIoStatus {
-        HiveIoStatus {
-            image_present: false,
-            log_len: 0,
-        }
     }
 }
 

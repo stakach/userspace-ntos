@@ -5,7 +5,8 @@
 //! addressed by a stable [`CellId`] (never a raw pointer). A [`HiveMountTable`] resolves a full
 //! NT registry path to a mounted hive + a relative path, applying the `CurrentControlSet` alias.
 //! Hives persist through a versioned, checksummed **image** + an append-only **log** (replayed
-//! on boot) behind a pluggable [`HiveIoProvider`] (Memory / FaultInjection / future NtFile), with
+//! on boot) behind a pluggable [`HiveIoProvider`] (Memory / FaultInjection / filesystem-backed
+//! providers), with
 //! a [`HiveManager`] boot / mutate / flush engine. `no_std` + `alloc`; explicit TLV wire format.
 
 #![no_std]
@@ -40,7 +41,7 @@ pub use hive::{
 };
 pub use io::{
     FaultInjectionHiveIoProvider, FlushMode, HiveIoError, HiveIoProvider, HiveIoProviderKind,
-    HiveIoStatus, HiveManager, MemoryHiveIoProvider, NtFileHiveIoProvider,
+    HiveIoStatus, HiveManager, MemoryHiveIoProvider,
 };
 
 #[cfg(test)]

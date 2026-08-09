@@ -96,7 +96,7 @@ fn query_information_encodes_zero_ea_size() {
 }
 
 use core::cell::RefCell;
-use nt_hive_core::{HiveKind, HiveLogOp, HiveManager, RegistryValueType};
+use nt_hive_core::{HiveIoProvider, HiveKind, HiveLogOp, HiveManager, RegistryValueType};
 
 const SYSTEM_HIVE: &str = r"\SystemRoot\System32\Config\SYSTEM";
 
@@ -561,6 +561,55 @@ fn hive_persists_through_file_apis() {
         assert_eq!(hive.query_dword(key, "Start"), Some(3)); // from the image file
         assert_eq!(hive.query_dword(key, "SeenByDriver"), Some(1)); // from the replayed log file
     }
+}
+
+#[test]
+fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
+    let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
+    let mut provider = NtFileHiveIoProvider::open(&fs, SYSTEM_HIVE);
+
+    provider.write_primary_image_atomic(b"old image").unwrap();
+    assert_eq!(fs.borrow().file_bytes(SYSTEM_HIVE), Some(&b"old image"[..]));
+    assert!(fs
+        .borrow()
+        .query_attributes(r"\SystemRoot\System32\Config\SYSTEM.TMP")
+        .is_none());
+
+    provider.append_log_record(b"abc").unwrap();
+    provider.append_log_record(b"de").unwrap();
+    assert_eq!(provider.get_status().log_len, 5);
+
+    provider.write_primary_image_atomic(b"new image").unwrap();
+    assert_eq!(fs.borrow().file_bytes(SYSTEM_HIVE), Some(&b"new image"[..]));
+    assert!(fs
+        .borrow()
+        .query_attributes(r"\SystemRoot\System32\Config\SYSTEM.TMP")
+        .is_none());
+    assert!(provider.get_status().image_present);
+    provider.truncate_log().unwrap();
+    assert_eq!(provider.get_status().log_len, 0);
+}
+
+#[test]
+fn ntfile_hive_provider_preserves_image_when_temp_write_fails() {
+    let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
+    let mut provider = NtFileHiveIoProvider::open(&fs, SYSTEM_HIVE);
+    provider.write_primary_image_atomic(b"committed").unwrap();
+
+    assert!(fs
+        .borrow_mut()
+        .provision_directory(r"\SystemRoot\System32\Config\SYSTEM.TMP"));
+    assert_eq!(
+        provider.write_primary_image_atomic(b"should not install"),
+        Err(nt_hive_core::HiveIoError::Io)
+    );
+    assert_eq!(fs.borrow().file_bytes(SYSTEM_HIVE), Some(&b"committed"[..]));
+    assert!(
+        fs.borrow()
+            .query_attributes(r"\SystemRoot\System32\Config\SYSTEM.TMP")
+            .unwrap()
+            .is_directory
+    );
 }
 
 #[test]

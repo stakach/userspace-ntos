@@ -373,10 +373,3 @@ fn fault_on_image_write_preserves_previous() {
     assert_eq!(booted.query_dword(key, "A"), Some(1)); // image #1
     assert_eq!(booted.query_dword(key, "B"), Some(2)); // replayed log survived
 }
-
-#[test]
-fn ntfile_provider_is_not_supported_yet() {
-    let mut p = NtFileHiveIoProvider;
-    assert_eq!(p.provider_kind(), HiveIoProviderKind::NtFile);
-    assert_eq!(p.read_primary_image(), Err(HiveIoError::NotSupported));
-}

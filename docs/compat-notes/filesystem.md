@@ -19,7 +19,9 @@ storage seam the M21 Hive Manager reserved.
   `zw_flush_buffers_file`, `zw_query_standard_information` (FileStandardInformation),
   `zw_close` (cleanup-before-close). Handle table of file objects.
 - `NtFileHiveIoProvider` (§14.1): the real hive I/O provider — image at the hive path, log at
-  `<path>.LOG`, both via ZwCreateFile/ReadFile/WriteFile/FlushBuffersFile/Close. Implements
+  `<path>.LOG`, both via ZwCreateFile/ReadFile/WriteFile/FlushBuffersFile/Close. Primary image
+  checkpoints are written to a temporary sibling and installed via `FileRenameInformation` replace,
+  so the storage path honors the Hive Manager atomic-image contract. Implements
   `nt_hive_core::HiveIoProvider`, so a `HiveManager` persists through the filesystem.
 - 5 unit tests incl. mount resolver, create dispositions, read/write offset + EOF, directory
   rejects data ops, and the §14.2 acceptance: HiveManager writes/reads a hive image + log through
@@ -32,5 +34,4 @@ The `configuration-manager` component now also proves the filesystem runtime bar
 queries its size through the Zw* APIs; then the §14.2 acceptance: a `HiveManager` over
 `NtFileHiveIoProvider` writes the SYSTEM hive image to `\SystemRoot\System32\Config\SYSTEM`,
 journals a post-checkpoint write, and a **restarted HiveManager reads it back from the file** —
-Answer=42 from the image file, SeenByDriver=1 from the replayed `.LOG` file. The M21
-NtFileHiveIoProvider stub is now backed by a real filesystem.
+Answer=42 from the image file, SeenByDriver=1 from the replayed `.LOG` file.

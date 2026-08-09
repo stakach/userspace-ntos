@@ -20,13 +20,13 @@ pluggable I/O provider.
 - Log codec (§12): `HLR1` per-record header + payload; ops CreateKey/SetValue/DeleteValue.
   `encode_log_record`/`replay_log` (sequence > base, idempotent, stops at a torn/invalid tail).
 - I/O providers (§10): `HiveIoProvider` trait + `MemoryHiveIoProvider` (RAM),
-  `FaultInjectionHiveIoProvider` (fail Nth image write; previous image preserved),
-  `NtFileHiveIoProvider` (compiled but `NotSupported` until a filesystem exists, §10.6).
+  `FaultInjectionHiveIoProvider` (fail Nth image write; previous image preserved). Filesystem
+  crates provide concrete file-backed providers without making `nt-hive-core` depend on storage.
 - `HiveManager` engine (§13, §16): `boot` (load+validate image → replay log), `mutate` (append
   log record + flush + apply), `flush` (checkpoint: fresh image + truncate log + clear dirty).
-- 8 unit tests incl. create/open/set/query, CCS resolver (Services through CurrentControlSet),
+- Unit tests incl. create/open/set/query, CCS resolver (Services through CurrentControlSet),
   image round-trip + checksum/magic rejection, manager boot/mutate/flush survives restart, log
-  replay idempotent + torn, image-write fault preserves previous, NtFile NotSupported.
+  replay idempotent + torn, and image-write fault preserves previous.
 
 ## Hive lifecycle in QEMU (implemented, Milestone 21 — `configuration-manager`)
 
