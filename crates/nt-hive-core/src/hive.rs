@@ -412,6 +412,14 @@ impl HiveMountTable {
         self.mounts.push((root_path.into(), hive));
     }
 
+    pub fn unmount(&mut self, root_path: &str) -> Option<HiveId> {
+        let index = self
+            .mounts
+            .iter()
+            .position(|(path, _)| path.eq_ignore_ascii_case(root_path))?;
+        Some(self.mounts.remove(index).1)
+    }
+
     /// Resolve a full NT registry path to `(HiveId, relative_path)` (spec §6.2), applying the
     /// `CurrentControlSet` → `ControlSet001` alias (spec §8) before matching.
     pub fn resolve(&self, full_path: &str) -> Option<(HiveId, String)> {
@@ -428,6 +436,97 @@ impl HiveMountTable {
         let (root, hive) = best?;
         let rel = &aliased[root.len()..];
         Some((hive, rel.into()))
+    }
+}
+
+/// A resolved key in a mounted mutable hive.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHiveKey {
+    pub hive: HiveId,
+    pub key: CellId,
+}
+
+/// Owned mutable hives plus the NT registry namespace that mounts them.
+///
+/// This is the host-testable Configuration Manager authority D2 needs before the executive stops
+/// pairing read-only `RegfHive` selectors with a separate `RegistryOverlay` write plane.
+#[derive(Default)]
+pub struct MutableHiveSet {
+    mounts: HiveMountTable,
+    hives: Vec<(HiveId, Hive)>,
+}
+
+impl MutableHiveSet {
+    pub fn new() -> Self {
+        Self {
+            mounts: HiveMountTable::new(),
+            hives: Vec::new(),
+        }
+    }
+
+    pub fn mount(&mut self, root_path: &str, hive_id: HiveId, hive: Hive) {
+        self.mounts.mount(root_path, hive_id);
+        match self.hives.iter().position(|(id, _)| *id == hive_id) {
+            Some(index) => self.hives[index] = (hive_id, hive),
+            None => self.hives.push((hive_id, hive)),
+        }
+    }
+
+    pub fn unmount(&mut self, root_path: &str) -> Option<Hive> {
+        let hive_id = self.mounts.unmount(root_path)?;
+        let index = self.hives.iter().position(|(id, _)| *id == hive_id)?;
+        Some(self.hives.remove(index).1)
+    }
+
+    pub fn hive(&self, hive_id: HiveId) -> Option<&Hive> {
+        self.hives
+            .iter()
+            .find(|(id, _)| *id == hive_id)
+            .map(|(_, hive)| hive)
+    }
+
+    pub fn hive_mut(&mut self, hive_id: HiveId) -> Option<&mut Hive> {
+        self.hives
+            .iter_mut()
+            .find(|(id, _)| *id == hive_id)
+            .map(|(_, hive)| hive)
+    }
+
+    pub fn resolve_key(&self, full_path: &str) -> Option<ResolvedHiveKey> {
+        let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
+        let hive = self.hive(hive_id)?;
+        Some(ResolvedHiveKey {
+            hive: hive_id,
+            key: hive.open_key(&rel_path)?,
+        })
+    }
+
+    pub fn create_key(&mut self, full_path: &str) -> Option<ResolvedHiveKey> {
+        let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
+        let hive = self.hive_mut(hive_id)?;
+        Some(ResolvedHiveKey {
+            hive: hive_id,
+            key: hive.create_key(&rel_path),
+        })
+    }
+
+    pub fn set_value(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        self.hive_mut(key.hive)
+            .is_some_and(|hive| hive.set_value(key.key, name, value_type, data))
+    }
+
+    pub fn query_value(
+        &self,
+        key: ResolvedHiveKey,
+        name: &str,
+    ) -> Option<(RegistryValueType, &[u8])> {
+        self.hive(key.hive)?.query_value(key.key, name)
     }
 }
 

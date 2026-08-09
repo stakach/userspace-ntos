@@ -69,6 +69,67 @@ fn mount_table_currentcontrolset_resolver() {
 }
 
 #[test]
+fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
+    let mut system = Hive::new(HiveKind::System);
+    system.create_key(r"ControlSet001\Services");
+    let mut software = Hive::new(HiveKind::Software);
+    software.create_key(r"Microsoft");
+
+    let mut set = MutableHiveSet::new();
+    set.mount(SYSTEM_HIVE_PATH, 1, system);
+    set.mount(r"\Registry\Machine\Software", 2, software);
+
+    let svc = set
+        .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs")
+        .expect("create service key");
+    assert_eq!(svc.hive, 1);
+    assert_eq!(
+        set.hive(svc.hive)
+            .and_then(|hive| hive.key_path(svc.key))
+            .as_deref(),
+        Some(r"\ControlSet001\Services\RpcSs")
+    );
+    assert!(set.set_value(
+        svc,
+        "Start",
+        RegistryValueType::Dword,
+        2u32.to_le_bytes().to_vec()
+    ));
+    assert_eq!(
+        set.query_value(svc, "start")
+            .map(|(ty, data)| (ty, data.to_vec())),
+        Some((RegistryValueType::Dword, 2u32.to_le_bytes().to_vec()))
+    );
+
+    let opened = set
+        .resolve_key(r"\registry\machine\system\controlset001\services\rpcss")
+        .expect("open through canonical control set");
+    assert_eq!(opened, svc);
+
+    let sw = set
+        .create_key(r"\Registry\Machine\Software\Microsoft\Windows")
+        .expect("create software key");
+    assert_eq!(sw.hive, 2);
+    assert_eq!(
+        set.hive(sw.hive)
+            .and_then(|hive| hive.key_path(sw.key))
+            .as_deref(),
+        Some(r"\Microsoft\Windows")
+    );
+
+    let removed = set
+        .unmount(r"\Registry\Machine\Software")
+        .expect("unmount software hive");
+    assert_eq!(removed.kind, HiveKind::Software);
+    assert!(set
+        .resolve_key(r"\Registry\Machine\Software\Microsoft")
+        .is_none());
+    assert!(set
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs")
+        .is_some());
+}
+
+#[test]
 fn image_roundtrips_registry_tree() {
     let mut h = Hive::new(HiveKind::System);
     let a = h.create_key(r"ControlSet001\Services\A");

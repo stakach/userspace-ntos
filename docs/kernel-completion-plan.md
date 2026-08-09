@@ -316,7 +316,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    Manager/Hive Manager to become the live authority for mutable hives, durable setup/profile state,
    subtree save serialization, and remaining long-lived registry data. The first bridge is now
    host-tested: real read-only `regf` trees can be imported into clean mutable `Hive` arenas and
-   checkpointed/rebooted through `HiveManager`.
+   checkpointed/rebooted through `HiveManager`. A host-tested `MutableHiveSet` now also owns mounted
+   mutable hives behind the NT registry namespace, including `CurrentControlSet` resolution,
+   create/set/query, longest-mount selection, and unmount.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2065,3 +2067,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the next D2 slice can introduce an executive-side mutable hive mount table in
   parallel with the existing `RegfHive` selectors, then migrate `NtCreateKey`/`NtSetValueKey` off
   `RegistryOverlay` one mounted hive at a time.
+
+- D2 mutable hive namespace slice. `nt-hive-core` now exposes `MutableHiveSet`, an owned mutable
+  hive namespace that combines a `HiveMountTable` with the mounted `Hive` arenas themselves. It can
+  mount and unmount hives, resolve full NT registry paths through the existing
+  `CurrentControlSet -> ControlSet001` alias, create keys, set/query values, and preserve longest
+  mount-root selection for machine/user hive boundaries. Host tests prove a SYSTEM service key is
+  created through the alias, a SOFTWARE key lands in the SOFTWARE hive instead of SYSTEM, unmount
+  detaches only that hive, and the remaining SYSTEM mount stays live. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core`, `cargo test -p nt-hive-regf`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the executive now has both prerequisites for the next migration: importing
+  real `regf` bytes into clean mutable hives, and resolving/mutating those hives by NT registry path.
+  The next D2 work should instantiate this beside the current `RegfHive`/`RegistryOverlay` state and
+  move one syscall write path onto it.
