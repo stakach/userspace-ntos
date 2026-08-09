@@ -20,6 +20,8 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
+const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
+const REGISTRY_SERVICE_NAME_COPY_MAX: usize = 512;
 
 #[derive(Clone, Copy)]
 pub(crate) struct NpfsFileRoute {
@@ -3627,6 +3629,12 @@ impl ExecNtHandler {
         requested_index: usize,
     ) -> Option<alloc::string::String> {
         let path = self.registry_target_path(target);
+        if path
+            .as_deref()
+            .is_some_and(Self::is_system_services_registry_path)
+        {
+            return self.registry_ordered_service_subkey_by_index(requested_index);
+        }
         let mutable_base = path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
@@ -3701,6 +3709,94 @@ impl ExecNtHandler {
             }
         }
         None
+    }
+
+    fn is_system_services_registry_path(path: &str) -> bool {
+        nt_hive_core::canon_path(path) == REGISTRY_SERVICES_CANON
+    }
+
+    fn registry_ordered_service_subkey_by_index(
+        &self,
+        requested_index: usize,
+    ) -> Option<alloc::string::String> {
+        let heap_mark = allocator::mark();
+        let mut name_buf = [0u8; REGISTRY_SERVICE_NAME_COPY_MAX];
+        let selected_len =
+            self.registry_ordered_service_subkey_copy(requested_index, &mut name_buf);
+        unsafe { allocator::reset_to(heap_mark) };
+        let selected_len = selected_len?;
+        alloc::string::String::from_utf8(alloc::vec::Vec::from(&name_buf[..selected_len])).ok()
+    }
+
+    fn registry_ordered_service_subkey_copy(
+        &self,
+        requested_index: usize,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let services_key = self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)?;
+        let hive = self.mutable_hives.hive(services_key.hive)?;
+        let mut entries = alloc::vec::Vec::new();
+        for index in 0..hive.subkey_count(services_key.key) {
+            let Some(name) = hive.subkey_name_by_index(services_key.key, index) else {
+                continue;
+            };
+            let Some(service_key) = hive.open_subkey(services_key.key, name) else {
+                continue;
+            };
+            entries.push(nt_config_manager::ServiceDatabaseOrderEntry {
+                name: alloc::string::String::from(name),
+                service_type: hive.query_dword(service_key, "Type"),
+                start_type: hive.query_dword(service_key, "Start"),
+                load_order_group: Self::hive_query_registry_string(hive, service_key, "Group"),
+                tag: hive.query_dword(service_key, "Tag"),
+            });
+        }
+        let group_order = Self::hive_service_group_order(hive);
+        nt_config_manager::sort_service_database_order_entries(&mut entries, &group_order);
+        let selected = entries.get(requested_index)?;
+        let bytes = selected.name.as_bytes();
+        if bytes.len() > out.len() {
+            return None;
+        }
+        out[..bytes.len()].copy_from_slice(bytes);
+        Some(bytes.len())
+    }
+
+    fn hive_service_group_order(hive: &nt_hive_core::Hive) -> alloc::vec::Vec<alloc::string::String> {
+        let mut path = alloc::string::String::from(nt_hive_core::CURRENT_CONTROL_SET_TARGET);
+        path.push_str("\\Control\\ServiceGroupOrder");
+        let Some(key) = hive.open_key(&path) else {
+            return alloc::vec::Vec::new();
+        };
+        Self::hive_query_registry_multi_string(hive, key, "List").unwrap_or_default()
+    }
+
+    fn hive_query_registry_string(
+        hive: &nt_hive_core::Hive,
+        key: nt_hive_core::CellId,
+        name: &str,
+    ) -> Option<alloc::string::String> {
+        let (value_type, data) = hive.query_value(key, name)?;
+        nt_config_manager::RegistryValue {
+            name: alloc::string::String::new(),
+            value_type,
+            data: alloc::vec::Vec::from(data),
+        }
+        .as_string()
+    }
+
+    fn hive_query_registry_multi_string(
+        hive: &nt_hive_core::Hive,
+        key: nt_hive_core::CellId,
+        name: &str,
+    ) -> Option<alloc::vec::Vec<alloc::string::String>> {
+        let (value_type, data) = hive.query_value(key, name)?;
+        nt_config_manager::RegistryValue {
+            name: alloc::string::String::new(),
+            value_type,
+            data: alloc::vec::Vec::from(data),
+        }
+        .as_multi_string()
     }
 
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence

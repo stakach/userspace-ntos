@@ -38,6 +38,7 @@ pub use codec::{
 };
 pub use config_import::{
     import_control_set_class_into_config_manager, import_control_set_enum_into_config_manager,
+    import_control_set_service_group_order_into_config_manager,
     import_control_set_services_into_config_manager,
 };
 pub use hive::{

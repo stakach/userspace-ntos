@@ -20,6 +20,7 @@ mod registry;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 pub use property::{device_property, devprop_type, DevPropKey, PropertyBag, PropertyValue};
 pub use registry::{
@@ -292,6 +293,16 @@ pub struct ServiceMetadata {
     pub object_name: Option<String>,
 }
 
+/// The service-key fields that determine SCM database enumeration order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceDatabaseOrderEntry {
+    pub name: String,
+    pub service_type: Option<u32>,
+    pub start_type: Option<u32>,
+    pub load_order_group: Option<String>,
+    pub tag: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PnpDriverBinding {
     pub service: ServiceMetadata,
@@ -317,17 +328,7 @@ impl ServiceMetadata {
     }
 
     pub fn win32_process_kind(&self) -> Option<Win32ServiceProcessKind> {
-        let service_type = self.service_type?;
-        if service_type & SERVICE_DRIVER_TYPE_MASK != 0 {
-            return None;
-        }
-        let owns_process = service_type & SERVICE_WIN32_OWN_PROCESS != 0;
-        let shares_process = service_type & SERVICE_WIN32_SHARE_PROCESS != 0;
-        match (owns_process, shares_process) {
-            (true, false) => Some(Win32ServiceProcessKind::Own),
-            (false, true) => Some(Win32ServiceProcessKind::Shared),
-            _ => None,
-        }
+        win32_service_process_kind_from_type(self.service_type?)
     }
 
     pub fn win32_launch_spec(&self) -> Option<Win32ServiceLaunchSpec> {
@@ -406,6 +407,31 @@ impl ServiceMetadata {
         };
         path.push_str(&self.name);
         Some(path)
+    }
+}
+
+impl From<&ServiceMetadata> for ServiceDatabaseOrderEntry {
+    fn from(service: &ServiceMetadata) -> Self {
+        Self {
+            name: service.name.clone(),
+            service_type: service.service_type,
+            start_type: service.start_type,
+            load_order_group: service.load_order_group.clone(),
+            tag: service.tag,
+        }
+    }
+}
+
+pub fn win32_service_process_kind_from_type(service_type: u32) -> Option<Win32ServiceProcessKind> {
+    if service_type & SERVICE_DRIVER_TYPE_MASK != 0 {
+        return None;
+    }
+    let owns_process = service_type & SERVICE_WIN32_OWN_PROCESS != 0;
+    let shares_process = service_type & SERVICE_WIN32_SHARE_PROCESS != 0;
+    match (owns_process, shares_process) {
+        (true, false) => Some(Win32ServiceProcessKind::Own),
+        (false, true) => Some(Win32ServiceProcessKind::Shared),
+        _ => None,
     }
 }
 
@@ -595,6 +621,18 @@ impl ConfigManager {
         }
         sort_service_metadata(&mut out);
         out
+    }
+
+    /// Service subkey names in the stable order exposed to SCM database builders.
+    pub fn service_database_ordered_names(&self) -> Vec<String> {
+        let mut entries: Vec<ServiceDatabaseOrderEntry> = self
+            .service_metadata_list()
+            .iter()
+            .map(ServiceDatabaseOrderEntry::from)
+            .collect();
+        let group_order = self.service_group_order();
+        sort_service_database_order_entries(&mut entries, &group_order);
+        entries.into_iter().map(|entry| entry.name).collect()
     }
 
     /// Generic service selection from registry metadata. Callers own policy; this only filters on
@@ -1148,15 +1186,19 @@ fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
 
 fn sort_service_metadata(services: &mut [ServiceMetadata]) {
     services.sort_by(|a, b| {
-        a.start_type
-            .cmp(&b.start_type)
-            .then_with(|| a.load_order_group.cmp(&b.load_order_group))
-            .then_with(|| a.tag.cmp(&b.tag))
-            .then_with(|| {
-                a.name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase())
-            })
+        service_order_cmp(
+            &a.name,
+            a.service_type,
+            a.start_type,
+            a.load_order_group.as_deref(),
+            a.tag,
+            &b.name,
+            b.service_type,
+            b.start_type,
+            b.load_order_group.as_deref(),
+            b.tag,
+            &[],
+        )
     });
 }
 
@@ -1165,22 +1207,97 @@ fn sort_service_metadata_with_group_order(
     group_order: &[String],
 ) {
     services.sort_by(|a, b| {
-        a.start_type
-            .cmp(&b.start_type)
-            .then_with(|| {
-                group_order_rank(a.load_order_group.as_deref(), group_order).cmp(&group_order_rank(
-                    b.load_order_group.as_deref(),
-                    group_order,
-                ))
-            })
-            .then_with(|| a.load_order_group.cmp(&b.load_order_group))
-            .then_with(|| a.tag.cmp(&b.tag))
-            .then_with(|| {
-                a.name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase())
-            })
+        service_order_cmp(
+            &a.name,
+            a.service_type,
+            a.start_type,
+            a.load_order_group.as_deref(),
+            a.tag,
+            &b.name,
+            b.service_type,
+            b.start_type,
+            b.load_order_group.as_deref(),
+            b.tag,
+            group_order,
+        )
     });
+}
+
+pub fn sort_service_database_order_entries(
+    entries: &mut [ServiceDatabaseOrderEntry],
+    group_order: &[String],
+) {
+    entries.sort_by(|a, b| {
+        service_order_cmp(
+            &a.name,
+            a.service_type,
+            a.start_type,
+            a.load_order_group.as_deref(),
+            a.tag,
+            &b.name,
+            b.service_type,
+            b.start_type,
+            b.load_order_group.as_deref(),
+            b.tag,
+            group_order,
+        )
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_order_cmp(
+    a_name: &str,
+    a_type: Option<u32>,
+    a_start: Option<u32>,
+    a_group: Option<&str>,
+    a_tag: Option<u32>,
+    b_name: &str,
+    b_type: Option<u32>,
+    b_start: Option<u32>,
+    b_group: Option<&str>,
+    b_tag: Option<u32>,
+    group_order: &[String],
+) -> Ordering {
+    service_start_rank(a_start)
+        .cmp(&service_start_rank(b_start))
+        .then_with(|| {
+            group_order_rank(a_group, group_order).cmp(&group_order_rank(b_group, group_order))
+        })
+        .then_with(|| optional_ascii_case_insensitive_cmp(a_group, b_group))
+        .then_with(|| service_process_rank(a_type).cmp(&service_process_rank(b_type)))
+        .then_with(|| service_tag_rank(a_tag).cmp(&service_tag_rank(b_tag)))
+        .then_with(|| ascii_case_insensitive_cmp(a_name, b_name))
+}
+
+fn service_start_rank(start: Option<u32>) -> u32 {
+    start.unwrap_or(u32::MAX)
+}
+
+fn service_tag_rank(tag: Option<u32>) -> u32 {
+    tag.unwrap_or(u32::MAX)
+}
+
+fn service_process_rank(service_type: Option<u32>) -> u8 {
+    match service_type.and_then(win32_service_process_kind_from_type) {
+        Some(Win32ServiceProcessKind::Own) => 0,
+        Some(Win32ServiceProcessKind::Shared) => 1,
+        None => 2,
+    }
+}
+
+fn optional_ascii_case_insensitive_cmp(a: Option<&str>, b: Option<&str>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => ascii_case_insensitive_cmp(a, b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn ascii_case_insensitive_cmp(a: &str, b: &str) -> Ordering {
+    a.to_ascii_lowercase()
+        .cmp(&b.to_ascii_lowercase())
+        .then_with(|| a.cmp(b))
 }
 
 fn group_order_rank(group: Option<&str>, group_order: &[String]) -> usize {
@@ -1628,6 +1745,82 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             names
+        );
+    }
+
+    #[test]
+    fn service_database_order_uses_typed_service_metadata() {
+        fn set_group(cm: &mut ConfigManager, service: &str, group: &str) {
+            let key = cm.service_metadata(service).unwrap().service_key;
+            cm.registry_mut().set_string(key, "Group", group);
+        }
+
+        let mut cm = ConfigManager::new();
+        let group_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+        cm.registry_mut().set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["Event Log", "NetworkProvider"]),
+        );
+        cm.register_typed_service(
+            "DcomLaunch",
+            r"%SystemRoot%\system32\svchost.exe -k DcomLaunch",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        set_group(&mut cm, "DcomLaunch", "Event log");
+        cm.register_typed_service(
+            "EventLog",
+            r"%SystemRoot%\system32\eventlog.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            0,
+        );
+        set_group(&mut cm, "EventLog", "Event Log");
+        cm.register_typed_service(
+            "Browser",
+            r"%SystemRoot%\system32\svchost.exe -k netsvcs",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        set_group(&mut cm, "Browser", "NetworkProvider");
+        cm.register_typed_service(
+            "NoGroupSvc",
+            r"%SystemRoot%\system32\nogroup.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+
+        assert_eq!(
+            cm.registry()
+                .enum_subkeys(cm.registry().open_key(SERVICES_PATH).unwrap()),
+            alloc::vec![
+                String::from("DcomLaunch"),
+                String::from("EventLog"),
+                String::from("Browser"),
+                String::from("NoGroupSvc")
+            ]
+        );
+        assert_eq!(
+            cm.service_database_ordered_names(),
+            alloc::vec![
+                String::from("EventLog"),
+                String::from("DcomLaunch"),
+                String::from("Browser"),
+                String::from("NoGroupSvc")
+            ]
         );
     }
 

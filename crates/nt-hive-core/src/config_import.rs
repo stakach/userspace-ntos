@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use nt_config_manager::{
     ConfigManager, Registry, RegistryKeyId, CONTROL_CLASS_PATH, ENUM_PATH, SERVICES_PATH,
+    SERVICE_GROUP_ORDER_PATH,
 };
 
 use crate::Hive;
@@ -34,6 +35,24 @@ pub fn import_control_set_services_into_config_manager(
         import_hive_key(hive, src_service, cm.registry_mut(), dst_service);
     }
     count
+}
+
+/// Import `ControlSetXXX\Control\ServiceGroupOrder` from a hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder`.
+pub fn import_control_set_service_group_order_into_config_manager(
+    hive: &Hive,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_path = alloc::string::String::from(control_set);
+    src_path.push_str("\\Control\\ServiceGroupOrder");
+    let Some(src_key) = hive.open_key(&src_path) else {
+        return 0;
+    };
+    let dst_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+    let value_count = hive.enum_values(src_key).len();
+    import_hive_key(hive, src_key, cm.registry_mut(), dst_key);
+    value_count
 }
 
 /// Import `ControlSetXXX\Enum` from a hive into

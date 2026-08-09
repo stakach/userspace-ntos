@@ -473,6 +473,74 @@ fn imports_control_set_services_into_config_manager() {
 }
 
 #[test]
+fn imports_service_group_order_for_service_database_order() {
+    let mut h = Hive::new(HiveKind::System);
+    let group_key = h.create_key(r"ControlSet001\Control\ServiceGroupOrder");
+    h.set_value(
+        group_key,
+        "List",
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(&["Event Log", "NetworkProvider"]),
+    );
+
+    let dcom = h.create_key(r"ControlSet001\Services\DcomLaunch");
+    h.set_value(
+        dcom,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"%SystemRoot%\system32\svchost.exe -k DcomLaunch"),
+    );
+    h.set_dword(dcom, "Type", nt_config_manager::SERVICE_WIN32_SHARE_PROCESS);
+    h.set_dword(dcom, "Start", nt_config_manager::SERVICE_AUTO_START);
+    h.set_dword(dcom, "ErrorControl", 1);
+    h.set_value(
+        dcom,
+        "Group",
+        RegistryValueType::Sz,
+        utf16le_sz("Event log"),
+    );
+
+    let eventlog = h.create_key(r"ControlSet001\Services\EventLog");
+    h.set_value(
+        eventlog,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"%SystemRoot%\system32\eventlog.exe"),
+    );
+    h.set_dword(
+        eventlog,
+        "Type",
+        nt_config_manager::SERVICE_WIN32_OWN_PROCESS,
+    );
+    h.set_dword(eventlog, "Start", nt_config_manager::SERVICE_AUTO_START);
+    h.set_dword(eventlog, "ErrorControl", 0);
+    h.set_value(
+        eventlog,
+        "Group",
+        RegistryValueType::Sz,
+        utf16le_sz("Event Log"),
+    );
+
+    let mut cm = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_services_into_config_manager(&h, &mut cm, "ControlSet001"),
+        2
+    );
+    assert_eq!(
+        import_control_set_service_group_order_into_config_manager(&h, &mut cm, "ControlSet001"),
+        1
+    );
+    assert_eq!(
+        cm.service_group_order(),
+        alloc::vec![String::from("Event Log"), String::from("NetworkProvider")]
+    );
+    assert_eq!(
+        cm.service_database_ordered_names(),
+        alloc::vec![String::from("EventLog"), String::from("DcomLaunch")]
+    );
+}
+
+#[test]
 fn imports_control_set_enum_into_config_manager() {
     let mut h = Hive::new(HiveKind::System);
     let dn = h.create_key(r"ControlSet001\Enum\PCI\VEN_8086&DEV_100E\3&11583659&0&18");
