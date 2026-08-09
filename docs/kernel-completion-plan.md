@@ -248,10 +248,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
    shell chrome still painting `34873` non-background pixels. The resident MEM_IMAGE writecopy
    follow-up now promotes shared resident image pages into private owned shadows and tears them down
-   through the ordinary image-unmap path. Continue the plan from the remaining structural debt
-   rather than shell-paint scaffolding: an explicit C4 gate proving image writecopy isolation, A4's
-   SCM pipe/listener special coordination, B3's real video/driver binding, broader C4 regressions,
-   and D1/D2 mutable registry/filesystem authority.
+   through the ordinary image-unmap path, and the follow-up C4 gate now proves the promoted private
+   frame can be mutated without changing the shared source frame. Continue the plan from the
+   remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
+   coordination, B3's real video/driver binding, broader C4 overlap/decommit/protect/view-teardown
+   regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1753,3 +1754,23 @@ in SCM, user-mode system processes, and our ntdll where possible.
   writecopy regression that faults or protects a shared image page writable and proves the original
   shared frame remains unchanged. Continue A4 SCM pipe/listener cleanup, B3 real video/driver
   binding, broader C4 regressions, and D1/D2 registry/filesystem authority.
+
+- C4 image writecopy isolation gate. A post-quiesce executive selftest now seeds a real source
+  frame, maps it into winlogon's live VSpace through the same shared-image map-cap ownership table
+  used by resident DLL image mappings, applies the `PAGE_EXECUTE_WRITECOPY` read/write fault plans,
+  and promotes the page through `vm_promote_image_cow_page`. The gate mutates the promoted private
+  frame through a temporary alias and then reads the original source frame back to prove the shared
+  image source was not modified. Cleanup runs through the same ownership paths as production:
+  shared map-cap entries are removed, promoted private pages are torn down with
+  `vm_unmap_private_page`, and the source frame is released separately. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-image-writecopy-cow-20260809.log`. Result: kernel specs pass, the full executive gate
+  is `293/293`, `exec_image_writecopy_cow_isolated` passes with proof `0x1ff/0x1ff`,
+  `exec_vm_pool_headroom` remains green with `ut-free=52327KiB`, `slot-free=81172`,
+  `frame-reg=16900/32768`, `image-mapcaps=7749`, `image-mapcap-fails=0`, `vad=40/96`,
+  `committed-map=233/512`, and explorer shell chrome still paints `34873` non-background pixels.
+  Review adjustment: continue the broader C4 VAD/view teardown gates, especially overlapping VADs,
+  partial decommit/release, `MEM_TOP_DOWN`, guard/no-access faults, and committed-view teardown.

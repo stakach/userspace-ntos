@@ -3899,6 +3899,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
     mapped_section_writeback_spec(passed);
+    image_writecopy_cow_spec(passed);
     vm_pool_headroom_spec(passed);
     unsafe { teb_tail_protected_spec(passed) };
     unsafe { lsarpc_connection_worker_spec(passed) };
@@ -4938,6 +4939,23 @@ fn mapped_section_writeback_spec(passed: &mut u64) {
         proof == MAPPED_SECTION_WRITEBACK_ALL
             && bytes == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64
             && status == nt_fs::STATUS_SUCCESS,
+        passed,
+    );
+}
+
+fn image_writecopy_cow_spec(passed: &mut u64) {
+    let proof = IMAGE_WRITECOPY_COW_SELFTEST.load(Ordering::Relaxed);
+    let status = IMAGE_WRITECOPY_COW_STATUS.load(Ordering::Relaxed) as u32;
+    print_str(b"[image-cow-selftest] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(IMAGE_WRITECOPY_COW_ALL as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    check(
+        b"exec_image_writecopy_cow_isolated",
+        proof == IMAGE_WRITECOPY_COW_ALL && status == nt_address_space::STATUS_SUCCESS,
         passed,
     );
 }
@@ -8535,6 +8553,23 @@ static MAPPED_SECTION_WRITEBACK_STATUS: AtomicU64 =
 static mut MAPPED_SECTION_WRITEBACK_TABLE: GenericSectionTable = GenericSectionTable::new();
 const MAPPED_SECTION_WRITEBACK_PAYLOAD: &[u8] = b"section writeback data";
 
+// --- MEM_IMAGE WRITECOPY COW SELF-TEST ---------------------------------------------------------
+const IMAGE_WRITECOPY_COW_SOURCE: u64 = 0x001;
+const IMAGE_WRITECOPY_COW_SEEDED: u64 = 0x002;
+const IMAGE_WRITECOPY_COW_MAPPED_SHARED: u64 = 0x004;
+const IMAGE_WRITECOPY_COW_REGISTERED: u64 = 0x008;
+const IMAGE_WRITECOPY_COW_PROMOTED: u64 = 0x010;
+const IMAGE_WRITECOPY_COW_COPIED: u64 = 0x020;
+const IMAGE_WRITECOPY_COW_PRIVATE_MUTATED: u64 = 0x040;
+const IMAGE_WRITECOPY_COW_SHARED_UNCHANGED: u64 = 0x080;
+const IMAGE_WRITECOPY_COW_CLEANED: u64 = 0x100;
+const IMAGE_WRITECOPY_COW_ALL: u64 = 0x1ff;
+static IMAGE_WRITECOPY_COW_RAN: AtomicBool = AtomicBool::new(false);
+static IMAGE_WRITECOPY_COW_SELFTEST: AtomicU64 = AtomicU64::new(0);
+static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 =
+    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+const IMAGE_WRITECOPY_COW_PATTERN: &[u8] = b"image writecopy shared source bytes";
+
 /// Commit → decommit → RE-COMMIT one private page in a hosted process's VSpace, on the real
 /// `vm_map_private_page` / `vm_unmap_private_page` path, at a VA the VAD allocator never reaches
 /// (the very top of the private window — placements run upward from `SMSS_ALLOC_VA` and the boot's
@@ -8780,6 +8815,393 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     print_str(b" status=0x");
     print_hex(status);
     print_str(b"\n");
+}
+
+unsafe fn image_cow_seed_source_frame(frame: u64, scratch_base: u64) -> Result<(), u32> {
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
+    if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    core::ptr::copy_nonoverlapping(
+        IMAGE_WRITECOPY_COW_PATTERN.as_ptr(),
+        alias as *mut u8,
+        IMAGE_WRITECOPY_COW_PATTERN.len(),
+    );
+    let _ = page_unmap_r(frame);
+    Ok(())
+}
+
+unsafe fn image_cow_frame_prefix_matches(
+    frame: u64,
+    scratch_base: u64,
+    expected: &[u8],
+) -> Result<bool, u32> {
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
+    let (copy, copy_error) = copy_cap_r(frame);
+    if copy_error != 0 {
+        if copy != 0 {
+            let _ = cnode_delete_recycle_r(copy);
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if page_map_r(copy, alias, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_recycle_r(copy);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let mut index = 0usize;
+    let mut matches = true;
+    while index < expected.len() {
+        if core::ptr::read_volatile((alias + index as u64) as *const u8) != expected[index] {
+            matches = false;
+            break;
+        }
+        index += 1;
+    }
+    let _ = page_unmap_r(copy);
+    let _ = cnode_delete_recycle_r(copy);
+    Ok(matches)
+}
+
+unsafe fn image_cow_frame_byte(
+    frame: u64,
+    scratch_base: u64,
+    offset: u64,
+) -> Result<u8, u32> {
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
+    let (copy, copy_error) = copy_cap_r(frame);
+    if copy_error != 0 {
+        if copy != 0 {
+            let _ = cnode_delete_recycle_r(copy);
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if page_map_r(copy, alias, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_recycle_r(copy);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let value = core::ptr::read_volatile((alias + offset) as *const u8);
+    let _ = page_unmap_r(copy);
+    let _ = cnode_delete_recycle_r(copy);
+    Ok(value)
+}
+
+unsafe fn image_cow_write_frame_byte(
+    frame: u64,
+    scratch_base: u64,
+    offset: u64,
+    value: u8,
+) -> Result<(), u32> {
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
+    let (copy, copy_error) = copy_cap_r(frame);
+    if copy_error != 0 {
+        if copy != 0 {
+            let _ = cnode_delete_recycle_r(copy);
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if page_map_r(copy, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_recycle_r(copy);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    core::ptr::write_volatile((alias + offset) as *mut u8, value);
+    let _ = page_unmap_r(copy);
+    let _ = cnode_delete_recycle_r(copy);
+    Ok(())
+}
+
+unsafe fn finish_image_writecopy_cow_selftest(
+    pi: usize,
+    page: u64,
+    source_frame: u64,
+    loose_map_cap: u64,
+    mut proof: u64,
+    status: u32,
+) {
+    let mut loose_map_cap = loose_map_cap;
+    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+        let _ = page_unmap_r(map_cap);
+        let _ = cnode_delete_recycle_r(map_cap);
+        if loose_map_cap == map_cap {
+            loose_map_cap = 0;
+        }
+    }
+    if loose_map_cap != 0 {
+        let _ = page_unmap_r(loose_map_cap);
+        let _ = cnode_delete_recycle_r(loose_map_cap);
+    }
+    vm_unmap_private_page(pi, page);
+    let clean =
+        csrss_frame_get_exact(pi as u64, page).0 == 0
+            && shared_image_mapping_get(pi as u64, page).is_none();
+    if source_frame != 0 {
+        vm_frame_release(source_frame, 0);
+    }
+    if clean {
+        proof |= IMAGE_WRITECOPY_COW_CLEANED;
+    }
+    IMAGE_WRITECOPY_COW_SELFTEST.store(proof, Ordering::Relaxed);
+    IMAGE_WRITECOPY_COW_STATUS.store(status as u64, Ordering::Relaxed);
+    print_str(b"[image-cow-selftest-run] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(IMAGE_WRITECOPY_COW_ALL as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_base: u64) {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    if pml4 == 0
+        || scratch_base == 0
+        || IMAGE_WRITECOPY_COW_RAN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let page = PRIVATE_VM_LIMIT - 0x40_0000;
+    let mut proof = 0u64;
+    let mut source_frame = 0u64;
+    let mut loose_map_cap = 0u64;
+    if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+        let _ = page_unmap_r(map_cap);
+        let _ = cnode_delete_recycle_r(map_cap);
+    }
+    vm_unmap_private_page(pi, page);
+
+    match vm_frame_acquire(scratch_base) {
+        Ok(frame) => source_frame = frame,
+        Err(status) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    proof |= IMAGE_WRITECOPY_COW_SOURCE;
+
+    if let Err(status) = image_cow_seed_source_frame(source_frame, scratch_base) {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    proof |= IMAGE_WRITECOPY_COW_SEEDED;
+    match image_cow_frame_prefix_matches(
+        source_frame,
+        scratch_base,
+        IMAGE_WRITECOPY_COW_PATTERN,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                STATUS_UNSUCCESSFUL,
+            );
+            return;
+        }
+        Err(status) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+
+    let read_plan = nt_address_space::image_view_fault_plan(
+        nt_address_space::PAGE_EXECUTE_WRITECOPY,
+        false,
+    );
+    let write_plan =
+        nt_address_space::image_view_fault_plan(nt_address_space::PAGE_EXECUTE_WRITECOPY, true);
+    if !write_plan.copy_on_write {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            STATUS_UNSUCCESSFUL,
+        );
+        return;
+    }
+    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    let (map_cap, copy_error) = copy_cap_r(source_frame);
+    if copy_error != 0 {
+        if map_cap != 0 {
+            let _ = cnode_delete_recycle_r(map_cap);
+        }
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    loose_map_cap = map_cap;
+    if page_map_r(map_cap, page, vm_page_rights(read_plan.map_protection), pml4) != 0 {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    proof |= IMAGE_WRITECOPY_COW_MAPPED_SHARED;
+    if !shared_image_mapping_put(pi as u64, page, map_cap) {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    loose_map_cap = 0;
+    proof |= IMAGE_WRITECOPY_COW_REGISTERED;
+
+    if let Err(status) = vm_promote_image_cow_page(
+        pi,
+        page,
+        read_plan.map_protection,
+        write_plan.map_protection,
+        pml4,
+        scratch_base,
+    ) {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+
+    let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            STATUS_UNSUCCESSFUL,
+        );
+        return;
+    };
+    if record.owns_frame
+        && record.frame != source_frame
+        && shared_image_mapping_get(pi as u64, page).is_none()
+    {
+        proof |= IMAGE_WRITECOPY_COW_PROMOTED;
+    }
+    match image_cow_frame_prefix_matches(record.frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN) {
+        Ok(true) => proof |= IMAGE_WRITECOPY_COW_COPIED,
+        Ok(false) => {}
+        Err(status) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+
+    let mutated = IMAGE_WRITECOPY_COW_PATTERN[0] ^ 0xff;
+    if let Err(status) = image_cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
+        finish_image_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    match image_cow_frame_byte(record.frame, scratch_base, 0) {
+        Ok(value) if value == mutated => proof |= IMAGE_WRITECOPY_COW_PRIVATE_MUTATED,
+        Ok(_) => {}
+        Err(status) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    match image_cow_frame_byte(source_frame, scratch_base, 0) {
+        Ok(value) if value == IMAGE_WRITECOPY_COW_PATTERN[0] => {
+            proof |= IMAGE_WRITECOPY_COW_SHARED_UNCHANGED;
+        }
+        Ok(_) => {}
+        Err(status) => {
+            finish_image_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    let status = if proof & (IMAGE_WRITECOPY_COW_ALL & !IMAGE_WRITECOPY_COW_CLEANED)
+        == (IMAGE_WRITECOPY_COW_ALL & !IMAGE_WRITECOPY_COW_CLEANED)
+    {
+        nt_address_space::STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    };
+    finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
 }
 
 unsafe fn alloc_frame() -> u64 {
