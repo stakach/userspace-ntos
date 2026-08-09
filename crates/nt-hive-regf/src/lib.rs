@@ -1682,6 +1682,56 @@ mod tests {
     }
 
     #[test]
+    fn local_reactos_system_services_preserve_eventlog_dcomlaunch_order() {
+        let path = "../../rust-micro/.tmp/reactos/reactos/system32/config/system";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: staged `config\\system` not present");
+            return;
+        };
+        let source =
+            RegfHive::new(&bytes).expect("the staged `config\\system` must be a regf hive");
+        let source_services = source
+            .open_key(r"ControlSet001\Services")
+            .expect("staged SYSTEM hive must contain Services");
+        let source_names = source
+            .subkeys_raw(source_services)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        let source_eventlog = source_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("EventLog"))
+            .expect("staged SYSTEM hive must contain EventLog");
+        let source_dcomlaunch = source_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("DcomLaunch"))
+            .expect("staged SYSTEM hive must contain DcomLaunch");
+
+        let (imported, _) = import_regf_into_hive(&source, HiveKind::System);
+        let imported_services = imported
+            .open_key(r"ControlSet001\Services")
+            .expect("imported SYSTEM hive must contain Services");
+        let imported_names = imported.enum_subkeys(imported_services);
+        let imported_eventlog = imported_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("EventLog"))
+            .expect("imported SYSTEM hive must contain EventLog");
+        let imported_dcomlaunch = imported_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("DcomLaunch"))
+            .expect("imported SYSTEM hive must contain DcomLaunch");
+
+        eprintln!(
+            "source EventLog/DcomLaunch ranks: {source_eventlog}/{source_dcomlaunch}; imported: {imported_eventlog}/{imported_dcomlaunch}"
+        );
+        assert_eq!(
+            source_eventlog.cmp(&source_dcomlaunch),
+            imported_eventlog.cmp(&imported_dcomlaunch),
+            "mutable SYSTEM import should preserve on-disk service enumeration order"
+        );
+    }
+
+    #[test]
     fn rejects_non_regf() {
         assert!(RegfHive::new(&[0u8; 0x2000]).is_none());
         assert!(RegfHive::new(b"not a hive").is_none());
