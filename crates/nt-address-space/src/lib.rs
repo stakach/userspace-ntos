@@ -331,6 +331,12 @@ pub struct VmMappedViewFaultPlan {
     pub mark_dirty: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VmImageViewFaultPlan {
+    pub map_protection: u32,
+    pub copy_on_write: bool,
+}
+
 pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedViewFaultPlan {
     let base = protection & 0xff;
     let modifiers = protection & !0xff;
@@ -354,6 +360,33 @@ pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedVie
         _ => VmMappedViewFaultPlan {
             map_protection: protection,
             mark_dirty: false,
+        },
+    }
+}
+
+pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewFaultPlan {
+    let base = protection & 0xff;
+    let modifiers = protection & !0xff;
+    match base {
+        PAGE_WRITECOPY => VmImageViewFaultPlan {
+            map_protection: if write_fault {
+                PAGE_READWRITE | modifiers
+            } else {
+                PAGE_READONLY | modifiers
+            },
+            copy_on_write: write_fault,
+        },
+        PAGE_EXECUTE_WRITECOPY => VmImageViewFaultPlan {
+            map_protection: if write_fault {
+                PAGE_EXECUTE_READWRITE | modifiers
+            } else {
+                PAGE_EXECUTE_READ | modifiers
+            },
+            copy_on_write: write_fault,
+        },
+        _ => VmImageViewFaultPlan {
+            map_protection: protection,
+            copy_on_write: false,
         },
     }
 }

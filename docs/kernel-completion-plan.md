@@ -239,10 +239,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `PAGE_EXECUTE_WRITECOPY`. Host tests cover image committed-view writecopy protection, and boot
    proof `.tmp/boot-committed-image-protect-20260809.log` is fully green at `292/292` with
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
+   shell chrome still painting `34873` non-background pixels. The current image demand-protect slice
+   adds a host-tested `image_view_fault_plan`, makes image faults derive seL4 rights from the live
+   committed `MEM_IMAGE` protection instead of PE-section defaults, refuses no-access/guard image
+   faults as protection failures instead of treating them as successful fills, and keeps shared DLL
+   text sharing disabled whenever the live image protection would map writable. Boot proof
+   `.tmp/boot-image-demand-protect-20260809.log` is fully green at `292/292` with
+   `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
    shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
-   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, true MEM_IMAGE write-fault COW shadows, broader C4 regressions,
-   and D1/D2 mutable registry/filesystem authority.
+   structural debt rather than shell-paint scaffolding: true resident MEM_IMAGE write-fault COW
+   shadows and their C4 gate, A4's SCM pipe/listener special coordination, B3's real video/driver
+   binding, broader C4 regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1702,3 +1709,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   explicit C4 regression gate that maps an overlay-backed file, dirties bytes through the mapped
   view, unmaps or flushes the view, and verifies the backing file bytes. After that, continue with
   MEM_IMAGE protect/COW semantics and the remaining overlap/decommit/protect/view-teardown gates.
+
+- C3 MEM_IMAGE demand-protect fault slice. `nt-address-space` now has a host-tested
+  `image_view_fault_plan` for `PAGE_WRITECOPY` and `PAGE_EXECUTE_WRITECOPY` image faults: read
+  faults map read/execute-read, write faults request writable private protection and mark the event
+  as copy-on-write. The executive image demand-fault loop now requires a committed `MEM_IMAGE`
+  owner for each page it fills, derives the process mapping rights from that live committed
+  protection instead of the PE fill's original section rights, refuses faulting no-access/guard
+  image pages as protection failures, and only uses the shared DLL text cache when the live mapping
+  remains non-writable. Validation: `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and boot proof `.tmp/boot-image-demand-protect-20260809.log`. Result: kernel specs pass, the full
+  executive gate is `292/292`, `committed-map=233/512`, `committed-map-fails=0`,
+  `exec_vm_pool_headroom` is green with `52410 KiB` root-Untyped free, and explorer shell chrome
+  still paints `34873` non-background pixels. Review adjustment: the remaining MEM_IMAGE COW work is
+  now resident shared-image shadowing, not protection lookup: record enough source ownership for
+  shared DLL image mappings, promote write-copy faults to private frames, reclaim the old shared
+  mapping cleanly, and add a C4 gate that proves the shared frame is not modified.

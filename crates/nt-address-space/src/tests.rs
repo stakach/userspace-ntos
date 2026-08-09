@@ -1147,6 +1147,45 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
 }
 
 #[test]
+fn image_view_fault_plan_tracks_writecopy_cow() {
+    assert_eq!(
+        image_view_fault_plan(PAGE_WRITECOPY, false),
+        VmImageViewFaultPlan {
+            map_protection: PAGE_READONLY,
+            copy_on_write: false,
+        }
+    );
+    assert_eq!(
+        image_view_fault_plan(PAGE_WRITECOPY, true),
+        VmImageViewFaultPlan {
+            map_protection: PAGE_READWRITE,
+            copy_on_write: true,
+        }
+    );
+    assert_eq!(
+        image_view_fault_plan(PAGE_EXECUTE_WRITECOPY, false),
+        VmImageViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READ,
+            copy_on_write: false,
+        }
+    );
+    assert_eq!(
+        image_view_fault_plan(PAGE_EXECUTE_WRITECOPY | PAGE_GUARD, true),
+        VmImageViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READWRITE | PAGE_GUARD,
+            copy_on_write: true,
+        }
+    );
+    assert_eq!(
+        image_view_fault_plan(PAGE_EXECUTE_READ, true),
+        VmImageViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READ,
+            copy_on_write: false,
+        }
+    );
+}
+
+#[test]
 fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
     let mut table = VmCommittedRangeTable::<4>::new();
     assert_eq!(

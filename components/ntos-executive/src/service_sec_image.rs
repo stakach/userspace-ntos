@@ -5851,6 +5851,7 @@ pub(crate) unsafe fn service_sec_image(
             // speculative run so late userinit DLL loads stop pre-residenting mostly untouched pages.
             let (batch_start, batch_pages) = (page, sec_image_forward_run());
             let mut allocation_failed = false;
+            let mut image_protect_failed = false;
             let mut bi: u64 = 0;
             while bi < batch_pages {
                 let bpage = batch_start + bi * 0x1000;
@@ -5864,11 +5865,65 @@ pub(crate) unsafe fn service_sec_image(
                     break;
                 }
                 let rva = (bpage - base) as u32;
+                let Some(image_view_info) =
+                    process_committed_mapping_basic_information(pi as u64, bpage)
+                else {
+                    if is_fault_page {
+                        print_str(b"[vmf-image-protect] missing committed image page pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b"\n");
+                        allocation_failed = true;
+                    }
+                    break;
+                };
+                if image_view_info.type_ != nt_address_space::MEM_IMAGE {
+                    if is_fault_page {
+                        print_str(b"[vmf-image-protect] non-image owner pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b" type=0x");
+                        print_hex(image_view_info.type_);
+                        print_str(b"\n");
+                        allocation_failed = true;
+                    }
+                    break;
+                }
+                let image_fault_plan = nt_address_space::image_view_fault_plan(
+                    image_view_info.protect,
+                    is_fault_page && (m3 & 0x2 != 0),
+                );
+                let image_map_rights = vm_page_rights(image_fault_plan.map_protection);
+                let image_map_writable = matches!(
+                    image_fault_plan.map_protection & 0xff,
+                    nt_address_space::PAGE_READWRITE
+                        | nt_address_space::PAGE_EXECUTE_READWRITE
+                );
+                if image_map_rights == 0 {
+                    if is_fault_page {
+                        print_str(b"[vmf-image-protect] denied image access pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b" protect=0x");
+                        print_hex(image_view_info.protect);
+                        print_str(b"\n");
+                        image_protect_failed = true;
+                        allocation_failed = true;
+                    }
+                    break;
+                }
                 // SHAREABLE = a registered DLL's executable text (not the per-process main image at
                 // PE_LOAD_BASE, and an RX page). Byte-identical across processes (each DLL loaded at a
                 // fixed base + pre-relocated) → filled ONCE into a frame, mapped READ-ONLY (RX) into
                 // every process that faults it — real image sharing.
-                let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
+                let shareable =
+                    base != PE_LOAD_BASE && page_rights(tpe, rva) == 2 && !image_map_writable;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 // A forward run may overlap pages filled by an earlier run. The faulting page must
                 // still be handled, but speculative neighbours that are already resident must not
@@ -5900,9 +5955,9 @@ pub(crate) unsafe fn service_sec_image(
                     if existing != 0 && existing != dll_cache_get(bpage) {
                         if is_fault_page {
                             // A previously-filled per-process frame for THE FAULTING page → re-map it
-                            // (preserving fixups). rights: per-process image pages are RW_NX here.
+                            // (preserving fixups) under the live committed image protection.
                             let (cc, ce) = copy_cap_r(existing);
-                            let me = page_map_r(cc, bpage, RW_NX, pml4);
+                            let me = page_map_r(cc, bpage, image_map_rights, pml4);
                             if ce != 0 || me != 0 {
                                 let _ = cnode_delete_recycle_r(cc);
                             }
@@ -5940,7 +5995,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 let (frame, rights) = if cached != 0 {
                     DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
-                    (cached, 2u64) // shared text → RX, no fill, no fresh frame
+                    (cached, image_map_rights) // shared text → live read/execute protection
                 } else {
                     // MISS (shared, first process) or a per-process page: fill a fresh frame `f`,
                     // mapped at a UNIQUE monotonic scratch slot (seL4 records the mapping on the frame
@@ -6004,7 +6059,7 @@ pub(crate) unsafe fn service_sec_image(
                         allocation_failed = true;
                         break;
                     }
-                    let r = fill_image_page(tpe, rva, scratch);
+                    let _filled_rights = fill_image_page(tpe, rva, scratch);
                     if pi == 2 && bpage == 0x8045_1000 {
                         KERNEL32_TABLE_WATCH_SCRATCH.store(scratch, Ordering::Relaxed);
                         print_str(b"[alias-watch] kernel32 table faults=");
@@ -6051,7 +6106,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     faults += 1; // a fill consumed a scratch slot; shared HITs do not
                     bump_progress(); // (B) a fresh page filled = real memory progress (resets stall)
-                    (f, if shareable { 2 } else { r })
+                    (f, image_map_rights)
                 };
                 // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
                 let (cc, ce) = copy_cap_r(frame);
@@ -6085,7 +6140,11 @@ pub(crate) unsafe fn service_sec_image(
                 bi += 1;
             }
             if allocation_failed {
-                park_and_log!(pi, b"image-map-resource", m0, addr);
+                if image_protect_failed {
+                    park_and_log!(pi, b"image-protect", m0, addr);
+                } else {
+                    park_and_log!(pi, b"image-map-resource", m0, addr);
+                }
             }
             procs[pi].faults = faults;
             procs[pi].first = first;
