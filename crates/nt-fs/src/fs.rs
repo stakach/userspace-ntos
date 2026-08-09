@@ -16,6 +16,9 @@ use crate::status::*;
 
 /// A MemFs node (spec §12.3). Carries the node's DOS attributes and its parent link so the volume
 /// can serve directory enumeration (`.`/`..` + children) and unlink, exactly like a real FSD.
+const ZERO_EXTENT_BLOB: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
 struct FileExtent {
     blob: usize,
     offset: usize,
@@ -38,9 +41,10 @@ impl FileData {
             Self::Extents(extents) => extents
                 .iter()
                 .filter(|extent| {
-                    blobs
-                        .get(extent.blob)
-                        .is_some_and(|blob| extent.offset + extent.len <= blob.len())
+                    extent.blob == ZERO_EXTENT_BLOB
+                        || blobs
+                            .get(extent.blob)
+                            .is_some_and(|blob| extent.offset + extent.len <= blob.len())
                 })
                 .map(|extent| extent.len)
                 .sum(),
@@ -64,12 +68,6 @@ impl FileData {
                     if written == out.len() {
                         break;
                     }
-                    let Some(blob) = blobs.get(extent.blob) else {
-                        return written;
-                    };
-                    if extent.offset + extent.len > blob.len() {
-                        return written;
-                    }
                     let extent_end = file_cursor + extent.len;
                     if requested >= extent_end {
                         file_cursor = extent_end;
@@ -78,9 +76,19 @@ impl FileData {
                     let within = requested.saturating_sub(file_cursor);
                     let available = extent.len - within;
                     let copy = available.min(out.len() - written);
-                    let blob_start = extent.offset + within;
-                    out[written..written + copy]
-                        .copy_from_slice(&blob[blob_start..blob_start + copy]);
+                    if extent.blob == ZERO_EXTENT_BLOB {
+                        out[written..written + copy].fill(0);
+                    } else {
+                        let Some(blob) = blobs.get(extent.blob) else {
+                            return written;
+                        };
+                        if extent.offset + extent.len > blob.len() {
+                            return written;
+                        }
+                        let blob_start = extent.offset + within;
+                        out[written..written + copy]
+                            .copy_from_slice(&blob[blob_start..blob_start + copy]);
+                    }
                     written += copy;
                     requested += copy;
                     file_cursor = extent_end;
@@ -120,10 +128,16 @@ impl FileData {
                 let Some(first) = extents.first() else {
                     return Some(&[]);
                 };
+                if first.blob == ZERO_EXTENT_BLOB {
+                    return None;
+                }
                 let blob = blobs.get(first.blob)?;
                 let start = first.offset;
                 let mut cursor = start;
                 for extent in extents {
+                    if extent.blob == ZERO_EXTENT_BLOB {
+                        return None;
+                    }
                     if extent.blob != first.blob || extent.offset != cursor {
                         return None;
                     }
@@ -210,7 +224,7 @@ impl MemFs {
         self.node(dir)?
             .children
             .iter()
-            .find(|(n, _, _)| n.as_bytes() == name)
+            .find(|(n, _, _)| n.as_bytes().eq_ignore_ascii_case(name))
             .map(|(_, _, id)| *id)
     }
 
@@ -386,6 +400,23 @@ impl MemFs {
             };
         }
         cur
+    }
+
+    /// Create every missing directory along a folded volume-relative path, returning the leaf id.
+    fn ensure_dir_folded_relative(&mut self, path: &[u8]) -> Option<u64> {
+        let mut cur = 0;
+        for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
+            cur = match self.child_folded_bytes(cur, comp) {
+                Some(id) => id,
+                None => {
+                    let name = core::str::from_utf8(comp)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)
+                        .ok()?;
+                    self.create_child(cur, name, true)
+                }
+            };
+        }
+        Some(cur)
     }
 
     /// Resolve a volume-relative path to a node id.
@@ -621,20 +652,119 @@ impl MemFs {
             self.node_mut(id).unwrap().data.truncate(length);
             return STATUS_SUCCESS;
         }
-        if !self.materialize_node_data(id) {
+        if !self.extend_with_zeroes(id, length - current) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        let Some(n) = self.node_mut(id) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        let FileData::Bytes(data) = &mut n.data else {
-            return STATUS_INVALID_HANDLE;
-        };
-        if data.try_reserve_exact(length - data.len()).is_err() {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        data.resize(length, 0);
         STATUS_SUCCESS
+    }
+
+    fn push_extent_merged(extents: &mut Vec<FileExtent>, extent: FileExtent) {
+        if extent.len == 0 {
+            return;
+        }
+        if let Some(last) = extents.last_mut() {
+            if last.blob == ZERO_EXTENT_BLOB && extent.blob == ZERO_EXTENT_BLOB {
+                last.len += extent.len;
+                return;
+            }
+            if last.blob == extent.blob
+                && last.blob != ZERO_EXTENT_BLOB
+                && last.offset + last.len == extent.offset
+            {
+                last.len += extent.len;
+                return;
+            }
+        }
+        extents.push(extent);
+    }
+
+    fn slice_extent(extent: FileExtent, skip: usize, len: usize) -> FileExtent {
+        FileExtent {
+            blob: extent.blob,
+            offset: if extent.blob == ZERO_EXTENT_BLOB {
+                0
+            } else {
+                extent.offset + skip
+            },
+            len,
+        }
+    }
+
+    fn extend_with_zeroes(&mut self, id: u64, additional: usize) -> bool {
+        if additional == 0 {
+            return true;
+        }
+        let Some(node) = self.node(id) else {
+            return false;
+        };
+        if node.is_dir {
+            return false;
+        }
+        if matches!(node.data, FileData::Extents(_)) {
+            let Some(node) = self.node_mut(id) else {
+                return false;
+            };
+            let FileData::Extents(extents) = &mut node.data else {
+                return false;
+            };
+            if extents.try_reserve_exact(1).is_err() {
+                return false;
+            }
+            Self::push_extent_merged(
+                extents,
+                FileExtent {
+                    blob: ZERO_EXTENT_BLOB,
+                    offset: 0,
+                    len: additional,
+                },
+            );
+            return true;
+        }
+
+        let existing_len = match &node.data {
+            FileData::Bytes(bytes) => bytes.len(),
+            FileData::Extents(_) => unreachable!(),
+        };
+        if existing_len != 0 && self.blobs.try_reserve_exact(1).is_err() {
+            return false;
+        }
+        let mut extents = Vec::new();
+        if extents
+            .try_reserve_exact(if existing_len == 0 { 1 } else { 2 })
+            .is_err()
+        {
+            return false;
+        }
+        let data = {
+            let Some(node) = self.node_mut(id) else {
+                return false;
+            };
+            core::mem::replace(&mut node.data, FileData::Extents(Vec::new()))
+        };
+        if let FileData::Bytes(bytes) = data {
+            if !bytes.is_empty() {
+                let blob = self.blobs.len();
+                self.blobs.push(bytes);
+                extents.push(FileExtent {
+                    blob,
+                    offset: 0,
+                    len: existing_len,
+                });
+            }
+        }
+        Self::push_extent_merged(
+            &mut extents,
+            FileExtent {
+                blob: ZERO_EXTENT_BLOB,
+                offset: 0,
+                len: additional,
+            },
+        );
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        node.data = FileData::Extents(extents);
+        true
     }
 
     fn directory_entry_count(&self, id: u64) -> Option<usize> {
@@ -755,6 +885,16 @@ impl MemFs {
         }
     }
 
+    fn file_data_folded_relative(&self, rel_path: &[u8]) -> Option<&[u8]> {
+        let id = self.lookup_folded_relative(rel_path)?;
+        let node = self.node(id)?;
+        if node.is_dir {
+            None
+        } else {
+            node.data.contiguous_slice(&self.blobs)
+        }
+    }
+
     fn write_at(&mut self, id: u64, offset: u64, bytes: &[u8]) -> usize {
         let Some(node) = self.node(id) else {
             return 0;
@@ -767,6 +907,24 @@ impl MemFs {
             return 0;
         }
         let current_len = self.size(id) as usize;
+        if start.checked_add(bytes.len()).is_none() {
+            return 0;
+        }
+        let sparse_extent_backed = matches!(
+            &node.data,
+            FileData::Extents(extents)
+                if extents.iter().any(|extent| extent.blob == ZERO_EXTENT_BLOB)
+        );
+        if sparse_extent_backed {
+            let Some(extent) = self.extent_for_bytes(bytes) else {
+                return 0;
+            };
+            return if self.splice_write_extent(id, start, extent) {
+                bytes.len()
+            } else {
+                0
+            };
+        }
         let copied_extent = (start == current_len)
             .then(|| self.find_blob_slice(bytes))
             .flatten();
@@ -815,6 +973,104 @@ impl MemFs {
         }
         data[start..start + bytes.len()].copy_from_slice(bytes);
         bytes.len()
+    }
+
+    fn extent_for_bytes(&mut self, bytes: &[u8]) -> Option<FileExtent> {
+        self.find_blob_slice(bytes).or_else(|| {
+            let blob = self.intern_blob(bytes)?;
+            Some(FileExtent {
+                blob,
+                offset: 0,
+                len: bytes.len(),
+            })
+        })
+    }
+
+    fn splice_write_extent(&mut self, id: u64, start: usize, write: FileExtent) -> bool {
+        let Some(write_end) = start.checked_add(write.len) else {
+            return false;
+        };
+        let old_extents = {
+            let Some(node) = self.node_mut(id) else {
+                return false;
+            };
+            match core::mem::replace(&mut node.data, FileData::Extents(Vec::new())) {
+                FileData::Extents(extents) => extents,
+                other => {
+                    node.data = other;
+                    return false;
+                }
+            }
+        };
+        let old_len = old_extents.iter().map(|extent| extent.len).sum::<usize>();
+        let mut next = Vec::new();
+        if next.try_reserve_exact(old_extents.len() + 3).is_err() {
+            if let Some(node) = self.node_mut(id) {
+                node.data = FileData::Extents(old_extents);
+            }
+            return false;
+        }
+
+        let mut cursor = 0usize;
+        let mut inserted = false;
+        for extent in old_extents.iter().copied() {
+            let extent_start = cursor;
+            let Some(extent_end) = cursor.checked_add(extent.len) else {
+                if let Some(node) = self.node_mut(id) {
+                    node.data = FileData::Extents(old_extents);
+                }
+                return false;
+            };
+            cursor = extent_end;
+
+            if extent_end <= start {
+                Self::push_extent_merged(&mut next, extent);
+                continue;
+            }
+            if extent_start >= write_end {
+                if !inserted {
+                    Self::push_extent_merged(&mut next, write);
+                    inserted = true;
+                }
+                Self::push_extent_merged(&mut next, extent);
+                continue;
+            }
+            if extent_start < start {
+                Self::push_extent_merged(
+                    &mut next,
+                    Self::slice_extent(extent, 0, start - extent_start),
+                );
+            }
+            if !inserted {
+                Self::push_extent_merged(&mut next, write);
+                inserted = true;
+            }
+            if extent_end > write_end {
+                Self::push_extent_merged(
+                    &mut next,
+                    Self::slice_extent(extent, write_end - extent_start, extent_end - write_end),
+                );
+            }
+        }
+        if !inserted {
+            if start > old_len {
+                Self::push_extent_merged(
+                    &mut next,
+                    FileExtent {
+                        blob: ZERO_EXTENT_BLOB,
+                        offset: 0,
+                        len: start - old_len,
+                    },
+                );
+            }
+            Self::push_extent_merged(&mut next, write);
+        }
+
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        node.data = FileData::Extents(next);
+        true
     }
 
     fn intern_blob(&mut self, bytes: &[u8]) -> Option<usize> {
@@ -867,6 +1123,11 @@ impl MemFs {
             return false;
         }
         for extent in extents {
+            if extent.blob == ZERO_EXTENT_BLOB {
+                let next_len = data.len() + extent.len;
+                data.resize(next_len, 0);
+                continue;
+            }
             let Some(blob) = self.blobs.get(extent.blob) else {
                 return false;
             };
@@ -1324,6 +1585,18 @@ impl FileSystem {
         self.volume.is_dir(id)
     }
 
+    /// Create every missing directory along a folded volume-relative path.
+    ///
+    /// This is the allocation-side twin of [`Self::zw_create_file_relative`]: callers that already
+    /// resolved a path through the mount-prefix seam can provision installed volume content without
+    /// depending on the `FileSystem` mount manager's DOS aliases.
+    pub fn provision_directory_relative(&mut self, relative: &[u8]) -> bool {
+        let Some(id) = self.volume.ensure_dir_folded_relative(relative) else {
+            return false;
+        };
+        self.volume.is_dir(id)
+    }
+
     /// Create `path` (and every missing directory above it) as a FILE holding `bytes`.
     ///
     /// This is volume PROVISIONING — the content an *installed* volume already carries because the
@@ -1348,11 +1621,37 @@ impl FileSystem {
         self.volume.set_file_data(id, bytes)
     }
 
+    /// Create a file by folded volume-relative path, and create every missing directory above it.
+    pub fn provision_file_relative(&mut self, relative: &[u8], bytes: &[u8]) -> bool {
+        let Some((parent_path, leaf)) = MemFs::parent_and_leaf_bytes(relative) else {
+            return false;
+        };
+        let Some(parent) = self.volume.ensure_dir_folded_relative(parent_path) else {
+            return false;
+        };
+        let Ok(leaf) = core::str::from_utf8(leaf) else {
+            return false;
+        };
+        let id = match self.volume.child(parent, leaf) {
+            Some(id) => id,
+            None => self.volume.create_child(parent, leaf, false),
+        };
+        if self.volume.is_dir(id) {
+            return false;
+        }
+        self.volume.set_file_data(id, bytes)
+    }
+
     /// A file's bytes, borrowed in place (no copy) — the read side [`provision_file`] writes.
     /// `None` when the path does not resolve to a file on this volume.
     pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
         let rel = self.to_relative(&normalize_separators(path))?;
         self.volume.file_data(&rel)
+    }
+
+    /// A file's bytes by folded volume-relative path.
+    pub fn file_bytes_relative(&self, relative: &[u8]) -> Option<&[u8]> {
+        self.volume.file_data_folded_relative(relative)
     }
 
     /// Total live node count (root included) — the volume's occupancy, for diagnostics.

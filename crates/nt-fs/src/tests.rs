@@ -740,6 +740,118 @@ fn writable_mount_covers_a_prefix_subtree_only() {
 }
 
 #[test]
+fn writable_mount_can_cover_system_config_under_windows_alias() {
+    const PREFIXES: &[&[u8]] = &[b"profiles", b"reactos\\system32\\config"];
+    assert_eq!(
+        writable_mount_relative(
+            &wide(r"\??\C:\Windows\system32\config\AppEvent.Evt"),
+            b"reactos",
+            PREFIXES
+        )
+        .as_deref(),
+        Some(&b"reactos\\system32\\config\\appevent.evt"[..])
+    );
+    assert_eq!(
+        writable_mount_relative(
+            &wide(r"\SystemRoot\system32\config\system"),
+            b"reactos",
+            PREFIXES
+        )
+        .as_deref(),
+        Some(&b"reactos\\system32\\config\\system"[..])
+    );
+    assert!(writable_mount_relative(
+        &wide(r"\??\C:\Windows\system32\notepad.exe"),
+        b"reactos",
+        PREFIXES
+    )
+    .is_none());
+}
+
+#[test]
+fn relative_provisioning_matches_writable_mount_relative_paths() {
+    let mut fs = FileSystem::new(MemFs::new());
+
+    assert!(fs.provision_directory_relative(b"reactos\\system32\\config"));
+    assert!(fs.provision_file_relative(b"reactos\\system32\\config\\SYSTEM", b"regf-system"));
+    assert_eq!(
+        fs.file_bytes_relative(b"reactos\\system32\\config\\system"),
+        Some(&b"regf-system"[..])
+    );
+
+    let event = fs.zw_create_file_relative(
+        b"reactos\\system32\\config\\appevent.evt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN_IF,
+        0,
+    );
+    assert_eq!(event.status, STATUS_SUCCESS);
+    assert_eq!(event.information, FILE_CREATED);
+
+    assert!(fs.provision_directory_relative(b"profiles\\Default User"));
+    let profile_child = fs.zw_create_file_relative(
+        b"profiles\\default user\\ntuser.dat",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(profile_child.status, STATUS_SUCCESS);
+}
+
+#[test]
+fn end_of_file_growth_on_extent_file_is_sparse_and_writable() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory_relative(b"reactos\\system32\\config"));
+    let file = fs.zw_create_file_relative(
+        b"reactos\\system32\\config\\appevent.evt",
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN_IF,
+        0,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+
+    let eventlog_default_size = 5 * 1024 * 1024u64;
+    assert_eq!(
+        fs.zw_set_information_file(
+            file.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &eventlog_default_size.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_query_standard_information(file.handle)
+            .unwrap()
+            .end_of_file,
+        eventlog_default_size
+    );
+
+    assert_eq!(
+        fs.zw_write_file(file.handle, Some(0), b"ElfFile\0"),
+        (STATUS_SUCCESS, 8)
+    );
+    assert_eq!(
+        fs.zw_query_standard_information(file.handle)
+            .unwrap()
+            .end_of_file,
+        eventlog_default_size
+    );
+    let (status, head) = fs.zw_read_file(file.handle, Some(0), 12);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(&head[..], b"ElfFile\0\0\0\0\0");
+    let (status, tail) = fs.zw_read_file(file.handle, Some(eventlog_default_size - 4), 4);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(&tail[..], &[0, 0, 0, 0]);
+    assert_eq!(fs.unique_data_blobs(), 1);
+}
+
+#[test]
 fn writable_volume_creates_writes_reads_and_enumerates() {
     let mut fs = FileSystem::new(MemFs::new());
     // CreateDirectoryW's syscall: FILE_CREATE + FILE_DIRECTORY_FILE.
@@ -1082,4 +1194,40 @@ fn provisioning_replaces_bytes_and_refuses_non_files() {
     assert_eq!(fs.file_bytes(r"\??\C:\profiles\Default User"), None);
     // A path that never resolved is an honest miss.
     assert_eq!(fs.file_bytes(r"\??\C:\profiles\nope.dat"), None);
+}
+
+#[test]
+fn provisioned_file_extend_reads_zeroes_and_materializes_on_write() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\profiles\AppEvent.Evt", b"evt"));
+    let f = fs.zw_create_file(
+        r"\??\C:\profiles\AppEvent.Evt",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        0,
+    );
+    assert_eq!(f.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(f.handle, FILE_END_OF_FILE_INFORMATION, &8u64.to_le_bytes()),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_query_standard_information(f.handle)
+            .unwrap()
+            .end_of_file,
+        8
+    );
+    let (status, bytes) = fs.zw_read_file(f.handle, Some(0), 8);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(&bytes, b"evt\0\0\0\0\0");
+
+    assert_eq!(
+        fs.zw_write_file(f.handle, Some(5), b"xy"),
+        (STATUS_SUCCESS, 2)
+    );
+    let (status, bytes) = fs.zw_read_file(f.handle, Some(0), 8);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(&bytes, b"evt\0\0xy\0");
 }

@@ -36,10 +36,13 @@ use crate::*;
 /// (lowercase, `\`-separated, no leading separator — the form `nt_path_to_volume_relative` emits).
 ///
 /// `profiles` is `%SystemDrive%\Profiles`, the `ProfilesDirectory` the real SOFTWARE hive names and
-/// the tree winlogon's `LoadUserProfileW` → `CreateUserProfileW` builds. It is deliberately narrow:
-/// everything else — above all `\reactos\…`, which carries the entire boot — keeps resolving
-/// through the read-only FAT reader, untouched.
-pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles"];
+/// the tree winlogon's `LoadUserProfileW` -> `CreateUserProfileW` builds.
+///
+/// `reactos\system32\config` is the installed-system state directory. The staged hives are copied
+/// into the writable volume at mount, then ordinary services can create their own state files there
+/// through `NtCreateFile` rather than hitting the read-only FAT reader. EventLog's
+/// `AppEvent.Evt`/`SecEvent.Evt`/`SysEvent.Evt` files are the first real users.
+pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles", b"reactos\\system32\\config"];
 
 /// ★ BYPASS SWITCH (the batch's control experiment). `false` unmounts the writable volume: every
 /// path below falls back to the pre-existing `STATUS_NOT_IMPLEMENTED` miss, `CreateDirectoryW`
@@ -248,7 +251,12 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
 
 /// The staged tree's FAT root name, and its mount point on the writable volume.
 pub(crate) const STAGED_PROFILES_DIR: &[u8] = b"Profiles";
-pub(crate) const PROFILES_VOLUME_ROOT: &str = r"\??\C:\Profiles";
+pub(crate) const PROFILES_VOLUME_ROOT_RELATIVE: &[u8] = b"profiles";
+pub(crate) const STAGED_CONFIG_DIR: &[u8] = br"reactos\system32\config";
+pub(crate) const CONFIG_VOLUME_ROOT_RELATIVE: &[u8] = b"reactos\\system32\\config";
+pub(crate) const CONFIG_SYSTEM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\system";
+pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] =
+    b"reactos\\system32\\config\\software";
 /// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
 /// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
 pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
@@ -282,6 +290,14 @@ pub(crate) static PROFILE_SOURCE_PROBE_OK: AtomicU64 = AtomicU64::new(0);
 /// Directory entries `Default User` really enumerates (`.`, `..` + its 15 real children), read back
 /// through the SAME `Zw*` record encoder `NtQueryDirectoryFile` — and so `FindFirstFileW` — uses.
 pub(crate) static PROFILE_SOURCE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Directories / files / content bytes really materialised from the staged
+/// `\reactos\system32\config` tree.
+pub(crate) static CONFIG_SOURCE_DIRS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONFIG_SOURCE_FILES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONFIG_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONFIG_SOURCE_SYSTEM_HIVE_OK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONFIG_SOURCE_SOFTWARE_HIVE_OK: AtomicU64 = AtomicU64::new(0);
 
 /// The mounted writable volume. `None` until the first path resolves into it (the volume is
 /// created lazily so a boot that never writes pays nothing).
@@ -383,6 +399,7 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
         if PROVISION_DEFAULT_USER_PROFILE {
             provision_staged_profiles(fs);
         }
+        provision_staged_config(fs);
         WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
     }
     slot.as_mut()
@@ -805,8 +822,87 @@ pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
 /// The FAT read buffer is fixed storage, not a temporary `Vec`: the writable filesystem owns the
 /// copied bytes after `provision_file`, and the service loop pins the mount syscall's dirty state.
 /// Keeping the read scratch out of the bump heap prevents that pin from retaining staging bytes.
-const MAX_STAGED_FILE: usize = 256 * 1024;
+const MAX_STAGED_FILE: usize = 1024 * 1024;
 static mut STAGED_FILE_COPY_BUF: [u8; MAX_STAGED_FILE] = [0; MAX_STAGED_FILE];
+
+#[derive(Clone, Copy, Default)]
+struct StagedTreeStats {
+    dirs: u64,
+    files: u64,
+    bytes: u64,
+    skipped_large_files: u64,
+}
+
+unsafe fn provision_staged_tree(
+    fs: &mut nt_fs::FileSystem,
+    fat: &Fat32,
+    root_cluster: u32,
+    volume_root_relative: &[u8],
+    max_depth: u32,
+) -> StagedTreeStats {
+    // Explicit DFS stack (no recursion in the executive): (fat cluster, volume path of the dir).
+    let mut stack: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, u32)> = alloc::vec::Vec::new();
+    let _ = fs.provision_directory_relative(volume_root_relative);
+    stack.push((
+        root_cluster,
+        volume_root_relative.to_vec(),
+        0,
+    ));
+    let mut stats = StagedTreeStats::default();
+    while let Some((cluster, base, depth)) = stack.pop() {
+        // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
+        // drive the sector cache, so the names are captured before any further reads.
+        let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        crate::fs_loader::fat_visit_directory(fat, cluster, |entry| {
+            let mut name = alloc::string::String::new();
+            for &unit in entry.name() {
+                if unit == 0 || unit > 0x7f {
+                    return true; // non-ASCII name: skip it rather than mangle it
+                }
+                name.push(unit as u8 as char);
+            }
+            if !name.is_empty() && name != "." && name != ".." {
+                names.push(name);
+            }
+            true
+        });
+        for name in names {
+            let Some((child, size, child_attr)) =
+                crate::fs_loader::dir_find_lfn(fat, cluster, name.as_bytes())
+            else {
+                continue;
+            };
+            let mut path = base.clone();
+            path.push(b'\\');
+            path.extend_from_slice(name.as_bytes());
+            if child_attr & 0x10 != 0 {
+                if fs.provision_directory_relative(&path) {
+                    stats.dirs += 1;
+                    if depth + 1 < max_depth {
+                        stack.push((child, path, depth + 1));
+                    }
+                }
+            } else if size as usize <= MAX_STAGED_FILE {
+                let data = core::slice::from_raw_parts_mut(
+                    core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
+                    size as usize,
+                );
+                let got = if size == 0 {
+                    0
+                } else {
+                    crate::fs_loader::fat_read_file(fat, child, size, data.as_mut_ptr() as u64)
+                };
+                if got == size && fs.provision_file_relative(&path, data) {
+                    stats.files += 1;
+                    stats.bytes += size as u64;
+                }
+            } else {
+                stats.skipped_large_files += 1;
+            }
+        }
+    }
+    stats
+}
 
 unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     let Some(fat) = crate::fs_loader::exec_fs() else {
@@ -822,69 +918,11 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     if attr & 0x10 == 0 {
         return;
     }
-    // Explicit DFS stack (no recursion in the executive): (fat cluster, volume path of the dir).
-    const MAX_DEPTH: u32 = 12;
-    let mut stack: alloc::vec::Vec<(u32, alloc::string::String, u32)> = alloc::vec::Vec::new();
-    let _ = fs.provision_directory(PROFILES_VOLUME_ROOT);
-    stack.push((
-        root_cluster,
-        alloc::string::String::from(PROFILES_VOLUME_ROOT),
-        0,
-    ));
-    let (mut dirs, mut files, mut bytes) = (0u64, 0u64, 0u64);
-    while let Some((cluster, base, depth)) = stack.pop() {
-        // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
-        // drive the sector cache, so the names are captured before any further reads.
-        let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-        crate::fs_loader::fat_visit_directory(&fat, cluster, |entry| {
-            let mut name = alloc::string::String::new();
-            for &unit in entry.name() {
-                if unit == 0 || unit > 0x7f {
-                    return true; // non-ASCII name: skip it rather than mangle it
-                }
-                name.push(unit as u8 as char);
-            }
-            if !name.is_empty() && name != "." && name != ".." {
-                names.push(name);
-            }
-            true
-        });
-        for name in names {
-            let Some((child, size, child_attr)) =
-                crate::fs_loader::dir_find_lfn(&fat, cluster, name.as_bytes())
-            else {
-                continue;
-            };
-            let mut path = base.clone();
-            path.push('\\');
-            path.push_str(&name);
-            if child_attr & 0x10 != 0 {
-                if fs.provision_directory(&path) {
-                    dirs += 1;
-                    if depth + 1 < MAX_DEPTH {
-                        stack.push((child, path, depth + 1));
-                    }
-                }
-            } else if size as usize <= MAX_STAGED_FILE {
-                let data = core::slice::from_raw_parts_mut(
-                    core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
-                    size as usize,
-                );
-                let got = if size == 0 {
-                    0
-                } else {
-                    crate::fs_loader::fat_read_file(&fat, child, size, data.as_mut_ptr() as u64)
-                };
-                if got == size && fs.provision_file(&path, &data) {
-                    files += 1;
-                    bytes += size as u64;
-                }
-            }
-        }
-    }
-    PROFILE_SOURCE_DIRS.store(dirs, Ordering::Relaxed);
-    PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
-    PROFILE_SOURCE_BYTES.store(bytes, Ordering::Relaxed);
+    let mut stats =
+        provision_staged_tree(fs, &fat, root_cluster, PROFILES_VOLUME_ROOT_RELATIVE, 12);
+    PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
+    PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
+    PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     // Read a REAL staged file back off the live volume, by content.
     if fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1") {
         PROFILE_SOURCE_PROBE_OK.store(1, Ordering::Relaxed);
@@ -899,27 +937,27 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
         match setup_image {
             Some(hive) if hive_image_ok(hive) => {
                 if fs.provision_file(DEFAULT_USER_NTUSER_DAT, hive) {
-                    files += 1;
-                    bytes += hive.len() as u64;
+                    stats.files += 1;
+                    stats.bytes += hive.len() as u64;
                     NTUSER_DAT_PROVISIONED.store(hive.len() as u64, Ordering::Relaxed);
                 }
             }
             _ => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),
         }
-        PROFILE_SOURCE_DIRS.store(dirs, Ordering::Relaxed);
-        PROFILE_SOURCE_FILES.store(files, Ordering::Relaxed);
-        PROFILE_SOURCE_BYTES.store(bytes, Ordering::Relaxed);
+        PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
+        PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
+        PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     }
     PROFILE_SOURCE_ENTRIES.store(
         count_entries(fs, DEFAULT_USER_PROFILE_DIR),
         Ordering::Relaxed,
     );
     print_str(b"[profile-source] materialised ::Profiles onto the writable volume: dirs=");
-    print_u64(dirs);
+    print_u64(stats.dirs);
     print_str(b" files=");
-    print_u64(files);
+    print_u64(stats.files);
     print_str(b" bytes=");
-    print_u64(bytes);
+    print_u64(stats.bytes);
     print_str(b" `Default User` dir-entries=");
     print_u64(PROFILE_SOURCE_ENTRIES.load(Ordering::Relaxed));
     print_str(b" probe-file-content-ok=");
@@ -931,6 +969,46 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     // source profile" is measured through the same navigator the registry will mount it with.
     print_u64(hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT) as u64);
     print_str(b")\n");
+}
+
+unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
+    let Some(fat) = crate::fs_loader::exec_fs() else {
+        print_str(b"[config-source] no FAT volume -> system32\\config NOT materialised\n");
+        return;
+    };
+    let Some((root_cluster, _, attr)) = crate::fs_loader::fat_open_path_entry(&fat, STAGED_CONFIG_DIR)
+    else {
+        print_str(b"[config-source] reactos\\system32\\config ABSENT -> not materialised\n");
+        return;
+    };
+    if attr & 0x10 == 0 {
+        return;
+    }
+    let stats = provision_staged_tree(fs, &fat, root_cluster, CONFIG_VOLUME_ROOT_RELATIVE, 4);
+    CONFIG_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
+    CONFIG_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
+    CONFIG_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
+    let system_hive_ok = fs
+        .file_bytes_relative(CONFIG_SYSTEM_HIVE_RELATIVE)
+        .is_some_and(hive_image_ok);
+    let software_hive_ok = fs
+        .file_bytes_relative(CONFIG_SOFTWARE_HIVE_RELATIVE)
+        .is_some_and(hive_image_ok);
+    CONFIG_SOURCE_SYSTEM_HIVE_OK.store(system_hive_ok as u64, Ordering::Relaxed);
+    CONFIG_SOURCE_SOFTWARE_HIVE_OK.store(software_hive_ok as u64, Ordering::Relaxed);
+    print_str(b"[config-source] materialised reactos\\system32\\config onto the writable volume: dirs=");
+    print_u64(stats.dirs);
+    print_str(b" files=");
+    print_u64(stats.files);
+    print_str(b" bytes=");
+    print_u64(stats.bytes);
+    print_str(b" skipped-large=");
+    print_u64(stats.skipped_large_files);
+    print_str(b" system-hive-ok=");
+    print_u64(system_hive_ok as u64);
+    print_str(b" software-hive-ok=");
+    print_u64(software_hive_ok as u64);
+    print_str(b"\n");
 }
 
 /// How many records a directory really enumerates through the `Zw*` surface (`.`, `..`, children) —
