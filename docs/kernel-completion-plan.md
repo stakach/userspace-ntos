@@ -321,7 +321,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    mutable hives behind the NT registry namespace, including `CurrentControlSet` resolution,
    create/set/query, longest-mount selection, and unmount. The real file-backed Hive I/O provider
    now installs primary images with temporary-file plus `FileRenameInformation` replacement and
-   reports real log length; the obsolete inert `nt-hive-core` placeholder provider is gone.
+   reports real log length; the obsolete inert `nt-hive-core` placeholder provider is gone. The
+   executive now instantiates a `MutableHiveSet` beside its borrowed `RegfHive` mounts for the boot
+   machine hives, `.Default`, and every `NtLoadKey` user hive; value reads can resolve through that
+   mutable authority by NT path while current handles keep their existing `KeyRef` encoding.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2100,3 +2103,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `RegfHive`/`RegistryOverlay` state and migrating one registry write syscall onto the live hive
   authority; D3 still needs explicit system/user hive and writable-overlay reboot proofs in the
   executive.
+
+- D2 executive mutable hive namespace slice. `ExecNtHandler` now owns a live
+  `nt_hive_core::MutableHiveSet` mounted at the same NT registry roots as the existing borrowed
+  `RegfHive` selectors. Boot imports mirror SYSTEM, SOFTWARE, SECURITY, SAM, and `.Default` into
+  clean mutable hive arenas; `NtLoadKey` imports mounted user hives into the same namespace and
+  `NtUnloadKey` unmounts them. `registry_value` now reads mounted-hive values through the mutable
+  authority by full NT path before falling back to the borrowed `RegfHive` navigator, while overlay
+  tombstone/shadow semantics remain intact. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-regf` with `11` tests passing, `cargo test -p nt-hive-core` with `31`
+  library tests plus `4` `gen_hive` tests passing, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next D2 slice should migrate `NtCreateKey`/`NtSetValueKey` for one mounted
+  hive root to mutate `MutableHiveSet` directly, then update enumeration/query stats to use the
+  mutable authority as the base view and retire the corresponding overlay shadow path.

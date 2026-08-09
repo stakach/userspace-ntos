@@ -7267,9 +7267,10 @@ pub(crate) unsafe fn service_sec_image(
                     heap_mark = allocator::mark();
                 }
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
-                // table's path `String`s above `heap_mark`. Same contract as `overlay_dirty` — a
-                // mounted hive must outlive the syscall that mounted it. (The hive BYTES live in a
-                // static slot, so only the paths need pinning.)
+                // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
+                // contract as `overlay_dirty` — a mounted hive must outlive the syscall that
+                // mounted it. (The source regf BYTES live in a static slot; the mutable cells own
+                // their runtime strings/value data.)
                 if nt_handler.hive_mounts_dirty {
                     nt_handler.hive_mounts_dirty = false;
                     heap_mark = allocator::mark();

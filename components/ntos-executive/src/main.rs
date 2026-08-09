@@ -81,8 +81,8 @@ use alloc::vec::Vec;
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
 use nt_config_manager::{DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START};
-use nt_hive_core::apply_ccs_alias;
-use nt_hive_regf::{KeyRef, RegfHive};
+use nt_hive_core::{apply_ccs_alias, HiveKind, MutableHiveSet};
+use nt_hive_regf::{import_regf_into_hive, KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
@@ -13474,6 +13474,27 @@ pub(crate) fn hive_mount(sel: u32) -> &'static str {
     }
 }
 
+pub(crate) fn hive_kind_for_selector(sel: u32) -> HiveKind {
+    match sel {
+        HIVE_SEL_SOFTWARE => HiveKind::Software,
+        HIVE_SEL_SECURITY => HiveKind::Security,
+        HIVE_SEL_SAM => HiveKind::Sam,
+        HIVE_SEL_USER_DEFAULT => HiveKind::Default,
+        sel if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel) => HiveKind::Default,
+        _ => HiveKind::System,
+    }
+}
+
+pub(crate) fn mount_mutable_regf_hive(
+    mutable_hives: &mut MutableHiveSet,
+    sel: u32,
+    mount_path: &str,
+    regf: &RegfHive<'_>,
+) {
+    let (hive, _stats) = import_regf_into_hive(regf, hive_kind_for_selector(sel));
+    mutable_hives.mount(mount_path, sel, hive);
+}
+
 /// ── `NtLoadKey` / `NtUnloadKey` — the run-time hive mounts ────────────────────────────────────
 /// One mounted `regf` hive that is NOT one of the four boot mounts: its selector, the NT path it
 /// is mounted at, the file it was loaded from, and the parsed navigator over its bytes.
@@ -15910,8 +15931,14 @@ struct ExecNtHandler {
     /// reallocate; the run-time `String` growth is pinned via `hive_mounts_dirty`.
     pub(crate) hive_mounts: alloc::vec::Vec<HiveMount>,
     /// Set by `NtLoadKey`/`NtUnloadKey`; the service loop pins the bump-heap mark past the mount's
-    /// path strings so the mount survives the per-syscall reset (the `overlay_dirty` contract).
+    /// path strings and mutable hive import arena so the mount survives the per-syscall reset (the
+    /// `overlay_dirty` contract).
     pub(crate) hive_mounts_dirty: bool,
+    /// Owned mutable hive authority mounted at the same NT registry roots as the borrowed `RegfHive`
+    /// selectors. Current handles still carry the existing `KeyRef` encoding while D2 migrates one
+    /// syscall family at a time; read helpers use this authority by path so future writes have a
+    /// single live hive arena to land in.
+    mutable_hives: MutableHiveSet,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark

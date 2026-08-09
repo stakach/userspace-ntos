@@ -993,6 +993,19 @@ impl ExecNtHandler {
                 RegfHive::new(core::slice::from_raw_parts(SWHIVEBUF_VADDR as *const u8, n))
             }
         };
+        let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
+        if let Some(ref regf) = hive {
+            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SYSTEM, hive_mount(HIVE_SEL_SYSTEM), regf);
+        }
+        if let Some(ref regf) = software_hive {
+            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SOFTWARE, hive_mount(HIVE_SEL_SOFTWARE), regf);
+        }
+        if let Some(ref regf) = security_hive {
+            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SECURITY, hive_mount(HIVE_SEL_SECURITY), regf);
+        }
+        if let Some(ref regf) = sam_hive {
+            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SAM, hive_mount(HIVE_SEL_SAM), regf);
+        }
         // ★ THE `\Registry\User` MOUNT TABLE. `\Registry\User\.Default` is the genuine
         // `config\default` (`$$$PROTO.HIV`) the storage host read BY PATH into DEFHIVEBUF, mounted
         // exactly where `CmpInitializeHiveList` mounts it on a real NT boot — and mounted through
@@ -1002,6 +1015,12 @@ impl ExecNtHandler {
             alloc::vec::Vec::with_capacity(1 + USER_HIVE_SLOTS);
         unsafe {
             if let Some(hive) = crate::writable_fs::default_hive_bytes().and_then(RegfHive::new) {
+                mount_mutable_regf_hive(
+                    &mut mutable_hives,
+                    HIVE_SEL_USER_DEFAULT,
+                    hive_mount(HIVE_SEL_USER_DEFAULT),
+                    &hive,
+                );
                 hive_mounts.push(HiveMount {
                     sel: HIVE_SEL_USER_DEFAULT,
                     canon: alloc::string::String::from(r"\registry\user\.default"),
@@ -1079,6 +1098,7 @@ impl ExecNtHandler {
         write_field!(software_hive, software_hive);
         write_field!(hive_mounts, hive_mounts);
         write_field!(hive_mounts_dirty, false);
+        write_field!(mutable_hives, mutable_hives);
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
@@ -2214,6 +2234,7 @@ impl ExecNtHandler {
             print_ascii_str(&full);
             print_str(b"\n");
         }
+        mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, &hive);
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
             canon,
@@ -2490,6 +2511,7 @@ impl ExecNtHandler {
         if let Some(slot) = mount.slot {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
+        let _ = self.mutable_hives.unmount(&mount.mount);
         let overlay_detached = self.overlay.detach_subtree(&canon);
         self.overlay_dirty = true;
         self.hive_mounts_dirty = true;
@@ -2517,11 +2539,31 @@ impl ExecNtHandler {
         })
     }
 
+    fn mutable_registry_value_by_path(
+        &self,
+        full_path: &str,
+        name: &str,
+    ) -> Option<(u32, alloc::vec::Vec<u8>)> {
+        let key = self.mutable_hives.resolve_key(full_path)?;
+        let (ty, data) = self.mutable_hives.query_value(key, name)?;
+        Some((ty as u32, data.to_vec()))
+    }
+
+    fn mutable_registry_value(
+        &self,
+        target: KeyRef,
+        name: &str,
+    ) -> Option<(u32, alloc::vec::Vec<u8>)> {
+        let full_path = self.registry_target_path(target)?;
+        self.mutable_registry_value_by_path(&full_path, name)
+    }
+
     fn registry_path_exists(&self, canon: &str) -> bool {
         matches!(
             canon,
             r"\" | r"\registry" | r"\registry\machine" | r"\registry\user"
         ) || self.overlay.find(canon).is_some()
+            || self.mutable_hives.resolve_key(canon).is_some()
             || self.resolve_key(canon).is_some()
     }
 
@@ -2554,10 +2596,14 @@ impl ExecNtHandler {
                 return Some((ty, data.to_vec()));
             }
             let path = self.overlay.path(index)?;
-            return self.resolve_key(path).and_then(|key| {
+            return self.mutable_registry_value_by_path(path, name).or_else(|| {
+                let key = self.resolve_key(path)?;
                 let (hive, cell) = self.base_hive(key)?;
                 hive.value(cell, name)
             });
+        }
+        if let Some(value) = self.mutable_registry_value(target, name) {
+            return Some(value);
         }
         let (hive, cell) = self.base_hive(target)?;
         hive.value(cell, name)
