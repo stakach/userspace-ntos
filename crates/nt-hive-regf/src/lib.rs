@@ -28,6 +28,7 @@ use nt_config_manager::{
     ConfigManager, Registry, RegistryKeyId, RegistryValueType, CONTROL_CLASS_PATH, ENUM_PATH,
     SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
 };
+use nt_hive_core::{CellId, Hive, HiveKind};
 
 const HBIN_BASE: usize = 0x1000;
 
@@ -40,6 +41,14 @@ pub struct RegfHive<'a> {
 
 /// A reference to a key node (its hbin-relative cell offset).
 pub type KeyRef = u32;
+
+/// Import accounting for copying a real `regf` hive into the mutable Hive Manager arena.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegfHiveImportStats {
+    pub keys: usize,
+    pub values: usize,
+    pub skipped_values: usize,
+}
 
 fn u16le(b: &[u8], off: usize) -> Option<u16> {
     b.get(off..off + 2)
@@ -579,6 +588,53 @@ impl<'a> RegfHive<'a> {
     }
 }
 
+/// Copy a real read-only `regf` image into the mutable Hive Manager arena.
+///
+/// The returned hive is clean: import-time construction does not appear as dirty runtime state, and
+/// the first later `HiveManager::mutate` call owns sequence number 1. Malformed value records are
+/// counted and skipped, matching the read-only parser's fail-closed cell access.
+pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, RegfHiveImportStats) {
+    let mut target = Hive::new(kind);
+    let mut stats = RegfHiveImportStats {
+        keys: 1,
+        ..RegfHiveImportStats::default()
+    };
+    let root = target.root();
+    import_regf_key_into_hive(source, source.root(), &mut target, root, &mut stats, 0);
+    target.finish_clean_import();
+    (target, stats)
+}
+
+fn import_regf_key_into_hive(
+    source: &RegfHive<'_>,
+    source_key: KeyRef,
+    target: &mut Hive,
+    target_key: CellId,
+    stats: &mut RegfHiveImportStats,
+    depth: usize,
+) {
+    if depth > 256 {
+        return;
+    }
+    for index in 0..source.value_count(source_key) {
+        let Some((name, raw_type, data)) = source.value_by_index(source_key, index) else {
+            stats.skipped_values += 1;
+            continue;
+        };
+        let value_type = RegistryValueType::from_u32(raw_type).unwrap_or(RegistryValueType::Binary);
+        if target.set_value(target_key, &name, value_type, data) {
+            stats.values += 1;
+        } else {
+            stats.skipped_values += 1;
+        }
+    }
+    for (child_name, source_child) in source.subkeys_raw(source_key) {
+        let target_child = target.create_subkey(target_key, &child_name);
+        stats.keys += 1;
+        import_regf_key_into_hive(source, source_child, target, target_child, stats, depth + 1);
+    }
+}
+
 /// Import counts for a control-set snapshot loaded into Configuration Manager state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlSetImportCounts {
@@ -1092,6 +1148,70 @@ mod tests {
             .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
             .and_then(|key| cm.registry().query_dword(key, "Answer"));
         assert_eq!(answer, Some(42));
+    }
+
+    #[test]
+    fn imports_regf_into_mutable_hive_authority() {
+        let data = services_test_hive();
+        let source = RegfHive::new(&data).expect("valid test hive");
+        let (mut hive, stats) = import_regf_into_hive(&source, HiveKind::System);
+
+        assert_eq!(
+            stats,
+            RegfHiveImportStats {
+                keys: 11,
+                values: 9,
+                skipped_values: 0,
+            }
+        );
+        assert_eq!(hive.dirty_count(), 0);
+        assert_eq!(hive.sequence, 0);
+        assert_eq!(hive.generation, 0);
+
+        let npfs = hive.open_key(r"ControlSet001\Services\Npfs").expect("Npfs");
+        assert_eq!(
+            hive.query_dword(npfs, "Type"),
+            Some(nt_config_manager::SERVICE_FILE_SYSTEM_DRIVER)
+        );
+        assert_eq!(
+            hive.query_dword(npfs, "Start"),
+            Some(nt_config_manager::SERVICE_SYSTEM_START)
+        );
+        let (image_ty, image_data) = hive.query_value(npfs, "ImagePath").unwrap();
+        assert_eq!(image_ty, RegistryValueType::ExpandSz);
+        assert_eq!(
+            image_data,
+            utf16le_sz(r"system32\drivers\npfs.sys").as_slice()
+        );
+
+        let answer = hive
+            .open_key(r"ControlSet001\Services\Npfs\Parameters")
+            .and_then(|key| hive.query_dword(key, "Answer"));
+        assert_eq!(answer, Some(42));
+        let enum_instance = hive
+            .open_key(r"ControlSet001\Enum\PCI\VEN_8086&DEV_100E\3&11583659&0&18")
+            .expect("PCI instance");
+        let (service_ty, service_data) = hive.query_value(enum_instance, "Service").unwrap();
+        assert_eq!(service_ty, RegistryValueType::Sz);
+        assert_eq!(service_data, utf16le_sz("E1000").as_slice());
+
+        let mut manager = nt_hive_core::HiveManager::new(nt_hive_core::MemoryHiveIoProvider::new());
+        manager.flush(&mut hive).expect("checkpoint imported hive");
+        let provider = manager.into_provider();
+        let mut reboot_manager = nt_hive_core::HiveManager::new(provider);
+        let rebooted = reboot_manager.boot(HiveKind::System).expect("reboot hive");
+        let reboot_npfs = rebooted
+            .open_key(r"ControlSet001\Services\Npfs")
+            .expect("rebooted Npfs");
+        assert_eq!(rebooted.query_dword(reboot_npfs, "ErrorControl"), Some(1));
+        let (reboot_image_ty, reboot_image_data) =
+            rebooted.query_value(reboot_npfs, "ImagePath").unwrap();
+        assert_eq!(reboot_image_ty, RegistryValueType::ExpandSz);
+        assert_eq!(
+            reboot_image_data,
+            utf16le_sz(r"system32\drivers\npfs.sys").as_slice()
+        );
+        assert_eq!(rebooted.dirty_count(), 0);
     }
 
     #[test]

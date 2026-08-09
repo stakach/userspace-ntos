@@ -73,7 +73,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
   `NtSaveKey` and writable-overlay `FileRenameInformation` are now real; D2/D3 still own live hive
   authority plus explicit flush/reboot persistence proofs.
-- `[ ]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
+- `[~]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors.
 - `[ ]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
@@ -314,7 +314,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    delete-on-close remove the renamed path; variable-length rename buffers use the bounded overlay
    scratch path instead of the old 64-byte staging limit. D2/D3/D4 still need the Configuration
    Manager/Hive Manager to become the live authority for mutable hives, durable setup/profile state,
-   subtree save serialization, and remaining long-lived registry data.
+   subtree save serialization, and remaining long-lived registry data. The first bridge is now
+   host-tested: real read-only `regf` trees can be imported into clean mutable `Hive` arenas and
+   checkpointed/rebooted through `HiveManager`.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2049,3 +2051,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: D1's rename/delete/writeback audit is now materially smaller; continue D2/D3
   by moving mutable hive state into the CM/Hive Manager authority and adding explicit flush/reboot
   persistence proofs, or resume A4/B3 structural cleanup.
+
+- D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
+  `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
+  mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported
+  hive is finalized with `Hive::finish_clean_import`, so construction from already-persistent hive
+  bytes does not appear as dirty runtime state and later `HiveManager` mutations start at sequence
+  one. Host tests import the existing synthetic services/Enum/ServiceGroupOrder REGF fixture,
+  validate values through the mutable `Hive` API, checkpoint it through `HiveManager`, and boot it
+  back with the same data and a clean dirty set. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core`, `cargo test -p nt-hive-regf`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next D2 slice can introduce an executive-side mutable hive mount table in
+  parallel with the existing `RegfHive` selectors, then migrate `NtCreateKey`/`NtSetValueKey` off
+  `RegistryOverlay` one mounted hive at a time.

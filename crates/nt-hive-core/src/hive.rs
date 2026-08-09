@@ -208,6 +208,23 @@ impl Hive {
         self.dirty.clear();
     }
 
+    /// A boot/import path has just populated this hive from already-persistent backing bytes.
+    ///
+    /// The imported cells are the new clean baseline: future `HiveManager::mutate` calls should be
+    /// the first journalled sequence numbers, and a later checkpoint should not report import-time
+    /// construction as dirty runtime state.
+    pub fn finish_clean_import(&mut self) {
+        self.sequence = 0;
+        self.generation = 0;
+        for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
+            match cell {
+                Cell::Key(key) => key.last_write_sequence = 0,
+                Cell::Value(value) => value.last_write_sequence = 0,
+            }
+        }
+        self.clear_dirty();
+    }
+
     /// `ZwSetValueKey` — set (create or replace) a named value on a key cell.
     pub fn set_value(
         &mut self,
