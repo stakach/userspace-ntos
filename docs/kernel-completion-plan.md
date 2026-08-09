@@ -288,8 +288,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    across the hole fail with `STATUS_NOT_COMMITTED`, recommit can restore a committed subrange with
    new protection, and capacity failures preserve the original committed allocation. The latest
    protect-rollback slice pins both private override exhaustion and committed mapped-range split
-   exhaustion as transactional failures. Continue with the remaining C4 overlap and `MEM_TOP_DOWN`
-   matrix plus D1/D2 mutable registry/filesystem authority.
+   exhaustion as transactional failures. The latest `MEM_TOP_DOWN` slice pins high-address
+   placement through occupied top ranges and free-gap query reporting after top-down allocation.
+   Continue with the remaining C4 overlap matrix plus D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1954,3 +1955,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo test -p nt-address-space` with `47` tests passing. Review adjustment: mapped/private
   protect capacity rollback is pinned host-side; continue C4 with overlap and `MEM_TOP_DOWN`
   placement/query gates before moving back to A4/B3 or D1/D2.
+
+- C4 `MEM_TOP_DOWN` placement regression slice. The private VAD policy now has host coverage for
+  top-down placement through occupied high ranges: allocation skips a committed range at the top of
+  the user arena, chooses the highest allocation-granularity gap below it, repeats into the next
+  high gap, and `query_basic` reports the free span after a top-down one-page allocation as bounded
+  by the next VAD. Validation: `cargo fmt --all` and `cargo test -p nt-address-space` with `48`
+  tests passing. Review adjustment: top-down placement/query behavior is pinned host-side; continue
+  C4 with overlap and cross-authority query/protect gates, then return to A4/B3 or D1/D2.

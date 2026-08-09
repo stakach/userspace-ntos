@@ -843,6 +843,57 @@ fn fixed_vm_map_places_top_down_and_honors_zero_bits_ceiling() {
 }
 
 #[test]
+fn fixed_vm_map_top_down_skips_conflicts_and_reports_high_gap() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x20_0000);
+    map.allocate(
+        Some(0x1f_0000),
+        0x10000,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    map.allocate(
+        Some(0x1c_0000),
+        0x10000,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+
+    let first = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(first.base, 0x1e_0000);
+
+    let second = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert_eq!(second.base, 0x1d_0000);
+    assert_eq!(
+        map.query_basic(0x1d_1000, 0x20_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x1d_1000,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: 0xf000,
+            state: MEM_FREE,
+            protect: PAGE_NOACCESS,
+            type_: 0,
+        }
+    );
+}
+
+#[test]
 fn fixed_vm_map_reset_preserves_existing_commit() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map
