@@ -364,6 +364,17 @@ pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedVie
     }
 }
 
+pub fn mapped_view_fault_access_status(protection: u32, write_fault: bool) -> Result<(), u32> {
+    let base = protection & 0xff;
+    if protection & PAGE_GUARD != 0 || base == PAGE_NOACCESS {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    if write_fault && !matches!(base, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
 pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewFaultPlan {
     let base = protection & 0xff;
     let modifiers = protection & !0xff;

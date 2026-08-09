@@ -1197,6 +1197,38 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
 }
 
 #[test]
+fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_READONLY, false),
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_READONLY, true),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_READWRITE, true),
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_EXECUTE_READWRITE, true),
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_NOACCESS, false),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_READWRITE | PAGE_GUARD, false),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_WRITECOPY, true),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}
+
+#[test]
 fn image_view_fault_plan_tracks_writecopy_cow() {
     assert_eq!(
         image_view_fault_plan(PAGE_WRITECOPY, false),

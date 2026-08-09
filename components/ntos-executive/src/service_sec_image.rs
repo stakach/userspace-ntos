@@ -805,6 +805,7 @@ unsafe fn service_generic_section_fault(
     if view_info.type_ != nt_address_space::MEM_MAPPED {
         return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
     }
+    nt_address_space::mapped_view_fault_access_status(view_info.protect, write_fault)?;
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
         if write_fault && fault_plan.mark_dirty {

@@ -255,10 +255,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
    mapping run covering that view, including runs split by `NtProtectVirtualMemory`. Boot proof
    `.tmp/boot-committed-view-range-unregister-20260809.log` is fully green at `293/293` with
    `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
+   and `exec_explorer_shell_chrome_painted` all passing. The latest C4 mapped-view fault access
+   slice adds a host-tested `mapped_view_fault_access_status` verdict and makes generic section
+   faults fail guard/no-access mappings, read-only writes, and unsupported mapped writecopy writes
+   with real `STATUS_ACCESS_VIOLATION` before any page is demand-filled. Boot proof
+   `.tmp/boot-mapped-view-fault-access-20260809.log` is fully green at `293/293` with
+   `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
    and `exec_explorer_shell_chrome_painted` all passing. Continue the plan from the remaining
    structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, broader C4 overlap/decommit/protect/guard/no-access regressions,
-   and D1/D2 mutable registry/filesystem authority.
+   B3's real video/driver binding, true mapped data-section writecopy COW, execute/NX fault
+   verdicts, broader C4 overlap/decommit/protect regressions, and D1/D2 mutable registry/filesystem
+   authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1801,3 +1808,21 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: committed-view teardown has a direct regression now; continue C4 with broader
   VAD overlap, partial decommit/release, `MEM_TOP_DOWN`, guard/no-access, and private/mapped protect
   matrix gates, then move into D1/D2 durability authority.
+
+- C4 mapped-view fault access slice. `nt-address-space` now exposes a host-tested
+  `mapped_view_fault_access_status` verdict for generic data-section faults: guard and no-access
+  mappings fail before any page map, write faults require write-through protections, and mapped
+  write-copy writes currently fail with a real access violation instead of being treated as
+  successful dirty writeback. The executive generic-section fault path consumes that verdict before
+  resident or nonresident mapping, so read-only writes cannot demand-fill a page and loop.
+  Validation: `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-mapped-view-fault-access-20260809.log`. Result: kernel specs pass, the full executive
+  gate is `293/293`, `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`,
+  `exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted` all remain green,
+  `ut-free=52153KiB`, `image-mapcaps=7749`, `vad=40/96`, `committed-map=233/512`, and explorer
+  shell chrome still paints `34873` non-background pixels. Review adjustment: next C4 work is true
+  mapped data-section writecopy COW and execute/NX fault verdicts, then broader private/mapped
+  protect, decommit, release, overlap, and `MEM_TOP_DOWN` matrix gates.
