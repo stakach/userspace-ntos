@@ -68,6 +68,7 @@ struct OverlayValue {
 struct OverlayKey {
     path: String,
     values: Vec<OverlayValue>,
+    security_descriptor: Option<usize>,
     detached: bool,
 }
 
@@ -150,11 +151,13 @@ impl RegistryOverlay {
         if let Some(i) = self.keys.iter().position(|k| k.path == canon && k.detached) {
             self.keys[i].detached = false;
             self.keys[i].values.clear();
+            self.keys[i].security_descriptor = None;
             return (i, true);
         }
         self.keys.push(OverlayKey {
             path: canon,
             values: Vec::new(),
+            security_descriptor: None,
             detached: false,
         });
         (self.keys.len() - 1, true)
@@ -293,6 +296,23 @@ impl RegistryOverlay {
         }
         self.blobs.push(data);
         self.blobs.len() - 1
+    }
+
+    pub fn set_key_security_descriptor(&mut self, idx: usize, descriptor: &[u8]) -> bool {
+        if !self.keys.get(idx).is_some_and(|k| !k.detached) {
+            return false;
+        }
+        let data_index = self.intern_data_slice(descriptor);
+        let Some(k) = self.keys.get_mut(idx).filter(|k| !k.detached) else {
+            return false;
+        };
+        k.security_descriptor = Some(data_index);
+        true
+    }
+
+    pub fn key_security_descriptor(&self, idx: usize) -> Option<&[u8]> {
+        let k = self.keys.get(idx).filter(|k| !k.detached)?;
+        self.blobs.get(k.security_descriptor?).map(Vec::as_slice)
     }
 
     /// Hide a value in this overlay, including a value that exists only in the read-only base hive.
@@ -536,6 +556,20 @@ mod tests {
 
         assert_eq!(ov.unique_data_blobs(), 1);
         assert_eq!(ov.value(b, "security"), Some((3, &b"descriptor"[..])));
+    }
+
+    #[test]
+    fn key_security_descriptors_are_key_metadata() {
+        let mut ov = RegistryOverlay::new();
+        let (a, _) = ov.create(r"\a");
+        let (b, _) = ov.create(r"\b");
+        let descriptor = b"\x01\x00\x00\x80";
+
+        assert!(ov.set_key_security_descriptor(a, descriptor));
+        assert!(ov.set_key_security_descriptor(b, descriptor));
+        assert_eq!(ov.unique_data_blobs(), 1);
+        assert_eq!(ov.key_security_descriptor(a), Some(&descriptor[..]));
+        assert_eq!(ov.key_security_descriptor(b), Some(&descriptor[..]));
     }
 
     #[test]

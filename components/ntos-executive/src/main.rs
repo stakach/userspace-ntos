@@ -17309,6 +17309,7 @@ fn build_nt_table() -> NativeServiceTable {
                 SSN_NT_SET_SYSTEM_INFORMATION as u32,
             ),
             (NativeService::NtUnmapViewOfSection, 277),
+            (NativeService::NtQuerySecurityObject, 176),
             (NativeService::NtSetSecurityObject, 246),
             (NativeService::NtResumeThread, 214),
             (NativeService::NtSetInformationObject, 236),

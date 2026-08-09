@@ -491,6 +491,7 @@ fn group_a_services_register_with_exact_bounds() {
         (NativeService::NtOpenProcessToken, 129),
         (NativeService::NtMakeTemporaryObject, 110),
         (NativeService::NtFreeVirtualMemory, 87),
+        (NativeService::NtQuerySecurityObject, 176),
         (NativeService::NtResumeThread, 214),
         (NativeService::NtSetInformationObject, 236),
         (NativeService::NtSetSecurityObject, 246),

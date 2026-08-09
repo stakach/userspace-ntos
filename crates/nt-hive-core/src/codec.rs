@@ -10,7 +10,8 @@ use crate::hive::{Cell, CellId, Hive, HiveKind, KeyCell, RegistryValueType, Valu
 
 const IMAGE_MAGIC: [u8; 8] = *b"UNTHIVE1";
 const IMAGE_HEADER_LEN: usize = 8 + 2 + 2 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4; // 68
-const SCHEMA_VERSION: u16 = 1;
+const MIN_SCHEMA_VERSION: u16 = 1;
+const SCHEMA_VERSION: u16 = 2;
 
 const REC_KEY_CELL: u16 = 1;
 const REC_VALUE_CELL: u16 = 2;
@@ -46,6 +47,13 @@ pub fn encode_image(hive: &Hive) -> Vec<u8> {
             Some(c) => {
                 p.u8(1);
                 p.str16(c);
+            }
+            None => p.u8(0),
+        }
+        match &k.security_descriptor {
+            Some(descriptor) => {
+                p.u8(1);
+                p.blob(descriptor);
             }
             None => p.u8(0),
         }
@@ -94,7 +102,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
     }
     let _hsize = r.u16().ok_or(HiveDecodeError::Truncated)?;
     let schema = r.u16().ok_or(HiveDecodeError::Truncated)?;
-    if schema != SCHEMA_VERSION {
+    if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema) {
         return Err(HiveDecodeError::UnsupportedSchema);
     }
     let _flags = r.u32().ok_or(HiveDecodeError::Truncated)?;
@@ -132,6 +140,14 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     0 => None,
                     _ => Some(pr.str16().ok_or(HiveDecodeError::Truncated)?),
                 };
+                let security_descriptor = if schema >= 2 {
+                    match pr.u8().ok_or(HiveDecodeError::Truncated)? {
+                        0 => None,
+                        _ => Some(pr.blob().ok_or(HiveDecodeError::Truncated)?),
+                    }
+                } else {
+                    None
+                };
                 let seq = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 // The root cell has no parent (encoded as 0); every other key links to its parent.
                 let parent = (id.0 != root_cell).then_some(CellId(parent_raw));
@@ -142,6 +158,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     subkeys: Vec::new(),
                     values: Vec::new(),
                     class_name,
+                    security_descriptor,
                     last_write_sequence: seq,
                 });
             }

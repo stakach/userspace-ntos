@@ -88,8 +88,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   deletes leaf keys through the same authority, including mounted mutable hives, while root/non-leaf
   keys return `STATUS_CANNOT_DELETE` and borrowed `regf` keys remain read-only. Mounted mutable-hive
   keys now preserve class strings, round-trip them through host-tested hive images, and expose them
-  through `NtCreateKey`, `NtQueryKey`, `NtEnumerateKey`, and key-stat maximum class lengths. Remaining
-  D2 work is security metadata and any still-overlay-backed persistent paths.
+  through `NtCreateKey`, `NtQueryKey`, `NtEnumerateKey`, and key-stat maximum class lengths. Registry
+  keys now also own real self-relative security descriptor metadata: `NtCreateKey` captures initial
+  descriptors, `NtSetSecurityObject` merges selected components into mounted mutable hives/volatile
+  overlay keys, and `NtQuerySecurityObject` returns sized descriptor data instead of relying on a
+  no-op success path. Remaining D2 work is any still-overlay-backed persistent paths.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
@@ -346,7 +349,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    fallback routes. `NtDeleteKey` is also registered at SSN 66 and deletes leaf keys in mounted
    mutable hives or the volatile overlay with ReactOS/NT-style root and non-leaf refusal. Mutable
    mounted keys now also store/query/enumerate key-class metadata instead of reporting every mounted
-   key as classless; the host hive image tests prove class data survives checkpoint/decode.
+   key as classless; the host hive image tests prove class data survives checkpoint/decode. The
+   object-security fallback is also gone for registry handles: `NtQuerySecurityObject` is registered
+   at SSN 176, `NtSetSecurityObject` no longer returns unconditional success, and key security
+   descriptors are captured, queried, merged, and stored through the mutable-hive/overlay authority.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2148,3 +2154,20 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the next D2 slice can now give newly mutable-created keys a handle identity and
   move `NtCreateKey`/`NtSetValueKey` for a selected mounted hive root off `RegistryOverlay`, because
   the main query/enumeration paths already see the mutable authority as their base view.
+
+- D2 registry key security metadata slice. `nt-security` now captures native absolute or
+  self-relative `SECURITY_DESCRIPTOR`s into validated self-relative byte descriptors, can query
+  selected owner/group/DACL/SACL components, and can merge `NtSetSecurityObject` updates while
+  preserving unselected components and DACL/SACL protection bits. `nt-hive-core` stores key security
+  descriptors as key metadata in schema-2 mutable hive images while remaining able to decode schema-1
+  images, and the volatile overlay carries descriptor metadata separately from values. The executive
+  now registers `NtQuerySecurityObject` at SSN 176, removes the no-op `NtSetSecurityObject` fallback,
+  captures `OBJECT_ATTRIBUTES.SecurityDescriptor` for newly-created keys, enforces
+  `READ_CONTROL`/`WRITE_DAC`/`WRITE_OWNER`/`ACCESS_SYSTEM_SECURITY` on registry handles, and serves
+  real query/set descriptor bytes from mounted mutable hives or volatile overlay keys. Validation:
+  `cargo fmt --all`, `cargo test -p nt-security`, `cargo test -p nt-hive-core`,
+  `cargo test -p nt-syscall`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: D2 security/class metadata is now materially closed for live registry keys; the
+  remaining D2 audit should look for persistent paths still forced through `RegistryOverlay`, then
+  move to D3 explicit flush/reboot proofs.

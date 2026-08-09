@@ -1009,6 +1009,33 @@ fn self_relative_sd(owner: &[u8], group: &[u8], dacl: Option<&[u8]>) -> Vec<u8> 
     sd
 }
 
+fn sd_owner(sd: &[u8]) -> Option<&[u8]> {
+    sd_sid_component(sd, 4)
+}
+
+fn sd_group(sd: &[u8]) -> Option<&[u8]> {
+    sd_sid_component(sd, 8)
+}
+
+fn sd_dacl(sd: &[u8]) -> Option<&[u8]> {
+    let offset = u32::from_le_bytes(sd[16..20].try_into().unwrap()) as usize;
+    if offset == 0 {
+        return None;
+    }
+    let len = u16::from_le_bytes(sd[offset + 2..offset + 4].try_into().unwrap()) as usize;
+    Some(&sd[offset..offset + len])
+}
+
+fn sd_sid_component(sd: &[u8], offset_field: usize) -> Option<&[u8]> {
+    let offset =
+        u32::from_le_bytes(sd[offset_field..offset_field + 4].try_into().unwrap()) as usize;
+    if offset == 0 {
+        return None;
+    }
+    let len = 8 + sd[offset + 1] as usize * 4;
+    Some(&sd[offset..offset + len])
+}
+
 // A mock layout mirroring exactly what lsasrv's `LsapLogonUser` hands `NtCreateToken` for
 // `LsaTokenInformationV1` (`dll/win32/lsasrv/authpackage.c:1655`).
 const USER_SID_VA: u64 = 0x0000_0007_0001_0000;
@@ -1394,6 +1421,90 @@ fn capture_absolute_security_descriptor_dereferences_native_pointers() {
         ProcessorMode::UserMode,
     );
     assert_eq!(result.status, STATUS_ACCESS_DENIED);
+}
+
+#[test]
+fn security_descriptor_bytes_capture_self_relative_and_query_components() {
+    let mut client = MockClient::default();
+    let owner = native_sid(5, &[21, MACHINE, 1000]);
+    let group = native_sid(5, &[32, 545]);
+    let everyone = native_sid(1, &[0]);
+    let dacl = acl_with_aces(&[access_ace(0, FILE_READ, &everyone)]);
+    let sd_bytes = self_relative_sd(&owner, &group, Some(&dacl));
+    client.map(0xB800, &sd_bytes);
+
+    let captured = capture_security_descriptor_bytes(&client, 0xB800).unwrap();
+    assert_eq!(captured, sd_bytes);
+
+    let queried = query_security_descriptor_bytes(&captured, DACL_SECURITY_INFORMATION).unwrap();
+    assert_eq!(sd_owner(&queried), None);
+    assert_eq!(sd_group(&queried), None);
+    assert_eq!(sd_dacl(&queried), Some(dacl.as_slice()));
+}
+
+#[test]
+fn security_descriptor_bytes_capture_absolute_normalizes_to_self_relative() {
+    let mut client = MockClient::default();
+    let owner = native_sid(5, &[21, MACHINE, 1000]);
+    let group = native_sid(5, &[32, 545]);
+    let admins = native_sid(5, &[32, 544]);
+    let dacl = acl_with_aces(&[access_ace(0, FILE_WRITE, &admins)]);
+
+    const SD_VA: u64 = 0x0000_0007_0004_0000;
+    const OWNER_VA: u64 = 0x0000_0007_0004_0100;
+    const GROUP_VA: u64 = 0x0000_0007_0004_0200;
+    const DACL_VA: u64 = 0x0000_0007_0004_0300;
+    let mut sd_bytes = vec![0u8; 40];
+    sd_bytes[0] = 1;
+    sd_bytes[2..4].copy_from_slice(&0x0004u16.to_le_bytes());
+    sd_bytes[8..16].copy_from_slice(&OWNER_VA.to_le_bytes());
+    sd_bytes[16..24].copy_from_slice(&GROUP_VA.to_le_bytes());
+    sd_bytes[32..40].copy_from_slice(&DACL_VA.to_le_bytes());
+    client.map(SD_VA, &sd_bytes);
+    client.map(OWNER_VA, &owner);
+    client.map(GROUP_VA, &group);
+    client.map(DACL_VA, &dacl);
+
+    let captured = capture_security_descriptor_bytes(&client, SD_VA).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([captured[2], captured[3]]) & 0x8000,
+        0x8000
+    );
+    assert_eq!(sd_owner(&captured), Some(owner.as_slice()));
+    assert_eq!(sd_group(&captured), Some(group.as_slice()));
+    assert_eq!(sd_dacl(&captured), Some(dacl.as_slice()));
+}
+
+#[test]
+fn security_descriptor_bytes_set_merges_selected_components() {
+    let owner = native_sid(5, &[21, MACHINE, 1000]);
+    let group = native_sid(5, &[32, 545]);
+    let old_dacl = acl_with_aces(&[access_ace(0, FILE_READ, &native_sid(1, &[0]))]);
+    let current = self_relative_sd(&owner, &group, Some(&old_dacl));
+
+    let replacement_owner = native_sid(5, &[21, MACHINE, 500]);
+    let replacement_group = native_sid(5, &[32, 544]);
+    let new_dacl = acl_with_aces(&[access_ace(0, FILE_WRITE, &replacement_group)]);
+    let modification = self_relative_sd(&replacement_owner, &replacement_group, Some(&new_dacl));
+
+    let updated = set_security_descriptor_bytes(
+        &current,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        &modification,
+    )
+    .unwrap();
+
+    assert_eq!(sd_owner(&updated), Some(owner.as_slice()));
+    assert_eq!(sd_group(&updated), Some(group.as_slice()));
+    assert_eq!(sd_dacl(&updated), Some(new_dacl.as_slice()));
+    assert_eq!(
+        u16::from_le_bytes([updated[2], updated[3]]) & 0x1000,
+        0x1000
+    );
+
+    let owner_only = query_security_descriptor_bytes(&updated, OWNER_SECURITY_INFORMATION).unwrap();
+    assert_eq!(sd_owner(&owner_only), Some(owner.as_slice()));
+    assert_eq!(sd_dacl(&owner_only), None);
 }
 
 #[test]

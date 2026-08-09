@@ -35,8 +35,12 @@ pub use create_token::{
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_sd::{
-    capture_security_descriptor, native_acl_to_acl, STATUS_INVALID_SECURITY_DESCR,
-    STATUS_UNKNOWN_REVISION,
+    capture_security_descriptor, capture_security_descriptor_bytes, native_acl_to_acl,
+    query_security_descriptor_bytes, set_security_descriptor_bytes, DACL_SECURITY_INFORMATION,
+    DEFAULT_KEY_SECURITY_DESCRIPTOR, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PROTECTED_SACL_SECURITY_INFORMATION,
+    SACL_SECURITY_INFORMATION, STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
 pub use sid::{Luid, Sid};
 pub use token::{

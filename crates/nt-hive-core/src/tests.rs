@@ -19,6 +19,10 @@ fn hive_create_open_set_query() {
         h.subkey_class_by_index(h.open_key(r"CurrentControlSet\Services\Test").unwrap(), 0),
         Some("Service Parameters")
     );
+    let descriptor =
+        b"\x01\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(h.set_key_security_descriptor(key, descriptor));
+    assert_eq!(h.key_security_descriptor(key), Some(&descriptor[..]));
     assert!(h.delete_value(key, "greeting"));
     assert_eq!(h.query_value(key, "Greeting"), None);
     assert!(!h.delete_value(key, "greeting"));
@@ -34,11 +38,18 @@ fn hive_class_metadata_roundtrips_in_image() {
     let mut h = Hive::new(HiveKind::Software);
     let key = h.create_key(r"Classes\Sample");
     assert!(h.set_key_class(key, Some("Sample Class")));
+    let descriptor =
+        b"\x01\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(h.set_key_security_descriptor(key, descriptor));
 
     let image = encode_image(&h);
     let decoded = decode_image(&image).expect("decode hive image");
     let decoded_key = decoded.open_key(r"Classes\Sample").unwrap();
     assert_eq!(decoded.key_class(decoded_key), Some("Sample Class"));
+    assert_eq!(
+        decoded.key_security_descriptor(decoded_key),
+        Some(&descriptor[..])
+    );
 }
 
 #[test]
@@ -151,6 +162,10 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
     assert!(!set.delete_value(svc, "Start"));
     assert!(set.set_key_class(svc, Some("Service")));
     assert_eq!(set.key_class(svc), Some("Service"));
+    let descriptor =
+        b"\x01\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(set.set_key_security_descriptor(svc, descriptor));
+    assert_eq!(set.key_security_descriptor(svc), Some(&descriptor[..]));
 
     let transient = set
         .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs\Parameters")

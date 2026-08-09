@@ -46,6 +46,7 @@ pub(crate) struct KeyCell {
     pub subkeys: Vec<(String, CellId)>, // (folded name, id)
     pub values: Vec<CellId>,
     pub class_name: Option<String>,
+    pub security_descriptor: Option<Vec<u8>>,
     pub last_write_sequence: u64,
 }
 
@@ -122,6 +123,7 @@ impl Hive {
             subkeys: Vec::new(),
             values: Vec::new(),
             class_name: None,
+            security_descriptor: None,
             last_write_sequence: self.sequence,
         }));
         id
@@ -219,6 +221,25 @@ impl Hive {
 
     pub fn key_class(&self, key: CellId) -> Option<&str> {
         self.key(key)?.class_name.as_deref()
+    }
+
+    pub fn set_key_security_descriptor(&mut self, key: CellId, descriptor: &[u8]) -> bool {
+        if self.key(key).is_none() {
+            return false;
+        }
+        self.sequence += 1;
+        let seq = self.sequence;
+        let Some(cell) = self.key_mut(key) else {
+            return false;
+        };
+        cell.security_descriptor = Some(descriptor.to_vec());
+        cell.last_write_sequence = seq;
+        self.mark_dirty(key);
+        true
+    }
+
+    pub fn key_security_descriptor(&self, key: CellId) -> Option<&[u8]> {
+        self.key(key)?.security_descriptor.as_deref()
     }
 
     fn mark_dirty(&mut self, id: CellId) {
@@ -649,6 +670,15 @@ impl MutableHiveSet {
 
     pub fn key_class(&self, key: ResolvedHiveKey) -> Option<&str> {
         self.hive(key.hive)?.key_class(key.key)
+    }
+
+    pub fn set_key_security_descriptor(&mut self, key: ResolvedHiveKey, descriptor: &[u8]) -> bool {
+        self.hive_mut(key.hive)
+            .is_some_and(|hive| hive.set_key_security_descriptor(key.key, descriptor))
+    }
+
+    pub fn key_security_descriptor(&self, key: ResolvedHiveKey) -> Option<&[u8]> {
+        self.hive(key.hive)?.key_security_descriptor(key.key)
     }
 
     pub fn query_value(

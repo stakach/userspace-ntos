@@ -2626,6 +2626,53 @@ impl ExecNtHandler {
             .map(alloc::string::String::from)
     }
 
+    fn registry_key_security_descriptor(&self, target: KeyRef) -> Option<&[u8]> {
+        if let Some(index) = self.registry_overlay_index(target) {
+            if let Some(descriptor) = self.overlay.key_security_descriptor(index) {
+                return Some(descriptor);
+            }
+        }
+        let key = self.mutable_registry_key(target)?;
+        self.mutable_hives.key_security_descriptor(key)
+    }
+
+    fn set_registry_key_security_descriptor(
+        &mut self,
+        target: KeyRef,
+        descriptor: &[u8],
+    ) -> Result<(), u32> {
+        if let Some(index) = self.registry_overlay_index(target) {
+            if self.overlay.set_key_security_descriptor(index, descriptor) {
+                self.overlay_dirty = true;
+                return Ok(());
+            }
+            return Err(0xC000_0008);
+        }
+        if let Some(key) = self.mutable_registry_key(target) {
+            if self.mutable_hives.set_key_security_descriptor(key, descriptor) {
+                self.mutable_hives_dirty = true;
+                return Ok(());
+            }
+            return Err(0xC000_0008);
+        }
+        if self.base_hive(target).is_some() {
+            return Err(0xC000_0022);
+        }
+        let Some(path) = self.registry_target_path(target) else {
+            return Err(0xC000_0008);
+        };
+        if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
+            return Err(0xC000_009A);
+        }
+        let canon = self.overlay_canon(&path);
+        let (index, _) = self.overlay.create_owned(canon);
+        if !self.overlay.set_key_security_descriptor(index, descriptor) {
+            return Err(0xC000_0008);
+        }
+        self.overlay_dirty = true;
+        Ok(())
+    }
+
     fn registry_subkey_class(
         &self,
         target: KeyRef,
@@ -12908,6 +12955,11 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 let root_dir = u64::from_le_bytes(rd);
+                let mut sd_ptr = [0u8; 8];
+                if !self.xas_read(oa + 32, &mut sd_ptr) {
+                    return 0xC000_0005;
+                }
+                let security_descriptor_ptr = u64::from_le_bytes(sd_ptr);
                 let root_target = if root_dir == 0 {
                     None
                 } else {
@@ -13095,6 +13147,18 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
+                    let initial_security = if security_descriptor_ptr != 0 {
+                        let memory = ExecClientMemory { handler: self };
+                        Some(match nt_security::capture_security_descriptor_bytes(
+                            &memory,
+                            security_descriptor_ptr,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        })
+                    } else {
+                        None
+                    };
                     let Some(mutable_key) = self.mutable_hives.create_key(full) else {
                         return 0xC000_0034;
                     };
@@ -13102,6 +13166,14 @@ impl ExecNtHandler {
                         && !self.mutable_hives.set_key_class(mutable_key, class_name)
                     {
                         return 0xC000_0008;
+                    }
+                    if let Some(descriptor) = initial_security.as_deref() {
+                        if !self
+                            .mutable_hives
+                            .set_key_security_descriptor(mutable_key, descriptor)
+                        {
+                            return 0xC000_0008;
+                        }
                     }
                     self.mutable_hives_dirty = true;
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
@@ -13161,7 +13233,24 @@ impl ExecNtHandler {
                     Ok(path) => alloc::string::String::from(path),
                     Err(_) => return 0xC000_0033, // STATUS_OBJECT_NAME_INVALID
                 };
+                let initial_security = if security_descriptor_ptr != 0 {
+                    let memory = ExecClientMemory { handler: self };
+                    Some(match nt_security::capture_security_descriptor_bytes(
+                        &memory,
+                        security_descriptor_ptr,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    })
+                } else {
+                    None
+                };
                 let (oidx, _) = self.overlay.create_owned(durable_canon);
+                if let Some(descriptor) = initial_security.as_deref() {
+                    if !self.overlay.set_key_security_descriptor(oidx, descriptor) {
+                        return 0xC000_0008;
+                    }
+                }
                 self.overlay_dirty = true;
                 let canon = self.overlay.path(oidx).unwrap_or("");
                 // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's OWN
@@ -16549,8 +16638,141 @@ impl ExecNtHandler {
                 Ok(false) => 0,
                 Err(status) => status,
             },
+            NativeService::NtQuerySecurityObject => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+                const READ_CONTROL: u32 = 0x0002_0000;
+                const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+                const QUERY_MASK: u32 = nt_security::OWNER_SECURITY_INFORMATION
+                    | nt_security::GROUP_SECURITY_INFORMATION
+                    | nt_security::DACL_SECURITY_INFORMATION
+                    | nt_security::SACL_SECURITY_INFORMATION;
+                let security_information = args[1] as u32;
+                if security_information & !QUERY_MASK != 0 {
+                    return 0xC000_000D;
+                }
+                let mut required_access = 0;
+                if security_information
+                    & (nt_security::OWNER_SECURITY_INFORMATION
+                        | nt_security::GROUP_SECURITY_INFORMATION
+                        | nt_security::DACL_SECURITY_INFORMATION)
+                    != 0
+                {
+                    required_access |= READ_CONTROL;
+                }
+                if security_information & nt_security::SACL_SECURITY_INFORMATION != 0 {
+                    required_access |= ACCESS_SYSTEM_SECURITY;
+                }
+                let key = match self.resolve_registry_key(args[0], required_access) {
+                    Ok(key) => key,
+                    Err(status) => return status,
+                };
+                let current = self
+                    .registry_key_security_descriptor(key)
+                    .map(alloc::vec::Vec::from)
+                    .unwrap_or_else(|| {
+                        alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
+                    });
+                let descriptor =
+                    match nt_security::query_security_descriptor_bytes(&current, security_information) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                if args[4] == 0
+                    || !self.xas_write_u32(args[4], descriptor.len().min(u32::MAX as usize) as u32)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if !self.probe_user_output(args[2], descriptor.len())
+                    || !self.xas_try_write_buf(args[2], &descriptor)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                0
+            }
+            NativeService::NtSetSecurityObject => {
+                const WRITE_DAC: u32 = 0x0004_0000;
+                const WRITE_OWNER: u32 = 0x0008_0000;
+                const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+                const SET_MASK: u32 = nt_security::OWNER_SECURITY_INFORMATION
+                    | nt_security::GROUP_SECURITY_INFORMATION
+                    | nt_security::DACL_SECURITY_INFORMATION
+                    | nt_security::SACL_SECURITY_INFORMATION
+                    | nt_security::PROTECTED_DACL_SECURITY_INFORMATION
+                    | nt_security::PROTECTED_SACL_SECURITY_INFORMATION
+                    | nt_security::UNPROTECTED_DACL_SECURITY_INFORMATION
+                    | nt_security::UNPROTECTED_SACL_SECURITY_INFORMATION;
+                let security_information = args[1] as u32;
+                if security_information & !SET_MASK != 0 {
+                    return 0xC000_000D;
+                }
+                if security_information & nt_security::PROTECTED_DACL_SECURITY_INFORMATION != 0
+                    && security_information & nt_security::UNPROTECTED_DACL_SECURITY_INFORMATION != 0
+                {
+                    return 0xC000_000D;
+                }
+                if security_information & nt_security::PROTECTED_SACL_SECURITY_INFORMATION != 0
+                    && security_information & nt_security::UNPROTECTED_SACL_SECURITY_INFORMATION != 0
+                {
+                    return 0xC000_000D;
+                }
+                let mut required_access = 0;
+                if security_information
+                    & (nt_security::OWNER_SECURITY_INFORMATION
+                        | nt_security::GROUP_SECURITY_INFORMATION)
+                    != 0
+                {
+                    required_access |= WRITE_OWNER;
+                }
+                if security_information
+                    & (nt_security::DACL_SECURITY_INFORMATION
+                        | nt_security::PROTECTED_DACL_SECURITY_INFORMATION
+                        | nt_security::UNPROTECTED_DACL_SECURITY_INFORMATION)
+                    != 0
+                {
+                    required_access |= WRITE_DAC;
+                }
+                if security_information
+                    & (nt_security::SACL_SECURITY_INFORMATION
+                        | nt_security::PROTECTED_SACL_SECURITY_INFORMATION
+                        | nt_security::UNPROTECTED_SACL_SECURITY_INFORMATION)
+                    != 0
+                {
+                    required_access |= ACCESS_SYSTEM_SECURITY;
+                }
+                let key = match self.resolve_registry_key(args[0], required_access) {
+                    Ok(key) => key,
+                    Err(status) => return status,
+                };
+                let memory = ExecClientMemory { handler: self };
+                let modification =
+                    match nt_security::capture_security_descriptor_bytes(&memory, args[2]) {
+                        Ok(descriptor) => descriptor,
+                        Err(status) => return status,
+                    };
+                let current = self
+                    .registry_key_security_descriptor(key)
+                    .map(alloc::vec::Vec::from)
+                    .unwrap_or_else(|| {
+                        alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
+                    });
+                let updated = match nt_security::set_security_descriptor_bytes(
+                    &current,
+                    security_information,
+                    &modification,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(status) => return status,
+                };
+                match self.set_registry_key_security_descriptor(key, &updated) {
+                    Ok(()) => 0,
+                    Err(status) => status,
+                }
+            }
             NativeService::NtInitializeRegistry
-            | NativeService::NtSetSecurityObject
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
             // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
             // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
