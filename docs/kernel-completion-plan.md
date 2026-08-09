@@ -52,8 +52,11 @@ mounted `NtLoadKey` hive and atomically replaces the source `ntuser.dat`; `RegUn
 mount, and the next `NtLoadKey` remounts the checkpoint image. `exec_profile_ntuser_dat_present` and
 `exec_ntloadkey_serviced` are green on that path.
 
-Current red gates are `exec_kbd_layout_opened`, `exec_msgina_logon_dialog_created`,
-`exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted`.
+Current red gates from the last uncontended full gate are `exec_kbd_layout_opened`,
+`exec_msgina_logon_dialog_created`, `exec_vm_pool_headroom`, and
+`exec_explorer_shell_chrome_painted`. The keyboard-layout proof has since been moved onto the
+common registry-open authority in commit `68b2529`; rerun the full gate in a clean single QEMU lane
+before removing it from this frontier.
 Explorer still leaves broad non-background framebuffer evidence, but `BeginPaint`/`EndPaint`
 accounting is `0/0`; the next useful shell slice is the real explorer paint/update-region path, not
 a framebuffer-only proof. The broader structural queue remains A4 SCM pipe/listener cleanup, B3 real
@@ -2345,3 +2348,27 @@ persistence.
   Review adjustment: the shell frontier remains honest: explorer still has direct GDI returns and a
   broad non-background framebuffer span, but `BeginPaint`/`EndPaint` remains `0/0`; continue at the
   real explorer update-region/paint boundary.
+
+- D2 keyboard-layout proof cleanup. `exec_kbd_layout_opened` no longer depends on the old
+  keyboard-specific `NtOpenKey` arm, which the common mounted-registry path now bypasses. Successful
+  opens of `HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layouts\<KLID>` are counted from the
+  shared overlay/mutable/base registry authority for both mutable and borrowed SYSTEM hives, and the
+  stale manual branch was removed. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and partial boot logs `.tmp/boot-kbd-layout-common-registry-rerun-20260810.log` /
+  `.tmp/boot-kbd-layout-common-registry-final-20260810.log`, both of which reached the real
+  `NtUserLoadKeyboardLayoutEx` path and hosted `kbdus.dll` before the QEMU lane was externally
+  SIGTERM'd. Review adjustment: rerun one uncontended full gate and require
+  `exec_kbd_layout_opened` to flip green before treating that frontier item as closed.
+
+- D3 writable system-config subtree slice. The writable filesystem can now mount
+  `reactos\system32\config` through the same prefix mechanism as profiles, provision staged
+  installed config files by folded volume-relative paths, and handle EventLog-style sparse file
+  growth without materializing multi-megabyte zero buffers. The executive copies the staged
+  `system32\config` tree into the writable volume on mount and records real SYSTEM/SOFTWARE hive
+  content checks. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Boot attempts in `.tmp/boot-kbd-layout-common-registry-*.log` were not accepted as proof because
+  competing Codex-owned QEMU lanes were holding or killing the disk image. Review adjustment: the
+  next clean boot should confirm EventLog creates/writes its `.Evt` files through the writable
+  config subtree and then continue D3 boot/system hive persistence proofs.
