@@ -202,6 +202,25 @@ impl Hive {
         cur
     }
 
+    pub fn set_key_class(&mut self, key: CellId, class_name: Option<&str>) -> bool {
+        if self.key(key).is_none() {
+            return false;
+        }
+        self.sequence += 1;
+        let seq = self.sequence;
+        let Some(cell) = self.key_mut(key) else {
+            return false;
+        };
+        cell.class_name = class_name.map(String::from);
+        cell.last_write_sequence = seq;
+        self.mark_dirty(key);
+        true
+    }
+
+    pub fn key_class(&self, key: CellId) -> Option<&str> {
+        self.key(key)?.class_name.as_deref()
+    }
+
     fn mark_dirty(&mut self, id: CellId) {
         if !self.dirty.contains(&id) {
             self.dirty.push(id);
@@ -414,6 +433,11 @@ impl Hive {
         self.key(child).map(|k| k.name.as_str())
     }
 
+    pub fn subkey_class_by_index(&self, key: CellId, index: usize) -> Option<&str> {
+        let child = self.key(key)?.subkeys.get(index)?.1;
+        self.key_class(child)
+    }
+
     /// Number of values on `key`.
     pub fn value_count(&self, key: CellId) -> usize {
         self.key(key).map_or(0, |k| k.values.len())
@@ -616,6 +640,15 @@ impl MutableHiveSet {
         self.hive_mut(key.hive)
             .ok_or(DeleteKeyError::NotFound)?
             .delete_key(key.key)
+    }
+
+    pub fn set_key_class(&mut self, key: ResolvedHiveKey, class_name: Option<&str>) -> bool {
+        self.hive_mut(key.hive)
+            .is_some_and(|hive| hive.set_key_class(key.key, class_name))
+    }
+
+    pub fn key_class(&self, key: ResolvedHiveKey) -> Option<&str> {
+        self.hive(key.hive)?.key_class(key.key)
     }
 
     pub fn query_value(

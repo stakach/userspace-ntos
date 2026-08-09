@@ -38,6 +38,7 @@ static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
 struct RegistryKeyStats {
     subkeys: u32,
     max_subkey_name_bytes: u32,
+    max_subkey_class_bytes: u32,
     values: u32,
     max_value_name_bytes: u32,
     max_value_data_bytes: u32,
@@ -249,11 +250,14 @@ fn committed_mapping_effective_page_protection(
 }
 
 impl RegistryKeyStats {
-    fn add_subkey(&mut self, name_bytes: usize) {
+    fn add_subkey(&mut self, name_bytes: usize, class_bytes: usize) {
         self.subkeys = self.subkeys.saturating_add(1);
         self.max_subkey_name_bytes = self
             .max_subkey_name_bytes
             .max(name_bytes.min(u32::MAX as usize) as u32);
+        self.max_subkey_class_bytes = self
+            .max_subkey_class_bytes
+            .max(class_bytes.min(u32::MAX as usize) as u32);
     }
 
     fn add_value(&mut self, name_bytes: usize, data_bytes: usize) {
@@ -287,10 +291,12 @@ fn build_registry_key_query_info(
     info_class: u32,
     full_path: &str,
     stats: RegistryKeyStats,
+    class_name: Option<&str>,
 ) -> Result<(alloc::vec::Vec<u8>, usize), u32> {
     const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
     let leaf = registry_query_leaf_name(full_path);
     let leaf_bytes = utf16le_byte_len(leaf);
+    let class_bytes = class_name.map(utf16le_byte_len).unwrap_or(0);
     match info_class {
         0 => {
             // KEY_BASIC_INFORMATION
@@ -302,26 +308,45 @@ fn build_registry_key_query_info(
             Ok((info, header))
         }
         1 => {
-            // KEY_NODE_INFORMATION. Mounted/overlay keys currently carry no class string.
+            // KEY_NODE_INFORMATION
             let header = 0x18usize;
-            let mut info = alloc::vec::Vec::with_capacity(header + leaf_bytes);
+            let mut info = alloc::vec::Vec::with_capacity(header + leaf_bytes + class_bytes);
             info.resize(header, 0);
-            info[0x0c..0x10].copy_from_slice(&u32::MAX.to_le_bytes());
+            let class_offset = if class_bytes == 0 {
+                u32::MAX
+            } else {
+                (header + leaf_bytes) as u32
+            };
+            info[0x0c..0x10].copy_from_slice(&class_offset.to_le_bytes());
+            info[0x10..0x14].copy_from_slice(&(class_bytes as u32).to_le_bytes());
             info[0x14..0x18].copy_from_slice(&(leaf_bytes as u32).to_le_bytes());
             append_utf16le(&mut info, leaf);
+            if let Some(class_name) = class_name {
+                append_utf16le(&mut info, class_name);
+            }
             Ok((info, header))
         }
         2 => {
-            // KEY_FULL_INFORMATION. No class string: ClassLength=0, ClassOffset=-1.
+            // KEY_FULL_INFORMATION.
             let header = 0x2cusize;
             let mut info = alloc::vec::Vec::new();
             info.resize(header, 0);
-            info[0x0c..0x10].copy_from_slice(&u32::MAX.to_le_bytes());
+            let class_offset = if class_bytes == 0 {
+                u32::MAX
+            } else {
+                header as u32
+            };
+            info[0x0c..0x10].copy_from_slice(&class_offset.to_le_bytes());
+            info[0x10..0x14].copy_from_slice(&(class_bytes as u32).to_le_bytes());
             info[0x14..0x18].copy_from_slice(&stats.subkeys.to_le_bytes());
             info[0x18..0x1c].copy_from_slice(&stats.max_subkey_name_bytes.to_le_bytes());
+            info[0x1c..0x20].copy_from_slice(&stats.max_subkey_class_bytes.to_le_bytes());
             info[0x20..0x24].copy_from_slice(&stats.values.to_le_bytes());
             info[0x24..0x28].copy_from_slice(&stats.max_value_name_bytes.to_le_bytes());
             info[0x28..0x2c].copy_from_slice(&stats.max_value_data_bytes.to_le_bytes());
+            if let Some(class_name) = class_name {
+                append_utf16le(&mut info, class_name);
+            }
             Ok((info, header))
         }
         3 => {
@@ -2587,6 +2612,33 @@ impl ExecNtHandler {
         self.mutable_registry_key_by_path(&full_path)
     }
 
+    fn registry_key_class_by_path(&self, full_path: &str) -> Option<alloc::string::String> {
+        let key = self.mutable_registry_key_by_path(full_path)?;
+        self.mutable_hives
+            .key_class(key)
+            .map(alloc::string::String::from)
+    }
+
+    fn registry_key_class(&self, target: KeyRef) -> Option<alloc::string::String> {
+        let key = self.mutable_registry_key(target)?;
+        self.mutable_hives
+            .key_class(key)
+            .map(alloc::string::String::from)
+    }
+
+    fn registry_subkey_class(
+        &self,
+        target: KeyRef,
+        name: &str,
+    ) -> Option<alloc::string::String> {
+        let mut full_path = self.registry_target_path(target)?;
+        if !full_path.is_empty() && !full_path.ends_with('\\') {
+            full_path.push('\\');
+        }
+        full_path.push_str(name);
+        self.registry_key_class_by_path(&full_path)
+    }
+
     fn note_mutable_registry_key_open(&self, key: ResolvedHiveKey, full_path: &str) {
         let canon = self.overlay_canon(full_path);
         if Self::is_dynamic_user_volatile_env_canon(&canon) {
@@ -2899,7 +2951,11 @@ impl ExecNtHandler {
                     let Some(name) = hive.subkey_name_by_index(key.key, index) else {
                         continue;
                     };
-                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2));
+                    let class_bytes = hive
+                        .subkey_class_by_index(key.key, index)
+                        .map(utf16le_byte_len)
+                        .unwrap_or(0);
+                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2), class_bytes);
                 }
                 for index in 0..hive.value_count(key.key) {
                     let Some((name, _, data)) = hive.value_by_index(key.key, index) else {
@@ -2925,7 +2981,7 @@ impl ExecNtHandler {
                 let Some(name_len) = hive.subkey_name_utf16_len_by_index(base, index) else {
                     break;
                 };
-                stats.add_subkey(name_len.saturating_mul(2));
+                stats.add_subkey(name_len.saturating_mul(2), 0);
             }
             for index in 0..hive.value_count(base) {
                 let Some(name) = hive.value_name_by_index(base, index) else {
@@ -2965,7 +3021,7 @@ impl ExecNtHandler {
                     })
                     .is_some();
                 if !exists_in_base {
-                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2));
+                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2), 0);
                 }
             }
         }
@@ -12997,16 +13053,31 @@ impl ExecNtHandler {
                 if !create_volatile && self.mutable_hives.resolve_key(parent).is_some() {
                     let full_len = full.len();
                     let canon_len = canon.len();
+                    let class_name = if args[4] != 0 {
+                        Some(self.read_registry_ustr_name(args[4]))
+                    } else {
+                        None
+                    };
+                    let class_present = class_name.is_some();
+                    let class_len = class_name.as_ref().map(|s| s.len()).unwrap_or(0);
                     let mut full_scratch = [0u8; 2048];
                     let mut canon_scratch = [0u8; 2048];
-                    if full_len > full_scratch.len() || canon_len > canon_scratch.len() {
+                    let mut class_scratch = [0u8; 2048];
+                    if full_len > full_scratch.len()
+                        || canon_len > canon_scratch.len()
+                        || class_len > class_scratch.len()
+                    {
                         return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
                     }
                     full_scratch[..full_len].copy_from_slice(full.as_bytes());
                     canon_scratch[..canon_len].copy_from_slice(canon.as_bytes());
+                    if let Some(class_name) = class_name.as_ref() {
+                        class_scratch[..class_len].copy_from_slice(class_name.as_bytes());
+                    }
                     drop(canon);
                     drop(full);
                     drop(name);
+                    drop(class_name);
                     allocator::reset_to(transient_mark);
                     let full = match core::str::from_utf8(&full_scratch[..full_len]) {
                         Ok(path) => path,
@@ -13016,9 +13087,22 @@ impl ExecNtHandler {
                         Ok(path) => path,
                         Err(_) => return 0xC000_0033,
                     };
+                    let class_name = if class_present {
+                        Some(match core::str::from_utf8(&class_scratch[..class_len]) {
+                            Ok(class_name) => class_name,
+                            Err(_) => return 0xC000_0033,
+                        })
+                    } else {
+                        None
+                    };
                     let Some(mutable_key) = self.mutable_hives.create_key(full) else {
                         return 0xC000_0034;
                     };
+                    if class_present
+                        && !self.mutable_hives.set_key_class(mutable_key, class_name)
+                    {
+                        return 0xC000_0008;
+                    }
                     self.mutable_hives_dirty = true;
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
@@ -13490,25 +13574,34 @@ impl ExecNtHandler {
                 let Some(name) = self.registry_subkey_by_index(key, idx) else {
                     return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
                 };
+                let class_name = self.registry_subkey_class(key, &name);
                 let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
                 let name_bytes = name16.len() * 2;
+                let class_bytes = class_name.as_deref().map(utf16le_byte_len).unwrap_or(0);
                 // class 0 = KeyBasicInformation {LastWriteTime@0(8), TitleIndex@8(4), NameLength@0xc(4),
                 // Name@0x10}; class 1 = KeyNodeInformation {…, ClassOffset@0xc, ClassLength@0x10,
                 // NameLength@0x14, Name@0x18}. RegEnumKeyExW(lpClass=NULL) → basic; ScmCreateService-
                 // Database uses that. Build both; other classes → basic.
                 let node = info_class == 1;
                 let hdr = if node { 0x18usize } else { 0x10 };
-                let mut info = alloc::vec::Vec::with_capacity(hdr + name_bytes);
+                let mut info = alloc::vec::Vec::with_capacity(hdr + name_bytes + class_bytes);
                 info.resize(hdr, 0); // LastWriteTime/TitleIndex/(ClassOffset/ClassLength) all 0
                 let nl_off = if node { 0x14 } else { 0x0c };
                 info[nl_off..nl_off + 4].copy_from_slice(&(name_bytes as u32).to_le_bytes());
                 if node {
-                    // ClassOffset = header + name (no class stored) — points past the name.
-                    let class_off = (hdr + name_bytes) as u32;
+                    let class_off = if class_bytes == 0 {
+                        u32::MAX
+                    } else {
+                        (hdr + name_bytes) as u32
+                    };
                     info[0x0c..0x10].copy_from_slice(&class_off.to_le_bytes());
+                    info[0x10..0x14].copy_from_slice(&(class_bytes as u32).to_le_bytes());
                 }
                 for w in &name16 {
                     info.extend_from_slice(&w.to_le_bytes());
+                }
+                if let Some(class_name) = class_name.as_deref() {
+                    append_utf16le(&mut info, class_name);
                 }
                 let total = info.len() as u32;
                 let total_bytes = total.to_le_bytes();
@@ -13543,8 +13636,14 @@ impl ExecNtHandler {
                 let stats = self.registry_key_stats(key);
                 let output_length = args[3] as u32 as usize;
                 let full_path = self.registry_target_path(key).unwrap_or_default();
+                let class_name = self.registry_key_class(key);
                 let (info, minimum_length) =
-                    match build_registry_key_query_info(info_class, &full_path, stats) {
+                    match build_registry_key_query_info(
+                        info_class,
+                        &full_path,
+                        stats,
+                        class_name.as_deref(),
+                    ) {
                         Ok(info) => info,
                         Err(status) => return status,
                     };

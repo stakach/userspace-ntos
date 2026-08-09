@@ -86,8 +86,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
   mutable mount owns the path. The old SECURITY/SAM/SOFTWARE boot-hive bypass switches were removed;
   present hive images mount, absent images miss honestly. `NtDeleteKey` is now registered and
   deletes leaf keys through the same authority, including mounted mutable hives, while root/non-leaf
-  keys return `STATUS_CANNOT_DELETE` and borrowed `regf` keys remain read-only. Remaining D2 work is
-  security/class metadata and any still-overlay-backed persistent paths.
+  keys return `STATUS_CANNOT_DELETE` and borrowed `regf` keys remain read-only. Mounted mutable-hive
+  keys now preserve class strings, round-trip them through host-tested hive images, and expose them
+  through `NtCreateKey`, `NtQueryKey`, `NtEnumerateKey`, and key-stat maximum class lengths. Remaining
+  D2 work is security metadata and any still-overlay-backed persistent paths.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
@@ -342,7 +344,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
    now use the same authority through `NtOpenKey`, including PE-recovered registry names and
    HKEY_USERS paths, and the old boot-hive bypass toggles have been removed instead of retained as
    fallback routes. `NtDeleteKey` is also registered at SSN 66 and deletes leaf keys in mounted
-   mutable hives or the volatile overlay with ReactOS/NT-style root and non-leaf refusal.
+   mutable hives or the volatile overlay with ReactOS/NT-style root and non-leaf refusal. Mutable
+   mounted keys now also store/query/enumerate key-class metadata instead of reporting every mounted
+   key as classless; the host hive image tests prove class data survives checkpoint/decode.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
