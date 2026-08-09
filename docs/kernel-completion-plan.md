@@ -283,8 +283,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `MEM_TOP_DOWN`. The latest private-access slice also makes `NtReadVirtualMemory`-style checks
    reject private execute-only and guarded pages through the shared `VmRegionMap` permission helper,
    matching the fault-access verdicts instead of treating every non-`PAGE_NOACCESS` committed page
-   as readable. Continue with the remaining C4 query/protect/decommit matrix and D1/D2 mutable
-   registry/filesystem authority.
+   as readable. The latest host-side decommit slice pins partial `MEM_DECOMMIT` query/protect
+   interactions: decommitted pages report `MEM_RESERVE`, protection overrides are cleared, protects
+   across the hole fail with `STATUS_NOT_COMMITTED`, recommit can restore a committed subrange with
+   new protection, and capacity failures preserve the original committed allocation. Continue with
+   the remaining C4 mapped/private protect rollback, overlap, and `MEM_TOP_DOWN` matrix plus D1/D2
+   mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1927,3 +1931,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: execute-only/guarded private access is pinned; continue C4 with partial
   decommit query/protect interactions, mapped/private protect rollback gates, overlap, and
   `MEM_TOP_DOWN` behavior.
+
+- C4 private VAD partial decommit regression slice. Host VM map tests now cover the private
+  `MEM_DECOMMIT` path after a protected page range has overrides: the decommit clears affected
+  page-protection overrides, `NtQueryVirtualMemory`-style basic queries report the decommitted span
+  as `MEM_RESERVE` with no active protection, `NtProtectVirtualMemory` over a range crossing the
+  reserved hole returns `STATUS_NOT_COMMITTED`, and recommitting a subpage installs the requested
+  protection without reviving stale overrides. A bounded-capacity failure test also proves a middle
+  decommit split that cannot be represented returns `STATUS_INSUFFICIENT_RESOURCES` without
+  mutating the original committed allocation. Validation: `cargo fmt --all` and
+  `cargo test -p nt-address-space` with `45` tests passing. Review adjustment: private partial
+  decommit query/protect/recommit behavior is pinned; continue C4 with mapped/private protect
+  rollback, overlap, and `MEM_TOP_DOWN` gates.

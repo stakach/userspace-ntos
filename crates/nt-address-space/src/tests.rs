@@ -414,6 +414,88 @@ fn fixed_vm_map_decommit_and_partial_release_split_vad() {
 }
 
 #[test]
+fn fixed_vm_map_partial_decommit_queries_rejects_protect_and_recommits() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(None, 0x5000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    map.protect(allocation.base + 0x1000, 0x1000, PAGE_READONLY)
+        .unwrap();
+
+    let decommit = map
+        .free(allocation.base + 0x1000, 0x2000, MEM_DECOMMIT)
+        .unwrap();
+    assert_eq!(
+        decommit,
+        VmFreePlan {
+            base: allocation.base + 0x1000,
+            size: 0x2000,
+            free_type: MEM_DECOMMIT,
+        }
+    );
+    assert_eq!(map.protection_override_count(), 0);
+    assert_eq!(
+        map.query_basic(allocation.base + 0x1000, 0x20_0000)
+            .unwrap(),
+        VmBasicInformation {
+            base_address: allocation.base + 0x1000,
+            allocation_base: allocation.base,
+            allocation_protect: PAGE_READWRITE,
+            region_size: 0x2000,
+            state: MEM_RESERVE,
+            protect: 0,
+            type_: MEM_PRIVATE,
+        }
+    );
+    assert_eq!(
+        map.protect(allocation.base, 0x3000, PAGE_READONLY),
+        Err(STATUS_NOT_COMMITTED)
+    );
+    assert!(!map.permits_read(allocation.base + 0x1000));
+
+    let recommit = map
+        .allocate(
+            Some(allocation.base + 0x2000),
+            0x1000,
+            MEM_COMMIT,
+            PAGE_EXECUTE_READ,
+        )
+        .unwrap();
+    assert_eq!(
+        recommit,
+        VmAllocatePlan {
+            base: allocation.base + 0x2000,
+            size: 0x1000,
+        }
+    );
+    assert_eq!(
+        map.query_basic(allocation.base + 0x2000, 0x20_0000)
+            .unwrap()
+            .protect,
+        PAGE_EXECUTE_READ
+    );
+    assert!(map.permits_read(allocation.base + 0x2000));
+    assert!(!map.permits_write(allocation.base + 0x2000));
+}
+
+#[test]
+fn fixed_vm_map_partial_decommit_capacity_failure_preserves_state() {
+    let mut map = VmRegionMap::<1>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+
+    assert_eq!(
+        map.free(allocation.base + 0x1000, 0x1000, MEM_DECOMMIT),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(map.extent_count(), 1);
+    assert!(map.is_committed(allocation.base));
+    assert!(map.is_committed(allocation.base + 0x1000));
+    assert!(map.is_committed(allocation.base + 0x2000));
+}
+
+#[test]
 fn fixed_vm_map_preserves_failure_state_and_reactos_statuses() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map
