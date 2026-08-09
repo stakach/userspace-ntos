@@ -75,6 +75,8 @@ pub(crate) use driver_launch::*;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -2482,10 +2484,17 @@ static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PIPE_ASYNC_LISTEN_N: usize = 8;
 static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_N> =
     nt_io_manager::AsyncListenTable::new();
+const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
+static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
+    nt_io_manager::PipeNameWaiterTable::new();
 /// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
 static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_LISTEN_SIGNALLED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_LISTEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_NAME_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_NAME_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_NAME_WAIT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Set once the SCM RPC listener thread (svc-listener, badge 7) has TERMINATED. rpcrt4's ncacn_np
 /// listener, after accepting winlogon's connect, spawns a per-connection WORKER thread (NtCreateThread)
 /// to service the bind/request and re-parks its OWN listen — then the listener may exit. The
@@ -2534,6 +2543,15 @@ pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) {
         }
     }
 }
+
+pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
+    name_hash != 0
+        && (0..PIPE_FID_NAME_N).any(|i| {
+            PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) != 0
+                && PIPE_FID_NAME_HASH[i].load(Ordering::Relaxed) == name_hash
+        })
+}
+
 /// The name-hash recorded for `fid` (0 = unknown).
 pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
     for i in 0..PIPE_FID_NAME_N {
@@ -11942,6 +11960,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .min();
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
+    let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
     // The deadman joins the same `min()` as every real waiter — it is a deadline like any other, so
     // the arm/disarm path (and `exec_delay_timer_disarms`' invariants) are untouched by it.
     let deadman_deadline = watchdog_deadline();
@@ -11951,6 +11970,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .chain(event_deadline)
         .chain(keyed_deadline)
         .chain(io_completion_deadline)
+        .chain(pipe_name_deadline)
         .chain(deadman_deadline)
         .min();
     if let Some(deadline) = deadline {
@@ -11968,6 +11988,8 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
             3
         } else if io_completion_deadline == Some(deadline) {
             4
+        } else if pipe_name_deadline == Some(deadline) {
+            6
         } else {
             5 // the deadman
         };
@@ -12094,6 +12116,28 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
+unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
+    let now = monotonic_time_100ns();
+    let mut woken = 0;
+    while let Some(waiter) =
+        unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS)).pop_due(now) }
+    {
+        pipe_name_wait_complete_one(handler, waiter, STATUS_IO_TIMEOUT);
+        PIPE_NAME_WAIT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+        woken += 1;
+        if PIPE_NAME_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[pipe-name-wait] TIMEOUT name_hash=0x");
+            print_hex_u64(waiter.name_hash);
+            print_str(b" pi=");
+            print_u64(waiter.pi as u64);
+            print_str(b" badge=");
+            print_u64(waiter.badge);
+            print_str(b"\n");
+        }
+    }
+    woken
+}
+
 unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
     handler: &mut ExecNtHandler,
@@ -12107,6 +12151,7 @@ unsafe fn delay_timer_interrupt(
         + wait_wake_due()
         + keyed_wait_wake_due()
         + io_completion_wake_due(handler)
+        + pipe_name_wait_wake_due(handler)
         + watchdog_tick;
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
@@ -12149,9 +12194,11 @@ unsafe fn delay_timer_interrupt(
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
     let completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
+    let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || queue.len() != 0
         || completion_deadline.is_some()
+        || pipe_name_deadline.is_some()
     {
         return;
     }
@@ -12679,6 +12726,24 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     for index in 0..listen_count.min(listen_file_ids.len()) {
         if listen_file_ids[index] != 0 {
             handler.release_file_reference(listen_file_ids[index]);
+        }
+    }
+    let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
+    let mut name_wait_reply_caps = [0u64; PIPE_NAME_WAITER_N];
+    let name_wait_count =
+        name_waiters.cancel_thread_collect_reply_caps(tid, &mut name_wait_reply_caps);
+    for index in 0..name_wait_count.min(name_wait_reply_caps.len()) {
+        let cap = name_wait_reply_caps[index];
+        if cap != 0 {
+            let deleted = cnode_delete_r(cap);
+            let retyped = if deleted == 0 {
+                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+            } else {
+                u64::MAX
+            };
+            if deleted == 0 && retyped == 0 {
+                release_reply_pool_cap(cap);
+            }
         }
     }
 }
@@ -16137,6 +16202,11 @@ struct ExecNtHandler {
     pipe_listen_fid: u64,
     pipe_listen_event_handle: u64,
     pipe_listen_iosb_va: u64,
+    pipe_name_wait_hash: u64,
+    pipe_name_wait_iosb_va: u64,
+    pipe_name_wait_event_obj_idx: u64,
+    pipe_name_wait_deadline_100ns: u64,
+    pipe_name_wait_redrive: u64,
     /// BATCH 34 — set (to the connected pipe's leaf name-hash) by a client pipe CONNECT
     /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe) that pairs with a server end. The LOOP then
     /// completes the pending async server listen FOR THAT SAME PIPE NAME (fills its IOSB SUCCESS +
@@ -16576,6 +16646,24 @@ impl HostedThreadRole {
             // not raw-resume its TCB; the pipe/event redrive path owns wakeup ordering.
             Self::LsaWorker => false,
             _ => true,
+        }
+    }
+
+    const fn counts_owner_for_indefinite_wait(self) -> bool {
+        match self {
+            Self::Main
+            | Self::ServicesListener
+            | Self::ScmWorker
+            | Self::LsassListener
+            | Self::LsassListener2
+            | Self::LsassListener3
+            | Self::LsaWorker => true,
+            Self::TpWorker { .. }
+            | Self::SmLoop
+            | Self::CsrApi
+            | Self::CsrSbApi
+            | Self::WinlogonListener
+            | Self::WinlogonWorker { .. } => false,
         }
     }
 }

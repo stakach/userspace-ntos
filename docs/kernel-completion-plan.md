@@ -31,6 +31,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
+Active boot-fix slice: `.tmp/boot-openfile-pipe-wait-20260810-092820.log` rebuilt ntdll,
+the executive, rust-micro, and the disk image, then reached real services/EventLog progress after
+the desktop path before timing out. The last stable frontier is not an `EventLog` shortcut:
+EventLog connects to SCM, SCM and EventLog exchange real pipe traffic, and the SCM worker later
+probes `\pipe\EventLog` before the EventLog RPC endpoint exists, receiving the real
+`STATUS_OBJECT_NAME_NOT_FOUND`. The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a
+bounded name waiter with real timeout/deadline handling and exact name completion, `NtOpenFile`
+clears failed output handles, and main threads plus persistent server-loop roles count their owning
+process when they take a deadline-less wait. Follow-up structural debt: the NPFS root handle should
+become a real hosted-FSD file object so `FSCTL_PIPE_WAIT` pending IRPs live inside the npfs driver
+instead of the executive carrying a root-handle wait queue.
+
 Boot proof `.tmp/boot-dynamic-hive-flush-gate-20260810.log` reaches `[microtest done]` at
 `291/295`:
 winlogon authenticates, the real profile/SAM/USER-object-security path reaches `userinit.exe`,
@@ -2372,3 +2384,18 @@ persistence.
   competing Codex-owned QEMU lanes were holding or killing the disk image. Review adjustment: the
   next clean boot should confirm EventLog creates/writes its `.Evt` files through the writable
   config subtree and then continue D3 boot/system hive persistence proofs.
+
+- A4/NPFS root wait and owner-quiesce slice. Root `FSCTL_PIPE_WAIT` now parses the full
+  `FILE_PIPE_WAIT_FOR_BUFFER`, returns success for an already armed same-name async listen, returns
+  honest `STATUS_OBJECT_NAME_NOT_FOUND` when no pipe FCB/name is known, and otherwise parks a bounded
+  waiter with NT-style relative/absolute/unbounded timeout handling. Name-wait completions are exact,
+  not wildcarded, and thread cancellation/timer wake releases retained reply caps. `NtOpenFile`
+  now clears `*FileHandle` on failed paths so user-mode retry loops do not observe stale handles.
+  Validation: `cargo fmt --all`, `git diff --check`, `cargo test -p nt-io-manager`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and full boot `.tmp/boot-openfile-pipe-wait-20260810-092820.log`. The boot rebuilt all artifacts
+  and timed out cleanly with `RUN_STATUS=124` at the real EventLog/SCM frontier:
+  `services.exe` probed `\pipe\EventLog` and got `STATUS_OBJECT_NAME_NOT_FOUND` after EventLog had
+  already connected to SCM and exchanged pipe/RPC traffic. Review adjustment: next work should
+  instrument/repair EventLog `ServiceMain` progress into `ServiceInit`/`RpcThreadRoutine` so the
+  genuine `\pipe\EventLog` server endpoint appears before SCM's event logging client bind.

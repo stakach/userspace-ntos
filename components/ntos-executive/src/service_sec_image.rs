@@ -6888,6 +6888,10 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
             let mut park_pipe_is_write = false;
+            let mut park_pipe_name_wait_hash: u64 = 0;
+            let mut park_pipe_name_wait_iosb_va: u64 = 0;
+            let mut park_pipe_name_wait_event_obj_idx: u64 = u64::MAX;
+            let mut park_pipe_name_wait_deadline_100ns: u64 = u64::MAX;
             let mut gui_message_wait_park_request = false;
             let mut gui_message_wait_queue_event_body: u64 = 0;
             let mut gui_message_wait_msg_ptr: u64 = 0;
@@ -6988,6 +6992,11 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_listen_fid = 0;
                 nt_handler.pipe_listen_event_handle = 0;
                 nt_handler.pipe_listen_iosb_va = 0;
+                nt_handler.pipe_name_wait_hash = 0;
+                nt_handler.pipe_name_wait_iosb_va = 0;
+                nt_handler.pipe_name_wait_event_obj_idx = u64::MAX;
+                nt_handler.pipe_name_wait_deadline_100ns = u64::MAX;
+                nt_handler.pipe_name_wait_redrive = 0;
                 nt_handler.pipe_connect_redrive = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.sm_request_port = 0;
@@ -7539,6 +7548,13 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_transceive = nt_handler.pipe_park_transceive;
                     park_pipe_is_write = nt_handler.pipe_park_is_write;
                 }
+                if nt_handler.pipe_name_wait_hash != 0 {
+                    park_pipe_name_wait_hash = nt_handler.pipe_name_wait_hash;
+                    park_pipe_name_wait_iosb_va = nt_handler.pipe_name_wait_iosb_va;
+                    park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
+                    park_pipe_name_wait_deadline_100ns =
+                        nt_handler.pipe_name_wait_deadline_100ns;
+                }
                 // ★ BATCH 34: a client CONNECT to a pipe with a pending async server FSCTL_PIPE_LISTEN
                 // for the SAME pipe name completes that listen — signal its completion event so the
                 // server's NtWaitForMultipleObjects wakes and reads the client's first PDU (the bind).
@@ -7553,6 +7569,15 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[pipe-listen] completed ");
                         print_u64(listens);
                         print_str(b" pending server listen(s) on client connect\n");
+                    }
+                }
+                if nt_handler.pipe_name_wait_redrive != 0 {
+                    let name_hash = nt_handler.pipe_name_wait_redrive;
+                    let waiters = pipe_name_wait_complete_named(&mut nt_handler, name_hash);
+                    if waiters != 0 {
+                        print_str(b"[pipe-name-wait] completed ");
+                        print_u64(waiters);
+                        print_str(b" waiter(s) on available pipe\n");
                     }
                 }
                 if nt_handler.pipe_write_redrive {
@@ -12942,7 +12967,7 @@ pub(crate) unsafe fn service_sec_image(
                         crash_parked,
                         wait_parked,
                     );
-                    if pi_is_top_level(&nt_handler, badge) {
+                    if indefinite_wait_counts_for_owner(&nt_handler, badge) {
                         mark_wait_parked!(pi, resume_ip);
                     }
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -12977,6 +13002,18 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" port=");
                     print_u64(park_io_completion_port as u64);
                     print_str(b" -> PARK remover\n");
+                    if park_io_completion_deadline.is_none() {
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
+                            mark_wait_parked!(pi, resume_ip);
+                        }
+                    }
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13101,9 +13138,10 @@ pub(crate) unsafe fn service_sec_image(
                     park_wait_deadline,
                 ) {
                     delay_timer_rearm(delay_queue);
-                    // An INDEFINITE (no-deadline) wait by a top-level process is quiesce-relevant: if
-                    // every live process is now parked, no signaler remains → run the gate. A
-                    // deadline-bounded wait is timer-woken, so it never deadlocks — don't count it.
+                    // An INDEFINITE (no-deadline) wait by a main thread or persistent server-loop
+                    // worker can be quiesce-relevant: if every live owner is now parked, no signaler
+                    // remains -> run the gate. A deadline-bounded wait is timer-woken, so it never
+                    // deadlocks; don't count it.
                     if winlogon_worker_can_signal {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
@@ -13115,7 +13153,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if pi_is_top_level(&nt_handler, badge) {
+                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
                             mark_wait_parked!(pi, resume_ip);
                         }
                     }
@@ -13167,7 +13205,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if pi_is_top_level(&nt_handler, badge) {
+                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
                             mark_wait_parked!(pi, resume_ip);
                         }
                     }
@@ -13302,6 +13340,55 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
+            if park_pipe_name_wait_hash != 0 && reply_main != 0 {
+                if pipe_name_wait_park(
+                    park_pipe_name_wait_hash,
+                    pi as u32,
+                    nt_handler.current_tid,
+                    badge,
+                    park_pipe_name_wait_iosb_va,
+                    park_pipe_name_wait_event_obj_idx,
+                    park_pipe_name_wait_deadline_100ns,
+                    resume_ip,
+                    sp,
+                    flags,
+                ) {
+                    if park_pipe_name_wait_deadline_100ns != u64::MAX {
+                        delay_timer_rearm(delay_queue);
+                    }
+                    print_str(b"[pipe-name-wait] badge=");
+                    print_u64(badge);
+                    print_str(b" name_hash=0x");
+                    print_hex_u64(park_pipe_name_wait_hash);
+                    print_str(b" -> PARK waiter\n");
+                    if park_pipe_name_wait_deadline_100ns == u64::MAX {
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
+                            mark_wait_parked!(pi, resume_ip);
+                        }
+                    }
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else {
+                    print_str(
+                        b"[pipe-name-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
+                    );
+                    result = 0xC000_009A;
+                }
+            }
             // ★ Dbgk TARGET-SIDE BLOCK, SYSCALL flavour (`DbgkpQueueMessage`'s wait on
             // `DebugEvent->ContinueEvent`). This syscall posted a debug event for a process whose
             // debugger is attached, and NT blocks the REPORTING thread until `NtDebugContinue`.
@@ -13330,7 +13417,7 @@ pub(crate) unsafe fn service_sec_image(
                     // A blocked reporter is a COOPERATIVE wait (the debugger's continue wakes it),
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
-                    if pi_is_top_level(&nt_handler, badge) {
+                    if indefinite_wait_counts_for_owner(&nt_handler, badge) {
                         mark_wait_parked!(pi, resume_ip);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -18408,6 +18495,137 @@ unsafe fn pipe_wait_park(
     true
 }
 
+unsafe fn pipe_name_wait_park(
+    name_hash: u64,
+    pi: u32,
+    tid: u64,
+    badge: u64,
+    iosb_va: u64,
+    event_obj_idx: u64,
+    deadline_100ns: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let mut fresh = 0u64;
+    let mut fresh_bit = 0usize;
+    for i in 0..WAIT_REPLY_POOL_N {
+        if used & (1u64 << i) == 0 {
+            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
+            if cp != 0 {
+                fresh = cp;
+                fresh_bit = i;
+                break;
+            }
+        }
+    }
+    if fresh == 0 {
+        return false;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
+    let parked = table.arm(nt_io_manager::PipeNameWaiter {
+        name_hash,
+        pi,
+        tid,
+        badge,
+        iosb_va,
+        event_obj_idx,
+        reply_cap: stolen,
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+        deadline_100ns,
+    });
+    if parked.is_none() {
+        return false;
+    }
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    PIPE_NAME_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+pub(crate) unsafe fn pipe_name_wait_complete_one(
+    nt_handler: &mut ExecNtHandler,
+    waiter: nt_io_manager::PipeNameWaiter,
+    status: u32,
+) {
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take();
+    let (sb, ss, smv, hmv, imv, scratch_base) =
+        mirror_ctx_for(waiter.badge, waiter.pi as usize);
+    ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    nt_handler.pi = waiter.pi as usize;
+    if waiter.iosb_va != 0 {
+        nt_handler.xas_write_buf(waiter.iosb_va, &status.to_le_bytes());
+        nt_handler.xas_write_buf(waiter.iosb_va + 8, &0u64.to_le_bytes());
+    }
+    if waiter.event_obj_idx != u64::MAX {
+        let _ = nt_handler.events.set_existing(waiter.event_obj_idx);
+        let _ = wait_wake_dispatcher_set(nt_handler);
+    }
+    if waiter.reply_cap != 0 {
+        set_reply_mr(15, waiter.resume_ip);
+        set_reply_mr(16, waiter.resume_sp);
+        set_reply_mr(17, waiter.resume_flags);
+        client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
+        release_reply_pool_cap(waiter.reply_cap);
+    }
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.loop_ctx = saved_ctx;
+}
+
+unsafe fn pipe_name_wait_complete_named(nt_handler: &mut ExecNtHandler, name_hash: u64) -> u64 {
+    let mut woken = 0u64;
+    loop {
+        let waiter = {
+            let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
+            table.complete_by_name(name_hash)
+        };
+        let Some(waiter) = waiter else {
+            break;
+        };
+        pipe_name_wait_complete_one(nt_handler, waiter, 0);
+        woken += 1;
+        PIPE_NAME_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        if PIPE_NAME_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[pipe-name-wait] COMPLETE name_hash=0x");
+            print_hex_u64(name_hash);
+            print_str(b" pi=");
+            print_u64(waiter.pi as u64);
+            print_str(b" badge=");
+            print_u64(waiter.badge);
+            print_str(b"\n");
+        }
+    }
+    woken
+}
+
 /// BATCH 33 — RE-DRIVE every parked pipe read after a peer write. The executive has no peer→reader
 /// map (npfs pairs the two ends internally by name), so on ANY completed pipe write we re-issue EVERY
 /// parked read against npfs: npfs's own FCB pairing makes the reader whose peer just wrote return data
@@ -18767,15 +18985,11 @@ fn owner_top_badge_for(nt_handler: &ExecNtHandler, badge: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// A top-level process badge (its MAIN thread), not a listener/worker sub-thread. Only a top-level
-/// process's indefinite wait is quiesce-relevant (a sub-thread listener parks cooperatively but its
-/// parent process may still run).
-#[inline]
 /// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
 /// woken by another RUNNABLE thread, and if none is left the loop's next `recv` blocks forever —
 /// past even the wall-clock stall watchdog, which lives at the loop top and therefore never runs.
-/// Only a TOP-LEVEL badge's park is counted toward quiesce (a worker parking says nothing about its
-/// process's main thread), so trace every one of them with the three masks the quiesce test reads.
+/// Main-thread waits and selected persistent server-loop worker waits can count their owner toward
+/// quiesce; trace each indefinite park with the masks the quiesce test reads.
 fn trace_indefinite_wait_park(
     nt_handler: &ExecNtHandler,
     badge: u64,
@@ -18793,6 +19007,8 @@ fn trace_indefinite_wait_park(
     print_u64(owner_top_badge_for(nt_handler, badge));
     print_str(b" top-level=");
     print_u64(pi_is_top_level(nt_handler, badge) as u64);
+    print_str(b" counts-owner=");
+    print_u64(indefinite_wait_counts_for_owner(nt_handler, badge) as u64);
     print_str(b" live=0x");
     print_hex(live as u32);
     print_str(b" crash=0x");
@@ -18822,8 +19038,18 @@ fn userinit_shell_frontier_pending(
     (crash_parked | wait_parked) & userinit_bit == 0
 }
 
+/// A top-level process badge is the process's main hosted thread, not a listener/worker sub-thread.
+#[inline]
 fn pi_is_top_level(nt_handler: &ExecNtHandler, badge: u64) -> bool {
     hosted_pi_for_top_badge(nt_handler, badge).is_some()
+}
+
+#[inline]
+fn indefinite_wait_counts_for_owner(nt_handler: &ExecNtHandler, badge: u64) -> bool {
+    pi_is_top_level(nt_handler, badge)
+        || nt_handler
+            .hosted_thread_role_for_badge(badge)
+            .is_some_and(HostedThreadRole::counts_owner_for_indefinite_wait)
 }
 
 /// The bitmask of LIVE top-level process badges (smss is always live; the rest once SPAWNED).

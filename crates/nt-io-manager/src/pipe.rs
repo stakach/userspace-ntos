@@ -834,10 +834,23 @@ pub fn pipe_name_hash(name16: &[u16]) -> u64 {
 /// Decode the variable-sized `FILE_PIPE_WAIT_FOR_BUFFER` payload used by
 /// `FSCTL_PIPE_WAIT`. The returned name is the caller-provided pipe suffix; the
 /// object-manager/NPFS bridge is responsible for applying its namespace prefix.
-pub fn decode_pipe_wait_name(input: &[u8]) -> Result<Vec<u16>, NtStatus> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipeWaitRequest {
+    /// Timeout from `FILE_PIPE_WAIT_FOR_BUFFER::Timeout` in NT 100ns units.
+    pub timeout_100ns: i64,
+    /// `FILE_PIPE_WAIT_FOR_BUFFER::TimeoutSpecified`.
+    pub timeout_specified: bool,
+    /// Caller-provided pipe suffix, without the NPFS root prefix.
+    pub name: Vec<u16>,
+}
+
+pub fn decode_pipe_wait_request(input: &[u8]) -> Result<PipeWaitRequest, NtStatus> {
     if input.len() < FILE_PIPE_WAIT_NAME_OFFSET + 2 {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    let timeout_100ns = i64::from_le_bytes([
+        input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+    ]);
     let name_len = u32::from_le_bytes([input[8], input[9], input[10], input[11]]) as usize;
     if name_len == 0
         || name_len & 1 != 0
@@ -849,10 +862,124 @@ pub fn decode_pipe_wait_name(input: &[u8]) -> Result<Vec<u16>, NtStatus> {
         return Err(NtStatus::INVALID_PARAMETER);
     }
     let name = &input[FILE_PIPE_WAIT_NAME_OFFSET..FILE_PIPE_WAIT_NAME_OFFSET + name_len];
-    Ok(name
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
-        .collect())
+    Ok(PipeWaitRequest {
+        timeout_100ns,
+        timeout_specified: input[12] != 0,
+        name: name
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect(),
+    })
+}
+
+pub fn decode_pipe_wait_name(input: &[u8]) -> Result<Vec<u16>, NtStatus> {
+    Ok(decode_pipe_wait_request(input)?.name)
+}
+
+/// A pending `FSCTL_PIPE_WAIT` issued on the NPFS root/control file. Native NPFS keeps these in
+/// `NP_VCB::WaitQueue` and completes them when a matching pipe instance becomes available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PipeNameWaiter {
+    pub name_hash: u64,
+    pub pi: u32,
+    pub tid: u64,
+    pub badge: u64,
+    pub iosb_va: u64,
+    pub event_obj_idx: u64,
+    pub reply_cap: u64,
+    pub resume_ip: u64,
+    pub resume_sp: u64,
+    pub resume_flags: u64,
+    /// Absolute monotonic deadline in 100ns units, or `u64::MAX` for an unbounded wait.
+    pub deadline_100ns: u64,
+}
+
+/// Fixed-capacity wait queue for root `FSCTL_PIPE_WAIT` requests.
+#[derive(Clone, Debug)]
+pub struct PipeNameWaiterTable<const N: usize> {
+    slots: [Option<PipeNameWaiter>; N],
+}
+
+impl<const N: usize> Default for PipeNameWaiterTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> PipeNameWaiterTable<N> {
+    pub const fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|slot| slot.is_none())
+    }
+
+    pub fn has_capacity(&self) -> bool {
+        self.slots.iter().any(|slot| slot.is_none())
+    }
+
+    pub fn has_thread(&self, tid: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.is_some_and(|waiter| waiter.tid == tid))
+    }
+
+    pub fn arm(&mut self, waiter: PipeNameWaiter) -> Option<usize> {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(waiter);
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    pub fn complete_by_name(&mut self, name_hash: u64) -> Option<PipeNameWaiter> {
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|waiter| waiter.name_hash == name_hash) {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    pub fn pop_due(&mut self, now_100ns: u64) -> Option<PipeNameWaiter> {
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|waiter| waiter.deadline_100ns <= now_100ns) {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.map(|waiter| waiter.deadline_100ns))
+            .filter(|deadline| *deadline != u64::MAX)
+            .min()
+    }
+
+    pub fn cancel_thread_collect_reply_caps(&mut self, tid: u64, out: &mut [u64]) -> usize {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if let Some(waiter) = *slot {
+                if waiter.tid == tid {
+                    if count < out.len() {
+                        out[count] = waiter.reply_cap;
+                    }
+                    *slot = None;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
 /// A fixed-capacity, heap-free, reset-safe table of pending async server listens. Same `.bss` static
@@ -1597,6 +1724,22 @@ mod tests {
         }
     }
 
+    fn pnw(name: &[u16], tid: u64, reply_cap: u64, deadline_100ns: u64) -> PipeNameWaiter {
+        PipeNameWaiter {
+            name_hash: pipe_name_hash(name),
+            pi: 3,
+            tid,
+            badge: 7,
+            iosb_va: 0xA000 + tid,
+            event_obj_idx: u64::MAX,
+            reply_cap,
+            resume_ip: 0x4000 + tid,
+            resume_sp: 0x5000 + tid,
+            resume_flags: 0x202,
+            deadline_100ns,
+        }
+    }
+
     #[test]
     fn async_listen_arm_records_and_finds() {
         let mut t = AsyncListenTable::<8>::new();
@@ -1745,6 +1888,7 @@ mod tests {
     fn decode_pipe_wait_name_reads_variable_suffix() {
         let name: std::vec::Vec<u16> = "net\\NtControlPipe1".encode_utf16().collect();
         let mut input = std::vec![0u8; FILE_PIPE_WAIT_NAME_OFFSET + name.len() * 2];
+        input[0..8].copy_from_slice(&(-50_000_000i64).to_le_bytes());
         input[8..12].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
         input[12] = 1;
         for (index, unit) in name.iter().enumerate() {
@@ -1754,6 +1898,10 @@ mod tests {
         }
 
         assert_eq!(decode_pipe_wait_name(&input).unwrap(), name);
+        let request = decode_pipe_wait_request(&input).unwrap();
+        assert_eq!(request.name, name);
+        assert_eq!(request.timeout_100ns, -50_000_000);
+        assert!(request.timeout_specified);
     }
 
     #[test]
@@ -1823,6 +1971,63 @@ mod tests {
         assert!(t.is_empty());
         // No third connect completes anything — consumption was one-per-connect.
         assert!(t.complete_by_name(h).is_none());
+    }
+
+    #[test]
+    fn pipe_name_waiter_complete_by_name_is_specific_and_rearmable() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let mut t = PipeNameWaiterTable::<4>::new();
+        t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
+        t.arm(pnw(&ntsvcs, 11, 0x31, u64::MAX)).unwrap();
+
+        let done = t.complete_by_name(pipe_name_hash(&eventlog)).unwrap();
+        assert_eq!(done.tid, 10);
+        assert_eq!(done.reply_cap, 0x30);
+        assert_eq!(t.len(), 1);
+        assert!(t.complete_by_name(pipe_name_hash(&eventlog)).is_none());
+        assert!(t.complete_by_name(0).is_none());
+
+        t.arm(pnw(&eventlog, 12, 0x32, u64::MAX)).unwrap();
+        assert_eq!(
+            t.complete_by_name(pipe_name_hash(&eventlog)).unwrap().tid,
+            12
+        );
+        assert_eq!(t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap().tid, 11);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn pipe_name_waiter_pop_due_ignores_unbounded_waits() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let mut t = PipeNameWaiterTable::<4>::new();
+        t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
+        t.arm(pnw(&ntsvcs, 11, 0x31, 150)).unwrap();
+
+        assert_eq!(t.next_deadline(), Some(150));
+        assert!(t.pop_due(149).is_none());
+        let due = t.pop_due(150).unwrap();
+        assert_eq!(due.tid, 11);
+        assert_eq!(t.next_deadline(), None);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn pipe_name_waiter_cancel_thread_collects_reply_caps() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let mut t = PipeNameWaiterTable::<4>::new();
+        t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
+        t.arm(pnw(&ntsvcs, 10, 0x31, 200)).unwrap();
+        t.arm(pnw(&ntsvcs, 11, 0x32, 300)).unwrap();
+
+        let mut caps = [0u64; 4];
+        assert_eq!(t.cancel_thread_collect_reply_caps(10, &mut caps), 2);
+        assert_eq!(&caps[..2], &[0x30, 0x31]);
+        assert!(!t.has_thread(10));
+        assert!(t.has_thread(11));
+        assert_eq!(t.len(), 1);
     }
 
     #[test]

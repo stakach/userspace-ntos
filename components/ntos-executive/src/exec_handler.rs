@@ -20,8 +20,25 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
+const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
 const REGISTRY_SERVICE_NAME_COPY_MAX: usize = 512;
+
+fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
+    let timeout = if request.timeout_specified {
+        request.timeout_100ns
+    } else {
+        PIPE_DEFAULT_WAIT_INTERVAL_100NS
+    };
+    if timeout == i64::MIN {
+        None
+    } else if timeout < 0 {
+        let span = timeout.checked_neg().unwrap_or(i64::MAX) as u64;
+        Some(monotonic_time_100ns().saturating_add(span))
+    } else {
+        Some(timeout as u64)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct NpfsFileRoute {
@@ -1384,6 +1401,11 @@ impl ExecNtHandler {
         write_field!(pipe_listen_fid, 0);
         write_field!(pipe_listen_event_handle, 0);
         write_field!(pipe_listen_iosb_va, 0);
+        write_field!(pipe_name_wait_hash, 0);
+        write_field!(pipe_name_wait_iosb_va, 0);
+        write_field!(pipe_name_wait_event_obj_idx, u64::MAX);
+        write_field!(pipe_name_wait_deadline_100ns, u64::MAX);
+        write_field!(pipe_name_wait_redrive, 0);
         write_field!(pipe_connect_redrive, 0);
         write_field!(anon_event_seq, 0);
         write_field!(lpc_rendezvous_conn, 0);
@@ -4359,6 +4381,12 @@ impl ExecNtHandler {
             .filter(|&tid| tid != 0)
     }
 
+    pub(crate) fn hosted_thread_role_for_badge(&self, badge: u64) -> Option<HostedThreadRole> {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.role)
+    }
+
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
         self.thread_runtime
             .get_by_badge(self.current_badge)
@@ -7292,6 +7320,7 @@ impl ExecNtHandler {
                 let pending = unsafe {
                     (&*core::ptr::addr_of!(PIPE_WAITERS)).has_thread(tid as u64)
                         || (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).has_thread(tid as u64)
+                        || (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).has_thread(tid as u64)
                 };
                 output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
                 4
@@ -10520,6 +10549,19 @@ impl ExecNtHandler {
         }
     }
 
+    fn write_nt_open_file_handle_out(&mut self, ptr: u64, val: u64) {
+        if ptr == 0 {
+            return;
+        }
+        if self.pi >= 2 {
+            self.queue_write(ptr, val);
+        } else {
+            unsafe {
+                smss_stack_write(ptr, val);
+            }
+        }
+    }
+
     pub(crate) fn close_current_handle(&mut self, handle: u64) {
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
             let _ = self.close_process_handle(pid, handle);
@@ -13043,6 +13085,7 @@ impl ExecNtHandler {
         let ctx = self.loop_ctx.unwrap();
         let reg = &mut *ctx.reg;
         const FILE_DIRECTORY_FILE: u64 = 0x01;
+        let file_handle_out = get_recv_mr(9);
         {
             let oa_probe = get_recv_mr(7);
             let nm = self.read_objattr_name_pe(oa_probe);
@@ -13060,7 +13103,9 @@ impl ExecNtHandler {
                     }
                 }
                 if let Some(handle) = opened_handle {
-                    self.queue_write(get_recv_mr(9), handle);
+                    self.queue_write(file_handle_out, handle);
+                } else {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
                 let iosb = get_recv_mr(8);
                 if iosb != 0 {
@@ -13111,7 +13156,9 @@ impl ExecNtHandler {
                     None
                 };
                 if let Some(handle) = opened_handle {
-                    self.queue_write(get_recv_mr(9), handle);
+                    self.queue_write(file_handle_out, handle);
+                } else {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
                 let iosb = get_recv_mr(8);
                 if iosb != 0 {
@@ -13139,53 +13186,55 @@ impl ExecNtHandler {
                 let leaf = Self::pipe_leaf16(&nm);
                 match self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
                     Ok((st, fid)) => {
-                    let mut status = st as u32;
-                    let opened_handle = if status == 0 && fid != 0 {
-                        let options = args[5] as u32;
-                        let synchronous = options
-                            & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
-                                | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
-                            != 0;
-                        let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
-                        if handle.is_none() {
-                            status = 0xC000_009A;
+                        let mut status = st as u32;
+                        let opened_handle = if status == 0 && fid != 0 {
+                            let options = args[5] as u32;
+                            let synchronous = options
+                                & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
+                                    | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
+                                != 0;
+                            let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
+                            if handle.is_none() {
+                                status = 0xC000_009A;
+                            }
+                            handle
+                        } else {
+                            if status == 0 {
+                                status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                            }
+                            None
+                        };
+                        if let Some(handle) = opened_handle {
+                            self.queue_write(file_handle_out, handle);
+                            if status == 0 {
+                                self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
+                                crate::pipe_fid_name_remember(
+                                    fid,
+                                    nt_io_manager::pipe_name_hash(&leaf),
+                                );
+                            }
+                        } else {
+                            self.write_nt_open_file_handle_out(file_handle_out, 0);
                         }
-                        handle
-                    } else {
-                        if status == 0 {
-                            status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        let iosb = get_recv_mr(8);
+                        if iosb != 0 {
+                            self.xas_write_buf(iosb, &status.to_le_bytes());
+                            let info = if status == 0 { 1u64 } else { 0 };
+                            self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                         }
-                        None
-                    };
-                    if let Some(handle) = opened_handle {
-                        self.queue_write(get_recv_mr(9), handle);
-                        if status == 0 {
-                            self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
-                            crate::pipe_fid_name_remember(
-                                fid,
-                                nt_io_manager::pipe_name_hash(&leaf),
-                            );
-                        }
-                    }
-                    let iosb = get_recv_mr(8);
-                    if iosb != 0 {
-                        self.xas_write_buf(iosb, &status.to_le_bytes());
-                        let info = if status == 0 { 1u64 } else { 0 };
-                        self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-                    }
-                    loader_trace_record(
-                        self.pi,
-                        LoaderOp::OpenFile,
-                        status,
-                        None,
-                        0,
-                        opened_handle.unwrap_or(0),
-                        &lc,
-                    );
-                    return status;
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::OpenFile,
+                            status,
+                            None,
+                            0,
+                            opened_handle.unwrap_or(0),
+                            &lc,
+                        );
+                        return status;
                     }
                     Err(status) => {
-                        self.queue_write(get_recv_mr(9), 0);
+                        self.write_nt_open_file_handle_out(file_handle_out, 0);
                         let iosb = get_recv_mr(8);
                         if iosb != 0 {
                             self.xas_write_buf(iosb, &status.to_le_bytes());
@@ -13235,10 +13284,13 @@ impl ExecNtHandler {
                 match self.mint_overlay_file_handle(file_id, args[1] as u32) {
                     Some(handle) => {
                         opened_handle = handle;
-                        self.queue_write(get_recv_mr(9), handle);
+                        self.queue_write(file_handle_out, handle);
                     }
                     None => status = 0xC000_009A,
                 }
+            }
+            if opened_handle == 0 {
+                self.write_nt_open_file_handle_out(file_handle_out, 0);
             }
             let iosb = get_recv_mr(8);
             if iosb != 0 {
@@ -13274,9 +13326,10 @@ impl ExecNtHandler {
             let opened_handle =
                 self.mint_disk_file_handle(first_cluster, file_size, desired_access);
             if let Some(handle) = opened_handle {
-                self.queue_write(get_recv_mr(9), handle);
+                self.queue_write(file_handle_out, handle);
             } else {
                 status = 0xC000_009A;
+                self.write_nt_open_file_handle_out(file_handle_out, 0);
             }
             let iosb = get_recv_mr(8);
             if iosb != 0 {
@@ -13443,6 +13496,7 @@ impl ExecNtHandler {
                 let Some(h) = h else {
                     let status = 0xC000_009A;
                     let iosb = get_recv_mr(8);
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
                     if iosb != 0 {
                         smss_stack_write32(iosb, status);
                         smss_stack_write(iosb + 8, 0);
@@ -13459,7 +13513,7 @@ impl ExecNtHandler {
                     return status;
                 };
                 opened_handle = h;
-                smss_stack_write(get_recv_mr(9), h);
+                smss_stack_write(file_handle_out, h);
                 if let Some(image) = hosted_exe_image {
                     let _ = record_hosted_child_exe_open(ctx, self.pi, image, h);
                 }
@@ -13493,6 +13547,9 @@ impl ExecNtHandler {
             opened_handle,
             &nb[..nlen],
         );
+        if status != 0 {
+            self.write_nt_open_file_handle_out(file_handle_out, 0);
+        }
         status
     }
 
@@ -15300,6 +15357,7 @@ impl ExecNtHandler {
                     }
                 }
                 NAMED_PIPE_CREATED.fetch_add(1, Ordering::Relaxed);
+                self.pipe_name_wait_redrive = nt_io_manager::pipe_name_hash(&leaf);
                 0 // STATUS_SUCCESS
             },
             // NtFsControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
@@ -15355,16 +15413,47 @@ impl ExecNtHandler {
                         if !self.xas_read(args[6], &mut input) {
                             status = STATUS_ACCESS_VIOLATION as u64;
                         } else {
-                            match nt_io_manager::decode_pipe_wait_name(&input) {
-                                Ok(wait_name) => {
-                                    let leaf = Self::pipe_leaf16(&wait_name);
+                            match nt_io_manager::decode_pipe_wait_request(&input) {
+                                Ok(wait_request) => {
+                                    let leaf = Self::pipe_leaf16(&wait_request.name);
                                     let pipe_wait_name_hash = nt_io_manager::pipe_name_hash(&leaf);
                                     let listens = &*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS);
-                                    status = if listens.armed_name(pipe_wait_name_hash) {
-                                        nt_fs::STATUS_SUCCESS as u64
+                                    if listens.armed_name(pipe_wait_name_hash) {
+                                        status = nt_fs::STATUS_SUCCESS as u64;
+                                    } else if !crate::pipe_name_hash_known(pipe_wait_name_hash) {
+                                        status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND as u64;
                                     } else {
-                                        STATUS_IO_TIMEOUT as u64
-                                    };
+                                        let deadline = pipe_wait_deadline_100ns(&wait_request);
+                                        let now = monotonic_time_100ns();
+                                        if deadline.is_some_and(|value| value <= now) {
+                                            status = STATUS_IO_TIMEOUT as u64;
+                                        } else {
+                                            let waiters =
+                                                &*core::ptr::addr_of!(crate::PIPE_NAME_WAITERS);
+                                            let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+                                            let reply_capacity = REPLY_MAIN_SLOT
+                                                .load(Ordering::Relaxed)
+                                                != 0
+                                                && (0..WAIT_REPLY_POOL_N).any(|index| {
+                                                    used & (1u64 << index) == 0
+                                                        && WAIT_REPLY_POOL[index]
+                                                            .load(Ordering::Relaxed)
+                                                            != 0
+                                                });
+                                            if !waiters.has_capacity() || !reply_capacity {
+                                                status =
+                                                    nt_io_completion::STATUS_INSUFFICIENT_RESOURCES
+                                                        as u64;
+                                            } else {
+                                                self.pipe_name_wait_hash = pipe_wait_name_hash;
+                                                self.pipe_name_wait_iosb_va = iosb;
+                                                self.pipe_name_wait_event_obj_idx = event_obj_idx;
+                                                self.pipe_name_wait_deadline_100ns =
+                                                    deadline.unwrap_or(u64::MAX);
+                                                status = STATUS_PENDING as u64;
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(wait_status) => status = wait_status.0 as u32 as u64,
                             }
@@ -15494,6 +15583,7 @@ impl ExecNtHandler {
                         print_str(b"\n");
                         // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
                         self.pipe_listen_fid = fid;
+                        self.pipe_name_wait_redrive = crate::pipe_fid_name_hash(fid);
                     } else {
                         if !already_armed && retain_status.is_ok() {
                             self.release_file_reference(fid);
@@ -15504,7 +15594,11 @@ impl ExecNtHandler {
                             as u64;
                     }
                 }
-                if iosb != 0 && self.pipe_park_fid == 0 && self.pipe_listen_fid == 0 {
+                if iosb != 0
+                    && self.pipe_park_fid == 0
+                    && self.pipe_listen_fid == 0
+                    && self.pipe_name_wait_hash == 0
+                {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
@@ -20179,6 +20273,13 @@ impl ExecNtHandler {
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                if status != nt_fs::STATUS_SUCCESS {
+                    if self.pi >= 2 {
+                        self.queue_write(args[0], 0);
+                    } else {
+                        smss_stack_write(args[0], 0);
+                    }
                 }
                 if nt_fs::is_named_pipe_path(&name16)
                     && (self.pi == 2 || self.pi == 3 || self.pi == 7)
