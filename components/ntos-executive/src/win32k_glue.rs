@@ -56,6 +56,7 @@ static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WINDOWPROC_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_LOOKUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_INVALID_REQUEST_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
@@ -1347,6 +1348,58 @@ unsafe fn callback_payload_write_u64(
     }
 }
 
+fn user_callback_validation_error_name(error: nt_user_callback::ValidationError) -> &'static [u8] {
+    match error {
+        nt_user_callback::ValidationError::Magic => b"magic",
+        nt_user_callback::ValidationError::Version => b"version",
+        nt_user_callback::ValidationError::Kind => b"kind",
+        nt_user_callback::ValidationError::State => b"state",
+        nt_user_callback::ValidationError::Length => b"length",
+        nt_user_callback::ValidationError::OutputLength => b"output-length",
+        nt_user_callback::ValidationError::Sequence => b"sequence",
+        nt_user_callback::ValidationError::Correlation => b"correlation",
+    }
+}
+
+unsafe fn trace_invalid_user_callback_request(
+    request: &nt_user_callback::CallbackHeader,
+    error: nt_user_callback::ValidationError,
+) {
+    let n = USER_CALLBACK_INVALID_REQUEST_TRACES.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 {
+        return;
+    }
+    print_str(b"[user-callback] invalid component request reason=");
+    print_str(user_callback_validation_error_name(error));
+    print_str(b" magic=0x");
+    print_hex(request.magic);
+    print_str(b" state=");
+    print_u64(request.state as u64);
+    print_str(b" api=");
+    print_u64(request.api_index as u64);
+    print_str(b" in=0x");
+    print_hex(request.input_length);
+    print_str(b" out-cap=0x");
+    print_hex(request.output_capacity);
+    print_str(b" out-len=0x");
+    print_hex(request.output_length);
+    print_str(b" status=0x");
+    print_hex(request.status as u32);
+    print_str(b" pi=");
+    print_u64(request.client_pi as u64);
+    print_str(b" tid=");
+    print_u64(request.client_tid);
+    print_str(b" badge=");
+    print_u64(request.client_badge);
+    print_str(b" cb=");
+    print_u64(request.callback_id as u64);
+    print_str(b" dispatch=");
+    print_u64(request.dispatch_id);
+    print_str(b" ref=0x");
+    print_hex(request.payload_reference_offset);
+    print_str(b"\n");
+}
+
 pub(crate) unsafe fn service_user_callback() -> Option<UserCallbackDisposition> {
     const WPCA_MSG: usize = 0x18;
     const WPCA_RESULT: usize = 0x38;
@@ -1354,8 +1407,8 @@ pub(crate) unsafe fn service_user_callback() -> Option<UserCallbackDisposition> 
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
-    if nt_user_callback::validate_request(&request).is_err() {
-        print_str(b"[user-callback] invalid component request\n");
+    if let Err(error) = nt_user_callback::validate_request(&request) {
+        trace_invalid_user_callback_request(&request, error);
         return None;
     }
     let Some(client) = user_callback_client_for_request(&request) else {

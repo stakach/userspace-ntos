@@ -809,6 +809,20 @@ unsafe fn service_generic_section_fault(
     nt_address_space::mapped_view_fault_access_status(view_info.protect, fault_access)?;
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
+        if write_fault && fault_plan.copy_on_write {
+            let old_protection = nt_address_space::mapped_view_fault_plan(view_info.protect, false)
+                .map_protection;
+            vm_promote_mapped_cow_page(
+                pi,
+                page,
+                0,
+                old_protection,
+                fault_plan.map_protection,
+                pml4,
+                scratch_base,
+            )?;
+            return Ok(true);
+        }
         if write_fault && fault_plan.mark_dirty {
             let old_protection = nt_address_space::mapped_view_fault_plan(view_info.protect, false)
                 .map_protection;
@@ -831,6 +845,20 @@ unsafe fn service_generic_section_fault(
         page_index,
         scratch_base,
     )?;
+    if fault_plan.copy_on_write {
+        let old_protection =
+            nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
+        vm_promote_mapped_cow_page(
+            pi,
+            page,
+            frame,
+            old_protection,
+            fault_plan.map_protection,
+            pml4,
+            scratch_base,
+        )?;
+        return Ok(true);
+    }
     vm_ensure_private_pt(pi, page, pml4)?;
     let (map_cap, copy_error) = copy_cap_r(frame);
     if copy_error != 0 {
@@ -12944,6 +12972,11 @@ pub(crate) unsafe fn service_sec_image(
             procs[logon_pi].scratch_base,
         );
         crate::mapped_section_writeback_selftest(procs[logon_pi].scratch_base);
+        crate::mapped_section_writecopy_cow_selftest(
+            logon_pi,
+            procs[logon_pi].pml4,
+            procs[logon_pi].scratch_base,
+        );
         crate::image_writecopy_cow_selftest(
             logon_pi,
             procs[logon_pi].pml4,

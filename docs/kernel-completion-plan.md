@@ -268,10 +268,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    decode the x86 page-fault access kind instead of treating every non-write fault as a read. Boot
    proof `.tmp/boot-execute-fault-access-20260809.log` is fully green at `293/293`, including
    `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
-   and `exec_explorer_shell_chrome_painted`. Continue the plan from the remaining
-   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
-   B3's real video/driver binding, true mapped data-section writecopy COW, broader C4
-   overlap/decommit/protect regressions, and D1/D2 mutable registry/filesystem authority.
+   and `exec_explorer_shell_chrome_painted`. The follow-up C4 mapped writecopy slice now treats
+   generic data-section `PAGE_WRITECOPY` and `PAGE_EXECUTE_WRITECOPY` write faults as true
+   copy-on-write promotions into process-owned private frames, and the post-quiesce gate proves the
+   shared mapped source frame remains unchanged after a private mutation. Boot proof
+   `.tmp/boot-callback-invalid-header-20260809.log` is fully green at `294/294`, including
+   `exec_mapped_section_writecopy_cow_isolated`, callback/LSA route gates, VM pool headroom, and
+   explorer shell chrome. Continue the plan from the remaining structural debt rather than
+   shell-paint scaffolding: A4's SCM pipe/listener special coordination, B3's real video/driver
+   binding, broader C4 private/mapped protect, partial decommit/release, overlap, `MEM_TOP_DOWN`,
+   guard/no-access regressions, and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1849,6 +1855,30 @@ in SCM, user-mode system processes, and our ntdll where possible.
   is `293/293`, `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`,
   `exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted` all remain green,
   `ut-free=52327KiB`, `image-mapcaps=7749`, `vad=40/96`, `committed-map=233/512`, and explorer
-  shell chrome still paints `34873` non-background pixels. Review adjustment: the remaining C4
-  work is true mapped data-section writecopy COW plus the broader private/mapped protect,
-  decommit, release, overlap, and `MEM_TOP_DOWN` matrix gates.
+  shell chrome still paints `34873` non-background pixels. Review adjustment: the next C4 work is
+  true mapped data-section writecopy COW, then the broader private/mapped protect, decommit,
+  release, overlap, and `MEM_TOP_DOWN` matrix gates.
+
+- C4 mapped data-section writecopy COW slice. `mapped_view_fault_plan` now treats
+  `PAGE_WRITECOPY` and `PAGE_EXECUTE_WRITECOPY` write faults as copy-on-write events instead of
+  dirty writeback or access failure. Generic section faults promote those mappings into
+  process-owned private frames copied from the exact resident source mapping or from the shared
+  section frame, then register the promoted page through the normal private owner path so unmap and
+  teardown do not need special identities. A post-quiesce executive selftest seeds a shared mapped
+  section source frame, promotes a winlogon `PAGE_WRITECOPY` mapping, mutates the private frame, and
+  verifies the source frame is unchanged through `exec_mapped_section_writecopy_cow_isolated`. The
+  win32k user-callback path also gained a bounded invalid-header diagnostic that preserves the
+  fail-closed request validator while making future callback regressions actionable; it did not fire
+  in the green boot proof. Validation: `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-callback-invalid-header-20260809.log`. Result: kernel specs pass, the full executive
+  gate is `294/294`, `exec_mapped_section_writecopy_cow_isolated` passes with proof `0x1ff/0x1ff`,
+  `exec_user_callback_real_api0_nested_roundtrip`, `exec_user_callback_dead_client_unwind`,
+  `exec_win32k_transport_call_nested`, and `exec_lsa_worker_route` are green again,
+  `exec_vm_pool_headroom` remains green, `committed-map=233/512`, `vad=40/96`,
+  `image-mapcaps=7749`, and explorer shell chrome still paints `34873` non-background pixels.
+  Review adjustment: true mapped writecopy COW is closed; continue the broader C4 regression matrix
+  for private/mapped protect, partial decommit/release, overlap, `MEM_TOP_DOWN`, guard/no-access
+  verdicts, then D1/D2 durability authority plus the remaining A4/B3 cleanup.

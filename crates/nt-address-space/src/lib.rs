@@ -158,6 +158,20 @@ fn protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool 
     }
 }
 
+fn mapped_protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool {
+    if protection & PAGE_GUARD != 0 || base_protection(protection) == PAGE_NOACCESS {
+        return false;
+    }
+    match access {
+        FaultAccess::Read | FaultAccess::Lock => readable(protection),
+        FaultAccess::Write => matches!(
+            base_protection(protection),
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
+        ),
+        FaultAccess::Execute => executable(protection),
+    }
+}
+
 fn image_protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool {
     if protection & PAGE_GUARD != 0 || base_protection(protection) == PAGE_NOACCESS {
         return false;
@@ -377,6 +391,7 @@ pub struct VmCommittedProtectPlan {
 pub struct VmMappedViewFaultPlan {
     pub map_protection: u32,
     pub mark_dirty: bool,
+    pub copy_on_write: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -396,6 +411,7 @@ pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedVie
                 PAGE_READONLY | modifiers
             },
             mark_dirty: write_fault,
+            copy_on_write: false,
         },
         PAGE_EXECUTE_READWRITE => VmMappedViewFaultPlan {
             map_protection: if write_fault {
@@ -404,16 +420,36 @@ pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedVie
                 PAGE_EXECUTE_READ | modifiers
             },
             mark_dirty: write_fault,
+            copy_on_write: false,
+        },
+        PAGE_WRITECOPY => VmMappedViewFaultPlan {
+            map_protection: if write_fault {
+                PAGE_READWRITE | modifiers
+            } else {
+                PAGE_READONLY | modifiers
+            },
+            mark_dirty: false,
+            copy_on_write: write_fault,
+        },
+        PAGE_EXECUTE_WRITECOPY => VmMappedViewFaultPlan {
+            map_protection: if write_fault {
+                PAGE_EXECUTE_READWRITE | modifiers
+            } else {
+                PAGE_EXECUTE_READ | modifiers
+            },
+            mark_dirty: false,
+            copy_on_write: write_fault,
         },
         _ => VmMappedViewFaultPlan {
             map_protection: protection,
             mark_dirty: false,
+            copy_on_write: false,
         },
     }
 }
 
 pub fn mapped_view_fault_access_status(protection: u32, access: FaultAccess) -> Result<(), u32> {
-    if !protection_allows_fault_access(protection, access) {
+    if !mapped_protection_allows_fault_access(protection, access) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     Ok(())

@@ -3905,6 +3905,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     get_message_guard_spec(passed);
     vspace_asid_unmap_spec(passed);
     mapped_section_writeback_spec(passed);
+    mapped_section_writecopy_cow_spec(passed);
     image_writecopy_cow_spec(passed);
     vm_pool_headroom_spec(passed);
     unsafe { teb_tail_protected_spec(passed) };
@@ -4945,6 +4946,24 @@ fn mapped_section_writeback_spec(passed: &mut u64) {
         proof == MAPPED_SECTION_WRITEBACK_ALL
             && bytes == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64
             && status == nt_fs::STATUS_SUCCESS,
+        passed,
+    );
+}
+
+fn mapped_section_writecopy_cow_spec(passed: &mut u64) {
+    let proof = MAPPED_SECTION_WRITECOPY_COW_SELFTEST.load(Ordering::Relaxed);
+    let status = MAPPED_SECTION_WRITECOPY_COW_STATUS.load(Ordering::Relaxed) as u32;
+    print_str(b"[section-writecopy-cow-selftest] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(MAPPED_SECTION_WRITECOPY_COW_ALL as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    check(
+        b"exec_mapped_section_writecopy_cow_isolated",
+        proof == MAPPED_SECTION_WRITECOPY_COW_ALL
+            && status == nt_address_space::STATUS_SUCCESS,
         passed,
     );
 }
@@ -8559,6 +8578,23 @@ static MAPPED_SECTION_WRITEBACK_STATUS: AtomicU64 =
 static mut MAPPED_SECTION_WRITEBACK_TABLE: GenericSectionTable = GenericSectionTable::new();
 const MAPPED_SECTION_WRITEBACK_PAYLOAD: &[u8] = b"section writeback data";
 
+// --- MAPPED-DATA SECTION WRITECOPY COW SELF-TEST -----------------------------------------------
+const MAPPED_SECTION_WRITECOPY_COW_SOURCE: u64 = 0x001;
+const MAPPED_SECTION_WRITECOPY_COW_SEEDED: u64 = 0x002;
+const MAPPED_SECTION_WRITECOPY_COW_MAPPED_SHARED: u64 = 0x004;
+const MAPPED_SECTION_WRITECOPY_COW_REGISTERED: u64 = 0x008;
+const MAPPED_SECTION_WRITECOPY_COW_PROMOTED: u64 = 0x010;
+const MAPPED_SECTION_WRITECOPY_COW_COPIED: u64 = 0x020;
+const MAPPED_SECTION_WRITECOPY_COW_PRIVATE_MUTATED: u64 = 0x040;
+const MAPPED_SECTION_WRITECOPY_COW_SHARED_UNCHANGED: u64 = 0x080;
+const MAPPED_SECTION_WRITECOPY_COW_CLEANED: u64 = 0x100;
+const MAPPED_SECTION_WRITECOPY_COW_ALL: u64 = 0x1ff;
+static MAPPED_SECTION_WRITECOPY_COW_RAN: AtomicBool = AtomicBool::new(false);
+static MAPPED_SECTION_WRITECOPY_COW_SELFTEST: AtomicU64 = AtomicU64::new(0);
+static MAPPED_SECTION_WRITECOPY_COW_STATUS: AtomicU64 =
+    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+const MAPPED_SECTION_WRITECOPY_COW_PATTERN: &[u8] = b"mapped writecopy shared source bytes";
+
 // --- MEM_IMAGE WRITECOPY COW SELF-TEST ---------------------------------------------------------
 const IMAGE_WRITECOPY_COW_SOURCE: u64 = 0x001;
 const IMAGE_WRITECOPY_COW_SEEDED: u64 = 0x002;
@@ -8823,21 +8859,322 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     print_str(b"\n");
 }
 
-unsafe fn image_cow_seed_source_frame(frame: u64, scratch_base: u64) -> Result<(), u32> {
+unsafe fn finish_mapped_section_writecopy_cow_selftest(
+    pi: usize,
+    page: u64,
+    source_frame: u64,
+    loose_map_cap: u64,
+    mut proof: u64,
+    status: u32,
+) {
+    if loose_map_cap != 0 {
+        let _ = page_unmap_r(loose_map_cap);
+        let _ = cnode_delete_recycle_r(loose_map_cap);
+    }
+    vm_unmap_private_page(pi, page);
+    let clean = csrss_frame_get_exact(pi as u64, page).0 == 0;
+    if source_frame != 0 {
+        vm_frame_release(source_frame, 0);
+    }
+    if clean {
+        proof |= MAPPED_SECTION_WRITECOPY_COW_CLEANED;
+    }
+    MAPPED_SECTION_WRITECOPY_COW_SELFTEST.store(proof, Ordering::Relaxed);
+    MAPPED_SECTION_WRITECOPY_COW_STATUS.store(status as u64, Ordering::Relaxed);
+    print_str(b"[section-writecopy-cow-selftest-run] proof=0x");
+    print_hex(proof as u32);
+    print_str(b"/0x");
+    print_hex(MAPPED_SECTION_WRITECOPY_COW_ALL as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
+    pi: usize,
+    pml4: u64,
+    scratch_base: u64,
+) {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    if pml4 == 0
+        || scratch_base == 0
+        || MAPPED_SECTION_WRITECOPY_COW_RAN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let page = PRIVATE_VM_LIMIT - 0x60_0000;
+    let mut proof = 0u64;
+    let mut source_frame = 0u64;
+    let mut loose_map_cap = 0u64;
+    vm_unmap_private_page(pi, page);
+
+    match vm_frame_acquire(scratch_base) {
+        Ok(frame) => source_frame = frame,
+        Err(status) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    proof |= MAPPED_SECTION_WRITECOPY_COW_SOURCE;
+
+    if let Err(status) = cow_seed_source_frame(
+        source_frame,
+        scratch_base,
+        MAPPED_SECTION_WRITECOPY_COW_PATTERN,
+    ) {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    proof |= MAPPED_SECTION_WRITECOPY_COW_SEEDED;
+    match cow_frame_prefix_matches(
+        source_frame,
+        scratch_base,
+        MAPPED_SECTION_WRITECOPY_COW_PATTERN,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                STATUS_UNSUCCESSFUL,
+            );
+            return;
+        }
+        Err(status) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+
+    let read_plan =
+        nt_address_space::mapped_view_fault_plan(nt_address_space::PAGE_WRITECOPY, false);
+    let write_plan =
+        nt_address_space::mapped_view_fault_plan(nt_address_space::PAGE_WRITECOPY, true);
+    if !write_plan.copy_on_write || write_plan.mark_dirty {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            STATUS_UNSUCCESSFUL,
+        );
+        return;
+    }
+    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    let (map_cap, copy_error) = copy_cap_r(source_frame);
+    if copy_error != 0 {
+        if map_cap != 0 {
+            let _ = cnode_delete_recycle_r(map_cap);
+        }
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    loose_map_cap = map_cap;
+    if page_map_r(map_cap, page, vm_page_rights(read_plan.map_protection), pml4) != 0 {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    proof |= MAPPED_SECTION_WRITECOPY_COW_MAPPED_SHARED;
+    let source_cap = csrss_frame_create_source_copy(map_cap, pi as u64, page, b"mapped-cow");
+    if source_cap == 0 || !csrss_frame_put_section_mapping(pi as u64, page, map_cap, source_cap) {
+        if source_cap != 0 {
+            let _ = cnode_delete_recycle_r(source_cap);
+        }
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return;
+    }
+    loose_map_cap = 0;
+    proof |= MAPPED_SECTION_WRITECOPY_COW_REGISTERED;
+
+    if let Err(status) = vm_promote_mapped_cow_page(
+        pi,
+        page,
+        0,
+        read_plan.map_protection,
+        write_plan.map_protection,
+        pml4,
+        scratch_base,
+    ) {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+
+    let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            STATUS_UNSUCCESSFUL,
+        );
+        return;
+    };
+    if record.owns_frame && record.frame != source_frame {
+        proof |= MAPPED_SECTION_WRITECOPY_COW_PROMOTED;
+    }
+    match cow_frame_prefix_matches(
+        record.frame,
+        scratch_base,
+        MAPPED_SECTION_WRITECOPY_COW_PATTERN,
+    ) {
+        Ok(true) => proof |= MAPPED_SECTION_WRITECOPY_COW_COPIED,
+        Ok(false) => {}
+        Err(status) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+
+    let mutated = MAPPED_SECTION_WRITECOPY_COW_PATTERN[0] ^ 0xff;
+    if let Err(status) = cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
+        finish_mapped_section_writecopy_cow_selftest(
+            pi,
+            page,
+            source_frame,
+            loose_map_cap,
+            proof,
+            status,
+        );
+        return;
+    }
+    match cow_frame_byte(record.frame, scratch_base, 0) {
+        Ok(value) if value == mutated => proof |= MAPPED_SECTION_WRITECOPY_COW_PRIVATE_MUTATED,
+        Ok(_) => {}
+        Err(status) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    match cow_frame_byte(source_frame, scratch_base, 0) {
+        Ok(value) if value == MAPPED_SECTION_WRITECOPY_COW_PATTERN[0] => {
+            proof |= MAPPED_SECTION_WRITECOPY_COW_SHARED_UNCHANGED;
+        }
+        Ok(_) => {}
+        Err(status) => {
+            finish_mapped_section_writecopy_cow_selftest(
+                pi,
+                page,
+                source_frame,
+                loose_map_cap,
+                proof,
+                status,
+            );
+            return;
+        }
+    }
+    let status = if proof
+        & (MAPPED_SECTION_WRITECOPY_COW_ALL & !MAPPED_SECTION_WRITECOPY_COW_CLEANED)
+        == (MAPPED_SECTION_WRITECOPY_COW_ALL & !MAPPED_SECTION_WRITECOPY_COW_CLEANED)
+    {
+        nt_address_space::STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    };
+    finish_mapped_section_writecopy_cow_selftest(
+        pi,
+        page,
+        source_frame,
+        loose_map_cap,
+        proof,
+        status,
+    );
+}
+
+unsafe fn cow_seed_source_frame(
+    frame: u64,
+    scratch_base: u64,
+    pattern: &[u8],
+) -> Result<(), u32> {
     let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
     if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    core::ptr::copy_nonoverlapping(
-        IMAGE_WRITECOPY_COW_PATTERN.as_ptr(),
-        alias as *mut u8,
-        IMAGE_WRITECOPY_COW_PATTERN.len(),
-    );
+    core::ptr::copy_nonoverlapping(pattern.as_ptr(), alias as *mut u8, pattern.len());
     let _ = page_unmap_r(frame);
     Ok(())
 }
 
-unsafe fn image_cow_frame_prefix_matches(
+unsafe fn cow_frame_prefix_matches(
     frame: u64,
     scratch_base: u64,
     expected: &[u8],
@@ -8868,7 +9205,7 @@ unsafe fn image_cow_frame_prefix_matches(
     Ok(matches)
 }
 
-unsafe fn image_cow_frame_byte(
+unsafe fn cow_frame_byte(
     frame: u64,
     scratch_base: u64,
     offset: u64,
@@ -8891,7 +9228,7 @@ unsafe fn image_cow_frame_byte(
     Ok(value)
 }
 
-unsafe fn image_cow_write_frame_byte(
+unsafe fn cow_write_frame_byte(
     frame: u64,
     scratch_base: u64,
     offset: u64,
@@ -8992,7 +9329,9 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
     }
     proof |= IMAGE_WRITECOPY_COW_SOURCE;
 
-    if let Err(status) = image_cow_seed_source_frame(source_frame, scratch_base) {
+    if let Err(status) =
+        cow_seed_source_frame(source_frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN)
+    {
         finish_image_writecopy_cow_selftest(
             pi,
             page,
@@ -9004,7 +9343,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         return;
     }
     proof |= IMAGE_WRITECOPY_COW_SEEDED;
-    match image_cow_frame_prefix_matches(
+    match cow_frame_prefix_matches(
         source_frame,
         scratch_base,
         IMAGE_WRITECOPY_COW_PATTERN,
@@ -9140,7 +9479,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
     {
         proof |= IMAGE_WRITECOPY_COW_PROMOTED;
     }
-    match image_cow_frame_prefix_matches(record.frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN) {
+    match cow_frame_prefix_matches(record.frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN) {
         Ok(true) => proof |= IMAGE_WRITECOPY_COW_COPIED,
         Ok(false) => {}
         Err(status) => {
@@ -9157,7 +9496,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
     }
 
     let mutated = IMAGE_WRITECOPY_COW_PATTERN[0] ^ 0xff;
-    if let Err(status) = image_cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
+    if let Err(status) = cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
         finish_image_writecopy_cow_selftest(
             pi,
             page,
@@ -9168,7 +9507,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         );
         return;
     }
-    match image_cow_frame_byte(record.frame, scratch_base, 0) {
+    match cow_frame_byte(record.frame, scratch_base, 0) {
         Ok(value) if value == mutated => proof |= IMAGE_WRITECOPY_COW_PRIVATE_MUTATED,
         Ok(_) => {}
         Err(status) => {
@@ -9183,7 +9522,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
             return;
         }
     }
-    match image_cow_frame_byte(source_frame, scratch_base, 0) {
+    match cow_frame_byte(source_frame, scratch_base, 0) {
         Ok(value) if value == IMAGE_WRITECOPY_COW_PATTERN[0] => {
             proof |= IMAGE_WRITECOPY_COW_SHARED_UNCHANGED;
         }
@@ -9676,6 +10015,112 @@ unsafe fn vm_promote_image_cow_page(
         OldImageMapping::Shared => {
             let _ = cnode_delete_recycle_r(old_map_cap);
         }
+    }
+    Ok(())
+}
+
+unsafe fn vm_promote_mapped_cow_page(
+    pi: usize,
+    page: u64,
+    source_frame: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let exact_record = csrss_frame_get_exact_record(pi as u64, page);
+    if let Some(record) = exact_record {
+        if record.owns_frame {
+            return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+        }
+    }
+
+    let source_cap = if let Some(record) = exact_record {
+        if record.source_cap != 0 {
+            record.source_cap
+        } else {
+            record.frame
+        }
+    } else if source_frame != 0 {
+        source_frame
+    } else {
+        return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+    };
+
+    let new_frame = vm_frame_acquire(scratch_base)?;
+    if let Err(status) = vm_copy_frame_4k(source_cap, new_frame, scratch_base) {
+        vm_frame_release(new_frame, 0);
+        return Err(status);
+    }
+
+    let old_mapping = if exact_record.is_some() {
+        let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) =
+            csrss_frame_take(pi as u64, page)
+        else {
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+        };
+        let _ = page_unmap_r(old_frame);
+        Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame))
+    } else {
+        None
+    };
+
+    if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
+        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
+            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
+            let _ = csrss_frame_put_at_cap_source_owned(
+                pi as u64,
+                page,
+                old_frame,
+                0,
+                old_alias_cap,
+                old_source_cap,
+                old_owns_frame,
+            );
+        }
+        vm_frame_release(new_frame, 0);
+        return Err(status);
+    }
+
+    let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
+    if map_error != 0 {
+        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
+            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
+            let _ = csrss_frame_put_at_cap_source_owned(
+                pi as u64,
+                page,
+                old_frame,
+                0,
+                old_alias_cap,
+                old_source_cap,
+                old_owns_frame,
+            );
+        }
+        vm_frame_release(new_frame, 0);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    if !csrss_frame_put_at_cap_source_owned(pi as u64, page, new_frame, 0, 0, 0, true) {
+        let _ = page_unmap_r(new_frame);
+        vm_frame_release(new_frame, 0);
+        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
+            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
+            let _ = csrss_frame_put_at_cap_source_owned(
+                pi as u64,
+                page,
+                old_frame,
+                0,
+                old_alias_cap,
+                old_source_cap,
+                old_owns_frame,
+            );
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
+        recycle_unmapped_frame_record_caps(old_frame, old_alias_cap, old_source_cap, old_owns_frame);
     }
     Ok(())
 }

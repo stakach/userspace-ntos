@@ -1197,6 +1197,7 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
         VmMappedViewFaultPlan {
             map_protection: PAGE_READONLY,
             mark_dirty: false,
+            copy_on_write: false,
         }
     );
     assert_eq!(
@@ -1204,6 +1205,7 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
         VmMappedViewFaultPlan {
             map_protection: PAGE_READWRITE,
             mark_dirty: true,
+            copy_on_write: false,
         }
     );
     assert_eq!(
@@ -1211,6 +1213,7 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
         VmMappedViewFaultPlan {
             map_protection: PAGE_EXECUTE_READ,
             mark_dirty: false,
+            copy_on_write: false,
         }
     );
     assert_eq!(
@@ -1218,13 +1221,31 @@ fn mapped_view_fault_plan_tracks_write_fault_promotion() {
         VmMappedViewFaultPlan {
             map_protection: PAGE_EXECUTE_READWRITE | PAGE_GUARD,
             mark_dirty: true,
+            copy_on_write: false,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_WRITECOPY, false),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_READONLY,
+            mark_dirty: false,
+            copy_on_write: false,
         }
     );
     assert_eq!(
         mapped_view_fault_plan(PAGE_WRITECOPY, true),
         VmMappedViewFaultPlan {
-            map_protection: PAGE_WRITECOPY,
+            map_protection: PAGE_READWRITE,
             mark_dirty: false,
+            copy_on_write: true,
+        }
+    );
+    assert_eq!(
+        mapped_view_fault_plan(PAGE_EXECUTE_WRITECOPY, true),
+        VmMappedViewFaultPlan {
+            map_protection: PAGE_EXECUTE_READWRITE,
+            mark_dirty: false,
+            copy_on_write: true,
         }
     );
 }
@@ -1269,7 +1290,11 @@ fn mapped_view_fault_access_denies_protection_violations_before_mapping() {
     );
     assert_eq!(
         mapped_view_fault_access_status(PAGE_WRITECOPY, FaultAccess::Write),
-        Err(STATUS_ACCESS_VIOLATION)
+        Ok(())
+    );
+    assert_eq!(
+        mapped_view_fault_access_status(PAGE_EXECUTE_WRITECOPY, FaultAccess::Write),
+        Ok(())
     );
 }
 
