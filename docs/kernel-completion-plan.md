@@ -358,6 +358,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    object-security fallback is also gone for registry handles: `NtQuerySecurityObject` is registered
    at SSN 176, `NtSetSecurityObject` no longer returns unconditional success, and key security
    descriptors are captured, queried, merged, and stored through the mutable-hive/overlay authority.
+   Win32k USER object handles now participate in native object security too: modeled
+   window-station/desktop objects store bounded self-relative security descriptors, expose their
+   granted-access metadata through the win32k subsystem boundary, and route `NtQuerySecurityObject`
+   and `NtSetSecurityObject` by real object identity before registry fallback. The
+   `.tmp/boot-userobj-security-20260810.log` boot cleared the old `AllowAccessOnSession` break,
+   reached real `WlxActivateUserShell`, launched `userinit.exe` and `explorer.exe`, and produced
+   non-background explorer framebuffer pixels. The remaining shell frontier is no longer process
+   launch scaffolding; it is the real explorer chrome paint proof, where `BeginPaint`/`EndPaint`
+   accounting was still `0/0` even though direct GDI returns and batch flushes reached the
+   framebuffer.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2227,3 +2237,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: this closes the save/load format loop for dynamically loaded profile hives; D3
   still needs a natural boot/reboot proof for that path and a boot-hive backing strategy before
   SYSTEM/SOFTWARE/SAM/SECURITY persistence can be claimed end to end.
+
+- D2/D3 USER object security bridge. The current boot frontier was no longer the profile hive
+  contents: `.tmp/boot-hive-childids-20260810.log` proved the staged `Default User\ntuser.dat` image
+  parses and mounts, while winlogon failed later in `AllowAccessOnSession` when
+  `NtSetSecurityObject` returned `STATUS_OBJECT_TYPE_MISMATCH` for a win32k USER object handle. The
+  active fix gives modeled USER objects bounded self-relative security descriptor storage, exposes
+  their granted-access metadata through the win32k subsystem boundary, routes native
+  query/set-security calls by real object identity before registry fallback, and updates the mutable
+  SOFTWARE proof counter to count mounted-hive reads served from `MutableHiveSet`. Validation:
+  `cargo fmt --all`, `cargo test -p nt-object-manager`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Boot validation `.tmp/boot-userobj-security-20260810.log`: `exec_winlogon_user_shell_activated`,
+  `exec_userinit_process_spawned`, `exec_explorer_process_spawned`,
+  `exec_explorer_user_callbacks_redirected`, `exec_explorer_wndproc_installed_by_client`, and
+  `exec_explorer_shell_com_classes_served` now pass. The framebuffer readback found `104517`
+  non-background pixels with saturated unique color evidence, but `exec_explorer_shell_chrome_painted`
+  still failed because explorer `BeginPaint`/`EndPaint` accounting was `0/0`; next work should find
+  the real paint-dispatch or update-region boundary that keeps shell chrome from proving through the
+  normal win32k paint path.
