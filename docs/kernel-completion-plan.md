@@ -69,7 +69,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### D. Registry And Filesystem Durability
 
-- `[ ]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
+- `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage.
 - `[ ]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors.
@@ -302,9 +302,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `KeyCachedInformation`, and `KeyFlagsInformation` with NT buffer-retry statuses. ntdll's
    `RtlQueryRegistryValues` now also handles ReactOS SCM/group-list registry shapes: strict SUBKEY
    opens, required empty enumeration failure, NOVALUE callbacks, DELETE-on-query, and
-   ReactOS-compatible length-bounded `REG_MULTI_SZ` walking. D2/D4 still need the Configuration
-   Manager/Hive Manager to become the live authority for mutable hives, durable setup/profile state,
-   and remaining long-lived registry data.
+   ReactOS-compatible length-bounded `REG_MULTI_SZ` walking. `NtSaveKey` is now a registered native
+   service and the supported root-hive case writes the mounted hive's real borrowed `regf` image to a
+   caller-opened writable overlay FILE_OBJECT after enforcing `SeBackupPrivilege`, file write access,
+   and `KEY_READ`; volatile/overlay keys, non-writable file backends, and subkey export return real
+   failures instead of synthetic success. D2/D4 still need the Configuration Manager/Hive Manager to
+   become the live authority for mutable hives, durable setup/profile state, subtree save
+   serialization, and remaining long-lived registry data.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2011,3 +2015,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: C4 overlap/placement is now guarded host-side and live; resume A4 SCM
   pipe/listener cleanup, B3 real video miniport hosting, or D1/D2 mutable registry/filesystem
   authority.
+
+- D1 `NtSaveKey` root-hive save slice. The owned ntdll ABI already exported `NtSaveKey`, but the
+  typed native dispatcher and executive table did not model SSN 215. `NativeService::NtSaveKey` now
+  carries the canonical two-argument contract, the executive registers SSN 215, enforces
+  `SeBackupPrivilege`, validates the target file as a writable overlay FILE_OBJECT, resolves the
+  source key with `KEY_READ`, and writes a mounted root hive's real borrowed `regf` bytes to the
+  caller-opened file with exact EOF and flush. Non-root subkey saves, volatile/overlay keys, and
+  non-writable file backends fail visibly until the CM/Hive Manager owns a subtree serializer and
+  persistent store. Validation: `cargo fmt --all`, `cargo test -p nt-syscall`,
+  `cargo test -p nt-hive-regf`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: continue D1 by auditing remaining mutable filesystem writeback/rename/delete
+  paths, or move into D2/D3 by making the host-tested CM/Hive Manager the live mutable hive authority
+  instead of executive-local overlay state.

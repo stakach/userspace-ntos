@@ -1073,6 +1073,11 @@ pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
 pub const SSN_NT_FLUSH_KEY: u64 = 83;
 /// Bypass switch for the `NtFlushKey` gate specs (see the `build_nt_table` row). `true` in tree.
 pub const NT_FLUSH_KEY_SERVICED: bool = true;
+/// `NtSaveKey(IN HANDLE KeyHandle, IN HANDLE FileHandle)` — `ntoskrnl/config/ntapi.c:1634`
+/// (`sysfuncs.lst` line 216 -> SSN 215, two arguments). Root mounted hives can be saved by writing
+/// their borrowed `regf` image to a writable FILE_OBJECT; subkey save still requires a subtree
+/// serializer and fails visibly instead of reporting success.
+pub const SSN_NT_SAVE_KEY: u64 = 215;
 /// **FILE_OBJECT LIFETIME switch** (bypass experiment for `exec_npfs_file_object_lifetime` +
 /// `exec_npfs_concurrent_irp_read_and_write`). `true` in tree = the NT lifetime: ONE FILE_OBJECT per
 /// OPEN, reused by every IRP on that open, destroyed at CLEANUP/CLOSE. `false` restores the old
@@ -15536,6 +15541,13 @@ pub(crate) static REG_FLUSH_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones whose key lives in the in-memory write overlay — `HvSyncHive`'s
 /// `HIVE_VOLATILE` early return (`sdk/lib/cmlib/hivewrt.c:477`) verbatim.
 pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
+/// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots whose raw `regf` image
+/// can be written to a writable overlay FILE_OBJECT; everything else returns the real refusal.
+pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_SAVE_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_SAVE_KEY_ROOT_SAVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_SAVE_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_SAVE_KEY_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
 /// Count of winlogon `DefaultPassword` value reads answered by the real Winlogon key.
 pub(crate) static WINLOGON_DEFAULT_PASSWORD_READS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
@@ -17199,6 +17211,7 @@ fn build_nt_table() -> NativeServiceTable {
                     u32::MAX
                 },
             ),
+            (NativeService::NtSaveKey, SSN_NT_SAVE_KEY as u32),
             // ★ `NtLoadKey` / `NtUnloadKey` — mount a per-user `regf` hive at `HKEY_USERS\<SID>`.
             // BYPASS EXPERIMENT SWITCH: flip `NT_LOAD_KEY_SERVICED` to `false` and both SSNs leave
             // the table exactly as before this batch -> `userenv!CreateUserProfileExW`'s

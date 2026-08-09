@@ -74,6 +74,11 @@ impl<'a> RegfHive<'a> {
         self.root
     }
 
+    /// The raw `regf` image this read-only hive navigates.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// The cell body (after the 4-byte signed size) at a hbin-relative `offset`, bounds-checked.
     fn cell_body(&self, offset: u32) -> Option<&[u8]> {
         let fo = HBIN_BASE.checked_add(offset as usize)?;
@@ -1275,5 +1280,12 @@ mod tests {
     fn rejects_non_regf() {
         assert!(RegfHive::new(&[0u8; 0x2000]).is_none());
         assert!(RegfHive::new(b"not a hive").is_none());
+    }
+
+    #[test]
+    fn exposes_the_borrowed_hive_image() {
+        let data = path_test_hive();
+        let hive = RegfHive::new(&data).expect("valid test hive");
+        assert_eq!(hive.bytes(), data.as_slice());
     }
 }

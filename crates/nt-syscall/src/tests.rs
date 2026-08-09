@@ -161,6 +161,16 @@ fn hive_load_variants_keep_native_argument_contracts() {
 }
 
 #[test]
+fn save_key_keeps_native_argument_contract() {
+    assert_eq!(NativeService::NtSaveKey.name(), "NtSaveKey");
+    assert_eq!(NativeService::NtSaveKey.arg_count(), (2, 2));
+    assert_eq!(nt_syscall_abi::ssn_of("NtSaveKey"), Some(215));
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtSaveKey)
+        .is_some());
+}
+
+#[test]
 fn driver_load_variants_keep_native_argument_contracts() {
     let cases = [
         (NativeService::NtLoadDriver, "NtLoadDriver", 101),
