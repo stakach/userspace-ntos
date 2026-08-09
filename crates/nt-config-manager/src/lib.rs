@@ -604,18 +604,12 @@ impl ConfigManager {
         start_types: &[u32],
         type_mask: u32,
     ) -> Vec<ServiceMetadata> {
-        let mut out: Vec<ServiceMetadata> = self
-            .service_metadata_list()
+        self.service_metadata_by_start_ordered(start_types)
             .into_iter()
             .filter(|s| {
-                s.has_launch_image()
-                    && s.start_type
-                        .is_some_and(|start| start_types.contains(&start))
-                    && s.service_type.is_some_and(|ty| ty & type_mask != 0)
+                s.has_launch_image() && s.service_type.is_some_and(|ty| ty & type_mask != 0)
             })
-            .collect();
-        sort_service_metadata(&mut out);
-        out
+            .collect()
     }
 
     /// Registry-declared drivers eligible for kernel boot/system driver bring-up.
@@ -692,13 +686,8 @@ impl ConfigManager {
     }
 
     pub fn service_start_specs_by_start(&self, start_types: &[u32]) -> Vec<ServiceStartSpec> {
-        self.service_metadata_list()
+        self.service_metadata_by_start_ordered(start_types)
             .into_iter()
-            .filter(|service| {
-                service
-                    .start_type
-                    .is_some_and(|start| start_types.contains(&start))
-            })
             .filter_map(|service| service.start_spec())
             .collect()
     }
@@ -708,13 +697,8 @@ impl ConfigManager {
         &self,
         start_types: &[u32],
     ) -> Vec<Win32ServiceLaunchSpec> {
-        self.service_metadata_list()
+        self.service_metadata_by_start_ordered(start_types)
             .into_iter()
-            .filter(|service| {
-                service
-                    .start_type
-                    .is_some_and(|start| start_types.contains(&start))
-            })
             .filter_map(|service| service.win32_launch_spec())
             .collect()
     }
@@ -734,13 +718,8 @@ impl ConfigManager {
         &self,
         start_types: &[u32],
     ) -> Vec<DriverServiceLaunchSpec> {
-        self.service_metadata_list()
+        self.service_metadata_by_start_ordered(start_types)
             .into_iter()
-            .filter(|service| {
-                service
-                    .start_type
-                    .is_some_and(|start| start_types.contains(&start))
-            })
             .filter_map(|service| service.driver_launch_spec())
             .collect()
     }
@@ -762,6 +741,21 @@ impl ConfigManager {
         self.registry
             .query_multi_string(key, "List")
             .unwrap_or_default()
+    }
+
+    fn service_metadata_by_start_ordered(&self, start_types: &[u32]) -> Vec<ServiceMetadata> {
+        let mut out: Vec<ServiceMetadata> = self
+            .service_metadata_list()
+            .into_iter()
+            .filter(|service| {
+                service
+                    .start_type
+                    .is_some_and(|start| start_types.contains(&start))
+            })
+            .collect();
+        let group_order = self.service_group_order();
+        sort_service_metadata_with_group_order(&mut out, &group_order);
+        out
     }
 
     fn service_metadata_from_key(&self, name: &str, service_key: RegistryKeyId) -> ServiceMetadata {
@@ -1190,13 +1184,13 @@ fn sort_service_metadata_with_group_order(
 }
 
 fn group_order_rank(group: Option<&str>, group_order: &[String]) -> usize {
-    group
-        .and_then(|group| {
-            group_order
-                .iter()
-                .position(|candidate| candidate.eq_ignore_ascii_case(group))
-        })
-        .unwrap_or(group_order.len())
+    match group {
+        Some(group) => group_order
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(group))
+            .unwrap_or(group_order.len()),
+        None => group_order.len().saturating_add(1),
+    }
 }
 
 #[cfg(test)]
@@ -1546,6 +1540,95 @@ mod tests {
         assert_eq!(demand[0].service_name, "DemandOwn");
         assert_eq!(demand[0].process_kind, Win32ServiceProcessKind::Own);
         assert!(!demand[0].interactive);
+    }
+
+    #[test]
+    fn win32_auto_start_services_follow_service_group_order() {
+        fn set_group(cm: &mut ConfigManager, service: &str, group: &str) {
+            let key = cm.service_metadata(service).unwrap().service_key;
+            cm.registry_mut().set_string(key, "Group", group);
+        }
+
+        let mut cm = ConfigManager::new();
+        let group_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+        cm.registry_mut().set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["Event Log", "NetworkProvider"]),
+        );
+        cm.register_typed_service(
+            "Browser",
+            r"%SystemRoot%\system32\svchost.exe -k netsvcs",
+            SERVICE_WIN32_SHARE_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        set_group(&mut cm, "Browser", "NetworkProvider");
+        cm.register_typed_service(
+            "NoGroupSvc",
+            r"%SystemRoot%\system32\nogroup.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        cm.register_typed_service(
+            "EventLog",
+            r"%SystemRoot%\system32\eventlog.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        set_group(&mut cm, "EventLog", "Event Log");
+        cm.register_typed_service(
+            "VendorSvc",
+            r"%SystemRoot%\system32\vendor.exe",
+            SERVICE_WIN32_OWN_PROCESS,
+            None,
+            None,
+            SERVICE_AUTO_START,
+            1,
+        );
+        set_group(&mut cm, "VendorSvc", "Vendor Group");
+
+        let names: Vec<String> = cm
+            .auto_start_win32_service_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(
+            names,
+            alloc::vec![
+                String::from("EventLog"),
+                String::from("Browser"),
+                String::from("VendorSvc"),
+                String::from("NoGroupSvc")
+            ]
+        );
+
+        let specs = cm.auto_start_win32_service_launch_specs();
+        assert_eq!(specs[0].service_name, "EventLog");
+        assert_eq!(specs[0].process_kind, Win32ServiceProcessKind::Own);
+        assert_eq!(
+            specs[0].process_launch().unwrap().nt_image_path,
+            r"\SystemRoot\system32\eventlog.exe"
+        );
+        assert_eq!(
+            cm.service_start_specs_by_start(&[SERVICE_AUTO_START])
+                .into_iter()
+                .filter_map(|spec| match spec {
+                    ServiceStartSpec::Win32(spec) => Some(spec.service_name),
+                    ServiceStartSpec::Driver(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            names
+        );
     }
 
     #[test]

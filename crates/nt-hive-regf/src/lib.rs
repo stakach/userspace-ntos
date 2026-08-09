@@ -1655,6 +1655,30 @@ mod tests {
             npfs_rank.is_some(),
             "expected Npfs in boot/system driver candidates"
         );
+        let auto_win32 = cm.auto_start_win32_service_launch_specs();
+        eprintln!(
+            "auto-start Win32 service prefix: {:?}",
+            auto_win32
+                .iter()
+                .take(8)
+                .map(|service| (
+                    service.service_name.as_str(),
+                    service.process_kind,
+                    service.image_path.as_str(),
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            auto_win32
+                .first()
+                .map(|service| service.service_name.as_str()),
+            Some("EventLog"),
+            "expected ServiceGroupOrder to put EventLog before shared svchost groups"
+        );
+        assert_eq!(
+            auto_win32.first().map(|service| service.process_kind),
+            Some(nt_config_manager::Win32ServiceProcessKind::Own)
+        );
     }
 
     #[test]
