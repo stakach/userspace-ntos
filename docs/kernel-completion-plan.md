@@ -249,10 +249,16 @@ in SCM, user-mode system processes, and our ntdll where possible.
    shell chrome still painting `34873` non-background pixels. The resident MEM_IMAGE writecopy
    follow-up now promotes shared resident image pages into private owned shadows and tears them down
    through the ordinary image-unmap path, and the follow-up C4 gate now proves the promoted private
-   frame can be mutated without changing the shared source frame. Continue the plan from the
-   remaining structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special
-   coordination, B3's real video/driver binding, broader C4 overlap/decommit/protect/view-teardown
-   regressions, and D1/D2 mutable registry/filesystem authority.
+   frame can be mutated without changing the shared source frame. The latest C4 teardown slice
+   removes the exact-base committed-view unmap assumption: `NtUnmapViewOfSection` now accepts any
+   address inside a generic section view, releases the whole view, and removes every committed
+   mapping run covering that view, including runs split by `NtProtectVirtualMemory`. Boot proof
+   `.tmp/boot-committed-view-range-unregister-20260809.log` is fully green at `293/293` with
+   `exec_mapped_section_writeback`, `exec_image_writecopy_cow_isolated`, `exec_vm_pool_headroom`,
+   and `exec_explorer_shell_chrome_painted` all passing. Continue the plan from the remaining
+   structural debt rather than shell-paint scaffolding: A4's SCM pipe/listener special coordination,
+   B3's real video/driver binding, broader C4 overlap/decommit/protect/guard/no-access regressions,
+   and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1774,3 +1780,24 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `committed-map=233/512`, and explorer shell chrome still paints `34873` non-background pixels.
   Review adjustment: continue the broader C4 VAD/view teardown gates, especially overlapping VADs,
   partial decommit/release, `MEM_TOP_DOWN`, guard/no-access faults, and committed-view teardown.
+
+- C4 committed mapped-view range teardown slice. `VmCommittedRangeTable::unregister_range` is now
+  host-tested for arbitrary page-aligned committed subranges: it removes every overlapping committed
+  run, preserves left and right survivors when a smaller range is removed, and normalizes the table
+  without mutating state on validation/capacity failure. The executive uses this range teardown from
+  generic-section `NtUnmapViewOfSection`, and that syscall now follows NT semantics by accepting any
+  address inside the view rather than only the original allocation base. A protected mapped view that
+  was split into multiple committed runs is therefore fully released from both the VM mappings and
+  the committed `MEM_MAPPED` authority; the old exact-base wrapper was removed. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-committed-view-range-unregister-20260809.log`. Result: kernel specs pass, the full
+  executive gate is `293/293`, `exec_mapped_section_writeback` and
+  `exec_image_writecopy_cow_isolated` remain green, `exec_vm_pool_headroom` remains green with
+  `ut-free=52153KiB`, `image-mapcaps=7749`, `image-mapcap-fails=0`, `vad=40/96`,
+  `committed-map=233/512`, and explorer shell chrome still paints `34873` non-background pixels.
+  Review adjustment: committed-view teardown has a direct regression now; continue C4 with broader
+  VAD overlap, partial decommit/release, `MEM_TOP_DOWN`, guard/no-access, and private/mapped protect
+  matrix gates, then move into D1/D2 durability authority.

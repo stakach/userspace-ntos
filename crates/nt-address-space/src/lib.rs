@@ -516,6 +516,42 @@ impl<const N: usize> VmCommittedRangeTable<N> {
         removed
     }
 
+    pub fn unregister_range(&mut self, base: u64, size: u64) -> Result<usize, u32> {
+        let Some(end) = base.checked_add(size) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if base & (PAGE_SIZE - 1) != 0 || size == 0 || size & (PAGE_SIZE - 1) != 0 || end <= base {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+
+        let mut replacement = [None; N];
+        let mut used = 0usize;
+        let mut removed = 0usize;
+        for range in self.ranges.iter().flatten().copied() {
+            if range.end() <= base || range.base >= end {
+                push_committed_range(&mut replacement, &mut used, range)?;
+                continue;
+            }
+            removed += 1;
+            if range.base < base {
+                let mut left = range;
+                left.size = base - range.base;
+                push_committed_range(&mut replacement, &mut used, left)?;
+            }
+            if range.end() > end {
+                let mut right = range;
+                right.base = end;
+                right.size = range.end() - end;
+                push_committed_range(&mut replacement, &mut used, right)?;
+            }
+        }
+        self.ranges = replacement;
+        if removed != 0 {
+            self.normalize();
+        }
+        Ok(removed)
+    }
+
     pub fn unregister_allocation_base(&mut self, allocation_base: u64) -> usize {
         let mut removed = 0usize;
         for slot in &mut self.ranges {

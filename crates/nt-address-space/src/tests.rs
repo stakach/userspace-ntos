@@ -1108,6 +1108,56 @@ fn committed_range_table_reports_section_granular_image_views_and_unregisters_al
 }
 
 #[test]
+fn committed_range_table_unregister_range_splits_and_tears_down_views() {
+    let mut table = VmCommittedRangeTable::<6>::new();
+    table
+        .register(VmCommittedRange::mapped(0x4000_0000, 0x4000, PAGE_READONLY))
+        .unwrap();
+
+    assert_eq!(table.unregister_range(0x4000_1000, 0x2000), Ok(1));
+    assert_eq!(table.range_count(), 2);
+    assert_eq!(
+        table.query_basic(0x4000_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x4000_0000,
+            allocation_base: 0x4000_0000,
+            allocation_protect: PAGE_READONLY,
+            region_size: 0x1000,
+            state: MEM_COMMIT,
+            protect: PAGE_READONLY,
+            type_: MEM_MAPPED,
+        }
+    );
+    assert!(table.query_basic(0x4000_1000).is_none());
+    assert_eq!(
+        table.query_basic(0x4000_3000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x4000_3000,
+            allocation_base: 0x4000_0000,
+            allocation_protect: PAGE_READONLY,
+            region_size: 0x1000,
+            state: MEM_COMMIT,
+            protect: PAGE_READONLY,
+            type_: MEM_MAPPED,
+        }
+    );
+
+    table
+        .register(VmCommittedRange::mapped(0x5000_0000, 0x4000, PAGE_READONLY))
+        .unwrap();
+    table.protect(0x5000_1000, 0x1000, PAGE_READWRITE).unwrap();
+    assert_eq!(table.unregister_range(0x5000_0000, 0x4000), Ok(3));
+    assert!(table.query_basic(0x5000_0000).is_none());
+    assert!(table.query_basic(0x5000_1000).is_none());
+    assert!(table.query_basic(0x5000_3000).is_none());
+    assert_eq!(table.unregister_range(0x5000_0000, 0x4000), Ok(0));
+    assert_eq!(
+        table.unregister_range(0x4000_0001, 0x1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+}
+
+#[test]
 fn mapped_view_fault_plan_tracks_write_fault_promotion() {
     assert_eq!(
         mapped_view_fault_plan(PAGE_READWRITE, false),

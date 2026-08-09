@@ -1461,14 +1461,20 @@ pub(crate) unsafe fn process_committed_mapping_replace(
     true
 }
 
-pub(crate) unsafe fn process_committed_mapping_unregister(pi: u64, base: u64) -> bool {
+pub(crate) unsafe fn process_committed_mapping_unregister_range(
+    pi: u64,
+    base: u64,
+    size: u64,
+) -> bool {
     if pi as usize >= MAX_PI {
         return false;
     }
     let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
         as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
         .add(pi as usize);
-    (*table).unregister_base(base).is_some()
+    (*table)
+        .unregister_range(base, size)
+        .is_ok_and(|removed| removed != 0)
 }
 
 pub(crate) unsafe fn process_committed_mapping_unregister_allocation(

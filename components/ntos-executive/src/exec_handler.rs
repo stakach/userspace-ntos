@@ -15665,49 +15665,49 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
-                        if view.base == base {
-                            let writeback = match service_generic_section_writeback_view(
-                                generic_sections,
-                                view,
-                                ctx.scratch_base,
-                            ) {
-                                Ok(bytes) => bytes,
-                                Err(status) => return status,
-                            };
-                            if writeback != 0 {
-                                self.writable_fs_dirty = true;
-                            }
-                            let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-                                as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-                                .add(target_pi);
-                            let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-                            let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                            *before = core::ptr::read(vm_map);
-                            *after = *before;
-                            let plan =
-                                match after.free(view.base, 0, nt_address_space::MEM_RELEASE) {
-                                    Ok(plan) => plan,
-                                    Err(status) => return status,
-                                };
-                            let mut page = plan.base;
-                            while page < plan.base + plan.size {
-                                let old = before.extent_at(page);
-                                let new = after.extent_at(page);
-                                if old.is_some_and(|extent| {
-                                    extent.state == nt_address_space::VmExtentState::Committed
-                                }) && new.is_none_or(|extent| {
-                                    extent.state != nt_address_space::VmExtentState::Committed
-                                }) {
-                                    vm_unmap_private_page(target_pi, page);
-                                }
-                                page += 0x1000;
-                            }
-                            core::ptr::write(vm_map, *after);
-                            let _ =
-                                process_committed_mapping_unregister(target_pi as u64, view.base);
-                            let _ = generic_sections.unmap_view(target_pi, view.base);
-                            return 0;
+                        let writeback = match service_generic_section_writeback_view(
+                            generic_sections,
+                            view,
+                            ctx.scratch_base,
+                        ) {
+                            Ok(bytes) => bytes,
+                            Err(status) => return status,
+                        };
+                        if writeback != 0 {
+                            self.writable_fs_dirty = true;
                         }
+                        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+                            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+                            .add(target_pi);
+                        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+                        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+                        *before = core::ptr::read(vm_map);
+                        *after = *before;
+                        let plan = match after.free(view.base, 0, nt_address_space::MEM_RELEASE) {
+                            Ok(plan) => plan,
+                            Err(status) => return status,
+                        };
+                        let mut page = plan.base;
+                        while page < plan.base + plan.size {
+                            let old = before.extent_at(page);
+                            let new = after.extent_at(page);
+                            if old.is_some_and(|extent| {
+                                extent.state == nt_address_space::VmExtentState::Committed
+                            }) && new.is_none_or(|extent| {
+                                extent.state != nt_address_space::VmExtentState::Committed
+                            }) {
+                                vm_unmap_private_page(target_pi, page);
+                            }
+                            page += 0x1000;
+                        }
+                        core::ptr::write(vm_map, *after);
+                        let _ = process_committed_mapping_unregister_range(
+                            target_pi as u64,
+                            view.base,
+                            view.size,
+                        );
+                        let _ = generic_sections.unmap_view(target_pi, view.base);
+                        return 0;
                     }
                 }
                 if let Some(ctx) = self.loop_ctx {
