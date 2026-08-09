@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::*;
+use alloc::vec::Vec;
 
 static mut HOSTED_PNP_PCI_DEVICES: Option<Vec<nt_pnp::PciDevice>> = None;
 static mut HOSTED_PNP_PCI_WINDOWS: Option<Vec<HostedPnpPciResourceWindow>> = None;
@@ -19,9 +19,8 @@ const _: () = assert!(
         <= HOSTED_RESOURCE_COMPONENT_VA_LIMIT
 );
 const _: () = assert!(HOSTED_ROOT_SEED_VA_BASE & 0x1F_FFFF == 0);
-const _: () = assert!(
-    HOSTED_ROOT_SEED_VA_BASE + HOSTED_RESOURCE_WINDOW_STRIDE <= HOSTED_ROOT_SEED_VA_LIMIT
-);
+const _: () =
+    assert!(HOSTED_ROOT_SEED_VA_BASE + HOSTED_RESOURCE_WINDOW_STRIDE <= HOSTED_ROOT_SEED_VA_LIMIT);
 
 #[derive(Default)]
 pub(crate) struct HostedPnpResourceVaAllocator {
@@ -121,8 +120,11 @@ impl HostedPnpPciResourceWindow {
         if mmio_va == 0 {
             return None;
         }
-        let has_dma =
-            dma_frame_base != 0 || dma_pages != 0 || dma_va != 0 || dma_logical != 0 || dma_len != 0;
+        let has_dma = dma_frame_base != 0
+            || dma_pages != 0
+            || dma_va != 0
+            || dma_logical != 0
+            || dma_len != 0;
         if (!has_dma && dma_va != 0)
             || (has_dma
                 && (dma_frame_base == 0
@@ -156,9 +158,7 @@ impl HostedPnpPciResourceWindow {
     }
 
     pub(crate) fn granted_mmio_len(&self) -> u32 {
-        self.mmio_pages
-            .saturating_mul(0x1000)
-            .min(u32::MAX as u64) as u32
+        self.mmio_pages.saturating_mul(0x1000).min(u32::MAX as u64) as u32
     }
 
     pub(crate) fn dma_grant_valid(&self) -> bool {
@@ -234,9 +234,7 @@ impl HostedPnpRootResourceWindow {
     }
 
     pub(crate) fn granted_mmio_len(&self) -> u32 {
-        self.mmio_pages
-            .saturating_mul(0x1000)
-            .min(u32::MAX as u64) as u32
+        self.mmio_pages.saturating_mul(0x1000).min(u32::MAX as u64) as u32
     }
 }
 
@@ -399,8 +397,7 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     let class_guid = spec.class_guid.as_deref();
     for devnode in &spec.devnodes {
         let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
-        let hardware_count =
-            copy_service_string_refs(&devnode.hardware_ids, &mut hardware_refs);
+        let hardware_count = copy_service_string_refs(&devnode.hardware_ids, &mut hardware_refs);
         let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
         let compatible_count =
             copy_service_string_refs(&devnode.compatible_ids, &mut compatible_refs);
@@ -472,12 +469,21 @@ unsafe fn start_one_devnode(
                 devnode.compatible_ids,
             ) {
                 Ok(Some(grant)) => {
-                    print_hosted_devnode_grant(service_name.as_bytes(), devnode.instance_id.as_bytes(), &grant);
+                    print_hosted_devnode_grant(
+                        service_name.as_bytes(),
+                        devnode.instance_id.as_bytes(),
+                        &grant,
+                    );
                     driver_launch::start_hosted_device(device_id, &grant.resource_list)
                 }
                 Ok(None) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
                 Err(status) => {
-                    print_resource_grant_failure(options.trace, service_name, devnode.instance_id, status);
+                    print_resource_grant_failure(
+                        options.trace,
+                        service_name,
+                        devnode.instance_id,
+                        status,
+                    );
                     Err(status)
                 }
             };
@@ -492,11 +498,29 @@ unsafe fn start_one_devnode(
                     status.raw() as u32
                 }
             };
-            print_start_status(options.trace, service_name, devnode.instance_id, start_status_raw);
+            print_start_status(
+                options.trace,
+                service_name,
+                devnode.instance_id,
+                start_status_raw,
+            );
             if options.inject_test_interrupt && start_status_raw == 0 {
-                inject_proof_interrupt(device_id, options.trace, service_name, devnode.instance_id, report);
+                inject_proof_interrupt(
+                    device_id,
+                    options.trace,
+                    service_name,
+                    devnode.instance_id,
+                    report,
+                );
             }
-            collect_hardware_evidence(device_id, options.trace, service_name, devnode.instance_id, start_status_raw, report);
+            collect_hardware_evidence(
+                device_id,
+                options.trace,
+                service_name,
+                devnode.instance_id,
+                start_status_raw,
+                report,
+            );
         }
         Err(status) => {
             remember_error(report, status);
@@ -647,7 +671,9 @@ fn print_add_device_success(
     device_id: u64,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => b"[driver-launch] generic hardware AddDevice service=",
+        HostedPnpStartTrace::HardwareProof => {
+            b"[driver-launch] generic hardware AddDevice service="
+        }
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice service=",
     });

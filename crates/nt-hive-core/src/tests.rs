@@ -181,6 +181,18 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
         .expect("open through canonical control set");
     assert_eq!(opened, svc);
 
+    let parent = set
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services")
+        .expect("resolve services parent");
+    let child = set
+        .create_subkey(parent, "EventLog")
+        .expect("create child from resolved parent");
+    assert_eq!(
+        set.resolve_key(r"\Registry\Machine\System\ControlSet001\Services\EventLog"),
+        Some(child)
+    );
+    assert!(set.create_subkey(parent, r"Bad\Name").is_none());
+
     let sw = set
         .create_key(r"\Registry\Machine\Software\Microsoft\Windows")
         .expect("create software key");
@@ -202,6 +214,192 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
     assert!(set
         .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs")
         .is_some());
+}
+
+#[test]
+fn prepared_value_buffer_reuses_existing_storage() {
+    let mut hive = Hive::new(HiveKind::System);
+    let key = hive.create_key(r"ControlSet001\Services\Large");
+    let mut original = alloc::vec::Vec::new();
+    original.resize(1024, 0x5a);
+    assert!(hive.set_value(key, "Blob", RegistryValueType::Binary, original));
+    let before_capacity = hive.query_value(key, "Blob").unwrap().1.len();
+
+    let value = hive
+        .prepare_value_buffer(key, "Blob", RegistryValueType::Binary, 768)
+        .expect("prepared existing value");
+    assert!(hive.append_prepared_value_data(value, &[1; 256]));
+    assert!(hive.append_prepared_value_data(value, &[2; 512]));
+    assert_eq!(hive.prepared_value_len(value), Some(768));
+    assert_eq!(hive.query_value(key, "Blob").unwrap().1[0], 1);
+    assert_eq!(hive.query_value(key, "Blob").unwrap().1[256], 2);
+    assert!(hive.query_value(key, "Blob").unwrap().1.len() < before_capacity);
+}
+
+#[test]
+fn same_hive_value_copy_shares_payload_until_replacement() {
+    let mut hive = Hive::new(HiveKind::System);
+    let source_key = hive.create_key(r"ControlSet001\Enum\PCI\VEN_8086");
+    let destination_key = hive.create_key(r"ControlSet002\Enum\PCI\VEN_8086");
+    let mut large = alloc::vec::Vec::new();
+    large.resize(128 * 1024, 0x37);
+    large[0] = 0x11;
+    let last = large.len() - 1;
+    large[last] = 0xee;
+    assert!(hive.set_value(
+        source_key,
+        "AllocConfig",
+        RegistryValueType::ResourceList,
+        large
+    ));
+
+    let (source_value, _, _, source_data) = hive.value_ref_by_index(source_key, 0).unwrap();
+    assert_eq!(source_data[0], 0x11);
+    assert_eq!(source_data[source_data.len() - 1], 0xee);
+    let source_ptr = source_data.as_ptr();
+    let source_len = source_data.len();
+
+    assert!(hive.set_value_from_existing_value(
+        destination_key,
+        "AllocConfig",
+        RegistryValueType::ResourceList,
+        source_value
+    ));
+    let source_data = hive.query_value(source_key, "AllocConfig").unwrap().1;
+    let destination_data = hive.query_value(destination_key, "allocconfig").unwrap().1;
+    assert_eq!(source_data.len(), source_len);
+    assert_eq!(destination_data, source_data);
+    assert_eq!(destination_data.as_ptr(), source_ptr);
+
+    let replacement = hive
+        .prepare_value_buffer(
+            destination_key,
+            "AllocConfig",
+            RegistryValueType::ResourceList,
+            3,
+        )
+        .expect("prepare replacement");
+    assert!(hive.append_prepared_value_data(replacement, &[1, 2, 3]));
+    assert_eq!(
+        hive.query_value(destination_key, "AllocConfig").unwrap().1,
+        &[1, 2, 3]
+    );
+    assert_eq!(
+        hive.query_value(source_key, "AllocConfig").unwrap().1[0],
+        0x11
+    );
+    assert_eq!(
+        hive.query_value(source_key, "AllocConfig")
+            .unwrap()
+            .1
+            .as_ptr(),
+        source_ptr
+    );
+}
+
+#[test]
+fn mutable_hive_set_prepares_mounted_value_buffer() {
+    let mut system = Hive::new(HiveKind::System);
+    system.create_key(r"ControlSet001\Services");
+    let mut set = MutableHiveSet::new();
+    set.mount(SYSTEM_HIVE_PATH, 1, system);
+    let key = set
+        .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\Large")
+        .expect("large key");
+    let value = set
+        .prepare_value_buffer(key, "Blob", RegistryValueType::Binary, 3)
+        .expect("prepared mounted value");
+    assert!(set.append_prepared_value_data(value, &[1, 2]));
+    assert!(set.append_prepared_value_data(value, &[3]));
+    assert_eq!(set.prepared_value_len(value), Some(3));
+    assert_eq!(
+        set.query_value(key, "Blob"),
+        Some((RegistryValueType::Binary, &[1, 2, 3][..]))
+    );
+}
+
+#[test]
+fn mutable_hive_set_cross_hive_copy_shares_payload_until_replacement() {
+    let mut system = Hive::new(HiveKind::System);
+    let system_key = system.create_key(r"ControlSet001\Setup");
+    let mut large = alloc::vec::Vec::new();
+    large.resize(128 * 1024, 0x42);
+    large[0] = 0x10;
+    let last = large.len() - 1;
+    large[last] = 0x90;
+    assert!(system.set_value(system_key, "BigValue", RegistryValueType::Binary, large));
+
+    let mut software = Hive::new(HiveKind::Software);
+    software.create_key(r"Microsoft\SetupCopy");
+
+    let mut set = MutableHiveSet::new();
+    set.mount(SYSTEM_HIVE_PATH, 1, system);
+    set.mount(r"\Registry\Machine\Software", 2, software);
+    let source_key = set
+        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Setup")
+        .expect("source key");
+    let (source, _, _, source_data) = set.value_ref_by_index(source_key, 0).expect("source value");
+    let source_ptr = source_data.as_ptr();
+    let dest_key = set
+        .resolve_key(r"\Registry\Machine\Software\Microsoft\SetupCopy")
+        .expect("destination key");
+    assert!(set.set_value_from_existing_value(
+        dest_key,
+        "BigValue",
+        RegistryValueType::Binary,
+        source
+    ));
+    let dest_data = set.query_value(dest_key, "BigValue").unwrap().1;
+    assert_eq!(dest_data.as_ptr(), source_ptr);
+    assert_eq!(dest_data[0], 0x10);
+    assert_eq!(dest_data[dest_data.len() - 1], 0x90);
+
+    let replacement = set
+        .prepare_value_buffer(dest_key, "BigValue", RegistryValueType::Binary, 3)
+        .expect("prepare destination replacement");
+    assert!(set.append_prepared_value_data(replacement, &[1, 2, 3]));
+    assert_eq!(set.query_value(dest_key, "BigValue").unwrap().1, &[1, 2, 3]);
+    assert_eq!(
+        set.query_value(source_key, "BigValue").unwrap().1.as_ptr(),
+        source_ptr
+    );
+}
+
+#[test]
+fn value_copy_provenance_is_per_thread() {
+    let source_a = ResolvedHiveValue {
+        hive: 1,
+        value: CellId(10),
+    };
+    let source_b = ResolvedHiveValue {
+        hive: 1,
+        value: CellId(20),
+    };
+    let mut table = RegistryValueCopyProvenanceTable::with_capacity(1);
+
+    assert!(table.record(RegistryValueCopyProvenance::new(
+        source_a, 3, 100, 0x5000, 128, 3,
+    )));
+    assert!(table.record(RegistryValueCopyProvenance::new(
+        source_b, 4, 200, 0x6000, 256, 4,
+    )));
+
+    assert_eq!(
+        table.source_for_user_data(3, 100, 0x5000, 128, 3),
+        Some(source_a)
+    );
+    assert_eq!(
+        table.source_for_user_data(4, 200, 0x6000, 256, 4),
+        Some(source_b)
+    );
+    assert_eq!(table.source_for_user_data(3, 100, 0x5000, 129, 3), None);
+
+    table.clear_for_thread(3, 100);
+    assert_eq!(table.source_for_user_data(3, 100, 0x5000, 128, 3), None);
+    assert_eq!(
+        table.source_for_user_data(4, 200, 0x6000, 256, 4),
+        Some(source_b)
+    );
 }
 
 #[test]

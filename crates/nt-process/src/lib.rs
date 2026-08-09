@@ -516,6 +516,10 @@ pub struct NtProcess {
     /// `PSF_CREATE_REPORTED_BIT` — the `DbgKmCreateProcessApi` message has already been reported,
     /// so a later thread create reports `DbgKmCreateThreadApi` instead.
     create_reported: bool,
+    /// Self-relative security descriptor applied through `NtQuerySecurityObject` /
+    /// `NtSetSecurityObject` on process handles. Access checks still use handle grants; this stores
+    /// the object descriptor CSRSS and debuggers can query or replace.
+    security_descriptor: Vec<u8>,
     /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
     /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
     /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
@@ -859,6 +863,7 @@ impl ProcessManager {
                 debug_port: None,
                 being_debugged: false,
                 create_reported: false,
+                security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 handles: Vec::new(),
             },
         );
@@ -1061,6 +1066,36 @@ impl ProcessManager {
 
     pub fn process_primary_token(&self, pid: ProcessId) -> Option<TokenId> {
         self.processes.get(&pid)?.primary_token
+    }
+
+    /// Return the process object's self-relative security descriptor after resolving a caller-local
+    /// process handle. `NtCurrentProcess()` is the caller and carries maximum pseudo-handle access.
+    pub fn process_security_descriptor(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<&[u8], u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, required_access)?;
+        self.processes
+            .get(&pid)
+            .map(|process| process.security_descriptor.as_slice())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    /// Replace the process object's self-relative security descriptor after the same process-handle
+    /// access checks used by other process syscalls.
+    pub fn set_process_security_descriptor(
+        &mut self,
+        caller_pid: ProcessId,
+        handle: u64,
+        required_access: u32,
+        descriptor: Vec<u8>,
+    ) -> Result<(), u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, required_access)?;
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.security_descriptor = descriptor;
+        Ok(())
     }
 
     /// Replace or clear a thread impersonation context. The returned context lets the caller
@@ -2751,6 +2786,15 @@ impl ProcessManager {
         object: HandleObject,
         granted_access: u32,
     ) -> Result<Handle, u32> {
+        match object {
+            HandleObject::Process(target) if !self.processes.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            HandleObject::Thread(target) if !self.threads.contains_key(&target) => {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            _ => {}
+        }
         let slot = {
             let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             let entry = HandleEntry {

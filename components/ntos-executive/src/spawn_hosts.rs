@@ -1048,7 +1048,14 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
         } else {
             0
         };
-        return PumpMessage { mi, m0, m1, m2, m3, m4 };
+        return PumpMessage {
+            mi,
+            m0,
+            m1,
+            m2,
+            m3,
+            m4,
+        };
     }
 }
 
@@ -1476,13 +1483,15 @@ unsafe fn pump_service_io_port_out32_fault(
     }
 
     let sh = ch.shared_va;
-    let port_cap =
-        core::ptr::read_volatile((sh + crate::driver_launch::SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    let port_cap = core::ptr::read_volatile(
+        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_CAP) as *const u64,
+    );
     let port_base = core::ptr::read_volatile(
         (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_BASE) as *const u64,
     );
-    let port_len =
-        core::ptr::read_volatile((sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    let port_len = core::ptr::read_volatile(
+        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LEN) as *const u64,
+    );
     if port_cap == 0 || port_base == 0 || port_len == 0 || ch.exec_code_va == 0 {
         return None;
     }

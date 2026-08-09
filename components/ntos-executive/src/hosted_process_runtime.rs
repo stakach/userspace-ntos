@@ -94,8 +94,8 @@ const CSRSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1078_0000;
 const HOSTED_DYNAMIC_FIRST_PI: usize = 7;
 const HOSTED_DYNAMIC_RUNTIME_BASE: u64 = 0x0000_0101_6000_0000;
 const HOSTED_DYNAMIC_RUNTIME_STRIDE: u64 = 0x0800_0000;
-const HOSTED_DYNAMIC_RUNTIME_LIMIT: u64 =
-    HOSTED_DYNAMIC_RUNTIME_BASE + (MAX_PI - HOSTED_DYNAMIC_FIRST_PI) as u64 * HOSTED_DYNAMIC_RUNTIME_STRIDE;
+const HOSTED_DYNAMIC_RUNTIME_LIMIT: u64 = HOSTED_DYNAMIC_RUNTIME_BASE
+    + (MAX_PI - HOSTED_DYNAMIC_FIRST_PI) as u64 * HOSTED_DYNAMIC_RUNTIME_STRIDE;
 const HOSTED_ENV_SCRATCH_WINDOW: u64 = 0x9000;
 const HOSTED_MIRROR_WINDOW: u64 = 0x20_0000;
 const HOSTED_DYNAMIC_RUNTIME_ARENA: DynamicRuntimeArena = DynamicRuntimeArena {
@@ -195,9 +195,7 @@ fn dynamic_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
     Some(address_layout_from_runtime_layout(layout))
 }
 
-fn address_layout_from_runtime_layout(
-    layout: ProcessRuntimeLayout,
-) -> HostedProcessAddressLayout {
+fn address_layout_from_runtime_layout(layout: ProcessRuntimeLayout) -> HostedProcessAddressLayout {
     HostedProcessAddressLayout {
         scratch_base: layout.scratch_base,
         env_scratch_va: layout.env_scratch_va,

@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use crate::*;
 use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
-    find_device_for_class, DriverClass, PciDevice, ResourceAssignment,
-    RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    find_device_for_class, DriverClass, PciDevice, ResourceAssignment, RootBusResourceProfile,
+    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static ROOT_BUS_RESOURCE_PROFILES: [RootBusResourceProfile; 1] = [ROOT_DMA_TEST_RESOURCE_PROFILE];
@@ -89,12 +89,7 @@ pub(crate) fn root_bus_resource_profile_for_devnode(
     compatible_ids: &[&str],
 ) -> Option<&'static RootBusResourceProfile> {
     ROOT_BUS_RESOURCE_PROFILES.iter().find(|profile| {
-        nt_pnp::devnode_matches_root_bus_profile(
-            instance_id,
-            hardware_ids,
-            compatible_ids,
-            profile,
-        )
+        nt_pnp::devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
     })
 }
 

@@ -6457,11 +6457,8 @@ unsafe fn image_c_string_is_safe(base: u64, rva: u64, len: usize) -> bool {
     let mut i = 0usize;
     while i < len {
         let b = read_volatile((base + rva + i as u64) as *const u8).to_ascii_lowercase();
-        let ok = b.is_ascii_lowercase()
-            || b.is_ascii_digit()
-            || b == b'_'
-            || b == b'-'
-            || b == b'.';
+        let ok =
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.';
         if !ok {
             return false;
         }
@@ -8652,8 +8649,7 @@ pub unsafe fn load_driver_into(
                     }
                     let name_ptr = dst_va + name_rva + 2;
                     let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
-                    let import_name =
-                        core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
+                    let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
                     let addr = if is_dxgthk && dxgthk_base != 0 {
                         pe_export_lookup(dxgthk_base, import_name)
                     } else if is_win32k {
@@ -8730,10 +8726,9 @@ pub unsafe fn win32k_static_import_dependency(index: usize, out: &mut [u8]) -> O
                         }
                         let mut n = 0usize;
                         while n < dn {
-                            out[n] = read_volatile(
-                                (code_va + dll_name_rva + n as u64) as *const u8
-                            )
-                            .to_ascii_lowercase();
+                            out[n] =
+                                read_volatile((code_va + dll_name_rva + n as u64) as *const u8)
+                                    .to_ascii_lowercase();
                             n += 1;
                         }
                         return Some(dn);
@@ -8813,8 +8808,7 @@ pub unsafe fn patch_win32k_static_import(dll_name: &[u8], dll_base: u64) -> u32 
                     else {
                         return patched;
                     };
-                    let import_name =
-                        core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
+                    let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
                     let addr = pe_export_lookup(dll_base, import_name);
                     if addr != 0 {
                         write_unaligned((slots + k * 8) as *mut u64, addr);

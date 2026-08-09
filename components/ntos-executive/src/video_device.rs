@@ -112,7 +112,11 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
 }
 
 #[inline(never)]
-unsafe fn install_video_miniport(framebuffer_va: u64, framebuffer_size: u64, mode: VideoModeSpec) -> bool {
+unsafe fn install_video_miniport(
+    framebuffer_va: u64,
+    framebuffer_size: u64,
+    mode: VideoModeSpec,
+) -> bool {
     VIDEO_MINIPORT = None;
     let Ok(miniport) = BootFramebufferMiniport::new(
         FramebufferMapping {
@@ -263,11 +267,12 @@ unsafe fn video_driver_object_path(driver_name: &[u8]) -> Option<&'static str> {
     }
     let path = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_OBJECT_PATH);
     path.fill(0);
-    path[..VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()]
-        .copy_from_slice(VIDEO_DRIVER_OBJECT_PATH_PREFIX);
+    path[..VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()].copy_from_slice(VIDEO_DRIVER_OBJECT_PATH_PREFIX);
     path[VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()..len].copy_from_slice(driver_name);
-    let bytes: &'static [u8] =
-        core::slice::from_raw_parts(core::ptr::addr_of!(VIDEO_DRIVER_OBJECT_PATH) as *const u8, len);
+    let bytes: &'static [u8] = core::slice::from_raw_parts(
+        core::ptr::addr_of!(VIDEO_DRIVER_OBJECT_PATH) as *const u8,
+        len,
+    );
     Some(core::str::from_utf8_unchecked(bytes))
 }
 

@@ -55,13 +55,17 @@ static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAG
     nt_exe_image::ImageTable::new();
 static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog<
     HOSTED_PROCESS_IMAGE_CAP,
-> =
-    nt_exe_image::OwnedHostedImageCatalog::new();
+> = nt_exe_image::OwnedHostedImageCatalog::new();
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
 static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue<DELAY_WAITER_N> =
     nt_delay_execution::Queue::new();
+static mut SERVICE_DLL_PE_STORE_WORK: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
+    [const { None }; DLL_REG_COUNT];
+static SERVICE_DLL_PE_NONE: Option<nt_pe_loader::PeFile<'static>> = None;
+static mut SERVICE_DLL_PE_REFS_WORK: [&'static Option<nt_pe_loader::PeFile<'static>>;
+    DLL_REG_COUNT] = [&SERVICE_DLL_PE_NONE; DLL_REG_COUNT];
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -547,8 +551,7 @@ fn sec_image_forward_run() -> u64 {
     let slot_pressure = slots_cap != 0 && slots_used * 5 >= slots_cap * 4;
     let frame_pressure = CSRSS_FRAME_HW.load(Ordering::Relaxed) * 10 >= CSRSS_FRAME_CAP as u64 * 7;
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
-    let untyped_free =
-        untyped_total.saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+    let untyped_free = untyped_total.saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed));
     let untyped_low = untyped_total != 0
         && untyped_free
             <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES;
@@ -570,7 +573,11 @@ fn sec_image_forward_run() -> u64 {
             print_str(b"KiB");
             print_str(b"\n");
         }
-        if untyped_critical { 1 } else { 4 }
+        if untyped_critical {
+            1
+        } else {
+            4
+        }
     } else {
         32
     }
@@ -608,6 +615,32 @@ unsafe fn reset_service_generic_sections_work() -> &'static mut GenericSectionTa
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
     (*slot).reset();
     &mut *slot
+}
+
+#[inline(never)]
+unsafe fn reset_service_dll_pe_store_work(
+) -> &'static mut [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] {
+    let store = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PE_STORE_WORK);
+    for slot in store.iter_mut() {
+        *slot = None;
+    }
+    store
+}
+
+#[inline(never)]
+unsafe fn reset_service_dll_pe_refs_work(
+    store: &'static [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
+) -> &'static [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] {
+    let refs = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PE_REFS_WORK);
+    for (i, slot) in refs.iter_mut().enumerate() {
+        *slot = &store[i];
+    }
+    refs
+}
+
+#[inline]
+fn pin_durable_heap_mark(heap_mark: &mut usize) {
+    *heap_mark = (*heap_mark).max(allocator::mark());
 }
 
 unsafe fn service_generic_section_frame(
@@ -810,8 +843,8 @@ unsafe fn service_generic_section_fault(
     if csrss_frame_get_exact(pi as u64, page).0 != 0 {
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
         if write_fault && fault_plan.copy_on_write {
-            let old_protection = nt_address_space::mapped_view_fault_plan(view_info.protect, false)
-                .map_protection;
+            let old_protection =
+                nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             vm_promote_mapped_cow_page(
                 pi,
                 page,
@@ -824,8 +857,8 @@ unsafe fn service_generic_section_fault(
             return Ok(true);
         }
         if write_fault && fault_plan.mark_dirty {
-            let old_protection = nt_address_space::mapped_view_fault_plan(view_info.protect, false)
-                .map_protection;
+            let old_protection =
+                nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             vm_reprotect_private_page(pi, page, old_protection, view_info.protect, pml4)?;
             generic_section_mark_dirty_if_backed(
                 generic_sections,
@@ -3701,15 +3734,13 @@ pub(crate) unsafe fn service_sec_image(
         (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
         (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
     ];
-    // Heap-backed parsed-PE storage (lives for the whole loop without consuming the 16 KiB stack).
-    // `dll_pes[i]` holds `&dll_pe_store[i]`
-    // — a stable ref into this array — so the erased `*const [&Option<PeFile>; N]` handed to the
+    // Static parsed-PE storage (lives for the whole loop without charging the executive bump heap).
+    // `dll_pes[i]` holds `&dll_pe_store[i]` — a stable ref into this array — so the erased slice
+    // handed to the
     // handler stays valid when a demand-load later writes `dll_pe_store[slot] = Some(pe)` (the ref
     // points AT the slot, so it observes the new value). Only the LIVE run (ntdll present) mounts the
     // pool/FS + demand-loads; the demo SEC_IMAGE call leaves every slot None.
-    let mut dll_pe_store: Vec<Option<nt_pe_loader::PeFile<'static>>> =
-        Vec::with_capacity(DLL_REG_COUNT);
-    dll_pe_store.resize_with(DLL_REG_COUNT, || None);
+    let dll_pe_store = reset_service_dll_pe_store_work();
     let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
     if ntdll.is_some() {
         // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
@@ -3739,16 +3770,17 @@ pub(crate) unsafe fn service_sec_image(
     // writes through this ptr are single-threaded + never alias a live `dll_pes[i]` read (the router
     // reads a slot only after it's mapped, which is after it's written).
     let dll_pe_store_ptr = dll_pe_store.as_mut_ptr();
-    let dll_pes: Vec<&Option<nt_pe_loader::PeFile>> =
-        (0..DLL_REG_COUNT).map(|i| &dll_pe_store[i]).collect();
+    let dll_pes: &'static [&'static Option<nt_pe_loader::PeFile<'static>>] =
+        &reset_service_dll_pe_refs_work(
+            &*(dll_pe_store.as_ptr()
+                as *const [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT]),
+        )[..];
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let mut nt_handler =
-        reset_exec_nt_handler(
-            exe_image_catalog
-                as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
-        );
+    let mut nt_handler = reset_exec_nt_handler(
+        exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    );
     nt_handler.register_main_thread_tcb(0, main_tcb);
     let delay_queue = reset_service_delay_queue_work();
     if ntdll.is_some() {
@@ -5595,37 +5627,38 @@ pub(crate) unsafe fn service_sec_image(
             // Route image faults through the committed view table. The table proves that this
             // process owns an image allocation at the faulting page; PE globals/registry state only
             // identify the bytes used to fill that committed view.
-            let (base, img_hi, tpe) =
-                if let Some(image_owner) = process_committed_image_allocation(pi as u64, page) {
-                    let base = image_owner.allocation_base;
-                    let tpe = if base == PE_LOAD_BASE {
-                        pe
-                    } else if nt_base != 0 && base == nt_base {
-                        ntfaults += 1;
-                        ntdll.unwrap().1
-                    } else if let Some((i, _)) = if pi >= 1 {
-                        reg.dll_for_page(pi, base)
-                    } else {
-                        None
-                    } {
-                        // A mapped registry DLL (csrsrv/basesrv/winsrv/Win32 stack) in a DLL-loading
-                        // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from
-                        // that DLL's parsed PE. The committed view table resolves ownership; the
-                        // registry maps the allocation base to the parsed PE bytes.
-                        dll_pes[i].as_ref().unwrap()
-                    } else {
-                        print_str(b"[vmf-image-owner] no PE for committed image allocation pi=");
-                        print_u64(pi as u64);
-                        print_str(b" base=0x");
-                        print_hex((base >> 32) as u32);
-                        print_hex(base as u32);
-                        print_str(b" page=0x");
-                        print_hex((page >> 32) as u32);
-                        print_hex(page as u32);
-                        print_str(b"\n");
-                        park_and_log!(pi, b"image-owner", m0, addr)
-                    };
-                    (base, image_owner.allocation_end, tpe)
+            let (base, img_hi, tpe) = if let Some(image_owner) =
+                process_committed_image_allocation(pi as u64, page)
+            {
+                let base = image_owner.allocation_base;
+                let tpe = if base == PE_LOAD_BASE {
+                    pe
+                } else if nt_base != 0 && base == nt_base {
+                    ntfaults += 1;
+                    ntdll.unwrap().1
+                } else if let Some((i, _)) = if pi >= 1 {
+                    reg.dll_for_page(pi, base)
+                } else {
+                    None
+                } {
+                    // A mapped registry DLL (csrsrv/basesrv/winsrv/Win32 stack) in a DLL-loading
+                    // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from
+                    // that DLL's parsed PE. The committed view table resolves ownership; the
+                    // registry maps the allocation base to the parsed PE bytes.
+                    dll_pes[i].as_ref().unwrap()
+                } else {
+                    print_str(b"[vmf-image-owner] no PE for committed image allocation pi=");
+                    print_u64(pi as u64);
+                    print_str(b" base=0x");
+                    print_hex((base >> 32) as u32);
+                    print_hex(base as u32);
+                    print_str(b" page=0x");
+                    print_hex((page >> 32) as u32);
+                    print_hex(page as u32);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"image-owner", m0, addr)
+                };
+                (base, image_owner.allocation_end, tpe)
             } else {
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
@@ -5961,8 +5994,7 @@ pub(crate) unsafe fn service_sec_image(
                 let image_map_rights = vm_page_rights(image_fault_plan.map_protection);
                 let image_map_writable = matches!(
                     image_fault_plan.map_protection & 0xff,
-                    nt_address_space::PAGE_READWRITE
-                        | nt_address_space::PAGE_EXECUTE_READWRITE
+                    nt_address_space::PAGE_READWRITE | nt_address_space::PAGE_EXECUTE_READWRITE
                 );
                 if image_map_rights == 0 {
                     if is_fault_page {
@@ -7248,11 +7280,11 @@ pub(crate) unsafe fn service_sec_image(
                 // within the 2 MiB heap; non-mutating iterations still reset fully.
                 if nt_handler.overlay_dirty {
                     nt_handler.overlay_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 if nt_handler.mutable_hives_dirty {
                     nt_handler.mutable_hives_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a
                 // later NtCreateSection/NtCreateProcessEx. Its pool bytes are reset-safe, but the
@@ -7261,15 +7293,15 @@ pub(crate) unsafe fn service_sec_image(
                 // main image just like a bootstrap image.
                 if nt_handler.hosted_exe_dirty {
                     nt_handler.hosted_exe_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 if nt_handler.token_dirty {
                     nt_handler.token_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 if nt_handler.process_dirty {
                     nt_handler.process_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
                 // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
@@ -7278,7 +7310,7 @@ pub(crate) unsafe fn service_sec_image(
                 // their runtime strings/value data.)
                 if nt_handler.hive_mounts_dirty {
                     nt_handler.hive_mounts_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 // WRITABLE FILESYSTEM plane: a handler that touched the writable overlay
                 // (`writable_fs`) — its lazy mount, or a create/write/set-information/close — grew
@@ -7289,10 +7321,10 @@ pub(crate) unsafe fn service_sec_image(
                 // iterations that actually touched the volume.
                 if nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty() {
                     nt_handler.writable_fs_dirty = false;
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 if take_shared_image_mapping_dirty() {
-                    heap_mark = allocator::mark();
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
                 // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
@@ -9136,7 +9168,9 @@ pub(crate) unsafe fn service_sec_image(
                                         &*header_out,
                                         i_usage as u32,
                                     ) {
-                                        Some(bytes) if bytes as u64 >= 12 && bytes as u64 <= cap => {
+                                        Some(bytes)
+                                            if bytes as u64 >= 12 && bytes as u64 <= cap =>
+                                        {
                                             staged_bmi_bytes = bytes as u64;
                                         }
                                         _ => {
@@ -16836,9 +16870,10 @@ unsafe fn spawn_requested_tp_worker(
     if spawned.tcb() == 0 {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
         if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
-            let _ = nt_handler
-                .pm
-                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Initialized);
+            let _ = nt_handler.pm.set_thread_state(
+                tid as nt_process::ThreadId,
+                nt_process::ThreadState::Initialized,
+            );
             let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
             let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
         }
@@ -16853,9 +16888,10 @@ unsafe fn spawn_requested_tp_worker(
     ) {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
         if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
-            let _ = nt_handler
-                .pm
-                .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Initialized);
+            let _ = nt_handler.pm.set_thread_state(
+                tid as nt_process::ThreadId,
+                nt_process::ThreadState::Initialized,
+            );
             let _ = nt_handler.release_pool_usage_slot(pool_pi, pool_slot);
             let _ = nt_handler.set_pool_thread_suspended(pool_pi, pool_slot, false);
         }

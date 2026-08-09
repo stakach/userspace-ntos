@@ -5,6 +5,7 @@
 //! The [`HiveMountTable`] resolves a full NT registry path to a mounted hive + a relative path,
 //! applying the `CurrentControlSet` alias (spec §8).
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -55,7 +56,7 @@ pub(crate) struct ValueCell {
     pub parent_key: CellId,
     pub name: String,
     pub value_type: RegistryValueType,
-    pub data: Vec<u8>,
+    pub data_blob: usize,
     pub last_write_sequence: u64,
 }
 
@@ -77,12 +78,13 @@ pub(crate) fn fold(name: &str) -> String {
 /// A mounted registry subtree as a cell arena (spec §6.1).
 pub struct Hive {
     pub(crate) cells: Vec<Option<Cell>>,
+    pub(crate) value_blobs: Vec<Rc<Vec<u8>>>,
     pub(crate) root: CellId,
     pub(crate) next_id: u64,
     pub kind: HiveKind,
     pub generation: u64,
     pub sequence: u64,
-    pub(crate) dirty: Vec<CellId>,
+    pub(crate) clean_sequence: u64,
 }
 
 impl Hive {
@@ -90,12 +92,13 @@ impl Hive {
     pub fn new(kind: HiveKind) -> Self {
         let mut h = Hive {
             cells: Vec::new(),
+            value_blobs: Vec::new(),
             root: CellId(0),
             next_id: 1,
             kind,
             generation: 0,
             sequence: 0,
-            dirty: Vec::new(),
+            clean_sequence: 0,
         };
         h.root = h.alloc_key(None, "");
         h
@@ -106,6 +109,14 @@ impl Hive {
     }
     pub fn cell_count(&self) -> usize {
         self.cells.iter().filter(|c| c.is_some()).count()
+    }
+
+    pub fn reserve_cells(&mut self, additional: usize) -> bool {
+        self.cells.try_reserve_exact(additional).is_ok()
+    }
+
+    pub fn reserve_value_blobs(&mut self, additional: usize) -> bool {
+        self.value_blobs.try_reserve_exact(additional).is_ok()
     }
 
     fn alloc_id(&mut self) -> CellId {
@@ -159,17 +170,81 @@ impl Hive {
         }
     }
 
+    pub(crate) fn value_data(&self, value: &ValueCell) -> Option<&[u8]> {
+        self.value_blobs
+            .get(value.data_blob)
+            .map(|data| data.as_slice())
+    }
+
+    fn value_id_by_name(&self, key: CellId, name: &str) -> Option<CellId> {
+        self.key(key)?
+            .values
+            .iter()
+            .find(|vid| {
+                self.value(**vid)
+                    .is_some_and(|v| v.name.eq_ignore_ascii_case(name))
+            })
+            .copied()
+    }
+
     fn components(path: &str) -> impl Iterator<Item = &str> {
         path.split('\\').filter(|c| !c.is_empty())
     }
 
+    pub(crate) fn intern_value_data(&mut self, data: Vec<u8>) -> usize {
+        if let Some(index) = self
+            .value_blobs
+            .iter()
+            .position(|existing| existing.as_slice() == data.as_slice())
+        {
+            return index;
+        }
+        self.value_blobs.push(Rc::new(data));
+        self.value_blobs.len() - 1
+    }
+
+    fn push_empty_value_blob_with_capacity(&mut self, len: usize) -> Option<usize> {
+        let mut data = Vec::new();
+        if data.try_reserve_exact(len).is_err() {
+            return None;
+        }
+        self.value_blobs.push(Rc::new(data));
+        Some(self.value_blobs.len() - 1)
+    }
+
+    fn intern_value_blob_handle(&mut self, data: Rc<Vec<u8>>) -> usize {
+        if let Some(index) = self
+            .value_blobs
+            .iter()
+            .position(|existing| Rc::ptr_eq(existing, &data))
+        {
+            return index;
+        }
+        self.value_blobs.push(data);
+        self.value_blobs.len() - 1
+    }
+
+    fn value_blob_handle(&self, value: CellId) -> Option<Rc<Vec<u8>>> {
+        let blob = self.value(value)?.data_blob;
+        self.value_blobs.get(blob).cloned()
+    }
+
+    fn value_blob_ref_count(&self, blob: usize) -> usize {
+        self.cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Some(Cell::Value(value)) if value.data_blob == blob => Some(()),
+                _ => None,
+            })
+            .count()
+    }
+
     /// Open a subkey by (case-insensitive) name.
     pub fn open_subkey(&self, parent: CellId, name: &str) -> Option<CellId> {
-        let folded = fold(name);
         self.key(parent)?
             .subkeys
             .iter()
-            .find(|(n, _)| *n == folded)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, id)| *id)
     }
 
@@ -187,6 +262,7 @@ impl Hive {
         if let Some(id) = self.open_subkey(parent, name) {
             return id;
         }
+        self.sequence += 1;
         let id = self.alloc_key(Some(parent), name);
         let folded = fold(name);
         self.key_mut(parent).unwrap().subkeys.push((folded, id));
@@ -243,15 +319,29 @@ impl Hive {
     }
 
     fn mark_dirty(&mut self, id: CellId) {
-        if !self.dirty.contains(&id) {
-            self.dirty.push(id);
+        let seq = self.sequence;
+        match self
+            .cells
+            .get_mut(id.0 as usize)
+            .and_then(|cell| cell.as_mut())
+        {
+            Some(Cell::Key(key)) => key.last_write_sequence = seq,
+            Some(Cell::Value(value)) => value.last_write_sequence = seq,
+            None => {}
         }
     }
     pub fn dirty_count(&self) -> usize {
-        self.dirty.len()
+        self.cells
+            .iter()
+            .filter(|cell| match cell {
+                Some(Cell::Key(key)) => key.last_write_sequence > self.clean_sequence,
+                Some(Cell::Value(value)) => value.last_write_sequence > self.clean_sequence,
+                None => false,
+            })
+            .count()
     }
     pub(crate) fn clear_dirty(&mut self) {
-        self.dirty.clear();
+        self.clean_sequence = self.sequence;
     }
 
     /// A boot/import path has just populated this hive from already-persistent backing bytes.
@@ -279,42 +369,34 @@ impl Hive {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
+        if self.key(key).is_none() {
+            return false;
+        }
+        let data_blob = self.intern_value_data(data);
         self.sequence += 1;
         let seq = self.sequence;
-        let folded = fold(name);
         // Existing value?
-        let existing = self
-            .key(key)
-            .map(|k| {
-                k.values
-                    .iter()
-                    .find(|vid| self.value(**vid).is_some_and(|v| fold(&v.name) == folded))
-                    .copied()
-            })
-            .unwrap_or(None);
+        let existing = self.value_id_by_name(key, name);
         match existing {
             Some(vid) => {
                 if let Some(Cell::Value(v)) =
                     self.cells.get_mut(vid.0 as usize).and_then(|c| c.as_mut())
                 {
                     v.value_type = value_type;
-                    v.data = data;
+                    v.data_blob = data_blob;
                     v.last_write_sequence = seq;
                 }
                 self.mark_dirty(vid);
                 true
             }
             None => {
-                if self.key(key).is_none() {
-                    return false;
-                }
                 let vid = self.alloc_id();
                 self.push_cell(Cell::Value(ValueCell {
                     id: vid,
                     parent_key: key,
                     name: name.into(),
                     value_type,
-                    data,
+                    data_blob,
                     last_write_sequence: seq,
                 }));
                 self.key_mut(key).unwrap().values.push(vid);
@@ -325,14 +407,199 @@ impl Hive {
         }
     }
 
+    /// Prepare a value's backing buffer for chunked replacement.
+    ///
+    /// Existing values reuse their current allocation when it is large enough, avoiding a second
+    /// large registry blob on the executive bump heap. On reserve failure the old value is left
+    /// untouched and `None` is returned.
+    pub fn prepare_value_buffer(
+        &mut self,
+        key: CellId,
+        name: &str,
+        value_type: RegistryValueType,
+        len: usize,
+    ) -> Option<CellId> {
+        if self.key(key).is_none() {
+            return None;
+        }
+        if let Some(vid) = self.value_id_by_name(key, name) {
+            let data_blob = self.value(vid)?.data_blob;
+            let reuse_existing_blob = self.value_blob_ref_count(data_blob) == 1
+                && self
+                    .value_blobs
+                    .get(data_blob)
+                    .is_some_and(|data| Rc::strong_count(data) == 1)
+                && self
+                    .value_blobs
+                    .get(data_blob)
+                    .is_some_and(|data| data.capacity() >= len);
+            let prepared_blob = if reuse_existing_blob {
+                data_blob
+            } else {
+                self.push_empty_value_blob_with_capacity(len)?
+            };
+            self.sequence += 1;
+            let seq = self.sequence;
+            let Some(Cell::Value(value)) = self
+                .cells
+                .get_mut(vid.0 as usize)
+                .and_then(|cell| cell.as_mut())
+            else {
+                return None;
+            };
+            value.value_type = value_type;
+            value.data_blob = prepared_blob;
+            if let Some(data) = self
+                .value_blobs
+                .get_mut(prepared_blob)
+                .and_then(Rc::get_mut)
+            {
+                data.clear();
+            }
+            value.last_write_sequence = seq;
+            self.mark_dirty(vid);
+            return Some(vid);
+        }
+
+        let data_blob = self.push_empty_value_blob_with_capacity(len)?;
+        self.sequence += 1;
+        let seq = self.sequence;
+        let vid = self.alloc_id();
+        self.push_cell(Cell::Value(ValueCell {
+            id: vid,
+            parent_key: key,
+            name: name.into(),
+            value_type,
+            data_blob,
+            last_write_sequence: seq,
+        }));
+        self.key_mut(key).unwrap().values.push(vid);
+        self.mark_dirty(key);
+        self.mark_dirty(vid);
+        Some(vid)
+    }
+
+    pub fn append_prepared_value_data(&mut self, value: CellId, chunk: &[u8]) -> bool {
+        let Some(blob) = self.value(value).map(|value| value.data_blob) else {
+            return false;
+        };
+        let Some(data) = self.value_blobs.get_mut(blob).and_then(Rc::get_mut) else {
+            return false;
+        };
+        if data.len().saturating_add(chunk.len()) > data.capacity() {
+            return false;
+        }
+        data.extend_from_slice(chunk);
+        true
+    }
+
+    pub fn prepared_value_len(&self, value: CellId) -> Option<usize> {
+        Some(self.value_data(self.value(value)?)?.len())
+    }
+
+    /// Set `name` on `key` to share the already-owned payload of `source`.
+    ///
+    /// This is the same-hive fast path a Configuration Manager subtree copy wants: the destination
+    /// value gets its own cell metadata but references the same immutable payload bytes until a later
+    /// replacement gives either cell a new blob.
+    pub fn set_value_from_existing_value(
+        &mut self,
+        key: CellId,
+        name: &str,
+        value_type: RegistryValueType,
+        source: CellId,
+    ) -> bool {
+        if self.key(key).is_none() {
+            return false;
+        }
+        let Some(source_blob) = self.value(source).map(|source| source.data_blob) else {
+            return false;
+        };
+        self.sequence += 1;
+        let seq = self.sequence;
+        if let Some(vid) = self.value_id_by_name(key, name) {
+            let Some(Cell::Value(value)) = self
+                .cells
+                .get_mut(vid.0 as usize)
+                .and_then(|cell| cell.as_mut())
+            else {
+                return false;
+            };
+            value.value_type = value_type;
+            value.data_blob = source_blob;
+            value.last_write_sequence = seq;
+            self.mark_dirty(vid);
+            return true;
+        }
+
+        let vid = self.alloc_id();
+        self.push_cell(Cell::Value(ValueCell {
+            id: vid,
+            parent_key: key,
+            name: name.into(),
+            value_type,
+            data_blob: source_blob,
+            last_write_sequence: seq,
+        }));
+        self.key_mut(key).unwrap().values.push(vid);
+        self.mark_dirty(key);
+        self.mark_dirty(vid);
+        true
+    }
+
+    fn set_value_from_blob_handle(
+        &mut self,
+        key: CellId,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Rc<Vec<u8>>,
+    ) -> bool {
+        if self.key(key).is_none() {
+            return false;
+        }
+        let data_blob = self.intern_value_blob_handle(data);
+        self.sequence += 1;
+        let seq = self.sequence;
+        if let Some(vid) = self.value_id_by_name(key, name) {
+            let Some(Cell::Value(value)) = self
+                .cells
+                .get_mut(vid.0 as usize)
+                .and_then(|cell| cell.as_mut())
+            else {
+                return false;
+            };
+            value.value_type = value_type;
+            value.data_blob = data_blob;
+            value.last_write_sequence = seq;
+            self.mark_dirty(vid);
+            return true;
+        }
+
+        let vid = self.alloc_id();
+        self.push_cell(Cell::Value(ValueCell {
+            id: vid,
+            parent_key: key,
+            name: name.into(),
+            value_type,
+            data_blob,
+            last_write_sequence: seq,
+        }));
+        self.key_mut(key).unwrap().values.push(vid);
+        self.mark_dirty(key);
+        self.mark_dirty(vid);
+        true
+    }
+
     /// `ZwDeleteValueKey` — remove a named value from a key cell.
     pub fn delete_value(&mut self, key: CellId, name: &str) -> bool {
-        let folded = fold(name);
         let Some((pos, value_id)) = self.key(key).and_then(|k| {
             k.values
                 .iter()
                 .enumerate()
-                .find(|(_, vid)| self.value(**vid).is_some_and(|v| fold(&v.name) == folded))
+                .find(|(_, vid)| {
+                    self.value(**vid)
+                        .is_some_and(|v| v.name.eq_ignore_ascii_case(name))
+                })
                 .map(|(pos, vid)| (pos, *vid))
         }) else {
             return false;
@@ -395,13 +662,12 @@ impl Hive {
 
     /// `ZwQueryValueKey` — read a named value (type + data).
     pub fn query_value(&self, key: CellId, name: &str) -> Option<(RegistryValueType, &[u8])> {
-        let folded = fold(name);
         let k = self.key(key)?;
         k.values
             .iter()
             .filter_map(|vid| self.value(*vid))
-            .find(|v| fold(&v.name) == folded)
-            .map(|v| (v.value_type, v.data.as_slice()))
+            .find(|v| v.name.eq_ignore_ascii_case(name))
+            .and_then(|v| Some((v.value_type, self.value_data(v)?)))
     }
 
     /// Convenience: a `REG_DWORD` value.
@@ -471,7 +737,25 @@ impl Hive {
         index: usize,
     ) -> Option<(&str, RegistryValueType, &[u8])> {
         let value = self.value(*self.key(key)?.values.get(index)?)?;
-        Some((value.name.as_str(), value.value_type, value.data.as_slice()))
+        Some((
+            value.name.as_str(),
+            value.value_type,
+            self.value_data(value)?,
+        ))
+    }
+
+    pub fn value_ref_by_index(
+        &self,
+        key: CellId,
+        index: usize,
+    ) -> Option<(CellId, &str, RegistryValueType, &[u8])> {
+        let value = self.value(*self.key(key)?.values.get(index)?)?;
+        Some((
+            value.id,
+            value.name.as_str(),
+            value.value_type,
+            self.value_data(value)?,
+        ))
     }
 
     /// The relative path of a key cell within the hive (`\Sub\Key`).
@@ -573,6 +857,133 @@ pub struct ResolvedHiveKey {
     pub key: CellId,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHiveValue {
+    pub hive: HiveId,
+    pub value: CellId,
+}
+
+/// A recently copied-out registry value payload.
+///
+/// ReactOS' `RegCopyTreeW` asks `NtEnumerateValueKey` for a full
+/// `KEY_VALUE_FULL_INFORMATION` record and immediately passes the data field back to
+/// `NtSetValueKey`. Keeping this source identity per caller thread lets the hive manager install a
+/// destination value that shares the source blob after the SetValue handler has verified that the
+/// user buffer still contains those bytes.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistryValueCopyProvenance {
+    source: Option<ResolvedHiveValue>,
+    process_index: u64,
+    thread_id: u64,
+    data_va: u64,
+    data_len: usize,
+    value_type: u32,
+}
+
+impl RegistryValueCopyProvenance {
+    pub fn new(
+        source: ResolvedHiveValue,
+        process_index: u64,
+        thread_id: u64,
+        data_va: u64,
+        data_len: usize,
+        value_type: u32,
+    ) -> Self {
+        Self {
+            source: Some(source),
+            process_index,
+            thread_id,
+            data_va,
+            data_len,
+            value_type,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.source.is_some() && self.data_len != 0
+    }
+
+    fn is_for_thread(&self, process_index: u64, thread_id: u64) -> bool {
+        self.process_index == process_index && self.thread_id == thread_id
+    }
+
+    fn source_for_user_data(
+        &self,
+        process_index: u64,
+        thread_id: u64,
+        data_va: u64,
+        data_len: usize,
+        value_type: u32,
+    ) -> Option<ResolvedHiveValue> {
+        if self.is_for_thread(process_index, thread_id)
+            && self.data_va == data_va
+            && self.data_len == data_len
+            && self.value_type == value_type
+        {
+            self.source
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct RegistryValueCopyProvenanceTable {
+    entries: Vec<RegistryValueCopyProvenance>,
+}
+
+impl RegistryValueCopyProvenanceTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut entries = Vec::new();
+        let _ = entries.try_reserve_exact(capacity);
+        Self { entries }
+    }
+
+    pub fn clear_for_thread(&mut self, process_index: u64, thread_id: u64) {
+        self.entries
+            .retain(|entry| !entry.is_for_thread(process_index, thread_id));
+    }
+
+    pub fn record(&mut self, provenance: RegistryValueCopyProvenance) -> bool {
+        if !provenance.is_valid() {
+            self.clear_for_thread(provenance.process_index, provenance.thread_id);
+            return true;
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_for_thread(provenance.process_index, provenance.thread_id))
+        {
+            *entry = provenance;
+            return true;
+        }
+        if self.entries.len() == self.entries.capacity()
+            && self.entries.try_reserve_exact(1).is_err()
+        {
+            return false;
+        }
+        self.entries.push(provenance);
+        true
+    }
+
+    pub fn source_for_user_data(
+        &self,
+        process_index: u64,
+        thread_id: u64,
+        data_va: u64,
+        data_len: usize,
+        value_type: u32,
+    ) -> Option<ResolvedHiveValue> {
+        self.entries.iter().find_map(|entry| {
+            entry.source_for_user_data(process_index, thread_id, data_va, data_len, value_type)
+        })
+    }
+}
+
 /// Owned mutable hives plus the NT registry namespace that mounts them.
 ///
 /// This is the host-testable Configuration Manager authority D2 needs before the executive stops
@@ -641,6 +1052,22 @@ impl MutableHiveSet {
         })
     }
 
+    /// Create or open an immediate child below an already-resolved mounted-hive key.
+    pub fn create_subkey(
+        &mut self,
+        parent: ResolvedHiveKey,
+        name: &str,
+    ) -> Option<ResolvedHiveKey> {
+        if name.is_empty() || name.contains('\\') {
+            return None;
+        }
+        let hive = self.hive_mut(parent.hive)?;
+        Some(ResolvedHiveKey {
+            hive: parent.hive,
+            key: hive.create_subkey(parent.key, name),
+        })
+    }
+
     pub fn set_value(
         &mut self,
         key: ResolvedHiveKey,
@@ -650,6 +1077,72 @@ impl MutableHiveSet {
     ) -> bool {
         self.hive_mut(key.hive)
             .is_some_and(|hive| hive.set_value(key.key, name, value_type, data))
+    }
+
+    pub fn set_value_from_existing_value(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+        value_type: RegistryValueType,
+        source: ResolvedHiveValue,
+    ) -> bool {
+        if key.hive == source.hive {
+            return self.hive_mut(key.hive).is_some_and(|hive| {
+                hive.set_value_from_existing_value(key.key, name, value_type, source.value)
+            });
+        }
+
+        let Some(source_blob) = self
+            .hive(source.hive)
+            .and_then(|hive| hive.value_blob_handle(source.value))
+        else {
+            return false;
+        };
+        let Some(source_type) = self
+            .hive(source.hive)
+            .and_then(|hive| hive.value(source.value))
+            .map(|value| value.value_type)
+        else {
+            return false;
+        };
+        if source_type != value_type {
+            return false;
+        }
+        self.hive_mut(key.hive).is_some_and(|hive| {
+            hive.set_value_from_blob_handle(key.key, name, value_type, source_blob)
+        })
+    }
+
+    pub fn prepare_value_buffer(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+        value_type: RegistryValueType,
+        len: usize,
+    ) -> Option<ResolvedHiveValue> {
+        let hive = self.hive_mut(key.hive)?;
+        Some(ResolvedHiveValue {
+            hive: key.hive,
+            value: hive.prepare_value_buffer(key.key, name, value_type, len)?,
+        })
+    }
+
+    pub fn append_prepared_value_data(&mut self, value: ResolvedHiveValue, chunk: &[u8]) -> bool {
+        self.hive_mut(value.hive)
+            .is_some_and(|hive| hive.append_prepared_value_data(value.value, chunk))
+    }
+
+    pub fn prepared_value_len(&self, value: ResolvedHiveValue) -> Option<usize> {
+        self.hive(value.hive)?.prepared_value_len(value.value)
+    }
+
+    pub fn query_resolved_value(
+        &self,
+        value: ResolvedHiveValue,
+    ) -> Option<(RegistryValueType, &[u8])> {
+        let hive = self.hive(value.hive)?;
+        let value = hive.value(value.value)?;
+        Some((value.value_type, hive.value_data(value)?))
     }
 
     pub fn delete_value(&mut self, key: ResolvedHiveKey, name: &str) -> bool {
@@ -688,6 +1181,24 @@ impl MutableHiveSet {
     ) -> Option<(RegistryValueType, &[u8])> {
         self.hive(key.hive)?.query_value(key.key, name)
     }
+
+    pub fn value_ref_by_index(
+        &self,
+        key: ResolvedHiveKey,
+        index: usize,
+    ) -> Option<(ResolvedHiveValue, &str, RegistryValueType, &[u8])> {
+        let hive = self.hive(key.hive)?;
+        let (value, name, value_type, data) = hive.value_ref_by_index(key.key, index)?;
+        Some((
+            ResolvedHiveValue {
+                hive: key.hive,
+                value,
+            },
+            name,
+            value_type,
+            data,
+        ))
+    }
 }
 
 /// Replace a `CurrentControlSet` path component with the live control set (spec §8).
@@ -706,7 +1217,14 @@ pub fn apply_ccs_alias(path: &str) -> String {
 
 /// Case-insensitive path-prefix test on `\`-delimited components.
 fn path_starts_with(path: &str, prefix: &str) -> bool {
-    let p: Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
-    let q: Vec<&str> = prefix.split('\\').filter(|c| !c.is_empty()).collect();
-    q.len() <= p.len() && q.iter().zip(&p).all(|(a, b)| a.eq_ignore_ascii_case(b))
+    let mut path_components = path.split('\\').filter(|c| !c.is_empty());
+    for prefix_component in prefix.split('\\').filter(|c| !c.is_empty()) {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !prefix_component.eq_ignore_ascii_case(path_component) {
+            return false;
+        }
+    }
+    true
 }

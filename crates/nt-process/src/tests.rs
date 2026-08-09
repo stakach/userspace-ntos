@@ -154,6 +154,79 @@ fn handle_table_operations() {
 }
 
 #[test]
+fn typed_handles_must_reference_live_process_manager_objects() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+
+    assert_eq!(
+        pm.insert_handle(owner, HandleObject::Process(0), PROCESS_ALL_ACCESS),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.insert_handle(owner, HandleObject::Process(0xdead), PROCESS_ALL_ACCESS),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.insert_handle(owner, HandleObject::Thread(0), THREAD_ALL_ACCESS),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.insert_handle(owner, HandleObject::Thread(0xbeef), THREAD_ALL_ACCESS),
+        Err(STATUS_INVALID_HANDLE)
+    );
+
+    let target = pm.create_process("target.exe", None, None);
+    let thread = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    assert!(pm
+        .insert_handle(owner, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .is_ok());
+    assert!(pm
+        .insert_handle(owner, HandleObject::Thread(thread), THREAD_ALL_ACCESS)
+        .is_ok());
+    assert!(pm.insert_handle(owner, HandleObject::Opaque(0), 0).is_ok());
+}
+
+#[test]
+fn process_security_descriptor_uses_process_handle_access() {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let read_only = pm
+        .insert_handle(caller, HandleObject::Process(target), READ_CONTROL)
+        .unwrap();
+
+    assert_eq!(
+        pm.process_security_descriptor(caller, u64::MAX, READ_CONTROL)
+            .unwrap(),
+        &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]
+    );
+    assert_eq!(
+        pm.set_process_security_descriptor(caller, read_only as u64, WRITE_DAC, alloc::vec![]),
+        Err(STATUS_ACCESS_DENIED)
+    );
+
+    let empty_dacl_sd = alloc::vec![
+        1, 0, 0x04, 0x80, // revision, control: self-relative + DACL present
+        0, 0, 0, 0, // owner
+        0, 0, 0, 0, // group
+        0, 0, 0, 0, // SACL
+        20, 0, 0, 0, // DACL
+        2, 0, 8, 0, // ACL revision + size
+        0, 0, 0, 0, // ACE count + padding
+    ];
+    pm.set_process_security_descriptor(caller, u64::MAX, WRITE_DAC, empty_dacl_sd.clone())
+        .unwrap();
+    assert_eq!(
+        pm.process_security_descriptor(caller, u64::MAX, READ_CONTROL)
+            .unwrap(),
+        empty_dacl_sd.as_slice()
+    );
+}
+
+#[test]
 fn queue_user_apc_requires_thread_set_context_access() {
     let mut pm = ProcessManager::new();
     let caller = pm.create_process("caller.exe", None, None);

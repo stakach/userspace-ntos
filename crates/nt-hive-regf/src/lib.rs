@@ -39,6 +39,26 @@ pub struct RegfHive<'a> {
     root: u32,
 }
 
+enum ValueDataView<'a> {
+    Inline { ty: u32, data: [u8; 4], len: usize },
+    Borrowed { ty: u32, data: &'a [u8] },
+}
+
+impl<'a> ValueDataView<'a> {
+    fn ty(&self) -> u32 {
+        match self {
+            ValueDataView::Inline { ty, .. } | ValueDataView::Borrowed { ty, .. } => *ty,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ValueDataView::Inline { data, len, .. } => &data[..*len],
+            ValueDataView::Borrowed { data, .. } => data,
+        }
+    }
+}
+
 /// A reference to a key node (its hbin-relative cell offset).
 pub type KeyRef = u32;
 
@@ -48,6 +68,38 @@ pub struct RegfHiveImportStats {
     pub keys: usize,
     pub values: usize,
     pub skipped_values: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RegfHiveCellCounts {
+    keys: usize,
+    values: usize,
+}
+
+fn live_mutation_cell_headroom(kind: HiveKind, imported_cells: usize) -> usize {
+    match kind {
+        // services.exe performs real ControlSet construction by copying a large SYSTEM subtree
+        // immediately after boot. Reserve enough metadata cells for that second live tree.
+        HiveKind::System => imported_cells,
+        // The install-time SOFTWARE writes we own here are class/profile metadata, not another full
+        // hive copy. Fixed slack avoids a late Vec growth while keeping profile-load headroom.
+        HiveKind::Software => 512,
+        // SAM/SECURITY boot hives are tiny on the live CD but grow during first-boot database
+        // creation; give them room for real account/policy keys without scaling by imported size.
+        HiveKind::Sam | HiveKind::Security => 1024,
+        // .Default and dynamically loaded user hives need Volatile Environment and profile deltas,
+        // but not a full duplicate of the prototype hive.
+        HiveKind::Default => 256,
+    }
+}
+
+fn live_mutation_value_headroom(kind: HiveKind, imported_values: usize) -> usize {
+    match kind {
+        HiveKind::System => imported_values,
+        HiveKind::Software => 256,
+        HiveKind::Sam | HiveKind::Security => 512,
+        HiveKind::Default => 128,
+    }
 }
 
 fn u16le(b: &[u8], off: usize) -> Option<u16> {
@@ -94,6 +146,13 @@ impl<'a> RegfHive<'a> {
         let size = i32le(self.data, fo)?;
         let len = (size.unsigned_abs() as usize).max(4);
         self.data.get(fo + 4..fo + len)
+    }
+
+    fn cell_body_len(&self, offset: u32) -> Option<usize> {
+        let fo = HBIN_BASE.checked_add(offset as usize)?;
+        let size = i32le(self.data, fo)?;
+        let len = (size.unsigned_abs() as usize).max(4);
+        self.data.get(fo + 4..fo + len).map(|body| body.len())
     }
 
     /// A cell body given a *file* offset already past the size word is not needed — everything is
@@ -238,6 +297,16 @@ impl<'a> RegfHive<'a> {
         self.subkey_by_index_in_list(list_off, &mut remaining, 0, false)
     }
 
+    fn subkey_ref_by_index(&self, nk: KeyRef, index: usize) -> Option<KeyRef> {
+        let body = self.cell_body(nk)?;
+        let list_off = match u32le(body, 0x1c) {
+            Some(o) if o != 0 && o != u32::MAX => o,
+            _ => return None,
+        };
+        let mut remaining = index;
+        self.subkey_ref_by_index_in_list(list_off, &mut remaining, 0)
+    }
+
     /// UTF-16 code units in the original-case immediate subkey name at `index`.
     pub fn subkey_name_utf16_len_by_index(&self, nk: KeyRef, index: usize) -> Option<usize> {
         let (_, cell) = self.subkey_by_index(nk, index)?;
@@ -358,6 +427,51 @@ impl<'a> RegfHive<'a> {
                     let sub = u32le(b, 0x04 + i * 4)?;
                     if let Some(found) =
                         self.subkey_by_index_in_list(sub, remaining, depth + 1, raw_names)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn subkey_ref_by_index_in_list(
+        &self,
+        list_off: u32,
+        remaining: &mut usize,
+        depth: u32,
+    ) -> Option<KeyRef> {
+        if depth > 8 {
+            return None;
+        }
+        let b = self.cell_body(list_off)?;
+        let sig = b.get(0..2)?;
+        let count = u16le(b, 0x02)? as usize;
+        match sig {
+            b"lf" | b"lh" => {
+                for i in 0..count {
+                    let off = u32le(b, 0x04 + i * 8)?;
+                    if *remaining == 0 {
+                        return Some(off);
+                    }
+                    *remaining -= 1;
+                }
+            }
+            b"li" => {
+                for i in 0..count {
+                    let off = u32le(b, 0x04 + i * 4)?;
+                    if *remaining == 0 {
+                        return Some(off);
+                    }
+                    *remaining -= 1;
+                }
+            }
+            b"ri" => {
+                for i in 0..count {
+                    let sub = u32le(b, 0x04 + i * 4)?;
+                    if let Some(found) = self.subkey_ref_by_index_in_list(sub, remaining, depth + 1)
                     {
                         return Some(found);
                     }
@@ -498,13 +612,35 @@ impl<'a> RegfHive<'a> {
     /// Read a value by name (case-insensitive) under `nk`: returns `(reg_type, data_bytes)`.
     /// Handles small (≤4 B) inline data (data-length top bit set).
     pub fn value(&self, nk: KeyRef, name: &str) -> Option<(u32, Vec<u8>)> {
+        self.value_with(nk, name, |ty, data| (ty, data.to_vec()))
+    }
+
+    /// Read a value by name and borrow its data for the duration of `visit`.
+    pub fn value_with<R>(
+        &self,
+        nk: KeyRef,
+        name: &str,
+        visit: impl FnOnce(u32, &[u8]) -> R,
+    ) -> Option<R> {
         let vk = self.value_cell_by_name(nk, name)?;
-        self.value_data(vk)
+        let data = self.value_data_view(vk)?;
+        Some(visit(data.ty(), data.as_slice()))
     }
 
     /// Whether a value exists by name without cloning the complete value list or data body.
     pub fn value_exists(&self, nk: KeyRef, name: &str) -> bool {
         self.value_cell_by_name(nk, name).is_some()
+    }
+
+    /// Compare a value by type and bytes without touching its data body when the lengths differ.
+    pub fn value_matches(&self, nk: KeyRef, name: &str, ty: u32, data: &[u8]) -> Option<bool> {
+        let vk = self.value_cell_by_name(nk, name)?;
+        let (stored_ty, stored_len) = self.value_data_type_len(vk)?;
+        if stored_ty != ty || stored_len != data.len() {
+            return Some(false);
+        }
+        let stored = self.value_data_view(vk)?;
+        Some(stored.ty() == ty && stored.as_slice() == data)
     }
 
     /// The original-case (unfolded) name of a value cell — for enumeration output.
@@ -536,10 +672,22 @@ impl<'a> RegfHive<'a> {
 
     /// Enumerate the value at `index` under `nk`: `(name, reg_type, data_bytes)` in stored order.
     pub fn value_by_index(&self, nk: KeyRef, index: usize) -> Option<(String, u32, Vec<u8>)> {
+        self.value_by_index_with(nk, index, |name, ty, data| {
+            (String::from(name), ty, data.to_vec())
+        })
+    }
+
+    /// Enumerate the value at `index` and borrow its data for the duration of `visit`.
+    pub fn value_by_index_with<R>(
+        &self,
+        nk: KeyRef,
+        index: usize,
+        visit: impl FnOnce(&str, u32, &[u8]) -> R,
+    ) -> Option<R> {
         let vk = self.value_cell_by_index(nk, index)?;
         let name = self.value_name_raw(vk)?;
-        let (ty, data) = self.value_data(vk)?;
-        Some((name, ty, data))
+        let data = self.value_data_view(vk)?;
+        Some(visit(&name, data.ty(), data.as_slice()))
     }
 
     /// Original-case value name at `index` without cloning its data body.
@@ -556,7 +704,7 @@ impl<'a> RegfHive<'a> {
         Some((name_bytes, data_bytes))
     }
 
-    fn value_data(&self, vk: u32) -> Option<(u32, Vec<u8>)> {
+    fn value_data_view<'s>(&'s self, vk: u32) -> Option<ValueDataView<'s>> {
         let b = self.cell_body(vk)?;
         let data_len_raw = u32le(b, 0x04)?;
         let data_off = u32le(b, 0x08)?;
@@ -565,26 +713,37 @@ impl<'a> RegfHive<'a> {
         let len = (data_len_raw & 0x7fff_ffff) as usize;
         if inline {
             // Data (≤4 bytes) stored directly in the data-offset field.
-            let raw = data_off.to_le_bytes();
-            Some((reg_type, raw.get(..len.min(4))?.to_vec()))
+            Some(ValueDataView::Inline {
+                ty: reg_type,
+                data: data_off.to_le_bytes(),
+                len: len.min(4),
+            })
         } else {
             let db = self.cell_body(data_off)?;
-            Some((reg_type, db.get(..len.min(db.len()))?.to_vec()))
+            Some(ValueDataView::Borrowed {
+                ty: reg_type,
+                data: db.get(..len.min(db.len()))?,
+            })
         }
     }
 
     fn value_data_len(&self, vk: u32) -> Option<usize> {
+        self.value_data_type_len(vk).map(|(_, len)| len)
+    }
+
+    fn value_data_type_len(&self, vk: u32) -> Option<(u32, usize)> {
         let b = self.cell_body(vk)?;
         let data_len_raw = u32le(b, 0x04)?;
         let data_off = u32le(b, 0x08)?;
+        let reg_type = u32le(b, 0x0c)?;
         let inline = data_len_raw & 0x8000_0000 != 0;
         let len = (data_len_raw & 0x7fff_ffff) as usize;
-        if inline {
-            Some(len.min(4))
+        let len = if inline {
+            len.min(4)
         } else {
-            let db = self.cell_body(data_off)?;
-            Some(len.min(db.len()))
-        }
+            len.min(self.cell_body_len(data_off)?)
+        };
+        Some((reg_type, len))
     }
 }
 
@@ -595,6 +754,18 @@ impl<'a> RegfHive<'a> {
 /// counted and skipped, matching the read-only parser's fail-closed cell access.
 pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, RegfHiveImportStats) {
     let mut target = Hive::new(kind);
+    let counts = count_regf_key_cells(source, source.root(), 0);
+    let imported_cells = counts.keys.saturating_add(counts.values);
+    let live_cells =
+        imported_cells.saturating_add(live_mutation_cell_headroom(kind, imported_cells));
+    let live_value_blobs = counts
+        .values
+        .saturating_add(live_mutation_value_headroom(kind, counts.values));
+
+    // Imported hives become live Configuration Manager authority immediately. Leave measured arena
+    // headroom for early boot mutations without doubling large hives.
+    let _ = target.reserve_cells(live_cells.saturating_sub(1));
+    let _ = target.reserve_value_blobs(live_value_blobs);
     let mut stats = RegfHiveImportStats {
         keys: 1,
         ..RegfHiveImportStats::default()
@@ -603,6 +774,29 @@ pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, Re
     import_regf_key_into_hive(source, source.root(), &mut target, root, &mut stats, 0);
     target.finish_clean_import();
     (target, stats)
+}
+
+fn count_regf_key_cells(
+    source: &RegfHive<'_>,
+    source_key: KeyRef,
+    depth: usize,
+) -> RegfHiveCellCounts {
+    if depth > 256 {
+        return RegfHiveCellCounts::default();
+    }
+    let mut counts = RegfHiveCellCounts {
+        keys: 1,
+        values: source.value_count(source_key),
+    };
+    for index in 0.. {
+        let Some(source_child) = source.subkey_ref_by_index(source_key, index) else {
+            break;
+        };
+        let child = count_regf_key_cells(source, source_child, depth + 1);
+        counts.keys = counts.keys.saturating_add(child.keys);
+        counts.values = counts.values.saturating_add(child.values);
+    }
+    counts
 }
 
 fn import_regf_key_into_hive(
@@ -1112,6 +1306,24 @@ mod tests {
         assert_eq!(hive.value_count(npfs), 4);
         assert!(hive.value_exists(npfs, "ImagePath"));
         assert!(!hive.value_exists(npfs, "Missing"));
+        assert_eq!(
+            hive.value_matches(
+                npfs,
+                "ImagePath",
+                RegistryValueType::ExpandSz as u32,
+                utf16le_sz(r"system32\drivers\npfs.sys").as_slice(),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            hive.value_matches(
+                npfs,
+                "ImagePath",
+                RegistryValueType::ExpandSz as u32,
+                b"small"
+            ),
+            Some(false)
+        );
         let (name, ty, data) = hive.value_by_index(npfs, 0).unwrap();
         assert_eq!(name, "ImagePath");
         assert_eq!(ty, RegistryValueType::ExpandSz as u32);
@@ -1154,6 +1366,7 @@ mod tests {
     fn imports_regf_into_mutable_hive_authority() {
         let data = services_test_hive();
         let source = RegfHive::new(&data).expect("valid test hive");
+        let counts = count_regf_key_cells(&source, source.root(), 0);
         let (mut hive, stats) = import_regf_into_hive(&source, HiveKind::System);
 
         assert_eq!(
@@ -1164,6 +1377,8 @@ mod tests {
                 skipped_values: 0,
             }
         );
+        assert_eq!(counts.keys, stats.keys);
+        assert_eq!(counts.values, stats.values);
         assert_eq!(hive.dirty_count(), 0);
         assert_eq!(hive.sequence, 0);
         assert_eq!(hive.generation, 0);
@@ -1283,6 +1498,52 @@ mod tests {
                 "SubSystems should have values (Required/Windows/…)"
             );
         }
+    }
+
+    #[test]
+    fn reactos_system_hive_import_preserves_known_dll_directory() {
+        let bytes =
+            match std::fs::read("../../rust-micro/.tmp/reactos/reactos/system32/config/system")
+                .or_else(|_| std::fs::read("/tmp/ros-system.hiv"))
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    eprintln!("skip: staged ReactOS SYSTEM hive not present");
+                    return;
+                }
+            };
+        let source = RegfHive::new(&bytes).expect("valid regf hive");
+        let (hive, stats) = import_regf_into_hive(&source, HiveKind::System);
+        assert!(
+            stats.values > 0,
+            "expected imported values from the ReactOS SYSTEM hive"
+        );
+
+        let known_dlls = hive
+            .open_key(r"ControlSet001\Control\Session Manager\KnownDlls")
+            .expect("SMSS KnownDlls key must survive mutable-hive import");
+        let (ty, data) = hive
+            .query_value(known_dlls, "DllDirectory")
+            .expect("SMSS KnownDlls\\DllDirectory value must survive mutable-hive import");
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"%SystemRoot%\system32").as_slice());
+        assert!(
+            hive.value_count(known_dlls) > 1,
+            "KnownDlls should carry DLL entries as well as DllDirectory"
+        );
+
+        let mut hives = nt_hive_core::MutableHiveSet::new();
+        hives.mount(r"\Registry\Machine\System", 0, hive);
+        let known_dlls = hives
+            .resolve_key(
+                r"\registry\machine\system\currentcontrolset\control\session manager\KnownDlls",
+            )
+            .expect("SMSS KnownDlls key must resolve through mutable hive mount");
+        let (ty, data) = hives
+            .query_value(known_dlls, "DllDirectory")
+            .expect("SMSS KnownDlls\\DllDirectory value must resolve through mutable hive mount");
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"%SystemRoot%\system32").as_slice());
     }
 
     #[test]

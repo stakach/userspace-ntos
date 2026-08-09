@@ -237,9 +237,7 @@ unsafe fn allocate_private_vad_avoiding_fixed_authorities(
     Err(nt_address_space::STATUS_NO_MEMORY)
 }
 
-fn committed_mapping_effective_page_protection(
-    info: nt_address_space::VmBasicInformation,
-) -> u32 {
+fn committed_mapping_effective_page_protection(info: nt_address_space::VmBasicInformation) -> u32 {
     if info.type_ == nt_address_space::MEM_MAPPED {
         nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection
     } else if info.type_ == nt_address_space::MEM_IMAGE {
@@ -279,6 +277,46 @@ fn append_utf16le(out: &mut alloc::vec::Vec<u8>, s: &str) {
     for w in s.encode_utf16() {
         out.extend_from_slice(&w.to_le_bytes());
     }
+}
+
+#[derive(Clone, Copy)]
+struct KeyValueInfoLayout {
+    total_len: usize,
+    name_len: usize,
+    data_offset: usize,
+    data_len: usize,
+}
+
+fn key_value_info_layout(class: u64, name: &str, data_len: usize) -> Option<KeyValueInfoLayout> {
+    let name_len = utf16le_byte_len(name);
+    match class {
+        0 => Some(KeyValueInfoLayout {
+            total_len: 0x0cusize.checked_add(name_len)?,
+            name_len,
+            data_offset: 0,
+            data_len: 0,
+        }),
+        2 => Some(KeyValueInfoLayout {
+            total_len: 0x0cusize.checked_add(data_len)?,
+            name_len: 0,
+            data_offset: 0x0c,
+            data_len,
+        }),
+        _ => {
+            let name_end = 0x14usize.checked_add(name_len)?;
+            let data_offset = name_end.checked_add(7)? & !7usize;
+            Some(KeyValueInfoLayout {
+                total_len: data_offset.checked_add(data_len)?,
+                name_len,
+                data_offset,
+                data_len,
+            })
+        }
+    }
+}
+
+fn put_u32_le(out: &mut [u8], offset: usize, value: u32) {
+    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 fn registry_query_leaf_name(path: &str) -> &str {
@@ -730,6 +768,10 @@ fn is_system_setup_key_canon(path: &str) -> bool {
     path.eq_ignore_ascii_case(r"\registry\machine\system\setup")
 }
 
+fn is_dynamic_hive_selector(sel: u32) -> bool {
+    HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel)
+}
+
 fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
     let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
     let affinity = if processors >= 64 {
@@ -887,13 +929,8 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ObjEntry::push_dir(&mut v, b"bnolinks", sessions).expect("initial BnoLinks directory");
     let session0 = v.len();
     ObjEntry::push_dir(&mut v, b"0", sessions).expect("initial Session 0 directory");
-    ObjEntry::push_symlink(
-        &mut v,
-        b"basenamedobjects",
-        session0,
-        b"\\basenamedobjects",
-    )
-    .expect("initial BaseNamedObjects link");
+    ObjEntry::push_symlink(&mut v, b"basenamedobjects", session0, b"\\basenamedobjects")
+        .expect("initial BaseNamedObjects link");
     ObjEntry::push_symlink(&mut v, b"global", bno, b"\\basenamedobjects")
         .expect("initial Global link");
     ObjEntry::push_symlink(&mut v, b"local", bno, b"\\basenamedobjects")
@@ -1020,16 +1057,36 @@ impl ExecNtHandler {
         };
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
         if let Some(ref regf) = hive {
-            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SYSTEM, hive_mount(HIVE_SEL_SYSTEM), regf);
+            mount_mutable_regf_hive(
+                &mut mutable_hives,
+                HIVE_SEL_SYSTEM,
+                hive_mount(HIVE_SEL_SYSTEM),
+                regf,
+            );
         }
         if let Some(ref regf) = software_hive {
-            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SOFTWARE, hive_mount(HIVE_SEL_SOFTWARE), regf);
+            mount_mutable_regf_hive(
+                &mut mutable_hives,
+                HIVE_SEL_SOFTWARE,
+                hive_mount(HIVE_SEL_SOFTWARE),
+                regf,
+            );
         }
         if let Some(ref regf) = security_hive {
-            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SECURITY, hive_mount(HIVE_SEL_SECURITY), regf);
+            mount_mutable_regf_hive(
+                &mut mutable_hives,
+                HIVE_SEL_SECURITY,
+                hive_mount(HIVE_SEL_SECURITY),
+                regf,
+            );
         }
         if let Some(ref regf) = sam_hive {
-            mount_mutable_regf_hive(&mut mutable_hives, HIVE_SEL_SAM, hive_mount(HIVE_SEL_SAM), regf);
+            mount_mutable_regf_hive(
+                &mut mutable_hives,
+                HIVE_SEL_SAM,
+                hive_mount(HIVE_SEL_SAM),
+                regf,
+            );
         }
         // ★ THE `\Registry\User` MOUNT TABLE. `\Registry\User\.Default` is the genuine
         // `config\default` (`$$$PROTO.HIV`) the storage host read BY PATH into DEFHIVEBUF, mounted
@@ -1127,6 +1184,10 @@ impl ExecNtHandler {
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hives_dirty, false);
+        write_field!(
+            registry_value_copy_provenance,
+            RegistryValueCopyProvenanceTable::with_capacity(64)
+        );
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
@@ -1248,6 +1309,7 @@ impl ExecNtHandler {
         handler.provision_kernel_srm_objects();
         handler.provision_volatile_hardware_registry();
         unsafe { handler.provision_default_user_locale() };
+        handler.provision_default_user_shell_folders();
         handler.provision_normal_system_setup_state();
         handler.provision_reactos_explorer_shell_com_classes();
         handler
@@ -1390,7 +1452,9 @@ impl ExecNtHandler {
         const REG_DWORD: u32 = 4;
         const SETUP_KEY: &str = r"\Registry\Machine\System\Setup";
         if self.resolve_key(SETUP_KEY).is_none() {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup absent -> normal-boot state not provisioned\n");
+            print_str(
+                b"[setup-state] HKLM\\SYSTEM\\Setup absent -> normal-boot state not provisioned\n",
+            );
             return;
         }
         let mut all_set = self.set_mutable_registry_value_by_path(
@@ -1444,6 +1508,29 @@ impl ExecNtHandler {
             print_hex(mask as u32);
             print_str(b" in mutable hive\n");
         }
+    }
+
+    /// Seed the default-user profile shell-folder registry state ReactOS setup normally writes.
+    ///
+    /// The LiveCD profile tree exists on disk, but its `.Default` hive can be missing the
+    /// `Explorer\Shell Folders` keys that `userenv!CreateUserHive` copies and then updates for the
+    /// real user. Materialize the setup table into the mounted `.Default` hive so the later
+    /// `RegCopyTreeW`/`UpdateUsersShellFolderSettings` path runs through ordinary registry syscalls.
+    fn provision_default_user_shell_folders(&mut self) {
+        let stats = nt_hive_core::seed_reactos_default_user_shell_folders_in_mutable_hives(
+            &mut self.mutable_hives,
+            r"C:\Profiles\Default User",
+        );
+        if stats.total_values() == 0 {
+            print_str(b"[profile-setup] default-user shell folders not provisioned\n");
+            return;
+        }
+        self.mutable_hives_dirty = true;
+        print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
+        print_u64(stats.shell_folder_values as u64);
+        print_str(b" User Shell Folders=");
+        print_u64(stats.user_shell_folder_values as u64);
+        print_str(b"\n");
     }
 
     /// ═══ THE SECOND SETUP STEP THE LIVECD SKIPS — the default user's LOCALE ═══════════════════
@@ -1509,7 +1596,9 @@ impl ExecNtHandler {
             REG_SZ,
             &language_id,
         ) {
-            print_str(b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n");
+            print_str(
+                b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
+            );
             return;
         }
         self.mutable_hives_dirty = true;
@@ -1575,10 +1664,7 @@ impl ExecNtHandler {
         0
     }
 
-    fn install_mutable_registry_key_target(
-        &mut self,
-        key: ResolvedHiveKey,
-    ) -> Result<KeyRef, u32> {
+    fn install_mutable_registry_key_target(&mut self, key: ResolvedHiveKey) -> Result<KeyRef, u32> {
         if let Some(index) = self
             .mutable_key_handles
             .iter()
@@ -1586,7 +1672,11 @@ impl ExecNtHandler {
         {
             return Ok(MUTABLE_KEY_TAG | index as u32);
         }
-        if let Some(index) = self.mutable_key_handles.iter().position(|entry| entry.is_none()) {
+        if let Some(index) = self
+            .mutable_key_handles
+            .iter()
+            .position(|entry| entry.is_none())
+        {
             self.mutable_key_handles[index] = Some(key);
             return Ok(MUTABLE_KEY_TAG | index as u32);
         }
@@ -1650,6 +1740,11 @@ impl ExecNtHandler {
             return None;
         }
         let sel = hive_sel(target);
+        let hive = self.borrowed_regf_hive_for_selector(sel)?;
+        Some((hive, hive_cell(target)))
+    }
+
+    fn borrowed_regf_hive_for_selector(&self, sel: u32) -> Option<&RegfHive<'static>> {
         let hive = match sel {
             HIVE_SEL_SOFTWARE => self.software_hive.as_ref()?,
             HIVE_SEL_SECURITY => self.security_hive.as_ref()?,
@@ -1662,7 +1757,7 @@ impl ExecNtHandler {
                 .hive
                 .as_ref()?,
         };
-        Some((hive, hive_cell(target)))
+        Some(hive)
     }
 
     /// The NT mount path a hive selector's keys hang off. The four boot mounts are compile-time
@@ -2158,8 +2253,18 @@ impl ExecNtHandler {
                 NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
                 return STATUS_NOT_IMPLEMENTED;
             }
-            owned_image = nt_hive_core::encode_image(hive);
-            owned_image.as_slice()
+            if is_dynamic_hive_selector(mutable_key.hive) {
+                owned_image = nt_hive_core::encode_image(hive);
+                owned_image.as_slice()
+            } else {
+                // Boot hives still have borrowed `regf` backing until D3 gives them a real
+                // checkpoint provider. Do not imply reboot persistence by serializing those large
+                // imported mirrors here.
+                let Some(hive) = self.borrowed_regf_hive_for_selector(mutable_key.hive) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                hive.bytes()
+            }
         } else {
             let (hive, cell) = match self.base_hive(key) {
                 Some(hive) => hive,
@@ -2180,8 +2285,7 @@ impl ExecNtHandler {
         if status != nt_fs::STATUS_SUCCESS {
             return status;
         }
-        let (write_status, written) =
-            unsafe { crate::writable_fs::write(file_id, Some(0), image) };
+        let (write_status, written) = unsafe { crate::writable_fs::write(file_id, Some(0), image) };
         if write_status != nt_fs::STATUS_SUCCESS {
             return write_status;
         }
@@ -2204,9 +2308,11 @@ impl ExecNtHandler {
         status
     }
 
-    /// `NtLoadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a `regf`
-    /// hive FILE at a key in the registry namespace. Base `NtLoadKey` passes `flags = 0` and a null
-    /// trust-class key; `NtLoadKey2` / `NtLoadKeyEx` feed their additional arguments here.
+    /// `NtLoadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a hive file at
+    /// a key in the registry namespace. Ordinary ReactOS/Windows `regf` images are imported into
+    /// the mutable hive authority; D3 dynamic checkpoints saved by this kernel are accepted as
+    /// mutable-only `nt-hive-core` images. Base `NtLoadKey` passes `flags = 0` and a null trust-class
+    /// key; `NtLoadKey2` / `NtLoadKeyEx` feed their additional arguments here.
     ///
     /// # Safety
     /// Reads two caller OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader.
@@ -2341,7 +2447,8 @@ impl ExecNtHandler {
         if let Some(ref hive) = regf_hive {
             mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, hive);
         } else if let Some(hive) = core_hive {
-            self.mutable_hives.mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
+            self.mutable_hives
+                .mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
         }
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
@@ -2714,7 +2821,10 @@ impl ExecNtHandler {
             return Err(0xC000_0008);
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            if self.mutable_hives.set_key_security_descriptor(key, descriptor) {
+            if self
+                .mutable_hives
+                .set_key_security_descriptor(key, descriptor)
+            {
                 self.mutable_hives_dirty = true;
                 return Ok(());
             }
@@ -2738,11 +2848,7 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    fn registry_subkey_class(
-        &self,
-        target: KeyRef,
-        name: &str,
-    ) -> Option<alloc::string::String> {
+    fn registry_subkey_class(&self, target: KeyRef, name: &str) -> Option<alloc::string::String> {
         let mut full_path = self.registry_target_path(target)?;
         if !full_path.is_empty() && !full_path.ends_with('\\') {
             full_path.push('\\');
@@ -2772,7 +2878,7 @@ impl ExecNtHandler {
             }
         } else if key.hive == HIVE_SEL_USER_DEFAULT {
             USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-        } else if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == key.hive) {
+        } else if is_dynamic_hive_selector(key.hive) {
             USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2799,7 +2905,7 @@ impl ExecNtHandler {
             }
         } else if sel == HIVE_SEL_USER_DEFAULT {
             USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-        } else if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel) {
+        } else if is_dynamic_hive_selector(sel) {
             USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2866,18 +2972,170 @@ impl ExecNtHandler {
             .set_value(key, name, value_type, data.to_vec())
     }
 
-    fn mutable_registry_value(
+    fn registry_value_with<R>(
         &self,
         target: KeyRef,
         name: &str,
-    ) -> Option<(u32, alloc::vec::Vec<u8>)> {
-        let key = self.mutable_registry_key(target)?;
-        let (ty, data) = self.mutable_hives.query_value(key, name)?;
-        Some((ty as u32, data.to_vec()))
+        mut visit: impl FnMut(u32, &[u8]) -> R,
+    ) -> Option<R> {
+        if let Some(index) = self.registry_overlay_index(target) {
+            if self.overlay.value_is_deleted(index, name) {
+                return None;
+            }
+            if let Some((ty, data)) = self.overlay.value(index, name) {
+                return Some(visit(ty, data));
+            }
+            let path = self.overlay.path(index)?;
+            if let Some(key) = self.mutable_registry_key_by_path(path) {
+                let (ty, data) = self.mutable_hives.query_value(key, name)?;
+                return Some(visit(ty as u32, data));
+            }
+            if self.mutable_hive_owns_path(path) {
+                return None;
+            }
+            let key = self.resolve_key(path)?;
+            let (hive, cell) = self.base_hive(key)?;
+            return hive.value_with(cell, name, visit);
+        }
+        if let Some(key) = self.mutable_registry_key(target) {
+            let (ty, data) = self.mutable_hives.query_value(key, name)?;
+            return Some(visit(ty as u32, data));
+        }
+        if let Some(path) = self.registry_target_path(target) {
+            if self.mutable_hive_owns_path(&path) {
+                return None;
+            }
+        }
+        let (hive, cell) = self.base_hive(target)?;
+        hive.value_with(cell, name, visit)
     }
 
     fn mutable_hive_owns_path(&self, path: &str) -> bool {
         self.mutable_hives.owns_path(path)
+    }
+
+    fn registry_value_matches(
+        &self,
+        target: KeyRef,
+        name: &str,
+        value_type: u32,
+        data: &[u8],
+    ) -> Option<bool> {
+        if let Some(index) = self.registry_overlay_index(target) {
+            if self.overlay.value_is_deleted(index, name) {
+                return None;
+            }
+            if let Some((ty, existing)) = self.overlay.value(index, name) {
+                return Some(ty == value_type && existing == data);
+            }
+            let path = self.overlay.path(index)?;
+            if let Some(key) = self.mutable_registry_key_by_path(path) {
+                let (ty, existing) = self.mutable_hives.query_value(key, name)?;
+                return Some(ty as u32 == value_type && existing == data);
+            }
+            if self.mutable_hive_owns_path(path) {
+                return None;
+            }
+            let key = self.resolve_key(path)?;
+            let (hive, cell) = self.base_hive(key)?;
+            return hive.value_matches(cell, name, value_type, data);
+        }
+        if let Some(key) = self.mutable_registry_key(target) {
+            let (ty, existing) = self.mutable_hives.query_value(key, name)?;
+            return Some(ty as u32 == value_type && existing == data);
+        }
+        if let Some(path) = self.registry_target_path(target) {
+            if self.mutable_hive_owns_path(&path) {
+                return None;
+            }
+        }
+        let (hive, cell) = self.base_hive(target)?;
+        hive.value_matches(cell, name, value_type, data)
+    }
+
+    unsafe fn user_data_readable(
+        &self,
+        data_ptr: u64,
+        data_size: usize,
+        scratch_cap: usize,
+    ) -> bool {
+        if data_size == 0 {
+            return true;
+        }
+        if data_ptr == 0 {
+            return false;
+        }
+        let scratch = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+            scratch_cap,
+        );
+        let mut offset = 0usize;
+        while offset < data_size {
+            let chunk = (data_size - offset).min(scratch_cap);
+            if !self.xas_read(data_ptr + offset as u64, &mut scratch[..chunk]) {
+                return false;
+            }
+            offset += chunk;
+        }
+        true
+    }
+
+    unsafe fn user_data_equals(&self, data_ptr: u64, expected: &[u8], scratch_cap: usize) -> bool {
+        if expected.is_empty() {
+            return true;
+        }
+        if data_ptr == 0 {
+            return false;
+        }
+        let scratch = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+            scratch_cap,
+        );
+        let mut offset = 0usize;
+        while offset < expected.len() {
+            let chunk = (expected.len() - offset).min(scratch_cap);
+            if !self.xas_read(data_ptr + offset as u64, &mut scratch[..chunk]) {
+                return false;
+            }
+            if scratch[..chunk] != expected[offset..offset + chunk] {
+                return false;
+            }
+            offset += chunk;
+        }
+        true
+    }
+
+    unsafe fn append_user_data_to_prepared_value(
+        &mut self,
+        value: nt_hive_core::ResolvedHiveValue,
+        data_ptr: u64,
+        data_size: usize,
+        staged: Option<&[u8]>,
+        scratch_cap: usize,
+    ) -> bool {
+        if let Some(staged) = staged {
+            return staged.len() == data_size
+                && self.mutable_hives.append_prepared_value_data(value, staged);
+        }
+        let scratch = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+            scratch_cap,
+        );
+        let mut offset = 0usize;
+        while offset < data_size {
+            let chunk = (data_size - offset).min(scratch_cap);
+            if !self.xas_read(data_ptr + offset as u64, &mut scratch[..chunk]) {
+                return false;
+            }
+            if !self
+                .mutable_hives
+                .append_prepared_value_data(value, &scratch[..chunk])
+            {
+                return false;
+            }
+            offset += chunk;
+        }
+        true
     }
 
     fn registry_path_exists(&self, canon: &str) -> bool {
@@ -2893,50 +3151,20 @@ impl ExecNtHandler {
     }
 
     fn registry_value(&self, target: KeyRef, name: &str) -> Option<(u32, alloc::vec::Vec<u8>)> {
-        if let Some(index) = self.registry_overlay_index(target) {
-            if self.overlay.value_is_deleted(index, name) {
-                return None;
-            }
-            if let Some((ty, data)) = self.overlay.value(index, name) {
-                return Some((ty, data.to_vec()));
-            }
-            let path = self.overlay.path(index)?;
-            if let Some(value) = self.mutable_registry_value_by_path(path, name) {
-                return Some(value);
-            }
-            if self.mutable_hive_owns_path(path) {
-                return None;
-            }
-            let key = self.resolve_key(path)?;
-            let (hive, cell) = self.base_hive(key)?;
-            return hive.value(cell, name);
-        }
-        if let Some(value) = self.mutable_registry_value(target, name) {
-            return Some(value);
-        }
-        if let Some(path) = self.registry_target_path(target) {
-            if self.mutable_hive_owns_path(&path) {
-                return None;
-            }
-        }
-        let (hive, cell) = self.base_hive(target)?;
-        hive.value(cell, name)
+        self.registry_value_with(target, name, |ty, data| (ty, data.to_vec()))
     }
 
-    fn registry_value_by_index(
+    fn registry_value_by_index_with<R>(
         &self,
         target: KeyRef,
         requested_index: usize,
-    ) -> Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> {
+        mut visit: impl FnMut(&str, u32, &[u8], Option<ResolvedHiveValue>) -> R,
+    ) -> Option<R> {
         let overlay_index = self.registry_overlay_index(target);
         let base_path = if let Some(index) = overlay_index {
-            self.overlay
-                .path(index)
-                .map(alloc::string::String::from)
-        } else if !is_virtual_registry_key(target) {
-            self.registry_target_path(target)
+            self.overlay.path(index).map(alloc::string::String::from)
         } else {
-            None
+            self.registry_target_path(target)
         };
         let mutable_base = base_path
             .as_deref()
@@ -2962,8 +3190,11 @@ impl ExecNtHandler {
         let mut visible_index = 0usize;
         if let Some(key) = mutable_base {
             if let Some(hive) = self.mutable_hives.hive(key.hive) {
-                for index in 0..hive.value_count(key.key) {
-                    let Some((name, ty, data)) = hive.value_by_index(key.key, index) else {
+                let value_count = hive.value_count(key.key);
+                for index in 0..value_count {
+                    let Some((source, name, ty, data)) =
+                        self.mutable_hives.value_ref_by_index(key, index)
+                    else {
                         continue;
                     };
                     if let Some(overlay) = overlay_index {
@@ -2974,53 +3205,48 @@ impl ExecNtHandler {
                             if let Some((overlay_ty, overlay_data)) =
                                 self.overlay.value(overlay, name)
                             {
-                                return Some((
-                                    alloc::string::String::from(name),
-                                    overlay_ty,
-                                    overlay_data.to_vec(),
-                                ));
+                                return Some(visit(name, overlay_ty, overlay_data, None));
                             }
-                            return Some((
-                                alloc::string::String::from(name),
-                                ty as u32,
-                                data.to_vec(),
-                            ));
+                            return Some(visit(name, ty as u32, data, Some(source)));
                         }
                         visible_index += 1;
                         continue;
                     }
                     if visible_index == requested_index {
-                        return Some((
-                            alloc::string::String::from(name),
-                            ty as u32,
-                            data.to_vec(),
-                        ));
+                        return Some(visit(name, ty as u32, data, Some(source)));
                     }
                     visible_index += 1;
                 }
             }
         } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             for index in 0..hive.value_count(base) {
-                let Some((name, ty, data)) = hive.value_by_index(base, index) else {
-                    continue;
-                };
-                if let Some(overlay) = overlay_index {
-                    if self.overlay.value_is_deleted(overlay, &name) {
-                        continue;
+                let Some(hit) = hive.value_by_index_with(base, index, |name, ty, data| {
+                    if let Some(overlay) = overlay_index {
+                        if self.overlay.value_is_deleted(overlay, name) {
+                            return None;
+                        }
+                        if visible_index == requested_index {
+                            if let Some((overlay_ty, overlay_data)) =
+                                self.overlay.value(overlay, name)
+                            {
+                                return Some(visit(name, overlay_ty, overlay_data, None));
+                            }
+                            return Some(visit(name, ty, data, None));
+                        }
+                        visible_index += 1;
+                        return None;
                     }
                     if visible_index == requested_index {
-                        if let Some((overlay_ty, overlay_data)) = self.overlay.value(overlay, &name) {
-                            return Some((name, overlay_ty, overlay_data.to_vec()));
-                        }
-                        return Some((name, ty, data));
+                        return Some(visit(name, ty, data, None));
                     }
                     visible_index += 1;
+                    None
+                }) else {
                     continue;
+                };
+                if let Some(result) = hit {
+                    return Some(result);
                 }
-                if visible_index == requested_index {
-                    return Some((name, ty, data));
-                }
-                visible_index += 1;
             }
         }
         if let Some(overlay) = overlay_index {
@@ -3041,7 +3267,7 @@ impl ExecNtHandler {
                     continue;
                 }
                 if visible_index == requested_index {
-                    return Some((alloc::string::String::from(name), ty, data.to_vec()));
+                    return Some(visit(name, ty, data, None));
                 }
                 visible_index += 1;
             }
@@ -3121,7 +3347,10 @@ impl ExecNtHandler {
                         continue;
                     }
                     if let Some((_, overlay_data)) = self.overlay.value(overlay, &name) {
-                        stats.add_value(name.encode_utf16().count().saturating_mul(2), overlay_data.len());
+                        stats.add_value(
+                            name.encode_utf16().count().saturating_mul(2),
+                            overlay_data.len(),
+                        );
                         continue;
                     }
                 }
@@ -3561,7 +3790,11 @@ impl ExecNtHandler {
             return false;
         }
         let mechanism = spawn.mechanism();
-        if mechanism.is_live() && self.thread_runtime.set_mechanism_caps(tid, mechanism).is_none()
+        if mechanism.is_live()
+            && self
+                .thread_runtime
+                .set_mechanism_caps(tid, mechanism)
+                .is_none()
         {
             let _ = self.release_hosted_thread_runtime(tid);
             unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
@@ -3603,14 +3836,18 @@ impl ExecNtHandler {
         let Some(apc) = self.pm.peek_user_apc(current_tid) else {
             return Ok(false);
         };
-        let dispatcher_rva = crate::img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA.load(Ordering::Relaxed);
+        let dispatcher_rva =
+            crate::img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA.load(Ordering::Relaxed);
         if dispatcher_rva == 0 {
             return Err(STATUS_UNSUCCESSFUL);
         }
         let Some(dispatcher) = NTDLL_BASE.checked_add(dispatcher_rva) else {
             return Err(STATUS_UNSUCCESSFUL);
         };
-        let Some(tcb) = self.hosted_thread_tcb(self.current_tid).filter(|tcb| *tcb > 1) else {
+        let Some(tcb) = self
+            .hosted_thread_tcb(self.current_tid)
+            .filter(|tcb| *tcb > 1)
+        else {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         };
         let Some(frame_base) = self
@@ -3647,8 +3884,7 @@ impl ExecNtHandler {
         saved[nt_user_callback::USER_CONTEXT_RAX] = 0;
         saved[nt_user_callback::USER_CONTEXT_RCX] = dispatcher;
         saved[nt_user_callback::USER_CONTEXT_R10] = 0;
-        saved[nt_user_callback::USER_CONTEXT_R11] =
-            saved[nt_user_callback::USER_CONTEXT_RFLAGS];
+        saved[nt_user_callback::USER_CONTEXT_R11] = saved[nt_user_callback::USER_CONTEXT_RFLAGS];
         let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &saved, false);
         if write_error != 0 {
             return Err(STATUS_UNSUCCESSFUL);
@@ -4324,7 +4560,9 @@ impl ExecNtHandler {
             access |= READ_CONTROL | DIRECTORY_QUERY_ACCESS | DIRECTORY_TRAVERSE_ACCESS;
         }
         if access & 0x4000_0000 != 0 {
-            access |= READ_CONTROL | DIRECTORY_CREATE_OBJECT_ACCESS | DIRECTORY_CREATE_SUBDIRECTORY_ACCESS;
+            access |= READ_CONTROL
+                | DIRECTORY_CREATE_OBJECT_ACCESS
+                | DIRECTORY_CREATE_SUBDIRECTORY_ACCESS;
         }
         if access & 0x2000_0000 != 0 {
             access |= READ_CONTROL | DIRECTORY_TRAVERSE_ACCESS;
@@ -4605,6 +4843,52 @@ impl ExecNtHandler {
             }
             _ => Ok(None),
         }
+    }
+
+    unsafe fn readonly_disk_read_to_user(
+        &self,
+        first_cluster: u32,
+        file_size: u32,
+        offset: u32,
+        buffer: u64,
+        len: usize,
+    ) -> Result<usize, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+        const STATUS_IO_DEVICE_ERROR: u32 = 0xC000_0185;
+        const READ_SCRATCH_CAP: usize = 64 * 1024;
+
+        let Some(fs) = exec_fs() else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        let total = len.min(file_size.saturating_sub(offset) as usize);
+        let scratch = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+            READ_SCRATCH_CAP,
+        );
+        let mut copied = 0usize;
+        while copied < total {
+            let chunk = (total - copied).min(scratch.len());
+            let file_offset = offset + copied as u32;
+            let read = fat_read_file_range(
+                &fs,
+                first_cluster,
+                file_size,
+                file_offset,
+                &mut scratch[..chunk],
+            );
+            if read != chunk {
+                return Err(STATUS_IO_DEVICE_ERROR);
+            }
+            let Some(dst) = buffer.checked_add(copied as u64) else {
+                return Err(STATUS_ACCESS_VIOLATION);
+            };
+            if read != 0 && !self.xas_try_write_buf(dst, &scratch[..read]) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            copied += read;
+        }
+        Ok(copied)
     }
 
     /// Mint a process-local handle for a file or directory on the WRITABLE overlay volume.
@@ -6040,7 +6324,11 @@ impl ExecNtHandler {
         Some((slot, tid, h as u64))
     }
 
-    unsafe fn create_generic_local_tp_worker_thread(&mut self, args: &[u64]) -> Option<u32> {
+    unsafe fn create_generic_local_tp_worker_thread(
+        &mut self,
+        args: &[u64],
+        ntdll_pool_worker_only: bool,
+    ) -> Option<u32> {
         if args.len() <= 3 || args[3] != u64::MAX || self.pi >= MAX_PI {
             return None;
         }
@@ -6072,6 +6360,9 @@ impl ExecNtHandler {
         } else {
             None
         };
+        if ntdll_pool_worker_only && preferred_slot.is_none() {
+            return None;
+        }
         let tp_slot = if let Some(slot) = preferred_slot {
             Self::tp_worker_slot_bit(slot)
                 .filter(|bit| self.hosted_tp_worker_window_mask(self.pi) & *bit == 0)
@@ -7267,6 +7558,18 @@ impl ExecNtHandler {
             _ => None,
         }
     }
+
+    fn is_process_security_handle(&self, caller: nt_process::ProcessId, handle: u64) -> bool {
+        if handle == u64::MAX {
+            return true;
+        }
+        handle <= u32::MAX as u64
+            && matches!(
+                self.pm.lookup_handle(caller, handle as nt_process::Handle),
+                Some(nt_process::HandleObject::Process(_))
+            )
+    }
+
     fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
         self.process_mechanisms
             .pi_for_pid(pid)
@@ -7907,11 +8210,7 @@ impl ExecNtHandler {
                     .map_or_else(|status| status, |_| 0)
             }
             OBJECT_SESSION_INFORMATION => {
-                match self.object_namespace_index_for_handle(
-                    handle,
-                    Some(OBJ_KIND_DIRECTORY),
-                    0,
-                ) {
+                match self.object_namespace_index_for_handle(handle, Some(OBJ_KIND_DIRECTORY), 0) {
                     Ok(_) => 0,
                     Err(_) => STATUS_INVALID_HANDLE,
                 }
@@ -8317,8 +8616,7 @@ impl ExecNtHandler {
         while page < plan.base + plan.size {
             let old_protection = before.protection_at(page);
             let new_protection = after.protection_at(page);
-            if let (Some(old_protection), Some(new_protection)) = (old_protection, new_protection)
-            {
+            if let (Some(old_protection), Some(new_protection)) = (old_protection, new_protection) {
                 if old_protection != new_protection {
                     if let Err(status) = vm_reprotect_private_page(
                         target_pi,
@@ -8356,13 +8654,11 @@ impl ExecNtHandler {
             return map_status;
         }
         core::ptr::write(vm_map, *after);
-        let registry_slot = self
-            .loop_ctx
-            .and_then(|ctx| {
-                (&*ctx.reg)
-                    .dll_for_page(target_pi, plan.base)
-                    .map(|(slot, _)| slot)
-            });
+        let registry_slot = self.loop_ctx.and_then(|ctx| {
+            (&*ctx.reg)
+                .dll_for_page(target_pi, plan.base)
+                .map(|(slot, _)| slot)
+        });
         loader_trace_record(
             self.pi,
             LoaderOp::ProtectVirtualMemory,
@@ -8486,12 +8782,12 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
 
-        let (target_pid, target_pi) =
-            match self.resolve_process_for_access(process_handle, nt_process::PROCESS_QUERY_INFORMATION)
-            {
-                Ok(target) => target,
-                Err(status) => return status,
-            };
+        let (target_pid, target_pi) = match self
+            .resolve_process_for_access(process_handle, nt_process::PROCESS_QUERY_INFORMATION)
+        {
+            Ok(target) => target,
+            Err(status) => return status,
+        };
         if self.pm.process(target_pid).is_some_and(|process| {
             matches!(
                 process.state,
@@ -10165,6 +10461,459 @@ impl ExecNtHandler {
         let _ = self.xas_try_write_buf(va, src);
     }
 
+    unsafe fn write_current_user_buf(&self, va: u64, src: &[u8], use_xas_write: bool) -> bool {
+        if src.is_empty() {
+            return true;
+        }
+        if use_xas_write {
+            self.xas_try_write_buf(va, src)
+        } else {
+            smss_copyout(va, src)
+        }
+    }
+
+    unsafe fn write_current_user_buf_at(
+        &self,
+        base: u64,
+        offset: usize,
+        src: &[u8],
+        use_xas_write: bool,
+    ) -> bool {
+        let Some(dst) = base.checked_add(offset as u64) else {
+            return false;
+        };
+        self.write_current_user_buf(dst, src, use_xas_write)
+    }
+
+    unsafe fn write_current_user_buf_chunked_at(
+        &self,
+        base: u64,
+        offset: usize,
+        src: &[u8],
+        use_xas_write: bool,
+    ) -> bool {
+        const CHUNK: usize = 64 * 1024;
+        let mut done = 0usize;
+        while done < src.len() {
+            let n = (src.len() - done).min(CHUNK);
+            let Some(dst_offset) = offset.checked_add(done) else {
+                return false;
+            };
+            if !self.write_current_user_buf_at(
+                base,
+                dst_offset,
+                &src[done..done + n],
+                use_xas_write,
+            ) {
+                return false;
+            }
+            done += n;
+        }
+        true
+    }
+
+    unsafe fn write_current_user_buf_bounded_at(
+        &self,
+        base: u64,
+        offset: usize,
+        src: &[u8],
+        bound: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        if offset >= bound {
+            return true;
+        }
+        let n = src.len().min(bound - offset);
+        self.write_current_user_buf_at(base, offset, &src[..n], use_xas_write)
+    }
+
+    unsafe fn write_current_user_buf_chunked_bounded_at(
+        &self,
+        base: u64,
+        offset: usize,
+        src: &[u8],
+        bound: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        if offset >= bound {
+            return true;
+        }
+        let n = src.len().min(bound - offset);
+        self.write_current_user_buf_chunked_at(base, offset, &src[..n], use_xas_write)
+    }
+
+    unsafe fn write_current_user_zeroes_at(
+        &self,
+        base: u64,
+        offset: usize,
+        len: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        let zeroes = [0u8; 64];
+        let mut done = 0usize;
+        while done < len {
+            let n = (len - done).min(zeroes.len());
+            let Some(dst_offset) = offset.checked_add(done) else {
+                return false;
+            };
+            if !self.write_current_user_buf_at(base, dst_offset, &zeroes[..n], use_xas_write) {
+                return false;
+            }
+            done += n;
+        }
+        true
+    }
+
+    unsafe fn write_current_user_zeroes_bounded_at(
+        &self,
+        base: u64,
+        offset: usize,
+        len: usize,
+        bound: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        if offset >= bound {
+            return true;
+        }
+        self.write_current_user_zeroes_at(base, offset, len.min(bound - offset), use_xas_write)
+    }
+
+    unsafe fn write_current_user_utf16le_at(
+        &self,
+        base: u64,
+        offset: usize,
+        s: &str,
+        use_xas_write: bool,
+    ) -> bool {
+        let mut scratch = [0u8; 128];
+        let mut pending = 0usize;
+        let mut written = 0usize;
+        for unit in s.encode_utf16() {
+            if pending + 2 > scratch.len() {
+                let Some(dst_offset) = offset.checked_add(written) else {
+                    return false;
+                };
+                if !self.write_current_user_buf_at(
+                    base,
+                    dst_offset,
+                    &scratch[..pending],
+                    use_xas_write,
+                ) {
+                    return false;
+                }
+                written += pending;
+                pending = 0;
+            }
+            scratch[pending..pending + 2].copy_from_slice(&unit.to_le_bytes());
+            pending += 2;
+        }
+        if pending != 0 {
+            let Some(dst_offset) = offset.checked_add(written) else {
+                return false;
+            };
+            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending], use_xas_write)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    unsafe fn write_current_user_utf16le_bounded_at(
+        &self,
+        base: u64,
+        offset: usize,
+        s: &str,
+        bound: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        if offset >= bound {
+            return true;
+        }
+        let mut remaining = bound - offset;
+        let mut scratch = [0u8; 128];
+        let mut pending = 0usize;
+        let mut written = 0usize;
+        for unit in s.encode_utf16() {
+            if remaining == 0 {
+                break;
+            }
+            let bytes = unit.to_le_bytes();
+            let n = remaining.min(2);
+            if pending + n > scratch.len() {
+                let Some(dst_offset) = offset.checked_add(written) else {
+                    return false;
+                };
+                if !self.write_current_user_buf_at(
+                    base,
+                    dst_offset,
+                    &scratch[..pending],
+                    use_xas_write,
+                ) {
+                    return false;
+                }
+                written += pending;
+                pending = 0;
+            }
+            scratch[pending..pending + n].copy_from_slice(&bytes[..n]);
+            pending += n;
+            remaining -= n;
+        }
+        if pending != 0 {
+            let Some(dst_offset) = offset.checked_add(written) else {
+                return false;
+            };
+            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending], use_xas_write)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    unsafe fn write_key_value_info_to_user(
+        &self,
+        va: u64,
+        class: u64,
+        name: &str,
+        ty: u32,
+        data: &[u8],
+        use_xas_write: bool,
+    ) -> bool {
+        let Some(layout) = key_value_info_layout(class, name, data.len()) else {
+            return false;
+        };
+        if layout.name_len > u32::MAX as usize || layout.data_len > u32::MAX as usize {
+            return false;
+        }
+        match class {
+            0 => {
+                let mut header = [0u8; 0x0c];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.name_len as u32);
+                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
+                    && self.write_current_user_utf16le_at(va, 0x0c, name, use_xas_write)
+            }
+            2 => {
+                let mut header = [0u8; 0x0c];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.data_len as u32);
+                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
+                    && self.write_current_user_buf_chunked_at(
+                        va,
+                        layout.data_offset,
+                        data,
+                        use_xas_write,
+                    )
+            }
+            _ => {
+                if layout.data_offset > u32::MAX as usize {
+                    return false;
+                }
+                let mut header = [0u8; 0x14];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.data_offset as u32);
+                put_u32_le(&mut header, 0x0c, layout.data_len as u32);
+                put_u32_le(&mut header, 0x10, layout.name_len as u32);
+                let name_end = 0x14usize + layout.name_len;
+                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
+                    && self.write_current_user_utf16le_at(va, 0x14, name, use_xas_write)
+                    && self.write_current_user_zeroes_at(
+                        va,
+                        name_end,
+                        layout.data_offset.saturating_sub(name_end),
+                        use_xas_write,
+                    )
+                    && self.write_current_user_buf_chunked_at(
+                        va,
+                        layout.data_offset,
+                        data,
+                        use_xas_write,
+                    )
+            }
+        }
+    }
+
+    unsafe fn write_key_value_info_prefix_to_user(
+        &self,
+        va: u64,
+        class: u64,
+        name: &str,
+        ty: u32,
+        data: &[u8],
+        limit: usize,
+        use_xas_write: bool,
+    ) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        let Some(layout) = key_value_info_layout(class, name, data.len()) else {
+            return false;
+        };
+        if layout.name_len > u32::MAX as usize || layout.data_len > u32::MAX as usize {
+            return false;
+        }
+        match class {
+            0 => {
+                let mut header = [0u8; 0x0c];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.name_len as u32);
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                    && self.write_current_user_utf16le_bounded_at(
+                        va,
+                        0x0c,
+                        name,
+                        limit,
+                        use_xas_write,
+                    )
+            }
+            2 => {
+                let mut header = [0u8; 0x0c];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.data_len as u32);
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                    && self.write_current_user_buf_chunked_bounded_at(
+                        va,
+                        layout.data_offset,
+                        data,
+                        limit,
+                        use_xas_write,
+                    )
+            }
+            _ => {
+                if layout.data_offset > u32::MAX as usize {
+                    return false;
+                }
+                let mut header = [0u8; 0x14];
+                put_u32_le(&mut header, 0x00, 0);
+                put_u32_le(&mut header, 0x04, ty);
+                put_u32_le(&mut header, 0x08, layout.data_offset as u32);
+                put_u32_le(&mut header, 0x0c, layout.data_len as u32);
+                put_u32_le(&mut header, 0x10, layout.name_len as u32);
+                let name_end = 0x14usize + layout.name_len;
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                    && self.write_current_user_utf16le_bounded_at(
+                        va,
+                        0x14,
+                        name,
+                        limit,
+                        use_xas_write,
+                    )
+                    && self.write_current_user_zeroes_bounded_at(
+                        va,
+                        name_end,
+                        layout.data_offset.saturating_sub(name_end),
+                        limit,
+                        use_xas_write,
+                    )
+                    && self.write_current_user_buf_chunked_bounded_at(
+                        va,
+                        layout.data_offset,
+                        data,
+                        limit,
+                        use_xas_write,
+                    )
+            }
+        }
+    }
+
+    unsafe fn query_value_key_copyout_status(
+        &self,
+        info_class: u64,
+        output_va: u64,
+        output_length: usize,
+        result_length_va: u64,
+        name: &str,
+        ty: u32,
+        data: &[u8],
+        use_xas_write: bool,
+    ) -> u32 {
+        let Some(layout) = key_value_info_layout(info_class, name, data.len()) else {
+            return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+        };
+        let result_length = (layout.total_len.min(u32::MAX as usize) as u32).to_le_bytes();
+        let result_length_written = if use_xas_write {
+            self.xas_try_write_buf(result_length_va, &result_length)
+        } else {
+            smss_copyout(result_length_va, &result_length)
+        };
+        if !result_length_written {
+            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+        }
+        if layout.total_len > output_length {
+            if output_length != 0
+                && !self.write_key_value_info_prefix_to_user(
+                    output_va,
+                    info_class,
+                    name,
+                    ty,
+                    data,
+                    output_length,
+                    use_xas_write,
+                )
+            {
+                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+            }
+            return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
+        }
+        if !self.write_key_value_info_to_user(output_va, info_class, name, ty, data, use_xas_write)
+        {
+            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+        }
+        0
+    }
+
+    fn registry_value_copy_provenance_for_copyout(
+        &self,
+        info_class: u64,
+        output_va: u64,
+        name: &str,
+        ty: u32,
+        data_len: usize,
+        source: Option<ResolvedHiveValue>,
+    ) -> RegistryValueCopyProvenance {
+        let Some(source) = source else {
+            return RegistryValueCopyProvenance::default();
+        };
+        let Some(layout) = key_value_info_layout(info_class, name, data_len) else {
+            return RegistryValueCopyProvenance::default();
+        };
+        if layout.data_len == 0 || layout.data_offset == 0 || data_len > u32::MAX as usize {
+            return RegistryValueCopyProvenance::default();
+        }
+        let Some(data_va) = output_va.checked_add(layout.data_offset as u64) else {
+            return RegistryValueCopyProvenance::default();
+        };
+        RegistryValueCopyProvenance::new(
+            source,
+            self.pi as u64,
+            self.current_tid,
+            data_va,
+            data_len,
+            ty,
+        )
+    }
+
+    fn registry_value_copy_source_for_user_data(
+        &self,
+        data_ptr: u64,
+        data_size: usize,
+        ty: u32,
+    ) -> Option<ResolvedHiveValue> {
+        self.registry_value_copy_provenance.source_for_user_data(
+            self.pi as u64,
+            self.current_tid,
+            data_ptr,
+            data_size,
+            ty,
+        )
+    }
+
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
         let dynamic_stack =
             self.current_process_is_winlogon() && wl_listener_stack_contains(va, src.len());
@@ -11348,8 +12097,13 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let index =
-            ObjEntry::push_kind(&mut self.obj_ns, &name, OBJ_PARENT_ANONYMOUS, OBJ_KIND_EVENT, &[])?;
+        let index = ObjEntry::push_kind(
+            &mut self.obj_ns,
+            &name,
+            OBJ_PARENT_ANONYMOUS,
+            OBJ_KIND_EVENT,
+            &[],
+        )?;
         if !self.events.try_initialize(
             index as u64,
             if auto_reset {
@@ -11645,8 +12399,7 @@ impl ExecNtHandler {
         }
         // The writable overlay answers by-path attribute queries for its own namespace. A miss here
         // is authoritative, not a synthetic success.
-        let folded_scratch =
-            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+        let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
             unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
         if let Some(relative_len) =
@@ -11655,7 +12408,9 @@ impl ExecNtHandler {
             return match crate::writable_fs::query_attributes_relative(
                 &relative_scratch[..relative_len],
             ) {
-                Some(info) if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } => {
+                Some(info)
+                    if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } =>
+                {
                     nt_fs::STATUS_SUCCESS
                 }
                 Some(_) => STATUS_ACCESS_VIOLATION,
@@ -11664,9 +12419,11 @@ impl ExecNtHandler {
         }
         // General read-only namespace lookup. This is intentionally below the writable mount so
         // profile paths stay overlay-backed, but above loader-specific EXE/DLL probes.
-        if let Some(attributes) =
-            crate::fs_loader::query_nt_path_attributes_into(name16, folded_scratch, relative_scratch)
-        {
+        if let Some(attributes) = crate::fs_loader::query_nt_path_attributes_into(
+            name16,
+            folded_scratch,
+            relative_scratch,
+        ) {
             return if unsafe { self.write_file_basic_attributes(args[1], attributes) } {
                 nt_fs::STATUS_SUCCESS
             } else {
@@ -11745,8 +12502,7 @@ impl ExecNtHandler {
             return STATUS_OBJECT_NAME_INVALID;
         }
 
-        let folded_scratch =
-            unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+        let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
             unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
         if let Some(relative_len) =
@@ -11755,7 +12511,9 @@ impl ExecNtHandler {
             return match crate::writable_fs::query_attributes_relative(
                 &relative_scratch[..relative_len],
             ) {
-                Some(info) if unsafe { self.write_file_network_open_information(args[1], info) } => {
+                Some(info)
+                    if unsafe { self.write_file_network_open_information(args[1], info) } =>
+                {
                     nt_fs::STATUS_SUCCESS
                 }
                 Some(_) => STATUS_ACCESS_VIOLATION,
@@ -12708,14 +13466,17 @@ impl ExecNtHandler {
                 status
             },
             // NtOpenKey(*KeyHandle[0], DesiredAccess[1], ObjectAttributes[2]). Copy in the object
-            // name from smss, resolve it in the SYSTEM hive, hand back a handle (copyout to arg0).
+            // name and root from the caller, resolve it in the registry namespace, and hand back a
+            // process-local handle (copyout to arg0).
             NativeService::NtOpenKey => unsafe {
                 // OBJECT_ATTRIBUTES: RootDirectory @+8, ObjectName @+0x10. RtlQueryRegistryValues
                 // opens subkeys RELATIVE to an already-open key (RootDirectory = its handle,
                 // ObjectName = a leaf like "Environment"), so honour RootDirectory.
                 let oa = args[2];
                 let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
+                if oa == 0 || !self.xas_read(oa + 8, &mut rd) {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
                 let root_dir = u64::from_le_bytes(rd);
                 // Noninteractive services: RegOpenKeyExW key-name strings are RTL_CONSTANT_STRING
                 // literals in DLL `.rdata` pages that the process NEVER dereferences (the
@@ -13184,9 +13945,18 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
-                if !create_volatile && self.mutable_hives.resolve_key(parent).is_some() {
-                    let full_len = full.len();
+                let mutable_parent = if create_volatile {
+                    None
+                } else {
+                    self.mutable_hives.resolve_key(parent)
+                };
+                if let Some(mutable_parent) = mutable_parent {
                     let canon_len = canon.len();
+                    let leaf = full.rsplit('\\').next().unwrap_or("");
+                    if leaf.is_empty() {
+                        return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                    }
+                    let leaf_len = leaf.len();
                     let class_name = if args[4] != 0 {
                         Some(self.read_registry_ustr_name(args[4]))
                     } else {
@@ -13194,17 +13964,17 @@ impl ExecNtHandler {
                     };
                     let class_present = class_name.is_some();
                     let class_len = class_name.as_ref().map(|s| s.len()).unwrap_or(0);
-                    let mut full_scratch = [0u8; 2048];
                     let mut canon_scratch = [0u8; 2048];
+                    let mut leaf_scratch = [0u8; 1024];
                     let mut class_scratch = [0u8; 2048];
-                    if full_len > full_scratch.len()
-                        || canon_len > canon_scratch.len()
+                    if canon_len > canon_scratch.len()
+                        || leaf_len > leaf_scratch.len()
                         || class_len > class_scratch.len()
                     {
                         return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
                     }
-                    full_scratch[..full_len].copy_from_slice(full.as_bytes());
                     canon_scratch[..canon_len].copy_from_slice(canon.as_bytes());
+                    leaf_scratch[..leaf_len].copy_from_slice(leaf.as_bytes());
                     if let Some(class_name) = class_name.as_ref() {
                         class_scratch[..class_len].copy_from_slice(class_name.as_bytes());
                     }
@@ -13213,12 +13983,12 @@ impl ExecNtHandler {
                     drop(name);
                     drop(class_name);
                     allocator::reset_to(transient_mark);
-                    let full = match core::str::from_utf8(&full_scratch[..full_len]) {
+                    let canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
                         Ok(path) => path,
                         Err(_) => return 0xC000_0033,
                     };
-                    let canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
-                        Ok(path) => path,
+                    let leaf = match core::str::from_utf8(&leaf_scratch[..leaf_len]) {
+                        Ok(name) => name,
                         Err(_) => return 0xC000_0033,
                     };
                     let class_name = if class_present {
@@ -13241,7 +14011,8 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
-                    let Some(mutable_key) = self.mutable_hives.create_key(full) else {
+                    let Some(mutable_key) = self.mutable_hives.create_subkey(mutable_parent, leaf)
+                    else {
                         return 0xC000_0034;
                     };
                     if class_present
@@ -13403,34 +14174,27 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 const REG_VALUE_SCRATCH_CAP: usize = 64 * 1024;
-                if data_size > REG_VALUE_SCRATCH_CAP {
-                    return 0xC000_009A;
-                }
-                if data_size != 0 {
-                    let scratch = core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                        REG_VALUE_SCRATCH_CAP,
-                    );
-                    if !self.xas_read(data_ptr, &mut scratch[..data_size]) {
-                        return 0xC000_0005;
+                let data_view = if data_size <= REG_VALUE_SCRATCH_CAP {
+                    if data_size != 0 {
+                        let scratch = core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                            REG_VALUE_SCRATCH_CAP,
+                        );
+                        if !self.xas_read(data_ptr, &mut scratch[..data_size]) {
+                            return 0xC000_0005;
+                        }
                     }
-                }
-                let data_view = if data_size == 0 {
-                    &[][..]
-                } else {
-                    core::slice::from_raw_parts(
-                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                        data_size,
-                    )
-                };
-                if self
-                    .registry_value(key, &name)
-                    .is_some_and(|(existing_ty, existing_data)| {
-                        existing_ty == ty && existing_data.as_slice() == data_view
+                    Some(if data_size == 0 {
+                        &[][..]
+                    } else {
+                        core::slice::from_raw_parts(
+                            core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                            data_size,
+                        )
                     })
-                {
-                    return 0;
-                }
+                } else {
+                    None
+                };
                 let mut name_scratch = [0u8; 1024];
                 let name_len = name.len();
                 if name_len > name_scratch.len() {
@@ -13474,6 +14238,26 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
+                let existing_matches = if let Some(data_view) = data_view {
+                    self.registry_value_matches(key, &name, ty, data_view) == Some(true)
+                } else if let Some(mutable_key) = mutable_target {
+                    self.mutable_hives
+                        .query_value(mutable_key, &name)
+                        .is_some_and(|(existing_ty, existing_data)| {
+                            existing_ty as u32 == ty
+                                && existing_data.len() == data_size
+                                && self.user_data_equals(
+                                    data_ptr,
+                                    existing_data,
+                                    REG_VALUE_SCRATCH_CAP,
+                                )
+                        })
+                } else {
+                    false
+                };
+                if existing_matches {
+                    return 0;
+                }
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
                 // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
                 // the gate can assert real SID structure (Revision 1, 4 sub-authorities, NT
@@ -13486,7 +14270,13 @@ impl ExecNtHandler {
                     LSA_ACCT_DOMAIN_SID_LEN.store(data_size as u64, Ordering::Relaxed);
                     let mut head = [0u8; 8];
                     let n = data_size.min(8);
-                    head[..n].copy_from_slice(&data_view[..n]);
+                    if n != 0 {
+                        if let Some(data_view) = data_view {
+                            head[..n].copy_from_slice(&data_view[..n]);
+                        } else if !self.xas_read(data_ptr, &mut head[..n]) {
+                            return 0xC000_0005;
+                        }
+                    }
                     LSA_ACCT_DOMAIN_SID_HEAD.store(u64::from_le_bytes(head), Ordering::Relaxed);
                 }
                 if self.current_process_is_winlogon() {
@@ -13520,27 +14310,68 @@ impl ExecNtHandler {
                     Ok(name) => name,
                     Err(_) => return 0xC000_0033,
                 };
-                let staged = core::slice::from_raw_parts(
-                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                    data_size,
-                );
                 if let Some(mutable_key) = mutable_target {
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
                         return 0xC000_000D;
                     };
-                    let mut durable_data = alloc::vec::Vec::with_capacity(data_size);
-                    durable_data.extend_from_slice(staged);
-                    if !self.mutable_hives.set_value(
+                    let copy_source =
+                        self.registry_value_copy_source_for_user_data(data_ptr, data_size, ty);
+                    if let Some(source) = copy_source {
+                        let source_matches = self
+                            .mutable_hives
+                            .query_resolved_value(source)
+                            .is_some_and(|(source_type, source_data)| {
+                                source_type == value_type
+                                    && self.user_data_equals(
+                                        data_ptr,
+                                        source_data,
+                                        REG_VALUE_SCRATCH_CAP,
+                                )
+                            });
+                        let shared_installed = if source_matches {
+                            self.mutable_hives.set_value_from_existing_value(
+                                mutable_key,
+                                durable_name,
+                                value_type,
+                                source,
+                            )
+                        } else {
+                            false
+                        };
+                        if shared_installed {
+                            self.mutable_hives_dirty = true;
+                            return 0;
+                        }
+                    }
+                    if data_view.is_none()
+                        && !self.user_data_readable(data_ptr, data_size, REG_VALUE_SCRATCH_CAP)
+                    {
+                        return 0xC000_0005;
+                    }
+                    let Some(prepared) = self.mutable_hives.prepare_value_buffer(
                         mutable_key,
                         durable_name,
                         value_type,
-                        durable_data,
-                    ) {
-                        return 0xC000_0008;
+                        data_size,
+                    ) else {
+                        return 0xC000_009A;
+                    };
+                    if !self.append_user_data_to_prepared_value(
+                        prepared,
+                        data_ptr,
+                        data_size,
+                        data_view,
+                        REG_VALUE_SCRATCH_CAP,
+                    ) || self.mutable_hives.prepared_value_len(prepared) != Some(data_size)
+                    {
+                        return 0xC000_0005;
                     }
                     self.mutable_hives_dirty = true;
                     return 0;
                 }
+                let Some(staged) = data_view else {
+                    return 0xC000_009A;
+                };
                 let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
                     Ok(name) => alloc::string::String::from(name),
                     Err(_) => return 0xC000_0033,
@@ -13700,33 +14531,53 @@ impl ExecNtHandler {
                 let index = args[1] as u32 as usize;
                 let info_class = args[2] as u32 as u64;
                 let output_length = args[4] as u32 as usize;
-                let byname = self.registry_value_by_index(key, index);
-                match byname {
-                    None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
-                    Some((name, ty, data)) => {
-                        let info = build_key_value_info(info_class, &name, ty, &data);
-                        let total = (info.len() as u32).to_le_bytes();
-                        if use_xas_write {
-                            if !self.xas_try_write_buf(args[5], &total) {
-                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                            }
+                let (status, provenance) = self
+                    .registry_value_by_index_with(key, index, |name, ty, data, source| {
+                        let Some(layout) = key_value_info_layout(info_class, name, data.len()) else {
+                            return (0xC000_009A, RegistryValueCopyProvenance::default());
+                        };
+                        let total = (layout.total_len.min(u32::MAX as usize) as u32).to_le_bytes();
+                        let wrote_result_length = if use_xas_write {
+                            self.xas_try_write_buf(args[5], &total)
                         } else {
-                            smss_copyout(args[5], &total); // *ResultLength
+                            smss_copyout(args[5], &total)
+                        };
+                        if !wrote_result_length {
+                            return (0xC000_0005, RegistryValueCopyProvenance::default());
                         }
-                        if info.len() > output_length {
-                            0x8000_0005 // STATUS_BUFFER_OVERFLOW
-                        } else {
-                            if use_xas_write {
-                                if !self.xas_try_write_buf(args[3], &info) {
-                                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                                }
-                            } else {
-                                smss_copyout(args[3], &info);
-                            }
-                            0 // STATUS_SUCCESS
+                        if layout.total_len > output_length {
+                            return (0x8000_0005, RegistryValueCopyProvenance::default());
                         }
-                    }
+                        if !self.write_key_value_info_to_user(
+                            args[3],
+                            info_class,
+                            name,
+                            ty,
+                            data,
+                            use_xas_write,
+                        ) {
+                            return (0xC000_0005, RegistryValueCopyProvenance::default());
+                        }
+                        (
+                            0,
+                            self.registry_value_copy_provenance_for_copyout(
+                                info_class,
+                                args[3],
+                                name,
+                                ty,
+                                data.len(),
+                                source,
+                            ),
+                        )
+                    })
+                    .unwrap_or((0x8000_001A, RegistryValueCopyProvenance::default()));
+                if status == 0 && provenance.is_valid() {
+                    let _ = self.registry_value_copy_provenance.record(provenance);
+                } else {
+                    self.registry_value_copy_provenance
+                        .clear_for_thread(self.pi as u64, self.current_tid);
                 }
+                status
             },
             // NtEnumerateKey(KeyHandle[0], Index[1], KeyInformationClass[2], KeyInformation[3],
             // Length[4], *ResultLength[5]). Hosted service processes enumerate REAL subkeys of hive
@@ -14233,135 +15084,113 @@ impl ExecNtHandler {
                     // on their narrow paths.
                     use_xas_write = true;
                 }
-                let mut val: Option<(u32, alloc::vec::Vec<u8>)> =
-                    self.registry_value(key, &name_lc);
-                if self.should_expose_sam_setup_phase(key_path.as_deref(), &name_lc) {
-                    val = Some((4, 1u32.to_le_bytes().to_vec()));
-                }
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
-                if self.current_process_is_winlogon() && key_is_real_winlogon {
-                    if let Some((ty, ref data)) = val {
-                        WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
-                        if name_lc == "userinit" {
-                            WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
-                            WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
-                            WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
-                            use_xas_write = true;
-                            if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
-                                print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
-                                for pair in data.chunks_exact(2) {
-                                    let unit = u16::from_le_bytes([pair[0], pair[1]]);
-                                    if unit == 0 {
-                                        break;
-                                    }
-                                    debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                        unit as u8
-                                    } else {
-                                        b'?'
-                                    });
-                                }
-                                print_str(b"\" (REG type ");
-                                print_u64(ty as u64);
-                                print_str(b", from the real SOFTWARE hive)\n");
-                            }
-                        } else if name_lc == "defaultpassword" {
-                            WINLOGON_DEFAULT_PASSWORD_READS.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                // A `PolAcDm[NS]` account-domain attribute served back through
-                // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and msv1_0's
-                // `GetAccountDomainSid` on the real logon path (counted separately while an
-                // `LsaLogonUser` is in flight, which is the credential-validation proof).
-                if val.is_some()
-                    && self
-                        .registry_target_path(key)
-                        .is_some_and(|p| p.starts_with(r"\registry\machine\security\policy\polacdm"))
+                let query_status = if self.should_expose_sam_setup_phase(key_path.as_deref(), &name_lc)
                 {
-                    LSA_ACCT_DOMAIN_ATTR_READS.fetch_add(1, Ordering::Relaxed);
-                    if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
-                        LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
-                // `HandleLogon` steps (`CreateUserEnvironment` → `SetDefaultLanguage` →
-                // `AllowAccessOnSession` → `StartUserShell`) fail through `WARN`, which the shipped
-                // binary does not print. A missed value read is the only externally visible
-                // evidence of which step gave up, so name the KEY and the VALUE.
-                if self.current_process_is_winlogon() && val.is_none() && post_profile_phase() {
-                    self.trace_post_profile_registry(b"query-value", key, &name_lc);
-                }
-                if val.is_some() && shell_com_inproc_bit != 0 {
-                    if name_lc.is_empty() {
-                        EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK
-                            .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
-                    } else if name_lc == "threadingmodel" {
-                        EXPLORER_SHELL_COM_THREADING_MODEL_MASK
-                            .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
-                    }
-                }
-                match val {
-                    None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
-                    Some((ty, data)) => {
-                        // KeyValuePartialInformation (class 2) carries no name.
-                        let info = build_key_value_info(info_class, "", ty, &data);
-                        // *ResultLength: use the cross-AS writer for hosted real-hive reads (advapi's
-                        // out-param may be a heap/stack the plain mirror can't reach — same reason as
-                        // the data write below); everything else stays mirror-only (byte-identical).
-                        let result_length = (info.len() as u32).to_le_bytes();
-                        let result_length_written = if use_xas_write {
-                            self.xas_try_write_buf(args[5], &result_length)
-                        } else {
-                            smss_copyout(args[5], &result_length)
-                        };
-                        if !result_length_written {
-                            return 0xC000_0005;
-                        }
-                        if info.len() > output_length {
-                            // BUFFER_OVERFLOW: real NtQueryValueKey still fills as much of the buffer as
-                            // fits (the KEY_VALUE_PARTIAL_INFORMATION header carries Type + DataLength,
-                            // which advapi's RegQueryValueExW reads to size the retry / set dwSize when
-                            // lpData is NULL). Writing NOTHING left advapi with a garbage dwType/dwSize →
-                            // SetDefaultLanguage bailed. Write the truncated prefix so the header lands.
-                            let n = output_length;
-                            if n > 0 {
-                                let written = if use_xas_write {
-                                    self.xas_try_write_buf(args[3], &info[..n])
-                                } else {
-                                    smss_copyout(args[3], &info[..n])
-                                };
-                                if !written {
-                                    return 0xC000_0005;
+                    let data = 1u32.to_le_bytes();
+                    self.query_value_key_copyout_status(
+                        info_class,
+                        args[3],
+                        output_length,
+                        args[5],
+                        "",
+                        4,
+                        &data,
+                        use_xas_write,
+                    )
+                } else {
+                    self.registry_value_with(key, &name_lc, |ty, data| {
+                        let mut value_use_xas_write = use_xas_write;
+                        if self.current_process_is_winlogon() && key_is_real_winlogon {
+                            WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
+                            if name_lc == "userinit" {
+                                WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
+                                WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
+                                WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
+                                value_use_xas_write = true;
+                                if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
+                                    print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
+                                    for pair in data.chunks_exact(2) {
+                                        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                                        if unit == 0 {
+                                            break;
+                                        }
+                                        debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                            unit as u8
+                                        } else {
+                                            b'?'
+                                        });
+                                    }
+                                    print_str(b"\" (REG type ");
+                                    print_u64(ty as u64);
+                                    print_str(b", from the real SOFTWARE hive)\n");
                                 }
+                            } else if name_lc == "defaultpassword" {
+                                WINLOGON_DEFAULT_PASSWORD_READS.fetch_add(1, Ordering::Relaxed);
                             }
-                            0x8000_0005 // STATUS_BUFFER_OVERFLOW
-                        } else {
-                            // Hosted out-buffers may be advapi32 heap allocations the mirror
-                            // can't reach → use the cross-AS writer so the value data actually lands.
-                            let written = if use_xas_write {
-                                self.xas_try_write_buf(args[3], &info)
-                            } else {
-                                smss_copyout(args[3], &info)
-                            };
-                            if !written {
-                                return 0xC000_0005;
-                            }
-                            // ★ A value COPIED OUT of the 4th mount, in full, to a hosted process.
-                            // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
-                            // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
-                            // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
-                            if !is_virtual_registry_key(key) && hive_sel(key) == HIVE_SEL_SOFTWARE {
-                                SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
-                                if self.current_process_is_winlogon()
-                                    && name_lc == "profilesdirectory"
-                                {
-                                    WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            0 // STATUS_SUCCESS
                         }
-                    }
-                }
+                        // A `PolAcDm[NS]` account-domain attribute served back through
+                        // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and
+                        // msv1_0's `GetAccountDomainSid` on the real logon path (counted separately
+                        // while an `LsaLogonUser` is in flight, which is the credential-validation
+                        // proof).
+                        if key_path
+                            .as_deref()
+                            .is_some_and(|p| p.starts_with(r"\registry\machine\security\policy\polacdm"))
+                        {
+                            LSA_ACCT_DOMAIN_ATTR_READS.fetch_add(1, Ordering::Relaxed);
+                            if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
+                                LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if shell_com_inproc_bit != 0 {
+                            if name_lc.is_empty() {
+                                EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK
+                                    .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                            } else if name_lc == "threadingmodel" {
+                                EXPLORER_SHELL_COM_THREADING_MODEL_MASK
+                                    .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                            }
+                        }
+                        let status = self.query_value_key_copyout_status(
+                            info_class,
+                            args[3],
+                            output_length,
+                            args[5],
+                            "",
+                            ty,
+                            data,
+                            value_use_xas_write,
+                        );
+                        // A value COPIED OUT of the 4th mount, in full, to a hosted process.
+                        // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
+                        // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
+                        // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
+                        if status == 0
+                            && !is_virtual_registry_key(key)
+                            && hive_sel(key) == HIVE_SEL_SOFTWARE
+                        {
+                            SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
+                            if self.current_process_is_winlogon() && name_lc == "profilesdirectory" {
+                                WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        status
+                    })
+                    .unwrap_or_else(|| {
+                        // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
+                        // `HandleLogon` steps (`CreateUserEnvironment` → `SetDefaultLanguage` →
+                        // `AllowAccessOnSession` → `StartUserShell`) fail through `WARN`, which the
+                        // shipped binary does not print. A missed value read is the only externally
+                        // visible evidence of which step gave up, so name the KEY and the VALUE.
+                        if self.current_process_is_winlogon() && post_profile_phase() {
+                            self.trace_post_profile_registry(b"query-value", key, &name_lc);
+                        }
+                        0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
+                    })
+                };
+                query_status
             },
             // NtQuerySystemInformation(Class[R10]=args[0], Buffer[RDX]=args[1], Len[R8]=args[2],
             // *RetLen[R9]=args[3]). Fixed class layouts and size policy live in nt-syscall; this
@@ -14849,6 +15678,16 @@ impl ExecNtHandler {
                             PM_INITIAL_THREAD_DONE.fetch_or(1u64 << pi, Ordering::Relaxed);
                         }
                         return 0;
+                    }
+                }
+                if matches!(ctx.service, NativeService::NtCreateThread) {
+                    // kernel32's thread-pool hook enters through BaseThreadStartup with the real
+                    // ntdll worker routine in RCX. Classify those workers before the process-local
+                    // listener routes claim them as winlogon/services RPC threads.
+                    if let Some(status) =
+                        unsafe { self.create_generic_local_tp_worker_thread(args, true) }
+                    {
+                        return status;
                     }
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread)
@@ -15427,7 +16266,7 @@ impl ExecNtHandler {
                 // their custom layouts; every remaining local hosted thread gets a real generic
                 // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
                 if let Some(status) =
-                    unsafe { self.create_generic_local_tp_worker_thread(args) }
+                    unsafe { self.create_generic_local_tp_worker_thread(args, false) }
                 {
                     return status;
                 }
@@ -16744,6 +17583,44 @@ impl ExecNtHandler {
                 if security_information & nt_security::SACL_SECURITY_INFORMATION != 0 {
                     required_access |= ACCESS_SYSTEM_SECURITY;
                 }
+                if let Some(caller_pid) = self.pm_pid_for_pi(self.pi) {
+                    if self.is_process_security_handle(caller_pid, args[0]) {
+                        let current = match self.pm.process_security_descriptor(
+                            caller_pid,
+                            args[0],
+                            required_access,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        let descriptor = match nt_security::query_security_descriptor_bytes(
+                            current,
+                            security_information,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        if args[4] == 0
+                            || !self.xas_write_u32(
+                                args[4],
+                                descriptor.len().min(u32::MAX as usize) as u32,
+                            )
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                            return STATUS_BUFFER_TOO_SMALL;
+                        }
+                        if !self.probe_user_output(args[2], descriptor.len())
+                            || !self.xas_try_write_buf(args[2], &descriptor)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        return 0;
+                    }
+                } else if args[0] == u64::MAX {
+                    return nt_process::STATUS_INVALID_HANDLE;
+                }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
                     Err(status) => return status,
@@ -16823,6 +17700,46 @@ impl ExecNtHandler {
                     != 0
                 {
                     required_access |= ACCESS_SYSTEM_SECURITY;
+                }
+                if let Some(caller_pid) = self.pm_pid_for_pi(self.pi) {
+                    if self.is_process_security_handle(caller_pid, args[0]) {
+                        let current = match self.pm.process_security_descriptor(
+                            caller_pid,
+                            args[0],
+                            required_access,
+                        ) {
+                            Ok(descriptor) => alloc::vec::Vec::from(descriptor),
+                            Err(status) => return status,
+                        };
+                        let memory = ExecClientMemory { handler: self };
+                        let modification =
+                            match nt_security::capture_security_descriptor_bytes(&memory, args[2]) {
+                                Ok(descriptor) => descriptor,
+                                Err(status) => return status,
+                            };
+                        let updated = match nt_security::set_security_descriptor_bytes(
+                            &current,
+                            security_information,
+                            &modification,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(status) => return status,
+                        };
+                        return match self.pm.set_process_security_descriptor(
+                            caller_pid,
+                            args[0],
+                            required_access,
+                            updated,
+                        ) {
+                            Ok(()) => {
+                                self.process_dirty = true;
+                                0
+                            }
+                            Err(status) => status,
+                        };
+                    }
+                } else if args[0] == u64::MAX {
+                    return nt_process::STATUS_INVALID_HANDLE;
                 }
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
@@ -17609,7 +18526,7 @@ impl ExecNtHandler {
                 const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
                 const GENERIC_READ: u32 = 0x8000_0000;
                 const GENERIC_ALL: u32 = 0x1000_0000;
-                const MAX_QUERY_BUFFER: usize = 1024 * 1024;
+                const DIR_QUERY_SCRATCH_CAP: usize = 64 * 1024;
 
                 let iosb = args[4];
                 let output = args[5];
@@ -17647,7 +18564,7 @@ impl ExecNtHandler {
                 // the ABI boundary must truncate them before validation for every filesystem path.
                 let raw_length = args[6] as u32 as u64;
                 let length = match usize::try_from(raw_length) {
-                    Ok(length) if length <= MAX_QUERY_BUFFER => length,
+                    Ok(length) => length,
                     _ => return STATUS_INSUFFICIENT_RESOURCES,
                 };
                 let information_class = args[7] as u32;
@@ -17719,30 +18636,26 @@ impl ExecNtHandler {
                             }
                         };
                         let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
-                        let mut encoded = alloc::vec::Vec::new();
-                        if encoded.try_reserve_exact(length).is_err() {
-                            return STATUS_INSUFFICIENT_RESOURCES;
-                        }
-                        encoded.resize(length, 0);
-                        // NOTE: deliberately NOT `writable_fs_dirty`. Reaching this arm means a
-                        // volume file object already exists, so the volume is mounted and an
-                        // enumeration mutates only the FILE_OBJECT's fixed-size cursor — nothing
-                        // is allocated that must outlive the syscall. Pinning here would strand
-                        // this `length`-byte encode buffer (16 KiB for every `FindFirstFileW`)
-                        // on the no-free bump heap for the rest of the boot.
+                        let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
+                        let encoded = core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                            scratch_len,
+                        );
+                        encoded.fill(0);
                         let result = crate::writable_fs::query_directory(
                             file_id,
                             information_class,
                             return_single_entry,
                             pattern,
                             restart_scan,
-                            &mut encoded,
+                            encoded,
                         );
                         let mut iosb_bytes = [0u8; 16];
                         iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
                         iosb_bytes[8..]
                             .copy_from_slice(&(result.information as u64).to_le_bytes());
-                        if !self.xas_try_write_buf(output, &encoded[..result.information])
+                        if result.information > encoded.len()
+                            || !self.xas_try_write_buf(output, &encoded[..result.information])
                             || !self.xas_try_write_buf(iosb, &iosb_bytes)
                         {
                             return STATUS_ACCESS_VIOLATION;
@@ -17802,11 +18715,12 @@ impl ExecNtHandler {
                     true
                 });
 
-                let mut encoded = alloc::vec::Vec::new();
-                if encoded.try_reserve_exact(length).is_err() {
-                    return STATUS_INSUFFICIENT_RESOURCES;
-                }
-                encoded.resize(length, 0);
+                let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
+                let encoded = core::slice::from_raw_parts_mut(
+                    core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                    scratch_len,
+                );
+                encoded.fill(0);
                 let result = {
                     let directory = match self.directory_opens.get_mut(object_id) {
                         Ok(directory) => directory,
@@ -17819,13 +18733,14 @@ impl ExecNtHandler {
                         return_single_entry,
                         pattern,
                         restart_scan,
-                        &mut encoded,
+                        encoded,
                     )
                 };
                 let mut iosb_bytes = [0u8; 16];
                 iosb_bytes[..4].copy_from_slice(&result.status.to_le_bytes());
                 iosb_bytes[8..].copy_from_slice(&(result.information as u64).to_le_bytes());
-                if !self.xas_try_write_buf(output, &encoded[..result.information])
+                if result.information > encoded.len()
+                    || !self.xas_try_write_buf(output, &encoded[..result.information])
                     || !self.xas_try_write_buf(iosb, &iosb_bytes)
                 {
                     if let Ok(directory) = self.directory_opens.get_mut(object_id) {
@@ -18816,9 +19731,8 @@ impl ExecNtHandler {
                 // whole destination tree and opening BOTH files.
                 let overlay_file = self.overlay_file_id_for(fh);
                 const OVERLAY_IO_CAP: usize = 64 * 1024;
-                let output_capacity = if matches!(disk_file, Ok(Some(_))) {
-                    len.min(16 * 1024 * 1024)
-                } else if overlay_file.is_some() {
+                let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
+                {
                     0
                 } else {
                     len.min(transport_capacity)
@@ -18852,9 +19766,7 @@ impl ExecNtHandler {
                 } else if let Err(handle_status) = disk_file {
                     handle_status
                 } else if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
-                    if len > output.len() {
-                        0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
-                    } else if len == 0 {
+                    if len == 0 {
                         nt_fs::STATUS_SUCCESS
                     } else if byte_offset == 0 {
                         0xC000_000D // STATUS_INVALID_PARAMETER: implicit positions are not modeled yet
@@ -18869,30 +19781,18 @@ impl ExecNtHandler {
                             } else if offset as u32 >= file_size {
                                 0xC000_0011 // STATUS_END_OF_FILE
                             } else {
-                                match exec_fs() {
-                                    Some(fs) => {
-                                        let expected = output
-                                            .len()
-                                            .min((file_size - offset as u32) as usize);
-                                        let read = fat_read_file_range(
-                                            &fs,
-                                            first_cluster,
-                                            file_size,
-                                            offset as u32,
-                                            &mut output,
-                                        );
-                                        if read != expected {
-                                            0xC000_0185 // STATUS_IO_DEVICE_ERROR
-                                        } else if read != 0
-                                            && !self.xas_try_write_buf(buffer, &output[..read])
-                                        {
-                                            0xC000_0005 // STATUS_ACCESS_VIOLATION
-                                        } else {
-                                            information = read as u64;
-                                            nt_fs::STATUS_SUCCESS
-                                        }
+                                match self.readonly_disk_read_to_user(
+                                    first_cluster,
+                                    file_size,
+                                    offset as u32,
+                                    buffer,
+                                    len,
+                                ) {
+                                    Ok(read) => {
+                                        information = read as u64;
+                                        nt_fs::STATUS_SUCCESS
                                     }
-                                    None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                                    Err(status) => status,
                                 }
                             }
                         }

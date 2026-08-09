@@ -22,12 +22,15 @@ mod reactos_registration;
 
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{
+    seed_reactos_default_user_shell_folders_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes,
-    seed_reactos_explorer_shell_com_classes_in_mutable_hives, utf16le_sz,
-    ReactOsComClassRegistrationScript, CLSID_REBAR_BAND_SITE, CLSID_START_MENU,
+    seed_reactos_explorer_shell_com_classes_in_mutable_hives,
+    seed_reactos_user_profile_shell_folders_in_mutable_hives, utf16le_sz,
+    ReactOsComClassRegistrationScript, ReactOsProfileShellFolder,
+    ReactOsProfileShellFolderSeedStats, CLSID_REBAR_BAND_SITE, CLSID_START_MENU,
     REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU,
-    REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS,
+    REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS, REACTOS_USER_PROFILE_SHELL_FOLDERS,
 };
 
 pub use codec::{
@@ -39,7 +42,8 @@ pub use config_import::{
 };
 pub use hive::{
     apply_ccs_alias, CellId, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
-    MutableHiveSet, RegistryValueType, ResolvedHiveKey, CURRENT_CONTROL_SET_TARGET,
+    MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
+    RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, CURRENT_CONTROL_SET_TARGET,
     SYSTEM_HIVE_PATH,
 };
 pub use io::{

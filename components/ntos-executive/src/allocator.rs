@@ -1,14 +1,17 @@
-//! A minimal bump global allocator for the spawned components.
+//! A small global allocator for the spawned components.
 //!
 //! Unlike the in-process M7b component, these components' image `.bss` is mapped
-//! **read-only** (shared image frames), so the bump counter can't be a static.
-//! Instead it lives in the first bytes of the **RW heap region** the broker maps
-//! at [`HEAP_BASE`]; allocations start past it. Each component has its own heap
-//! frames at the same vaddr, and each is single-threaded, so no atomics are
-//! needed. The retype-zeroed heap gives counter = 0, so there is no init step.
+//! **read-only** (shared image frames), so allocator metadata can't be ordinary
+//! mutable statics. The bump counter and free-list head live in the first bytes
+//! of the **RW heap region** the broker maps at [`HEAP_BASE`]; allocations start
+//! past them. Each component has its own heap frames at the same vaddr, and each
+//! is single-threaded, so no locks are needed. The retype-zeroed heap gives empty
+//! metadata, so there is no init step.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::{null_mut, read_volatile, write_volatile};
+use core::mem::{align_of, size_of};
+use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Base of the RW heap region the broker maps into each component. Sits just past the executive
 /// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
@@ -27,15 +30,19 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// frame budget; they never allocate near this cap.
 /// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
 /// at the winlogon profile frontier: the CM overlay, the writable volume and every `*_dirty`
-/// mark-pin move the permanent floor, and a no-free bump heap that reaches its cap does not panic
-/// — allocations start returning null and callers quietly take their error paths, which is what a
-/// mysteriously slow, never-quiescing boot looks like from outside. The materialised profile tree
-/// and the per-user hive load need headroom above that, so the executive gets it.
+/// mark-pin move the permanent floor, and a heap that reaches its cap does not panic — allocations
+/// start returning null and callers quietly take their error paths, which is what a mysteriously
+/// slow, never-quiescing boot looks like from outside. The materialised profile tree and the
+/// per-user hive load need headroom above that, so the executive gets it.
 /// ★ RAISED 1536 -> 1792 (6 MiB -> 7 MiB) once Dbgk stopped allocating late and instead precharged
 /// bounded `DEBUG_OBJECT` slots/event queues before the service-loop reset mark. That is durable NT
 /// object state, not transient proof scaffolding, and the previous full boot ended with only a few
 /// KiB free under the 6 MiB cap.
-pub const HEAP_FRAMES: u64 = 1792;
+/// ★ RAISED 1792 -> 2048 (7 MiB -> 8 MiB) when the live mutable-hive authority started owning
+/// installed setup state and shell COM class provisioning directly in mounted hives. The prior green
+/// boot measured 6.82 MiB used under the 7 MiB cap, leaving too little room for that durable CM
+/// state before the service-loop reset mark. Spawned service heaps remain capped separately below.
+pub const HEAP_FRAMES: u64 = 2048;
 /// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
 /// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
 /// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The
@@ -45,27 +52,378 @@ pub const SERVICE_HEAP_FRAMES: u64 = 128;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
+const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
 const DATA: usize = HEAP_BASE + 64; // allocations start past the counter
 const END: usize = HEAP_BASE + HEAP_SIZE;
+const WORD: usize = size_of::<usize>();
+const ALLOC_GRANULE: usize = align_of::<usize>();
+const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
 
 struct Bump;
 
-// SAFETY: single-threaded per component; the counter (in RW heap) only advances,
-// so allocations never alias. Alignment is applied to each returned pointer.
+static OOM_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn debug_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        crate::debug_put_char(byte);
+    }
+}
+
+fn debug_usize(mut value: usize) {
+    let mut buf = [b'0'; 20];
+    let mut i = buf.len();
+    if value == 0 {
+        crate::debug_put_char(b'0');
+        return;
+    }
+    while value != 0 && i != 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    debug_bytes(&buf[i..]);
+}
+
+fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end: usize) {
+    if OOM_REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    debug_bytes(b"[alloc-oom] size=");
+    debug_usize(size);
+    debug_bytes(b" align=");
+    debug_usize(align);
+    debug_bytes(b" cur=");
+    debug_usize(cur);
+    debug_bytes(b" start=");
+    debug_usize(start);
+    debug_bytes(b" requested-end=");
+    debug_usize(requested_end);
+    debug_bytes(b" cap=");
+    debug_usize(HEAP_SIZE);
+    crate::debug_put_char(b'\n');
+}
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
+fn block_size(size: usize) -> Option<usize> {
+    align_up(size.max(FREE_NODE_SIZE), ALLOC_GRANULE)
+}
+
+unsafe fn read_word(addr: usize) -> usize {
+    unsafe { read_volatile(addr as *const usize) }
+}
+
+unsafe fn write_word(addr: usize, value: usize) {
+    unsafe { write_volatile(addr as *mut usize, value) };
+}
+
+unsafe fn free_node_size(node: usize) -> usize {
+    unsafe { read_word(node) }
+}
+
+unsafe fn free_node_next(node: usize) -> usize {
+    unsafe { read_word(node + WORD) }
+}
+
+unsafe fn set_free_node(node: usize, size: usize, next: usize) {
+    unsafe {
+        write_word(node, size);
+        write_word(node + WORD, next);
+    }
+}
+
+unsafe fn insert_free_block(start: usize, size: usize) {
+    if size < FREE_NODE_SIZE || start < DATA || start.checked_add(size).is_none_or(|end| end > END)
+    {
+        return;
+    }
+
+    let mut prev = 0usize;
+    let mut prev_link = FREE_HEAD;
+    let mut cur = unsafe { read_word(FREE_HEAD) };
+    while cur != 0 && cur < start {
+        prev = cur;
+        prev_link = cur + WORD;
+        cur = unsafe { free_node_next(cur) };
+    }
+    if cur == start {
+        return;
+    }
+
+    unsafe {
+        set_free_node(start, size, cur);
+        write_word(prev_link, start);
+    }
+
+    let block = start;
+    let mut block_size = size;
+    if cur != 0 && block.checked_add(block_size) == Some(cur) {
+        let merged_size = block_size.saturating_add(unsafe { free_node_size(cur) });
+        let merged_next = unsafe { free_node_next(cur) };
+        unsafe { set_free_node(block, merged_size, merged_next) };
+        block_size = merged_size;
+    }
+
+    if prev != 0 {
+        let prev_size = unsafe { free_node_size(prev) };
+        if prev.checked_add(prev_size) == Some(block) {
+            let merged_size = prev_size.saturating_add(block_size);
+            let merged_next = unsafe { free_node_next(block) };
+            unsafe { set_free_node(prev, merged_size, merged_next) };
+        }
+    }
+}
+
+unsafe fn release_top_free_blocks() {
+    loop {
+        let top = DATA + unsafe { read_word(CTR) };
+        let mut prev_link = FREE_HEAD;
+        let mut cur = unsafe { read_word(FREE_HEAD) };
+        let mut released = false;
+        while cur != 0 {
+            let size = unsafe { free_node_size(cur) };
+            let next = unsafe { free_node_next(cur) };
+            if cur.checked_add(size) == Some(top) {
+                unsafe {
+                    write_word(prev_link, next);
+                    write_word(CTR, cur - DATA);
+                }
+                released = true;
+                break;
+            }
+            prev_link = cur + WORD;
+            cur = next;
+        }
+        if !released {
+            break;
+        }
+    }
+}
+
+unsafe fn trim_free_list_to(limit: usize) {
+    let mut prev_link = FREE_HEAD;
+    let mut cur = unsafe { read_word(FREE_HEAD) };
+    while cur != 0 {
+        let size = unsafe { free_node_size(cur) };
+        let next = unsafe { free_node_next(cur) };
+        if cur >= limit {
+            unsafe { write_word(prev_link, next) };
+            cur = next;
+            continue;
+        }
+        if cur.checked_add(size).is_some_and(|end| end > limit) {
+            let trimmed = limit - cur;
+            if trimmed >= FREE_NODE_SIZE {
+                unsafe { set_free_node(cur, trimmed, next) };
+                prev_link = cur + WORD;
+            } else {
+                unsafe { write_word(prev_link, next) };
+            }
+            cur = next;
+            continue;
+        }
+        prev_link = cur + WORD;
+        cur = next;
+    }
+}
+
+unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
+    let align = layout.align().max(ALLOC_GRANULE);
+    let mut prev_link = FREE_HEAD;
+    let mut cur = unsafe { read_word(FREE_HEAD) };
+    while cur != 0 {
+        let size = unsafe { free_node_size(cur) };
+        let next = unsafe { free_node_next(cur) };
+        let mut start = match align_up(cur, align) {
+            Some(start) => start,
+            None => return null_mut(),
+        };
+        let mut prefix = start - cur;
+        if prefix != 0 && prefix < FREE_NODE_SIZE {
+            start = match align_up(cur + FREE_NODE_SIZE, align) {
+                Some(start) => start,
+                None => return null_mut(),
+            };
+            prefix = start - cur;
+        }
+        if prefix.checked_add(needed).is_some_and(|total| total <= size) {
+            unsafe { write_word(prev_link, next) };
+            if prefix >= FREE_NODE_SIZE {
+                unsafe { insert_free_block(cur, prefix) };
+            }
+            let suffix_start = start + needed;
+            let suffix = cur + size - suffix_start;
+            if suffix >= FREE_NODE_SIZE {
+                unsafe { insert_free_block(suffix_start, suffix) };
+            }
+            return start as *mut u8;
+        }
+        prev_link = cur + WORD;
+        cur = next;
+    }
+    null_mut()
+}
+
+unsafe fn grow_in_place_from_adjacent_free(
+    start: usize,
+    old_size: usize,
+    new_size: usize,
+) -> bool {
+    let adjacent = match start.checked_add(old_size) {
+        Some(adjacent) => adjacent,
+        None => return false,
+    };
+    let need = new_size - old_size;
+    let mut prev_link = FREE_HEAD;
+    let mut cur = unsafe { read_word(FREE_HEAD) };
+    while cur != 0 {
+        let size = unsafe { free_node_size(cur) };
+        let next = unsafe { free_node_next(cur) };
+        if cur == adjacent && size >= need {
+            if size - need >= FREE_NODE_SIZE {
+                let new_free = cur + need;
+                unsafe {
+                    set_free_node(new_free, size - need, next);
+                    write_word(prev_link, new_free);
+                }
+            } else {
+                unsafe { write_word(prev_link, next) };
+            }
+            return true;
+        }
+        prev_link = cur + WORD;
+        cur = next;
+    }
+    false
+}
+
+// SAFETY: single-threaded per component; allocator metadata lives in the component-local RW heap
+// and is accessed only by this allocator. Free blocks are returned to the list only through
+// `dealloc`/`realloc` for dead allocations, and alignment is applied to each returned pointer.
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ctr = CTR as *mut usize;
-        let cur = read_volatile(ctr); // 0 on a freshly-zeroed heap frame
-        let start = (DATA + cur + layout.align() - 1) & !(layout.align() - 1);
-        let end = match start.checked_add(layout.size()) {
-            Some(e) if e <= END => e,
-            _ => return null_mut(),
+        let Some(size) = block_size(layout.size()) else {
+            report_oom(layout.size(), layout.align(), unsafe { read_word(CTR) }, 0, usize::MAX);
+            return null_mut();
         };
-        write_volatile(ctr, end - DATA);
+        let from_free = unsafe { alloc_from_free_list(layout, size) };
+        if !from_free.is_null() {
+            return from_free;
+        }
+
+        let cur = unsafe { read_word(CTR) }; // 0 on a freshly-zeroed heap frame
+        let start = match align_up(DATA + cur, layout.align().max(ALLOC_GRANULE)) {
+            Some(start) => start,
+            None => {
+                report_oom(layout.size(), layout.align(), cur, cur, usize::MAX);
+                return null_mut();
+            }
+        };
+        let requested_end = start.saturating_add(layout.size());
+        let end = match start.checked_add(size) {
+            Some(e) if e <= END => e,
+            _ => {
+                report_oom(
+                    layout.size(),
+                    layout.align(),
+                    cur,
+                    start - DATA,
+                    requested_end - DATA,
+                );
+                return null_mut();
+            }
+        };
+        unsafe { write_word(CTR, end - DATA) };
         start as *mut u8
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() || layout.size() == 0 {
+            return;
+        }
+        let start = ptr as usize;
+        let Some(size) = block_size(layout.size()) else {
+            return;
+        };
+        unsafe {
+            insert_free_block(start, size);
+            release_top_free_blocks();
+        };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            let Ok(layout) = Layout::from_size_align(new_size, old_layout.align()) else {
+                return null_mut();
+            };
+            return unsafe { self.alloc(layout) };
+        }
+        if new_size == 0 {
+            unsafe { self.dealloc(ptr, old_layout) };
+            return null_mut();
+        }
+
+        let start = ptr as usize;
+        let old_size = old_layout.size();
+        let Some(old_block_size) = block_size(old_size) else {
+            return null_mut();
+        };
+        let Some(new_block_size) = block_size(new_size) else {
+            return null_mut();
+        };
+
+        if new_block_size <= old_block_size {
+            let tail = old_block_size - new_block_size;
+            if tail >= FREE_NODE_SIZE {
+                unsafe {
+                    insert_free_block(start + new_block_size, tail);
+                    release_top_free_blocks();
+                }
+            }
+            return ptr;
+        }
+
+        let old_end = match start.checked_add(old_block_size) {
+            Some(end) => end,
+            None => return null_mut(),
+        };
+        let cur_end = DATA + unsafe { read_word(CTR) };
+        if start >= DATA && old_end <= END && old_end == cur_end {
+            let Some(new_end) = start.checked_add(new_block_size) else {
+                report_oom(new_size, old_layout.align(), start - DATA, start - DATA, usize::MAX);
+                return null_mut();
+            };
+            if new_end <= END {
+                unsafe { write_word(CTR, new_end - DATA) };
+                return ptr;
+            }
+            report_oom(
+                new_size,
+                old_layout.align(),
+                old_end - DATA,
+                start - DATA,
+                new_end - DATA,
+            );
+            return null_mut();
+        }
+
+        if unsafe { grow_in_place_from_adjacent_free(start, old_block_size, new_block_size) } {
+            return ptr;
+        }
+
+        let Ok(new_layout) = Layout::from_size_align(new_size, old_layout.align()) else {
+            return null_mut();
+        };
+        let new_ptr = unsafe { self.alloc(new_layout) };
+        if !new_ptr.is_null() {
+            unsafe { copy_nonoverlapping(ptr, new_ptr, old_size.min(new_size)) };
+            unsafe { self.dealloc(ptr, old_layout) };
+        }
+        new_ptr
+    }
 }
 
 #[global_allocator]
@@ -73,15 +431,13 @@ static ALLOC: Bump = Bump;
 
 /// Current bump offset — a heap "high-water mark".
 ///
-/// The bump allocator never reclaims on `dealloc`, so a hot loop that allocates
-/// transient `Vec`/`String` per iteration (e.g. servicing thousands of registry
-/// syscalls) walks the counter to `END` and the next alloc fails. A caller that
-/// knows a region of work allocates only *transient* objects can snapshot the
-/// mark before it and [`reset_to`] after, reclaiming everything allocated in
-/// between. SAFETY CONTRACT: nothing allocated after the mark may still be live
-/// when `reset_to` runs (it would be handed out again).
+/// The allocator reuses dropped blocks, but `mark`/[`reset_to`] is still the syscall loop's bulk
+/// transient reclamation tool. A caller that knows a region of work allocates only *transient*
+/// objects can snapshot the mark before it and reset after, reclaiming everything above the mark in
+/// one operation. SAFETY CONTRACT: nothing allocated after the mark may still be live when
+/// `reset_to` runs; it may be handed out again.
 pub fn mark() -> usize {
-    unsafe { read_volatile(CTR as *const usize) }
+    unsafe { read_word(CTR) }
 }
 
 /// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.
@@ -89,5 +445,9 @@ pub fn mark() -> usize {
 /// # Safety
 /// All allocations made after `m` must be dead (unreferenced) at this point.
 pub unsafe fn reset_to(m: usize) {
-    write_volatile(CTR as *mut usize, m);
+    let bounded = m.min(HEAP_SIZE - (DATA - HEAP_BASE));
+    unsafe {
+        write_word(CTR, bounded);
+        trim_free_list_to(DATA + bounded);
+    }
 }

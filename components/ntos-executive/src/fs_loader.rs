@@ -13,9 +13,8 @@ struct DirFindLfnScratch {
 
 const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
-const _: () = assert!(
-    FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 <= 0x1000
-);
+const _: () =
+    assert!(FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 <= 0x1000);
 
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
 pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
@@ -215,8 +214,7 @@ pub(crate) unsafe fn dir_find_lfn(
     dir_cluster: u32,
     comp: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    let DirFindLfnScratch { short, want, lfn } =
-        &mut *(fs.scratch_vaddr as *mut DirFindLfnScratch);
+    let DirFindLfnScratch { short, want, lfn } = &mut *(fs.scratch_vaddr as *mut DirFindLfnScratch);
     name_to_83_into(comp, short);
     // Lowercase the target (ASCII) once.
     let want_len = if comp.len() < 256 { comp.len() } else { 256 };

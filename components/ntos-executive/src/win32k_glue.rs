@@ -4790,8 +4790,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let callback_client = client.callback_client();
     let callback_capable = user_callback_client_can_register(callback_client);
-    if callback_capable
-        && !register_user_callback_client_for_dispatch(dispatch_id, callback_client)
+    if callback_capable && !register_user_callback_client_for_dispatch(dispatch_id, callback_client)
     {
         print_str(b"[user-callback] callback client registry full for dispatch\n");
         return (0xC000_009Au64, false);
@@ -5011,7 +5010,12 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         }
     }
     if callback_capable && !pr.callback_suspended {
-        unregister_user_callback_client_for_dispatch(dispatch_id, client.pi, client.tid, client.badge);
+        unregister_user_callback_client_for_dispatch(
+            dispatch_id,
+            client.pi,
+            client.tid,
+            client.badge,
+        );
     }
     (pr.result, pr.completed)
 }

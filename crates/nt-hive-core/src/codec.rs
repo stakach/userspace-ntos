@@ -66,7 +66,7 @@ pub fn encode_image(hive: &Hive) -> Vec<u8> {
         p.u64(v.parent_key.0);
         p.str16(&v.name);
         p.u32(v.value_type as u32);
-        p.blob(&v.data);
+        p.blob(hive.value_data(v).unwrap_or(&[]));
         p.u64(v.last_write_sequence);
         record_count += 1;
     }
@@ -128,7 +128,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
     // Rebuild the arena: key cells first, then values; parent/subkey links reconstructed.
     let mut hive = Hive::empty(kind, CellId(root_cell), generation, sequence);
     let mut pr = Reader::new(payload);
-    let mut pending_values: Vec<ValueCell> = Vec::new();
+    let mut pending_values: Vec<(ValueCell, Vec<u8>)> = Vec::new();
     while !pr.is_empty() {
         match pr.u16().ok_or(HiveDecodeError::Truncated)? {
             REC_KEY_CELL => {
@@ -169,21 +169,25 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                 let ty = pr.u32().ok_or(HiveDecodeError::Truncated)?;
                 let data = pr.blob().ok_or(HiveDecodeError::Truncated)?;
                 let seq = pr.u64().ok_or(HiveDecodeError::Truncated)?;
-                pending_values.push(ValueCell {
-                    id,
-                    parent_key,
-                    name,
-                    value_type: RegistryValueType::from_u32(ty)
-                        .unwrap_or(RegistryValueType::Binary),
+                pending_values.push((
+                    ValueCell {
+                        id,
+                        parent_key,
+                        name,
+                        value_type: RegistryValueType::from_u32(ty)
+                            .unwrap_or(RegistryValueType::Binary),
+                        data_blob: 0,
+                        last_write_sequence: seq,
+                    },
                     data,
-                    last_write_sequence: seq,
-                });
+                ));
             }
             _ => return Err(HiveDecodeError::Truncated),
         }
     }
     hive.relink_subkeys();
-    for v in pending_values {
+    for (mut v, data) in pending_values {
+        v.data_blob = hive.intern_value_data(data);
         hive.insert_value(v);
     }
     Ok(hive)
@@ -319,12 +323,13 @@ impl Hive {
     fn empty(kind: HiveKind, root: CellId, generation: u64, sequence: u64) -> Hive {
         Hive {
             cells: Vec::new(),
+            value_blobs: Vec::new(),
             root,
             next_id: 1,
             kind,
             generation,
             sequence,
-            dirty: Vec::new(),
+            clean_sequence: sequence,
         }
     }
     fn insert_key(&mut self, k: KeyCell) {

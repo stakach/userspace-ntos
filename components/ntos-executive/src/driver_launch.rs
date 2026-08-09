@@ -29,7 +29,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
-use nt_kernel_exec::{kevent, EventKind};
 use nt_io_abi::major;
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
@@ -42,6 +41,7 @@ use nt_io_manager::{
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
+use nt_kernel_exec::{kevent, EventKind};
 use nt_mdl::MdlRegistry;
 use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
@@ -268,10 +268,8 @@ pub const SH_DPC_QUEUE_BASE: u64 = SH_HANDOFF_ARENA_BASE; // out: queued KDPC po
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
 pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
     ((SH_HANDOFF_ARENA_LIMIT - SH_HANDOFF_ARENA_BASE) / 8) & !0x7;
-pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 =
-    SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
-pub const SH_DMA_ALLOC_RECORDS: u64 =
-    SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
+pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 = SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
+pub const SH_DMA_ALLOC_RECORDS: u64 = SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
@@ -415,10 +413,7 @@ const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_COMPLETED_WRITE_CAP: usize = 128;
 const FSD_COMPLETED_READ_CAP: usize = 30;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
-const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(
-    FSD_RUNTIME_TABLES_OFF + 0x10,
-    8,
-);
+const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
 const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
     FSD_COMPLETED_WRITES_OFF
         + core::mem::size_of::<CompletedWrite>() as u64 * FSD_COMPLETED_WRITE_CAP as u64,
@@ -453,16 +448,14 @@ unsafe fn pending_irp_head(data_base: u64) -> *mut u64 {
 unsafe fn completed_write_slot(data_base: u64, index: usize) -> *mut CompletedWrite {
     (data_base
         + FSD_COMPLETED_WRITES_OFF
-        + (index as u64) * core::mem::size_of::<CompletedWrite>() as u64)
-        as *mut CompletedWrite
+        + (index as u64) * core::mem::size_of::<CompletedWrite>() as u64) as *mut CompletedWrite
 }
 
 #[inline]
 unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRead {
     (data_base
         + FSD_COMPLETED_READS_OFF
-        + (index as u64) * core::mem::size_of::<CompletedRead>() as u64)
-        as *mut CompletedRead
+        + (index as u64) * core::mem::size_of::<CompletedRead>() as u64) as *mut CompletedRead
 }
 
 #[inline]
@@ -1499,9 +1492,8 @@ static mut DRIVER_REGISTRY_HANDLES: Option<Vec<DriverRegistryHandleSlot>> = None
 static mut HOSTED_REGISTRY_IDENTITIES: Option<Vec<HostedRegistryIdentitySlot>> = None;
 static mut HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId =
     INVALID_HOSTED_REGISTRY_IDENTITY_ID;
-static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<
-    Vec<HostedDeviceInterfaceRegistration>,
-> = None;
+static mut HOSTED_DEVICE_INTERFACE_REGISTRATIONS: Option<Vec<HostedDeviceInterfaceRegistration>> =
+    None;
 
 #[inline]
 fn ascii_upcase_u16(c: u16) -> u16 {
@@ -1892,7 +1884,10 @@ unsafe fn write_allocated_unicode_string_from_ascii<const N: usize>(
         i += 1;
     }
     write_unaligned((buf + data_len as u64) as *mut u16, 0);
-    write_unaligned((us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, data_len as u16);
+    write_unaligned(
+        (us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16,
+        data_len as u16,
+    );
     write_unaligned(
         (us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
         alloc_len as u16,
@@ -2306,7 +2301,8 @@ extern "win64" fn s_rtl_ansi_string_to_unicode_string(dst: u64, src: u64, alloca
             write_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, p);
             p
         } else {
-            let max_len = read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16);
+            let max_len =
+                read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16);
             let p = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
             if out_len > max_len || (out_len != 0 && p == 0) {
                 return STATUS_BUFFER_TOO_SMALL;
@@ -2320,7 +2316,10 @@ extern "win64" fn s_rtl_ansi_string_to_unicode_string(dst: u64, src: u64, alloca
             i += 1;
         }
         write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, out_len);
-        if out_len <= read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16).saturating_sub(2) {
+        if out_len
+            <= read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16)
+                .saturating_sub(2)
+        {
             write_unaligned((dst_buf + out_len as u64) as *mut u16, 0);
         }
     }
@@ -2368,7 +2367,10 @@ extern "win64" fn s_rtl_unicode_string_to_ansi_string(dst: u64, src: u64, alloca
             i += 1;
         }
         write_unaligned((dst + ANSI_STRING_LENGTH_OFFSET) as *mut u16, out_len);
-        if out_len <= read_unaligned((dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16).saturating_sub(1) {
+        if out_len
+            <= read_unaligned((dst + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16)
+                .saturating_sub(1)
+        {
             write_unaligned((dst_buf + out_len as u64) as *mut u8, 0);
         }
     }
@@ -2416,7 +2418,8 @@ extern "win64" fn s_rtl_integer_to_unicode_string(value: u32, base: u32, dst: u6
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
-        let max_len = read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
+        let max_len =
+            read_unaligned((dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) & !1;
         let buf = read_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *const u64);
         if buf == 0 {
             return STATUS_INVALID_PARAMETER;
@@ -2512,8 +2515,16 @@ extern "win64" fn s_wcsncmp(left: u64, right: u64, count: u64) -> i32 {
     unsafe {
         let mut i = 0u64;
         while i < count {
-            let a = if left == 0 { 0 } else { read_unaligned((left + i * 2) as *const u16) };
-            let b = if right == 0 { 0 } else { read_unaligned((right + i * 2) as *const u16) };
+            let a = if left == 0 {
+                0
+            } else {
+                read_unaligned((left + i * 2) as *const u16)
+            };
+            let b = if right == 0 {
+                0
+            } else {
+                read_unaligned((right + i * 2) as *const u16)
+            };
             if a != b || a == 0 || b == 0 {
                 return a as i32 - b as i32;
             }
@@ -2527,7 +2538,11 @@ extern "win64" fn s_wcscpy(dst: u64, src: u64) -> u64 {
     unsafe {
         let mut i = 0u64;
         loop {
-            let c = if src == 0 { 0 } else { read_unaligned((src + i * 2) as *const u16) };
+            let c = if src == 0 {
+                0
+            } else {
+                read_unaligned((src + i * 2) as *const u16)
+            };
             write_unaligned((dst + i * 2) as *mut u16, c);
             i += 1;
             if c == 0 {
@@ -2578,7 +2593,11 @@ extern "win64" fn s_wcsncat(dst: u64, src: u64, count: u64) -> u64 {
         let mut out = wcs_end(dst);
         let mut i = 0u64;
         while i < count {
-            let c = if src == 0 { 0 } else { read_unaligned((src + i * 2) as *const u16) };
+            let c = if src == 0 {
+                0
+            } else {
+                read_unaligned((src + i * 2) as *const u16)
+            };
             if c == 0 {
                 break;
             }
@@ -2742,10 +2761,9 @@ extern "win64" fn s_io_allocate_driver_object_extension(
     }
     unsafe {
         let table = driver_object_extensions_mut();
-        if table
-            .iter()
-            .any(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
-        {
+        if table.iter().any(|slot| {
+            slot.used && slot.driver_object == driver_object && slot.client_id == client_id
+        }) {
             write_unaligned(extension_out as *mut u64, 0);
             return STATUS_OBJECT_NAME_COLLISION;
         }
@@ -2780,7 +2798,9 @@ extern "win64" fn s_io_get_driver_object_extension(driver_object: u64, client_id
         };
         table
             .iter()
-            .find(|slot| slot.used && slot.driver_object == driver_object && slot.client_id == client_id)
+            .find(|slot| {
+                slot.used && slot.driver_object == driver_object && slot.client_id == client_id
+            })
             .map(|slot| slot.extension)
             .unwrap_or(0)
     }
@@ -2982,7 +3002,8 @@ extern "win64" fn s_io_open_device_registry_key(
             write_unaligned(handle_out as *mut u64, 0);
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
-        let Some(handle) = allocate_driver_registry_handle(DriverRegistryHandleKind::DriverKey, identity)
+        let Some(handle) =
+            allocate_driver_registry_handle(DriverRegistryHandleKind::DriverKey, identity)
         else {
             write_unaligned(handle_out as *mut u64, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -3073,9 +3094,7 @@ unsafe fn hosted_pdo_known(pdo: u64) -> bool {
             || read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64) == pdo)
 }
 
-unsafe fn hosted_registry_identity_by_pdo_object(
-    pdo: u64,
-) -> Option<HostedDriverRegistryIdentity> {
+unsafe fn hosted_registry_identity_by_pdo_object(pdo: u64) -> Option<HostedDriverRegistryIdentity> {
     if let Some(identity_id) = hosted_registry_identity_id_by_pdo_object(pdo) {
         if let Some(identity) = hosted_registry_identity(identity_id) {
             return Some(identity);
@@ -3089,9 +3108,7 @@ unsafe fn hosted_registry_identity_by_pdo_object(
     }
 }
 
-unsafe fn hosted_registry_identity_id_by_pdo_object(
-    pdo: u64,
-) -> Option<HostedRegistryIdentityId> {
+unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRegistryIdentityId> {
     if pdo == 0 {
         return None;
     }
@@ -3328,12 +3345,18 @@ extern "win64" fn s_io_register_device_interface(
         return STATUS_INVALID_PARAMETER;
     }
     unsafe {
-        write_unaligned((symbolic_link_name + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, 0);
+        write_unaligned(
+            (symbolic_link_name + UNICODE_STRING_LENGTH_OFFSET) as *mut u16,
+            0,
+        );
         write_unaligned(
             (symbolic_link_name + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
             0,
         );
-        write_unaligned((symbolic_link_name + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, 0);
+        write_unaligned(
+            (symbolic_link_name + UNICODE_STRING_BUFFER_OFFSET) as *mut u64,
+            0,
+        );
 
         if !hosted_pdo_known(pdo) {
             return STATUS_INVALID_PARAMETER;
@@ -3347,9 +3370,10 @@ extern "win64" fn s_io_register_device_interface(
         let reference = if reference_string == 0 {
             HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty()
         } else {
-            let Some(reference) =
-                unicode_string_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(reference_string, true)
-            else {
+            let Some(reference) = unicode_string_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(
+                reference_string,
+                true,
+            ) else {
                 return STATUS_INVALID_PARAMETER;
             };
             reference
@@ -3390,10 +3414,9 @@ extern "win64" fn s_io_set_device_interface_state(symbolic_link_name: u64, enabl
         else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let Some(slot) = table
-            .iter_mut()
-            .find(|slot| slot.used && hosted_ascii_eq_ignore_case(&slot.symbolic_link, &symbolic_link))
-        else {
+        let Some(slot) = table.iter_mut().find(|slot| {
+            slot.used && hosted_ascii_eq_ignore_case(&slot.symbolic_link, &symbolic_link)
+        }) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         if (enable != 0) == slot.enabled {
@@ -3601,8 +3624,7 @@ extern "win64" fn s_io_allocate_irp(stack_size: u8, _charge_quota: u8) -> u64 {
     if stack_count == 0 || stack_count > 32 {
         return 0;
     }
-    let total =
-        WDM_X64_IRP_SIZE as u64 + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    let total = WDM_X64_IRP_SIZE as u64 + stack_count * WDM_X64_IO_STACK_LOCATION_SIZE as u64;
     unsafe {
         let irp = pool_alloc(total);
         if irp == 0 {
@@ -3752,7 +3774,10 @@ extern "win64" fn s_io_csq_insert_irp(csq: u64, irp: u64, context: u64) {
             );
             write_unaligned((context + IO_CSQ_IRP_CONTEXT_IRP_OFFSET) as *mut u64, irp);
             write_unaligned((context + IO_CSQ_IRP_CONTEXT_CSQ_OFFSET) as *mut u64, csq);
-            write_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64, context);
+            write_unaligned(
+                (irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64,
+                context,
+            );
         } else {
             write_unaligned((irp + WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET) as *mut u64, csq);
         }
@@ -3807,8 +3832,7 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
             core::mem::transmute(peek as *const ());
         let irp = peek_fn(csq, 0, peek_context);
         if irp != 0 {
-            let remove_fn: extern "win64" fn(u64, u64) =
-                core::mem::transmute(remove as *const ());
+            let remove_fn: extern "win64" fn(u64, u64) = core::mem::transmute(remove as *const ());
             remove_fn(csq, irp);
             csq_clear_irp_context(irp);
         }
@@ -3860,7 +3884,10 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             status,
         );
         if irp != 0 {
-            write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+                status,
+            );
             if next != 0 {
                 complete_forwarded_stack_location(irp, next, status);
             }
@@ -3870,14 +3897,12 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
 }
 
 unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
-    let completion = read_unaligned(
-        (stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64,
-    );
+    let completion =
+        read_unaligned((stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64);
     if completion == 0 {
         return;
     }
-    let control =
-        read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
+    let control = read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8);
     let invoke = if status >= 0 {
         (control & WDM_X64_SL_INVOKE_ON_SUCCESS) != 0
     } else {
@@ -3887,8 +3912,7 @@ unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
         return;
     }
 
-    let current_location =
-        read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
+    let current_location = read_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *const u8);
     let stack_count = read_unaligned((irp + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8);
     let next_location = current_location.saturating_add(1);
     let next_stack = stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64;
@@ -3960,10 +3984,7 @@ extern "win64" fn s_io_allocate_mdl(
             (mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
             virtual_address & !0xFFF,
         );
-        write_unaligned(
-            (mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
-            length,
-        );
+        write_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32, length);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
             (virtual_address & 0xFFF) as u32,
@@ -3985,13 +4006,19 @@ extern "win64" fn s_io_free_mdl(mdl: u64) {
 }
 
 /// `VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length)`.
-extern "win64" fn s_io_build_partial_mdl(source_mdl: u64, target_mdl: u64, virtual_address: u64, length: u32) {
+extern "win64" fn s_io_build_partial_mdl(
+    source_mdl: u64,
+    target_mdl: u64,
+    virtual_address: u64,
+    length: u32,
+) {
     if source_mdl == 0 || target_mdl == 0 {
         return;
     }
     unsafe {
         let source_start = read_unaligned((source_mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
-        let source_offset = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+        let source_offset =
+            read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
         let source_len = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32);
         let va = if virtual_address != 0 {
             virtual_address
@@ -4012,15 +4039,15 @@ extern "win64" fn s_io_build_partial_mdl(source_mdl: u64, target_mdl: u64, virtu
             (target_mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
             va & !0xFFF,
         );
-        write_unaligned(
-            (target_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
-            len,
-        );
+        write_unaligned((target_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32, len);
         write_unaligned(
             (target_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
             (va & 0xFFF) as u32,
         );
-        write_unaligned((target_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64, va);
+        write_unaligned(
+            (target_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
+            va,
+        );
     }
 }
 
@@ -4222,10 +4249,7 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
                 0,
             );
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
-                0,
-            );
+            write_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             write_volatile(
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
                 0,
@@ -4453,12 +4477,9 @@ extern "win64" fn s_dma_allocate_common_buffer(
             if end > grant_len {
                 return 0;
             }
-            if let Some(next_offset) = dma_allocation_range_overlaps(
-                FSD_SHARED_VADDR,
-                grant_logical,
-                aligned,
-                requested,
-            ) {
+            if let Some(next_offset) =
+                dma_allocation_range_overlaps(FSD_SHARED_VADDR, grant_logical, aligned, requested)
+            {
                 offset = next_offset;
                 continue;
             }
@@ -4485,7 +4506,10 @@ extern "win64" fn s_dma_allocate_common_buffer(
         let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
             .saturating_add(1);
         if used > count {
-            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64, used);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64,
+                used,
+            );
         }
         let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
         let end = offset + requested;
@@ -4914,7 +4938,8 @@ extern "win64" fn s_rtl_query_registry_values(
             let default_data = read_unaligned((entry + 40) as *const u64);
             let default_length = read_unaligned((entry + 48) as *const u32);
 
-            if routine == 0 && (flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT)) == 0
+            if routine == 0
+                && (flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT)) == 0
             {
                 break;
             }
@@ -4925,7 +4950,9 @@ extern "win64" fn s_rtl_query_registry_values(
                 }
                 let linkage_export = registry_path
                     .as_ref()
-                    .and_then(|registry_path| hosted_registry_identity_by_linkage_path(registry_path))
+                    .and_then(|registry_path| {
+                        hosted_registry_identity_by_linkage_path(registry_path)
+                    })
                     .filter(|identity| {
                         wide_cstr_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(name)
                             .as_ref()
@@ -4938,8 +4965,10 @@ extern "win64" fn s_rtl_query_registry_values(
                     if entry_context == 0 {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    let status =
-                        write_allocated_unicode_string_from_ascii(entry_context, &identity.export_name);
+                    let status = write_allocated_unicode_string_from_ascii(
+                        entry_context,
+                        &identity.export_name,
+                    );
                     if status < 0 {
                         return status;
                     }
@@ -5054,7 +5083,11 @@ extern "win64" fn s_ex_interlocked_remove_head_list(head: u64, _lock: u64) -> u6
 }
 
 /// `LARGE_INTEGER ExInterlockedAddLargeInteger(PLARGE_INTEGER, LARGE_INTEGER, PKSPIN_LOCK)`.
-extern "win64" fn s_ex_interlocked_add_large_integer(addend: u64, increment: i64, _lock: u64) -> i64 {
+extern "win64" fn s_ex_interlocked_add_large_integer(
+    addend: u64,
+    increment: i64,
+    _lock: u64,
+) -> i64 {
     unsafe {
         if addend == 0 {
             return 0;
@@ -5452,8 +5485,7 @@ unsafe fn fsd_drain_queued_dpcs() -> u64 {
         let context = read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
         let arg1 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *const u64);
         let arg2 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *const u64);
-        let f: extern "win64" fn(u64, u64, u64, u64) =
-            core::mem::transmute(routine as *const ());
+        let f: extern "win64" fn(u64, u64, u64, u64) = core::mem::transmute(routine as *const ());
         let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
         f(dpc, context, arg1, arg2);
         hosted_lower_irql(old_irql);
@@ -5899,7 +5931,8 @@ extern "win64" fn s_hal_translate_bus_address(
         if !hosted_resource_identity_active()
             || interface_type
                 != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
-            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+            || bus_number
+                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
         {
             return 0;
         }
@@ -5959,13 +5992,15 @@ extern "win64" fn s_hal_get_interrupt_vector(
         if !hosted_resource_identity_active()
             || interface_type
                 != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
-            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+            || bus_number
+                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
         {
             return 0;
         }
         let granted_vector =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
-        if granted_vector == 0 || (bus_interrupt_vector != 0 && bus_interrupt_vector != granted_vector)
+        if granted_vector == 0
+            || (bus_interrupt_vector != 0 && bus_interrupt_vector != granted_vector)
         {
             return 0;
         }
@@ -5975,7 +6010,10 @@ extern "win64" fn s_hal_get_interrupt_vector(
         if affinity_out != 0 {
             let affinity =
                 read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
-            write_unaligned(affinity_out as *mut u64, if affinity == 0 { 1 } else { affinity });
+            write_unaligned(
+                affinity_out as *mut u64,
+                if affinity == 0 { 1 } else { affinity },
+            );
         }
         granted_vector
     }
@@ -6042,7 +6080,8 @@ extern "win64" fn s_hal_get_bus_data_by_offset(
             || !hosted_resource_identity_active()
             || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
                 != HOSTED_INTERFACE_TYPE_PCIBUS
-            || bus_number != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
+            || bus_number
+                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
             || !hosted_pci_slot_number_matches(slot_number)
         {
             return 0;
@@ -6536,10 +6575,7 @@ fn register_fsd_trampolines() {
         "KeInitializeEvent",
         s_ke_initialize_event as *const () as usize as u64,
     );
-    reg.bind(
-        "KeSetEvent",
-        s_ke_set_event as *const () as usize as u64,
-    );
+    reg.bind("KeSetEvent", s_ke_set_event as *const () as usize as u64);
     reg.bind(
         "KeClearEvent",
         s_ke_clear_event as *const () as usize as u64,
@@ -6564,7 +6600,10 @@ fn register_fsd_trampolines() {
         "KeInsertQueueDpc",
         s_ke_insert_queue_dpc as *const () as usize as u64,
     );
-    reg.bind("KeQueryTimeIncrement", s_ke_query_time_increment as usize as u64);
+    reg.bind(
+        "KeQueryTimeIncrement",
+        s_ke_query_time_increment as usize as u64,
+    );
     reg.bind(
         "KeGetRecommendedSharedDataAlignment",
         s_ke_get_recommended_shared_data_alignment as usize as u64,
@@ -6855,7 +6894,8 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     if major == FSD_DISPATCH_INTERRUPT {
         let interrupt_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
         let vector = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
-        let expected_id = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+        let expected_id =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *const u64);
         let expected_vector =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
         let interrupt_object =
@@ -8029,13 +8069,8 @@ unsafe fn load_pe_into(
                     return None;
                 }
                 let mut name_buf = [0u8; 128];
-                let name = read_pe_ascii(
-                    dst_va,
-                    cap,
-                    thunk & 0x7FFF_FFFF_FFFF_FFFF,
-                    2,
-                    &mut name_buf,
-                )?;
+                let name =
+                    read_pe_ascii(dst_va, cap, thunk & 0x7FFF_FFFF_FFFF_FFFF, 2, &mut name_buf)?;
                 let addr = resolve(dll, name)?;
                 write_unaligned((dst_va + slot_rva) as *mut u64, addr);
                 k = k.checked_add(1)?;
@@ -8266,7 +8301,10 @@ unsafe fn load_driver_reserved(
     write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
-    write_volatile((win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64, support_entry_rva);
+    write_volatile(
+        (win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64,
+        support_entry_rva,
+    );
     write_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
     write_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
     write_volatile(
@@ -9117,8 +9155,11 @@ fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtSt
 }
 
 unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::NtStatus> {
-    let (link_len, link_utf16) =
-        read_shared_path_capture(sh, SH_DEVICE_INTERFACE_LINK_LEN, SH_DEVICE_INTERFACE_LINK_BUF);
+    let (link_len, link_utf16) = read_shared_path_capture(
+        sh,
+        SH_DEVICE_INTERFACE_LINK_LEN,
+        SH_DEVICE_INTERFACE_LINK_BUF,
+    );
     if link_len == 0 {
         return Ok(());
     }
@@ -9755,7 +9796,9 @@ fn reserve_instance_slot() -> Option<usize> {
             table
                 .iter()
                 .enumerate()
-                .find(|(index, slot)| !slot.used && ExecVaWindow::try_for_instance(*index).is_some())
+                .find(|(index, slot)| {
+                    !slot.used && ExecVaWindow::try_for_instance(*index).is_some()
+                })
                 .map(|(index, _)| index)
         })
     };
@@ -9855,12 +9898,7 @@ unsafe fn ensure_instance_exec_pd(instance: usize, vaddr: u64) -> Option<()> {
 
 unsafe fn map_instance_exec_pt(instance: usize, cap: u64, vaddr: u64) -> Option<()> {
     ensure_instance_exec_pd(instance, vaddr)?;
-    let label = paging_struct_map_r(
-        cap,
-        LBL_X86_PAGE_TABLE_MAP,
-        vaddr,
-        CAP_INIT_THREAD_VSPACE,
-    );
+    let label = paging_struct_map_r(cap, LBL_X86_PAGE_TABLE_MAP, vaddr, CAP_INIT_THREAD_VSPACE);
     if label != 0 && label != SEL4_DELETE_FIRST {
         print_str(b"[driver-launch] exec PT map failed inst=");
         print_u64(instance as u64);
@@ -10014,12 +10052,9 @@ fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {
     let t = unsafe { driver_instances()? };
-    t.iter()
-        .copied()
-        .enumerate()
-        .find(|(_, entry)| {
-            entry.used && entry.device_object != 0 && entry.device_object == device_object
-        })
+    t.iter().copied().enumerate().find(|(_, entry)| {
+        entry.used && entry.device_object != 0 && entry.device_object == device_object
+    })
 }
 
 fn destroy_registered_driver_after_unload(driver_id: u64) -> Result<(), nt_status::NtStatus> {
@@ -10421,7 +10456,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
     write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mapped_len);
     write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, io_port_base);
-    write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, io_port_len as u64);
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64,
+        io_port_len as u64,
+    );
     write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, io_port_cap);
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, mmio_va);

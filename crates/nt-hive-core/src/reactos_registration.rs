@@ -18,6 +18,139 @@ pub const CLSID_START_MENU: &str = "{4622AD11-FF23-11D0-8D34-00A0C90F2719}";
 pub const CLSID_REBAR_BAND_SITE: &str = "{ECD4FC4D-521C-11D0-B792-00A0C90312E1}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReactOsProfileShellFolder {
+    pub value_name: &'static str,
+    pub path: &'static str,
+    pub shell_folder: bool,
+    pub user_shell_folder: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReactOsProfileShellFolderSeedStats {
+    pub shell_folder_values: u32,
+    pub user_shell_folder_values: u32,
+}
+
+impl ReactOsProfileShellFolderSeedStats {
+    pub fn total_values(self) -> u32 {
+        self.shell_folder_values + self.user_shell_folder_values
+    }
+}
+
+/// ReactOS `dll/win32/userenv/setup.c` `UserShellFolders`. The resource-backed localized names
+/// fall back to these literal paths, which match the LiveCD profile tree staged for this bring-up.
+pub const REACTOS_USER_PROFILE_SHELL_FOLDERS: &[ReactOsProfileShellFolder] = &[
+    ReactOsProfileShellFolder {
+        value_name: "AppData",
+        path: "Application Data",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Desktop",
+        path: "Desktop",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Favorites",
+        path: "Favorites",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Personal",
+        path: "My Documents",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "NetHood",
+        path: "NetHood",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "PrintHood",
+        path: "PrintHood",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Recent",
+        path: "Recent",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "SendTo",
+        path: "SendTo",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Templates",
+        path: "Templates",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Start Menu",
+        path: "Start Menu",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Programs",
+        path: r"Start Menu\Programs",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Startup",
+        path: r"Start Menu\Programs\Startup",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Local Settings",
+        path: "Local Settings",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Local AppData",
+        path: r"Local Settings\Application Data",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Temp",
+        path: r"Local Settings\Temp",
+        shell_folder: false,
+        user_shell_folder: false,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Cache",
+        path: r"Local Settings\Temporary Internet Files",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "History",
+        path: r"Local Settings\History",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+    ReactOsProfileShellFolder {
+        value_name: "Cookies",
+        path: "Cookies",
+        shell_folder: true,
+        user_shell_folder: true,
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReactOsComClassRegistrationScript {
     pub clsid: &'static str,
     pub module: &'static str,
@@ -47,7 +180,7 @@ pub const REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS: &[ReactOsComClassRegi
 ];
 
 pub fn utf16le_sz(s: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity((s.encode_utf16().count() + 1) * 2);
     for unit in s.encode_utf16() {
         out.extend_from_slice(&unit.to_le_bytes());
     }
@@ -66,6 +199,17 @@ fn join_key_path(parent: &str, child: &str) -> String {
         canon_path(child)
     } else {
         canon_path(&format!(r"{}\{}", root, child))
+    }
+}
+
+fn join_registry_profile_path(profile_root: &str, child: &str) -> String {
+    let root = profile_root.trim_end_matches('\\');
+    if root.is_empty() {
+        String::from(child)
+    } else if child.is_empty() {
+        String::from(root)
+    } else {
+        format!(r"{}\{}", root, child)
     }
 }
 
@@ -99,8 +243,12 @@ fn parse_rgs_reg_sz(rest: &str, module: &str) -> Option<Vec<u8>> {
     let after_type = after_equals.strip_prefix('s')?.trim_start();
     let value = after_type.strip_prefix('\'')?;
     let end = value.find('\'')?;
-    let value = value[..end].replace("%MODULE%", module);
-    Some(utf16le_sz(&value))
+    let value = &value[..end];
+    if value.contains("%MODULE%") {
+        Some(utf16le_sz(&value.replace("%MODULE%", module)))
+    } else {
+        Some(utf16le_sz(value))
+    }
 }
 
 trait RgsSeedTarget {
@@ -121,7 +269,7 @@ struct OverlayRgsSeedTarget<'a> {
 
 impl RgsSeedTarget for OverlayRgsSeedTarget<'_> {
     fn create_key(&mut self, path: &str) -> bool {
-        self.overlay.create(&canon_path(path));
+        self.overlay.create(path);
         true
     }
 
@@ -132,14 +280,14 @@ impl RgsSeedTarget for OverlayRgsSeedTarget<'_> {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
-        let (index, _) = self.overlay.create(&canon_path(path));
+        let (index, _) = self.overlay.create(path);
         self.overlay
             .set_value(index, name, value_type as u32, &data)
     }
 
     fn has_value(&self, path: &str, name: &str) -> bool {
         self.overlay
-            .find(&canon_path(path))
+            .find(path)
             .is_some_and(|index| self.overlay.value(index, name).is_some())
     }
 }
@@ -150,7 +298,7 @@ struct MutableHiveRgsSeedTarget<'a> {
 
 impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
     fn create_key(&mut self, path: &str) -> bool {
-        self.hives.create_key(&canon_path(path)).is_some()
+        self.hives.create_key(path).is_some()
     }
 
     fn set_value(
@@ -160,7 +308,7 @@ impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
-        let Some(key) = self.hives.create_key(&canon_path(path)) else {
+        let Some(key) = self.hives.create_key(path) else {
             return false;
         };
         self.hives.set_value(key, name, value_type, data)
@@ -168,7 +316,7 @@ impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
 
     fn has_value(&self, path: &str, name: &str) -> bool {
         self.hives
-            .resolve_key(&canon_path(path))
+            .resolve_key(path)
             .and_then(|key| self.hives.query_value(key, name))
             .is_some()
     }
@@ -257,8 +405,8 @@ fn rgs_script_materialized_expected_class<T: RgsSeedTarget>(
     classes_root: &str,
     clsid: &str,
 ) -> bool {
-    let class_path = class_key(classes_root, clsid);
-    let inproc_path = format!(r"{}\InprocServer32", class_key(classes_root, clsid));
+    let class_path = canon_path(&class_key(classes_root, clsid));
+    let inproc_path = join_key_path(&class_path, "InprocServer32");
     target.has_value(&class_path, "")
         && target.has_value(&inproc_path, "")
         && target.has_value(&inproc_path, "ThreadingModel")
@@ -277,6 +425,52 @@ fn seed_reactos_explorer_shell_com_classes_into<T: RgsSeedTarget>(
         }
     }
     mask
+}
+
+fn seed_reactos_user_profile_shell_folders_into<T: RgsSeedTarget>(
+    target: &mut T,
+    user_hive_root: &str,
+    profile_path: &str,
+    user_shell_profile_root: &str,
+) -> ReactOsProfileShellFolderSeedStats {
+    let shell_key = join_key_path(
+        user_hive_root,
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+    );
+    let user_shell_key = join_key_path(
+        user_hive_root,
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+    );
+    if !target.create_key(&shell_key) || !target.create_key(&user_shell_key) {
+        return ReactOsProfileShellFolderSeedStats::default();
+    }
+
+    let mut stats = ReactOsProfileShellFolderSeedStats::default();
+    for folder in REACTOS_USER_PROFILE_SHELL_FOLDERS {
+        if folder.shell_folder {
+            let path = join_registry_profile_path(profile_path, folder.path);
+            if target.set_value(
+                &shell_key,
+                folder.value_name,
+                RegistryValueType::Sz,
+                utf16le_sz(&path),
+            ) {
+                stats.shell_folder_values += 1;
+            }
+        }
+        if folder.user_shell_folder {
+            let path = join_registry_profile_path(user_shell_profile_root, folder.path);
+            if target.set_value(
+                &user_shell_key,
+                folder.value_name,
+                RegistryValueType::ExpandSz,
+                utf16le_sz(&path),
+            ) {
+                stats.user_shell_folder_values += 1;
+            }
+        }
+    }
+    stats
 }
 
 /// Seed explorer's shell COM classes under `classes_root` (normally
@@ -306,6 +500,38 @@ pub fn seed_reactos_explorer_shell_com_classes_in_mutable_hives(
     seed_reactos_explorer_shell_com_classes_into(
         &mut MutableHiveRgsSeedTarget { hives },
         classes_root,
+    )
+}
+
+/// Seed the ReactOS setup user-profile shell-folder values into a mounted user hive.
+///
+/// `user_hive_root` is normally `\Registry\User\.Default` during setup. The `Shell Folders` values
+/// get absolute profile paths, while `User Shell Folders` keep the expandable profile root, matching
+/// `dll/win32/userenv/setup.c`.
+pub fn seed_reactos_user_profile_shell_folders_in_mutable_hives(
+    hives: &mut MutableHiveSet,
+    user_hive_root: &str,
+    profile_path: &str,
+    user_shell_profile_root: &str,
+) -> ReactOsProfileShellFolderSeedStats {
+    seed_reactos_user_profile_shell_folders_into(
+        &mut MutableHiveRgsSeedTarget { hives },
+        user_hive_root,
+        profile_path,
+        user_shell_profile_root,
+    )
+}
+
+/// Seed the default-user hive exactly where ReactOS setup's standard-profile pass writes it.
+pub fn seed_reactos_default_user_shell_folders_in_mutable_hives(
+    hives: &mut MutableHiveSet,
+    default_user_profile_path: &str,
+) -> ReactOsProfileShellFolderSeedStats {
+    seed_reactos_user_profile_shell_folders_in_mutable_hives(
+        hives,
+        r"\Registry\User\.Default",
+        default_user_profile_path,
+        "%USERPROFILE%",
     )
 }
 
@@ -481,6 +707,56 @@ mod tests {
         assert_eq!(second_mask, mask);
         assert_eq!(
             hives.hive(2).expect("software hive").cell_count(),
+            first_cell_count
+        );
+    }
+
+    #[test]
+    fn seeds_default_user_shell_folders_into_mutable_user_hive() {
+        let mut hives = MutableHiveSet::new();
+        hives.mount(r"\Registry\User\.Default", 5, Hive::new(HiveKind::Default));
+
+        let stats = seed_reactos_default_user_shell_folders_in_mutable_hives(
+            &mut hives,
+            r"C:\Profiles\Default User",
+        );
+        assert_eq!(stats.shell_folder_values, 17);
+        assert_eq!(stats.user_shell_folder_values, 17);
+
+        let (ty, data) = hive_value_bytes(
+            &hives,
+            r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            "AppData",
+        );
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(
+            data,
+            utf16le_sz(r"C:\Profiles\Default User\Application Data")
+        );
+
+        let (ty, data) = hive_value_bytes(
+            &hives,
+            r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            "AppData",
+        );
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"%USERPROFILE%\Application Data"));
+
+        let shell_key = hives
+            .resolve_key(
+                r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            )
+            .expect("shell folders key");
+        assert!(hives.query_value(shell_key, "Temp").is_none());
+
+        let first_cell_count = hives.hive(5).expect("default hive").cell_count();
+        let second_stats = seed_reactos_default_user_shell_folders_in_mutable_hives(
+            &mut hives,
+            r"C:\Profiles\Default User",
+        );
+        assert_eq!(second_stats, stats);
+        assert_eq!(
+            hives.hive(5).expect("default hive").cell_count(),
             first_cell_count
         );
     }

@@ -81,7 +81,10 @@ use alloc::vec::Vec;
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
 use nt_config_manager::{DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START};
-use nt_hive_core::{apply_ccs_alias, HiveKind, MutableHiveSet, ResolvedHiveKey};
+use nt_hive_core::{
+    apply_ccs_alias, HiveKind, MutableHiveSet, RegistryValueCopyProvenance,
+    RegistryValueCopyProvenanceTable, ResolvedHiveKey, ResolvedHiveValue,
+};
 use nt_hive_regf::{import_regf_into_hive, KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
@@ -1074,9 +1077,10 @@ pub const SSN_NT_FLUSH_KEY: u64 = 83;
 /// Bypass switch for the `NtFlushKey` gate specs (see the `build_nt_table` row). `true` in tree.
 pub const NT_FLUSH_KEY_SERVICED: bool = true;
 /// `NtSaveKey(IN HANDLE KeyHandle, IN HANDLE FileHandle)` — `ntoskrnl/config/ntapi.c:1634`
-/// (`sysfuncs.lst` line 216 -> SSN 215, two arguments). Root mounted hives can be saved by writing
-/// their live mutable-hive image to a writable FILE_OBJECT; subkey save still requires a subtree
-/// serializer and fails visibly instead of reporting success.
+/// (`sysfuncs.lst` line 216 -> SSN 215, two arguments). Dynamically loaded profile hive roots can
+/// be saved by writing their live mutable-hive image to a writable FILE_OBJECT. Boot hive roots
+/// retain their borrowed `regf` backing until D3 gives them a real checkpoint provider; subkey save
+/// still requires a subtree serializer and fails visibly instead of reporting success.
 pub const SSN_NT_SAVE_KEY: u64 = 215;
 /// **FILE_OBJECT LIFETIME switch** (bypass experiment for `exec_npfs_file_object_lifetime` +
 /// `exec_npfs_concurrent_irp_read_and_write`). `true` in tree = the NT lifetime: ONE FILE_OBJECT per
@@ -1394,9 +1398,9 @@ static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY
 /// ranges under one allocation base. Keep the table precharged for explorer's post-desktop DLL set
 /// without allocating in the syscall-reset window.
 const PROCESS_COMMITTED_MAPPING_CAPACITY: usize = 512;
-static mut PROCESS_COMMITTED_MAPPINGS:
-    [nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>; MAX_PI] =
-    [const { nt_address_space::VmCommittedRangeTable::new() }; MAX_PI];
+static mut PROCESS_COMMITTED_MAPPINGS: [nt_address_space::VmCommittedRangeTable<
+    PROCESS_COMMITTED_MAPPING_CAPACITY,
+>; MAX_PI] = [const { nt_address_space::VmCommittedRangeTable::new() }; MAX_PI];
 
 pub(crate) unsafe fn process_committed_mapping_register(
     pi: u64,
@@ -1908,10 +1912,7 @@ impl GenericSectionTable {
             if page_offset < view_start || page_offset >= view_end {
                 continue;
             }
-            let len = section
-                .size
-                .saturating_sub(page_offset)
-                .min(0x1000) as usize;
+            let len = section.size.saturating_sub(page_offset).min(0x1000) as usize;
             if len == 0 {
                 continue;
             }
@@ -4984,8 +4985,7 @@ fn mapped_section_writecopy_cow_spec(passed: &mut u64) {
     print_str(b"\n");
     check(
         b"exec_mapped_section_writecopy_cow_isolated",
-        proof == MAPPED_SECTION_WRITECOPY_COW_ALL
-            && status == nt_address_space::STATUS_SUCCESS,
+        proof == MAPPED_SECTION_WRITECOPY_COW_ALL && status == nt_address_space::STATUS_SUCCESS,
         passed,
     );
 }
@@ -6686,12 +6686,7 @@ fn try_alloc_slot_run(count: u64) -> Option<u64> {
         if next > end {
             return None;
         }
-        match NEXT_SLOT.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match NEXT_SLOT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => {
                 let mut slot = current;
                 while slot < next {
@@ -8637,8 +8632,7 @@ const IMAGE_WRITECOPY_COW_CLEANED: u64 = 0x100;
 const IMAGE_WRITECOPY_COW_ALL: u64 = 0x1ff;
 static IMAGE_WRITECOPY_COW_RAN: AtomicBool = AtomicBool::new(false);
 static IMAGE_WRITECOPY_COW_SELFTEST: AtomicU64 = AtomicU64::new(0);
-static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 =
-    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 = AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
 const IMAGE_WRITECOPY_COW_PATTERN: &[u8] = b"image writecopy shared source bytes";
 
 // --- CROSS-AUTHORITY VM PLACEMENT SELF-TEST ----------------------------------------------------
@@ -8687,7 +8681,11 @@ fn vm_cross_authority_placement_retry_selftest() -> (u64, u64, u64) {
         ) else {
             break;
         };
-        match fixed.first_overlap_range(plan.base, plan.size).ok().flatten() {
+        match fixed
+            .first_overlap_range(plan.base, plan.size)
+            .ok()
+            .flatten()
+        {
             Some(range) => {
                 let Some(next_lower) = align_up_allocation_granularity(range.end()) else {
                     break;
@@ -8758,7 +8756,12 @@ fn vm_cross_authority_placement_retry_selftest() -> (u64, u64, u64) {
             UPPER,
         )
         .ok()
-        .and_then(|plan| fixed.first_overlap_range(plan.base, plan.size).ok().flatten())
+        .and_then(|plan| {
+            fixed
+                .first_overlap_range(plan.base, plan.size)
+                .ok()
+                .flatten()
+        })
         .is_some()
     {
         proof |= VM_CROSS_AUTH_RETRY_EXPLICIT_CONFLICT;
@@ -8852,20 +8855,18 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     let mut section_index = usize::MAX;
     let table = &mut *core::ptr::addr_of_mut!(MAPPED_SECTION_WRITEBACK_TABLE);
     table.reset();
-    let cleanup = |table: &mut GenericSectionTable,
-                   section_index: usize,
-                   frame: u64,
-                   file_id: u64| unsafe {
-        if section_index != usize::MAX {
-            table.clear_section(section_index);
-        }
-        if frame != 0 {
-            vm_frame_release(frame, 0);
-        }
-        if file_id != 0 {
-            crate::writable_fs::close(file_id);
-        }
-    };
+    let cleanup =
+        |table: &mut GenericSectionTable, section_index: usize, frame: u64, file_id: u64| unsafe {
+            if section_index != usize::MAX {
+                table.clear_section(section_index);
+            }
+            if frame != 0 {
+                vm_frame_release(frame, 0);
+            }
+            if file_id != 0 {
+                crate::writable_fs::close(file_id);
+            }
+        };
 
     let (create_status, created_file, _info) = crate::writable_fs::create(
         RELATIVE_PATH,
@@ -8992,11 +8993,8 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
             return;
         }
     }
-    let (read_status, read_back) = crate::writable_fs::read(
-        file_id,
-        Some(0),
-        MAPPED_SECTION_WRITEBACK_PAYLOAD.len(),
-    );
+    let (read_status, read_back) =
+        crate::writable_fs::read(file_id, Some(0), MAPPED_SECTION_WRITEBACK_PAYLOAD.len());
     status = read_status;
     if read_status == nt_fs::STATUS_SUCCESS
         && read_back.as_slice() == MAPPED_SECTION_WRITEBACK_PAYLOAD
@@ -9174,7 +9172,13 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
         return;
     }
     loose_map_cap = map_cap;
-    if page_map_r(map_cap, page, vm_page_rights(read_plan.map_protection), pml4) != 0 {
+    if page_map_r(
+        map_cap,
+        page,
+        vm_page_rights(read_plan.map_protection),
+        pml4,
+    ) != 0
+    {
         finish_mapped_section_writecopy_cow_selftest(
             pi,
             page,
@@ -9320,11 +9324,7 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
     );
 }
 
-unsafe fn cow_seed_source_frame(
-    frame: u64,
-    scratch_base: u64,
-    pattern: &[u8],
-) -> Result<(), u32> {
+unsafe fn cow_seed_source_frame(frame: u64, scratch_base: u64, pattern: &[u8]) -> Result<(), u32> {
     let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
     if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
@@ -9365,11 +9365,7 @@ unsafe fn cow_frame_prefix_matches(
     Ok(matches)
 }
 
-unsafe fn cow_frame_byte(
-    frame: u64,
-    scratch_base: u64,
-    offset: u64,
-) -> Result<u8, u32> {
+unsafe fn cow_frame_byte(frame: u64, scratch_base: u64, offset: u64) -> Result<u8, u32> {
     let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
     let (copy, copy_error) = copy_cap_r(frame);
     if copy_error != 0 {
@@ -9433,9 +9429,8 @@ unsafe fn finish_image_writecopy_cow_selftest(
         let _ = cnode_delete_recycle_r(loose_map_cap);
     }
     vm_unmap_private_page(pi, page);
-    let clean =
-        csrss_frame_get_exact(pi as u64, page).0 == 0
-            && shared_image_mapping_get(pi as u64, page).is_none();
+    let clean = csrss_frame_get_exact(pi as u64, page).0 == 0
+        && shared_image_mapping_get(pi as u64, page).is_none();
     if source_frame != 0 {
         vm_frame_release(source_frame, 0);
     }
@@ -9492,22 +9487,11 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
     if let Err(status) =
         cow_seed_source_frame(source_frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN)
     {
-        finish_image_writecopy_cow_selftest(
-            pi,
-            page,
-            source_frame,
-            loose_map_cap,
-            proof,
-            status,
-        );
+        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     proof |= IMAGE_WRITECOPY_COW_SEEDED;
-    match cow_frame_prefix_matches(
-        source_frame,
-        scratch_base,
-        IMAGE_WRITECOPY_COW_PATTERN,
-    ) {
+    match cow_frame_prefix_matches(source_frame, scratch_base, IMAGE_WRITECOPY_COW_PATTERN) {
         Ok(true) => {}
         Ok(false) => {
             finish_image_writecopy_cow_selftest(
@@ -9533,10 +9517,8 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         }
     }
 
-    let read_plan = nt_address_space::image_view_fault_plan(
-        nt_address_space::PAGE_EXECUTE_WRITECOPY,
-        false,
-    );
+    let read_plan =
+        nt_address_space::image_view_fault_plan(nt_address_space::PAGE_EXECUTE_WRITECOPY, false);
     let write_plan =
         nt_address_space::image_view_fault_plan(nt_address_space::PAGE_EXECUTE_WRITECOPY, true);
     if !write_plan.copy_on_write {
@@ -9551,14 +9533,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         return;
     }
     if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
-        finish_image_writecopy_cow_selftest(
-            pi,
-            page,
-            source_frame,
-            loose_map_cap,
-            proof,
-            status,
-        );
+        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     let (map_cap, copy_error) = copy_cap_r(source_frame);
@@ -9577,7 +9552,13 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         return;
     }
     loose_map_cap = map_cap;
-    if page_map_r(map_cap, page, vm_page_rights(read_plan.map_protection), pml4) != 0 {
+    if page_map_r(
+        map_cap,
+        page,
+        vm_page_rights(read_plan.map_protection),
+        pml4,
+    ) != 0
+    {
         finish_image_writecopy_cow_selftest(
             pi,
             page,
@@ -9611,14 +9592,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
         pml4,
         scratch_base,
     ) {
-        finish_image_writecopy_cow_selftest(
-            pi,
-            page,
-            source_frame,
-            loose_map_cap,
-            proof,
-            status,
-        );
+        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
 
@@ -9657,14 +9631,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
 
     let mutated = IMAGE_WRITECOPY_COW_PATTERN[0] ^ 0xff;
     if let Err(status) = cow_write_frame_byte(record.frame, scratch_base, 0, mutated) {
-        finish_image_writecopy_cow_selftest(
-            pi,
-            page,
-            source_frame,
-            loose_map_cap,
-            proof,
-            status,
-        );
+        finish_image_writecopy_cow_selftest(pi, page, source_frame, loose_map_cap, proof, status);
         return;
     }
     match cow_frame_byte(record.frame, scratch_base, 0) {
@@ -10280,7 +10247,12 @@ unsafe fn vm_promote_mapped_cow_page(
     }
 
     if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
-        recycle_unmapped_frame_record_caps(old_frame, old_alias_cap, old_source_cap, old_owns_frame);
+        recycle_unmapped_frame_record_caps(
+            old_frame,
+            old_alias_cap,
+            old_source_cap,
+            old_owns_frame,
+        );
     }
     Ok(())
 }
@@ -10543,19 +10515,8 @@ unsafe fn alloc_seeded_root_dma_mmio_frame(seed_va: u64) -> u64 {
         return 0;
     }
     let pt = alloc_slot();
-    let _ = untyped_retype(
-        CAP_INIT_UNTYPED,
-        OBJ_X86_PAGE_TABLE,
-        PAGING_BITS,
-        1,
-        pt,
-    );
-    let _ = paging_struct_map_r(
-        pt,
-        LBL_X86_PAGE_TABLE_MAP,
-        seed_va,
-        CAP_INIT_THREAD_VSPACE,
-    );
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, seed_va, CAP_INIT_THREAD_VSPACE);
     if page_map_r(frame, seed_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         return 0;
     }
@@ -10864,7 +10825,13 @@ pub(crate) unsafe fn ensure_executive_paging(page: u64) -> bool {
             page,
             b"pd",
         )
-        && ensure_executive_paging_level(pt, OBJ_X86_PAGE_TABLE, LBL_X86_PAGE_TABLE_MAP, page, b"pt")
+        && ensure_executive_paging_level(
+            pt,
+            OBJ_X86_PAGE_TABLE,
+            LBL_X86_PAGE_TABLE_MAP,
+            page,
+            b"pt",
+        )
 }
 
 /// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
@@ -13458,7 +13425,8 @@ pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
 pub(crate) const HIVE_SEL_DYNAMIC: [u32; 2] = [0x3000_0000, 0x5000_0000];
 const _: () =
     assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
-const _: () = assert!(HIVE_SEL_SAM < MUTABLE_KEY_TAG && MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= OVERLAY_KEY_TAG);
+const _: () =
+    assert!(HIVE_SEL_SAM < MUTABLE_KEY_TAG && MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= OVERLAY_KEY_TAG);
 /// The hive selector bits of a `KeyRef` (meaningful only for a mounted-hive key).
 pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
     kr & HIVE_SEL_MASK
@@ -14131,7 +14099,11 @@ fn hosted_pci_device_by_location<'a>(
         .find(|device| device.bus == bus && device.dev == dev && device.func == func)
 }
 
-unsafe fn allocate_hosted_pci_dma_grant(pages: u64, logical: u64, len: u64) -> Option<HostedPciDmaGrant> {
+unsafe fn allocate_hosted_pci_dma_grant(
+    pages: u64,
+    logical: u64,
+    len: u64,
+) -> Option<HostedPciDmaGrant> {
     if pages == 0 || len == 0 || len > pages.saturating_mul(0x1000) || logical == 0 {
         return None;
     }
@@ -14199,12 +14171,7 @@ unsafe fn map_hosted_pci_dma_grant_iova(
                 map_io_err = copy_err;
                 break;
             }
-            let err = map_io(
-                frame_io,
-                io_space_cap,
-                0x3,
-                grant.logical + page * 0x1000,
-            );
+            let err = map_io(frame_io, io_space_cap, 0x3, grant.logical + page * 0x1000);
             if err != 0 {
                 map_io_err = err;
             }
@@ -14734,9 +14701,7 @@ fn config_hive_boot_system_driver_launch_spec(
     let service = cm
         .boot_system_driver_candidates()
         .into_iter()
-        .find(|service| {
-            service.driver_service_class() == Some(DriverServiceClass::FileSystem)
-        })?;
+        .find(|service| service.driver_service_class() == Some(DriverServiceClass::FileSystem))?;
     let (image_path_len, class) =
         driver_launch_spec_from_service_metadata(&service, out_path, SERVICE_SYSTEM_START)?;
     let driver_object_path = service.driver_object_path()?;
@@ -14908,7 +14873,8 @@ pub(crate) fn system_hive_driver_service_launch_spec(
     max_start: u32,
 ) -> Option<DriverServiceLaunchSpec> {
     let cm = system_hive_config_manager()?;
-    let nt_config_manager::ServiceStartSpec::Driver(service) = cm.service_start_spec(service_name)?
+    let nt_config_manager::ServiceStartSpec::Driver(service) =
+        cm.service_start_spec(service_name)?
     else {
         return None;
     };
@@ -14921,7 +14887,8 @@ pub(crate) fn system_hive_driver_service_object_path(
     max_start: u32,
 ) -> Option<alloc::string::String> {
     let cm = system_hive_config_manager()?;
-    let nt_config_manager::ServiceStartSpec::Driver(service) = cm.service_start_spec(service_name)?
+    let nt_config_manager::ServiceStartSpec::Driver(service) =
+        cm.service_start_spec(service_name)?
     else {
         return None;
     };
@@ -15582,8 +15549,9 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REG_FLUSH_KEY_MUTABLE: AtomicU64 = AtomicU64::new(0);
 /// Dirty mutable-hive cells observed by the most recent mutable-key flush.
 pub(crate) static REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS: AtomicU64 = AtomicU64::new(0);
-/// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots whose live image can be
-/// written to a writable overlay FILE_OBJECT; everything else returns the real refusal.
+/// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
+/// writable overlay FILE_OBJECT. Dynamic profile roots use the live mutable image; boot roots still
+/// use their borrowed `regf` backing until D3 adds a checkpoint provider.
 pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_ROOT_SAVED: AtomicU64 = AtomicU64::new(0);
@@ -15766,51 +15734,6 @@ impl ObjEntry {
     }
 }
 
-/// Build a KEY_VALUE_*_INFORMATION structure (NtQueryValueKey/NtEnumerateValueKey out buffer) for
-/// the given class: 0 = Basic {TitleIndex,Type,NameLength,Name}, 2 = Partial
-/// {TitleIndex,Type,DataLength,Data}, 1/other = Full {TitleIndex,Type,DataOffset,DataLength,
-/// NameLength,Name,[pad],Data}. Name is UTF-16LE.
-fn build_key_value_info(class: u64, name: &str, ty: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
-    let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
-    let nb = name16.len() * 2;
-    let mut b = alloc::vec::Vec::new();
-    match class {
-        0 => {
-            // KeyValueBasicInformation
-            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
-            b.extend_from_slice(&ty.to_le_bytes()); // Type
-            b.extend_from_slice(&(nb as u32).to_le_bytes()); // NameLength
-            for &w in &name16 {
-                b.extend_from_slice(&w.to_le_bytes());
-            }
-        }
-        2 => {
-            // KeyValuePartialInformation
-            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
-            b.extend_from_slice(&ty.to_le_bytes()); // Type
-            b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
-            b.extend_from_slice(data);
-        }
-        _ => {
-            // KeyValueFullInformation
-            let data_off = ((0x14 + nb) + 7) & !7; // 8-align the data
-            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
-            b.extend_from_slice(&ty.to_le_bytes()); // Type
-            b.extend_from_slice(&(data_off as u32).to_le_bytes()); // DataOffset
-            b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
-            b.extend_from_slice(&(nb as u32).to_le_bytes()); // NameLength
-            for &w in &name16 {
-                b.extend_from_slice(&w.to_le_bytes());
-            }
-            while b.len() < data_off {
-                b.push(0);
-            }
-            b.extend_from_slice(data);
-        }
-    }
-    b
-}
-
 /// Raw references to the fault/syscall loop's per-iteration state, handed to the group-C handlers
 /// (Workstream A) so they can reach the section/registry/demand-fill state that genuinely lives on
 /// the loop (`service_sec_image`), not on the handler. The Tier-1 dispatch arm rebuilds this each
@@ -15965,6 +15888,12 @@ struct ExecNtHandler {
     /// Set when a mutable hive create/value write allocates new key/value arena state above the
     /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
     mutable_hives_dirty: bool,
+    /// Last successful mutable-hive value copyout to a hosted process. ReactOS `RegCopyTreeW`
+    /// enumerates a source value into a process heap buffer, then calls `NtSetValueKey` with a data
+    /// pointer into that same buffer. Keeping the source value identity here lets the Configuration
+    /// Manager install the destination as a same-hive shared payload when the pointer/length/type
+    /// still match and the user buffer validates byte-for-byte.
+    registry_value_copy_provenance: RegistryValueCopyProvenanceTable,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
@@ -18221,7 +18150,10 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     if t.resume {
         let _ = tcb_resume(tcb);
     }
-    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode, sched_context))
+    HostedThreadSpawnResult::new(
+        tcb,
+        HostedThreadMechanismCaps::new(raw, cnode, sched_context),
+    )
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
@@ -19678,15 +19610,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     map_own_heap();
 
     // Object Manager: stand it up as an isolated service + drive it as the front-end.
-    let c: &'static mut ObjectClient<ObChan<'static>> = Box::leak(Box::new(ObjectClient::new(
-        ObChan(stand_up_service(
-        server::server_entry,
-        SUB_RING_VADDR,
-        COMP_RING_VADDR,
-        REQ_DATA_VADDR,
-        REP_DATA_VADDR,
-        )),
-    )));
+    let c: &'static mut ObjectClient<ObChan<'static>> =
+        Box::leak(Box::new(ObjectClient::new(ObChan(stand_up_service(
+            server::server_entry,
+            SUB_RING_VADDR,
+            COMP_RING_VADDR,
+            REQ_DATA_VADDR,
+            REP_DATA_VADDR,
+        )))));
     install_object_manager_client(&mut *c);
 
     let mut passed = 0u64;
@@ -19740,15 +19671,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- Second isolated service: the Configuration Manager (registry) over SURT.
     print_str(b"[ntos-exec] spawning the Configuration Manager as a second isolated service\n");
-    let cm: &'static mut ConfigClient<CmChan<'static>> = Box::leak(Box::new(ConfigClient::new(
-        CmChan(stand_up_service(
-        cm_server::cm_server_entry,
-        CM_SUB_VADDR,
-        CM_COMP_VADDR,
-        CM_REQ_VADDR,
-        CM_REP_VADDR,
-        )),
-    )));
+    let cm: &'static mut ConfigClient<CmChan<'static>> =
+        Box::leak(Box::new(ConfigClient::new(CmChan(stand_up_service(
+            cm_server::cm_server_entry,
+            CM_SUB_VADDR,
+            CM_COMP_VADDR,
+            CM_REQ_VADDR,
+            CM_REP_VADDR,
+        )))));
     install_config_manager_client(&mut *cm);
     let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
     check(b"exec_cm_ping", cm.ping(), &mut passed);
@@ -20205,16 +20135,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         reset_hosted_process_runtimes();
         register_hosted_process_runtime_for_image(smss_image)
             .expect("SMSS runtime layout must register before SEC_IMAGE demo spawn");
-        let spawn = spawn_hosted_sec_image_for_image(
-            smss_image,
-            &pe,
-            si_fault_c,
-            None,
-            false,
-            0,
-            0,
-            0,
-        );
+        let spawn =
+            spawn_hosted_sec_image_for_image(smss_image, &pe, si_fault_c, None, false, 0, 0, 0);
         let (v, f, _, _, _, _) = service_sec_image(
             si_fault,
             spawn.pml4,
@@ -20644,8 +20566,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(
         b"exec_hosted_pci_existing_grant_brokered",
-        !found_nic
-            || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
+        !found_nic || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
         &mut passed,
     );
     check(
@@ -21293,8 +21214,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ld_sysarg = alloc_frame();
         let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
         let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
-        let (_srv, ld_magic) =
-            service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
+        let (_srv, ld_magic) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
         let ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         print_str(b"[ntos-exec] loader demand-paged the disk hive: magic=0x");
         print_hex((ld_magic >> 32) as u32);

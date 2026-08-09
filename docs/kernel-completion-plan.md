@@ -171,8 +171,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    objects can bind real `EventsPresent` dispatcher events after explorer has consumed namespace
    slots. Dbgk object/event storage is now precharged during process-manager bootstrap and reused
    from bounded slot bodies, so late `NtCreateDebugObject` and blocked-reporter release no longer
-   allocate out of the post-desktop bump frontier; the executive heap cap is rebased to `7 MiB` for
-   that durable kernel-owned state while spawned service heaps stay at `512 KiB`. The latest FSD
+   allocate out of the post-desktop bump frontier; the executive heap cap was rebased to `7 MiB` for
+   that durable kernel-owned state and later to `8 MiB` once mounted mutable hives started owning
+   installed setup state and shell COM class provisioning directly, while spawned service heaps stay
+   at `512 KiB`. The latest FSD
    transport and handle-lifetime cleanup moves past the profile hive/user
    shell activation regression and the explorer icon/image-list wall again. Explorer now captures
    register-window messages, serves all required shell COM classes, redirects real api0 callbacks,
@@ -2211,14 +2213,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   either add a real `regf` writer or make loaded hives boot from the `nt-hive-core` image/log
   provider before any syscall claims reboot persistence.
 
-- D3 mutable hive checkpoint/load slice. `NtSaveKey` now prefers the live mounted mutable-hive root
-  and writes an `nt-hive-core` image instead of saving stale borrowed `regf` bytes after runtime
-  mutation. `NtLoadKey` still accepts ordinary ReactOS/Windows `regf` hives, but also accepts saved
+- D3 mutable hive checkpoint/load slice. `NtSaveKey` now writes a live `nt-hive-core` image for
+  dynamically loaded `NtLoadKey` profile hive roots instead of saving stale borrowed `regf` bytes
+  after runtime mutation. Boot hive roots deliberately retain their borrowed `regf` save backing
+  until D3 adds a real checkpoint provider for SYSTEM/SOFTWARE/SAM/SECURITY/`.Default`; this avoids
+  claiming reboot persistence for imported boot-hive mirrors before the backing strategy exists.
+  `NtLoadKey` still accepts ordinary ReactOS/Windows `regf` hives, but also accepts saved
   `nt-hive-core` images and mounts them as mutable-only hives under `HKEY_USERS\<SID>`. The dynamic
   mount table now distinguishes borrowed-regf mounts from mutable-only checkpoint mounts, while
   hosted-process opens continue to resolve through `MutableHiveSet` before any borrowed fallback.
   Validation `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: this closes the save/load format loop for dynamically loaded profile hives; D3
-  still needs a reboot proof and a boot-hive backing strategy before SYSTEM/SOFTWARE/SAM/SECURITY
-  persistence can be claimed end to end.
+  still needs a natural boot/reboot proof for that path and a boot-hive backing strategy before
+  SYSTEM/SOFTWARE/SAM/SECURITY persistence can be claimed end to end.

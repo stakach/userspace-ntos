@@ -749,12 +749,7 @@ pub(crate) unsafe fn spawn_sec_image(
             crate::WL_TEB2_PML4.store(pml4, core::sync::atomic::Ordering::Relaxed);
         }
         csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
-        register_spawn_private_mapping(
-            pi,
-            SMSS_TEB_VA,
-            0x2000,
-            nt_address_space::PAGE_READWRITE,
-        );
+        register_spawn_private_mapping(pi, SMSS_TEB_VA, 0x2000, nt_address_space::PAGE_READWRITE);
         // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's
         // TEB), but is mapped READ-ONLY there and copy-on-written on the first store. See
         // `W32_CLIENT_TEB_TAIL_PROTECTED`.
@@ -857,12 +852,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
         // synthetic success.
         csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000);
-        register_spawn_private_mapping(
-            pi,
-            SMSS_PEB_VA,
-            0x1000,
-            nt_address_space::PAGE_READWRITE,
-        );
+        register_spawn_private_mapping(pi, SMSS_PEB_VA, 0x1000, nt_address_space::PAGE_READWRITE);
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
         let nls_pt = alloc_slot();
