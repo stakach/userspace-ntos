@@ -70,7 +70,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ### D. Registry And Filesystem Durability
 
 - `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
-  `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage.
+  `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
+  `NtSaveKey` and writable-overlay `FileRenameInformation` are now real; D2/D3 still own live hive
+  authority plus explicit flush/reboot persistence proofs.
 - `[ ]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors.
 - `[ ]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
@@ -306,9 +308,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
    service and the supported root-hive case writes the mounted hive's real borrowed `regf` image to a
    caller-opened writable overlay FILE_OBJECT after enforcing `SeBackupPrivilege`, file write access,
    and `KEY_READ`; volatile/overlay keys, non-writable file backends, and subkey export return real
-   failures instead of synthetic success. D2/D4 still need the Configuration Manager/Hive Manager to
-   become the live authority for mutable hives, durable setup/profile state, subtree save
-   serialization, and remaining long-lived registry data.
+   failures instead of synthetic success. Writable-overlay `FileRenameInformation` now renames real
+   MemFs nodes, supports root-directory handle translation at the executive boundary, obeys
+   no-replace/replacement collision semantics, preserves the open FILE_OBJECT across rename, and lets
+   delete-on-close remove the renamed path; variable-length rename buffers use the bounded overlay
+   scratch path instead of the old 64-byte staging limit. D2/D3/D4 still need the Configuration
+   Manager/Hive Manager to become the live authority for mutable hives, durable setup/profile state,
+   subtree save serialization, and remaining long-lived registry data.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2029,3 +2035,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: continue D1 by auditing remaining mutable filesystem writeback/rename/delete
   paths, or move into D2/D3 by making the host-tested CM/Hive Manager the live mutable hive authority
   instead of executive-local overlay state.
+
+- D1 writable-overlay rename slice. `nt-fs` now implements `FileRenameInformation` against real
+  MemFs node identity instead of returning `STATUS_NOT_IMPLEMENTED`: absolute writable-volume
+  targets, relative `RootDirectory` handles, same-node case rename, no-replace collisions,
+  replacement of existing files, directory-cycle rejection, and delete-on-close after rename are all
+  real storage operations. The executive `NtSetInformationFile` path now copies variable-sized
+  overlay rename structures through the existing bounded 64 KiB scratch buffer, translates the
+  caller's process-local `RootDirectory` handle into the writable FS file-object id before invoking
+  the storage layer, and marks the writable overlay dirty only after a successful set-information
+  operation. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: D1's rename/delete/writeback audit is now materially smaller; continue D2/D3
+  by moving mutable hive state into the CM/Hive Manager authority and adding explicit flush/reboot
+  persistence proofs, or resume A4/B3 structural cleanup.

@@ -251,6 +251,131 @@ impl MemFs {
         Ok(())
     }
 
+    fn rename_into_parent(
+        &mut self,
+        source: u64,
+        target_parent: u64,
+        leaf: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        if source == 0 || leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\\') {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(source_node) = self.node(source) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let source_parent = source_node.parent;
+        let source_is_dir = source_node.is_dir;
+        let Some(target_parent_node) = self.node(target_parent) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        if !target_parent_node.is_dir {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        }
+        if source_is_dir {
+            let mut cur = target_parent;
+            loop {
+                if cur == source {
+                    return STATUS_ACCESS_DENIED;
+                }
+                if cur == 0 {
+                    break;
+                }
+                let Some(node) = self.node(cur) else {
+                    return STATUS_OBJECT_PATH_NOT_FOUND;
+                };
+                cur = node.parent;
+            }
+        }
+
+        if let Some(existing) = self.child(target_parent, leaf) {
+            if existing == source {
+                if let Some(parent_node) = self.node_mut(target_parent) {
+                    if let Some((folded, created, _)) = parent_node
+                        .children
+                        .iter_mut()
+                        .find(|(_, _, child)| *child == source)
+                    {
+                        *folded = fold(leaf);
+                        *created = String::from(leaf);
+                        return STATUS_SUCCESS;
+                    }
+                }
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            if !replace_if_exists {
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+            let Some(existing_node) = self.node(existing) else {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            };
+            if source_is_dir || existing_node.is_dir {
+                return STATUS_ACCESS_DENIED;
+            }
+            if let Err(status) = self.unlink(target_parent, existing) {
+                return status;
+            }
+        } else if source_parent != target_parent {
+            let Some(parent_node) = self.node_mut(target_parent) else {
+                return STATUS_OBJECT_PATH_NOT_FOUND;
+            };
+            if parent_node.children.try_reserve_exact(1).is_err() {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+
+        let Some(old_parent) = self.node_mut(source_parent) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        let Some(old_index) = old_parent
+            .children
+            .iter()
+            .position(|(_, _, child)| *child == source)
+        else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        old_parent.children.remove(old_index);
+
+        let Some(source_node) = self.node_mut(source) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        source_node.parent = target_parent;
+
+        let Some(parent_node) = self.node_mut(target_parent) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        parent_node
+            .children
+            .push((fold(leaf), String::from(leaf), source));
+        STATUS_SUCCESS
+    }
+
+    fn rename_relative(&mut self, source: u64, target_path: &str, replace_if_exists: bool) -> u32 {
+        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(parent) = self.lookup(parent_path) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        self.rename_into_parent(source, parent, leaf, replace_if_exists)
+    }
+
+    fn rename_relative_to_dir(
+        &mut self,
+        source: u64,
+        root: u64,
+        target_path: &str,
+        replace_if_exists: bool,
+    ) -> u32 {
+        let Some((parent_path, leaf)) = Self::parent_and_leaf_relative(target_path) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(parent) = self.lookup_from(root, parent_path) else {
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        };
+        self.rename_into_parent(source, parent, leaf, replace_if_exists)
+    }
+
     /// Create every missing directory along `path`, returning the leaf directory's id.
     fn ensure_dir(&mut self, path: &str) -> u64 {
         let mut cur = 0;
@@ -272,6 +397,14 @@ impl MemFs {
         Some(cur)
     }
 
+    fn lookup_from(&self, start: u64, path: &str) -> Option<u64> {
+        let mut cur = start;
+        for comp in path.split('\\').filter(|c| !c.is_empty()) {
+            cur = self.child(cur, comp)?;
+        }
+        Some(cur)
+    }
+
     fn lookup_folded_relative(&self, path: &[u8]) -> Option<u64> {
         let mut cur = 0;
         for comp in path.split(|byte| *byte == b'\\').filter(|c| !c.is_empty()) {
@@ -285,6 +418,17 @@ impl MemFs {
         let trimmed = path.trim_end_matches('\\');
         let idx = trimmed.rfind('\\')?;
         Some((&trimmed[..idx], &trimmed[idx + 1..]))
+    }
+
+    fn parent_and_leaf_relative(path: &str) -> Option<(&str, &str)> {
+        let trimmed = path.trim_end_matches('\\');
+        if trimmed.is_empty() {
+            return None;
+        }
+        match trimmed.rfind('\\') {
+            Some(index) => Some((&trimmed[..index], &trimmed[index + 1..])),
+            None => Some(("", trimmed)),
+        }
     }
 
     fn parent_and_leaf_bytes(path: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -801,6 +945,54 @@ impl FileSystem {
         self.handles.get_mut(handle as usize)?.as_mut()
     }
 
+    fn decode_utf16_name(bytes: &[u8]) -> Result<String, u32> {
+        if bytes.is_empty() || bytes.len() % 2 != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut out = String::new();
+        if out.try_reserve_exact(bytes.len()).is_err() {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+        for ch in core::char::decode_utf16(units) {
+            match ch {
+                Ok(ch) => out.push(ch),
+                Err(_) => return Err(STATUS_INVALID_PARAMETER),
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode_rename_information(data: &[u8]) -> Result<(bool, u64, String), u32> {
+        if data.len() < 20 {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let replace_if_exists = data[0] != 0;
+        let root_directory = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let name_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        if name_len == 0 || data.len().saturating_sub(20) < name_len {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let name = Self::decode_utf16_name(&data[20..20 + name_len])?;
+        Ok((
+            replace_if_exists,
+            root_directory,
+            normalize_separators(&name),
+        ))
+    }
+
+    fn rename_target_relative(&self, target: &str) -> Result<String, u32> {
+        if let Some(rel) = self.to_relative(target) {
+            return Ok(rel);
+        }
+        if target.starts_with('\\') {
+            return Ok(String::from(target));
+        }
+        Err(STATUS_OBJECT_PATH_NOT_FOUND)
+    }
+
     /// `ZwCreateFile` (spec §8.1): resolve the path, apply the create disposition, and return a
     /// file handle.
     pub fn zw_create_file(
@@ -1083,6 +1275,34 @@ impl FileSystem {
                 }
                 let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 self.volume.set_end_of_file(node_id, length)
+            }
+            FILE_RENAME_INFORMATION => {
+                let (replace_if_exists, root_directory, target) =
+                    match Self::decode_rename_information(data) {
+                        Ok(info) => info,
+                        Err(status) => return status,
+                    };
+                if root_directory == 0 {
+                    let target = match self.rename_target_relative(&target) {
+                        Ok(target) => target,
+                        Err(status) => return status,
+                    };
+                    self.volume
+                        .rename_relative(node_id, &target, replace_if_exists)
+                } else {
+                    let Some(root) = self.obj(root_directory) else {
+                        return STATUS_INVALID_HANDLE;
+                    };
+                    let root_id = root.node_id;
+                    if !self.volume.is_dir(root_id) {
+                        return STATUS_NOT_A_DIRECTORY;
+                    }
+                    if self.to_relative(&target).is_some() || target.starts_with('\\') {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    self.volume
+                        .rename_relative_to_dir(node_id, root_id, &target, replace_if_exists)
+                }
             }
             _ => STATUS_NOT_IMPLEMENTED,
         }

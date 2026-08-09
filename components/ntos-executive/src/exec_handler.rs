@@ -18301,6 +18301,7 @@ impl ExecNtHandler {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
                 let information_class = args[4] as u32;
                 let length = args[3] as u32 as usize;
+                let overlay_file = self.overlay_file_id_for(args[0]);
                 // ★ 64, not 32. The staging buffer TRUNCATES the caller's structure to its own
                 // size, so a 40-byte `FILE_BASIC_INFORMATION` (the class `kernel32!SetLastWriteTime`
                 // uses at the end of every `CopyFileW`) arrived as 32 bytes and the volume
@@ -18309,7 +18310,28 @@ impl ExecNtHandler {
                 // `userenv/directory.c:148` AFTER the file's bytes had already been copied.
                 let mut payload = [0u8; 64];
                 let payload_len = length.min(payload.len());
-                let payload_ok = payload_len == 0 || self.xas_read(args[2], &mut payload[..payload_len]);
+                let payload_uses_scratch = overlay_file.is_some() && length > payload.len();
+                let payload_ok = if length == 0 {
+                    true
+                } else if args[2] == 0 {
+                    false
+                } else if payload_uses_scratch {
+                    if length > 64 * 1024 {
+                        false
+                    } else {
+                        let scratch = core::slice::from_raw_parts_mut(
+                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                            64 * 1024,
+                        );
+                        let ok = self.xas_read(args[2], &mut scratch[..length]);
+                        if ok {
+                            payload[..payload_len].copy_from_slice(&scratch[..payload_len]);
+                        }
+                        ok
+                    }
+                } else {
+                    self.xas_read(args[2], &mut payload[..payload_len])
+                };
                 if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-set-information-file] pi="); print_u64(self.pi as u64);
                     print_str(b" handle=0x"); print_hex(args[0] as u32);
@@ -18338,17 +18360,54 @@ impl ExecNtHandler {
                 // ★ THE WRITABLE FILESYSTEM OVERLAY owns its own file objects' information classes
                 // (position / end-of-file / disposition / basic). Checked first so an overlay handle
                 // never falls into the pipe-only classes below.
-                if let Some(file_id) = self.overlay_file_id_for(args[0]) {
-                    self.writable_fs_dirty = true;
+                if let Some(file_id) = overlay_file {
                     let status = if !payload_ok {
                         0xC000_0005 // STATUS_ACCESS_VIOLATION
                     } else {
-                        crate::writable_fs::set_information(
-                            file_id,
-                            information_class,
-                            &payload[..payload_len],
-                        )
+                        let mut translated_status = nt_fs::STATUS_SUCCESS;
+                        if information_class == nt_fs::FILE_RENAME_INFORMATION && length >= 20 {
+                            let rename = if payload_uses_scratch {
+                                core::slice::from_raw_parts_mut(
+                                    core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                                    length,
+                                )
+                            } else {
+                                &mut payload[..payload_len]
+                            };
+                            let root_directory =
+                                u64::from_le_bytes(rename[8..16].try_into().unwrap());
+                            if root_directory != 0 {
+                                match self.overlay_file_id_for(root_directory) {
+                                    Some(root_file_id) => {
+                                        rename[8..16].copy_from_slice(&root_file_id.to_le_bytes());
+                                    }
+                                    None => {
+                                        translated_status = nt_fs::STATUS_INVALID_HANDLE;
+                                    }
+                                }
+                            }
+                        }
+                        if translated_status != nt_fs::STATUS_SUCCESS {
+                            translated_status
+                        } else {
+                            let overlay_payload = if payload_uses_scratch {
+                                core::slice::from_raw_parts(
+                                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                                    length,
+                                )
+                            } else {
+                                &payload[..payload_len]
+                            };
+                            crate::writable_fs::set_information(
+                                file_id,
+                                information_class,
+                                overlay_payload,
+                            )
+                        }
                     };
+                    if status == nt_fs::STATUS_SUCCESS {
+                        self.writable_fs_dirty = true;
+                    }
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return status;

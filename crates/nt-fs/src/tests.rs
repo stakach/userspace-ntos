@@ -634,6 +634,19 @@ fn wide(s: &str) -> alloc::vec::Vec<u16> {
     s.encode_utf16().collect()
 }
 
+fn rename_information(path: &str, root_directory: u64, replace: bool) -> alloc::vec::Vec<u8> {
+    let name = wide(path);
+    let mut data = alloc::vec::Vec::new();
+    data.resize(20 + name.len() * 2, 0);
+    data[0] = u8::from(replace);
+    data[8..16].copy_from_slice(&root_directory.to_le_bytes());
+    data[16..20].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+    for (index, unit) in name.iter().enumerate() {
+        data[20 + index * 2..22 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    data
+}
+
 #[test]
 fn writable_mount_covers_a_prefix_subtree_only() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
@@ -812,10 +825,84 @@ fn writable_volume_set_information_and_delete() {
     assert_eq!(fs.current_offset(f.handle), Some(2));
     let (_, tail) = fs.zw_read_file(f.handle, None, 8);
     assert_eq!(&tail[..], b"23");
-    // An unhandled class is reported honestly, not silently succeeded.
+    // FileRenameInformation renames the FILE_OBJECT's node; the open handle continues to name it.
     assert_eq!(
-        fs.zw_set_information_file(f.handle, FILE_RENAME_INFORMATION, &[0u8; 24]),
-        STATUS_NOT_IMPLEMENTED
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_RENAME_INFORMATION,
+            &rename_information(r"\??\C:\profiles\b.txt", 0, false),
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(fs.query_attributes(r"\??\C:\profiles\a.txt").is_none());
+    assert_eq!(
+        fs.query_attributes(r"\??\C:\profiles\b.txt")
+            .unwrap()
+            .end_of_file,
+        4
+    );
+
+    let dir = fs.zw_create_file(
+        r"\??\C:\profiles",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_RENAME_INFORMATION,
+            &rename_information("nested.txt", dir.handle, false),
+        ),
+        STATUS_SUCCESS
+    );
+    assert!(fs.query_attributes(r"\??\C:\profiles\b.txt").is_none());
+    assert_eq!(
+        fs.query_attributes(r"\??\C:\profiles\nested.txt")
+            .unwrap()
+            .end_of_file,
+        4
+    );
+
+    let collision = fs.zw_create_file(
+        r"\??\C:\profiles\collision.txt",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(collision.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(collision.handle, None, b"collision"),
+        (STATUS_SUCCESS, 9)
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_RENAME_INFORMATION,
+            &rename_information("collision.txt", dir.handle, false),
+        ),
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\collision.txt"),
+        Some(&b"collision"[..])
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_RENAME_INFORMATION,
+            &rename_information("collision.txt", dir.handle, true),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\collision.txt"),
+        Some(&b"0123"[..])
     );
     // FileDispositionInformation deletes at close.
     assert_eq!(
@@ -823,7 +910,9 @@ fn writable_volume_set_information_and_delete() {
         STATUS_SUCCESS
     );
     fs.zw_close(f.handle);
-    assert!(fs.query_attributes(r"\??\C:\profiles\a.txt").is_none());
+    assert!(fs
+        .query_attributes(r"\??\C:\profiles\collision.txt")
+        .is_none());
     // The directory itself survived, and is still a directory.
     let d = fs.query_attributes(r"\??\C:\profiles").unwrap();
     assert!(d.is_directory && d.attributes & FILE_ATTRIBUTE_DIRECTORY != 0);
