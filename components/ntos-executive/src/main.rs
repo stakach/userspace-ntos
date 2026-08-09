@@ -1371,13 +1371,11 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI;
 /// Per-process VAD extents. A real NT process's VAD is an unbounded AVL tree; ours is a fixed slot
 /// array, and `insert` returns STATUS_INSUFFICIENT_RESOURCES once it is full.
 ///
-/// ★ BATCH 58 measured this and RULED IT OUT as the `CopyDirectory` frontier. Raised to 256 for a
-/// control boot: `kernel32!CopyLoop`'s `NtAllocateVirtualMemory` still returned
-/// STATUS_INSUFFICIENT_RESOURCES at exactly the same file, with byte-identical overlay counters
-/// (creates=23 dirs=21 reads=1 writes=1), so the map is NOT full — the refusal comes from the frame
-/// / page-table commit below `vm_map_private_page`. Left at 64; the control boot's real finding was
-/// the STACK (see [`VM_MAP_BEFORE`]).
-const VM_REGION_CAPACITY: usize = 64;
+/// ★ BATCH 58 measured this and RULED IT OUT as the `CopyDirectory` frontier. The later full
+/// explorer desktop path reaches 48 live/split private VAD extents while still making real forward
+/// progress. Keep the reset-safe table fixed, but size it with measured runway so the headroom gate
+/// remains meaningful instead of sitting exactly on its three-quarter ceiling.
+const VM_REGION_CAPACITY: usize = 96;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
     [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
@@ -4984,6 +4982,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && slots_available >= 2048
             // … with nothing having been refused by any of them.
             && CSRSS_FRAME_FULL.load(Ordering::Relaxed) == 0
+            && SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed) == 0
             && committed_mapping_fails == 0
             && UT_RETYPE_FAILS.load(Ordering::Relaxed) == 0
             && VM_FAIL_PT.load(Ordering::Relaxed) == 0
@@ -6809,6 +6808,13 @@ static mut CSRSS_FRAME_SOURCE_CAP: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP]
 static mut CSRSS_FRAME_OWNS_FRAME: [bool; CSRSS_FRAME_CAP] = [false; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
 static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
+#[derive(Copy, Clone)]
+struct CsrssFrameRecord {
+    frame: u64,
+    alias: u64,
+    source_cap: u64,
+    owns_frame: bool,
+}
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
     let _ = csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, 0);
@@ -6987,6 +6993,22 @@ unsafe fn csrss_frame_get_exact(pi: u64, page: u64) -> (u64, usize) {
         }
     }
     (0, usize::MAX)
+}
+unsafe fn csrss_frame_get_exact_record(pi: u64, page: u64) -> Option<CsrssFrameRecord> {
+    let (frame, index) = csrss_frame_get_exact(pi, page);
+    if index == usize::MAX || frame == 0 {
+        return None;
+    }
+    Some(CsrssFrameRecord {
+        frame,
+        alias: core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index)),
+        source_cap: core::ptr::read(
+            (core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64).add(index),
+        ),
+        owns_frame: core::ptr::read(
+            (core::ptr::addr_of!(CSRSS_FRAME_OWNS_FRAME) as *const bool).add(index),
+        ),
+    })
 }
 unsafe fn csrss_frame_next_page_after(pi: u64, page: u64) -> Option<u64> {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
@@ -7232,6 +7254,92 @@ unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
     dll_cache_get(page)
 }
 
+#[derive(Clone, Copy)]
+struct SharedImageMapping {
+    pi: u8,
+    page: u64,
+    map_cap: u64,
+}
+
+static mut SHARED_IMAGE_MAPPINGS: Option<Vec<SharedImageMapping>> = None;
+static SHARED_IMAGE_MAPPING_DIRTY: AtomicBool = AtomicBool::new(false);
+
+unsafe fn shared_image_mappings_mut() -> &'static mut Vec<SharedImageMapping> {
+    let slot = &mut *core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPINGS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+pub(crate) fn take_shared_image_mapping_dirty() -> bool {
+    SHARED_IMAGE_MAPPING_DIRTY.swap(false, Ordering::Relaxed)
+}
+
+unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
+    if pi > u8::MAX as u64 || map_cap == 0 {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let table = shared_image_mappings_mut();
+    for existing in table.iter() {
+        if existing.pi as u64 == pi && existing.page == page {
+            if existing.map_cap == map_cap {
+                return true;
+            }
+            SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+    if table.len() == table.capacity() {
+        if table.try_reserve(512).is_err() {
+            SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
+    }
+    table.push(SharedImageMapping {
+        pi: pi as u8,
+        page,
+        map_cap,
+    });
+    note_high_water(&SHARED_IMAGE_MAPPING_HW, table.len() as u64);
+    true
+}
+
+unsafe fn shared_image_mapping_get(pi: u64, page: u64) -> Option<u64> {
+    let table = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPINGS)).as_ref()?;
+    table
+        .iter()
+        .find(|mapping| mapping.pi as u64 == pi && mapping.page == page)
+        .map(|mapping| mapping.map_cap)
+}
+
+unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
+    let table = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPINGS)).as_mut()?;
+    let index = table
+        .iter()
+        .position(|mapping| mapping.pi as u64 == pi && mapping.page == page)?;
+    Some(table.swap_remove(index).map_cap)
+}
+
+unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
+    let Some(table) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPINGS)).as_mut() else {
+        return;
+    };
+    let mut index = 0usize;
+    while index < table.len() {
+        let mapping = table[index];
+        if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
+            let map_cap = table.swap_remove(index).map_cap;
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 const CLIENT_COPYIN_FRAME_CAP: usize = 256;
 static mut CLIENT_COPYIN_FRAME_PI: [u8; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
 static mut CLIENT_COPYIN_FRAME_VA: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
@@ -7321,6 +7429,11 @@ pub(crate) static CSRSS_FRAME_HW: AtomicU64 = AtomicU64::new(0);
 /// Times the registry refused an insert because it was FULL — the failure that turns into
 /// `STATUS_INSUFFICIENT_RESOURCES` out of `vm_map_private_page` with every seL4 call succeeding.
 pub(crate) static CSRSS_FRAME_FULL: AtomicU64 = AtomicU64::new(0);
+/// High-water of resident shared image process-map caps. These are not client frames: they exist so
+/// mapped-image protect and write-copy faults can unmap/promote the exact PTE owner without
+/// polluting the GUI/client frame registry.
+pub(crate) static SHARED_IMAGE_MAPPING_HW: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SHARED_IMAGE_MAPPING_FAILS: AtomicU64 = AtomicU64::new(0);
 /// High-water of the recycled-frame free list (`VM_FREE_FRAME_CAPACITY`).
 pub(crate) static VM_FREE_FRAME_HW: AtomicU64 = AtomicU64::new(0);
 /// Per-step failure tally for `vm_map_private_page`, so a refusal names its own sub-step.
@@ -7441,6 +7554,10 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(CSRSS_FRAME_CAP as u64);
     print_str(b" reg-full=");
     print_u64(CSRSS_FRAME_FULL.load(Ordering::Relaxed));
+    print_str(b" image-mapcaps=");
+    print_u64(SHARED_IMAGE_MAPPING_HW.load(Ordering::Relaxed));
+    print_str(b" image-mapcap-fails=");
+    print_u64(SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed));
     print_str(b" freelist=");
     print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");
@@ -8873,6 +8990,13 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) {
     }
 }
 
+fn vm_protection_writable(protection: u32) -> bool {
+    matches!(
+        protection & 0xff,
+        nt_address_space::PAGE_READWRITE | nt_address_space::PAGE_EXECUTE_READWRITE
+    )
+}
+
 unsafe fn vm_reprotect_private_page(
     pi: usize,
     page: u64,
@@ -8890,6 +9014,272 @@ unsafe fn vm_reprotect_private_page(
     } else {
         let _ = page_map_r(frame, page, vm_page_rights(old_protection), pml4);
         Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
+unsafe fn vm_copy_frame_4k(source_cap: u64, dest_frame: u64, scratch_base: u64) -> Result<(), u32> {
+    let source_alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x6000;
+    let dest_alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x7000;
+    let (source_copy, source_error) = copy_cap_r(source_cap);
+    if source_error != 0 {
+        if source_copy != 0 {
+            let _ = cnode_delete_recycle_r(source_copy);
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let source_map = page_map_r(source_copy, source_alias, RO_NX, CAP_INIT_THREAD_VSPACE);
+    if source_map != 0 {
+        let _ = cnode_delete_recycle_r(source_copy);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let dest_map = page_map_r(dest_frame, dest_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+    if dest_map != 0 {
+        let _ = page_unmap_r(source_copy);
+        let _ = cnode_delete_recycle_r(source_copy);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    let mut offset = 0u64;
+    while offset < 0x1000 {
+        core::ptr::write_volatile(
+            (dest_alias + offset) as *mut u64,
+            core::ptr::read_volatile((source_alias + offset) as *const u64),
+        );
+        offset += 8;
+    }
+
+    let _ = page_unmap_r(dest_frame);
+    let _ = page_unmap_r(source_copy);
+    let _ = cnode_delete_recycle_r(source_copy);
+    Ok(())
+}
+
+unsafe fn recycle_unmapped_frame_record_caps(
+    frame: u64,
+    alias_cap: u64,
+    source_cap: u64,
+    owns_frame: bool,
+) {
+    if owns_frame {
+        vm_frame_release(frame, alias_cap);
+    } else {
+        let _ = cnode_delete_recycle_r(frame);
+        if alias_cap != 0 {
+            let _ = page_unmap_r(alias_cap);
+            let _ = cnode_delete_recycle_r(alias_cap);
+        }
+    }
+    if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+        let _ = cnode_delete_recycle_r(source_cap);
+    }
+}
+
+unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) {
+    let mut page = base;
+    while page < end {
+        vm_unmap_private_page(pi, page);
+        page += 0x1000;
+    }
+    shared_image_mapping_unmap_range(pi as u64, base, end);
+}
+
+unsafe fn vm_reprotect_shared_image_mapping(
+    pi: usize,
+    page: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+) -> Result<(), u32> {
+    let Some(map_cap) = shared_image_mapping_get(pi as u64, page) else {
+        return Ok(());
+    };
+    let new_rights = vm_page_rights(new_protection);
+    if new_rights == 0 {
+        let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
+            return Ok(());
+        };
+        let _ = page_unmap_r(map_cap);
+        let _ = cnode_delete_recycle_r(map_cap);
+        return Ok(());
+    }
+    let old_rights = vm_page_rights(old_protection);
+    let _ = page_unmap_r(map_cap);
+    if page_map_r(map_cap, page, new_rights, pml4) == 0 {
+        Ok(())
+    } else {
+        let _ = page_map_r(map_cap, page, old_rights, pml4);
+        Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
+unsafe fn vm_promote_image_cow_page(
+    pi: usize,
+    page: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    enum OldImageMapping {
+        Exact {
+            alias: u64,
+            alias_cap: u64,
+            source_cap: u64,
+            owns_frame: bool,
+        },
+        Shared,
+    }
+
+    let exact_record = csrss_frame_get_exact_record(pi as u64, page);
+    if let Some(record) = exact_record {
+        if record.owns_frame {
+            return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+        }
+    }
+
+    let source_cap = if let Some(record) = exact_record {
+        if record.source_cap != 0 {
+            record.source_cap
+        } else {
+            record.frame
+        }
+    } else if let Some(map_cap) = shared_image_mapping_get(pi as u64, page) {
+        map_cap
+    } else {
+        return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+    };
+    let new_frame = match vm_frame_acquire(scratch_base) {
+        Ok(frame) => frame,
+        Err(status) => return Err(status),
+    };
+    if let Err(status) = vm_copy_frame_4k(source_cap, new_frame, scratch_base) {
+        vm_frame_release(new_frame, 0);
+        return Err(status);
+    }
+
+    let (old_map_cap, old_mapping) = if let Some(record) = exact_record {
+        let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) =
+            csrss_frame_take(pi as u64, page)
+        else {
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+        };
+        (
+            old_frame,
+            OldImageMapping::Exact {
+                alias: record.alias,
+                alias_cap: old_alias_cap,
+                source_cap: old_source_cap,
+                owns_frame: old_owns_frame,
+            },
+        )
+    } else {
+        let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
+        };
+        (map_cap, OldImageMapping::Shared)
+    };
+    let _ = page_unmap_r(old_map_cap);
+    let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
+    if map_error != 0 {
+        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
+        match old_mapping {
+            OldImageMapping::Exact {
+                alias,
+                alias_cap,
+                source_cap,
+                owns_frame,
+            } => {
+                let _ = csrss_frame_put_at_cap_source_owned(
+                    pi as u64,
+                    page,
+                    old_map_cap,
+                    alias,
+                    alias_cap,
+                    source_cap,
+                    owns_frame,
+                );
+            }
+            OldImageMapping::Shared => {
+                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
+            }
+        }
+        vm_frame_release(new_frame, 0);
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if !csrss_frame_put_at_cap_source_owned(pi as u64, page, new_frame, 0, 0, 0, true) {
+        let _ = page_unmap_r(new_frame);
+        vm_frame_release(new_frame, 0);
+        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
+        match old_mapping {
+            OldImageMapping::Exact {
+                alias,
+                alias_cap,
+                source_cap,
+                owns_frame,
+            } => {
+                let _ = csrss_frame_put_at_cap_source_owned(
+                    pi as u64,
+                    page,
+                    old_map_cap,
+                    alias,
+                    alias_cap,
+                    source_cap,
+                    owns_frame,
+                );
+            }
+            OldImageMapping::Shared => {
+                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
+            }
+        }
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    match old_mapping {
+        OldImageMapping::Exact {
+            alias_cap,
+            source_cap,
+            owns_frame,
+            ..
+        } => {
+            recycle_unmapped_frame_record_caps(old_map_cap, alias_cap, source_cap, owns_frame);
+        }
+        OldImageMapping::Shared => {
+            let _ = cnode_delete_recycle_r(old_map_cap);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn vm_reprotect_resident_image_page(
+    pi: usize,
+    page: u64,
+    old_protection: u32,
+    new_protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
+        if vm_protection_writable(new_protection) && !record.owns_frame {
+            return vm_promote_image_cow_page(
+                pi,
+                page,
+                old_protection,
+                new_protection,
+                pml4,
+                scratch_base,
+            );
+        }
+        return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
+    }
+    if shared_image_mapping_get(pi as u64, page).is_none() {
+        return Ok(());
+    }
+    if vm_protection_writable(new_protection) {
+        vm_promote_image_cow_page(pi, page, old_protection, new_protection, pml4, scratch_base)
+    } else {
+        vm_reprotect_shared_image_mapping(pi, page, old_protection, new_protection, pml4)
     }
 }
 

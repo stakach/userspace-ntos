@@ -5925,6 +5925,40 @@ pub(crate) unsafe fn service_sec_image(
                 let shareable =
                     base != PE_LOAD_BASE && page_rights(tpe, rva) == 2 && !image_map_writable;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                if is_fault_page && image_fault_plan.copy_on_write {
+                    let read_fault_protection =
+                        nt_address_space::image_view_fault_plan(image_view_info.protect, false)
+                            .map_protection;
+                    if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
+                        || shared_image_mapping_get(pi as u64, bpage).is_some()
+                    {
+                        match vm_promote_image_cow_page(
+                            pi,
+                            bpage,
+                            read_fault_protection,
+                            image_fault_plan.map_protection,
+                            pml4,
+                            scratch_base,
+                        ) {
+                            Ok(()) => {
+                                bi += 1;
+                                continue;
+                            }
+                            Err(status) => {
+                                print_str(b"[image-cow] promote failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" page=0x");
+                                print_hex((bpage >> 32) as u32);
+                                print_hex(bpage as u32);
+                                print_str(b" status=0x");
+                                print_hex(status);
+                                print_str(b"\n");
+                                allocation_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 // A forward run may overlap pages filled by an earlier run. The faulting page must
                 // still be handled, but speculative neighbours that are already resident must not
                 // be filled into a new frame and mapped over the live page (seL4 DeleteFirst).
@@ -6111,6 +6145,7 @@ pub(crate) unsafe fn service_sec_image(
                 // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
                 let (cc, ce) = copy_cap_r(frame);
                 let me = page_map_r(cc, bpage, rights, pml4);
+                let mapped_into_process = ce == 0 && me == 0;
                 if ce != 0 || me != 0 {
                     let _ = cnode_delete_recycle_r(cc);
                     // Multiple threads in one process can fault the same shared DLL text page before
@@ -6133,6 +6168,20 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(shareable as u64);
                     print_str(b"\n");
                     if ce != 0 || me != 8 || (is_fault_page && !duplicate_shared_fault) {
+                        allocation_failed = true;
+                        break;
+                    }
+                }
+                if mapped_into_process && shareable && pi >= 1 {
+                    if !shared_image_mapping_put(pi as u64, bpage, cc) {
+                        let _ = page_unmap_r(cc);
+                        let _ = cnode_delete_recycle_r(cc);
+                        print_str(b"[image-shared] register failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b"\n");
                         allocation_failed = true;
                         break;
                     }
@@ -7173,6 +7222,9 @@ pub(crate) unsafe fn service_sec_image(
                 // iterations that actually touched the volume.
                 if nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty() {
                     nt_handler.writable_fs_dirty = false;
+                    heap_mark = allocator::mark();
+                }
+                if take_shared_image_mapping_dirty() {
                     heap_mark = allocator::mark();
                 }
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace

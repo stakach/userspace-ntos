@@ -246,10 +246,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    text sharing disabled whenever the live image protection would map writable. Boot proof
    `.tmp/boot-image-demand-protect-20260809.log` is fully green at `292/292` with
    `committed-map=233/512`, `committed-map-fails=0`, `exec_vm_pool_headroom` green, and explorer
-   shell chrome still painting `34873` non-background pixels. Continue the plan from the remaining
-   structural debt rather than shell-paint scaffolding: true resident MEM_IMAGE write-fault COW
-   shadows and their C4 gate, A4's SCM pipe/listener special coordination, B3's real video/driver
-   binding, broader C4 regressions, and D1/D2 mutable registry/filesystem authority.
+   shell chrome still painting `34873` non-background pixels. The resident MEM_IMAGE writecopy
+   follow-up now promotes shared resident image pages into private owned shadows and tears them down
+   through the ordinary image-unmap path. Continue the plan from the remaining structural debt
+   rather than shell-paint scaffolding: an explicit C4 gate proving image writecopy isolation, A4's
+   SCM pipe/listener special coordination, B3's real video/driver binding, broader C4 regressions,
+   and D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1727,3 +1729,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
   now resident shared-image shadowing, not protection lookup: record enough source ownership for
   shared DLL image mappings, promote write-copy faults to private frames, reclaim the old shared
   mapping cleanly, and add a C4 gate that proves the shared frame is not modified.
+
+- C3 resident MEM_IMAGE COW shadowing slice. Resident shared DLL mappings now use a dedicated
+  growable image map-cap ownership table instead of polluting the GUI/client frame registry or
+  creating per-page source caps. The pool census measures that table as `image-mapcaps`, tracks
+  `image-mapcap-fails`, and pins durable heap state whenever growth occurs. Image writecopy faults
+  and `NtProtectVirtualMemory` transitions that make a resident shared image page writable now
+  promote the page into a new process-owned private frame copied from the exact resident source cap,
+  source frame, or shared process mapping. Nonresident writecopy image faults still fill a private
+  writable frame from image bytes, and `NtUnmapViewOfSection` for image allocations tears down both
+  promoted private frames and remaining shared map-cap records. The private VAD table was right-sized
+  from `64` to `96` entries because the real explorer path reached `48/64` while still making
+  forward progress; this keeps the `<75%` headroom gate meaningful rather than relaxing it. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  `./rust-micro/scripts/run_specs.sh`, and boot proof
+  `.tmp/boot-shared-image-mapcaps-vad96-20260809.log`. Result: kernel specs pass, the full executive
+  gate is `292/292`, `exec_vm_pool_headroom` is green with `ut-free=52244KiB`,
+  `slot-free=81170`, `frame-reg=16900/32768`, `image-mapcaps=7748`,
+  `image-mapcap-fails=0`, `vad=40/96`, `committed-map=233/512`, and explorer shell chrome still
+  paints `34873` non-background pixels. Review adjustment: C4 should next add an explicit image
+  writecopy regression that faults or protects a shared image page writable and proves the original
+  shared frame remains unchanged. Continue A4 SCM pipe/listener cleanup, B3 real video/driver
+  binding, broader C4 regressions, and D1/D2 registry/filesystem authority.

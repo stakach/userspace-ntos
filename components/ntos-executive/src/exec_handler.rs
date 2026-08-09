@@ -78,6 +78,8 @@ fn committed_mapping_effective_page_protection(
 ) -> u32 {
     if info.type_ == nt_address_space::MEM_MAPPED {
         nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection
+    } else if info.type_ == nt_address_space::MEM_IMAGE {
+        nt_address_space::image_view_fault_plan(info.protect, false).map_protection
     } else {
         info.protect
     }
@@ -7420,18 +7422,30 @@ impl ExecNtHandler {
                 let old = before_committed.query_basic(page);
                 let new = after_committed.query_basic(page);
                 if let (Some(old), Some(new)) = (old, new) {
-                    if old.protect != new.protect
-                        && csrss_frame_get_exact(target_pi as u64, page).0 != 0
-                    {
+                    if old.protect != new.protect {
                         let old_page_protection = committed_mapping_effective_page_protection(old);
                         let new_page_protection = committed_mapping_effective_page_protection(new);
-                        if let Err(status) = vm_reprotect_private_page(
-                            target_pi,
-                            page,
-                            old_page_protection,
-                            new_page_protection,
-                            target.pml4,
-                        ) {
+                        let result = if new.type_ == nt_address_space::MEM_IMAGE {
+                            vm_reprotect_resident_image_page(
+                                target_pi,
+                                page,
+                                old_page_protection,
+                                new_page_protection,
+                                target.pml4,
+                                target.scratch_base,
+                            )
+                        } else if csrss_frame_get_exact(target_pi as u64, page).0 != 0 {
+                            vm_reprotect_private_page(
+                                target_pi,
+                                page,
+                                old_page_protection,
+                                new_page_protection,
+                                target.pml4,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(status) = result {
                             map_status = status;
                             break;
                         }
@@ -7446,20 +7460,29 @@ impl ExecNtHandler {
                     let old = before_committed.query_basic(page);
                     let new = after_committed.query_basic(page);
                     if let (Some(old), Some(new)) = (old, new) {
-                        if old.protect != new.protect
-                            && csrss_frame_get_exact(target_pi as u64, page).0 != 0
-                        {
+                        if old.protect != new.protect {
                             let old_page_protection =
                                 committed_mapping_effective_page_protection(old);
                             let new_page_protection =
                                 committed_mapping_effective_page_protection(new);
-                            let _ = vm_reprotect_private_page(
-                                target_pi,
-                                page,
-                                new_page_protection,
-                                old_page_protection,
-                                target.pml4,
-                            );
+                            if new.type_ == nt_address_space::MEM_IMAGE {
+                                let _ = vm_reprotect_resident_image_page(
+                                    target_pi,
+                                    page,
+                                    new_page_protection,
+                                    old_page_protection,
+                                    target.pml4,
+                                    target.scratch_base,
+                                );
+                            } else if csrss_frame_get_exact(target_pi as u64, page).0 != 0 {
+                                let _ = vm_reprotect_private_page(
+                                    target_pi,
+                                    page,
+                                    new_page_protection,
+                                    old_page_protection,
+                                    target.pml4,
+                                );
+                            }
                         }
                     }
                     page += 0x1000;
@@ -15691,7 +15714,16 @@ impl ExecNtHandler {
                     let reg = &mut *ctx.reg;
                     if let Some((slot, _)) = reg.dll_for_page(target_pi, base) {
                         let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
+                        let allocation =
+                            process_committed_image_allocation(target_pi as u64, image_base);
                         if reg.clear_mapped(target_pi, slot) {
+                            if let Some(allocation) = allocation {
+                                vm_unmap_shared_image_mapping_range(
+                                    target_pi,
+                                    allocation.allocation_base,
+                                    allocation.allocation_end,
+                                );
+                            }
                             let _ = process_committed_mapping_unregister_allocation(
                                 target_pi as u64,
                                 image_base,
