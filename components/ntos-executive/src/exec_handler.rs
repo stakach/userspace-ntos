@@ -971,7 +971,7 @@ impl ExecNtHandler {
         let (security_hive, sam_hive) = unsafe {
             let mount = |base: u64, size: u64| -> Option<RegfHive<'static>> {
                 let n = size as usize;
-                if n == 0 || !SECURITY_SAM_HIVES_MOUNTED {
+                if n == 0 {
                     return None;
                 }
                 RegfHive::new(core::slice::from_raw_parts(base as *const u8, n))
@@ -987,7 +987,7 @@ impl ExecNtHandler {
         // (0 if the file wasn't staged → None → the mount is simply absent).
         let software_hive = unsafe {
             let n = SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed) as usize;
-            if n == 0 || !SOFTWARE_HIVE_MOUNTED {
+            if n == 0 {
                 None
             } else {
                 RegfHive::new(core::slice::from_raw_parts(SWHIVEBUF_VADDR as *const u8, n))
@@ -1831,20 +1831,8 @@ impl ExecNtHandler {
             return Some(self.mint_registry_key(USER_ROOT_KEY, args[1] as u32, args[0]));
         }
         let full = self.user_namespace_target(root_target, &name)?;
-        // (b) A created key shadows the mount, exactly as it does for the machine hives.
-        let canon = self.overlay_canon(&full);
-        if let Some(index) = self.overlay.find(&canon) {
-            if Self::is_dynamic_user_volatile_env_canon(&canon) {
-                USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
-            }
-            return Some(self.mint_registry_key(
-                OVERLAY_KEY_TAG | index as u32,
-                args[1] as u32,
-                args[0],
-            ));
-        }
-        // (c) …otherwise the mount table. A miss inside the namespace is a real NOT_FOUND (which is
-        // what every `\Registry\User` open returned before this batch), never a fabricated key.
+        // (b) Overlay/mutable/base resolution follows the same full-path authority as machine
+        // hives. A miss inside the namespace is a real NOT_FOUND, never a fabricated key.
         if USER_NS_TRACED.fetch_add(1, Ordering::Relaxed) < 40 {
             print_str(b"[user-ns] pi=");
             print_u64(self.pi as u64);
@@ -1854,27 +1842,27 @@ impl ExecNtHandler {
             print_u64(self.resolve_user_key(&full).unwrap_or(0) as u64);
             print_str(b"\n");
         }
-        match self.resolve_user_key(&full) {
-            Some(key) => {
-                if hive_sel(key) == HIVE_SEL_USER_DEFAULT {
-                    USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                }
-                Some(self.mint_registry_key(key, args[1] as u32, args[0]))
+        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+            if status == 0xC000_0034
+                && self.current_process_is_winlogon()
+                && post_profile_phase()
+                && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64
+            {
+                print_str(b"[post-profile] open MISS ");
+                print_ascii_str(&full);
+                print_str(b"\n");
             }
-            None => {
-                if self.current_process_is_winlogon()
-                    && post_profile_phase()
-                    && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64
-                {
-                    print_str(b"[post-profile] open MISS ");
-                    print_ascii_str(&full);
-                    print_str(b"\n");
-                }
-                Some(0xC000_0034) // STATUS_OBJECT_NAME_NOT_FOUND
-            }
+            return Some(status);
         }
+        if self.current_process_is_winlogon()
+            && post_profile_phase()
+            && POST_PROFILE_TRACED.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            print_str(b"[post-profile] open MISS ");
+            print_ascii_str(&full);
+            print_str(b"\n");
+        }
+        Some(0xC000_0034) // STATUS_OBJECT_NAME_NOT_FOUND
     }
 
     /// Explorer's COM activation path uses HKCR, which ReactOS maps to
@@ -1939,27 +1927,12 @@ impl ExecNtHandler {
             return None;
         }
 
-        if let Some(index) = self.overlay.find(&canon) {
-            let bit = explorer_shell_com_class_bit_for_path(&canon);
-            if bit != 0 {
+        let bit = explorer_shell_com_class_bit_for_path(&canon);
+        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+            if status == 0 && bit != 0 {
                 EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
             }
-            return Some(self.mint_registry_key(
-                OVERLAY_KEY_TAG | index as u32,
-                args[1] as u32,
-                args[0],
-            ));
-        }
-
-        if let Some(key) = self.resolve_key(&full) {
-            if hive_sel(key) == HIVE_SEL_SOFTWARE {
-                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-            }
-            let bit = explorer_shell_com_class_bit_for_path(&canon);
-            if bit != 0 {
-                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
-            }
-            return Some(self.mint_registry_key(key, args[1] as u32, args[0]));
+            return Some(status);
         }
 
         Some(0xC000_0034)
@@ -2028,27 +2001,12 @@ impl ExecNtHandler {
             return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
         }
 
-        if let Some(index) = self.overlay.find(&canon) {
-            let bit = explorer_shell_com_class_bit_for_path(&canon);
-            if bit != 0 {
+        let bit = explorer_shell_com_class_bit_for_path(&canon);
+        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+            if status == 0 && bit != 0 {
                 EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
             }
-            return Some(self.mint_registry_key(
-                OVERLAY_KEY_TAG | index as u32,
-                args[1] as u32,
-                args[0],
-            ));
-        }
-
-        if let Some(key) = self.resolve_key(&full) {
-            if hive_sel(key) == HIVE_SEL_SOFTWARE {
-                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-            }
-            let bit = explorer_shell_com_class_bit_for_path(&canon);
-            if bit != 0 {
-                EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
-            }
-            return Some(self.mint_registry_key(key, args[1] as u32, args[0]));
+            return Some(status);
         }
 
         Some(0xC000_0034)
@@ -2627,6 +2585,94 @@ impl ExecNtHandler {
         }
         let full_path = self.registry_target_path(target)?;
         self.mutable_registry_key_by_path(&full_path)
+    }
+
+    fn note_mutable_registry_key_open(&self, key: ResolvedHiveKey, full_path: &str) {
+        let canon = self.overlay_canon(full_path);
+        if Self::is_dynamic_user_volatile_env_canon(&canon) {
+            USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
+        if key.hive == HIVE_SEL_SOFTWARE {
+            SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
+                WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.current_process_is_winlogon() && is_profile_list_key(&canon) {
+                WINLOGON_PROFILE_LIST_OPENS.fetch_add(1, Ordering::Relaxed);
+                WINLOGON_PROFILE_LIST_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if key.hive == HIVE_SEL_SECURITY || key.hive == HIVE_SEL_SAM {
+            LSA_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            if key.hive == HIVE_SEL_SAM {
+                SAM_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if key.hive == HIVE_SEL_USER_DEFAULT {
+            USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        } else if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == key.hive) {
+            USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn note_base_registry_key_open(&self, key: KeyRef, full_path: &str) {
+        let canon = self.overlay_canon(full_path);
+        if Self::is_dynamic_user_volatile_env_canon(&canon) {
+            USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
+        let sel = hive_sel(key);
+        if sel == HIVE_SEL_SOFTWARE {
+            SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            if self.current_process_is_winlogon() && is_winlogon_key(&canon) {
+                WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.current_process_is_winlogon() && is_profile_list_key(&canon) {
+                WINLOGON_PROFILE_LIST_OPENS.fetch_add(1, Ordering::Relaxed);
+                WINLOGON_PROFILE_LIST_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if sel == HIVE_SEL_SECURITY || sel == HIVE_SEL_SAM {
+            LSA_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            if sel == HIVE_SEL_SAM {
+                SAM_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if sel == HIVE_SEL_USER_DEFAULT {
+            USER_DEFAULT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        } else if HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel) {
+            USER_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn note_registry_open_miss(&self, full_path: &str) {
+        if self.current_process_is_winlogon() && is_profile_list_key(full_path) {
+            WINLOGON_PROFILE_LIST_OPENS.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_lsa_hive_path(full_path) {
+            LSA_HIVE_OPEN_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    unsafe fn open_registry_full_path(
+        &mut self,
+        full_path: &str,
+        desired: u32,
+        out: u64,
+    ) -> Option<u32> {
+        let canon = self.overlay_canon(full_path);
+        if let Some(index) = self.overlay.find(&canon) {
+            if Self::is_dynamic_user_volatile_env_canon(&canon) {
+                USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(OVERLAY_KEY_TAG | index as u32, desired, out));
+        }
+        if let Some(mutable_key) = self.mutable_registry_key_by_path(full_path) {
+            self.note_mutable_registry_key_open(mutable_key, full_path);
+            return Some(self.mint_mutable_registry_key(mutable_key, desired, out));
+        }
+        if self.mutable_hive_owns_path(full_path) {
+            self.note_registry_open_miss(full_path);
+            return Some(0xC000_0034);
+        }
+        let base_key = self.resolve_key(full_path)?;
+        self.note_base_registry_key_open(base_key, full_path);
+        Some(self.mint_registry_key(base_key, desired, out))
     }
 
     fn mutable_registry_value_by_path(
@@ -12532,13 +12578,11 @@ impl ExecNtHandler {
                 if let Some(status) = self.open_hosted_machine_key(root_target, &path, oa, args) {
                     return status;
                 }
-                // Registry overlays are machine-global, so keys created by configuration code must
-                // be openable by every process. This is especially important for loader IFEO keys:
-                // a configured image option may be created by services/setup and consumed while
-                // SMSS, CSRSS, or winlogon loads an image. Restricting overlay lookup to pi 3/4 made
-                // those real values permanently unreachable. This exact-key lookup changes nothing
-                // when the overlay is empty and does not synthesize missing SOFTWARE paths.
-                let overlay_full = if root_target == Some(MACHINE_ROOT_KEY) {
+                // A readable full registry path is resolved through one authority order for every
+                // process: created overlay keys first, then mounted mutable hives, then borrowed
+                // read-only regf only for paths no mutable hive owns. Empty PE-literal names still
+                // fall through to the recovery arms below.
+                let full_open_path = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut full = alloc::string::String::from(r"\Registry\Machine\");
                     full.push_str(&path);
                     Some(full)
@@ -12556,17 +12600,11 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                if let Some(ref full) = overlay_full {
-                    let canon = self.overlay_canon(full);
-                    if let Some(index) = self.overlay.find(&canon) {
-                        if Self::is_dynamic_user_volatile_env_canon(&canon) {
-                            USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return self.mint_registry_key(
-                            OVERLAY_KEY_TAG | index as u32,
-                            args[1] as u32,
-                            args[0],
-                        );
+                if let Some(ref full) = full_open_path {
+                    if let Some(status) =
+                        self.open_registry_full_path(full, args[1] as u32, args[0])
+                    {
+                        return status;
                     }
                 }
                 // ★ `\Registry\User` (HKEY_USERS) — the per-user hive namespace. EXACT-NAMESPACE
@@ -12605,21 +12643,12 @@ impl ExecNtHandler {
                             full.push_str(&eff_name);
                             full
                         };
-                        if let Some(kr) = self.resolve_key(&full) {
-                            if hive_sel(kr) == HIVE_SEL_SOFTWARE {
-                                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                            }
-                            WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                            return self.mint_registry_key(kr, args[1] as u32, args[0]);
+                        if let Some(status) =
+                            self.open_registry_full_path(&full, args[1] as u32, args[0])
+                        {
+                            return status;
                         }
                         return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
-                    }
-                    // COUNT ONLY — no `return`, no synthesized key, no outcome change. See
-                    // `is_profile_list_key`: this open is the structural witness that the real
-                    // `WLX_SAS_ACTION_LOGON` was returned and `HandleLogon` ran. It must still MISS
-                    // (the SOFTWARE hive is not mounted here), so the profile load fails honestly.
-                    if is_profile_list_key(&eff_name) {
-                        WINLOGON_PROFILE_LIST_OPENS.fetch_add(1, Ordering::Relaxed);
                     }
                     // Exact `\Registry\Machine` predefined-HKLM open (rd absolute) → sentinel handle.
                     if root_target.is_none() {
@@ -12639,49 +12668,30 @@ impl ExecNtHandler {
                     // winlogon InitializeSAS → SetDefaultLanguage(NULL) opens
                     // `System\CurrentControlSet\Control\Nls\Language` (relative to the HKLM handle, so
                     // root_dir arrives 0 like the keyboard-layout key) and reads its `Default` value (the
-                    // system default LCID string). This key IS in the real staged SYSTEM hive, so resolve
-                    // it there (prepend the `\Registry\Machine\` mount prefix → `resolve_key` applies the
-                    // CurrentControlSet→ControlSet001 alias + strips the prefix). Backing it makes
-                    // SetDefaultLanguage succeed → InitializeSAS succeeds (was: NOT_FOUND → SetDefaultLanguage
+                    // system default LCID string). Backing it makes SetDefaultLanguage succeed →
+                    // InitializeSAS succeeds (was: NOT_FOUND → SetDefaultLanguage
                     // FALSE → InitializeSAS FALSE → winlogon ExitProcess(2)). EXACT-name scoped so no other
                     // pi==2 HKLM subkey outcome changes (the desktop paint's client reads stay identical).
                     if is_nls_language_key(&eff_name) {
                         let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
-                        if let Some(kr) = self.resolve_key(&full) {
-                            return self.mint_registry_key(kr, args[1] as u32, args[0]);
+                        if let Some(status) =
+                            self.open_registry_full_path(&full, args[1] as u32, args[0])
+                        {
+                            return status;
                         }
+                        return 0xC000_0034;
                     }
-                    // ★ THE 4TH MOUNT'S ROUTE for winlogon — `ProfileList`, resolved for real
-                    // against the newly mounted SOFTWARE hive. winlogon's HKLM subkey opens arrive
-                    // with RootDirectory == the machine-root sentinel, and the arm further down
-                    // answers every such open NOT_FOUND: that is exactly why
-                    // `Software\Microsoft\Windows NT\CurrentVersion\ProfileList` was Error 2 and
-                    // `GetProfilesDirectoryW` failed. Same shape, and the same reason, as the
-                    // `is_nls_language_key` route immediately above.
-                    //
-                    // ★ EXACT-NAME scoped, and MEASURED to need to be. The general form — "accept
-                    // any pi==2 open that resolves into the SOFTWARE hive" — was tried and it
-                    // REGRESSED THE DESKTOP PAINT (gate 241 -> 218/99, 23 FAILs incl.
-                    // `exec_win32k_desktop_painted`, `exec_winlogon_sas_window`, all 7
-                    // `exec_msgina_*`): `Microsoft\Windows NT\CurrentVersion\Drivers32` then
-                    // resolved for the first time, winmm's DllMain took its real legacy-driver path
-                    // (beepmidi/msacm32.drv/msacm32 + a `system.ini` probe), and the SAS window's
-                    // `WM_NCCREATE` ended in a win32k `#PF` at `cr2=0xb0` —
-                    // "WL: Failed to create SAS window" -> "WL: Failed to initialize SAS". This is
-                    // the SAME hazard the keyboard-layout and Winlogon-key notes above record:
-                    // broadly succeeding HKLM opens regress the paint. So this stays exact-name, in
-                    // the established pattern, and the general hosted-service mechanism serves SOFTWARE
-                    // everywhere else (absolute opens, noninteractive services, relative opens off a SOFTWARE handle,
-                    // `registry_value(s)`, `registry_subkeys`, the overlay).
+                    // PE-name recovery only. Readable ProfileList opens are handled by the generic
+                    // mutable-hive route above; this branch exists for winlogon registry names that
+                    // live in untouched `.rdata` and arrive empty through the normal mirror reader.
                     if is_profile_list_key(&eff_name) {
                         let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
-                        if let Some(kr) = self.resolve_key(&full) {
-                            if hive_sel(kr) == HIVE_SEL_SOFTWARE {
-                                SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                                WINLOGON_PROFILE_LIST_HITS.fetch_add(1, Ordering::Relaxed);
-                                return self.mint_registry_key(kr, args[1] as u32, args[0]);
-                            }
+                        if let Some(status) =
+                            self.open_registry_full_path(&full, args[1] as u32, args[0])
+                        {
+                            return status;
                         }
+                        return 0xC000_0034;
                     }
                 }
                 // Noninteractive services: resolve HKLM predefined roots + machine-relative subkeys
@@ -12727,39 +12737,12 @@ impl ExecNtHandler {
                         }
                         Some(path.clone())
                     };
-                    // Overlay-FIRST: a created key shadows the base hive. Before services creates
-                    // anything the overlay is empty, so this is byte-identical to the prior path.
                     if let Some(ref full) = full_opt {
-                        let canon = self.overlay_canon(full);
-                        if let Some(oidx) = self.overlay.find(&canon) {
-                            return self.mint_registry_key(
-                                OVERLAY_KEY_TAG | (oidx as u32),
-                                args[1] as u32,
-                                args[0],
-                            );
+                        if let Some(status) =
+                            self.open_registry_full_path(full, args[1] as u32, args[0])
+                        {
+                            return status;
                         }
-                    }
-                    // Base-hive resolution (unchanged from the read-only seam).
-                    let cell: Option<KeyRef> = full_opt
-                        .as_ref()
-                        .and_then(|full| self.resolve_key(full));
-                    if let Some(cell) = cell {
-                        // `LSA_HIVE_ROOT_OPENED` means what its name says — an open resolved
-                        // against the real SECURITY or SAM mount. Test those two selectors
-                        // EXPLICITLY rather than "not SYSTEM": since the SOFTWARE hive became the
-                        // 4th mount, "not SYSTEM" also catches services'/lsass' HKLM\Software opens
-                        // and the counter drifted 3 -> 15 with no LSA meaning. SOFTWARE opens are
-                        // counted by `SOFTWARE_HIVE_KEY_OPENED` instead.
-                        if hive_sel(cell) == HIVE_SEL_SECURITY || hive_sel(cell) == HIVE_SEL_SAM {
-                            LSA_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
-                            if hive_sel(cell) == HIVE_SEL_SAM {
-                                SAM_HIVE_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if hive_sel(cell) == HIVE_SEL_SOFTWARE {
-                            SOFTWARE_HIVE_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return self.mint_registry_key(cell, args[1] as u32, args[0]);
                     }
                     // NOTE (SAM/SECURITY batch): `\Registry\Machine\{SECURITY,SAM}` used to be
                     // AUTO-CREATED in the overlay here on any lsass.exe open. That was a fabrication and
@@ -12773,21 +12756,6 @@ impl ExecNtHandler {
                     if let Some(ref full) = full_opt {
                         if is_lsa_hive_path(full) {
                             LSA_HIVE_OPEN_MISS.fetch_add(1, Ordering::Relaxed);
-                            // BYPASS ARM ONLY (`SECURITY_SAM_HIVES_MOUNTED == false`): the PRE-BATCH
-                            // behaviour — fabricate an empty overlay hive root on any lsass
-                            // SECURITY/SAM open. Kept solely so the bypass experiment reproduces the
-                            // old steady state (gate 220) instead of diverging into a hang; the live
-                            // path never takes it.
-                            if !SECURITY_SAM_HIVES_MOUNTED && self.current_process_is_lsass() {
-                                let canon = self.overlay_canon(full);
-                                let (oidx, _) = self.overlay.create(&canon);
-                                self.overlay_dirty = true;
-                                return self.mint_registry_key(
-                                    OVERLAY_KEY_TAG | (oidx as u32),
-                                    args[1] as u32,
-                                    args[0],
-                                );
-                            }
                         }
                         // samsrv's `SamIConnect` → `SampOpenDbObject(NULL, NULL, L"SAM", …)`: the
                         // bare leaf `SAM` opened with a NULL RootDirectory means its `SamKeyHandle`
@@ -12802,30 +12770,33 @@ impl ExecNtHandler {
                 // Early keyboard-layout open. advapi32's HKLM predefined-root handle does not always
                 // arrive as RootDirectory on this path, so accept either the sentinel-relative form
                 // or a machine-relative absolute name, but resolve only the exact real SYSTEM hive key.
-                let keyboard_layout_full =
-                    if root_target == Some(MACHINE_ROOT_KEY) && is_keyboard_layout_key(&path) {
+                let mut keyboard_layout_full = None;
+                if root_target == Some(MACHINE_ROOT_KEY) && is_keyboard_layout_key(&path) {
+                    let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                    full.push_str(&path);
+                    keyboard_layout_full = Some(full);
+                } else if root_target.is_none() && is_keyboard_layout_key(&path) {
+                    let comps = Self::key_components(&path);
+                    if comps.len() >= 2
+                        && comps[0].eq_ignore_ascii_case("Registry")
+                        && comps[1].eq_ignore_ascii_case("Machine")
+                    {
+                        keyboard_layout_full = Some(path.clone());
+                    } else {
                         let mut full = alloc::string::String::from(r"\Registry\Machine\");
                         full.push_str(&path);
-                        Some(full)
-                    } else if root_target.is_none() && is_keyboard_layout_key(&path) {
-                        let comps = Self::key_components(&path);
-                        if comps.len() >= 2
-                            && comps[0].eq_ignore_ascii_case("Registry")
-                            && comps[1].eq_ignore_ascii_case("Machine")
-                        {
-                            Some(path.clone())
-                        } else {
-                            let mut full = alloc::string::String::from(r"\Registry\Machine\");
-                            full.push_str(&path);
-                            Some(full)
-                        }
-                    } else {
-                        None
-                    };
+                        keyboard_layout_full = Some(full);
+                    }
+                }
                 if let Some(full) = keyboard_layout_full {
-                    if let Some(cell) = self.resolve_key(&full) {
+                    if let Some(status) =
+                        self.open_registry_full_path(&full, args[1] as u32, args[0])
+                    {
+                        if status != 0 {
+                            return status;
+                        }
                         KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                        return self.mint_registry_key(cell, args[1] as u32, args[0]);
+                        return 0;
                     }
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }

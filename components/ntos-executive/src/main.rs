@@ -5284,7 +5284,7 @@ fn winlogon_profile_directories_spec(passed: &mut u64) {
 /// `REG_EXPAND_SZ "%SystemDrive%\Profiles"` — the value `userenv!GetProfilesDirectoryW`
 /// (`profile.c:1592`) reads, whose absence was the `ERROR_FILE_NOT_FOUND` that made winlogon's
 /// `LoadUserProfileW` fail. Plus the live counters: winlogon really opened keys out of this mount,
-/// and its ProfileList open was really SATISFIED from it (0 with `SOFTWARE_HIVE_MOUNTED == false`).
+/// and its ProfileList open was really SATISFIED from it.
 unsafe fn software_hive_mount_spec(passed: &mut u64) {
     let size = SOFTWARE_HIVE_SIZE.load(Ordering::Relaxed);
     let opens = SOFTWARE_HIVE_KEY_OPENED.load(Ordering::Relaxed);
@@ -13419,18 +13419,6 @@ fn is_virtual_registry_key(kr: KeyRef) -> bool {
 /// `\reactos\system32\config`. A `KeyRef` is a cell offset inside ONE of them, so the top nibble
 /// SELECTS the hive. Real cell offsets are far below 0x2000_0000 (the largest hive is 460 KiB), and
 /// the tags stay below `OVERLAY_KEY_TAG` so `is_virtual_registry_key` is unchanged.
-/// **BYPASS SWITCH** for the SECURITY/SAM hive mount. Set to `false` to leave both hives unmounted
-/// (the pre-batch state): `\Registry\Machine\SECURITY` then fails to open, lsasrv's
-/// `LsapOpenServiceKey` returns STATUS_OBJECT_NAME_NOT_FOUND, no LSA policy database is installed
-    /// and samsrv never reaches its SAM keys — `exec_lsa_security_hive_backed`,
-    /// `exec_samsrv_hosted` and `exec_msv1_0_account_domain_sid_resolved` all FAIL. Verified.
-pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
-/// **BYPASS SWITCH** for the SOFTWARE hive mount (the 4th slot). Set to `false` to leave it
-/// unmounted (the pre-batch state): `\Registry\Machine\SOFTWARE` stops resolving,
-/// `RegOpenKeyExW(HKLM, "Software\Microsoft\Windows NT\CurrentVersion\ProfileList")` goes back to
-/// `ERROR_FILE_NOT_FOUND`, `userenv!GetProfilesDirectoryW` fails (Error 2) and winlogon's
-/// `HandleLogon` takes `goto cleanup` instead of reaching `StartUserShell`.
-pub(crate) const SOFTWARE_HIVE_MOUNTED: bool = true;
 /// ★ WIDENED `0xE000_0000` -> `0xF000_0000` (batch 62). The mask must leave room for the hives
 /// mounted at RUN time by `NtLoadKey` as well as the four mounted at boot, and every selector has
 /// to stay strictly below [`OVERLAY_KEY_TAG`] (`0x8000_0000`) so `is_virtual_registry_key` is
@@ -15460,7 +15448,7 @@ pub(crate) fn is_profile_list_key(path: &str) -> bool {
 /// `exec_winlogon_logon_action_returned`.
 pub(crate) static WINLOGON_PROFILE_LIST_OPENS: AtomicU64 = AtomicU64::new(0);
 /// Times a ProfileList open was SATISFIED out of the real SOFTWARE mount (a subset of
-/// `WINLOGON_PROFILE_LIST_OPENS`, which counts every attempt). 0 with the mount bypassed.
+/// `WINLOGON_PROFILE_LIST_OPENS`, which counts every attempt).
 pub(crate) static WINLOGON_PROFILE_LIST_HITS: AtomicU64 = AtomicU64::new(0);
 /// Times ANY key was opened out of the 4th mount, `\Registry\Machine\SOFTWARE`.
 pub(crate) static SOFTWARE_HIVE_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
