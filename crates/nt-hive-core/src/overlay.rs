@@ -135,8 +135,8 @@ impl RegistryOverlay {
     /// `created` is `true` only if the key did not already exist in the overlay.
     ///
     /// A DETACHED slot with the same path is re-attached in place and emptied for an explicit new
-    /// create. The `NtLoadKey` remount path uses [`Self::reattach_subtree`] instead, because a prior
-    /// `RegFlushKey`/unload must make those retained writes visible again.
+    /// create. `NtLoadKey` remounts must reload the hive image from their backing file; detached
+    /// overlay values are not persistent registry storage.
     pub fn create(&mut self, canon: &str) -> (usize, bool) {
         self.create_owned(String::from(canon))
     }
@@ -172,11 +172,9 @@ impl RegistryOverlay {
     }
 
     /// DETACH every key at or below `canon` — the write-plane half of `NtUnloadKey`. Without this
-    /// an unload would leave the writes made through the mounted hive still resolving at the same
-    /// path, so the "unloaded" key would keep answering opens. Values are kept hidden, not erased:
-    /// the registry hive write path has no on-disk writer, so this retained overlay is the durable
-    /// state a later `NtLoadKey` reattaches. Returns how many keys were detached (0 = nothing was
-    /// mounted there, which the caller must report as a refusal).
+    /// an unload would leave volatile overlay keys made below the mounted hive still resolving at
+    /// the same path, so the "unloaded" key would keep answering opens. Values are kept hidden until
+    /// an explicit new create reuses the slot and starts empty.
     pub fn detach_subtree(&mut self, canon: &str) -> usize {
         let mut detached = 0;
         for key in self.keys.iter_mut() {
@@ -193,28 +191,6 @@ impl RegistryOverlay {
             }
         }
         detached
-    }
-
-    /// REATTACH every detached key at or below `canon`, restoring the overlay writes hidden by
-    /// [`Self::detach_subtree`]. This models a hive that was flushed/unloaded and then mounted again
-    /// from the same path: while unloaded it answered nothing, but its prior writes are still the
-    /// volatile backing store once the mount returns.
-    pub fn reattach_subtree(&mut self, canon: &str) -> usize {
-        let mut reattached = 0;
-        for key in self.keys.iter_mut() {
-            if !key.detached {
-                continue;
-            }
-            let under = key.path == canon
-                || (key.path.len() > canon.len()
-                    && key.path.starts_with(canon)
-                    && key.path.as_bytes()[canon.len()] == b'\\');
-            if under {
-                key.detached = false;
-                reattached += 1;
-            }
-        }
-        reattached
     }
 
     /// Set (create-or-replace) a value on an overlay key. `name` may be `""` (the default value).
@@ -644,15 +620,12 @@ mod tests {
         assert_eq!(ov.find(r"\registry\user\s-1-5-21-11"), Some(other));
         assert_eq!(ov.find(r"\registry\user\.default"), Some(keep));
 
-        assert_eq!(ov.reattach_subtree(r"\registry\user\s-1-5-21-1"), 2);
-        assert_eq!(ov.find(r"\registry\user\s-1-5-21-1"), Some(root));
-        assert_eq!(
-            ov.find(r"\registry\user\s-1-5-21-1\environment"),
-            Some(child)
-        );
-        assert_eq!(ov.value(root, "Loaded"), Some((4, &1u32.to_le_bytes()[..])));
-        assert_eq!(ov.value(child, "TEMP"), Some((1, &b"t"[..])));
-        assert_eq!(ov.live_len(), 4);
+        let (again, created_again) = ov.create(r"\registry\user\s-1-5-21-1");
+        assert_eq!(again, root);
+        assert!(created_again);
+        assert_eq!(ov.values_len(root), 0);
+        assert!(ov.is_detached(child));
+        assert_eq!(ov.live_len(), 3);
     }
 
     #[test]
@@ -660,7 +633,6 @@ mod tests {
         let mut ov = RegistryOverlay::new();
         ov.create(r"\registry\user\.default");
         assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-9"), 0);
-        assert_eq!(ov.reattach_subtree(r"\registry\user\s-1-5-21-9"), 0);
         assert_eq!(ov.live_len(), 1);
     }
 

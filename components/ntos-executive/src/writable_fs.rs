@@ -524,6 +524,106 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
     (status, written)
 }
 
+fn rename_information(
+    replace_if_exists: bool,
+    root_directory: u64,
+    target_path: &str,
+) -> Result<alloc::vec::Vec<u8>, u32> {
+    let name_len = target_path
+        .encode_utf16()
+        .count()
+        .checked_mul(2)
+        .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let name_len_u32 =
+        u32::try_from(name_len).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let total_len = 20usize
+        .checked_add(name_len)
+        .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let mut info = alloc::vec::Vec::new();
+    info.try_reserve_exact(total_len)
+        .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    info.resize(20, 0);
+    info[0] = u8::from(replace_if_exists);
+    info[8..16].copy_from_slice(&root_directory.to_le_bytes());
+    info[16..20].copy_from_slice(&name_len_u32.to_le_bytes());
+    for unit in target_path.encode_utf16() {
+        info.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(info)
+}
+
+fn delete_open_file(fs: &mut nt_fs::FileSystem, handle: u64) {
+    let _ = fs.zw_set_information_file(handle, nt_fs::FILE_DISPOSITION_INFORMATION, &[1]);
+    let _ = fs.zw_close(handle);
+}
+
+/// Atomically replace a writable-volume file with `bytes` using the same temp-file +
+/// `FileRenameInformation` contract as the hive I/O provider.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted writable volume for the duration of the replace.
+pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
+    };
+    let tmp_path = alloc::format!("{}.TMP", path);
+    let create = fs.zw_create_file(
+        &tmp_path,
+        nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+        0,
+        0,
+        nt_fs::FILE_OVERWRITE_IF,
+        0,
+    );
+    if create.status != nt_fs::STATUS_SUCCESS {
+        return create.status;
+    }
+
+    let (write_status, written) = fs.zw_write_file(create.handle, Some(0), bytes);
+    if write_status != nt_fs::STATUS_SUCCESS {
+        delete_open_file(fs, create.handle);
+        return write_status;
+    }
+    if written != bytes.len() {
+        delete_open_file(fs, create.handle);
+        return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    let eof = (bytes.len() as u64).to_le_bytes();
+    let status =
+        fs.zw_set_information_file(create.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
+    if status != nt_fs::STATUS_SUCCESS {
+        delete_open_file(fs, create.handle);
+        return status;
+    }
+    let status = fs.zw_flush_buffers_file(create.handle);
+    if status != nt_fs::STATUS_SUCCESS {
+        delete_open_file(fs, create.handle);
+        return status;
+    }
+
+    let rename = match rename_information(true, 0, path) {
+        Ok(rename) => rename,
+        Err(status) => {
+            delete_open_file(fs, create.handle);
+            return status;
+        }
+    };
+    let status = fs.zw_set_information_file(create.handle, nt_fs::FILE_RENAME_INFORMATION, &rename);
+    if status != nt_fs::STATUS_SUCCESS {
+        delete_open_file(fs, create.handle);
+        return status;
+    }
+    let status = fs.zw_flush_buffers_file(create.handle);
+    let _ = fs.zw_close(create.handle);
+    if status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
+        OVERLAY_BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+    }
+    status
+}
+
 /// `NtFlushBuffersFile` on a writable-volume file object.
 pub(crate) unsafe fn flush(file_id: u64) -> u32 {
     let Some(fs) = writable_fs() else {

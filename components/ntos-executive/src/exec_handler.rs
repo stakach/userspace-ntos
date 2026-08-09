@@ -2338,6 +2338,55 @@ impl ExecNtHandler {
         status
     }
 
+    fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if dirty_cells == 0 {
+            return nt_fs::STATUS_SUCCESS;
+        }
+        let Some(file_path) = self
+            .hive_mounts
+            .iter()
+            .find(|mount| mount.dynamic && mount.sel == hive_sel)
+            .map(|mount| mount.file.clone())
+        else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let image = nt_hive_core::encode_image(hive);
+        if image.len() > USER_HIVE_SLOT_BYTES {
+            REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] dynamic hive checkpoint too large bytes=");
+            print_u64(image.len() as u64);
+            print_str(b" path=");
+            print_ascii_str(&file_path);
+            print_str(b"\n");
+            return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let status = unsafe { crate::writable_fs::write_file_atomic(&file_path, &image) };
+        if status == nt_fs::STATUS_SUCCESS {
+            self.writable_fs_dirty = true;
+            REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+            REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
+            print_str(b"[cm-flush] dynamic hive checkpoint ");
+            print_u64(image.len() as u64);
+            print_str(b"B dirty-cells=");
+            print_u64(dirty_cells as u64);
+            print_str(b" path=");
+            print_ascii_str(&file_path);
+            print_str(b"\n");
+        } else {
+            REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] dynamic hive checkpoint failed status=0x");
+            print_hex(status);
+            print_str(b" path=");
+            print_ascii_str(&file_path);
+            print_str(b"\n");
+        }
+        status
+    }
+
     /// `NtLoadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a hive file at
     /// a key in the registry namespace. Ordinary ReactOS/Windows `regf` images are imported into
     /// the mutable hive authority; D3 dynamic checkpoints saved by this kernel are accepted as
@@ -2464,21 +2513,12 @@ impl ExecNtHandler {
             }
         };
         USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
-        let reattached = self.overlay.reattach_subtree(&canon);
-        if reattached != 0 {
-            NT_LOAD_KEY_OVERLAY_REATTACHED.fetch_add(reattached as u64, Ordering::Relaxed);
-            self.overlay_dirty = true;
-            print_str(b"[cm-load] reattached ");
-            print_u64(reattached as u64);
-            print_str(b" overlay key(s) for ");
-            print_ascii_str(&full);
-            print_str(b"\n");
-        }
         if let Some(ref hive) = regf_hive {
             mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, hive);
         } else if let Some(hive) = core_hive {
             self.mutable_hives
                 .mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
+            NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
         self.mutable_hives_dirty = true;
         self.hive_mounts.push(HiveMount {
@@ -14473,9 +14513,9 @@ impl ExecNtHandler {
             // NT references the key object by handle with no access mask, rejects deleted KCBs, then
             // calls `CmFlushKey(kcb, FALSE)`. This host now has two live write authorities:
             // volatile overlay keys, which match `HvSyncHive`'s volatile-hive early return, and
-            // mounted mutable hives, which are coherent immediately but still need D3's file-backed
-            // checkpoint/reboot proof. Keep the classifications explicit so the proof follows the
-            // current authority instead of the old overlay-only model.
+            // mounted mutable hives. Dynamic `NtLoadKey` profile hives are checkpointed back to the
+            // source file on flush, so `RegUnLoadKey` followed by a later `RegLoadKey` sees the file
+            // image instead of a hidden overlay side table.
             NativeService::NtFlushKey => {
                 let key = match self.resolve_registry_key(args[0], 0) {
                     Ok(key) => key,
@@ -14491,8 +14531,14 @@ impl ExecNtHandler {
                         .hive(mutable_key.hive)
                         .map_or(0, |hive| hive.dirty_count());
                     REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(dirty as u64, Ordering::Relaxed);
+                    if is_dynamic_hive_selector(mutable_key.hive) {
+                        let status = self.checkpoint_dynamic_mutable_hive(mutable_key.hive, dirty);
+                        if status != nt_fs::STATUS_SUCCESS {
+                            return status;
+                        }
+                    }
                 }
-                0 // STATUS_SUCCESS: live authority is coherent; durable checkpointing is D3.
+                0
             }
             // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive root to a caller-opened file.
             // Mutable hive roots write their live `nt-hive-core` image; borrowed-regf roots without

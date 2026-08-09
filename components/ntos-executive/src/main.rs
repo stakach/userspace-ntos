@@ -4559,6 +4559,8 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
         r"control panel\international",
         "Locale",
     ) as u64;
+    let checkpointed = REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.load(Ordering::Relaxed);
+    let checkpoint_bytes = REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.load(Ordering::Relaxed);
     print_str(b"[wl-ntuser] Default User\\ntuser.dat provisioned=");
     print_u64(staged);
     print_str(b"B hive-image-parses=");
@@ -4571,6 +4573,8 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     print_u64(copied_locale);
     print_str(b"B raw-config-default=");
     print_u64(DEFAULT_HIVE_SIZE.load(Ordering::Relaxed));
+    print_str(b"B checkpoint=");
+    print_u64(checkpoint_bytes);
     print_str(b"B)\n");
     check(
         b"exec_profile_ntuser_dat_present",
@@ -4578,8 +4582,14 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
             || (staged > 0
                 // the SOURCE profile really holds the setup hive image, byte-length exact …
                 && source == staged
-                // … winlogon's own CopyDirectory produced an equally real one in the profile …
-                && copied == source
+                // … winlogon's own CopyDirectory produced a mountable destination image; after
+                // CreateUserHive mutates and flushes it, the destination is expected to be the
+                // checkpoint NtFlushKey wrote rather than the original source byte-for-byte.
+                && if checkpointed == 0 {
+                    copied == source
+                } else {
+                    copied == checkpoint_bytes && checkpoint_bytes > 0
+                }
                 // … and the file contains setup-owned values, not just the raw LiveCD prototype.
                 && copied_appdata > 0
                 && copied_locale > 0),
@@ -4612,7 +4622,10 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     let subkeys = NT_LOAD_KEY_ROOT_SUBKEYS.load(Ordering::Relaxed);
     let unloads = NT_UNLOAD_KEY_CALLS.load(Ordering::Relaxed);
     let detached = NT_UNLOAD_KEY_DETACHED.load(Ordering::Relaxed);
-    let reattached = NT_LOAD_KEY_OVERLAY_REATTACHED.load(Ordering::Relaxed);
+    let core_mounted = NT_LOAD_KEY_CORE_HIVE_MOUNTED.load(Ordering::Relaxed);
+    let checkpoints = REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.load(Ordering::Relaxed);
+    let checkpoint_bytes = REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.load(Ordering::Relaxed);
+    let checkpoint_fails = REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.load(Ordering::Relaxed);
     let user_opens = USER_HIVE_KEY_OPENED.load(Ordering::Relaxed);
     let default_opens = USER_DEFAULT_KEY_OPENED.load(Ordering::Relaxed);
     let root_opens = USER_ROOT_OPENED.load(Ordering::Relaxed);
@@ -4637,8 +4650,14 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     print_u64(unloads);
     print_str(b" detached=");
     print_u64(detached);
-    print_str(b" reattached-overlay-keys=");
-    print_u64(reattached);
+    print_str(b" core-mounted=");
+    print_u64(core_mounted);
+    print_str(b" flush-checkpoints=");
+    print_u64(checkpoints);
+    print_str(b" checkpoint-bytes=");
+    print_u64(checkpoint_bytes);
+    print_str(b" checkpoint-fails=");
+    print_u64(checkpoint_fails);
     print_str(b" | \\Registry\\User opens: root=");
     print_u64(root_opens);
     print_str(b" .Default=");
@@ -4663,8 +4682,10 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                 && mounted >= 1
                 && held == 1
                 && refused == 0
-                // a REAL regf: the hive it mounted is the profile's own `ntuser.dat` …
-                && bytes == DEFAULT_HIVE_SIZE.load(Ordering::Relaxed)
+                // a REAL mountable hive image: the hive it mounted is the profile's own
+                // `ntuser.dat`, and after CreateUserHive flushed/unloaded it the next mount read the
+                // checkpoint image written to that file.
+                && bytes == checkpoint_bytes
                 && bytes > 0
                 // … with `config\default`'s five root subkeys (AppEvents, Control Panel,
                 // Environment, Keyboard Layout, Software) …
@@ -4682,9 +4703,12 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                 && unloads >= 1
                 && detached >= 1
                 // CreateUserProfileExW initializes the hive, flushes/unloads it, then
-                // LoadUserProfileW mounts it again; without reattaching the saved writes, HKCU shell
-                // folder values disappear before explorer asks for CSIDL_STARTMENU.
-                && reattached >= detached),
+                // LoadUserProfileW mounts it again. Persistence across that detach now comes from a
+                // real dynamic-hive checkpoint written by NtFlushKey and read back by NtLoadKey.
+                && checkpoints >= detached
+                && checkpoint_bytes > 0
+                && checkpoint_fails == 0
+                && core_mounted >= 1),
         passed,
     );
 }
@@ -15222,7 +15246,7 @@ pub(crate) static USER_VOLATILE_ENV_QUERY_VALUE_COUNT: AtomicU64 = AtomicU64::ne
 /// `NtLoadKey`/`NtUnloadKey` outcome counters, so the gate asserts what really happened.
 pub(crate) static NT_LOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_MOUNTED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NT_LOAD_KEY_OVERLAY_REATTACHED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_LOAD_KEY_CORE_HIVE_MOUNTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_LOAD_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_UNLOAD_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_UNLOAD_KEY_DETACHED: AtomicU64 = AtomicU64::new(0);
@@ -15566,6 +15590,12 @@ pub(crate) static REG_FLUSH_KEY_VOLATILE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REG_FLUSH_KEY_MUTABLE: AtomicU64 = AtomicU64::new(0);
 /// Dirty mutable-hive cells observed by the most recent mutable-key flush.
 pub(crate) static REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS: AtomicU64 = AtomicU64::new(0);
+/// Dynamic profile-hive checkpoints written by `NtFlushKey` to the hive's source file.
+pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+/// Bytes in the most recent dynamic profile-hive checkpoint image.
+pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Failed attempts to checkpoint a dynamic profile hive during `NtFlushKey`.
+pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
 /// writable overlay FILE_OBJECT. Dynamic profile roots use the live mutable image; boot roots still
 /// use their borrowed `regf` backing until D3 adds a checkpoint provider.
