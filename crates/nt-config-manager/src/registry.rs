@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 /// An opaque registry key handle.
 pub type RegistryKeyId = u64;
 
-/// `REG_*` value type (spec §8.3).
+/// NT5 `REG_*` value type (spec §8.3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RegistryValueType {
@@ -20,7 +20,12 @@ pub enum RegistryValueType {
     ExpandSz = 2,
     Binary = 3,
     Dword = 4,
+    DwordBigEndian = 5,
+    Link = 6,
     MultiSz = 7,
+    ResourceList = 8,
+    FullResourceDescriptor = 9,
+    ResourceRequirementsList = 10,
     Qword = 11,
 }
 
@@ -32,7 +37,12 @@ impl RegistryValueType {
             2 => Self::ExpandSz,
             3 => Self::Binary,
             4 => Self::Dword,
+            5 => Self::DwordBigEndian,
+            6 => Self::Link,
             7 => Self::MultiSz,
+            8 => Self::ResourceList,
+            9 => Self::FullResourceDescriptor,
+            10 => Self::ResourceRequirementsList,
             11 => Self::Qword,
             _ => return None,
         })
@@ -496,6 +506,31 @@ mod tests {
         assert_eq!(r.query_dword(k, "D"), Some(1));
         assert!(r.delete_value(k, "D"));
         assert_eq!(r.query_value(k, "D"), None);
+    }
+
+    #[test]
+    fn nt5_value_type_numbers_roundtrip() {
+        let known = [
+            RegistryValueType::None,
+            RegistryValueType::Sz,
+            RegistryValueType::ExpandSz,
+            RegistryValueType::Binary,
+            RegistryValueType::Dword,
+            RegistryValueType::DwordBigEndian,
+            RegistryValueType::Link,
+            RegistryValueType::MultiSz,
+            RegistryValueType::ResourceList,
+            RegistryValueType::FullResourceDescriptor,
+            RegistryValueType::ResourceRequirementsList,
+            RegistryValueType::Qword,
+        ];
+        for value_type in known {
+            assert_eq!(
+                RegistryValueType::from_u32(value_type as u32),
+                Some(value_type)
+            );
+        }
+        assert_eq!(RegistryValueType::from_u32(12), None);
     }
 
     #[test]

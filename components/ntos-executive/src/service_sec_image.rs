@@ -6904,6 +6904,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.stop = false;
                 nt_handler.user_apc_redirected = false;
                 nt_handler.overlay_dirty = false;
+                nt_handler.mutable_hives_dirty = false;
                 nt_handler.hosted_exe_dirty = false;
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
@@ -7247,6 +7248,10 @@ pub(crate) unsafe fn service_sec_image(
                 // within the 2 MiB heap; non-mutating iterations still reset fully.
                 if nt_handler.overlay_dirty {
                     nt_handler.overlay_dirty = false;
+                    heap_mark = allocator::mark();
+                }
+                if nt_handler.mutable_hives_dirty {
+                    nt_handler.mutable_hives_dirty = false;
                     heap_mark = allocator::mark();
                 }
                 // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a

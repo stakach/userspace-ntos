@@ -1099,6 +1099,8 @@ impl ExecNtHandler {
         write_field!(hive_mounts, hive_mounts);
         write_field!(hive_mounts_dirty, false);
         write_field!(mutable_hives, mutable_hives);
+        write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
+        write_field!(mutable_hives_dirty, false);
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
@@ -1528,6 +1530,44 @@ impl ExecNtHandler {
         0
     }
 
+    fn install_mutable_registry_key_target(
+        &mut self,
+        key: ResolvedHiveKey,
+    ) -> Result<KeyRef, u32> {
+        if let Some(index) = self
+            .mutable_key_handles
+            .iter()
+            .position(|entry| *entry == Some(key))
+        {
+            return Ok(MUTABLE_KEY_TAG | index as u32);
+        }
+        if let Some(index) = self.mutable_key_handles.iter().position(|entry| entry.is_none()) {
+            self.mutable_key_handles[index] = Some(key);
+            return Ok(MUTABLE_KEY_TAG | index as u32);
+        }
+        if self.mutable_key_handles.len() >= MUTABLE_KEY_MAX as usize {
+            return Err(0xC000_009A);
+        }
+        let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
+        self.mutable_key_handles.push(Some(key));
+        if grows_buffer {
+            self.mutable_hives_dirty = true;
+        }
+        Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
+    }
+
+    unsafe fn mint_mutable_registry_key(
+        &mut self,
+        key: ResolvedHiveKey,
+        desired: u32,
+        out: u64,
+    ) -> u32 {
+        match self.install_mutable_registry_key_target(key) {
+            Ok(target) => self.mint_registry_key(target, desired, out),
+            Err(status) => status,
+        }
+    }
+
     /// Resolve a registry handle owned by the current process and enforce the requested key right.
     fn resolve_registry_key(&self, handle: u64, required_access: u32) -> Result<KeyRef, u32> {
         if handle > u32::MAX as u64 {
@@ -1591,12 +1631,38 @@ impl ExecNtHandler {
         }
     }
 
+    fn mutable_key_handle(&self, target: KeyRef) -> Option<ResolvedHiveKey> {
+        let index = mutable_key_idx(target)?;
+        let key = *self.mutable_key_handles.get(index)?.as_ref()?;
+        self.mutable_hives
+            .hive(key.hive)
+            .and_then(|hive| hive.key_path(key.key))
+            .map(|_| key)
+    }
+
+    fn mutable_key_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
+        let relative = self.mutable_hives.hive(key.hive)?.key_path(key.key)?;
+        let mut full = self.hive_mount_path(key.hive)?;
+        if !relative.is_empty() {
+            if relative.as_bytes().first() == Some(&b'\\') {
+                full.push_str(&relative);
+            } else {
+                full.push('\\');
+                full.push_str(&relative);
+            }
+        }
+        Some(self.overlay_canon(&full))
+    }
+
     fn registry_target_path(&self, target: KeyRef) -> Option<alloc::string::String> {
         if target == MACHINE_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\machine"));
         }
         if target == USER_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\user"));
+        }
+        if let Some(key) = self.mutable_key_handle(target) {
+            return self.mutable_key_path(key);
         }
         if let Some(index) = overlay_key_idx(target) {
             return self.overlay.path(index).map(alloc::string::String::from);
@@ -2512,6 +2578,13 @@ impl ExecNtHandler {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
         let _ = self.mutable_hives.unmount(&mount.mount);
+        let mut mutable_handles_invalidated = 0usize;
+        for entry in self.mutable_key_handles.iter_mut() {
+            if entry.as_ref().is_some_and(|key| key.hive == mount.sel) {
+                *entry = None;
+                mutable_handles_invalidated += 1;
+            }
+        }
         let overlay_detached = self.overlay.detach_subtree(&canon);
         self.overlay_dirty = true;
         self.hive_mounts_dirty = true;
@@ -2526,6 +2599,8 @@ impl ExecNtHandler {
         print_ascii_str(&mount.mount);
         print_str(b" overlay-keys=");
         print_u64(overlay_detached as u64);
+        print_str(b" mutable-handles=");
+        print_u64(mutable_handles_invalidated as u64);
         print_str(b" mounts-left=");
         print_u64(self.hive_mounts.len() as u64);
         print_str(b"\n");
@@ -2547,6 +2622,9 @@ impl ExecNtHandler {
     }
 
     fn mutable_registry_key(&self, target: KeyRef) -> Option<nt_hive_core::ResolvedHiveKey> {
+        if let Some(key) = self.mutable_key_handle(target) {
+            return Some(key);
+        }
         let full_path = self.registry_target_path(target)?;
         self.mutable_registry_key_by_path(&full_path)
     }
@@ -12767,10 +12845,9 @@ impl ExecNtHandler {
                 }
             },
             // NtCreateKey(*KeyHandle[0], DesiredAccess[1], *ObjectAttributes[2], TitleIndex, *Class,
-            // CreateOptions, *Disposition[sp+0x38]). The CM WRITE plane: create-or-open a key in the
-            // in-memory overlay ([`RegistryOverlay`]) that shadows the read-only base hive. services.exe's
-            // ScmCreateServiceDatabase creates volatile keys (Control\ServiceCurrent, group list) here;
-            // lsass.exe creates SECURITY/SAM policy state on first boot.
+            // CreateOptions, *Disposition[sp+0x38]). Persistent mounted-hive keys are created/opened
+            // in `MutableHiveSet`; explicitly volatile keys and paths outside mounted hives stay in
+            // the volatile overlay until D4 gives volatile keys first-class hive ownership.
             NativeService::NtCreateKey => unsafe {
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
                     return 0xC000_0005;
@@ -12843,12 +12920,24 @@ impl ExecNtHandler {
                 if !self.registry_path_exists(parent) {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                // Disposition/storage split: an existing overlay key still shadows the base, but an
-                // existing mounted-hive key should stay a mounted-hive handle. Creating an overlay for
-                // every OPEN existing key made profile setup duplicate the whole loaded user hive.
+                // Disposition/storage split: existing overlay keys keep their overlay identity
+                // because they may be volatile. Non-volatile keys owned by a mounted mutable hive
+                // now open/create in the Hive Manager instead of shadowing through the overlay.
+                let create_options = args[5] as u32;
+                let create_volatile = create_options & 0x1 != 0;
                 let overlay_existing = self.overlay.find(&canon);
-                let base_existing = self.resolve_key(&full);
-                let existed = overlay_existing.is_some() || base_existing.is_some();
+                let mutable_existing = if create_volatile {
+                    None
+                } else {
+                    self.mutable_hives.resolve_key(&full)
+                };
+                let base_existing = if mutable_existing.is_none() {
+                    self.resolve_key(&full)
+                } else {
+                    None
+                };
+                let existed =
+                    overlay_existing.is_some() || mutable_existing.is_some() || base_existing.is_some();
                 if let Some(oidx) = overlay_existing {
                     let status = self.mint_registry_key(
                         OVERLAY_KEY_TAG | (oidx as u32),
@@ -12872,6 +12961,26 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
+                if let Some(mutable_key) = mutable_existing {
+                    let status =
+                        self.mint_mutable_registry_key(mutable_key, args[1] as u32, args[0]);
+                    if status != 0 {
+                        return status;
+                    }
+                    if self.current_process_is_winlogon()
+                        && is_profile_list_sid_key_canon(&canon)
+                        && PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16
+                    {
+                        print_str(b"[profile-list] NtCreateKey ");
+                        print_ascii_str(&canon);
+                        print_str(b" opened-mutable\n");
+                    }
+                    let disp_ptr = args[6];
+                    if disp_ptr != 0 {
+                        self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
+                    }
+                    return 0;
+                }
                 if let Some(base_key) = base_existing {
                     let status = self.mint_registry_key(base_key, args[1] as u32, args[0]);
                     if status != 0 {
@@ -12888,6 +12997,72 @@ impl ExecNtHandler {
                     let disp_ptr = args[6];
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
+                    }
+                    return 0;
+                }
+                if !create_volatile && self.mutable_hives.resolve_key(parent).is_some() {
+                    let full_len = full.len();
+                    let canon_len = canon.len();
+                    let mut full_scratch = [0u8; 2048];
+                    let mut canon_scratch = [0u8; 2048];
+                    if full_len > full_scratch.len() || canon_len > canon_scratch.len() {
+                        return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                    }
+                    full_scratch[..full_len].copy_from_slice(full.as_bytes());
+                    canon_scratch[..canon_len].copy_from_slice(canon.as_bytes());
+                    drop(canon);
+                    drop(full);
+                    drop(name);
+                    allocator::reset_to(transient_mark);
+                    let full = match core::str::from_utf8(&full_scratch[..full_len]) {
+                        Ok(path) => path,
+                        Err(_) => return 0xC000_0033,
+                    };
+                    let canon = match core::str::from_utf8(&canon_scratch[..canon_len]) {
+                        Ok(path) => path,
+                        Err(_) => return 0xC000_0033,
+                    };
+                    let Some(mutable_key) = self.mutable_hives.create_key(full) else {
+                        return 0xC000_0034;
+                    };
+                    self.mutable_hives_dirty = true;
+                    // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
+                    // own first-boot setup, plus registry writes needed by profile/computer-name
+                    // boot paths.
+                    if canon.starts_with(r"\registry\machine\security\policy") {
+                        LSA_POLICY_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
+                    } else if canon.starts_with(r"\registry\machine\sam\") {
+                        SAM_SETUP_KEYS_CREATED.fetch_add(1, Ordering::Relaxed);
+                    } else if canon.ends_with(r"\computername\activecomputername") {
+                        ACTIVE_COMPUTER_NAME_KEY_CREATED.fetch_add(1, Ordering::Relaxed);
+                    } else if self.current_process_is_winlogon() && is_profile_list_sid_key_canon(canon) {
+                        PROFILE_LIST_SID_KEYS_CREATED
+                            .fetch_add((!existed) as u64, Ordering::Relaxed);
+                        if PROFILE_LIST_VALUE_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+                            print_str(b"[profile-list] NtCreateKey ");
+                            print_ascii_str(canon);
+                            print_str(b" created-mutable\n");
+                        }
+                    } else if self.current_process_is_winlogon()
+                        && Self::is_dynamic_user_volatile_env_canon(canon)
+                    {
+                        let created_counted = (!existed) as u64;
+                        let previous =
+                            USER_VOLATILE_ENV_CREATED.fetch_add(created_counted, Ordering::Relaxed);
+                        if created_counted != 0 && previous < 4 {
+                            print_str(b"[cm-load] NtCreateKey ");
+                            print_ascii_str(canon);
+                            print_str(b" created mutable by winlogon\n");
+                        }
+                    }
+                    let status =
+                        self.mint_mutable_registry_key(mutable_key, args[1] as u32, args[0]);
+                    if status != 0 {
+                        return status;
+                    }
+                    let disp_ptr = args[6];
+                    if disp_ptr != 0 {
+                        self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                     }
                     return 0;
                 }
@@ -12963,9 +13138,8 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS
             },
             // NtSetValueKey(KeyHandle[0], *ValueName[1], TitleIndex, Type[3], Data[sp+0x28],
-            // DataSize[sp+0x30]). The CM WRITE plane: write a value into an overlay (created) key.
-            // Base-hive handles shadow only when the visible value actually changes; idempotent writes
-            // to an already-loaded hive succeed without duplicating base hive data into the overlay.
+            // DataSize[sp+0x30]). Mounted-hive keys write into `MutableHiveSet`; overlay handles
+            // keep using the volatile overlay.
             NativeService::NtSetValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -13030,9 +13204,6 @@ impl ExecNtHandler {
                     if let Some(index) = self.overlay.find(&path) {
                         Some(index)
                     } else {
-                        if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
-                            return 0xC000_009A;
-                        }
                         shadow_path_len = path.len();
                         if shadow_path_len > shadow_path_scratch.len() {
                             return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
@@ -13049,6 +13220,11 @@ impl ExecNtHandler {
                                 .unwrap_or("")
                         })
                     });
+                let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none() {
+                    self.mutable_registry_key(key)
+                } else {
+                    None
+                };
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
                 // the `PolAcDmS` policy attribute's DEFAULT value. Record its length + SID header so
                 // the gate can assert real SID structure (Revision 1, 4 sub-authorities, NT
@@ -13091,9 +13267,42 @@ impl ExecNtHandler {
                 drop(name);
                 allocator::reset_to(transient_mark);
 
+                let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
+                    Ok(name) => name,
+                    Err(_) => return 0xC000_0033,
+                };
+                let staged = core::slice::from_raw_parts(
+                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                    data_size,
+                );
+                if let Some(mutable_key) = mutable_target {
+                    let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
+                        return 0xC000_000D;
+                    };
+                    let mut durable_data = alloc::vec::Vec::with_capacity(data_size);
+                    durable_data.extend_from_slice(staged);
+                    if !self.mutable_hives.set_value(
+                        mutable_key,
+                        durable_name,
+                        value_type,
+                        durable_data,
+                    ) {
+                        return 0xC000_0008;
+                    }
+                    self.mutable_hives_dirty = true;
+                    return 0;
+                }
+                let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
+                    Ok(name) => alloc::string::String::from(name),
+                    Err(_) => return 0xC000_0033,
+                };
+
                 let oidx = if let Some(index) = existing_overlay {
                     index
                 } else {
+                    if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
+                        return 0xC000_009A;
+                    }
                     let path = match core::str::from_utf8(&shadow_path_scratch[..shadow_path_len]) {
                         Ok(path) => alloc::string::String::from(path),
                         Err(_) => return 0xC000_0033,
@@ -13101,14 +13310,6 @@ impl ExecNtHandler {
                     let (index, _) = self.overlay.create_owned(path);
                     index
                 };
-                let durable_name = match core::str::from_utf8(&name_scratch[..name_len]) {
-                    Ok(name) => alloc::string::String::from(name),
-                    Err(_) => return 0xC000_0033,
-                };
-                let staged = core::slice::from_raw_parts(
-                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                    data_size,
-                );
                 if !self
                     .overlay
                     .set_value_from_slice(oidx, durable_name, ty, staged)

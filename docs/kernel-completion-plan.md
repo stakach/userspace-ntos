@@ -75,7 +75,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
   replacement are now real; D2/D3 still own live hive authority plus explicit system/user flush and
   reboot persistence proofs.
 - `[~]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
-  than executive-local mirrors.
+  than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
+  reads prefer that authority, and `NtCreateKey`/`NtSetValueKey` now use mutable-hive key handles for
+  non-volatile keys under mounted hives instead of creating overlay shadows. Remaining D2 work is to
+  move delete/subtree/security/class metadata and any still-overlay-backed persistent paths into the
+  same hive authority.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability

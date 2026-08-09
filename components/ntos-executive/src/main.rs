@@ -81,7 +81,7 @@ use alloc::vec::Vec;
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
 use nt_config_manager::{DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START};
-use nt_hive_core::{apply_ccs_alias, HiveKind, MutableHiveSet};
+use nt_hive_core::{apply_ccs_alias, HiveKind, MutableHiveSet, ResolvedHiveKey};
 use nt_hive_regf::{import_regf_into_hive, KeyRef, RegfHive};
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
@@ -13397,6 +13397,12 @@ const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
 /// way. Like `MACHINE_ROOT_KEY` this is a sentinel, not a hive cell: the root itself has no
 /// backing regf (in NT it is a `\Registry` directory object, not a hive).
 const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
+/// A registry `KeyRef` in the range `[MUTABLE_KEY_TAG, MUTABLE_KEY_TAG+MUTABLE_KEY_MAX)` names a
+/// live mutable hive key; its low bits index `ExecNtHandler::mutable_key_handles`, whose entry
+/// stores the owning mutable hive and cell. The range is below overlay/predefined-root targets and
+/// above every mounted-hive selector.
+const MUTABLE_KEY_TAG: u32 = 0x7000_0000;
+const MUTABLE_KEY_MAX: u32 = 0x1000;
 /// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
 /// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
 /// far above any real cell offset and below the predefined-root sentinel targets.
@@ -13405,7 +13411,7 @@ const OVERLAY_KEY_MAX: u32 = 0x1000;
 /// True if a `KeyRef` is an overlay/predefined-root target rather than a genuine mounted
 /// hive cell offset. Real hive KeyRefs keep their selector below `OVERLAY_KEY_TAG`.
 fn is_virtual_registry_key(kr: KeyRef) -> bool {
-    kr >= OVERLAY_KEY_TAG
+    (kr >= MUTABLE_KEY_TAG && kr < MUTABLE_KEY_TAG + MUTABLE_KEY_MAX) || kr >= OVERLAY_KEY_TAG
 }
 /// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
 /// FOUR REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
@@ -13416,8 +13422,8 @@ fn is_virtual_registry_key(kr: KeyRef) -> bool {
 /// **BYPASS SWITCH** for the SECURITY/SAM hive mount. Set to `false` to leave both hives unmounted
 /// (the pre-batch state): `\Registry\Machine\SECURITY` then fails to open, lsasrv's
 /// `LsapOpenServiceKey` returns STATUS_OBJECT_NAME_NOT_FOUND, no LSA policy database is installed
-/// and samsrv never reaches its SAM keys — `exec_lsa_security_hive_backed`,
-/// `exec_samsrv_hosted` and `exec_msv1_0_account_domain_sid_resolved` all FAIL. Verified.
+    /// and samsrv never reaches its SAM keys — `exec_lsa_security_hive_backed`,
+    /// `exec_samsrv_hosted` and `exec_msv1_0_account_domain_sid_resolved` all FAIL. Verified.
 pub(crate) const SECURITY_SAM_HIVES_MOUNTED: bool = true;
 /// **BYPASS SWITCH** for the SOFTWARE hive mount (the 4th slot). Set to `false` to leave it
 /// unmounted (the pre-batch state): `\Registry\Machine\SOFTWARE` stops resolving,
@@ -13454,6 +13460,7 @@ pub(crate) const HIVE_SEL_SAM: u32 = 0x6000_0000;
 pub(crate) const HIVE_SEL_DYNAMIC: [u32; 2] = [0x3000_0000, 0x5000_0000];
 const _: () =
     assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
+const _: () = assert!(HIVE_SEL_SAM < MUTABLE_KEY_TAG && MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= OVERLAY_KEY_TAG);
 /// The hive selector bits of a `KeyRef` (meaningful only for a mounted-hive key).
 pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
     kr & HIVE_SEL_MASK
@@ -15300,6 +15307,15 @@ pub(crate) static USER_ROOT_OPENED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_DEFAULT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_HIVE_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// If a `KeyRef` names an overlay (created) key, return its overlay index.
+fn mutable_key_idx(kr: KeyRef) -> Option<usize> {
+    if kr >= MUTABLE_KEY_TAG && kr < MUTABLE_KEY_TAG + MUTABLE_KEY_MAX {
+        Some((kr - MUTABLE_KEY_TAG) as usize)
+    } else {
+        None
+    }
+}
+
+/// If a `KeyRef` names an overlay (created) key, return its overlay index.
 fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
     if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
         Some((kr - OVERLAY_KEY_TAG) as usize)
@@ -15914,7 +15930,8 @@ struct ExecNtHandler {
     /// hive is the genuine post-setup one: 8 KiB, root key only, NO `Policy` subkey. That emptiness
     /// is load-bearing — it is exactly what makes lsasrv's `LsapIsDatabaseInstalled()` answer FALSE
     /// and run its real first-boot `LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` install
-    /// (which mints the account-domain SID). Writes land in the overlay, as for any base hive.
+    /// (which mints the account-domain SID). Persistent writes now land in `mutable_hives`; the
+    /// borrowed `RegfHive` remains the boot image navigator while D2 retires the old overlay shadow.
     pub(crate) security_hive: Option<RegfHive<'static>>,
     /// The REAL ReactOS **SAM** hive (root = `\Registry\Machine\SAM`), same by-path staging.
     pub(crate) sam_hive: Option<RegfHive<'static>>,
@@ -15935,10 +15952,15 @@ struct ExecNtHandler {
     /// `overlay_dirty` contract).
     pub(crate) hive_mounts_dirty: bool,
     /// Owned mutable hive authority mounted at the same NT registry roots as the borrowed `RegfHive`
-    /// selectors. Current handles still carry the existing `KeyRef` encoding while D2 migrates one
-    /// syscall family at a time; read helpers use this authority by path so future writes have a
-    /// single live hive arena to land in.
+    /// selectors. Mounted-hive create/open handles use `mutable_key_handles` so later writes can
+    /// land in this authority without path shadowing through `RegistryOverlay`.
     mutable_hives: MutableHiveSet,
+    /// Process handle targets in the mutable key range. Entries store stable hive/cell identity; a
+    /// dynamic hive unload clears entries for that hive so stale handles stop resolving.
+    mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
+    /// Set when a mutable hive create/value write allocates new key/value arena state above the
+    /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
+    mutable_hives_dirty: bool,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
@@ -16178,12 +16200,9 @@ struct ExecNtHandler {
     /// Set when a live `NtCreateProcess[Ex]` allocated EPROCESS/ETHREAD/handle-table state above the
     /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
     process_dirty: bool,
-    /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
-    /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
-    /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay
-    /// FIRST then fall through to the base hive. Pre-reserved in `new()` (below the per-syscall heap
-    /// mark) so its key vector never reallocates; the executive pins the heap high-water mark past
-    /// each mutation (`overlay_dirty`) so the runtime `String`/`Vec` growth survives the bump reset.
+    /// Volatile registry write plane for keys that do not belong to a mounted mutable hive.
+    /// Mounted hive paths use `mutable_hives`; this overlay remains for explicitly volatile state
+    /// such as boot-created Control keys until D4 gives volatile keys first-class hive ownership.
     overlay: nt_hive_core::RegistryOverlay,
     /// Set by a handler that mutated `overlay` (`NtCreateKey`/`NtSetValueKey`). The service loop
     /// consumes it after dispatch: it advances the heap high-water mark to the current bump
