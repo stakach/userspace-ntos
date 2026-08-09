@@ -286,9 +286,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
    as readable. The latest host-side decommit slice pins partial `MEM_DECOMMIT` query/protect
    interactions: decommitted pages report `MEM_RESERVE`, protection overrides are cleared, protects
    across the hole fail with `STATUS_NOT_COMMITTED`, recommit can restore a committed subrange with
-   new protection, and capacity failures preserve the original committed allocation. Continue with
-   the remaining C4 mapped/private protect rollback, overlap, and `MEM_TOP_DOWN` matrix plus D1/D2
-   mutable registry/filesystem authority.
+   new protection, and capacity failures preserve the original committed allocation. The latest
+   protect-rollback slice pins both private override exhaustion and committed mapped-range split
+   exhaustion as transactional failures. Continue with the remaining C4 overlap and `MEM_TOP_DOWN`
+   matrix plus D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1943,3 +1944,13 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `cargo test -p nt-address-space` with `45` tests passing. Review adjustment: private partial
   decommit query/protect/recommit behavior is pinned; continue C4 with mapped/private protect
   rollback, overlap, and `MEM_TOP_DOWN` gates.
+
+- C4 protect rollback regression slice. Host VM map tests now prove failed protection rewrites are
+  transactional in both private and committed-mapping authorities. Private `NtProtectVirtualMemory`
+  override exhaustion over more than `VM_PROTECTION_OVERRIDE_CAPACITY` pages returns
+  `STATUS_INSUFFICIENT_RESOURCES` with no partial overrides and the original write access intact.
+  `VmCommittedRangeTable::protect` likewise preserves a single mapped range when a middle protect
+  would need more split records than the table can hold. Validation: `cargo fmt --all` and
+  `cargo test -p nt-address-space` with `47` tests passing. Review adjustment: mapped/private
+  protect capacity rollback is pinned host-side; continue C4 with overlap and `MEM_TOP_DOWN`
+  placement/query gates before moving back to A4/B3 or D1/D2.

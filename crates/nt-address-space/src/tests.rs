@@ -1028,6 +1028,33 @@ fn fixed_vm_map_protect_validation_matches_reactos_private_path() {
 }
 
 #[test]
+fn fixed_vm_map_protect_capacity_failure_preserves_state() {
+    let mut map = VmRegionMap::<1>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(
+            None,
+            (VM_PROTECTION_OVERRIDE_CAPACITY as u64 + 1) * PAGE_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+
+    assert_eq!(
+        map.protect(
+            allocation.base,
+            (VM_PROTECTION_OVERRIDE_CAPACITY as u64 + 1) * PAGE_SIZE,
+            PAGE_READONLY,
+        ),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(map.protection_override_count(), 0);
+    assert!(map.permits_write(allocation.base));
+    assert!(
+        map.permits_write(allocation.base + (VM_PROTECTION_OVERRIDE_CAPACITY as u64) * PAGE_SIZE)
+    );
+}
+
+#[test]
 fn fixed_vm_map_protect_clears_overrides_on_default_recommit_and_free() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map
@@ -1235,6 +1262,32 @@ fn committed_range_table_rejects_overlaps_and_tracks_next_base() {
     assert_eq!(table.next_base_after(0x1000_0000), Some(0x2000_0000));
     assert_eq!(table.next_base_after(0x2000_0000), Some(0x3000_0000));
     assert!(table.query_basic(0x2800_0000).is_none());
+}
+
+#[test]
+fn committed_range_table_protect_capacity_failure_preserves_state() {
+    let mut table = VmCommittedRangeTable::<1>::new();
+    table
+        .register(VmCommittedRange::mapped(0x2000_0000, 0x3000, PAGE_READONLY))
+        .unwrap();
+
+    assert_eq!(
+        table.protect(0x2000_1000, 0x1000, PAGE_READWRITE),
+        Err(STATUS_INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(table.range_count(), 1);
+    assert_eq!(
+        table.query_basic(0x2000_0000).unwrap(),
+        VmBasicInformation {
+            base_address: 0x2000_0000,
+            allocation_base: 0x2000_0000,
+            allocation_protect: PAGE_READONLY,
+            region_size: 0x3000,
+            state: MEM_COMMIT,
+            protect: PAGE_READONLY,
+            type_: MEM_MAPPED,
+        }
+    );
 }
 
 #[test]
