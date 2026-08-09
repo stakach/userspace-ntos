@@ -618,6 +618,26 @@ impl<const N: usize> VmCommittedRangeTable<N> {
             .any(|range| base < range.end() && range.base < end))
     }
 
+    pub fn first_overlap_range(
+        &self,
+        base: u64,
+        size: u64,
+    ) -> Result<Option<VmCommittedRange>, u32> {
+        let Some(end) = base.checked_add(size) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if base & (PAGE_SIZE - 1) != 0 || size == 0 || size & (PAGE_SIZE - 1) != 0 || end <= base {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(self
+            .ranges
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|range| base < range.end() && range.base < end)
+            .min_by_key(|range| range.base))
+    }
+
     pub fn unregister_base(&mut self, base: u64) -> Option<VmCommittedRange> {
         let slot = self
             .ranges
@@ -1143,12 +1163,22 @@ impl<const N: usize> VmRegionMap<N> {
         Ok(())
     }
 
-    fn find_free_below(&self, size: u64, upper_bound: u64, top_down: bool) -> Option<u64> {
+    fn find_free_between(
+        &self,
+        size: u64,
+        lower_bound: u64,
+        upper_bound: u64,
+        top_down: bool,
+    ) -> Option<u64> {
+        let lower_bound = lower_bound.max(self.lower_bound);
         let upper_bound = upper_bound.min(self.upper_bound);
+        if lower_bound >= upper_bound {
+            return None;
+        }
         if top_down {
             let mut candidate = upper_bound.checked_sub(size)? & !(ALLOCATION_GRANULARITY - 1);
             loop {
-                if candidate < self.lower_bound {
+                if candidate < lower_bound {
                     return None;
                 }
                 let end = candidate.checked_add(size)?;
@@ -1167,7 +1197,7 @@ impl<const N: usize> VmRegionMap<N> {
                 }
             }
         }
-        let mut candidate = Self::align_up(self.lower_bound, ALLOCATION_GRANULARITY)?;
+        let mut candidate = Self::align_up(lower_bound, ALLOCATION_GRANULARITY)?;
         loop {
             let end = candidate.checked_add(size)?;
             if end > upper_bound {
@@ -1289,11 +1319,32 @@ impl<const N: usize> VmRegionMap<N> {
         protection: u32,
         upper_bound: u64,
     ) -> Result<VmAllocatePlan, u32> {
+        self.allocate_between(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            self.lower_bound,
+            upper_bound,
+        )
+    }
+
+    /// Allocate beneath `upper_bound` while starting automatic placement at `lower_bound`. The
+    /// syscall layer uses this to retry around fixed-address authorities outside the private VAD
+    /// map without teaching this crate about those authorities.
+    pub fn allocate_between(
+        &mut self,
+        requested_base: Option<u64>,
+        requested_size: u64,
+        allocation_type: u32,
+        protection: u32,
+        lower_bound: u64,
+        upper_bound: u64,
+    ) -> Result<VmAllocatePlan, u32> {
         validate_allocate_parameters(0, allocation_type, protection)?;
+        let lower_bound = lower_bound.max(self.lower_bound);
         let upper_bound = upper_bound.min(self.upper_bound);
-        if requested_base
-            .is_some_and(|address| address < self.lower_bound || address >= upper_bound)
-        {
+        if requested_base.is_some_and(|address| address < lower_bound || address >= upper_bound) {
             return Err(STATUS_CONFLICTING_ADDRESSES);
         }
         let available = match requested_base {
@@ -1343,7 +1394,12 @@ impl<const N: usize> VmRegionMap<N> {
                     let size = Self::align_up(requested_size, PAGE_SIZE)
                         .ok_or(STATUS_INVALID_PARAMETER_4)?;
                     let base = self
-                        .find_free_below(size, upper_bound, allocation_type & MEM_TOP_DOWN != 0)
+                        .find_free_between(
+                            size,
+                            lower_bound,
+                            upper_bound,
+                            allocation_type & MEM_TOP_DOWN != 0,
+                        )
                         .ok_or(STATUS_NO_MEMORY)?;
                     (base, base + size)
                 }

@@ -73,26 +73,79 @@ unsafe fn registered_frame_basic_information(
     })
 }
 
-unsafe fn registered_frame_range_overlaps_unowned_private_vad(
+#[derive(Copy, Clone)]
+struct FixedMappingOverlap {
+    base: u64,
+    end: u64,
+}
+
+fn choose_first_fixed_overlap(
+    current: Option<FixedMappingOverlap>,
+    candidate: FixedMappingOverlap,
+) -> Option<FixedMappingOverlap> {
+    match current {
+        Some(existing) if existing.base <= candidate.base => Some(existing),
+        _ => Some(candidate),
+    }
+}
+
+unsafe fn registered_frame_first_overlap_unowned_private_vad(
     vm_map: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
     pi: usize,
     base: u64,
     size: u64,
-) -> bool {
-    let Some(end) = base.checked_add(size) else {
-        return true;
-    };
+) -> Option<FixedMappingOverlap> {
+    let end = base.checked_add(size)?;
     if size == 0 || end <= base {
-        return true;
+        return None;
     }
     let mut page = base & !0xfffu64;
     while page < end {
         if csrss_frame_get_exact(pi as u64, page).0 != 0 && vm_map.extent_at(page).is_none() {
-            return true;
+            return Some(FixedMappingOverlap {
+                base: page,
+                end: page + 0x1000,
+            });
         }
-        page = page.saturating_add(0x1000);
+        page = page.checked_add(0x1000)?;
     }
-    false
+    None
+}
+
+unsafe fn fixed_mapping_authority_first_overlap(
+    vm_map: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    pi: usize,
+    base: u64,
+    size: u64,
+) -> Option<FixedMappingOverlap> {
+    let end = base.checked_add(size)?;
+    if size == 0 || end <= base {
+        return None;
+    }
+    let mut first = None;
+    if KUSER_VA < end && base < KUSER_VA + 0x1000 && kuser_page_alias_get(pi) != 0 {
+        first = choose_first_fixed_overlap(
+            first,
+            FixedMappingOverlap {
+                base: KUSER_VA,
+                end: KUSER_VA + 0x1000,
+            },
+        );
+    }
+    if let Some(range) = process_committed_mapping_first_overlap(pi as u64, base, size) {
+        first = choose_first_fixed_overlap(
+            first,
+            FixedMappingOverlap {
+                base: range.base,
+                end: range.end(),
+            },
+        );
+    }
+    if let Some(frame) = registered_frame_first_overlap_unowned_private_vad(vm_map, pi, base, size)
+    {
+        first = choose_first_fixed_overlap(first, frame);
+    }
+    first
 }
 
 unsafe fn fixed_mapping_authority_range_overlaps(
@@ -107,11 +160,80 @@ unsafe fn fixed_mapping_authority_range_overlaps(
     if size == 0 || end <= base {
         return true;
     }
-    if KUSER_VA < end && base < KUSER_VA + 0x1000 && kuser_page_alias_get(pi) != 0 {
-        return true;
+    fixed_mapping_authority_first_overlap(vm_map, pi, base, size).is_some()
+}
+
+fn align_up_allocation_granularity(value: u64) -> Option<u64> {
+    value
+        .checked_add(nt_address_space::ALLOCATION_GRANULARITY - 1)
+        .map(|value| value & !(nt_address_space::ALLOCATION_GRANULARITY - 1))
+}
+
+unsafe fn allocate_private_vad_avoiding_fixed_authorities(
+    before: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    after: &mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    target_pi: usize,
+    requested_base: Option<u64>,
+    requested_size: u64,
+    allocation_type: u32,
+    protection: u32,
+    placement_limit: u64,
+) -> Result<nt_address_space::VmAllocatePlan, u32> {
+    const FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT: usize =
+        VM_REGION_CAPACITY + PROCESS_COMMITTED_MAPPING_CAPACITY + 64;
+
+    let auto_placement = requested_base.is_none();
+    if !auto_placement {
+        *after = *before;
+        let plan = after.allocate_below(
+            requested_base,
+            requested_size,
+            allocation_type,
+            protection,
+            placement_limit,
+        )?;
+        if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size) {
+            return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+        }
+        return Ok(plan);
     }
-    process_committed_mapping_range_overlaps(pi as u64, base, size)
-        || registered_frame_range_overlaps_unowned_private_vad(vm_map, pi, base, size)
+
+    let top_down = allocation_type & nt_address_space::MEM_TOP_DOWN != 0;
+    let mut lower_bound = 0;
+    let mut upper_bound = placement_limit;
+    for _ in 0..=FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT {
+        *after = *before;
+        let plan = after.allocate_between(
+            None,
+            requested_size,
+            allocation_type,
+            protection,
+            lower_bound,
+            upper_bound,
+        )?;
+        let Some(overlap) =
+            fixed_mapping_authority_first_overlap(before, target_pi, plan.base, plan.size)
+        else {
+            return Ok(plan);
+        };
+        if top_down {
+            if overlap.base <= lower_bound {
+                return Err(nt_address_space::STATUS_NO_MEMORY);
+            }
+            upper_bound = upper_bound.min(overlap.base);
+        } else {
+            let next_lower = align_up_allocation_granularity(overlap.end)
+                .ok_or(nt_address_space::STATUS_NO_MEMORY)?;
+            if next_lower <= lower_bound {
+                return Err(nt_address_space::STATUS_NO_MEMORY);
+            }
+            lower_bound = next_lower;
+        }
+        if lower_bound >= upper_bound {
+            return Err(nt_address_space::STATUS_NO_MEMORY);
+        }
+    }
+    Err(nt_address_space::STATUS_NO_MEMORY)
 }
 
 fn committed_mapping_effective_page_protection(
@@ -7268,8 +7390,10 @@ impl ExecNtHandler {
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
         *before = core::ptr::read(vm_map);
-        *after = *before;
-        let plan = match after.allocate_below(
+        let plan = match allocate_private_vad_avoiding_fixed_authorities(
+            before,
+            after,
+            target_pi,
             (base_in != 0).then_some(base_in),
             want,
             allocation_type,
@@ -7279,9 +7403,6 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
-        if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size) {
-            return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
-        }
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
@@ -18913,8 +19034,10 @@ impl ExecNtHandler {
                     let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
                     let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
                     *before = core::ptr::read(vm_map);
-                    *after = *before;
-                    let plan = match after.allocate_below(
+                    let plan = match allocate_private_vad_avoiding_fixed_authorities(
+                        before,
+                        after,
+                        target_pi,
                         (base_in != 0).then_some(base_in),
                         map_size,
                         nt_address_space::MEM_RESERVE
@@ -18926,10 +19049,6 @@ impl ExecNtHandler {
                         Ok(plan) => plan,
                         Err(status) => return status,
                     };
-                    if fixed_mapping_authority_range_overlaps(before, target_pi, plan.base, plan.size)
-                    {
-                        return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
-                    }
                     if !generic_sections.map_view(
                         target_pi,
                         section_index,

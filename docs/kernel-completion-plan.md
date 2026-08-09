@@ -290,11 +290,11 @@ in SCM, user-mode system processes, and our ntdll where possible.
    protect-rollback slice pins both private override exhaustion and committed mapped-range split
    exhaustion as transactional failures. The latest `MEM_TOP_DOWN` slice pins high-address
    placement through occupied top ranges and free-gap query reporting after top-down allocation.
-   The latest overlap-authority slice adds a host-tested committed-range overlap predicate and makes
-   private allocation plus generic data-section map-view publication reject selected ranges already
-   owned by committed mappings, KUSER aliases, or unowned registered frames. Continue with the
-   remaining C4 cross-authority placement retry/live gate plus D1/D2 mutable registry/filesystem
-   authority.
+   The latest overlap-authority slices add host-tested committed-range overlap selection, bounded
+   lower/upper private VAD auto-placement, and executive retry around committed mappings, KUSER
+   aliases, or unowned registered frames before private allocation/generic data-section map-view
+   publication. Continue with the C4 live boot/selftest proof for cross-authority placement, then
+   return to A4/B3 or D1/D2 mutable registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1982,3 +1982,17 @@ in SCM, user-mode system processes, and our ntdll where possible.
   Review adjustment: the remaining C4 overlap work is teaching auto-placement to retry around
   fixed-authority ranges, or replacing that with a live executive gate proving the selected arenas
   cannot collide; otherwise move back to A4/B3 or D1/D2.
+
+- C4 cross-authority auto-placement retry slice. `VmCommittedRangeTable::first_overlap_range` now
+  exposes the first committed fixed range blocking a selected span, and `VmRegionMap::allocate_between`
+  gives the executive a host-tested lower/upper cursor for retrying ordinary bottom-up and
+  `MEM_TOP_DOWN` placement without duplicating VAD gap search. `NtAllocateVirtualMemory` and generic
+  data-section `NtMapViewOfSection` now route through a bounded retry helper: explicit-base callers
+  still fail with `STATUS_CONFLICTING_ADDRESSES`, while auto-placement retries below or above the
+  first fixed-authority overlap before publishing a private VAD or mapped-view record. The old
+  committed-mapping boolean helper was removed in favor of first-overlap selection. Validation:
+  `cargo fmt --all`, `cargo test -p nt-address-space` with `50` tests passing, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: add a live executive/boot proof that exercises or at least guards the
+  cross-authority retry path; then resume A4 SCM pipe/listener cleanup, B3 real video miniport
+  hosting, or D1/D2 mutable registry/filesystem authority.

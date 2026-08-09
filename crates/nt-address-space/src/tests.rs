@@ -894,6 +894,57 @@ fn fixed_vm_map_top_down_skips_conflicts_and_reports_high_gap() {
 }
 
 #[test]
+fn fixed_vm_map_auto_placement_honors_retry_bounds() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let bottom_up = map
+        .allocate_between(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            0x7_0000,
+            0x20_0000,
+        )
+        .unwrap();
+    assert_eq!(bottom_up.base, 0x7_0000);
+
+    let top_down = map
+        .allocate_between(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_READWRITE,
+            0x10000,
+            0x9_0000,
+        )
+        .unwrap();
+    assert_eq!(top_down.base, 0x8_0000);
+
+    assert_eq!(
+        map.allocate_between(
+            Some(0x6_0000),
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            0x7_0000,
+            0x20_0000,
+        ),
+        Err(STATUS_CONFLICTING_ADDRESSES)
+    );
+    assert_eq!(
+        map.allocate_between(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            0x20_0000,
+            0x20_0000,
+        ),
+        Err(STATUS_NO_MEMORY)
+    );
+}
+
+#[test]
 fn fixed_vm_map_reset_preserves_existing_commit() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map
@@ -1334,7 +1385,26 @@ fn committed_range_table_reports_range_overlap_without_touching_adjacent_gaps() 
     assert_eq!(table.overlaps_range(0x2000_3000, 0x1000), Ok(false));
     assert_eq!(table.overlaps_range(0x2fff_f000, 0x1000), Ok(false));
     assert_eq!(
+        table
+            .first_overlap_range(0x1fff_f000, 0x5000)
+            .unwrap()
+            .map(|range| range.base),
+        Some(0x2000_0000)
+    );
+    assert_eq!(
+        table
+            .first_overlap_range(0x2fff_f000, 0x3000)
+            .unwrap()
+            .map(|range| range.base),
+        Some(0x3000_0000)
+    );
+    assert_eq!(table.first_overlap_range(0x2000_3000, 0x1000), Ok(None));
+    assert_eq!(
         table.overlaps_range(0x2000_0001, 0x1000),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        table.first_overlap_range(0x2000_0001, 0x1000),
         Err(STATUS_INVALID_PARAMETER)
     );
     assert_eq!(
