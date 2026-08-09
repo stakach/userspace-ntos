@@ -931,15 +931,13 @@ impl<const N: usize> VmRegionMap<N> {
     }
 
     pub fn permits_read(&self, address: u64) -> bool {
-        self.protection_at(address).is_some_and(|protection| {
-            protection & PAGE_GUARD == 0 && protection & 0xff != PAGE_NOACCESS
-        })
+        self.protection_at(address)
+            .is_some_and(|protection| protection_allows_fault_access(protection, FaultAccess::Read))
     }
 
     pub fn permits_write(&self, address: u64) -> bool {
         self.protection_at(address).is_some_and(|protection| {
-            protection & PAGE_GUARD == 0
-                && matches!(protection & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+            protection_allows_fault_access(protection, FaultAccess::Write)
         })
     }
 

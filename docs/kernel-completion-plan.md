@@ -279,8 +279,12 @@ in SCM, user-mode system processes, and our ntdll where possible.
    `MEM_RELEASE` behavior: right-side VAD rebasing, free-gap query reporting, reuse of the released
    hole, zero-size release of the rebased survivor, and failed split state preservation under
    bounded VAD capacity. Continue with A4's SCM pipe/listener special coordination, B3's real
-   video/driver binding, broader C4 private/mapped protect, partial decommit, overlap,
-   `MEM_TOP_DOWN`, guard/no-access regressions, and D1/D2 mutable registry/filesystem authority.
+   video/driver binding, broader C4 private/mapped protect, partial decommit, overlap, and
+   `MEM_TOP_DOWN`. The latest private-access slice also makes `NtReadVirtualMemory`-style checks
+   reject private execute-only and guarded pages through the shared `VmRegionMap` permission helper,
+   matching the fault-access verdicts instead of treating every non-`PAGE_NOACCESS` committed page
+   as readable. Continue with the remaining C4 query/protect/decommit matrix and D1/D2 mutable
+   registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -1911,3 +1915,15 @@ in SCM, user-mode system processes, and our ntdll where possible.
   `MEM_RELEASE` now has host-side regression coverage; continue the C4 matrix with partial
   decommit query/protect interactions, mapped/private protect gates, overlap, `MEM_TOP_DOWN`, and
   guard/no-access behavior.
+
+- C4 private access-permission regression slice. `VmRegionMap::permits_read` and
+  `VmRegionMap::permits_write` now delegate to the same protection/access verdict used by private
+  fault resolution, so private `PAGE_EXECUTE` pages are not treated as data-readable and guarded
+  pages deny both read and write access before `NtReadVirtualMemory`/`NtWriteVirtualMemory` try to
+  copy bytes. Host tests now cover `PAGE_NOACCESS`, `PAGE_EXECUTE`, `PAGE_EXECUTE_READ`,
+  `PAGE_EXECUTE_READWRITE`, `PAGE_READWRITE | PAGE_GUARD`, and unmapped pages through the
+  committed-access helpers. Validation: `cargo fmt --all`, `cargo test -p nt-address-space`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: execute-only/guarded private access is pinned; continue C4 with partial
+  decommit query/protect interactions, mapped/private protect rollback gates, overlap, and
+  `MEM_TOP_DOWN` behavior.

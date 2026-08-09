@@ -815,9 +815,12 @@ fn fixed_vm_map_reset_matches_reactos_overlap_hack() {
 
 #[test]
 fn fixed_vm_map_reports_committed_access_permissions() {
-    let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
+    let mut map = VmRegionMap::<6>::new(0x10000, 0x10_0000);
     let no_access = map
         .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS)
+        .unwrap();
+    let execute_only = map
+        .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE)
         .unwrap();
     let executable = map
         .allocate(None, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ)
@@ -830,12 +833,24 @@ fn fixed_vm_map_reports_committed_access_permissions() {
             PAGE_EXECUTE_READWRITE,
         )
         .unwrap();
+    let guarded = map
+        .allocate(
+            None,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE | PAGE_GUARD,
+        )
+        .unwrap();
     assert!(!map.permits_read(no_access.base));
     assert!(!map.permits_write(no_access.base));
+    assert!(!map.permits_read(execute_only.base));
+    assert!(!map.permits_write(execute_only.base));
     assert!(map.permits_read(executable.base));
     assert!(!map.permits_write(executable.base));
     assert!(map.permits_read(writable.base));
     assert!(map.permits_write(writable.base));
+    assert!(!map.permits_read(guarded.base));
+    assert!(!map.permits_write(guarded.base));
     assert!(!map.permits_read(0xF_0000));
 }
 
