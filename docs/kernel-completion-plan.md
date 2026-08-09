@@ -325,6 +325,8 @@ in SCM, user-mode system processes, and our ntdll where possible.
    executive now instantiates a `MutableHiveSet` beside its borrowed `RegfHive` mounts for the boot
    machine hives, `.Default`, and every `NtLoadKey` user hive; value reads can resolve through that
    mutable authority by NT path while current handles keep their existing `KeyRef` encoding.
+   Value enumeration, key statistics, and subkey enumeration now also treat `MutableHiveSet` as the
+   base mounted-hive view before falling back to the borrowed `RegfHive` reader.
 5. Complete the native syscall argument-width audit. The latest SCM/LSA runs exposed several x64
    stack-slot high-half leaks where NT `ULONG`/`BOOLEAN` parameters had been read as pointer-sized
    values. Keep fixing these at the declared ABI boundary, prefer dispatcher-captured `args[]` over
@@ -2115,5 +2117,14 @@ in SCM, user-mode system processes, and our ntdll where possible.
   library tests plus `4` `gen_hive` tests passing, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Review adjustment: the next D2 slice should migrate `NtCreateKey`/`NtSetValueKey` for one mounted
-  hive root to mutate `MutableHiveSet` directly, then update enumeration/query stats to use the
-  mutable authority as the base view and retire the corresponding overlay shadow path.
+  hive root to mutate `MutableHiveSet` directly and retire the corresponding overlay shadow path.
+
+- D2 mutable hive base-read completion slice. The executive's merged registry read helpers now use
+  `MutableHiveSet` as the mounted-hive base for value enumeration, `NtQueryKey` statistics, and
+  subkey enumeration, not just direct `NtQueryValueKey` name reads. Overlay tombstones and overlay
+  value shadows are still applied first, and the borrowed `RegfHive` reader remains only as a
+  fallback when a mounted hive has not yet been mirrored. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: the next D2 slice can now give newly mutable-created keys a handle identity and
+  move `NtCreateKey`/`NtSetValueKey` for a selected mounted hive root off `RegistryOverlay`, because
+  the main query/enumeration paths already see the mutable authority as their base view.

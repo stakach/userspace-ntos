@@ -2539,12 +2539,24 @@ impl ExecNtHandler {
         })
     }
 
+    fn mutable_registry_key_by_path(
+        &self,
+        full_path: &str,
+    ) -> Option<nt_hive_core::ResolvedHiveKey> {
+        self.mutable_hives.resolve_key(full_path)
+    }
+
+    fn mutable_registry_key(&self, target: KeyRef) -> Option<nt_hive_core::ResolvedHiveKey> {
+        let full_path = self.registry_target_path(target)?;
+        self.mutable_registry_key_by_path(&full_path)
+    }
+
     fn mutable_registry_value_by_path(
         &self,
         full_path: &str,
         name: &str,
     ) -> Option<(u32, alloc::vec::Vec<u8>)> {
-        let key = self.mutable_hives.resolve_key(full_path)?;
+        let key = self.mutable_registry_key_by_path(full_path)?;
         let (ty, data) = self.mutable_hives.query_value(key, name)?;
         Some((ty as u32, data.to_vec()))
     }
@@ -2554,8 +2566,9 @@ impl ExecNtHandler {
         target: KeyRef,
         name: &str,
     ) -> Option<(u32, alloc::vec::Vec<u8>)> {
-        let full_path = self.registry_target_path(target)?;
-        self.mutable_registry_value_by_path(&full_path, name)
+        let key = self.mutable_registry_key(target)?;
+        let (ty, data) = self.mutable_hives.query_value(key, name)?;
+        Some((ty as u32, data.to_vec()))
     }
 
     fn registry_path_exists(&self, canon: &str) -> bool {
@@ -2615,6 +2628,18 @@ impl ExecNtHandler {
         requested_index: usize,
     ) -> Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> {
         let overlay_index = self.registry_overlay_index(target);
+        let base_path = if let Some(index) = overlay_index {
+            self.overlay
+                .path(index)
+                .map(alloc::string::String::from)
+        } else if !is_virtual_registry_key(target) {
+            self.registry_target_path(target)
+        } else {
+            None
+        };
+        let mutable_base = base_path
+            .as_deref()
+            .and_then(|path| self.mutable_registry_key_by_path(path));
         let base_key = if let Some(index) = overlay_index {
             self.overlay
                 .path(index)
@@ -2625,7 +2650,46 @@ impl ExecNtHandler {
             None
         };
         let mut visible_index = 0usize;
-        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+        if let Some(key) = mutable_base {
+            if let Some(hive) = self.mutable_hives.hive(key.hive) {
+                for index in 0..hive.value_count(key.key) {
+                    let Some((name, ty, data)) = hive.value_by_index(key.key, index) else {
+                        continue;
+                    };
+                    if let Some(overlay) = overlay_index {
+                        if self.overlay.value_is_deleted(overlay, name) {
+                            continue;
+                        }
+                        if visible_index == requested_index {
+                            if let Some((overlay_ty, overlay_data)) =
+                                self.overlay.value(overlay, name)
+                            {
+                                return Some((
+                                    alloc::string::String::from(name),
+                                    overlay_ty,
+                                    overlay_data.to_vec(),
+                                ));
+                            }
+                            return Some((
+                                alloc::string::String::from(name),
+                                ty as u32,
+                                data.to_vec(),
+                            ));
+                        }
+                        visible_index += 1;
+                        continue;
+                    }
+                    if visible_index == requested_index {
+                        return Some((
+                            alloc::string::String::from(name),
+                            ty as u32,
+                            data.to_vec(),
+                        ));
+                    }
+                    visible_index += 1;
+                }
+            }
+        } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             for index in 0..hive.value_count(base) {
                 let Some((name, ty, data)) = hive.value_by_index(base, index) else {
                     continue;
@@ -2654,10 +2718,13 @@ impl ExecNtHandler {
                 let Some((name, ty, data)) = self.overlay.value_by_index(overlay, index) else {
                     continue;
                 };
-                let exists_in_base = base_key
-                    .and_then(|key| {
-                        let (hive, base) = self.base_hive(key)?;
-                        hive.value_exists(base, name).then_some(())
+                let exists_in_base = mutable_base
+                    .and_then(|key| self.mutable_hives.query_value(key, name).map(|_| ()))
+                    .or_else(|| {
+                        base_key.and_then(|key| {
+                            let (hive, base) = self.base_hive(key)?;
+                            hive.value_exists(base, name).then_some(())
+                        })
                     })
                     .is_some();
                 if exists_in_base {
@@ -2676,6 +2743,9 @@ impl ExecNtHandler {
         let mut stats = RegistryKeyStats::default();
         let path = self.registry_target_path(target);
         let overlay_index = self.registry_overlay_index(target);
+        let mutable_base = path
+            .as_deref()
+            .and_then(|path| self.mutable_registry_key_by_path(path));
         let base_key = if let Some(index) = overlay_key_idx(target) {
             self.overlay
                 .path(index)
@@ -2685,7 +2755,34 @@ impl ExecNtHandler {
         } else {
             None
         };
-        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+        if let Some(key) = mutable_base {
+            if let Some(hive) = self.mutable_hives.hive(key.hive) {
+                for index in 0..hive.subkey_count(key.key) {
+                    let Some(name) = hive.subkey_name_by_index(key.key, index) else {
+                        continue;
+                    };
+                    stats.add_subkey(name.encode_utf16().count().saturating_mul(2));
+                }
+                for index in 0..hive.value_count(key.key) {
+                    let Some((name, _, data)) = hive.value_by_index(key.key, index) else {
+                        continue;
+                    };
+                    if let Some(overlay) = overlay_index {
+                        if self.overlay.value_is_deleted(overlay, name) {
+                            continue;
+                        }
+                        if let Some((_, overlay_data)) = self.overlay.value(overlay, name) {
+                            stats.add_value(
+                                name.encode_utf16().count().saturating_mul(2),
+                                overlay_data.len(),
+                            );
+                            continue;
+                        }
+                    }
+                    stats.add_value(name.encode_utf16().count().saturating_mul(2), data.len());
+                }
+            }
+        } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             for index in 0.. {
                 let Some(name_len) = hive.subkey_name_utf16_len_by_index(base, index) else {
                     break;
@@ -2715,10 +2812,18 @@ impl ExecNtHandler {
                 let Some(name) = self.overlay.subkey_by_index(path, index) else {
                     continue;
                 };
-                let exists_in_base = base_key
+                let exists_in_base = mutable_base
                     .and_then(|key| {
-                        let (hive, base) = self.base_hive(key)?;
-                        hive.open_subkey(base, name)
+                        self.mutable_hives
+                            .hive(key.hive)?
+                            .open_subkey(key.key, name)
+                            .map(|_| ())
+                    })
+                    .or_else(|| {
+                        base_key.and_then(|key| {
+                            let (hive, base) = self.base_hive(key)?;
+                            hive.open_subkey(base, name).map(|_| ())
+                        })
                     })
                     .is_some();
                 if !exists_in_base {
@@ -2731,10 +2836,13 @@ impl ExecNtHandler {
                 let Some((name, _, data)) = self.overlay.value_by_index(overlay, index) else {
                     continue;
                 };
-                let exists_in_base = base_key
-                    .and_then(|key| {
-                        let (hive, base) = self.base_hive(key)?;
-                        hive.value_exists(base, name).then_some(())
+                let exists_in_base = mutable_base
+                    .and_then(|key| self.mutable_hives.query_value(key, name).map(|_| ()))
+                    .or_else(|| {
+                        base_key.and_then(|key| {
+                            let (hive, base) = self.base_hive(key)?;
+                            hive.value_exists(base, name).then_some(())
+                        })
                     })
                     .is_some();
                 if !exists_in_base {
@@ -2751,6 +2859,9 @@ impl ExecNtHandler {
         requested_index: usize,
     ) -> Option<alloc::string::String> {
         let path = self.registry_target_path(target);
+        let mutable_base = path
+            .as_deref()
+            .and_then(|path| self.mutable_registry_key_by_path(path));
         let base_key = if let Some(index) = overlay_key_idx(target) {
             self.overlay
                 .path(index)
@@ -2761,7 +2872,19 @@ impl ExecNtHandler {
             None
         };
         let mut visible_index = 0usize;
-        if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+        if let Some(key) = mutable_base {
+            if let Some(hive) = self.mutable_hives.hive(key.hive) {
+                for index in 0..hive.subkey_count(key.key) {
+                    let Some(name) = hive.subkey_name_by_index(key.key, index) else {
+                        continue;
+                    };
+                    if visible_index == requested_index {
+                        return Some(alloc::string::String::from(name));
+                    }
+                    visible_index += 1;
+                }
+            }
+        } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
             for index in 0.. {
                 let Some((name, _)) = hive.subkey_by_index(base, index) else {
                     break;
@@ -2777,10 +2900,18 @@ impl ExecNtHandler {
                 let Some(name) = self.overlay.subkey_by_index(path, index) else {
                     continue;
                 };
-                let exists_in_base = base_key
+                let exists_in_base = mutable_base
                     .and_then(|key| {
-                        let (hive, base) = self.base_hive(key)?;
-                        hive.open_subkey(base, name)
+                        self.mutable_hives
+                            .hive(key.hive)?
+                            .open_subkey(key.key, name)
+                            .map(|_| ())
+                    })
+                    .or_else(|| {
+                        base_key.and_then(|key| {
+                            let (hive, base) = self.base_hive(key)?;
+                            hive.open_subkey(base, name).map(|_| ())
+                        })
                     })
                     .is_some();
                 if exists_in_base {
