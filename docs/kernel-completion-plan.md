@@ -78,7 +78,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
   reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
   mutable-hive key handles for non-volatile keys under mounted hives instead of creating overlay
-  shadows. Remaining D2 work is to move subtree delete, security/class metadata, and any
+  shadows. Mounted mutable hives also advertise path ownership, so shared value/subkey/key-stat
+  queries no longer fall back to the borrowed boot image when the mutable authority owns a missing
+  path. Remaining D2 work is to move `NtOpenKey`, subtree delete, security/class metadata, and any
   still-overlay-backed persistent paths into the same hive authority.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes.

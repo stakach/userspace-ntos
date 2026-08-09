@@ -2649,13 +2649,20 @@ impl ExecNtHandler {
         Some((ty as u32, data.to_vec()))
     }
 
+    fn mutable_hive_owns_path(&self, path: &str) -> bool {
+        self.mutable_hives.owns_path(path)
+    }
+
     fn registry_path_exists(&self, canon: &str) -> bool {
         matches!(
             canon,
             r"\" | r"\registry" | r"\registry\machine" | r"\registry\user"
         ) || self.overlay.find(canon).is_some()
-            || self.mutable_hives.resolve_key(canon).is_some()
-            || self.resolve_key(canon).is_some()
+            || if self.mutable_hive_owns_path(canon) {
+                self.mutable_hives.resolve_key(canon).is_some()
+            } else {
+                self.resolve_key(canon).is_some()
+            }
     }
 
     fn registry_value(&self, target: KeyRef, name: &str) -> Option<(u32, alloc::vec::Vec<u8>)> {
@@ -2667,14 +2674,23 @@ impl ExecNtHandler {
                 return Some((ty, data.to_vec()));
             }
             let path = self.overlay.path(index)?;
-            return self.mutable_registry_value_by_path(path, name).or_else(|| {
-                let key = self.resolve_key(path)?;
-                let (hive, cell) = self.base_hive(key)?;
-                hive.value(cell, name)
-            });
+            if let Some(value) = self.mutable_registry_value_by_path(path, name) {
+                return Some(value);
+            }
+            if self.mutable_hive_owns_path(path) {
+                return None;
+            }
+            let key = self.resolve_key(path)?;
+            let (hive, cell) = self.base_hive(key)?;
+            return hive.value(cell, name);
         }
         if let Some(value) = self.mutable_registry_value(target, name) {
             return Some(value);
+        }
+        if let Some(path) = self.registry_target_path(target) {
+            if self.mutable_hive_owns_path(&path) {
+                return None;
+            }
         }
         let (hive, cell) = self.base_hive(target)?;
         hive.value(cell, name)
@@ -2698,10 +2714,19 @@ impl ExecNtHandler {
         let mutable_base = base_path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
+        let mutable_owned = base_path
+            .as_deref()
+            .is_some_and(|path| self.mutable_hive_owns_path(path));
         let base_key = if let Some(index) = overlay_index {
-            self.overlay
-                .path(index)
-                .and_then(|path| self.resolve_key(path))
+            if mutable_owned {
+                None
+            } else {
+                self.overlay
+                    .path(index)
+                    .and_then(|path| self.resolve_key(path))
+            }
+        } else if mutable_owned {
+            None
         } else if !is_virtual_registry_key(target) {
             Some(target)
         } else {
@@ -2804,10 +2829,19 @@ impl ExecNtHandler {
         let mutable_base = path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
+        let mutable_owned = path
+            .as_deref()
+            .is_some_and(|path| self.mutable_hive_owns_path(path));
         let base_key = if let Some(index) = overlay_key_idx(target) {
-            self.overlay
-                .path(index)
-                .and_then(|overlay_path| self.resolve_key(overlay_path))
+            if mutable_owned {
+                None
+            } else {
+                self.overlay
+                    .path(index)
+                    .and_then(|overlay_path| self.resolve_key(overlay_path))
+            }
+        } else if mutable_owned {
+            None
         } else if !is_virtual_registry_key(target) {
             Some(target)
         } else {
@@ -2920,10 +2954,19 @@ impl ExecNtHandler {
         let mutable_base = path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
+        let mutable_owned = path
+            .as_deref()
+            .is_some_and(|path| self.mutable_hive_owns_path(path));
         let base_key = if let Some(index) = overlay_key_idx(target) {
-            self.overlay
-                .path(index)
-                .and_then(|overlay_path| self.resolve_key(overlay_path))
+            if mutable_owned {
+                None
+            } else {
+                self.overlay
+                    .path(index)
+                    .and_then(|overlay_path| self.resolve_key(overlay_path))
+            }
+        } else if mutable_owned {
+            None
         } else if !is_virtual_registry_key(target) {
             Some(target)
         } else {

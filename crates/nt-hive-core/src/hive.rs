@@ -464,6 +464,14 @@ impl HiveMountTable {
         let rel = &aliased[root.len()..];
         Some((hive, rel.into()))
     }
+
+    /// True if a mounted hive owns this full NT registry path, whether or not the key exists.
+    pub fn owns_path(&self, full_path: &str) -> bool {
+        let aliased = apply_ccs_alias(full_path);
+        self.mounts
+            .iter()
+            .any(|(root, _)| path_starts_with(&aliased, root))
+    }
 }
 
 /// A resolved key in a mounted mutable hive.
@@ -526,6 +534,10 @@ impl MutableHiveSet {
             hive: hive_id,
             key: hive.open_key(&rel_path)?,
         })
+    }
+
+    pub fn owns_path(&self, full_path: &str) -> bool {
+        self.mounts.owns_path(full_path)
     }
 
     pub fn create_key(&mut self, full_path: &str) -> Option<ResolvedHiveKey> {

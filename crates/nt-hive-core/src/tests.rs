@@ -67,8 +67,10 @@ fn mount_table_currentcontrolset_resolver() {
     assert_eq!(rel, r"\ControlSet001\Services\Foo");
     // Longest-mount-root wins.
     assert_eq!(mt.resolve(r"\Registry\Machine\Software\X").unwrap().0, 2);
+    assert!(mt.owns_path(r"\Registry\Machine\Software\Missing"));
     // Unmounted path → None.
     assert!(mt.resolve(r"\Registry\User\Foo").is_none());
+    assert!(!mt.owns_path(r"\Registry\User\Foo"));
 }
 
 #[test]
@@ -103,6 +105,7 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
             .map(|(ty, data)| (ty, data.to_vec())),
         Some((RegistryValueType::Dword, 2u32.to_le_bytes().to_vec()))
     );
+    assert!(set.owns_path(r"\Registry\Machine\System\CurrentControlSet\Services\Missing"));
     assert!(set.delete_value(svc, "Start"));
     assert!(set.query_value(svc, "start").is_none());
     assert!(!set.delete_value(svc, "Start"));
