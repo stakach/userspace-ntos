@@ -4735,7 +4735,39 @@ impl ExecNtHandler {
         pi: usize,
         out: &mut [u64],
     ) -> usize {
-        self.thread_runtime.live_badges_for_pi(pi, out)
+        let raw_count = self.thread_runtime.live_badges_for_pi(pi, out);
+        let mut count = 0usize;
+        for index in 0..raw_count {
+            let badge = out[index];
+            if out[..count].contains(&badge) {
+                continue;
+            }
+            let Some(tid) = self.hosted_thread_tid_for_badge(badge) else {
+                continue;
+            };
+            if !self.hosted_thread_can_make_progress(tid) {
+                continue;
+            }
+            out[count] = badge;
+            count += 1;
+        }
+        count
+    }
+
+    fn hosted_thread_can_make_progress(&self, tid: u64) -> bool {
+        if tid == 0 || tid > nt_process::ThreadId::MAX as u64 {
+            return false;
+        }
+        self.pm
+            .thread(tid as nt_process::ThreadId)
+            .is_some_and(|thread| {
+                matches!(
+                    thread.state,
+                    nt_process::ThreadState::Ready
+                        | nt_process::ThreadState::Running
+                        | nt_process::ThreadState::Waiting
+                )
+            })
     }
 
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {

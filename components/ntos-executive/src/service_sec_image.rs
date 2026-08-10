@@ -4117,6 +4117,7 @@ pub(crate) unsafe fn service_sec_image(
         ($pi:expr, $ip:expr) => {{
             thread_wait_state_park_badge(badge);
             wait_parked = wait_parked_owner_mask(&nt_handler);
+            wait_parked |= wait_parked_owner_bit_for_pi(&nt_handler, $pi);
             trace_wait_owner_mask_after_mark(
                 &nt_handler,
                 $pi,
@@ -5282,6 +5283,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
+                    mark_wait_parked!(pi, m0);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -12714,6 +12716,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
+                    mark_wait_parked!(pi, m0);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -18833,31 +18836,61 @@ fn wait_parked_owner_mask(nt_handler: &ExecNtHandler) -> u64 {
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
     let mut mask = 0u64;
     for pi in 0..MAX_PI {
-        if !hosted_process_pi_is_live(pi) {
-            continue;
-        }
-        let Some(owner) = nt_handler.hosted_process_top_badge(pi) else {
-            continue;
-        };
-        if owner >= 64 {
-            continue;
-        }
         let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
-        let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, &mut badges);
-        if !badges[..count].contains(&owner) && count < badges.len() {
-            badges[count] = owner;
-            count += 1;
-        }
-        if count != 0
-            && badges[..count]
-                .iter()
-                .copied()
-                .all(thread_wait_state_badge_parked)
+        if let Some((owner, _, true)) = hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
         {
             mask |= 1u64 << owner;
         }
     }
     mask
+}
+
+fn hosted_process_wait_snapshot(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    badges: &mut [u64],
+) -> Option<(u64, usize, bool)> {
+    if !hosted_process_pi_can_run(nt_handler, pi) {
+        return None;
+    }
+    let owner = nt_handler.hosted_process_top_badge(pi)?;
+    if owner >= 64 {
+        return None;
+    }
+    let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, badges);
+    if count > badges.len() {
+        count = badges.len();
+    }
+    if !badges[..count].contains(&owner) {
+        if count == badges.len() {
+            return Some((owner, count, false));
+        }
+        badges[count] = owner;
+        count += 1;
+    }
+    let all_parked = count != 0
+        && badges[..count]
+            .iter()
+            .copied()
+            .all(thread_wait_state_badge_parked);
+    Some((owner, count, all_parked))
+}
+
+fn wait_parked_owner_bit_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
+    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
+    let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
+    hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
+        .and_then(|(owner, _, all_parked)| all_parked.then_some(1u64 << owner))
+        .unwrap_or(0)
+}
+
+fn hosted_process_pi_can_run(nt_handler: &ExecNtHandler, pi: usize) -> bool {
+    if !hosted_process_pi_is_live(pi) {
+        return false;
+    }
+    nt_handler
+        .pm_pid_for_pi(pi)
+        .is_none_or(|pid| !nt_handler.pm.is_process_signaled(pid))
 }
 
 fn trace_wait_owner_mask_after_mark(
@@ -18870,17 +18903,13 @@ fn trace_wait_owner_mask_after_mark(
 ) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    if n >= 160 {
+    if n >= 320 {
         return;
     }
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
-    let owner = owner_top_badge_for(nt_handler, badge);
     let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
-    let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, &mut badges);
-    if !badges[..count].contains(&owner) && count < badges.len() {
-        badges[count] = owner;
-        count += 1;
-    }
+    let (owner, count, all_parked) = hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
+        .unwrap_or_else(|| (owner_top_badge_for(nt_handler, badge), 0, false));
     print_str(b"[wait-owner] #");
     print_u64(n);
     print_str(b" pi=");
@@ -18890,13 +18919,17 @@ fn trace_wait_owner_mask_after_mark(
     print_str(b" owner=");
     print_u64(owner);
     print_str(b" live=0x");
-    print_hex(live as u32);
+    print_hex_u64(live);
     print_str(b" crash=0x");
-    print_hex(crash_parked as u32);
+    print_hex_u64(crash_parked);
     print_str(b" wait=0x");
-    print_hex(wait_parked as u32);
+    print_hex_u64(wait_parked);
     print_str(b" remaining=0x");
-    print_hex((live & !(crash_parked | wait_parked)) as u32);
+    print_hex_u64(live & !(crash_parked | wait_parked));
+    print_str(b" owner-bit=");
+    print_u64(((owner < 64) && (wait_parked & (1u64 << owner)) != 0) as u64);
+    print_str(b" all-parked=");
+    print_u64(all_parked as u64);
     print_str(b" threads=");
     for thread_badge in badges[..count].iter().copied() {
         print_u64(thread_badge);
@@ -18922,7 +18955,7 @@ fn trace_indefinite_wait_park(
     wait_parked: u64,
 ) {
     static N: AtomicU64 = AtomicU64::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 96 {
+    if N.fetch_add(1, Ordering::Relaxed) >= 320 {
         return;
     }
     print_str(b"[wait-park] badge=");
@@ -18932,11 +18965,11 @@ fn trace_indefinite_wait_park(
     print_str(b" top-level=");
     print_u64(pi_is_top_level(nt_handler, badge) as u64);
     print_str(b" live=0x");
-    print_hex(live as u32);
+    print_hex_u64(live);
     print_str(b" crash=0x");
-    print_hex(crash_parked as u32);
+    print_hex_u64(crash_parked);
     print_str(b" wait=0x");
-    print_hex(wait_parked as u32);
+    print_hex_u64(wait_parked);
     print_str(b"\n");
 }
 
@@ -18973,7 +19006,8 @@ fn pi_is_top_level(nt_handler: &ExecNtHandler, badge: u64) -> bool {
 unsafe fn live_top_badges(nt_handler: &ExecNtHandler) -> u64 {
     (0..MAX_PI)
         .filter_map(|pi| {
-            hosted_process_pi_is_live(pi).then_some(hosted_top_badge_for_pi(nt_handler, pi))
+            hosted_process_pi_can_run(nt_handler, pi)
+                .then_some(hosted_top_badge_for_pi(nt_handler, pi))
         })
         .fold(0u64, |mask, badge| mask | (1u64 << badge))
 }
