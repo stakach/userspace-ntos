@@ -163,8 +163,19 @@ heap blocks plus `RtlSizeHeap`/`RtlReAllocateHeap`, and makes win32k's GDI user-
 resource lifetime: the later `svchost.exe` GUI connect (`pi=15`) now reaches real
 `NtUserProcessConnect` but fails desktop heap mapping with `[win32k-host] HEAP EXHAUSTED
 size=0x00100000 used=0x00f082a0`, then desktop assignment unwinds and SCM pipe control reports
-`ConnectNamedPipe failed (Error 1450)`. The next slice should make win32k session desktop heaps real
-allocation objects with teardown/reuse, not expand static heap VA or add service-specific policy.
+`ConnectNamedPipe failed (Error 1450)`. The current implementation slice makes win32k USER/desktop
+heaps real section-backed allocation objects: `RtlCreateHeap(HeapBase=Mm section view, ...)` returns
+that section view as the heap handle, `RtlAllocateHeap`/`RtlFreeHeap`/`RtlSizeHeap`/`RtlReAllocateHeap`
+route by validated heap handle instead of ignoring it, and the old `pheapDesktop`/`pvDesktopBase`
+repair code now fails honestly if ReactOS desktop initialization did not publish a valid heap.
+`MmUnmapView*` imports are also bound to descriptor-backed logical unmap with map counts rather than
+falling through to a success stub, and the old foreign-section private mapping fallback has been
+removed. Local validation for this slice is green (`cargo fmt --all`, `cargo test -p nt-kernel-exec`,
+the executive `cargo check`, and `git diff --check`). A live `./run.sh` boot on 2026-08-10 again
+reported `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`; the old
+late `HEAP EXHAUSTED` / failed-desktop-map signature did not recur. The active red edge moves back to
+generic service/control resource lifetime: the late service client reaches root pipe wait/open paths
+and times out on `\net\NtControlPipe11`.
 
 ### A. SCM-Controlled Service Startup
 

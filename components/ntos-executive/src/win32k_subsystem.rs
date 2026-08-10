@@ -70,7 +70,7 @@ pub const WIN32K_STACK_VADDR: u64 = 0x0000_0100_0D00_0000;
 /// and the host-run view map a page table here for those frames.
 pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// Data-export region: placeholder structs (page 0) + import cells (page 1) + KPCR (page 2) +
-/// HEAP handle (page 3) + win32 compatibility slots/callout table (page 4) + reserved mapped data
+/// reserved data (page 3) + win32 compatibility slots/callout table (page 4) + reserved mapped data
 /// pages (pages 5-8). Runtime EPROCESS/ETHREAD bodies and per-thread callout TEB mirrors are
 /// allocated from win32k-owned arenas instead of fixed cells in this region.
 /// 9 frames.
@@ -82,9 +82,6 @@ pub const WIN32K_TOKEN_USER_SID_VADDR: u64 = WIN32K_DATA_VADDR + 0x5000;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
 /// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
 pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
-/// A zeroed page used as the fake HEAP handle `RtlCreateHeap` returns (win32k stores it + passes
-/// it back to RtlAllocateHeap; any field reads see 0). Page 3 of the DATA region.
-pub const WIN32K_HEAP_HANDLE: u64 = WIN32K_DATA_VADDR + 0x3000;
 /// The real `SE_EXPORTS` struct (well-known SID pointers + privilege LUIDs) that win32k's `SeExports`
 /// data-export cell points at, built by [`nt_security::se_exports::build_se_exports`]. Lives in DATA
 /// page 0 (the old zeroed placeholder region, clear of the SeExports/Nls placeholders at +0x1C0/
@@ -104,9 +101,9 @@ const WIN32K_BOOTSTRAP_PI: usize = 1;
 const WIN32K_BOOTSTRAP_TID: u64 = FAKE_PROCESS_HANDLE + 0x100;
 const WIN32K_EPROCESS_BYTES: u64 = 0x1000;
 const WIN32K_ETHREAD_BYTES: u64 = 0x400;
-/// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers allocate
-/// from (counter at +0, free-list head at +8, data at +0x1000). The arena is reclaimed through the
-/// hosted RtlFreeHeap path instead of being grown to mask leaks.
+/// The win32k session-heap arena that lookaside fallbacks, section descriptors, and section backing
+/// allocate from (counter at +0, free-list head at +8, data at +0x1000). Section-backed USER and
+/// desktop heaps then allocate inside their own section views, using the same block allocator.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
 const _: () =
@@ -146,12 +143,12 @@ pub const WIN32K_KUSER_SCRATCH_VA: u64 = WIN32K_AUX_PT_VADDR + 0x1B_0000;
 /// so moving the base is behavior-preserving for the existing GUI clients (csrss pi 1 / winlogon pi 2).
 pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;
 
-/// The GUI-client-side VA where win32k's POOL arena ([`WIN32K_POOL_VADDR`] — where the DESKTOP body +
-/// its DESKTOPINFO are `pool_alloc`ed) is RO-mapped, so user32's client-side `DesktopPtrToUser` can
-/// read `pci->pDeskInfo->pvDesktopBase/pvDesktopLimit` (the DESKTOPINFO lives in the POOL, NOT the
-/// USER heap). Sits immediately ABOVE the 16 MiB USER-heap window (0x9800_0000..0x9900_0000) and below
-/// the NLS section (0xA000_0000), inside the shared 0x8000_0000..0xC000_0000 1 GiB PD. The client VA of
-/// a pool object = its server VA - ([`WIN32K_POOL_VADDR`] - `CSRSS_W32_POOL_VA`).
+/// The GUI-client-side VA where win32k's POOL arena ([`WIN32K_POOL_VADDR`] — where DESKTOP bodies and
+/// other session-lifetime object bodies live) is RO-mapped. DESKTOPINFO lives in the per-desktop heap;
+/// this pool window remains needed for object bodies referenced by USER/desktop structures. Sits
+/// immediately ABOVE the 16 MiB USER-heap window (0x9800_0000..0x9900_0000) and below the NLS section
+/// (0xA000_0000), inside the shared 0x8000_0000..0xC000_0000 1 GiB PD. The client VA of a pool object =
+/// its server VA - ([`WIN32K_POOL_VADDR`] - `CSRSS_W32_POOL_VA`).
 pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
 // The USER-heap window (16 MiB) must end at or below the POOL window base so the two client windows
 // never overlap; the POOL window (8 MiB) must end below the NLS section (0xA000_0000).
@@ -519,6 +516,7 @@ pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
 /// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 
+pub const DESKTOP_HSECTION_OFF: u64 = 0x78;
 /// DESKTOP.pheapDesktop offset (`desktop.h` `struct _DESKTOP`: dwSessionId@0, pDeskInfo@8,
 /// ListEntry@0x10, rpwinstaParent@0x20, ..., hsectionDesktop@0x78, **pheapDesktop@0x80**). The
 /// per-desktop USER heap handle `DesktopHeapAlloc → RtlAllocateHeap(pdesk->pheapDesktop, ...)` uses
@@ -526,14 +524,22 @@ pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 /// at win32k RVA 0x4f5e3 (`mov rax,[rsp+0x40]=pdesk; mov rcx,[rax+0x80]=pheapDesktop; call
 /// RtlAllocateHeap`). Matches `nt_object_manager::win32k_ob::desktop` (pheapDesktop@0x80).
 pub const DESKTOP_PHEAP_OFF: u64 = 0x80;
+pub const DESKTOP_UL_HEAP_SIZE_OFF: u64 = 0x88;
+
+const DESKTOPINFO_PV_DESKTOP_BASE_OFF: u64 = 0x00;
+const DESKTOPINFO_PV_DESKTOP_LIMIT_OFF: u64 = 0x08;
+const DESKTOPINFO_APHK_START_OFF: u64 = 0x20;
+const DESKTOPINFO_HOOK_COUNT: u64 = 16; // WH_MINHOOK(-1)..WH_MAXHOOK(14)
+const DESKTOPINFO_NAME_OFF: u64 = 0x154;
+const DESKTOPINFO_MIN_ALLOC: u64 = 0x158;
+const DESKTOP_HEAP_INTERACTIVE_BYTES: u64 = 3 * 1024 * 1024;
+const DESKTOP_HEAP_NONINTERACTIVE_BYTES: u64 = 512 * 1024;
+const DESKTOP_HEAP_WINLOGON_BYTES: u64 = 128 * 1024;
 
 /// SSN of NtUserCreateDesktop (WIN32K_SERVICE_BASE 0x1000 + SSDT idx 0x22d). When a hosted client
 /// (winlogon) drives its own CreateWindowStation→CreateDesktop→SwitchDesktop chain, its
-/// naturally-created DESKTOP objects come through the routed `dispatch_ssn` path; our Ob layer does
-/// not populate `pdesk->rpwinstaParent` (the winsta→desktop parent linkage IntCreateDesktop would
-/// set from the parse context), so we poke it after the create — exactly as the gfx-trigger's
-/// `create_winsta_and_desktop` does for the Default desktop — else NtUserSwitchDesktop NULL-derefs it
-/// (RVA 0x6c281→0x6c285). See the `dispatch_ssn` fixup.
+/// naturally-created DESKTOP objects come through the routed `dispatch_ssn` path; Ob creation now
+/// populates `pdesk->rpwinstaParent` and the section-backed desktop heap before the handle is returned.
 pub const SSN_NT_USER_CREATE_DESKTOP: u64 = 0x122d;
 
 /// `NtUserSetThreadDesktop` (SSN 0x1092, w32ksvc64.h) → `IntSetThreadDesktop` (desktop.c:3295), the
@@ -1963,7 +1969,7 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
     init_desktop_body, link_thread_to_desktop, unlink_thread_from_desktop, ObHandleTable, ObKind,
-    DESKTOPINFO_SIZE, DESKTOP_BODY_SIZE,
+    DESKTOP_BODY_SIZE,
 };
 
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
@@ -2275,19 +2281,14 @@ extern "win64" fn s_rtl_get_exp_winver(_base: u64) -> u32 {
     0x0501 // MAKEWORD(1, 5): Windows XP/Server 2003-compatible subsystem version.
 }
 
-/// Allocate + zero a DESKTOP body (with a DESKTOPINFO hung off `pDeskInfo`@+0x08) from the win32k
-/// pool. Enough to satisfy IntCreateDesktop up to IntGetAndReferenceClass(WC_DESKTOP); the desktop
-/// heap + full DESKTOPINFO population is the following increment's work. The body layout lives with
-/// the object-type definition in the crate ([`init_desktop_body`]).
+/// Allocate + initialize a DESKTOP body from the win32k pool. The DESKTOPINFO is created later from
+/// the desktop's own section-backed heap, matching ReactOS `UserInitializeDesktop`.
 unsafe fn alloc_desktop_body() -> u64 {
-    let desk = pool_alloc(DESKTOP_BODY_SIZE); // zeroed by the arena
+    let desk = pool_alloc(DESKTOP_BODY_SIZE);
     if desk == 0 {
         return 0;
     }
-    let dinfo = pool_alloc(DESKTOPINFO_SIZE); // DESKTOPINFO + szDesktopName tail, zeroed
-    if dinfo != 0 {
-        init_desktop_body(desk as *mut u8, dinfo); // DESKTOP.pDeskInfo
-    }
+    init_desktop_body(desk as *mut u8, 0);
     desk
 }
 
@@ -2415,6 +2416,177 @@ unsafe fn object_attributes_name_leaf_ascii(
         offset += 1;
     }
     Some((leaf, len))
+}
+
+unsafe fn object_attributes_name_leaf_unicode(object_attributes: u64) -> Option<(u64, usize)> {
+    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
+        return None;
+    };
+    if units == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < units {
+        let unit = read_unaligned((buffer + (index * 2) as u64) as *const u16);
+        if unit == b'\\' as u16 || unit == b'/' as u16 {
+            start = index + 1;
+        }
+        index += 1;
+    }
+    let len = units - start;
+    (len != 0).then_some((buffer + (start * 2) as u64, len))
+}
+
+unsafe fn desktop_root_from_handle(
+    table: &ObHandleTable,
+    handle: u64,
+) -> Option<(u64, u64)> {
+    match table.lookup(handle) {
+        Some((ObKind::WindowStation, body)) if body != 0 => Some((handle, body)),
+        _ => None,
+    }
+}
+
+unsafe fn effective_desktop_root(
+    table: &ObHandleTable,
+    requested_root: u64,
+) -> Option<(u64, u64)> {
+    if requested_root != 0 {
+        return desktop_root_from_handle(table, requested_root);
+    }
+
+    let ppi = current_w32process();
+    if ppi != 0 {
+        let h = read_volatile((ppi + PROCESSINFO_HWINSTA_OFF) as *const u64);
+        let body = read_volatile((ppi + PROCESSINFO_PRPWINSTA_OFF) as *const u64);
+        if h != 0 && body != 0 {
+            if let Some((_, table_body)) = desktop_root_from_handle(table, h) {
+                if table_body == body {
+                    return Some((h, body));
+                }
+            }
+        }
+    }
+
+    let h = s_ps_get_process_winsta(current_eprocess());
+    if h != 0 {
+        return desktop_root_from_handle(table, h);
+    }
+    None
+}
+
+unsafe fn desktop_heap_size_for(
+    table: &ObHandleTable,
+    winsta_body: u64,
+    object_attributes: u64,
+) -> u64 {
+    let input_winsta = {
+        let global = read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
+        if global != 0 {
+            global
+        } else {
+            table.cached_winsta_body()
+        }
+    };
+    if winsta_body == input_winsta && winsta_body != 0 {
+        if object_attributes_name_leaf_eq_ascii(object_attributes, b"winlogon") {
+            DESKTOP_HEAP_WINLOGON_BYTES
+        } else {
+            DESKTOP_HEAP_INTERACTIVE_BYTES
+        }
+    } else {
+        DESKTOP_HEAP_NONINTERACTIVE_BYTES
+    }
+}
+
+unsafe fn desktop_info_alloc_size(object_attributes: u64) -> u64 {
+    let name_bytes = object_attributes_name_leaf_unicode(object_attributes)
+        .map(|(_, units)| ((units + 1) * 2) as u64)
+        .unwrap_or(2);
+    align16((DESKTOPINFO_NAME_OFF + name_bytes).max(DESKTOPINFO_MIN_ALLOC))
+}
+
+unsafe fn initialize_desktop_info(dinfo: u64, heap_base: u64, heap_size: u64, object_attributes: u64) {
+    write_volatile(
+        (dinfo + DESKTOPINFO_PV_DESKTOP_BASE_OFF) as *mut u64,
+        heap_base,
+    );
+    write_volatile(
+        (dinfo + DESKTOPINFO_PV_DESKTOP_LIMIT_OFF) as *mut u64,
+        heap_base + heap_size,
+    );
+
+    let mut hook = 0u64;
+    while hook < DESKTOPINFO_HOOK_COUNT {
+        let head = dinfo + DESKTOPINFO_APHK_START_OFF + hook * 16;
+        write_volatile(head as *mut u64, head);
+        write_volatile((head + 8) as *mut u64, head);
+        hook += 1;
+    }
+
+    let mut units = 0usize;
+    if let Some((src, len)) = object_attributes_name_leaf_unicode(object_attributes) {
+        while units < len {
+            let ch = read_unaligned((src + (units * 2) as u64) as *const u16);
+            write_volatile(
+                (dinfo + DESKTOPINFO_NAME_OFF + (units * 2) as u64) as *mut u16,
+                ch,
+            );
+            units += 1;
+        }
+    }
+    write_volatile(
+        (dinfo + DESKTOPINFO_NAME_OFF + (units * 2) as u64) as *mut u16,
+        0,
+    );
+}
+
+unsafe fn initialize_desktop_heap(
+    table: &ObHandleTable,
+    desk_body: u64,
+    winsta_body: u64,
+    object_attributes: u64,
+) -> bool {
+    if desk_body == 0 || winsta_body == 0 {
+        return false;
+    }
+    let existing_section = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
+    let existing_heap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    if existing_section != 0 || existing_heap != 0 {
+        return existing_section != 0
+            && is_section(existing_section as *const u8)
+            && existing_heap != 0
+            && hosted_heap_bounds(existing_heap).is_some();
+    }
+
+    let heap_size = desktop_heap_size_for(table, winsta_body, object_attributes);
+    let section = pool_alloc(section_object::SIZE_OF as u64);
+    if section == 0 {
+        return false;
+    }
+    init_section(section as *mut u8, heap_size);
+    register_section_descriptor(section);
+    let (heap_base, mapped_size) = section_view(section, heap_size);
+    if heap_base == 0 || mapped_size < heap_size {
+        return false;
+    }
+    let pheap = hosted_heap_init(heap_base, heap_size);
+    if pheap == 0 {
+        return false;
+    }
+    let info_size = desktop_info_alloc_size(object_attributes);
+    let dinfo = s_rtl_allocate_heap(pheap, HEAP_ZERO_MEMORY, info_size);
+    if dinfo == 0 {
+        return false;
+    }
+
+    init_desktop_body(desk_body as *mut u8, dinfo);
+    initialize_desktop_info(dinfo, heap_base, heap_size, object_attributes);
+    write_volatile((desk_body + DESKTOP_HSECTION_OFF) as *mut u64, section);
+    write_volatile((desk_body + DESKTOP_PHEAP_OFF) as *mut u64, pheap);
+    write_volatile((desk_body + DESKTOP_UL_HEAP_SIZE_OFF) as *mut u64, heap_size);
+    true
 }
 
 struct CapturedUserObjectSecurityDescriptor {
@@ -2689,7 +2861,10 @@ extern "win64" fn s_ob_open_object_by_name(
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
-                let root = object_attributes_root_directory(object_attributes);
+                let requested_root = object_attributes_root_directory(object_attributes);
+                let Some((root, winsta_body)) = effective_desktop_root(table, requested_root) else {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                };
                 let named_leaf = object_attributes_name_leaf_ascii(object_attributes);
                 if let Some((leaf, len)) = named_leaf {
                     if let Some(existing) = table.desktop_handle_for_name(root, &leaf[..len]) {
@@ -2713,11 +2888,12 @@ extern "win64" fn s_ob_open_object_by_name(
                 if body == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
-                if let Some((ObKind::WindowStation, winsta_body)) = table.lookup(root) {
-                    write_volatile(
-                        (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
-                        winsta_body,
-                    );
+                write_volatile(
+                    (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
+                    winsta_body,
+                );
+                if !initialize_desktop_heap(table, body, winsta_body, object_attributes) {
+                    return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
                 let h = table.register_with_security(
                     ObKind::Desktop,
@@ -3083,48 +3259,49 @@ extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
 /// (unexpected) `ObjectType` pointer, and which known type statics it is/ isn't, so a gate mismatch
 /// can be classified (polymorphic call site that should pass NULL vs a genuine type confusion).
 fn ob_type_mismatch_trace(handle: u64, obj_type: u64, which: &[u8]) {
-    unsafe {
-        use nt_object_manager::object_type as ot;
-        print_str(b"[win32k-host] ObRefByHandle TYPE_MISMATCH on ");
-        print_str(which);
-        print_str(b" handle=0x");
-        print_hex(handle as u32);
-        print_str(b" expected_type=0x");
-        print_hex((obj_type >> 32) as u32);
-        print_hex(obj_type as u32);
-        let tag: &[u8] = if obj_type == ot::desktop_object_type_addr() {
-            b" (=Desktop)"
-        } else if obj_type == ot::window_station_object_type_addr() {
-            b" (=WindowStation)"
-        } else if obj_type == ot::process_object_type_addr() {
-            b" (=Process)"
-        } else if obj_type == ot::thread_object_type_addr() {
-            b" (=Thread)"
-        } else if obj_type == ot::event_object_type_addr() {
-            b" (=Event)"
-        } else if obj_type == ot::port_object_type_addr() {
-            b" (=Port)"
-        } else {
-            b" (=unknown)"
-        };
-        print_str(tag);
-        print_str(b"\n");
-    }
+    use nt_object_manager::object_type as ot;
+    print_str(b"[win32k-host] ObRefByHandle TYPE_MISMATCH on ");
+    print_str(which);
+    print_str(b" handle=0x");
+    print_hex(handle as u32);
+    print_str(b" expected_type=0x");
+    print_hex((obj_type >> 32) as u32);
+    print_hex(obj_type as u32);
+    let tag: &[u8] = if obj_type == ot::desktop_object_type_addr() {
+        b" (=Desktop)"
+    } else if obj_type == ot::window_station_object_type_addr() {
+        b" (=WindowStation)"
+    } else if obj_type == ot::process_object_type_addr() {
+        b" (=Process)"
+    } else if obj_type == ot::thread_object_type_addr() {
+        b" (=Thread)"
+    } else if obj_type == ot::event_object_type_addr() {
+        b" (=Event)"
+    } else if obj_type == ot::port_object_type_addr() {
+        b" (=Port)"
+    } else {
+        b" (=unknown)"
+    };
+    print_str(tag);
+    print_str(b"\n");
 }
 
 const HEAP_HDR_SIZE: u64 = 16;
 const HEAP_ALLOC_MARKER: u64 = 0xffff_ffff_ffff_fffd;
+const HEAP_HANDLE_MAGIC: u64 = 0x4845_4150_5355_4253; // "HEAPSUBS"
+const HEAP_HANDLE_MAGIC_OFF: u64 = 0x10;
+const HEAP_HANDLE_SIZE_OFF: u64 = 0x18;
 const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
 const HEAP_REALLOC_IN_PLACE_ONLY: u64 = 0x0000_0010;
 
-/// Allocate from the win32k session-heap arena. The block header stores the aligned payload
-/// capacity; free blocks use the second header word as a next pointer, and live blocks carry a marker.
-unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
+/// Allocate from a hosted heap arena. The block header stores the aligned payload capacity; free
+/// blocks use the second header word as a next pointer, and live blocks carry a marker.
+unsafe fn heap_alloc_in(arena_base: u64, arena_bytes: u64, size: u64, zero: bool, label: &[u8]) -> u64 {
     if size == 0 {
         return 0;
     }
     let want = align16(size);
-    let head = (WIN32K_HEAP_VADDR + 8) as *mut u64;
+    let head = (arena_base + 8) as *mut u64;
     let mut prev = 0u64;
     let mut cur = read_volatile(head);
     let mut scanned = 0usize;
@@ -3160,22 +3337,24 @@ unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
         scanned += 1;
     }
 
-    let ctr = WIN32K_HEAP_VADDR as *mut u64;
+    let ctr = arena_base as *mut u64;
     let mut cur = read_volatile(ctr);
     if cur < POOL_DATA_OFF {
         cur = POOL_DATA_OFF;
     }
-    let hdr = align16(WIN32K_HEAP_VADDR + cur);
-    let cap = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    let hdr = align16(arena_base + cur);
+    let cap = arena_base + arena_bytes;
     if hdr + HEAP_HDR_SIZE + want > cap {
-        print_str(b"[win32k-host] HEAP EXHAUSTED size=0x");
+        print_str(b"[win32k-host] ");
+        print_str(label);
+        print_str(b" EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b" used=0x");
         print_hex(cur as u32);
         print_str(b"\n");
         return 0;
     }
-    write_volatile(ctr, (hdr + HEAP_HDR_SIZE + want) - WIN32K_HEAP_VADDR);
+    write_volatile(ctr, (hdr + HEAP_HDR_SIZE + want) - arena_base);
     write_volatile(hdr as *mut u64, want);
     write_volatile((hdr + 8) as *mut u64, HEAP_ALLOC_MARKER);
     let payload = hdr + HEAP_HDR_SIZE;
@@ -3185,9 +3364,9 @@ unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
     payload
 }
 
-unsafe fn heap_block_capacity(p: u64) -> Option<u64> {
-    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
-    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+unsafe fn heap_block_capacity_in(arena_base: u64, arena_bytes: u64, p: u64) -> Option<u64> {
+    let arena_start = arena_base + POOL_DATA_OFF;
+    let arena_end = arena_base + arena_bytes;
     if p < arena_start + HEAP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
         return None;
     }
@@ -3203,13 +3382,13 @@ unsafe fn heap_block_capacity(p: u64) -> Option<u64> {
     Some(cap)
 }
 
-unsafe fn heap_free(p: u64) -> bool {
-    let Some(cap) = heap_block_capacity(p) else {
+unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
+    let Some(cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
         return false;
     };
     let hdr = p - HEAP_HDR_SIZE;
 
-    let head = (WIN32K_HEAP_VADDR + 8) as *mut u64;
+    let head = (arena_base + 8) as *mut u64;
     let mut prev = 0u64;
     let mut cur = read_volatile(head);
     let mut scanned = 0usize;
@@ -3250,8 +3429,8 @@ unsafe fn heap_free(p: u64) -> bool {
         }
     }
 
-    let ctr = WIN32K_HEAP_VADDR as *mut u64;
-    let high = WIN32K_HEAP_VADDR + read_volatile(ctr);
+    let ctr = arena_base as *mut u64;
+    let high = arena_base + read_volatile(ctr);
     if block + HEAP_HDR_SIZE + block_cap == high {
         let mut list_prev = 0u64;
         let mut list_cur = read_volatile(head);
@@ -3268,21 +3447,34 @@ unsafe fn heap_free(p: u64) -> bool {
             } else {
                 write_volatile((list_prev + 8) as *mut u64, next);
             }
-            write_volatile(ctr, block - WIN32K_HEAP_VADDR);
+            write_volatile(ctr, block - arena_base);
         }
     }
     true
 }
 
-unsafe fn heap_realloc(flags: u64, p: u64, size: u64) -> u64 {
+unsafe fn heap_realloc_in(
+    arena_base: u64,
+    arena_bytes: u64,
+    flags: u64,
+    p: u64,
+    size: u64,
+    label: &[u8],
+) -> u64 {
     if p == 0 {
-        return heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0);
+        return heap_alloc_in(
+            arena_base,
+            arena_bytes,
+            size,
+            flags & HEAP_ZERO_MEMORY != 0,
+            label,
+        );
     }
     if size == 0 {
-        heap_free(p);
+        heap_free_in(arena_base, arena_bytes, p);
         return 0;
     }
-    let Some(old_cap) = heap_block_capacity(p) else {
+    let Some(old_cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
         return 0;
     };
     let want = align16(size);
@@ -3292,7 +3484,13 @@ unsafe fn heap_realloc(flags: u64, p: u64, size: u64) -> u64 {
     if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
         return 0;
     }
-    let newp = heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0);
+    let newp = heap_alloc_in(
+        arena_base,
+        arena_bytes,
+        size,
+        flags & HEAP_ZERO_MEMORY != 0,
+        label,
+    );
     if newp == 0 {
         return 0;
     }
@@ -3301,8 +3499,55 @@ unsafe fn heap_realloc(flags: u64, p: u64, size: u64) -> u64 {
         newp as *mut u8,
         core::cmp::min(old_cap, size) as usize,
     );
-    heap_free(p);
+    heap_free_in(arena_base, arena_bytes, p);
     newp
+}
+
+unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
+    heap_alloc_in(
+        WIN32K_HEAP_VADDR,
+        WIN32K_HEAP_FRAMES * 0x1000,
+        size,
+        zero,
+        b"HEAP",
+    )
+}
+
+unsafe fn heap_free(p: u64) -> bool {
+    heap_free_in(WIN32K_HEAP_VADDR, WIN32K_HEAP_FRAMES * 0x1000, p)
+}
+
+unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
+    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
+    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    let reserve_size = (reserve_size + 0xFFF) & !0xFFF;
+    if base < arena_start
+        || reserve_size < POOL_DATA_OFF + HEAP_HDR_SIZE
+        || base + reserve_size > arena_end
+    {
+        return 0;
+    }
+    write_volatile(base as *mut u64, POOL_DATA_OFF);
+    write_volatile((base + 8) as *mut u64, 0);
+    write_volatile((base + HEAP_HANDLE_MAGIC_OFF) as *mut u64, HEAP_HANDLE_MAGIC);
+    write_volatile((base + HEAP_HANDLE_SIZE_OFF) as *mut u64, reserve_size);
+    base
+}
+
+unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
+    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
+    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    if heap < arena_start || heap + HEAP_HANDLE_SIZE_OFF + 8 > arena_end {
+        return None;
+    }
+    if read_volatile((heap + HEAP_HANDLE_MAGIC_OFF) as *const u64) != HEAP_HANDLE_MAGIC {
+        return None;
+    }
+    let size = read_volatile((heap + HEAP_HANDLE_SIZE_OFF) as *const u64);
+    if size < POOL_DATA_OFF + HEAP_HDR_SIZE || heap + size > arena_end {
+        return None;
+    }
+    Some((heap, size))
 }
 
 /// A GENERAL_LOOKASIDE's default Allocate `PVOID(POOL_TYPE, SIZE_T, ULONG Tag)` — bump the heap
@@ -3394,53 +3639,137 @@ extern "win64" fn s_ex_init_npaged_lookaside(
     }
 }
 
-/// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)` — win32k
-/// creates its session heap. Return a non-null fake handle; RtlAllocateHeap uses the arena above.
-extern "win64" fn s_rtl_create_heap() -> u64 {
-    WIN32K_HEAP_HANDLE
+/// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)`. win32k creates
+/// the global USER heap and every desktop heap over a section view; return that view as the heap
+/// handle and keep subsequent allocations inside the section-backed arena.
+extern "win64" fn s_rtl_create_heap(
+    _flags: u64,
+    heap_base: u64,
+    reserve_size: u64,
+    _commit_size: u64,
+    _lock: u64,
+    _parameters: u64,
+) -> u64 {
+    unsafe {
+        if heap_base != 0 {
+            return hosted_heap_init(heap_base, reserve_size);
+        }
+    }
+    0
 }
 /// `PVOID RtlAllocateHeap(HeapHandle, Flags, Size)`.
-extern "win64" fn s_rtl_allocate_heap(_heap: u64, flags: u64, size: u64) -> u64 {
-    unsafe { heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0) }
+extern "win64" fn s_rtl_allocate_heap(heap: u64, flags: u64, size: u64) -> u64 {
+    unsafe {
+        let Some((base, bytes)) = hosted_heap_bounds(heap) else {
+            return 0;
+        };
+        heap_alloc_in(
+            base,
+            bytes,
+            size,
+            flags & HEAP_ZERO_MEMORY != 0,
+            b"RTL_HEAP",
+        )
+    }
 }
 /// `BOOLEAN RtlFreeHeap(HeapHandle, Flags, Base)`.
-extern "win64" fn s_rtl_free_heap(_heap: u64, _flags: u64, base: u64) -> u64 {
+extern "win64" fn s_rtl_free_heap(heap: u64, _flags: u64, base: u64) -> u64 {
     if base == 0 {
         return 1;
     }
-    unsafe { heap_free(base) as u64 }
+    unsafe {
+        let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+            return 0;
+        };
+        heap_free_in(arena_base, arena_bytes, base) as u64
+    }
 }
 /// `SIZE_T RtlSizeHeap(HeapHandle, Flags, Base)`.
-extern "win64" fn s_rtl_size_heap(_heap: u64, _flags: u64, base: u64) -> u64 {
-    unsafe { heap_block_capacity(base).unwrap_or(u64::MAX) }
+extern "win64" fn s_rtl_size_heap(heap: u64, _flags: u64, base: u64) -> u64 {
+    unsafe {
+        let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+            return u64::MAX;
+        };
+        heap_block_capacity_in(arena_base, arena_bytes, base).unwrap_or(u64::MAX)
+    }
 }
 /// `PVOID RtlReAllocateHeap(HeapHandle, Flags, Base, Size)`.
-extern "win64" fn s_rtl_reallocate_heap(_heap: u64, flags: u64, base: u64, size: u64) -> u64 {
-    unsafe { heap_realloc(flags, base, size) }
+extern "win64" fn s_rtl_reallocate_heap(heap: u64, flags: u64, base: u64, size: u64) -> u64 {
+    unsafe {
+        let Some((arena_base, arena_bytes)) = hosted_heap_bounds(heap) else {
+            return 0;
+        };
+        heap_realloc_in(arena_base, arena_bytes, flags, base, size, b"RTL_HEAP")
+    }
 }
 
 use nt_kernel_exec::session_section::{
-    init_section, is_section, map_section, section_object, section_size,
+    init_section, is_section, map_section, section_contains_addr, section_next, section_object,
+    section_size, set_section_next, unmap_section,
 };
 
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
+static WIN32K_SECTION_LIST_HEAD: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn register_section_descriptor(desc: u64) {
+    loop {
+        let head = WIN32K_SECTION_LIST_HEAD.load(Ordering::Relaxed);
+        set_section_next(desc as *mut u8, head);
+        if WIN32K_SECTION_LIST_HEAD
+            .compare_exchange(head, desc, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+unsafe fn find_section_for_view_addr(addr: u64) -> u64 {
+    let mut cur = WIN32K_SECTION_LIST_HEAD.load(Ordering::Relaxed);
+    let mut scanned = 0usize;
+    while cur != 0 && scanned < 4096 {
+        if is_section(cur as *const u8) {
+            if section_contains_addr(cur as *const u8, addr) {
+                return cur;
+            }
+            cur = section_next(cur as *const u8);
+        } else {
+            break;
+        }
+        scanned += 1;
+    }
+    0
+}
+
+unsafe fn unmap_section_view_addr(addr: u64) -> i32 {
+    if addr == 0 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let section = find_section_for_view_addr(addr);
+    if section == 0 {
+        print_str(b"[win32k-host] MmUnmapView: unmapped/foreign base=0x");
+        print_hex((addr >> 32) as u32);
+        print_hex(addr as u32);
+        print_str(b"\n");
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if unmap_section(section as *mut u8, addr, |base| heap_free(base)) {
+        0
+    } else {
+        STATUS_INVALID_PARAMETER_I32
+    }
+}
 
 /// Resolve (allocating once, from the heap arena) the coherent backing base + size for a section
-/// map. If `section` is one of our [`init_section`] descriptors, use its recorded size + idempotent
-/// base (so the kernel session view and every per-process view share one backing); otherwise fall
-/// back to `size_hint` (a foreign/system-space section we didn't create).
-unsafe fn section_view(section: u64, size_hint: u64) -> (u64, u64) {
-    if is_section(section as *const u8) {
-        let sz = section_size(section as *const u8);
-        (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
-    } else {
-        let mut size = size_hint;
-        if size == 0 || size > 0x0040_0000 {
-            size = 0x0010_0000; // default/cap the view at 1 MiB
-        }
-        size = (size + 0xFFF) & !0xFFF;
-        (heap_alloc(size, true), size)
+/// map. The section must be one of our [`init_section`] descriptors, so the kernel session view and
+/// every per-process view share one backing. Unknown section pointers fail instead of receiving a
+/// synthetic private mapping.
+unsafe fn section_view(section: u64, _size_hint: u64) -> (u64, u64) {
+    if section == 0 || !is_section(section as *const u8) {
+        return (0, 0);
     }
+    let sz = section_size(section as *const u8);
+    (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
 }
 
 /// `NTSTATUS MmCreateSection(PVOID *SectionObject, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER
@@ -3465,11 +3794,25 @@ extern "win64" fn s_mm_create_section(
             return STATUS_NO_MEMORY;
         }
         init_section(desc as *mut u8, size);
+        register_section_descriptor(desc);
         if !section_out.is_null() {
             write_unaligned(section_out, desc);
         }
     }
     0
+}
+
+/// `NTSTATUS MmUnmapViewOfSection(PEPROCESS Process, PVOID BaseAddress)`. The host maps session
+/// sections at the same VA for kernel and client views, so unmap is logical: validate the base
+/// belongs to a live section view, drop that view's reference, and release the backing when it was
+/// the final view.
+extern "win64" fn s_mm_unmap_view_of_section(_process: u64, base: u64) -> i32 {
+    unsafe { unmap_section_view_addr(base) }
+}
+
+/// `NTSTATUS MmUnmapViewInSessionSpace(PVOID MappedBase)` / `MmUnmapViewInSystemSpace`.
+extern "win64" fn s_mm_unmap_view_in_space(base: u64) -> i32 {
+    unsafe { unmap_section_view_addr(base) }
 }
 
 /// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
@@ -5201,22 +5544,22 @@ unsafe fn ensure_desktop_runtime_fields(desk_body: u64) -> Option<u64> {
     if desk_body == 0 {
         return None;
     }
-    if read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-        write_volatile(
-            (desk_body + DESKTOP_PHEAP_OFF) as *mut u64,
-            WIN32K_HEAP_HANDLE,
-        );
+    let hsection = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
+    if !is_section(hsection as *const u8) {
+        return None;
+    }
+    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
+        return None;
     }
     let pdeskinfo = read_volatile((desk_body + 0x08) as *const u64);
     if pdeskinfo == 0 {
         return None;
     }
-    if read_volatile(pdeskinfo as *const u64) == 0 {
-        write_volatile(pdeskinfo as *mut u64, WIN32K_HEAP_VADDR);
-        write_volatile(
-            (pdeskinfo + 0x08) as *mut u64,
-            WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
-        );
+    let desktop_base = read_volatile(pdeskinfo as *const u64);
+    let desktop_limit = read_volatile((pdeskinfo + 0x08) as *const u64);
+    if desktop_base == 0 || desktop_limit <= desktop_base {
+        return None;
     }
     Some(pdeskinfo)
 }
@@ -6816,6 +7159,18 @@ fn register_trampolines() {
         "MmMapViewOfSection",
         s_mm_map_view_of_section as usize as u64,
     );
+    reg.bind(
+        "MmUnmapViewInSessionSpace",
+        s_mm_unmap_view_in_space as usize as u64,
+    );
+    reg.bind(
+        "MmUnmapViewInSystemSpace",
+        s_mm_unmap_view_in_space as usize as u64,
+    );
+    reg.bind(
+        "MmUnmapViewOfSection",
+        s_mm_unmap_view_of_section as usize as u64,
+    );
     // --- batch 3: lookaside-list init (nt_kernel_exec::init_general_lookaside) ---
     reg.bind(
         "ExInitializePagedLookasideList",
@@ -8293,38 +8648,16 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
     }
 
-    // Stand up the winsta->desktop parent linkage our Ob layer does not populate. A hosted client's
-    // (winlogon's) natural CreateDesktop returns a real DESKTOP body (IntCreateDesktop builds its
-    // window graph), but `pdesk->rpwinstaParent` (DESKTOP+0x20) stays NULL — in real win32k
-    // IntCreateDesktop sets it from the window station the desktop is parsed under. NtUserSwitchDesktop
-    // then derefs it (session-id guard RVA 0x6c281→0x6c285; WSS_LOCKED guard :3007; the
-    // `rpwinstaParent == InputWindowStation` guard :3015) and NULL-derefs without it. Poke it to the
-    // interactive window station (the single-instance cached WINDOWSTATION == the InputWindowStation
-    // global the bring-up gfx-trigger already set) — the same field the gfx-trigger's
-    // `create_winsta_and_desktop` pokes on the Default desktop. The returned HDESK is a small handle
-    // (0xc/0x10/0x14) so the i32 return carries it intact.
+    // Publish only the interactive Default desktop after Ob creation has already installed its real
+    // parent window station and desktop heap. Service desktops remain scoped to their own window
+    // station and must not inherit WinSta0 here.
     if ssn == SSN_NT_USER_CREATE_DESKTOP && ret != 0 {
         let hdesk = (ret as u32) as u64;
         let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-        let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
-        if desk_body != 0 && winsta_body != 0 {
-            let rpwinsta = (desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64;
-            if read_volatile(rpwinsta) == 0 {
-                write_volatile(rpwinsta, winsta_body);
-                // Keep the InputWindowStation global consistent (it is already set by the bring-up
-                // gfx-trigger to this same cached body; setting it is idempotent/harmless).
-                write_volatile(
-                    (WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64,
-                    winsta_body,
-                );
-                print_str(b"[win32k-host] routed NtUserCreateDesktop hDesk=0x");
-                print_hex(hdesk as u32);
-                print_str(b" rpwinstaParent set -> body=0x");
-                print_hex((desk_body >> 32) as u32);
-                print_hex(desk_body as u32);
-                print_str(b"\n");
-            }
-            if object_attributes_name_leaf_eq_ascii(a0, b"default") {
+        if desk_body != 0 && object_attributes_name_leaf_eq_ascii(a0, b"default") {
+            let rpwinsta = read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64);
+            let input_winsta = read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
+            if rpwinsta != 0 && rpwinsta == input_winsta {
                 publish_default_desktop(hdesk, desk_body, b"NtUserCreateDesktop(Default)");
             }
         }
@@ -8345,19 +8678,16 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         let rpdesk = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
         let pdeskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
         if rpdesk != 0 && pdeskinfo != 0 {
+            // Keep the real per-desktop heap handle that IntCreateDesktop installed. The class
+            // call-proc path `UserGetCPD -> CreateCallProc -> DesktopHeapAlloc` allocates through
+            // `RtlAllocateHeap(pdesk->pheapDesktop, ...)`; a missing or foreign handle means desktop
+            // initialization did not complete and must not be patched over here.
+            let pheap = read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64);
+            if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
+                return ret;
+            }
             BOUND_DESK_BODY = rpdesk;
             BOUND_DESK_PDESKINFO = pdeskinfo;
-            // Ensure the bound DESKTOP has a NON-NULL `pheapDesktop` (DESKTOP+0x80, desktop.h). The class
-            // call-proc path `UserGetCPD → CreateCallProc → DesktopHeapAlloc` (callproc.c:143,
-            // object.c:103) does `RtlAllocateHeap(pdesk->pheapDesktop, ...)` — and our win32k
-            // `RtlAllocateHeap` import is bound to `s_rtl_allocate_heap`, which IGNORES the handle and
-            // bumps the shared session arena, so the handle only needs to be non-NULL to avoid the
-            // `mov rcx,[pdesk+0x80]; call RtlAllocateHeap(NULL,...)` NULL-handle path. (This is the REAL
-            // deref at RVA 0x4f5e3 — `Desktop->pheapDesktop`, NOT `pti->pDeskInfo`; see the corrected
-            // comment at THREADINFO_PDESKINFO_OFF.)
-            if read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-                write_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
-            }
             print_str(b"[win32k-host] NtUserSetThreadDesktop latched: pti->rpdesk=0x");
             print_hex((rpdesk >> 32) as u32);
             print_hex(rpdesk as u32);
@@ -8365,7 +8695,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             print_hex((pdeskinfo >> 32) as u32);
             print_hex(pdeskinfo as u32);
             print_str(b" pheapDesktop=0x");
-            print_hex(read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64) as u32);
+            print_hex(pheap as u32);
             print_str(b"\n");
         }
     }
@@ -8676,20 +9006,12 @@ unsafe fn seed_process_startup_desktop_for_process(
     {
         return false;
     }
-    let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
-    if winsta_body != 0
-        && read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64) == 0
-    {
-        write_volatile(
-            (desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
-            winsta_body,
-        );
+    if read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64) == 0 {
+        return false;
     }
-    if read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-        write_volatile(
-            (desk_body + DESKTOP_PHEAP_OFF) as *mut u64,
-            WIN32K_HEAP_HANDLE,
-        );
+    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
+        return false;
     }
     write_volatile((ppi + PROCESSINFO_HDESK_STARTUP_OFF) as *mut u64, hdesk);
     write_volatile(
@@ -8925,30 +9247,27 @@ unsafe fn create_winsta_and_desktop() {
     //       desktop.c:3015 returns FALSE (and the session-id check at 0x6c281 derefs it);
     //   (2) InputWindowStation (winsta.c:21 global, RVA 0x20c068) == that same window station;
     //   (3) winsta->dwSessionId (WINSTATION+0) == PsGetCurrentProcessSessionId() (both 0 here);
-    //   (4) winsta->Flags (WINSTATION+0x20) WSS_LOCKED bit clear (zeroed body → clear).
-    // We stand up (1)+(2) from our created WINDOWSTATION body; (3)+(4) hold for the zeroed body. This is
-    // strictly MORE authentic than the old blind poke — the switch now runs win32k's real handle
-    // validation + winsta-locking checks. On this first switch gpdeskInputDesktop is NULL so the
-    // hide-previous-desktop branch (desktop.c:3031) is skipped; the switch's own trailing
-    // co_IntShowDesktop runs with bRedraw=FALSE (no paint — SM_CX/CYSCREEN are still 0 pre-InitVideo),
-    // then co_IntInitializeDesktopGraphics's :340 co_IntShowDesktop(bRedraw=TRUE) does the real paint.
+    //   (4) winsta->Flags (WINSTATION+0x20) WSS_LOCKED bit clear (zeroed body -> clear).
+    // Ob desktop creation now owns (1); this bootstrap only publishes (2) before running the real
+    // switch. On this first switch gpdeskInputDesktop is NULL so the hide-previous-desktop branch
+    // (desktop.c:3031) is skipped; the switch's own trailing co_IntShowDesktop runs with bRedraw=FALSE
+    // (no paint -- SM_CX/CYSCREEN are still 0 pre-InitVideo), then co_IntInitializeDesktopGraphics's
+    // :340 co_IntShowDesktop(bRedraw=TRUE) does the real paint.
     let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
     let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
     if desk_body != 0 && winsta_body != 0 {
-        // (1) pdesk->rpwinstaParent = our WINDOWSTATION body.
-        write_volatile(
-            (desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
-            winsta_body,
-        );
-        // (2) the interactive InputWindowStation global = the same window station.
+        let parent = read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64);
+        if parent != winsta_body {
+            print_str(b"[win32k-host] ERROR: Default desktop parent mismatch, switch skipped\n");
+            return;
+        }
+        // The interactive InputWindowStation global = the same window station.
         write_volatile(
             (WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64,
             winsta_body,
         );
 
-        print_str(
-            b"[win32k-host] NtUserSwitchDesktop(hDesk) [rpwinstaParent+InputWindowStation set]\n",
-        );
+        print_str(b"[win32k-host] NtUserSwitchDesktop(hDesk) [InputWindowStation set]\n");
         let switch: extern "win64" fn(u64) -> i32 =
             core::mem::transmute((WIN32K_CODE_VA + NT_USER_SWITCH_DESKTOP_RVA) as *const ());
         let sret = switch(hdesk);
