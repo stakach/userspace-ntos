@@ -19540,6 +19540,26 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
             }
         }
+        if !w.is_write && copy_len >= 16 && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
+        {
+            let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
+            if pdu.is_some() && PIPE_REDRIVE_RPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 96 {
+                print_str(b"[pipe-redrive-rpc] fid=0x");
+                print_hex(w.file_id as u32);
+                print_str(b" name_hash=0x");
+                print_hex_u64(pipe_fid_name_hash(w.file_id));
+                print_str(b" pi=");
+                print_u64(w.pi as u64);
+                print_str(b" badge=");
+                print_u64(w.badge);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b" bytes=");
+                print_u64(completed);
+                driver_launch::print_dcerpc_pdu_view(pdu);
+                print_str(b"\n");
+            }
+        }
         if w.iosb_va != 0 {
             nt_handler.xas_write_buf(w.iosb_va, &status.to_le_bytes());
             nt_handler.xas_write_buf(w.iosb_va + 8, &(completed as u64).to_le_bytes());

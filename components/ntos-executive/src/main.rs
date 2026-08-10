@@ -2449,6 +2449,7 @@ pub(crate) static PIPE_WAITERS_REFUSED: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_REDRIVE_RPC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 // ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
 /// Pending async server-side `FSCTL_PIPE_LISTEN`s (host-tested `nt_io_manager::AsyncListenTable`). The
 /// ncacn_np rpcrt4 server posts an OVERLAPPED FSCTL_PIPE_LISTEN (STATUS_PENDING while no client) with a

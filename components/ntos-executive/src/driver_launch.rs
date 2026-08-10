@@ -992,7 +992,7 @@ struct PipeCcbView {
 }
 
 #[derive(Clone, Copy)]
-struct DceRpcContextHandleView {
+pub(crate) struct DceRpcContextHandleView {
     offset: u16,
     attributes: u32,
     uuid: [u8; 16],
@@ -1001,7 +1001,7 @@ struct DceRpcContextHandleView {
 const DCERPC_CONTEXT_HANDLE_TRACE_CAP: usize = 4;
 
 #[derive(Clone, Copy)]
-struct DceRpcPduView {
+pub(crate) struct DceRpcPduView {
     ptype: u8,
     flags: u8,
     frag_len: u16,
@@ -1098,6 +1098,10 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
         fault_status,
         context_handles,
     })
+}
+
+pub(crate) unsafe fn dcerpc_pdu_view_from_slice(payload: &[u8]) -> Option<DceRpcPduView> {
+    dcerpc_pdu_view(payload.as_ptr() as u64, payload.len() as u64)
 }
 
 unsafe fn dcerpc_context_handles(
@@ -1210,7 +1214,7 @@ fn dcerpc_ptype_name(ptype: u8) -> &'static [u8] {
     }
 }
 
-fn print_dcerpc_pdu_view(view: Option<DceRpcPduView>) {
+pub(crate) fn print_dcerpc_pdu_view(view: Option<DceRpcPduView>) {
     let Some(pdu) = view else {
         return;
     };

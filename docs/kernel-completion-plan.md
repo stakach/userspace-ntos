@@ -271,7 +271,13 @@ paint and real browser service DLL load, but also showed that counted strings an
 crowding out the real deeper context handle candidates. The trace now keeps only UUID-shaped
 generated context handles so the next serialized desktop run can decide whether the missing desktop
 path is an NPFS instance routing issue, an association-group lifetime issue, or a thread
-teardown/reuse issue.
+teardown/reuse issue. The filtered run (`.tmp/boot-rpc-context-filter-20260810.log`) moved into the
+shell service DLL wave (`localspl`, `localmon`, `winprint`, `wkssvc`, `wmisvc`, and `browser`) and
+reproduced the context mismatch on a second `\ntsvcs` pipe instance using association group 4, but
+the rejected UUID only appeared in rpcrt4's diagnostic. The next slice adds the same generic
+DCE/RPC PDU summary at the retained-IRP redrive boundary so completed pending reads are visible too;
+that should prove whether the missing handle was created on another accepted instance, hidden in a
+split read, or lost through association/FILE_OBJECT lifetime.
 
 ### A. SCM-Controlled Service Startup
 
