@@ -12188,6 +12188,33 @@ impl ExecNtHandler {
             return client_range_has_backing(self.pi as u64, va, len);
         }
 
+        unsafe fn committed_mapped_output_range_backed(pi: u64, va: u64, len: usize) -> bool {
+            let Some(chunks) = nt_address_space::page_chunks(va, len) else {
+                return false;
+            };
+            for chunk in chunks {
+                let Some(info) = process_committed_mapping_basic_information(pi, chunk.page_base)
+                else {
+                    return false;
+                };
+                if info.type_ != nt_address_space::MEM_MAPPED
+                    || nt_address_space::mapped_view_fault_access_status(
+                        info.protect,
+                        nt_address_space::FaultAccess::Write,
+                    )
+                    .is_err()
+                    || csrss_frame_get_exact(pi, chunk.page_base).0 == 0
+                {
+                    return false;
+                }
+            }
+            true
+        }
+
+        if committed_mapped_output_range_backed(self.pi as u64, va, len) {
+            return true;
+        }
+
         fn writable_image_range(pe: &nt_pe_loader::PeFile, base: u64, va: u64, len: usize) -> bool {
             let rva = match va.checked_sub(base) {
                 Some(rva) => rva,
@@ -17780,10 +17807,10 @@ impl ExecNtHandler {
             NativeService::NtQuerySystemInformation => unsafe {
                 use nt_syscall::system_information::{
                     encode_system_module_information, query_plan,
-                    system_module_information_required_length, SystemInformationKind,
-                    SystemTimeOfDayInformation, RTL_PROCESS_MODULES_HEADER_SIZE,
-                    SYSTEM_MODULE_INFORMATION_CLASS,
-                    SYSTEM_BASIC_INFORMATION_CLASS,
+                    system_module_information_required_length, SystemFlagsInformation,
+                    SystemInformationKind, SystemTimeOfDayInformation,
+                    RTL_PROCESS_MODULES_HEADER_SIZE, SYSTEM_FLAGS_INFORMATION_CLASS,
+                    SYSTEM_MODULE_INFORMATION_CLASS, SYSTEM_BASIC_INFORMATION_CLASS,
                     SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
                     SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
                 };
@@ -17803,6 +17830,7 @@ impl ExecNtHandler {
                         | SYSTEM_PROCESSOR_INFORMATION_CLASS
                         | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS
                         | SYSTEM_MODULE_INFORMATION_CLASS
+                        | SYSTEM_FLAGS_INFORMATION_CLASS
                         | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS
                 ) {
                     return STATUS_INVALID_INFO_CLASS;
@@ -17893,12 +17921,20 @@ impl ExecNtHandler {
                         .encode();
                         self.xas_try_write_buf(buf, &output[..plan.copy_length])
                     }
+                    SystemInformationKind::Flags => {
+                        let output = SystemFlagsInformation { flags: 0 }.encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
                     SystemInformationKind::CurrentTimeZone => {
                         let output = self.time_zone_information.encode();
                         self.xas_try_write_buf(buf, &output)
                     }
                 };
-                if wrote { 0 } else { STATUS_ACCESS_VIOLATION }
+                if wrote {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
             },
             // NtQueryInformationProcess(Handle, Class, Buffer, Len, *RetLen).
             NativeService::NtQueryInformationProcess => unsafe {
@@ -24020,6 +24056,23 @@ impl ExecNtHandler {
                             k += 1;
                         }
                         *ctx.csrss_anon_base = CSRSS_ANON_BASE;
+                    }
+                    let anon_size = *ctx.csrss_anon_size;
+                    let Some(mapped_size) = anon_size.checked_add(0xFFF).map(|size| size & !0xFFFu64)
+                    else {
+                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                    };
+                    if mapped_size == 0
+                        || !process_committed_mapping_register(
+                            self.pi as u64,
+                            nt_address_space::VmCommittedRange::mapped(
+                                *ctx.csrss_anon_base,
+                                mapped_size,
+                                nt_address_space::PAGE_READWRITE,
+                            ),
+                        )
+                    {
+                        return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                     }
                     // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
                     // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).

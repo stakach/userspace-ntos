@@ -10,9 +10,10 @@ use nt_config_manager::{ConfigManager, RegistryKeyId};
 use nt_fs::{FileSystem, FILE_READ_DATA, FILE_WRITE_DATA};
 use nt_process::ProcessManager;
 use nt_syscall::system_information::{
-    SystemBasicInformation, SystemProcessorInformation, SystemTimeOfDayInformation,
-    PROCESSOR_ARCHITECTURE_AMD64, SYSTEM_BASIC_INFORMATION_CLASS,
-    SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+    SystemBasicInformation, SystemFlagsInformation, SystemProcessorInformation,
+    SystemTimeOfDayInformation, PROCESSOR_ARCHITECTURE_AMD64, SYSTEM_BASIC_INFORMATION_CLASS,
+    SYSTEM_FLAGS_INFORMATION_CLASS, SYSTEM_PROCESSOR_INFORMATION_CLASS,
+    SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
 };
 use nt_syscall::{
     NativeCallContext, NativeService, NativeSyscallHandler, STATUS_INVALID_HANDLE,
@@ -250,6 +251,10 @@ impl NativeSyscallHandler for KernelServices {
                         }
                         .encode(),
                     );
+                    STATUS_SUCCESS
+                }
+                class if class == SYSTEM_FLAGS_INFORMATION_CLASS as u64 => {
+                    out.extend_from_slice(&SystemFlagsInformation { flags: 0 }.encode());
                     STATUS_SUCCESS
                 }
                 _ => STATUS_INVALID_INFO_CLASS,

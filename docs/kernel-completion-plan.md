@@ -3201,3 +3201,32 @@ executable-order fallbacks.
   headless/post-desktop run that continues past the base-paint sentinel into the real profile,
   userinit, EventLog/SCM, or explorer-shell edge, without reintroducing runner, IRQ, pipe,
   service-name, executable-order, or paint fallbacks.
+
+- CSR shared-section system-information copyout. ReactOS `basesrv` was aborting during CSR startup
+  because `NtQuerySystemInformation(SystemTimeOfDayInformation)` and
+  `NtQuerySystemInformation(SystemBasicInformation)` wrote into the CSR anonymous shared section.
+  The section's pages were real and writable, but `probe_user_output` only accepted stack, private
+  heap, and writable image/DLL ranges, so the executive returned `STATUS_ACCESS_VIOLATION` before
+  the cross-address-space copyout path could use the registered frame backing. The syscall surface
+  also lacked NT5 `SystemFlagsInformation` class 9, which `smss` queries during startup. Current
+  cleanup adds class 9 to `nt-syscall`, the host shim, and the executive; registers the CSR
+  anonymous view as a committed `MEM_MAPPED` `PAGE_READWRITE` range when it is mapped; and lets
+  `probe_user_output` accept backed committed mapped ranges only when
+  `mapped_view_fault_access_status(..., Write)` permits the write. This keeps read-only image/DLL
+  checks on their existing path while allowing real writable section views to serve native
+  out-parameters.
+
+  Validation: `cargo fmt --all`, `cargo test -p nt-syscall -- --nocapture`,
+  `cargo test -p nt-user-host -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Serialized visible boot `.tmp/boot-csr-mapped-output-20260811.log` rebuilt the stack and reached
+  genuine base desktop paint with no old CSRSS class 3/class 0 system-information
+  `STATUS_ACCESS_VIOLATION` lines. Serialized headless retry
+  `.tmp/boot-csr-mapped-output-headless-20260811.log` likewise passed the old CSR startup wall and
+  drove winlogon much deeper through user32/win32k initialization, profile namespace access
+  (`\Registry\User\S-1-5-18`), and real user callbacks before reaching `NtUserSwitchDesktop`
+  framebuffer paint. That run was stopped manually after a quiet post-paint wall; the last progress
+  line is the production delay timer being armed (`[delay] timer ready pin=8 irq=12 ...`). Review
+  adjustment: the active frontier is now the post-paint delay timer / receive handoff that should
+  advance the shell path after base paint, not CSR system-information output probing and not
+  hardcoded userinit/explorer launch scaffolding.

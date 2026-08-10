@@ -5,12 +5,14 @@ use crate::{STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
+pub const SYSTEM_FLAGS_INFORMATION_CLASS: u32 = 9;
 pub const SYSTEM_MODULE_INFORMATION_CLASS: u32 = 11;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS: u32 = 44;
 
 pub const SYSTEM_BASIC_INFORMATION_SIZE: usize = 0x40;
 pub const SYSTEM_PROCESSOR_INFORMATION_SIZE: usize = 0x0c;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 0x30;
+pub const SYSTEM_FLAGS_INFORMATION_SIZE: usize = 0x04;
 pub const RTL_PROCESS_MODULES_HEADER_SIZE: usize = 0x08;
 pub const RTL_PROCESS_MODULE_INFORMATION_SIZE: usize = 0x128;
 pub const RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE: usize = 256;
@@ -210,6 +212,17 @@ impl SystemTimeOfDayInformation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemFlagsInformation {
+    pub flags: u32,
+}
+
+impl SystemFlagsInformation {
+    pub fn encode(self) -> [u8; SYSTEM_FLAGS_INFORMATION_SIZE] {
+        self.flags.to_le_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemModuleEntry {
     pub section: u32,
     pub mapped_base: u64,
@@ -354,6 +367,7 @@ pub enum SystemInformationKind {
     Basic,
     Processor,
     TimeOfDay,
+    Flags,
     CurrentTimeZone,
 }
 
@@ -410,6 +424,19 @@ pub fn query_plan(class: u32, buffer_length: usize) -> Result<QueryPlan, QueryEr
                 kind: SystemInformationKind::TimeOfDay,
                 copy_length: buffer_length,
                 return_length: buffer_length as u32,
+            })
+        }
+        SYSTEM_FLAGS_INFORMATION_CLASS => {
+            if buffer_length != SYSTEM_FLAGS_INFORMATION_SIZE {
+                return Err(QueryError {
+                    status: STATUS_INFO_LENGTH_MISMATCH,
+                    return_length: SYSTEM_FLAGS_INFORMATION_SIZE as u32,
+                });
+            }
+            Ok(QueryPlan {
+                kind: SystemInformationKind::Flags,
+                copy_length: SYSTEM_FLAGS_INFORMATION_SIZE,
+                return_length: SYSTEM_FLAGS_INFORMATION_SIZE as u32,
             })
         }
         SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS => {
@@ -603,6 +630,27 @@ mod tests {
             STATUS_INFO_LENGTH_MISMATCH
         );
         assert_eq!(query_plan(3, 49).unwrap_err().return_length, 0);
+    }
+
+    #[test]
+    fn flags_information_matches_nt5_fixed_length_rule() {
+        for length in [0, 3, 5] {
+            let error = query_plan(SYSTEM_FLAGS_INFORMATION_CLASS, length).unwrap_err();
+            assert_eq!(error.status, STATUS_INFO_LENGTH_MISMATCH);
+            assert_eq!(error.return_length, SYSTEM_FLAGS_INFORMATION_SIZE as u32);
+        }
+        let plan = query_plan(
+            SYSTEM_FLAGS_INFORMATION_CLASS,
+            SYSTEM_FLAGS_INFORMATION_SIZE,
+        )
+        .unwrap();
+        assert_eq!(plan.kind, SystemInformationKind::Flags);
+        assert_eq!(plan.copy_length, SYSTEM_FLAGS_INFORMATION_SIZE);
+        assert_eq!(plan.return_length, SYSTEM_FLAGS_INFORMATION_SIZE as u32);
+        assert_eq!(
+            SystemFlagsInformation { flags: 0x200 }.encode(),
+            0x200u32.to_le_bytes()
+        );
     }
 
     #[test]
