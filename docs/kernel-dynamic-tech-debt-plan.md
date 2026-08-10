@@ -2179,3 +2179,18 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   was issuing a second synthetic `IRP_MJ_READ` for a parked transceive instead of consuming the
   retained npfs completion stash. Review adjustment: parked READ/TRANSCEIVE completion must be
   delivered only from `IoCompleteRequest`'s exact completed-read stash; no executive re-read fallback.
+- I4 transceive redrive cleanup complete. `pipe_redrive_all` no longer issues a fresh read for parked
+  `FSCTL_PIPE_TRANSCEIVE`; pending READ/TRANSCEIVE waiters now complete only from the driver bridge's
+  exact `IoCompleteRequest` completed-read stash, which matches the retained-IRP ownership model and
+  removes the synthetic duplicate read entry that tripped the real `NpTransceive` busy check.
+  Validation: `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`,
+  `git diff --check`, and serialized boot
+  `.tmp/boot-no-transceive-reissue-20260810-195411.log`. Evidence: kernel specs passed, winlogon
+  desktop background still paints (`desktop-bg 768/768`), no `TransactNamedPipe(Schedule)` or
+  `0xc00000ae` transceive failure recurs, and service startup advances through dynamic `spoolsv.exe`,
+  `browser` `ServiceMain`, and `srvsvc`. Review adjustment: I4 remains open at the later generic
+  rpcrt4/server-association context-handle fault on SCM worker slot 9
+  (`{2d5427c4-1402-43d3-8929-6d5b131898a2}` / fault `0x1c00001a`) plus `browser`
+  `RpcServerListen() failed (Status 6b1)`; keep the next slice on real RPC association/context-handle
+  state and do not add service-name, executable, or pipe read fallbacks.
