@@ -982,11 +982,15 @@ impl<const N: usize> PipeNameWaiterTable<N> {
     }
 }
 
-/// A fixed-capacity, heap-free, reset-safe table of pending async server listens. Same `.bss` static
-/// shape as [`PipeWaiterTable`]. One entry per server pipe end awaiting a client connect.
+/// Reset-safe table of pending async server listens.
+///
+/// ReactOS/NT does not impose a tiny global cap on `FSCTL_PIPE_LISTEN` IRPs: service startup can
+/// legitimately have many RPC servers listening before clients drain them. The const parameter is
+/// only the first reservation size; the table grows on demand and returns `None` only if the
+/// allocation for another listen record fails.
 #[derive(Clone, Debug)]
 pub struct AsyncListenTable<const N: usize> {
-    slots: [Option<AsyncListen>; N],
+    slots: Vec<Option<AsyncListen>>,
 }
 
 impl<const N: usize> Default for AsyncListenTable<N> {
@@ -997,7 +1001,7 @@ impl<const N: usize> Default for AsyncListenTable<N> {
 
 impl<const N: usize> AsyncListenTable<N> {
     pub const fn new() -> Self {
-        Self { slots: [None; N] }
+        Self { slots: Vec::new() }
     }
 
     /// Whether `tid` currently owns any retained pending listen IRP.
@@ -1041,9 +1045,29 @@ impl<const N: usize> AsyncListenTable<N> {
         count
     }
 
+    /// Cancel all pending listens issued by `tid`, invoking `release` for every removed server file
+    /// id. This is the unbounded form the executive uses so a growable table cannot leak retained
+    /// FILE_OBJECT references when a thread exits with more listens than a fixed scratch array held.
+    pub fn cancel_thread_with_file_ids<F>(&mut self, tid: u64, mut release: F) -> usize
+    where
+        F: FnMut(u64),
+    {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if let Some(listen) = *slot {
+                if listen.tid == tid {
+                    release(listen.server_file_id);
+                    *slot = None;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Record a pending async listen. If an entry already exists for `server_file_id`, it is REPLACED
     /// (a re-armed listen after a prior completion updates the event/iosb). Returns the slot index, or
-    /// `None` if the table is full.
+    /// `None` if the table cannot allocate storage for a new distinct server end.
     pub fn arm(&mut self, l: AsyncListen) -> Option<usize> {
         // Replace an existing entry for the same server end (re-arm).
         for (i, slot) in self.slots.iter_mut().enumerate() {
@@ -1058,7 +1082,18 @@ impl<const N: usize> AsyncListenTable<N> {
                 return Some(i);
             }
         }
-        None
+        if self.slots.len() == self.slots.capacity() {
+            let reserve = if self.slots.capacity() == 0 {
+                N.max(1)
+            } else {
+                1
+            };
+            if self.slots.try_reserve(reserve).is_err() {
+                return None;
+            }
+        }
+        self.slots.push(Some(l));
+        Some(self.slots.len() - 1)
     }
 
     /// Number of pending listens.
@@ -1834,12 +1869,31 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_full_never_hangs() {
+    fn async_listen_grows_past_initial_reservation() {
         let mut t = AsyncListenTable::<2>::new();
         assert!(t.arm(al(1, 10)).is_some());
         assert!(t.arm(al(2, 20)).is_some());
-        // Third DISTINCT server end → table full → None (caller degrades, never a hang).
-        assert!(t.arm(al(3, 30)).is_none());
+        // Third DISTINCT server end grows the table. A real allocation failure would still return
+        // None, but the model no longer has an artificial two-listen ceiling.
+        assert!(t.arm(al(3, 30)).is_some());
+        assert_eq!(t.len(), 3);
+        assert!(t.armed(3));
+    }
+
+    #[test]
+    fn async_listen_cancel_thread_callback_releases_every_file_id() {
+        let mut t = AsyncListenTable::<2>::new();
+        t.arm(al(0xA, 1)).unwrap();
+        t.arm(al(0xB, 2)).unwrap();
+        t.arm(al(0xC, 3)).unwrap();
+
+        let mut released = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_with_file_ids(77, |file_id| released.push(file_id)),
+            3
+        );
+        assert_eq!(released, std::vec![0xA, 0xB, 0xC]);
+        assert!(t.is_empty());
     }
 
     #[test]

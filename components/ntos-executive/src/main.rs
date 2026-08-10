@@ -2539,9 +2539,10 @@ static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// completion EVENT, then parks on `NtWaitForMultipleObjects([mgr_event, listen_event])` — it does NOT
 /// block on a pipe read. When the client (winlogon) connects/writes, the executive completes the
 /// pending listen + signals its event through the shared dispatcher wake path so the
-/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. `.bss`, cap 8.
-const PIPE_ASYNC_LISTEN_N: usize = 8;
-static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_N> =
+/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. The table starts with
+/// a small reservation and grows as real RPC/service listeners accumulate.
+const PIPE_ASYNC_LISTEN_INITIAL_N: usize = 16;
+static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_INITIAL_N> =
     nt_io_manager::AsyncListenTable::new();
 const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
@@ -12863,13 +12864,11 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
         }
     }
     let listens = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-    let mut listen_file_ids = [0u64; PIPE_ASYNC_LISTEN_N];
-    let listen_count = listens.cancel_thread_collect_file_ids(tid, &mut listen_file_ids);
-    for index in 0..listen_count.min(listen_file_ids.len()) {
-        if listen_file_ids[index] != 0 {
-            handler.release_file_reference(listen_file_ids[index]);
+    let _ = listens.cancel_thread_with_file_ids(tid, |file_id| {
+        if file_id != 0 {
+            handler.release_file_reference(file_id);
         }
-    }
+    });
     let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
     let name_wait_reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_NAME_CANCEL_REPLY_CAPS_WORK);
     let name_wait_count = name_waiters.cancel_thread_collect_reply_caps(tid, name_wait_reply_caps);

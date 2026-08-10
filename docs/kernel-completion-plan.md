@@ -175,7 +175,18 @@ the executive `cargo check`, and `git diff --check`). A live `./run.sh` boot on 
 reported `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`; the old
 late `HEAP EXHAUSTED` / failed-desktop-map signature did not recur. The active red edge moves back to
 generic service/control resource lifetime: the late service client reaches root pipe wait/open paths
-and times out on `\net\NtControlPipe11`.
+and times out on `\net\NtControlPipe11`. The next implementation slice removes the artificial
+eight-entry async `FSCTL_PIPE_LISTEN` ceiling that produced the preceding
+`ConnectNamedPipe failed (Error 1450)` resource failure: `AsyncListenTable` now starts from a small
+reservation and grows on demand, and thread cancellation releases every retained server FILE_OBJECT
+without a fixed scratch array. Local validation is green (`cargo fmt --all`,
+`cargo test -p nt-io-manager async_listen`, the executive `cargo check`, and `git diff --check`);
+live boot validation `.tmp/boot-growable-async-listens-20260810.log` confirms the old
+`ConnectNamedPipe failed (Error 1450)` wall is gone. The run reaches repeated real shell dependency
+loads (`shell32`, `browseui`, `shdocvw`, `propsys`), advances pipe control traffic through
+`NtControlPipe5`, and then parks `services.exe` (`pi=3`, `badge=6`) on syscall `0x18` after
+`\pipe\ntsvcs` listen/connect churn. The next red edge is native service syscall/reply correctness,
+not pipe-listen capacity.
 
 ### A. SCM-Controlled Service Startup
 
@@ -2535,6 +2546,18 @@ and times out on `\net\NtControlPipe11`.
   A4 frontier is now service process GUI/IPC mechanics: `spoolsv.exe` reaches win32k, fails
   default desktop/winsta thread setup with `STATUS_INSUFFICIENT_RESOURCES`, SCM reports
   `ConnectNamedPipe failed (Error 1450)`, and the run then parks.
+
+- A4 growable async-listen slice. The pipe wait/listen model no longer has a tiny global cap for
+  pending overlapped `FSCTL_PIPE_LISTEN` IRPs. `AsyncListenTable` keeps its deterministic
+  name-scoped completion and re-arm semantics, but grows from an initial reservation instead of
+  returning `STATUS_INSUFFICIENT_RESOURCES` once eight RPC/service listeners are armed. Thread
+  cancellation now walks the whole growable table and releases every retained server FILE_OBJECT.
+  Validation: `cargo fmt --all`, `cargo test -p nt-io-manager async_listen`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Live boot
+  `.tmp/boot-growable-async-listens-20260810.log` shows no repeat of the previous SCM
+  `ConnectNamedPipe failed (Error 1450)` edge; shell dependency loading continues and the active
+  blocker moves to `services.exe` parking on syscall `0x18` after `\pipe\ntsvcs` churn.
 
 - A4 service desktop/object-manager slice. Win32k Ob desktop lookup now reopens an existing desktop
   by leaf name under the exact root window-station handle/body, so `Service-<LUID>$\Default` behaves
