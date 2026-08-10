@@ -295,6 +295,22 @@ header wake followed by body-only synchronous reads, so the assembler must consu
 read bytes too. The active failure remains a real rpcrt4 context mismatch, now for
 `{e44be6c8-a98d-40e7-8db7-220913505ca7}`; do not add UUID or service fallback handling.
 
+Current chained-callback context slice: `.tmp/boot-chained-callback-context-20260811-044456.log`
+removes the early winlogon api0 callback crash by separating the chained callback's physical
+callout context from the inherited outer completion context. When win32k immediately yielded a
+second callback while an outer callback was parked, the executive had been placing the next
+`UCALLOUT_FRAME` under the stale outer saved stack. Chained redirects now read the live client TCB,
+use that current stack and syscall-return IP for the dispatcher callout frame, and keep the inherited
+outer saved context only for final `NtCallbackReturn` completion. Local validation is green
+(`cargo fmt --all`, `cargo test -p nt-user-callback -- --nocapture`, executive `cargo check`, and
+`git diff --check`). Boot validation confirms no `cb-crash`, no `dead client pi=2`, and real
+winlogon base desktop paint (`desktop-bg 768/768`). This is still not a shell proof:
+`explorer total=0` throughout the census, and the quiet-period red edge has moved to generic native
+syscall/RPC service behavior (`SSN=100`, `SSN=56`, LSA `SSN=203`, and RPCRT4 context faults). The
+next implementation slice should decode and implement those native syscalls through normal kernel
+mechanisms, then continue the NPFS/RPC association investigation without service-name or
+executable-order fallbacks.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

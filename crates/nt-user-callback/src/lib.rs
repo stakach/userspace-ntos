@@ -1827,6 +1827,19 @@ pub const fn completed_outer_context(
     completed
 }
 
+/// The post-syscall instruction pointer captured in a user context.
+///
+/// On x64 `syscall` saves the user return address in `RCX`. Some synthetic/test contexts only carry
+/// `RIP`, so fall back to that when `RCX` is absent.
+pub const fn syscall_resume_ip_from_context(saved: &[u64; 20]) -> u64 {
+    let rcx = saved[USER_CONTEXT_RCX];
+    if rcx == 0 {
+        saved[USER_CONTEXT_RIP]
+    } else {
+        rcx
+    }
+}
+
 /// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2629,6 +2642,41 @@ mod tests {
         assert_eq!(
             UserCallbackStackLayout::below(0x8000, CALLBACK_PAYLOAD_MAX + 1),
             Err(ValidationError::Length)
+        );
+    }
+
+    #[test]
+    fn chained_callback_uses_current_stack_but_inherited_completion_context() {
+        let mut inherited = [0u64; 20];
+        inherited[USER_CONTEXT_RIP] = 0x1000_8010;
+        inherited[USER_CONTEXT_RSP] = 0x1001_05c3_000;
+        inherited[USER_CONTEXT_RFLAGS] = 0x202;
+
+        let mut current = inherited;
+        current[USER_CONTEXT_RIP] = 0x801e_f0c1;
+        current[USER_CONTEXT_RCX] = 0x801e_f0f8;
+        current[USER_CONTEXT_RSP] = 0x1001_3f4f_e58;
+
+        let layout = UserCallbackStackLayout::below(current[USER_CONTEXT_RSP], 0x40).unwrap();
+        let redirected = callback_redirect_context(&current, 0x1000_9000, layout.frame_pointer);
+        assert_eq!(redirected[USER_CONTEXT_RIP], 0x1000_9000);
+        assert_eq!(redirected[USER_CONTEXT_RSP], layout.frame_pointer);
+        assert!(layout.frame_pointer < current[USER_CONTEXT_RSP]);
+        assert!(layout.frame_pointer > inherited[USER_CONTEXT_RSP]);
+
+        let completed = completed_outer_context(&inherited, 0x1234, inherited[USER_CONTEXT_RIP]);
+        assert_eq!(completed[USER_CONTEXT_RIP], inherited[USER_CONTEXT_RIP]);
+        assert_eq!(completed[USER_CONTEXT_RSP], inherited[USER_CONTEXT_RSP]);
+        assert_eq!(completed[USER_CONTEXT_RAX], 0x1234);
+        assert_eq!(
+            syscall_resume_ip_from_context(&current),
+            current[USER_CONTEXT_RCX]
+        );
+
+        current[USER_CONTEXT_RCX] = 0;
+        assert_eq!(
+            syscall_resume_ip_from_context(&current),
+            current[USER_CONTEXT_RIP]
         );
     }
 

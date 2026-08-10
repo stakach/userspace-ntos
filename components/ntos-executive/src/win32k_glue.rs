@@ -1760,15 +1760,25 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     };
     let mut saved = [0u64; 20];
     tcb_read_regs20(tcb, &mut saved);
-    redirect_pending_user_callback(client, &saved, outer_resume_ip, outer_rsp, outer_flags)
+    redirect_pending_user_callback(
+        client,
+        &saved,
+        &saved,
+        outer_resume_ip,
+        outer_resume_ip,
+        outer_rsp,
+        outer_flags,
+    )
 }
 
 unsafe fn redirect_pending_user_callback(
     client: Win32kClientContext,
-    saved: &[u64; 20],
-    outer_resume_ip: u64,
-    outer_rsp: u64,
-    outer_flags: u64,
+    redirect_context: &[u64; 20],
+    completion_context: &[u64; 20],
+    completion_resume_ip: u64,
+    callout_resume_ip: u64,
+    callout_rsp: u64,
+    callout_flags: u64,
 ) -> bool {
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
@@ -1790,7 +1800,7 @@ unsafe fn redirect_pending_user_callback(
     }
 
     let Ok(layout) = nt_user_callback::UserCallbackStackLayout::below(
-        saved[nt_user_callback::USER_CONTEXT_RSP],
+        redirect_context[nt_user_callback::USER_CONTEXT_RSP],
         request.input_length as usize,
     ) else {
         return false;
@@ -1837,9 +1847,9 @@ unsafe fn redirect_pending_user_callback(
         layout.input_pointer,
         request.input_length,
         request.api_index,
-        outer_resume_ip,
-        outer_rsp,
-        outer_flags as u32,
+        callout_resume_ip,
+        callout_rsp,
+        callout_flags as u32,
     );
     let frame_bytes = core::slice::from_raw_parts(
         core::ptr::addr_of!(frame) as *const u8,
@@ -1857,7 +1867,7 @@ unsafe fn redirect_pending_user_callback(
     }
 
     let redirected =
-        nt_user_callback::callback_redirect_context(saved, dispatcher, layout.frame_pointer);
+        nt_user_callback::callback_redirect_context(redirect_context, dispatcher, layout.frame_pointer);
     let error = tcb_write_regs20(tcb, &redirected, false);
     if error != 0 {
         print_str(b"[user-callback] client redirect TCB_WriteRegisters failed error=");
@@ -1868,8 +1878,8 @@ unsafe fn redirect_pending_user_callback(
     if active
         .record_redirect(
             nt_user_callback::CallbackCorrelation::from_request(&request),
-            *saved,
-            outer_resume_ip,
+            *completion_context,
+            completion_resume_ip,
         )
         .is_err()
     {
@@ -3221,12 +3231,25 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             token_user_sid: completed_client.token_user_sid,
             token_user_sid_len: completed_client.token_user_sid_len,
         };
+        let Some(chained_tcb) = callback_context_tcb(chained_client) else {
+            abort_controlled_user_callbacks();
+            print_str(b"[user-callback] chained callback missing client TCB\n");
+            return None;
+        };
+        let mut chained_context = [0u64; 20];
+        tcb_read_regs20(chained_tcb, &mut chained_context);
+        let chained_rsp = chained_context[nt_user_callback::USER_CONTEXT_RSP];
+        let chained_flags = chained_context[nt_user_callback::USER_CONTEXT_RFLAGS];
+        let chained_callout_resume_ip =
+            nt_user_callback::syscall_resume_ip_from_context(&chained_context);
         if !redirect_pending_user_callback(
             chained_client,
+            &chained_context,
             completed_frame.saved_user_context(),
             completed_frame.outer_resume_ip(),
-            completed_frame.saved_user_context()[nt_user_callback::USER_CONTEXT_RSP],
-            completed_frame.saved_user_context()[nt_user_callback::USER_CONTEXT_RFLAGS],
+            chained_callout_resume_ip,
+            chained_rsp,
+            chained_flags,
         ) {
             abort_controlled_user_callbacks();
             print_str(b"[user-callback] chained callback redirect failed\n");
