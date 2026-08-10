@@ -185,6 +185,29 @@ impl Win32kClientContext {
     }
 }
 
+fn win32k_client_context_from_callback_client(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> Win32kClientContext {
+    Win32kClientContext {
+        pi: client.pi,
+        pid: client.pid,
+        badge: client.badge,
+        tid: client.tid,
+        tcb: client.tcb,
+        eprocess: client.eprocess,
+        ethread: client.ethread,
+        role: client.role,
+        process_role: client.process_role,
+        top_badge: client.top_badge,
+        teb: client.teb,
+        peb_mirror: client.peb_mirror,
+        scratch_base: client.scratch_base,
+        token_authentication_id: client.token_authentication_id,
+        token_user_sid: client.token_user_sid,
+        token_user_sid_len: client.token_user_sid_len,
+    }
+}
+
 fn user_callback_client_record_matches(
     record: &UserCallbackClientRecord,
     dispatch_id: u64,
@@ -1909,6 +1932,20 @@ fn callback_client_from_frame(
     }
 }
 
+unsafe fn flush_returned_user_callback_gdi_batch(
+    request: nt_user_callback::CallbackHeader,
+    frame: nt_user_callback::ActiveCallbackFrame,
+) {
+    let client = callback_client_from_frame(request, frame);
+    let Some(teb_alias) = client_callback_teb_alias(client) else {
+        return;
+    };
+    crate::ke_gdi_flush_user_batch(win32k_client_context_from_callback_client(client), teb_alias);
+    let identity =
+        nt_user_callback::ClientThreadIdentity::new(request.client_pi, request.client_tid, request.client_badge);
+    reassert_top_client_callback_window(&identity);
+}
+
 unsafe fn resume_suspended_user_callback_component(
     request: nt_user_callback::CallbackHeader,
     client: crate::spawn_hosts::UserCallbackClient,
@@ -2079,74 +2116,123 @@ unsafe fn win32k_test_fault_idle_probe(client: Win32kClientContext) -> (u64, boo
     (status, ok, parked)
 }
 
-/// Crash-site diagnostic for a client that faulted while a user-mode callback was in flight. Prints
-/// the faulting GPRs plus the exact client-side state `user32`'s `ValidateHwnd`/`DesktopPtrToUser`
-/// read to produce a `PWND`: the `CLIENTINFO.CallbackWnd` triple the callback bridge maintains
-/// (TEB+0x840 hWnd / +0x848 pWnd / +0x850 pActCtx) and `CLIENTINFO.pDeskInfo` / `.ulClientDelta`
-/// (TEB+0x820 / +0x828). A corrupt `PWND` is either the cached one or a delta-translated one — this
-/// line says WHICH, without which the two are indistinguishable from the fault address alone.
+unsafe fn print_crash_hex64(value: u64) {
+    print_hex((value >> 32) as u32);
+    print_hex(value as u32);
+}
+
+/// Crash-site diagnostic for a GUI client that faulted around the user-callback path. It prints the
+/// faulting GPRs and, when a TEB alias is known, the exact client-side state `user32`'s
+/// `ValidateHwnd`/`DesktopPtrToUser` read to produce a `PWND`: the `CLIENTINFO.CallbackWnd` triple
+/// the callback bridge maintains (TEB+0x840 hWnd / +0x848 pWnd / +0x850 pActCtx) and
+/// `CLIENTINFO.pDeskInfo` / `.ulClientDelta` (TEB+0x820 / +0x828). This deliberately also works
+/// after the callback frame has been popped, because a bad `NtCallbackReturn` resume can fault in
+/// the caller immediately after the active stack becomes empty.
 pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64) {
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
-    if client_pi != 2 || active.is_empty() {
+    let active_frame = active.top_for_pi(client_pi as u32);
+    if tcb == 0 && active_frame.is_none() && client_pi != 2 {
         return;
     }
     if tcb != 0 {
         let mut regs = [0u64; 20];
         tcb_read_regs20(tcb, &mut regs);
         print_str(b"[cb-crash] regs rip=0x");
-        print_hex(regs[0] as u32);
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RIP]);
         print_str(b" rsp=0x");
-        print_hex((regs[1] >> 32) as u32);
-        print_hex(regs[1] as u32);
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
         print_str(b" rax=0x");
-        print_hex((regs[3] >> 32) as u32);
-        print_hex(regs[3] as u32);
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RAX]);
+        print_str(b" rbx=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RBX]);
         print_str(b" rcx=0x");
-        print_hex((regs[5] >> 32) as u32);
-        print_hex(regs[5] as u32);
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RCX]);
         print_str(b" rdx=0x");
-        print_hex((regs[6] >> 32) as u32);
-        print_hex(regs[6] as u32);
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+        print_str(b" rsi=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RSI]);
+        print_str(b" rdi=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RDI]);
+        print_str(b" rbp=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RBP]);
+        print_str(b" r8=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R8]);
+        print_str(b" r9=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R9]);
+        print_str(b" r10=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R10]);
+        print_str(b" r11=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R11]);
+        print_str(b" r12=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R12]);
+        print_str(b" r13=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R13]);
+        print_str(b" r14=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R14]);
+        print_str(b" r15=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R15]);
         print_str(b"\n");
         print_str(b"[cb-crash] stack:");
         let mut slot = 0u64;
-        while slot < 12 {
-            let value = crate::img_spawn::smss_stack_read(regs[1] + slot * 8);
+        while slot < 16 {
+            let value = crate::img_spawn::smss_stack_read(
+                regs[nt_user_callback::USER_CONTEXT_RSP] + slot * 8,
+            );
             print_str(b" +0x");
             print_hex((slot * 8) as u32);
             print_str(b":0x");
-            print_hex((value >> 32) as u32);
-            print_hex(value as u32);
+            print_crash_hex64(value);
             slot += 1;
         }
         print_str(b"\n");
     }
-    let teb = WINLOGON_MAIN_TEB_MIRROR_VA;
+    let teb = active_frame
+        .map(|frame| frame.client_teb())
+        .filter(|&teb| teb != 0)
+        .unwrap_or(if client_pi == 2 {
+            WINLOGON_MAIN_TEB_MIRROR_VA
+        } else {
+            0
+        });
+    if teb == 0 {
+        print_str(b"[cb-crash] CLIENTINFO unavailable\n");
+    } else {
     let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
     print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
-    print_hex((read(0x820) >> 32) as u32);
-    print_hex(read(0x820) as u32);
+    print_crash_hex64(read(0x820));
     print_str(b" ulClientDelta=0x");
-    print_hex((read(0x828) >> 32) as u32);
-    print_hex(read(0x828) as u32);
+    print_crash_hex64(read(0x828));
     print_str(b" CallbackWnd{hWnd=0x");
     print_hex(read(0x840) as u32);
     print_str(b" pWnd=0x");
-    print_hex((read(0x848) >> 32) as u32);
-    print_hex(read(0x848) as u32);
+    print_crash_hex64(read(0x848));
     print_str(b" pActCtx=0x");
-    print_hex((read(0x850) >> 32) as u32);
-    print_hex(read(0x850) as u32);
+    print_crash_hex64(read(0x850));
     print_str(b"}\n");
-    if let Some(frame) = active.top() {
+    }
+    if let Some(frame) = active_frame {
         let request = frame.request();
         print_str(b"[cb-crash] active callback api=");
         print_u64(request.api_index as u64);
+        print_str(b" hwnd=0x");
+        let hwnd = if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+            && request.input_length as usize >= WINDOWPROC_PAYLOAD_OFFSET as usize
+        {
+            let callback_frame = (win32k_subsystem::WIN32K_SHARED_VADDR
+                + win32k_subsystem::SH_USER_CALLBACK)
+                as *mut nt_user_callback::CallbackFrame;
+            callback_payload_u64(callback_frame, 0x10)
+        } else {
+            0
+        };
+        print_hex(hwnd as u32);
         print_str(b" depth=");
         print_u64(active.len() as u64);
         print_str(b" redirected=");
         print_u64(frame.is_redirected() as u64);
         print_str(b"\n");
+    } else {
+        print_str(b"[cb-crash] active callback none depth=0\n");
     }
 }
 
@@ -3065,6 +3151,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         abort_controlled_user_callbacks();
         return None;
     }
+    // ReactOS flushes the caller's deferred GDI batch after `KiCallUserMode` returns from a
+    // `KeUserModeCallback`, before the suspended win32k continuation runs again. Normal win32k
+    // syscalls already do this at syscall entry; callbacks need the same kernel-owned boundary so
+    // user32/GDI work performed inside WndProc cannot keep stale records across chained callbacks.
+    flush_returned_user_callback_gdi_batch(request, active_frame);
     if !unwind_controlled_callback(request) {
         print_str(b"[user-callback] continuation correlation rejected SSN 22\n");
         abort_controlled_user_callbacks();

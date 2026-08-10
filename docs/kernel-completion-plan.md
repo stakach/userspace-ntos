@@ -2773,3 +2773,20 @@ natural userinit/explorer launch.
   later service RPC context-handle association: `RpcServerListen() failed (Status 6b1)` followed by
   `no context handle found for uuid {fb1f958e-c047-4b4f-ba6c-97645a18f1a1}` before explorer issues
   any syscalls.
+
+- I4 desktop paint recovery through real callback-return GDI marshalling. A reported
+  `./run.sh --desktop` failure exposed a later winlogon/user32 callback-return edge, not a need for
+  paint scaffolding. The callback dispatcher now scrubs entry registers like ReactOS
+  `KiUserCallbackExit`, the executive shares those context indexes with `NtContinue`, and completed
+  `KeUserModeCallback` paths flush the caller's deferred GDI batch before resuming the parked win32k
+  continuation. The late win32k bridge also stages/copies back real caller-owned buffers for
+  `NtGdiGetTextMetricsW` and the non-Ex `NtGdiGetTextExtent`, so the modal/dialog paint path no
+  longer succeeds by returning synthetic text metrics or sizes. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `cargo test -p nt-user-callback -- --nocapture`, `git diff --check`, and serialized desktop run
+  `.tmp/boot-gdi-text-marshalling-20260810.log`. Result: the previous callback-memory instruction
+  fault is gone, `PASS exec_win32k_desktop_painted` and `PASS exec_gdi_user_batch_flushed` are back,
+  and the run reaches `249/295` executive checks. Review adjustment: the active frontier has moved
+  to LSA auth-port request marshalling (`[lsa-rdv] WALL: could not marshal the message into the
+  server's RequestMsg`), with msgina modal paint/profile/userinit/explorer gates still downstream of
+  that real logon IPC path.

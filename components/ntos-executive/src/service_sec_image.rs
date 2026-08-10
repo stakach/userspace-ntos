@@ -38,6 +38,7 @@ static GET_ICON_INFO_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_BITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIB_SECTION_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static TEXT_METRICS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +85,7 @@ const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
     (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
     (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
+const WIN32K_TEXT_METRICS_STAGE_BYTES: usize = 68;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
 const WIN32K_PAINTSTRUCT_STAGE_BYTES: usize = 72;
@@ -106,6 +108,8 @@ const NTGDI_ALPHA_BLEND_SSN: u64 = 0x107d;
 const NTGDI_STRETCH_DIBITS_INTERNAL_SSN: u64 = 0x1082;
 const NTUSER_FILL_WINDOW_SSN: u64 = 0x108a;
 const NTGDI_RECTANGLE_SSN: u64 = 0x1091;
+const NTGDI_GET_TEXT_METRICS_W_SSN: u64 = 0x1076;
+const NTGDI_GET_TEXT_EXTENT_SSN: u64 = 0x1095;
 const FNID_DEFWINDOWPROC: u64 = 0x029e;
 const FNID_SENDMESSAGE: u64 = 0x02b1;
 const ETO_PDY: u64 = 0x02000;
@@ -5609,6 +5613,10 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 (base, image_owner.allocation_end, tpe)
             } else {
+                let fault_tcb = nt_handler
+                    .hosted_thread_tcb_for_badge(badge)
+                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
+                    .unwrap_or(0);
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
                 print_str(b"[vmf-out] ip=0x");
@@ -5629,16 +5637,15 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"..0x");
                 print_hex((STACK_BASE + STACK_FRAMES * 0x1000) as u32);
                 print_str(b")\n");
-                // On an INSTRUCTION-FETCH fault (ip==addr, both a bare low RVA) execution CALLed/JMPed
+                // On an INSTRUCTION-FETCH fault (ip==addr), execution CALLed/JMPed
                 // through a bad/truncated code pointer. Read the faulting thread's real GPRs + walk its
                 // stack (TCB rsp) for return addresses in any mapped module — this identifies the CALLER
-                // (module + RVA) whose indirect transfer landed on the bare RVA. General class-of-wall
-                // diagnostic (BATCH 24/25: lsass rpcrt4 `0x3a288`); applies to any process at quiescence.
-                if m0 == addr && addr < 0x8000_0000 {
-                    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
-                    if tcb != 0 {
+                // (module + RVA) whose indirect transfer landed on the bad pointer. General class-of-wall
+                // diagnostic; applies to any process at quiescence.
+                if m0 == addr {
+                    if fault_tcb != 0 {
                         let mut regs = [0u64; 20];
-                        crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                        crate::win32k_glue::tcb_read_regs20(fault_tcb, &mut regs);
                         // seL4 x86_64 UserContext order: [0]rip [1]rsp [2]rflags [3]rax [4]rbx [5]rcx
                         // [6]rdx [7]rsi [8]rdi [9]rbp [10]r8..[17]r15.
                         print_str(b"[vmf-out] regs: rip=0x");
@@ -5703,10 +5710,7 @@ pub(crate) unsafe fn service_sec_image(
                 // client-side state user32 used to derive the PWND it dereferenced (see
                 // `dump_client_callback_crash_state`). Callback-scoped, so it costs nothing on any
                 // other wall.
-                win32k_glue::dump_client_callback_crash_state(
-                    pi,
-                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0),
-                );
+                win32k_glue::dump_client_callback_crash_state(pi, fault_tcb);
                 // ★ Checkpoint B containment: once lsass has signaled LSA_RPC_SERVER_ACTIVE (its
                 // essential init is done), an unrecoverable fault on lsass' MAIN thread (badge 8) —
                 // e.g. rpcrt4 NdrSimpleTypeUnmarshall dereferencing a bogus RPC request buffer
@@ -8889,6 +8893,12 @@ pub(crate) unsafe fn service_sec_image(
                 let mut paintstruct_probe_failed = false;
                 let mut user_rect_copyout = (0u64, 0u64);
                 let mut user_rect_probe_failed = false;
+                let mut text_metrics_copyout = (0u64, 0u64, 0usize);
+                let mut text_metrics_probe_failed = false;
+                let mut get_text_extent_stack_args = [0u64; 1];
+                let mut get_text_extent_stack_arg_count = 0usize;
+                let mut get_text_extent_copyout = (0u64, 0u64);
+                let mut get_text_extent_probe_failed = false;
                 let mut text_extent_stack_args = [0u64; 4];
                 let mut text_extent_stack_arg_count = 0usize;
                 let mut text_extent_copyout = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
@@ -10544,6 +10554,141 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else if m0 == NTUSER_DEFER_WINDOW_POS_SSN {
                     defer_window_pos_probe_failed = true;
+                } else if m0 == NTGDI_GET_TEXT_METRICS_W_SSN && uses_client_gdi {
+                    // NtGdiGetTextMetricsW writes a caller-owned TMW_INTERNAL. Let win32k probe and
+                    // fill provider-owned memory, then copy the exact caller-requested byte count
+                    // back across the hosted-process boundary.
+                    let cj = a2 as u32 as usize;
+                    if (cj != 0 && d_a1 == 0) || cj > WIN32K_TEXT_METRICS_STAGE_BYTES {
+                        text_metrics_probe_failed = true;
+                    } else {
+                        let staged_tmwi = win32k_subsystem::WIN32K_ARG_VADDR;
+                        core::ptr::write_bytes(
+                            staged_tmwi as *mut u8,
+                            0,
+                            WIN32K_TEXT_METRICS_STAGE_BYTES,
+                        );
+                        d_a1 = staged_tmwi;
+                        d_a2 = cj as u32 as u64;
+                        text_metrics_copyout = (a1, staged_tmwi, cj);
+                        let n = TEXT_METRICS_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                        if n < 24 {
+                            print_str(b"[w32marshal] NtGdiGetTextMetricsW pi=");
+                            print_u64(pi as u64);
+                            print_str(b" hdc=0x");
+                            print_hex_u64(a0);
+                            print_str(b" out=0x");
+                            print_hex_u64(a1);
+                            print_str(b" bytes=");
+                            print_u64(cj as u64);
+                            print_str(b"\n");
+                        }
+                    }
+                } else if m0 == NTGDI_GET_TEXT_EXTENT_SSN && uses_client_gdi {
+                    // NtGdiGetTextExtent(hdc, string, count, size, fl) is the non-Ex facade over
+                    // NtGdiGetTextExtentExW. Its WCHAR input and SIZE output are caller-owned, and
+                    // the final fl argument lives in the x64 stack tail.
+                    if sp == 0 {
+                        get_text_extent_probe_failed = true;
+                    } else {
+                        let fl = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if let Some(fl) = fl {
+                            let count = a2 as u32;
+                            let count_negative = (count as i32) < 0;
+                            let string_bytes = (count as usize).checked_mul(2);
+                            if count_negative || d_a3 == 0 || (count != 0 && d_a1 == 0) {
+                                get_text_extent_probe_failed = true;
+                            } else if let Some(string_bytes) = string_bytes {
+                                let base = win32k_subsystem::WIN32K_ARG_VADDR;
+                                let staged_string = if count != 0 { base } else { 0 };
+                                let mut offset = string_bytes as u64;
+                                let mut layout_ok = true;
+                                if let Some(next) = align_up_u64(offset, 8) {
+                                    offset = next;
+                                } else {
+                                    layout_ok = false;
+                                }
+                                let staged_size = if layout_ok {
+                                    let out = base + offset;
+                                    offset += 8;
+                                    out
+                                } else {
+                                    0
+                                };
+                                if !layout_ok || offset > WIN32K_TEXT_EXTENT_STAGE_BYTES as u64 {
+                                    get_text_extent_probe_failed = true;
+                                } else {
+                                    core::ptr::write_bytes(
+                                        base as *mut u8,
+                                        0,
+                                        WIN32K_TEXT_EXTENT_STAGE_BYTES,
+                                    );
+                                    let copied_string = if count == 0 {
+                                        true
+                                    } else {
+                                        prefill_client_copyin_dll_range_pages(
+                                            pi as u64,
+                                            d_a1,
+                                            string_bytes,
+                                            scratch_base,
+                                            &reg,
+                                            &dll_pes,
+                                        );
+                                        img_spawn::client_copyin_mapped(
+                                            pi as u64,
+                                            d_a1,
+                                            core::slice::from_raw_parts_mut(
+                                                staged_string as *mut u8,
+                                                string_bytes,
+                                            ),
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        )
+                                    };
+                                    if copied_string {
+                                        d_a1 = staged_string;
+                                        d_a3 = staged_size;
+                                        get_text_extent_stack_args = [fl as u32 as u64];
+                                        get_text_extent_stack_arg_count =
+                                            get_text_extent_stack_args.len();
+                                        get_text_extent_copyout = (a3, staged_size);
+                                        let n = TEXT_EXTENT_MARSHAL_TRACE
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if n < 24 {
+                                            print_str(b"[w32marshal] NtGdiGetTextExtent pi=");
+                                            print_u64(pi as u64);
+                                            print_str(b" hdc=0x");
+                                            print_hex_u64(a0);
+                                            print_str(b" count=");
+                                            print_u64(count as u64);
+                                            print_str(b" str=0x");
+                                            print_hex_u64(a1);
+                                            print_str(b" size=0x");
+                                            print_hex_u64(a3);
+                                            print_str(b" fl=0x");
+                                            print_hex(fl as u32);
+                                            print_str(b" bytes=");
+                                            print_u64(offset);
+                                            print_str(b"\n");
+                                        }
+                                    } else {
+                                        get_text_extent_probe_failed = true;
+                                    }
+                                }
+                            } else {
+                                get_text_extent_probe_failed = true;
+                            }
+                        } else {
+                            get_text_extent_probe_failed = true;
+                        }
+                    }
                 } else if m0 == 0x10cb && uses_client_gdi {
                     // NtGdiGetCharWidthW copies an optional caller WCHAR/glyph array and then writes
                     // Count INT/FLOAT-sized widths back to the caller. Stage both sides explicitly so
@@ -11662,6 +11807,32 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" -> FALSE\n");
                     }
                     (0, true)
+                } else if text_metrics_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiGetTextMetricsW output probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" out=0x");
+                        print_hex_u64(a1);
+                        print_str(b" bytes=");
+                        print_u64(a2 as u32 as u64);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
+                } else if get_text_extent_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtGdiGetTextExtent input probe failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" count=");
+                        print_u64(a2 as u32 as u64);
+                        print_str(b" str=0x");
+                        print_hex_u64(a1);
+                        print_str(b" size=0x");
+                        print_hex_u64(a3);
+                        print_str(b" -> FALSE\n");
+                    }
+                    (0, true)
                 } else if load_keyboard_layout_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -11830,6 +12001,8 @@ pub(crate) unsafe fn service_sec_image(
                     let ext_text_out_staged_stack = m0
                         == nt_user_callback::NTGDI_EXT_TEXT_OUT_W_SSN
                         && ext_text_out_stack_arg_count == ext_text_out_stack_args.len();
+                    let get_text_extent_staged_stack = m0 == NTGDI_GET_TEXT_EXTENT_SSN
+                        && get_text_extent_stack_arg_count == get_text_extent_stack_args.len();
                     let text_extent_staged_stack =
                         m0 == 0x11d9 && text_extent_stack_arg_count == text_extent_stack_args.len();
                     let char_width_staged_stack =
@@ -11867,6 +12040,8 @@ pub(crate) unsafe fn service_sec_image(
                         (sp, &stretch_dibits_stack_args)
                     } else if ext_text_out_staged_stack {
                         (sp, &ext_text_out_stack_args)
+                    } else if get_text_extent_staged_stack {
+                        (sp, &get_text_extent_stack_args)
                     } else if text_extent_staged_stack {
                         (sp, &text_extent_stack_args)
                     } else if char_width_staged_stack {
@@ -12080,6 +12255,61 @@ pub(crate) unsafe fn service_sec_image(
                                 print_hex_u64(a0);
                                 print_str(b" rect=0x");
                                 print_hex_u64(client_rect);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if m0 == NTGDI_GET_TEXT_METRICS_W_SSN && r.1 && r.0 != 0 {
+                        let (client_tmwi, staged_tmwi, output_bytes) = text_metrics_copyout;
+                        let tmwi_ok = output_bytes == 0
+                            || (client_tmwi != 0
+                                && img_spawn::client_write_mapped(
+                                    pi as u64,
+                                    client_tmwi,
+                                    core::slice::from_raw_parts(
+                                        staged_tmwi as *const u8,
+                                        output_bytes,
+                                    ),
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                ));
+                        if !tmwi_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtGdiGetTextMetricsW copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" out=0x");
+                                print_hex_u64(client_tmwi);
+                                print_str(b" bytes=");
+                                print_u64(output_bytes as u64);
+                                print_str(b"\n");
+                            }
+                            r = (0, true);
+                        }
+                    }
+                    if get_text_extent_staged_stack && r.1 && r.0 != 0 {
+                        let (client_size, staged_size) = get_text_extent_copyout;
+                        let size_ok = img_spawn::client_write_mapped(
+                            pi as u64,
+                            client_size,
+                            core::slice::from_raw_parts(staged_size as *const u8, 8),
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                        if !size_ok {
+                            let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            if failures < 8 {
+                                print_str(
+                                    b"[win32k-svc] NtGdiGetTextExtent copy-out failed pi=",
+                                );
+                                print_u64(pi as u64);
+                                print_str(b" size=0x");
+                                print_hex_u64(client_size);
                                 print_str(b"\n");
                             }
                             r = (0, true);

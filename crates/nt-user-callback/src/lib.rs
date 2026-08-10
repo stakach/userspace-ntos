@@ -1762,12 +1762,28 @@ pub const USER_CONTEXT_RIP: usize = 0;
 pub const USER_CONTEXT_RSP: usize = 1;
 pub const USER_CONTEXT_RFLAGS: usize = 2;
 pub const USER_CONTEXT_RAX: usize = 3;
+pub const USER_CONTEXT_RBX: usize = 4;
 pub const USER_CONTEXT_RCX: usize = 5;
+pub const USER_CONTEXT_RDX: usize = 6;
+pub const USER_CONTEXT_RSI: usize = 7;
+pub const USER_CONTEXT_RDI: usize = 8;
+pub const USER_CONTEXT_RBP: usize = 9;
+pub const USER_CONTEXT_R8: usize = 10;
+pub const USER_CONTEXT_R9: usize = 11;
 pub const USER_CONTEXT_R10: usize = 12;
 pub const USER_CONTEXT_R11: usize = 13;
+pub const USER_CONTEXT_R12: usize = 14;
+pub const USER_CONTEXT_R13: usize = 15;
+pub const USER_CONTEXT_R14: usize = 16;
+pub const USER_CONTEXT_R15: usize = 17;
+pub const USER_CONTEXT_FS_BASE: usize = 18;
+pub const USER_CONTEXT_GS_BASE: usize = 19;
 
 /// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
-/// path. The original outer syscall context remains untouched in the caller's saved copy.
+/// path. The dispatcher takes its arguments from the `UCALLOUT_FRAME` on RSP, so the kernel-facing
+/// entry registers are scrubbed like ReactOS `KiUserCallbackExit`: stale interrupted syscall
+/// registers must not leak into user32 or a client WndProc while the original outer syscall context
+/// remains untouched in the caller's saved copy.
 pub const fn callback_redirect_context(
     saved: &[u64; 20],
     dispatcher: u64,
@@ -1777,9 +1793,20 @@ pub const fn callback_redirect_context(
     redirected[USER_CONTEXT_RIP] = dispatcher;
     redirected[USER_CONTEXT_RSP] = callback_sp;
     redirected[USER_CONTEXT_RAX] = 0;
+    redirected[USER_CONTEXT_RBX] = 0;
     redirected[USER_CONTEXT_RCX] = dispatcher;
+    redirected[USER_CONTEXT_RDX] = 0;
+    redirected[USER_CONTEXT_RSI] = 0;
+    redirected[USER_CONTEXT_RDI] = 0;
+    redirected[USER_CONTEXT_RBP] = 0;
+    redirected[USER_CONTEXT_R8] = 0;
+    redirected[USER_CONTEXT_R9] = 0;
     redirected[USER_CONTEXT_R10] = 0;
     redirected[USER_CONTEXT_R11] = redirected[USER_CONTEXT_RFLAGS];
+    redirected[USER_CONTEXT_R12] = 0;
+    redirected[USER_CONTEXT_R13] = 0;
+    redirected[USER_CONTEXT_R14] = 0;
+    redirected[USER_CONTEXT_R15] = 0;
     redirected
 }
 
@@ -3304,7 +3331,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_redirect_context_uses_sysret_register_aliases() {
+    fn callback_redirect_context_uses_scrubbed_dispatcher_entry() {
         let mut saved = [0u64; 20];
         let mut index = 0;
         while index < saved.len() {
@@ -3318,8 +3345,30 @@ mod tests {
         assert_eq!(redirected[USER_CONTEXT_RCX], 0x7000);
         assert_eq!(redirected[USER_CONTEXT_R10], 0);
         assert_eq!(redirected[USER_CONTEXT_R11], saved[USER_CONTEXT_RFLAGS]);
-        assert_eq!(redirected[4], saved[4]);
-        assert_eq!(redirected[17], saved[17]);
+        for index in [
+            USER_CONTEXT_RBX,
+            USER_CONTEXT_RDX,
+            USER_CONTEXT_RSI,
+            USER_CONTEXT_RDI,
+            USER_CONTEXT_RBP,
+            USER_CONTEXT_R8,
+            USER_CONTEXT_R9,
+            USER_CONTEXT_R12,
+            USER_CONTEXT_R13,
+            USER_CONTEXT_R14,
+            USER_CONTEXT_R15,
+        ] {
+            assert_eq!(redirected[index], 0, "register index {index}");
+        }
+        assert_eq!(redirected[USER_CONTEXT_RFLAGS], saved[USER_CONTEXT_RFLAGS]);
+        assert_eq!(
+            redirected[USER_CONTEXT_FS_BASE],
+            saved[USER_CONTEXT_FS_BASE]
+        );
+        assert_eq!(
+            redirected[USER_CONTEXT_GS_BASE],
+            saved[USER_CONTEXT_GS_BASE]
+        );
     }
 
     #[test]

@@ -4877,18 +4877,6 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_continue(&mut self, args: &[u64]) -> u32 {
-        const USER_CONTEXT_RBX: usize = 4;
-        const USER_CONTEXT_RDX: usize = 6;
-        const USER_CONTEXT_RSI: usize = 7;
-        const USER_CONTEXT_RDI: usize = 8;
-        const USER_CONTEXT_RBP: usize = 9;
-        const USER_CONTEXT_R8: usize = 10;
-        const USER_CONTEXT_R9: usize = 11;
-        const USER_CONTEXT_R12: usize = 14;
-        const USER_CONTEXT_R13: usize = 15;
-        const USER_CONTEXT_R14: usize = 16;
-        const USER_CONTEXT_R15: usize = 17;
-
         let context_ptr = args.first().copied().unwrap_or(0);
         if context_ptr == 0 {
             return STATUS_ACCESS_VIOLATION;
@@ -4926,33 +4914,33 @@ impl ExecNtHandler {
         if context_flags & CONTEXT_INTEGER != 0 {
             registers[nt_user_callback::USER_CONTEXT_RAX] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RAX_OFFSET as usize);
-            registers[USER_CONTEXT_RBX] =
+            registers[nt_user_callback::USER_CONTEXT_RBX] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RBX_OFFSET as usize);
             registers[nt_user_callback::USER_CONTEXT_RCX] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RCX_OFFSET as usize);
-            registers[USER_CONTEXT_RDX] =
+            registers[nt_user_callback::USER_CONTEXT_RDX] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RDX_OFFSET as usize);
-            registers[USER_CONTEXT_RSI] =
+            registers[nt_user_callback::USER_CONTEXT_RSI] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RSI_OFFSET as usize);
-            registers[USER_CONTEXT_RDI] =
+            registers[nt_user_callback::USER_CONTEXT_RDI] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RDI_OFFSET as usize);
-            registers[USER_CONTEXT_RBP] =
+            registers[nt_user_callback::USER_CONTEXT_RBP] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_RBP_OFFSET as usize);
-            registers[USER_CONTEXT_R8] =
+            registers[nt_user_callback::USER_CONTEXT_R8] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R8_OFFSET as usize);
-            registers[USER_CONTEXT_R9] =
+            registers[nt_user_callback::USER_CONTEXT_R9] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R9_OFFSET as usize);
             registers[nt_user_callback::USER_CONTEXT_R10] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R10_OFFSET as usize);
             registers[nt_user_callback::USER_CONTEXT_R11] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R11_OFFSET as usize);
-            registers[USER_CONTEXT_R12] =
+            registers[nt_user_callback::USER_CONTEXT_R12] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R12_OFFSET as usize);
-            registers[USER_CONTEXT_R13] =
+            registers[nt_user_callback::USER_CONTEXT_R13] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R13_OFFSET as usize);
-            registers[USER_CONTEXT_R14] =
+            registers[nt_user_callback::USER_CONTEXT_R14] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R14_OFFSET as usize);
-            registers[USER_CONTEXT_R15] =
+            registers[nt_user_callback::USER_CONTEXT_R15] =
                 read_le_u64_at(&context, nt_thread_start::CONTEXT_R15_OFFSET as usize);
         }
 
