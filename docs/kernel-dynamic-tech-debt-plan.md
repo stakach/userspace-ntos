@@ -112,7 +112,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   ReactOS kernel32 can pass `OVERLAPPED.hEvent | 1` without failing event validation.
 - `[x]` I2: Implement file I/O completion notification modes and audit completion-port packet/event
   suppression through `NtSetInformationFile(FileIoCompletionNotificationInformation)`.
-- `[ ]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
+- `[~]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
   next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
 
 ## Review Log
@@ -2125,3 +2125,24 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: retry one uncontended boot next; the expected proof is a real late
   `role=scm-rpc` worker on the `\pipe\ntsvcs` path, with no fallback fixed badge/window route left
   to mask the next frontier.
+- I3 in progress. Fresh serialized desktop boot
+  `.tmp/boot-current-desktop-repro-20260810-191348.log` first required clearing a stale QEMU holder
+  of `rust-micro/.tmp/disk.img`, then rebuilt and reached real win32k desktop background paint:
+  `winlogon NtUserSwitchDesktop ... desktop-bg 768/768`. The boot does not reach `userinit.exe` or
+  `explorer.exe`; it parks after late `\pipe\ntsvcs` churn. The dynamic SCM worker route is real
+  (`role=scm-rpc` generic slot 6) and the final workers execute
+  `NtSetInformationThread -> NtCreateEvent -> NtReadFile -> NtQueryInformationFile -> NtClose
+  -> NtClose -> NtQueryInformationThread -> NtTerminateThread`, then services re-arms the listen and
+  all SCM threads park. Review adjustment: keep the next slice on generic SCM/NPFS/RPC result
+  tracing and I/O semantics; do not restore fixed worker windows or service-name fallbacks.
+- I3 pipe-waiter capacity fix staged. The late dynamic SCM worker slot was failing
+  `NtReadFile(\pipe\ntsvcs)` with `STATUS_INSUFFICIENT_RESOURCES` before NPFS routing, even though
+  the handle, IOSB, event, buffer, and file route were valid. The parked pipe-IRP table is now
+  growable like async listens, the executive reserves pipe-waiter storage before issuing pending
+  read/write/transceive routes, post-route park refusals count as real allocation failures, and
+  terminating-thread cancellation releases detached reply caps without a fixed scratch array. Local
+  validation: `cargo fmt --all`, `cargo test -p nt-io-manager pipe_waiter`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`. Review adjustment: run one serialized desktop boot next; expected proof is
+  that the late slot-6 `NtReadFile` reaches NPFS/pends or completes instead of returning
+  pre-route `0xc000009a`.

@@ -2429,25 +2429,19 @@ static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The parked-pipe-read table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
 /// pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
 /// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
-/// — and re-driven when the peer writes. `.bss`-resident (no heap), single-threaded executive (no
-/// races).
+/// — and re-driven when the peer writes. The single-threaded executive owns all mutation.
 ///
-/// ★ PHASE 4 left this at 16 and MEASURED it instead. The LSA worker route adds a whole second
-/// rpcrt4 connection on top of the SCM/CSR listeners already parked, so exhaustion was the first
-/// suspect for the route's lost `LsarOpenPolicy` response — and it was WRONG: `PIPE_WAITERS_FULL` is
-/// **0** on every route-ON boot (the real cause was per-connection park exclusivity, see
-/// `PIPE_FULL_DUPLEX_PARK` in `exec_handler.rs`). Raising it to 32 was tried and reverted: it is
-/// unneeded, and this boot is timing-sensitive enough that an unnecessary `.bss` change is not free.
-/// What DID change is that a full table is no longer SILENT — it is a functional degrade (the park
-/// site returns `STATUS_INSUFFICIENT_RESOURCES` for an I/O that should merely have completed later)
-/// and it is now counted by `PIPE_WAITERS_FULL`, asserted 0 by `exec_lsa_worker_route`.
-const PIPE_WAITER_N: usize = 16;
-static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_N> =
+/// This starts with a small bootstrap reservation and grows like the async listen table. There is no
+/// tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and driver control
+/// paths can legitimately accumulate more parked reads/writes than the old 16-slot bring-up table.
+/// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
+const PIPE_WAITER_INITIAL_N: usize = 16;
+static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_INITIAL_N> =
     nt_io_manager::PipeWaiterTable::new();
-/// ★ Times an async pipe read/write park was REFUSED because [`PIPE_WAITERS`] was full. A refusal is
-/// a silent functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
-/// should have completed later), so this must be **0**. See `PIPE_WAITER_N`.
-pub(crate) static PIPE_WAITERS_FULL: AtomicU64 = AtomicU64::new(0);
+/// Times a pipe read/write park was refused after a pending-capable IRP route wanted to retain it. A
+/// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
+/// should have completed later), so this must stay 0.
+pub(crate) static PIPE_WAITERS_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Proof/diagnostic counters (specs + boot log): pipe reads parked, and woken by a peer write.
 static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2466,7 +2460,6 @@ static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN
 const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
     nt_io_manager::PipeNameWaiterTable::new();
-static mut PIPE_IO_CANCEL_REPLY_CAPS_WORK: [u64; PIPE_WAITER_N] = [0; PIPE_WAITER_N];
 static mut PIPE_NAME_CANCEL_REPLY_CAPS_WORK: [u64; PIPE_NAME_WAITER_N] = [0; PIPE_NAME_WAITER_N];
 /// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
 static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -5912,7 +5905,7 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     let client_writes = LSA_SELF_RPC_CLIENT_WRITES.load(Ordering::Relaxed);
     let ticks_absorbed = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
     let ticks_drained = PUMP_TIMER_TICKS_DRAINED.load(Ordering::Relaxed);
-    let pipe_full = PIPE_WAITERS_FULL.load(Ordering::Relaxed);
+    let pipe_refusals = PIPE_WAITERS_REFUSED.load(Ordering::Relaxed);
     let wall_suspends = spawn_hosts::PUMP_WALL_SUSPENDS.load(Ordering::Relaxed);
     let reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     print_str(b"[lsa-route] worker PDUs read=");
@@ -5929,8 +5922,8 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     print_u64(ticks_absorbed);
     print_str(b" drained=");
     print_u64(ticks_drained);
-    print_str(b" pipe-waiters-full=");
-    print_u64(pipe_full);
+    print_str(b" pipe-waiter-refusals=");
+    print_u64(pipe_refusals);
     print_str(b" pump-walls=");
     print_u64(wall_suspends);
     print_str(b"\n");
@@ -5974,7 +5967,7 @@ fn lsa_worker_route_spec(passed: &mut u64) {
             && wall_suspends == 0
             && reply_errors == 0
             && ticks_drained + 1 >= ticks_absorbed
-            && pipe_full == 0,
+            && pipe_refusals == 0,
         passed,
     );
     delay_timer_disarm_spec(passed);
@@ -12813,21 +12806,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 
 unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-    let reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_IO_CANCEL_REPLY_CAPS_WORK);
-    let mut count = 0usize;
-    for (_, waiter) in table
-        .drain_all()
-        .filter(|(_, waiter)| waiter.tid == tid && waiter.reply_cap != 0)
-    {
-        reply_caps[count] = waiter.reply_cap;
-        count += 1;
-    }
-    let _ = table.detach_blocked_thread(tid);
-    for index in 0..count {
-        if reply_caps[index] != 0 {
-            release_reply_pool_cap(reply_caps[index]);
-        }
-    }
+    let _ = table.detach_blocked_thread_with_reply_caps(tid, release_reply_pool_cap);
     let listens = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
     let _ = listens.cancel_thread_with_file_ids(tid, |file_id| {
         if file_id != 0 {

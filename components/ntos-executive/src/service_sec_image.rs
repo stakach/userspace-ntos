@@ -31,6 +31,8 @@ static GUI_MESSAGE_WAIT_STILL_EMPTY: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_REDRIVES: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_READY_REDRIVES: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_WAIT_TRACE: AtomicU64 = AtomicU64::new(0);
+static SCM_WORKER_SLOT_RESULT_TRACE: [AtomicU64; TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static USERCONNECT_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_MSG_COPY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_DESKTOP_PAINT_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -7085,6 +7087,76 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" resume-ip=0x");
                             print_hex_u64(resume_ip);
                             print_str(b"\n");
+                        }
+                    }
+                    if let Some(HostedThreadRole::ScmWorkerSlot { slot }) = hosted_thread_role {
+                        if slot < TP_WORKER_SLOT_COUNT {
+                            let trace =
+                                SCM_WORKER_SLOT_RESULT_TRACE[slot].fetch_add(1, Ordering::Relaxed);
+                            if trace < 40 {
+                                print_str(b"[scm-worker-slot-ret] slot=");
+                                print_u64(slot as u64);
+                                print_str(b" #");
+                                print_u64(trace);
+                                print_str(b" ssn=");
+                                print_u64(m0);
+                                print_str(b" status=0x");
+                                print_hex(result as u32);
+                                print_str(b" a1=0x");
+                                print_hex_u64(argv[0]);
+                                print_str(b" a2=0x");
+                                print_hex_u64(argv[1]);
+                                print_str(b" stack=");
+                                print_u64(stack_args_valid as u64);
+                                print_str(b" park_fid=0x");
+                                print_hex(nt_handler.pipe_park_fid as u32);
+                                if m0 == 191 && n > 6 {
+                                    let iosb = argv[4];
+                                    let buffer = argv[5];
+                                    let length = argv[6];
+                                    print_str(b" read_iosb=0x");
+                                    print_hex_u64(iosb);
+                                    print_str(b" buf=0x");
+                                    print_hex_u64(buffer);
+                                    print_str(b" len=");
+                                    print_u64(length);
+                                    if iosb != 0 {
+                                        let mut iosb_bytes = [0u8; 16];
+                                        if client_copyin_mapped(
+                                            pi as u64,
+                                            iosb,
+                                            &mut iosb_bytes,
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        ) {
+                                            let iosb_status = u32::from_le_bytes([
+                                                iosb_bytes[0],
+                                                iosb_bytes[1],
+                                                iosb_bytes[2],
+                                                iosb_bytes[3],
+                                            ]);
+                                            let iosb_info = u64::from_le_bytes([
+                                                iosb_bytes[8],
+                                                iosb_bytes[9],
+                                                iosb_bytes[10],
+                                                iosb_bytes[11],
+                                                iosb_bytes[12],
+                                                iosb_bytes[13],
+                                                iosb_bytes[14],
+                                                iosb_bytes[15],
+                                            ]);
+                                            print_str(b" iosb_status=0x");
+                                            print_hex(iosb_status);
+                                            print_str(b" iosb_info=");
+                                            print_u64(iosb_info);
+                                        } else {
+                                            print_str(b" iosb=<unreadable>");
+                                        }
+                                    }
+                                }
+                                print_str(b"\n");
+                            }
                         }
                     }
                     if nt_handler.user_apc_redirected {
@@ -18292,8 +18364,8 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 /// `wait_park_multi` reply-cap steal EXACTLY (steal the active REPLY_MAIN, rotate a fresh pool object
 /// into REPLY_MAIN so the next recv binds a new object), but records the wait in the PipeWaiterTable
 /// keyed by the reading end's npfs file-id instead of an obj_ns event index. Returns true on success;
-/// false if the pool or the waiter table is exhausted (caller then returns PENDING directly — degraded
-/// but never a hang). The stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
+/// false if the reply pool is unavailable or the growable waiter table cannot allocate the record. The
+/// stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
 unsafe fn pipe_wait_park(
     file_id: u64,
     pi: u32,
@@ -18339,7 +18411,8 @@ unsafe fn pipe_wait_park(
         is_write,
     });
     if parked.is_none() {
-        return false; // table exhausted → caller returns PENDING directly
+        PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
     // Commit the reply-cap rotation only after the waiter is recorded.
     wait_reply_pool_mark_used(fresh_index);

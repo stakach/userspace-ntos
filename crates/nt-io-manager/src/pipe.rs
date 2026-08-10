@@ -619,14 +619,14 @@ pub struct PipeWaiter {
     pub is_write: bool,
 }
 
-/// A fixed-capacity, heap-free, reset-safe table of parked pipe reads. Mirrors
-/// the executive's `PENDING_IRPS` / event-waiter-table style (a `.bss` static, no
-/// allocation, bounded). Parking past capacity fails (the caller then returns the
-/// PENDING status directly — degraded, never a hang), exactly like the event
-/// waiter pool exhausting.
+/// Reset-safe table of parked pipe reads/writes.
+///
+/// The const parameter is the first reservation size, not a hard NT limit. Real service startup can
+/// legitimately have many RPC servers and driver control pipes with pending reads at once, so the
+/// table grows on demand. Parking fails only if allocation for the next waiter record fails.
 #[derive(Clone, Debug)]
 pub struct PipeWaiterTable<const N: usize> {
-    slots: [Option<PipeWaiter>; N],
+    slots: Vec<Option<PipeWaiter>>,
 }
 
 impl<const N: usize> Default for PipeWaiterTable<N> {
@@ -637,11 +637,36 @@ impl<const N: usize> Default for PipeWaiterTable<N> {
 
 impl<const N: usize> PipeWaiterTable<N> {
     pub const fn new() -> Self {
-        Self { slots: [None; N] }
+        Self { slots: Vec::new() }
     }
 
-    /// Park `w` in a free slot. Returns the slot index, or `None` if the table is
-    /// full (caller degrades to returning PENDING directly — never a hang).
+    fn grow_reservation(&mut self) -> bool {
+        if self.slots.len() == self.slots.capacity() {
+            let reserve = if self.slots.capacity() == 0 {
+                N.max(1)
+            } else {
+                1
+            };
+            if self.slots.try_reserve(reserve).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Ensure one future [`park`](Self::park) call can record a distinct waiter without allocating at
+    /// the post-IRP park point. The executive calls this before issuing an operation that may pend, so a
+    /// successful NPFS pending IRP always has storage for its completion owner.
+    pub fn ensure_capacity(&mut self) -> bool {
+        if self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
+        {
+            return true;
+        }
+        self.grow_reservation()
+    }
+
+    /// Park `w` in a free slot. Returns the slot index, or `None` if the table cannot allocate the next
+    /// record.
     ///
     /// Re-armable by construction: a slot freed by [`complete`](Self::complete) or
     /// [`cancel_thread`](Self::cancel_thread) becomes `None` and is immediately
@@ -653,7 +678,11 @@ impl<const N: usize> PipeWaiterTable<N> {
                 return Some(i);
             }
         }
-        None
+        if !self.grow_reservation() {
+            return None;
+        }
+        self.slots.push(Some(w));
+        Some(self.slots.len() - 1)
     }
 
     /// Number of currently parked waiters.
@@ -666,7 +695,11 @@ impl<const N: usize> PipeWaiterTable<N> {
     }
 
     pub fn has_capacity(&self) -> bool {
-        self.slots.iter().any(|slot| slot.is_none())
+        self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
     }
 
     /// Whether `tid` currently owns any retained pending read/transceive IRP.
@@ -746,10 +779,17 @@ impl<const N: usize> PipeWaiterTable<N> {
 
     /// Detach reply-cap-blocked operations from a terminating thread while preserving the driver
     /// completion owner. The finalizer will discard user copyout and release the file reference.
-    pub fn detach_blocked_thread(&mut self, tid: u64) -> usize {
+    ///
+    /// The callback receives every stolen reply cap that was detached so the executive can return it to
+    /// the reply pool without relying on a fixed-size scratch array.
+    pub fn detach_blocked_thread_with_reply_caps<F>(&mut self, tid: u64, mut release: F) -> usize
+    where
+        F: FnMut(u64),
+    {
         let mut count = 0;
         for waiter in self.slots.iter_mut().flatten() {
             if waiter.tid == tid && waiter.reply_cap != 0 {
+                release(waiter.reply_cap);
                 waiter.tid = 0;
                 waiter.buffer_va = 0;
                 waiter.buffer_len = 0;
@@ -765,6 +805,12 @@ impl<const N: usize> PipeWaiterTable<N> {
             }
         }
         count
+    }
+
+    /// Detach blocked operations without observing the reply caps. Tests and legacy callers use this
+    /// when the cap-lifecycle side is irrelevant.
+    pub fn detach_blocked_thread(&mut self, tid: u64) -> usize {
+        self.detach_blocked_thread_with_reply_caps(tid, |_| {})
     }
 
     /// Is there already a parked read on `file_id`? (Guards double-parking the
@@ -1400,7 +1446,12 @@ mod tests {
     fn terminating_blocked_thread_detaches_without_dropping_completion_owner() {
         let mut t = PipeWaiterTable::<1>::new();
         let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
-        assert_eq!(t.detach_blocked_thread(7), 1);
+        let mut released = std::vec::Vec::new();
+        assert_eq!(
+            t.detach_blocked_thread_with_reply_caps(7, |cap| released.push(cap)),
+            1
+        );
+        assert_eq!(released, std::vec![0x40 + 0xAA]);
         let waiter = t.get(slot).unwrap();
         assert_eq!(waiter.file_id, 0xAA);
         assert_eq!(waiter.tid, 0);
@@ -1468,17 +1519,20 @@ mod tests {
     }
 
     #[test]
-    fn pipe_waiter_park_fails_when_full_never_hangs() {
-        // Capacity exhaustion returns None (caller degrades to returning PENDING
-        // directly), never overwrites a live waiter.
+    fn pipe_waiter_grows_past_initial_reservation() {
+        // The const parameter is only the bootstrap reservation. More concurrent RPC/driver pipe
+        // waiters grow the table instead of returning a synthetic out-of-resources status.
         let mut t = PipeWaiterTable::<2>::new();
+        assert!(t.ensure_capacity());
         assert!(t.park(wtr(0xAA, 3, 7)).is_some());
         assert!(t.park(wtr(0xBB, 3, 8)).is_some());
-        assert!(t.park(wtr(0xCC, 3, 9)).is_none());
-        assert_eq!(t.len(), 2);
+        assert!(t.park(wtr(0xCC, 3, 9)).is_some());
+        assert_eq!(t.len(), 3);
+        assert!(t.capacity() >= 3);
         // Freeing one re-opens a slot.
         t.complete(0).unwrap();
-        assert!(t.park(wtr(0xCC, 3, 9)).is_some());
+        let reused = t.park(wtr(0xDD, 3, 10)).unwrap();
+        assert_eq!(reused, 0);
     }
 
     #[test]
@@ -2343,10 +2397,11 @@ mod tests {
         assert!(!t.parked_on(0xAA), "cancel clears the parked_on key");
         assert!(!t.parked_on(0xBB));
         assert!(t.is_empty());
-        // Both freed slots are immediately re-usable.
+        // Both freed slots are immediately re-usable, and additional concurrent waiters grow the table.
         assert!(t.park(wtr(0xCC, 2, 4)).is_some());
         assert!(t.park(wtr(0xDD, 2, 4)).is_some());
-        assert!(t.park(wtr(0xEE, 2, 4)).is_none(), "still bounded at N=2");
+        assert!(t.park(wtr(0xEE, 2, 4)).is_some());
+        assert_eq!(t.len(), 3);
     }
 
     #[test]

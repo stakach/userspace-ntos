@@ -16426,7 +16426,6 @@ impl ExecNtHandler {
                         status = STATUS_ACCESS_VIOLATION as u64;
                     } else {
                         let prepared = if is_pipe_transceive {
-                            let waiter_table = &*core::ptr::addr_of!(PIPE_WAITERS);
                             let synchronous = self
                                 .file_completion
                                 .is_synchronous(route.file_id)
@@ -16437,10 +16436,14 @@ impl ExecNtHandler {
                             } else {
                                 true
                             };
-                            if !waiter_table.has_capacity()
-                                || waiter_table.parked_on_dir(route.file_id, false)
-                                || !sync_reply_capacity
-                            {
+                            let waiter_capacity = if sync_reply_capacity {
+                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+                                !waiter_table.parked_on_dir(route.file_id, false)
+                                    && waiter_table.ensure_capacity()
+                            } else {
+                                false
+                            };
+                            if !waiter_capacity || !sync_reply_capacity {
                                 Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                             } else {
                                 self.file_completion.retain_file(route.file_id).map(|()| {
@@ -21285,8 +21288,6 @@ impl ExecNtHandler {
                             completion_file_id = file_id;
                             let synchronous =
                                 self.file_completion.is_synchronous(file_id).unwrap_or(true);
-                            let waiter_table =
-                                unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
                             // ★★ PER-DIRECTION PIPE PARKING — MEASURED, GATED OFF (Phase 4).
                             //
                             // The direction-BLIND predicate makes a connection half-duplex: an
@@ -21317,14 +21318,19 @@ impl ExecNtHandler {
                             // timer fixed the paint is deterministic (768/768 over six consecutive
                             // boots) and this is ON.
                             const PIPE_FULL_DUPLEX_PARK: bool = true;
-                            let waiter_capacity = waiter_table.has_capacity()
-                                && !waiter_table.parked_on_dir(file_id, true)
-                                && (PIPE_FULL_DUPLEX_PARK
-                                    || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
                                 wait_reply_pool_has_free()
                             } else {
                                 true
+                            };
+                            let waiter_capacity = if sync_reply_capacity {
+                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+                                !waiter_table.parked_on_dir(file_id, true)
+                                    && (PIPE_FULL_DUPLEX_PARK
+                                        || !waiter_table.parked_on(file_id))
+                                    && waiter_table.ensure_capacity()
+                            } else {
+                                false
                             };
                             let prepared = if !waiter_capacity || !sync_reply_capacity {
                                 Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
@@ -21403,18 +21409,17 @@ impl ExecNtHandler {
                             is_transceive: false,
                             is_write: true,
                         };
-                        if unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter) }
+                        if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
+                            .park(waiter)
                             .is_none()
                         {
                             if async_file_retained {
                                 self.release_file_reference(pending_write_fid);
                             }
-                            // ★ A full table is a SILENT FUNCTIONAL DEGRADE, not a hang: this write
-                            // would have completed on the peer's read, and instead fails. This is
-                            // exactly how the LSA self-RPC's 48-byte `LsarOpenPolicy` RESPONSE was
-                            // lost. Count + log it (see `PIPE_WAITER_N`).
-                            if crate::PIPE_WAITERS_FULL.fetch_add(1, Ordering::Relaxed) < 8 {
-                                print_str(b"[pipe-park] table FULL -> async WRITE degraded to STATUS_INSUFFICIENT_RESOURCES fid=0x");
+                            // A park refusal is a functional degrade: this write would have completed
+                            // on the peer's read, and instead fails.
+                            if crate::PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
+                                print_str(b"[pipe-park] refused async WRITE -> STATUS_INSUFFICIENT_RESOURCES fid=0x");
                                 print_hex(pending_write_fid as u32);
                                 print_str(b"\n");
                             }
@@ -21702,19 +21707,22 @@ impl ExecNtHandler {
                             completion_file_id = file_id;
                             let synchronous =
                                 self.file_completion.is_synchronous(file_id).unwrap_or(true);
-                            let waiter_table =
-                                unsafe { &*core::ptr::addr_of!(PIPE_WAITERS) };
                             // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
                             // pre-check, which carries the full rationale + measurements). ON.
                             const PIPE_FULL_DUPLEX_PARK: bool = true;
-                            let waiter_capacity = waiter_table.has_capacity()
-                                && !waiter_table.parked_on_dir(file_id, false)
-                                && (PIPE_FULL_DUPLEX_PARK
-                                    || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
                                 wait_reply_pool_has_free()
                             } else {
                                 true
+                            };
+                            let waiter_capacity = if sync_reply_capacity {
+                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+                                !waiter_table.parked_on_dir(file_id, false)
+                                    && (PIPE_FULL_DUPLEX_PARK
+                                        || !waiter_table.parked_on(file_id))
+                                    && waiter_table.ensure_capacity()
+                            } else {
+                                false
                             };
                             let prepared = if !waiter_capacity || !sync_reply_capacity {
                                 Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
@@ -21825,15 +21833,13 @@ impl ExecNtHandler {
                             is_transceive: false,
                             is_write: false,
                         };
-                        let parked = unsafe {
-                            (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter)
-                        };
+                        let parked = (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).park(waiter);
                         if parked.is_none() {
                             if async_file_retained {
                                 self.release_file_reference(pending_read_fid);
                             }
-                            if crate::PIPE_WAITERS_FULL.fetch_add(1, Ordering::Relaxed) < 8 {
-                                print_str(b"[pipe-park] table FULL -> async READ degraded to STATUS_INSUFFICIENT_RESOURCES fid=0x");
+                            if crate::PIPE_WAITERS_REFUSED.fetch_add(1, Ordering::Relaxed) < 8 {
+                                print_str(b"[pipe-park] refused async READ -> STATUS_INSUFFICIENT_RESOURCES fid=0x");
                                 print_hex(pending_read_fid as u32);
                                 print_str(b"\n");
                             }
