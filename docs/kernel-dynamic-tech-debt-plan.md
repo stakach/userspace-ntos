@@ -2160,3 +2160,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   context handle for UUID `{60ed3641-4ff2-4e3b-adc8-7747e364f201}` and a fault packet with status
   `0x1c00001a`. Review adjustment: continue at real RPC/context-handle semantics for that service
   path; do not reintroduce service-name, executable, or pipe-capacity fallbacks.
+- I4 started. ReactOS rpcrt4/WLAN tracing shows the UUID in the failure is a generated context
+  handle owned by the server RPC association, not the WLAN interface UUID. The first kernel-side
+  cleanup is therefore generic NPFS/RPC transport fidelity: async `FSCTL_PIPE_LISTEN` completion now
+  uses the exact server-end fid for the accepted CCB (`(client_fid & !1) | FILE_PIPE_SERVER_END`)
+  instead of consuming the first pending listen with the same name, and the host pipe model matches
+  ReactOS `NpTransceive` preconditions (`STATUS_INVALID_PIPE_STATE` for
+  non-connected/non-full-duplex/non-message-mode, `STATUS_PIPE_BUSY` when unread reply data is
+  already queued before writing a new request).
+  Review adjustment: validate this with focused pipe tests/checks, then run one serialized desktop
+  boot to see whether the remaining `wlansvc` context-handle fault is association reuse or the next
+  service-control pipe semantic gap.

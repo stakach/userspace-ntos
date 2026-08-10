@@ -356,6 +356,8 @@ static mut DATA_TRACE_COUNT: u32 = 0;
 static mut FSD_DISPATCH_TRACE: u32 = 0;
 /// Narrow NPFS read/write queue-state trace for message-mode RPC over named pipes.
 static mut PIPE_RW_TRACE_COUNT: u32 = 0;
+/// Narrow NPFS transceive queue-state trace for RPC request/reply pipe transactions.
+static mut PIPE_TRANSCEIVE_TRACE_COUNT: u32 = 0;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
 static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
@@ -1166,6 +1168,54 @@ unsafe fn trace_pipe_rw_result(
     print_hex(fsctx as u32);
     print_str(b" len=");
     print_u64(length);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(info);
+    print_dcerpc_pdu_view(pdu);
+    if let Some(view) = before {
+        print_pipe_ccb_view(b" before", view);
+    }
+    if let Some(view) = after {
+        print_pipe_ccb_view(b" after", view);
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_pipe_transceive_result(
+    file_id: u64,
+    fsctx: u64,
+    input_len: u64,
+    output_len: u64,
+    status: u32,
+    info: u64,
+    before: Option<PipeCcbView>,
+    payload: u64,
+    payload_len: u64,
+) {
+    let after = pipe_ccb_view(if fsctx != 0 { fsctx } else { file_id });
+    let pdu = dcerpc_pdu_view(payload, payload_len);
+    let interesting = status == STATUS_PENDING
+        || status == 0x8000_0005
+        || status == 0xC000_00AE
+        || info != 0
+        || pdu.is_some()
+        || before.is_some_and(|view| view.has_queued_state())
+        || after.is_some_and(|view| view.has_queued_state());
+    if !interesting || PIPE_TRANSCEIVE_TRACE_COUNT >= 128 {
+        return;
+    }
+    PIPE_TRANSCEIVE_TRACE_COUNT += 1;
+    print_str(b"[fsd-pipe-transceive] fid=0x");
+    print_hex(file_id as u32);
+    print_str(b" end=");
+    print_u64(file_id & 1);
+    print_str(b" fsctx=0x");
+    print_hex(fsctx as u32);
+    print_str(b" in=");
+    print_u64(input_len);
+    print_str(b" out=");
+    print_u64(output_len);
     print_str(b" status=0x");
     print_hex(status);
     print_str(b" info=");
@@ -7253,7 +7303,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if uses_file_object {
         audit_ccb(file_id);
     }
-    let pipe_rw_before = if major == IRP_MJ_READ || major == IRP_MJ_WRITE {
+    let pipe_rw_before = if major == IRP_MJ_READ
+        || major == IRP_MJ_WRITE
+        || (major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE)
+    {
         pipe_ccb_view(file_id)
     } else {
         None
@@ -7579,6 +7632,19 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             inlen
         },
     );
+    if major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE {
+        trace_pipe_transceive_result(
+            file_id,
+            fsctx,
+            inlen,
+            outlen,
+            st as u32,
+            info,
+            pipe_rw_before,
+            data,
+            inlen,
+        );
+    }
     if st as u32 == STATUS_PENDING {
         let inserted = insert_pending_irp(PendingIrp {
             irp,

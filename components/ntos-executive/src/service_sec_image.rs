@@ -6978,7 +6978,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_name_wait_event_obj_idx = u64::MAX;
                 nt_handler.pipe_name_wait_deadline_100ns = u64::MAX;
                 nt_handler.pipe_name_wait_redrive = 0;
-                nt_handler.pipe_connect_redrive = 0;
+                nt_handler.pipe_connect_redrive_server_fid = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.sm_request_port = 0;
                 nt_handler.sm_request_message = 0;
@@ -7518,16 +7518,12 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
                     park_pipe_name_wait_deadline_100ns = nt_handler.pipe_name_wait_deadline_100ns;
                 }
-                // ★ BATCH 34: a client CONNECT to a pipe with a pending async server FSCTL_PIPE_LISTEN
-                // for the SAME pipe name completes that listen — signal its completion event so the
-                // server's NtWaitForMultipleObjects wakes and reads the client's first PDU (the bind).
-                // Name-scoped (pipe_connect_redrive carries the connected pipe's leaf name-hash) so a
-                // connect to \ntsvcs never spuriously wakes the \lsarpc/\samr servers. Only a CONNECT
-                // (not a write) completes a listen — a write re-drives parked reads (below), which is
-                // the correct edge once the connection is established.
-                if nt_handler.pipe_connect_redrive != 0 {
-                    let connect_name_hash = nt_handler.pipe_connect_redrive;
-                    let listens = pipe_listen_complete_named(&mut nt_handler, connect_name_hash);
+                // ★ BATCH 34: a client CONNECT to a pipe completes the exact async server
+                // FSCTL_PIPE_LISTEN for the accepted CCB's server end. Only a CONNECT (not a write)
+                // completes a listen; writes re-drive parked reads once the connection exists.
+                if nt_handler.pipe_connect_redrive_server_fid != 0 {
+                    let server_fid = nt_handler.pipe_connect_redrive_server_fid;
+                    let listens = pipe_listen_complete_server_fid(&mut nt_handler, server_fid);
                     if listens != 0 {
                         print_str(b"[pipe-listen] completed ");
                         print_u64(listens);
@@ -18641,22 +18637,23 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
-/// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` matching `name_hash` after a
-/// client CONNECT to that same pipe name. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
+/// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` for `server_fid` after a client
+/// CONNECT to the same CCB. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
 /// FSCTL_PIPE_LISTEN (STATUS_PENDING, no client) with a completion EVENT, then parked on
 /// `NtWaitForMultipleObjects([mgr_event, listen_event])`. The client just connected (npfs paired the
-/// ends by name), so ONE matching pending listen is now satisfied: fill its listen IOSB
+/// ends in one CCB), so ONE matching pending listen is now satisfied: fill its listen IOSB
 /// `{Status=SUCCESS, Information=0}` in the SERVER's VSpace (switch in the listener's mirror context
 /// for the copyout, then restore) and signal its completion event via the shared dispatcher wake path
 /// NtSetEvent wake path — waking the server's wait-array so it reads the client's first PDU (the bind).
-/// Name-scoped so a `\ntsvcs` connect never wakes `\lsarpc`/`\samr` (which would spin their rpcrt4
-/// accept loop). Returns 1 if a listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
+/// Matching the server fid matters when multiple instances of one pipe name are listening: the FSD
+/// has already selected the accepted instance, so the executive must not pick by name. Returns 1 if a
+/// listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
 /// FSCTL_PIPE_LISTEN for the next client (a NEW record). Completes ONE listen per connect (one client).
-unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: u64) -> u64 {
-    // Find the matching pending listen (name-scoped); take it (consumed once per client connect).
+unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server_fid: u64) -> u64 {
+    // Find the pending listen for the accepted server end; take it once per client connect.
     let l = {
         let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-        match table_mut.complete_by_name(name_hash) {
+        match table_mut.complete(server_fid) {
             Some(l) => l,
             None => return 0,
         }

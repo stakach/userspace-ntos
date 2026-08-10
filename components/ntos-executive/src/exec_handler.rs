@@ -1924,7 +1924,7 @@ impl ExecNtHandler {
         write_field!(pipe_name_wait_event_obj_idx, u64::MAX);
         write_field!(pipe_name_wait_deadline_100ns, u64::MAX);
         write_field!(pipe_name_wait_redrive, 0);
-        write_field!(pipe_connect_redrive, 0);
+        write_field!(pipe_connect_redrive_server_fid, 0);
         write_field!(anon_event_seq, 0);
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
@@ -14074,7 +14074,7 @@ impl ExecNtHandler {
                         if let Some(handle) = opened_handle {
                             self.queue_write(file_handle_out, handle);
                             if status == 0 {
-                                self.pipe_connect_redrive = pipe_hash;
+                                self.pipe_connect_redrive_server_fid = (fid & !1) | 1;
                             }
                         } else {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
@@ -16196,8 +16196,8 @@ impl ExecNtHandler {
 
                 let status = match self.npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0) {
                     Ok((0, fid)) if fid != 0 => {
-                        // Remember this server fid -> its pipe leaf name-hash, so a client connect
-                        // completes only the matching-name server listen.
+                        // Remember this server fid -> pipe leaf name-hash for FSCTL_PIPE_WAIT
+                        // readiness probes. Client connects complete listens by exact server fid.
                         match crate::pipe_fid_name_remember(
                             fid,
                             nt_io_manager::pipe_name_hash(&leaf),
@@ -20994,11 +20994,9 @@ impl ExecNtHandler {
                                     {
                                         self.queue_write(args[0], handle);
                                         info = nt_fs::FILE_OPENED as u64;
-                                        // ★ BATCH 34: client CONNECT (winlogon's NtCreateFile on \pipe\ntsvcs)
-                                        // paired with the server end by name → complete the pending async
-                                        // server listen FOR THAT PIPE NAME (signal its completion event → the
-                                        // SCM listener's NtWaitForMultipleObjects wakes to read the bind PDU).
-                                        self.pipe_connect_redrive = pipe_hash;
+                                        // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
+                                        // Complete the exact server-end listen IRP for the same CCB.
+                                        self.pipe_connect_redrive_server_fid = (file_id & !1) | 1;
                                     } else {
                                         crate::pipe_fid_name_forget(file_id);
                                         status = 0xC000_009A;

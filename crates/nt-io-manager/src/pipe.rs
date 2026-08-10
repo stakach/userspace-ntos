@@ -52,6 +52,8 @@ pub const FILE_PIPE_SERVER_END: usize = 0x0000_0001;
 pub const STATUS_PIPE_NOT_AVAILABLE: NtStatus = NtStatus(0xC000_00ACu32 as i32);
 /// `STATUS_PIPE_BUSY` (0xC00000AE): all instances are busy.
 pub const STATUS_PIPE_BUSY: NtStatus = NtStatus(0xC000_00AEu32 as i32);
+/// `STATUS_INVALID_PIPE_STATE` (0xC00000AD): operation invalid for this pipe state/mode.
+pub const STATUS_INVALID_PIPE_STATE: NtStatus = NtStatus(0xC000_00ADu32 as i32);
 /// `STATUS_PIPE_DISCONNECTED` (0xC00000B0): the peer end disconnected.
 pub const STATUS_PIPE_DISCONNECTED: NtStatus = NtStatus(0xC000_00B0u32 as i32);
 /// `STATUS_PIPE_LISTENING` (0xC00000B3): FSCTL_PIPE_LISTEN, no client yet.
@@ -485,6 +487,20 @@ impl PipeRegistry {
         out: &[u8],
         max: usize,
     ) -> Result<(usize, Vec<u8>, bool), NtStatus> {
+        {
+            let conn = self.conn(h)?;
+            if conn.state != PipeState::Connected {
+                return Err(STATUS_INVALID_PIPE_STATE);
+            }
+            if conn.configuration != FILE_PIPE_FULL_DUPLEX
+                || !conn.read_message_mode[h.end.to_raw()]
+            {
+                return Err(STATUS_INVALID_PIPE_STATE);
+            }
+            if conn.readable_bytes(h.end) != 0 {
+                return Err(STATUS_PIPE_BUSY);
+            }
+        }
         let written = self.pipe_write(h, out)?;
         let (bytes, more) = self.pipe_read(h, max)?;
         if bytes.is_empty() && max != 0 {
@@ -964,14 +980,14 @@ pub struct AsyncListen {
     pub apc_context: u64,
     /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
     pub completion_port_suppressed: bool,
-    /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, …). A client connect
-    /// completes ONLY the listen whose `name_hash` matches the connected pipe. `0` is incomplete
-    /// metadata and never matches.
+    /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, ...). This is used by
+    /// `FSCTL_PIPE_WAIT` readiness probes before a client owns a connected CCB. Client connects
+    /// complete async listens by the exact server-end fid chosen by NPFS, not by this hash.
     pub name_hash: u64,
 }
 
 /// A tiny stable FNV-1a hash of a pipe leaf name (UTF-16 units, case-insensitive on ASCII). Used to
-/// match a client connect to the specific armed server listen for the same pipe name.
+/// match a pipe name without relying on a fixed string table.
 pub fn pipe_name_hash(name16: &[u16]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &w in name16 {
@@ -1356,25 +1372,6 @@ impl<const N: usize> AsyncListenTable<N> {
             .copied()
             .flatten()
             .map(|l| l.server_file_id)
-    }
-
-    /// Complete + free the FIRST pending listen matching `name_hash` (a client connected to that
-    /// specific pipe name). `0` never matches; a listen without real name metadata must not satisfy an
-    /// unrelated client connect. Returns the completed record so the caller can signal its event +
-    /// fill its IOSB. `None` if no match. Idempotent: the matched listen is consumed once; a fresh
-    /// re-arm (re-post) is a NEW record.
-    pub fn complete_by_name(&mut self, name_hash: u64) -> Option<AsyncListen> {
-        if name_hash == 0 {
-            return None;
-        }
-        for slot in self.slots.iter_mut() {
-            if let Some(l) = *slot {
-                if l.name_hash != 0 && l.name_hash == name_hash {
-                    return slot.take();
-                }
-            }
-        }
-        None
     }
 }
 
@@ -1815,20 +1812,21 @@ mod tests {
 
     #[test]
     fn transceive_round_trips() {
-        // Model an RPC: client transceives a request, server reads it and replies,
-        // then the client's transceive read returns the reply. Because our
-        // transceive is synchronous, we do it in two coordinated steps.
+        // Model an RPC request/reply. The first transceive queues the request and pends because the
+        // reply is not available yet; the later read drains the reply bytes.
         let mut r = dx();
-        let s = r.create_server_pipe("p", PipeParams::default()).unwrap();
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
+        let s = r.create_server_pipe("p", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("p").unwrap();
-        // Client writes request.
-        r.pipe_write(c, b"req").unwrap();
+        assert_eq!(r.transceive(c, b"req", 16), Err(STATUS_PENDING));
         // Server reads it and writes the reply.
         assert_eq!(r.pipe_read(s, 16).unwrap().0, b"req");
         r.pipe_write(s, b"reply").unwrap();
-        // Client transceive (write nothing more, read the reply).
-        let (_w, reply, _more) = r.transceive(c, b"", 16).unwrap();
+        let (reply, _more) = r.pipe_read(c, 16).unwrap();
         assert_eq!(&reply, b"reply");
     }
 
@@ -1849,6 +1847,23 @@ mod tests {
         assert_eq!(&request, b"svc-control");
         assert!(!more);
         assert_eq!(r.readable_bytes(c).unwrap(), 0);
+    }
+
+    #[test]
+    fn transceive_rejects_unread_reply_without_writing_request() {
+        let mut r = dx();
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
+        let s = r.create_server_pipe("busy", params).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("busy").unwrap();
+
+        r.pipe_write(s, b"old-reply").unwrap();
+        assert_eq!(r.transceive(c, b"new-request", 16), Err(STATUS_PIPE_BUSY));
+        assert_eq!(r.readable_bytes(c).unwrap(), b"old-reply".len());
+        assert_eq!(r.readable_bytes(s).unwrap(), 0);
     }
 
     #[test]
@@ -2149,9 +2164,9 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_complete_by_name_is_specific() {
-        // The key regression guard: a client connecting to \ntsvcs must complete ONLY the \ntsvcs
-        // server listen, NOT the \lsarpc/\samr ones (spuriously waking them makes their rpcrt4 loop).
+    fn async_listen_complete_exact_fid_is_specific() {
+        // A client connect exposes the exact accepted server CCB. Completing by fid must not touch
+        // other pending listens, even when names differ or multiple listeners are armed.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
         let samr: std::vec::Vec<u16> = "\\samr".encode_utf16().collect();
@@ -2159,8 +2174,7 @@ mod tests {
         t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
         t.arm(al_named(0xB, 2, &lsarpc)).unwrap();
         t.arm(al_named(0xC, 3, &samr)).unwrap();
-        // Connect to \ntsvcs → completes ONLY the ntsvcs listen (event 1).
-        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
+        let done = t.complete(0xA).unwrap();
         assert_eq!(done.event_obj_idx, 1);
         assert_eq!(t.len(), 2, "lsarpc + samr listens are untouched");
         assert!(t.armed(0xB));
@@ -2168,9 +2182,7 @@ mod tests {
         // Case-insensitive match.
         let ntsvcs_uc: std::vec::Vec<u16> = "\\NTSVCS".encode_utf16().collect();
         assert_eq!(pipe_name_hash(&ntsvcs), pipe_name_hash(&ntsvcs_uc));
-        // A connect to a name with NO armed listen completes nothing.
-        let unknown: std::vec::Vec<u16> = "\\nope".encode_utf16().collect();
-        assert!(t.complete_by_name(pipe_name_hash(&unknown)).is_none());
+        assert!(t.complete(0xDEAD).is_none());
         assert_eq!(t.len(), 2);
     }
 
@@ -2186,7 +2198,7 @@ mod tests {
         assert!(!t.armed_name(0));
         assert_eq!(t.len(), 1, "wait probing must not consume the listen");
 
-        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
+        let done = t.complete(0xA).unwrap();
         assert_eq!(done.server_file_id, 0xA);
         assert!(t.is_empty());
     }
@@ -2234,20 +2246,21 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_complete_by_name_rejects_unset_hash() {
-        // Missing name metadata is an internal resource/registration problem, not a wildcard. A later
-        // client connect must never complete an unrelated listen just because either hash is zero.
+    fn async_listen_complete_exact_fid_does_not_need_name_hash() {
+        // The accept edge is the exact server fid returned by NPFS, so it can complete a listen even if
+        // name metadata is unavailable. Name hashes are only the pre-open WaitNamedPipe probe surface.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
         let mut t = AsyncListenTable::<8>::new();
         t.arm(al(0xA, 1)).unwrap(); // al() leaves name_hash == 0
-        assert!(t.complete_by_name(pipe_name_hash(&ntsvcs)).is_none());
-        assert!(t.complete_by_name(0).is_none());
-        assert_eq!(t.len(), 1);
+        assert!(!t.armed_name(pipe_name_hash(&ntsvcs)));
+        assert!(!t.armed_name(0));
+        assert_eq!(t.complete(0xA).unwrap().event_obj_idx, 1);
+        assert!(t.is_empty());
 
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
         let mut t2 = AsyncListenTable::<8>::new();
         t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
-        assert!(t2.complete_by_name(0).is_none());
+        assert!(!t2.armed_name(0));
         assert_eq!(t2.len(), 1);
     }
 
@@ -2281,23 +2294,21 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_complete_by_name_takes_first_of_same_name_then_rearm_is_new() {
-        // Two instances of the SAME named pipe (two server ends listening on \ntsvcs). A connect
-        // completes ONE (the first in slot order); the second stays armed. A re-post is a distinct
-        // record consumed on the NEXT connect (idempotent — the first connect consumed exactly one).
+    fn async_listen_same_name_instances_complete_by_exact_fid() {
+        // Two instances of the SAME named pipe are not interchangeable once NPFS has accepted a client.
+        // The executive must complete the server fid for the accepted CCB, even if that is not slot 0.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let h = pipe_name_hash(&ntsvcs);
         let mut t = AsyncListenTable::<8>::new();
         t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
         t.arm(al_named(0xB, 2, &ntsvcs)).unwrap();
-        let first = t.complete_by_name(h).unwrap();
-        assert_eq!(first.server_file_id, 0xA, "first slot-order match consumed");
-        assert_eq!(t.len(), 1, "the second same-named instance stays armed");
-        let second = t.complete_by_name(h).unwrap();
-        assert_eq!(second.server_file_id, 0xB);
+        let accepted = t.complete(0xB).unwrap();
+        assert_eq!(accepted.server_file_id, 0xB);
+        assert_eq!(accepted.event_obj_idx, 2);
+        assert_eq!(t.len(), 1, "the other same-named instance stays armed");
+        let remaining = t.complete(0xA).unwrap();
+        assert_eq!(remaining.event_obj_idx, 1);
         assert!(t.is_empty());
-        // No third connect completes anything — consumption was one-per-connect.
-        assert!(t.complete_by_name(h).is_none());
+        assert!(t.complete(0xA).is_none());
     }
 
     #[test]
@@ -2516,9 +2527,9 @@ mod tests {
     }
 
     #[test]
-    fn transceive_propagates_wrong_direction_write_error() {
-        // transceive is write-then-read; a direction-illegal write must surface as the error (and NOT
-        // then attempt the read). On an INBOUND pipe a server transceive write is rejected.
+    fn transceive_requires_full_duplex_message_mode() {
+        // ReactOS NpTransceive checks full-duplex + message read mode before attempting the write.
+        // On an INBOUND pipe the transaction is invalid and must not queue request bytes.
         let mut r = dx();
         let p = PipeParams {
             configuration: FILE_PIPE_INBOUND as u32,
@@ -2529,18 +2540,18 @@ mod tests {
         let _c = r.connect_client("inb").unwrap();
         assert_eq!(
             r.transceive(s, b"x", 16).unwrap_err(),
-            NtStatus::INVALID_PARAMETER
+            STATUS_INVALID_PIPE_STATE
         );
     }
 
     #[test]
     fn transceive_on_disconnected_pipe_errors() {
-        // transceive before a client connects → the underlying write hits the not-Connected guard.
+        // ReactOS NpTransceive decodes the CCB, then rejects a non-connected pipe state before writing.
         let mut r = dx();
         let s = r.create_server_pipe("d", PipeParams::default()).unwrap();
         assert_eq!(
             r.transceive(s, b"x", 16).unwrap_err(),
-            STATUS_PIPE_DISCONNECTED
+            STATUS_INVALID_PIPE_STATE
         );
     }
 
