@@ -114,9 +114,9 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   suppression through `NtSetInformationFile(FileIoCompletionNotificationInformation)`.
 - `[x]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
   next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
-- `[~]` I4: Fix the real service-control RPC/context-handle path now exposed by dynamic `wlansvc.exe`,
-  starting with the `FSCTL_PIPE_TRANSCEIVE -> STATUS_PIPE_BUSY` schedule failure and the rpcrt4
-  fault packet, using NPFS/RPC semantics rather than service-name or executable fallbacks.
+- `[~]` I4: Fix the real service-control RPC/context-handle path now exposed by dynamic service
+  startup, using NPFS/RPC/loader semantics rather than service-name, executable, or launch-order
+  fallbacks.
 
 ## Review Log
 
@@ -2226,27 +2226,49 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   writing through lsass' image mirror instead of the connector's image/global storage. Explicit
   copyout helpers now only use active mirrors when `ACTIVE_CLIENT_PI == pi`, and
   `lsa_complete_connect` selects the parked client's mirror context while publishing `*PortHandle`
-  and `ConnectInfo`. The LSA data plane also no longer fails a valid client request just because the
-  real server has not yet re-entered `NtReplyWaitReceivePort`; it parks the client request and
-  delivers the stored payload when the server parks again. Validation: `cargo fmt --all`,
-  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`, `git diff --check`, and serialized headless boot
-  `.tmp/boot-lsa-request-timing-20260810-204100.log` (previous proof:
-  `.tmp/boot-lsa-copyout-active-pi-stream-20260810-203714.log`). Both boots passed the base
-  desktop-background gate (`exec_win32k_desktop_painted`) but quiesced before any
-  `\LsaAuthenticationPort` client connect was delivered: services' LSA/SCM RPC workers loop in real
-  `NtDelayExecution(Alertable = FALSE, Timeout = 0x1058fd30)` after starting worker threads. Review
-  adjustment: keep these LPC/copyout semantics, then resolve that service-delay/progress edge so the
-  dynamic service wave reaches `wkssvc`/LSA again; do not relax quiesce with synthetic progress.
-- I4 LSA request timing fix staged. The later serialized headless run
+  and `ConnectInfo`. Serialized headless boot
+  `.tmp/boot-lsa-request-timing-20260810-204100.log` still passed the base desktop-background gate
+  (`exec_win32k_desktop_painted`) but quiesced before any `\LsaAuthenticationPort` client connect
+  was delivered. Review adjustment: keep the copyout fix, then remove the remaining LSA LPC
+  receive-order assumptions so the service wave can reach `wkssvc` without synthetic progress.
+- I4 queued LSA auth-port rendezvous staged. The later serialized headless run
   `.tmp/run-headless-lsa-lpc-20260810-203214.log` did reach `wkssvc`'s real
   `NtConnectPort(\LsaAuthenticationPort)`, copied back and cached the accepted handle, then exposed a
   real LPC wait-order bug: `wkssvc` immediately issued `LsaLookupAuthenticationPackage` while the LSA
   server thread was between receive calls, so the executive fell through to the generic
-  `NtRequestWaitReplyPort` failure path and returned `STATUS_INVALID_HANDLE`. NT parks that request
-  until the server calls `NtReplyWaitReceivePort`; the LSA rendezvous now stores one parked request
-  payload with the caller CID and delivers it as soon as the real LSA server re-enters its receive
-  syscall. Local validation: `cargo fmt --all` and `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: run one
-  serialized boot next and require the old `LsaLookupAuthenticationPackage() failed! (Status
-  0xc0000008)` edge to disappear before returning to the rpcrt4 context-handle frontier.
+  `NtRequestWaitReplyPort` failure path and returned `STATUS_INVALID_HANDLE`. NT queues both
+  connection and request messages on the port until the server calls `NtReplyWaitReceivePort`; the
+  LSA rendezvous now parks auth-port connects and data-plane requests with their payloads and drains
+  whichever pending client is present when the real server receive parks. Local validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: run one serialized boot next and
+  require the old `LsaLookupAuthenticationPackage() failed! (Status 0xc0000008)` edge to disappear
+  before returning to the rpcrt4 context-handle frontier.
+- I4 queued LSA auth-port rendezvous boot-proven by
+  `.tmp/boot-queued-lsa-rendezvous-20260810-204744.log`. The old
+  `LsaLookupAuthenticationPackage() failed! (Status 0xc0000008)` edge did not recur: a later
+  service client connected to `\LsaAuthenticationPort`, the real LSA server accepted it, the
+  connector cached the accepted handle, and the queued `ApiNumber=3` request was relayed and replied
+  through the parked server receive. Service startup advanced into the dynamic Browser service wave
+  (`browser ServiceMain`, real pipe listens, and SCM workers) before hitting the next genuine
+  frontier: `LoadLibraryExW(c:\windows\system32\wbem\wmisvc.dll)` reported `STATUS_DLL_NOT_FOUND`
+  even though the staged ReactOS tree contains `reactos\system32\wbem\wmisvc.dll`, and Browser's
+  real `RpcServerListen` then faulted after rpcrt4 could not find server context handle
+  `{209079a8-dd34-44b7-a91e-549be2d50a15}` on its association. Review adjustment: keep the LSA
+  queued rendezvous, then run one combined boot with the generic worker alias-paging cleanup before
+  splitting the next slice between real DLL search/image-demand lookup for `wbem` modules and
+  rpcrt4/NPFS association reuse. No fallback DLL success, service-name routing, or synthetic RPC
+  context handle should be added.
+- A4 worker alias-paging cleanup complete. The generic TP-worker spawn path no longer tracks a fixed
+  64-entry mirror page-table bitset derived from the historical services listener window. It now uses
+  the executive's growable paging helper for the requested stack mirror and scratch aliases, and
+  fails the thread spawn visibly if those aliases cannot be made reachable. Validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and combined headless boot
+  `.tmp/boot-combined-lsa-worker-alias-20260810-205754.log` (manually interrupted after the new
+  service/RPC frontier because headless QEMU did not self-exit once Browser faulted). Evidence: the
+  LSA queued connect/request/reply proof recurred with this change built into the image, generic
+  Browser/WKSSVC TP workers spawned on slots 3/4/9/10 without the old fixed-window alias failure, and
+  the run reached the same real red edge: `wmisvc.dll` file-missing demand load followed by rpcrt4
+  context-handle fault `0x1c00001a`. Review adjustment: commit this cleanup, then implement the
+  loader/image-demand path for nested `system32\wbem` DLLs before returning to RPC association state.

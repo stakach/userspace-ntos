@@ -6702,8 +6702,10 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = lsa_deliver_reply(&mut nt_handler, replymsg);
                 }
                 if lsa_server_park(badge, pi, recvmsg, ctx_out, resume_ip, sp, flags) {
-                    let delivered_waiting_request = lsa_try_deliver_pending_request(&mut nt_handler);
-                    if delivered_waiting_request {
+                    let delivered_waiting_client =
+                        lsa_try_deliver_pending_connect(&mut nt_handler)
+                            || lsa_try_deliver_pending_request(&mut nt_handler);
+                    if delivered_waiting_client {
                         bump_progress();
                     } else if LSA_SERVER_PARKS.load(Ordering::Relaxed) <= 4 {
                         print_str(b"[lsa-rdv] real LSA server thread (badge ");
@@ -6718,7 +6720,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    if !delivered_waiting_request {
+                    if !delivered_waiting_client {
                         mark_wait_parked!(pi, m0);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -7621,7 +7623,6 @@ pub(crate) unsafe fn service_sec_image(
                 // (`references/reactos/dll/win32/lsasrv/authport.c:163`).
                 if LSA_RENDEZVOUS_ENABLED
                     && nt_handler.lpc_rendezvous_conn != 0
-                    && lsa_server_parked()
                     && LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
                     && LSA_PENDING_CONN.load(Ordering::Relaxed) == 0
                 {
@@ -7648,8 +7649,6 @@ pub(crate) unsafe fn service_sec_image(
                                 }
                             }
                         }
-                        let client_pid = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
-                        let client_tid = nt_handler.current_tid;
                         LSA_PENDING_CONN.store(conn_id, Ordering::Relaxed);
                         LSA_ACCEPT_DECISION.store(0, Ordering::Relaxed);
                         LSA_COMPLETE_PENDING.store(0, Ordering::Relaxed);
@@ -7665,38 +7664,30 @@ pub(crate) unsafe fn service_sec_image(
                             sp,
                             flags,
                         ) {
-                            let delivered = lsa_server_deliver(
-                                &mut nt_handler,
-                                LSA_MSG_TYPE_CONNECTION_REQUEST,
-                                client_pid,
-                                client_tid,
-                                &conn_info[..conn_info_len],
-                                0,
-                            );
+                            lsa_store_connect_payload(&conn_info[..conn_info_len]);
+                            let delivered = lsa_try_deliver_pending_connect(&mut nt_handler);
                             if delivered {
-                                LSA_CONNECT_DELIVERED.fetch_add(1, Ordering::Relaxed);
-                                if pi == 2 {
-                                    WINLOGON_CRED_LSA_CONNECT.store(1, Ordering::Relaxed);
-                                }
+                                bump_progress();
+                            } else if lsa_server_parked() {
+                                let cap = LSA_CLI_REPLY_CAP.swap(0, Ordering::Relaxed);
+                                LSA_CLI_KIND.store(0, Ordering::Relaxed);
+                                LSA_PENDING_CONN.store(0, Ordering::Relaxed);
+                                lsa_clear_client_context();
+                                lsa_wake(cap, 0xC000_0001, resume_ip, sp, flags);
+                            } else {
                                 print_str(b"[lsa-rdv] pi=");
                                 print_u64(pi as u64);
                                 print_str(b" NtConnectPort(\\LsaAuthenticationPort) conn=");
                                 print_u64(conn_id);
                                 print_str(b" info=");
                                 print_u64(conn_info_len as u64);
-                                print_str(b"B -> delivered to the REAL LSA server; connector BLOCKED on the accept\n");
-                                bump_progress();
-                            } else {
-                                let cap = LSA_CLI_REPLY_CAP.swap(0, Ordering::Relaxed);
-                                LSA_CLI_KIND.store(0, Ordering::Relaxed);
-                                LSA_PENDING_CONN.store(0, Ordering::Relaxed);
-                                lsa_wake(cap, 0xC000_0001, resume_ip, sp, flags);
+                                print_str(b"B -> queued until the REAL LSA server receives; connector BLOCKED on the accept\n");
                             }
                             procs[pi].faults = faults;
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
-                            if delivered {
+                            if LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) != 0 {
                                 mark_wait_parked!(pi, resume_ip);
                             }
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -17900,6 +17891,7 @@ static LSA_CLI_FLAGS: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_TID: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_REQUEST_API: AtomicU64 = AtomicU64::new(u64::MAX);
 static LSA_CLI_REQUEST_LEN: AtomicU64 = AtomicU64::new(0);
+static mut LSA_CLI_CONNECT_INFO: [u8; LSA_CONNECTION_INFO_SIZE] = [0; LSA_CONNECTION_INFO_SIZE];
 static mut LSA_CLI_REQUEST: [u8; LSA_API_MSG_MAX] = [0; LSA_API_MSG_MAX];
 
 /// Steal the Reply object bound to the caller the loop is currently servicing and rotate a fresh pool
@@ -18140,6 +18132,62 @@ unsafe fn lsa_store_request_payload(api_number: u64, payload: &[u8]) {
     }
     LSA_CLI_REQUEST_API.store(api_number, Ordering::Relaxed);
     LSA_CLI_REQUEST_LEN.store(length as u64, Ordering::Relaxed);
+}
+
+unsafe fn lsa_store_connect_payload(payload: &[u8]) {
+    let length = payload.len().min(LSA_CONNECTION_INFO_SIZE);
+    if length != 0 {
+        let dst = core::ptr::addr_of_mut!(LSA_CLI_CONNECT_INFO) as *mut u8;
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), dst, length);
+    }
+    LSA_CLI_CONNINFO_LEN.store(length as u64, Ordering::Relaxed);
+}
+
+unsafe fn lsa_try_deliver_pending_connect(nt_handler: &mut ExecNtHandler) -> bool {
+    if LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
+        || LSA_CLI_KIND.load(Ordering::Relaxed) != 1
+        || LSA_PENDING_CONN.load(Ordering::Relaxed) == 0
+        || LSA_SRV_REPLY_CAP.load(Ordering::Relaxed) == 0
+    {
+        return false;
+    }
+    let Some(cli_pi) = lsa_recorded_pi(&LSA_CLI_PI) else {
+        return false;
+    };
+    let length = (LSA_CLI_CONNINFO_LEN.load(Ordering::Relaxed) as usize)
+        .min(LSA_CONNECTION_INFO_SIZE);
+    let payload = core::slice::from_raw_parts(
+        core::ptr::addr_of!(LSA_CLI_CONNECT_INFO) as *const u8,
+        length,
+    );
+    let client_pid = nt_handler.pm_pid_for_pi(cli_pi).unwrap_or(0) as u64;
+    let client_tid = LSA_CLI_TID.load(Ordering::Relaxed);
+    let delivered = lsa_server_deliver(
+        nt_handler,
+        LSA_MSG_TYPE_CONNECTION_REQUEST,
+        client_pid,
+        client_tid,
+        payload,
+        0,
+    );
+    if delivered {
+        LSA_CONNECT_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        if hosted_pi_has_role(
+            nt_handler,
+            cli_pi,
+            nt_exe_image::HostedProcessRole::InteractiveLogon,
+        ) {
+            WINLOGON_CRED_LSA_CONNECT.store(1, Ordering::Relaxed);
+        }
+        print_str(b"[lsa-rdv] pi=");
+        print_u64(cli_pi as u64);
+        print_str(b" NtConnectPort(\\LsaAuthenticationPort) conn=");
+        print_u64(LSA_PENDING_CONN.load(Ordering::Relaxed));
+        print_str(b" info=");
+        print_u64(length as u64);
+        print_str(b"B -> delivered to the REAL LSA server; connector BLOCKED on the accept\n");
+    }
+    delivered
 }
 
 unsafe fn lsa_try_deliver_pending_request(nt_handler: &mut ExecNtHandler) -> bool {

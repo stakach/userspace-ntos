@@ -390,7 +390,6 @@ pub const WL_WORKER3_TEB_VA: u64 = 0x0000_0100_1055_0000;
 pub const WL_WORKER3_TRAMP_VA: u64 = 0x0000_0100_1057_0000;
 pub const WL_WORKER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107D_0000;
 pub const WINLOGON_WORKER3_BADGE: u64 = 13;
-static HOSTED_STACK_MIRROR_PT_BITS: AtomicU64 = AtomicU64::new(0);
 pub const WINLOGON_WORKER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1388_0000;
 // --- services' RPC listener thread (the SCM's ScmStartRpcServer io_thread). Runs in services' OWN
 // pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
@@ -17953,6 +17952,28 @@ struct HostedThread {
 /// `call`s the context RIP (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$ is a net).
 /// Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
 /// spawns all express (see the thin wrappers below).
+unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> bool {
+    let mut ok = true;
+    if t.stack_mirror_va != 0 {
+        ok &= ensure_executive_paging(t.stack_mirror_va);
+        ok &= ensure_executive_paging(t.stack_mirror_va + (t.stack_frames + 1) * 0x1000);
+    }
+    ok &= ensure_executive_paging(scr);
+    ok &= ensure_executive_paging(scr + 0x4000);
+    if !ok {
+        print_str(b"[thread-life] executive alias paging failed pi=");
+        print_u64(t.client_pi);
+        print_str(b" stack_mirror=0x");
+        print_hex((t.stack_mirror_va >> 32) as u32);
+        print_hex(t.stack_mirror_va as u32);
+        print_str(b" scr=0x");
+        print_hex((scr >> 32) as u32);
+        print_hex(scr as u32);
+        print_str(b"\n");
+    }
+    ok
+}
+
 unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     let scr = t.scr;
     let resource_pi = t.client_pi as usize;
@@ -17967,28 +17988,11 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     if resource_slot.is_some() {
         window_resources.live = true;
     }
-    if t.stack_mirror_va != 0 {
-        let pt_base = t.stack_mirror_va & !0x1f_ffffu64;
-        let dynamic_base = SVC_LISTENER_STACK_MIRROR_VA & !0x1f_ffffu64;
-        // Low SM/CSR mirrors already live in FILEBUF's page table. Only create page tables for the
-        // dedicated high mirror window; checked_sub prevents low addresses wrapping the bit index.
-        if let Some(offset) = pt_base.checked_sub(dynamic_base) {
-            let pt_index = (offset >> 21) as u32;
-            if pt_index < 64 {
-                let bit = 1u64 << pt_index;
-                if HOSTED_STACK_MIRROR_PT_BITS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                    let pt = alloc_slot();
-                    let _ =
-                        untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                    let _ = paging_struct_map(
-                        pt,
-                        LBL_X86_PAGE_TABLE_MAP,
-                        pt_base,
-                        CAP_INIT_THREAD_VSPACE,
-                    );
-                }
-            }
+    if !ensure_hosted_thread_exec_alias_paging(t, scr) {
+        if let Some(slot) = resource_slot {
+            release_hosted_tp_worker_window_resources(resource_pi, slot);
         }
+        return HostedThreadSpawnResult::failed();
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
     // rendezvous's out-param copyout. GUI-client stacks must also be discoverable by win32k's
