@@ -86,9 +86,9 @@ struct RawExceptionRecord {
 const _: [(); 0x98] = [(); core::mem::size_of::<RawExceptionRecord>()];
 
 /// `NtContinue` SSN (shared `nt-syscall-abi` table).
-const SSN_NT_CONTINUE: u32 = 0x43;
+const SSN_NT_CONTINUE: u32 = 34;
 /// `NtRaiseException` SSN.
-const SSN_NT_RAISE_EXCEPTION: u32 = 0x2E;
+const SSN_NT_RAISE_EXCEPTION: u32 = 189;
 
 // =================================================================================================
 // CONTEXT <-> the pure Context model
@@ -629,9 +629,9 @@ pub unsafe fn rtl_raise_exception(record: *mut c_void) {
         if rtl_dispatch_exception(record, ctx.as_mut_ptr()) {
             nt_continue(ctx.as_mut_ptr()); // does not return
         }
-        // Unhandled: last-chance → terminate the process (honest non-return, never a silent
-        // continue). NtRaiseException(FirstChance=FALSE) is the kernel path; until the executive
-        // services it, an `int3` (→ the kernel #BP handler) terminates deterministically.
+        // Unhandled: last-chance → the kernel's `NtRaiseException` path. A plain boot has no
+        // debugger attached, so the executive terminates the reporting process without returning to
+        // this frame.
         nt_raise_exception(record, ctx.as_mut_ptr(), 0 /*FirstChance=FALSE*/);
     }
 }
@@ -1096,19 +1096,28 @@ unsafe extern "C" fn restore_context(_context: *mut u8) -> ! {
     );
 }
 
-/// `NtRaiseException(EXCEPTION_RECORD*, CONTEXT*, FirstChance)` — the last-chance raise into the
-/// kernel. On `FirstChance=FALSE` this is the unhandled-exception terminate. The executive does not
-/// yet service `NtRaiseException` (SSN reserved), so we terminate deterministically via `int3` (→ the
-/// kernel #BP handler) — an HONEST non-return for an unhandled exception, never a silent continue.
-/// When the executive services `NtRaiseException`, swap the `int3` for the trap.
+/// `NtRaiseException(EXCEPTION_RECORD*, CONTEXT*, FirstChance)` — raise into the kernel. On
+/// `FirstChance=FALSE` this is the unhandled-exception path; without a debugger the executive
+/// terminates the process and does not return to this frame.
 ///
 /// # Safety
 /// `record`/`context` valid. Does not return.
-unsafe fn nt_raise_exception(record: *mut c_void, context: *mut u8, _first_chance: u64) -> ! {
-    let _ = (record, context, SSN_NT_RAISE_EXCEPTION, SSN_NT_CONTINUE);
-    // SAFETY: int3 traps to the kernel #BP handler → process terminates; does not return.
+unsafe fn nt_raise_exception(record: *mut c_void, context: *mut u8, first_chance: u64) -> ! {
+    let _ = SSN_NT_CONTINUE;
+    // SAFETY: the caller has built valid exception/context records. A successful last-chance raise
+    // is non-returning; a returned NTSTATUS means the executive could not complete the raise.
+    let _status = unsafe {
+        crate::on_target::seh_syscall3(
+            SSN_NT_RAISE_EXCEPTION,
+            record as u64,
+            context as u64,
+            first_chance,
+        )
+    };
+    // An `NtRaiseException` return is itself fatal to this path: there is no original control flow
+    // left to resume after an unhandled exception.
     unsafe {
-        core::arch::asm!("int3", options(noreturn));
+        core::arch::asm!("ud2", options(noreturn));
     }
 }
 

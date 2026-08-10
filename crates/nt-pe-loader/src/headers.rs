@@ -19,8 +19,8 @@ pub const DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
 
 /// Section characteristics (subset).
 pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+pub const IMAGE_SCN_MEM_SHARED: u32 = 0x1000_0000;
 pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-#[allow(dead_code)] // documented PE constant, not consulted yet
 pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
@@ -204,8 +204,14 @@ impl Section {
     pub fn is_executable(&self) -> bool {
         self.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
     }
+    pub fn is_readable(&self) -> bool {
+        self.characteristics & IMAGE_SCN_MEM_READ != 0
+    }
     pub fn is_writable(&self) -> bool {
         self.characteristics & IMAGE_SCN_MEM_WRITE != 0
+    }
+    pub fn is_shared(&self) -> bool {
+        self.characteristics & IMAGE_SCN_MEM_SHARED != 0
     }
     pub fn is_uninitialized(&self) -> bool {
         self.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0

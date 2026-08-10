@@ -4479,35 +4479,6 @@ pub(crate) unsafe fn service_sec_image(
         first = procs[pi].first;
         ntfaults = procs[pi].ntfaults;
         *filled_pages = pfilled[pi];
-        if pi == 2 {
-            let watch = KERNEL32_TABLE_WATCH_SCRATCH.load(Ordering::Relaxed);
-            if watch != 0 {
-                // BaseHeapHandleTable+8 is zero after the kernel32 BSS page is materialized. The
-                // value below is the first eight bytes of the msgina dialog-resource signature
-                // observed in the corrupt page. Catch the first client event after it changes.
-                let value = core::ptr::read_volatile((watch + 0x648) as *const u64);
-                if value == 0x0039_003c_5081_0080
-                    && KERNEL32_TABLE_WATCH_CORRUPT.swap(1, Ordering::Relaxed) == 0
-                {
-                    print_str(b"[alias-corrupt] badge=");
-                    print_u64(badge);
-                    print_str(b" label=0x");
-                    print_hex((mi >> 12) as u32);
-                    print_str(b" m0=0x");
-                    print_hex((m0 >> 32) as u32);
-                    print_hex(m0 as u32);
-                    print_str(b" m1=0x");
-                    print_hex((m1 >> 32) as u32);
-                    print_hex(m1 as u32);
-                    print_str(b" faults=");
-                    print_u64(faults);
-                    print_str(b" scratch=0x");
-                    print_hex((watch >> 32) as u32);
-                    print_hex(watch as u32);
-                    print_str(b"\n");
-                }
-            }
-        }
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
         // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
@@ -6012,6 +5983,13 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         ) {
                             Ok(()) => {
+                                for filled_page in
+                                    filled_pages.iter_mut().take(faults as usize)
+                                {
+                                    if *filled_page == bpage {
+                                        *filled_page = 0;
+                                    }
+                                }
                                 bi += 1;
                                 continue;
                             }
@@ -6113,37 +6091,6 @@ pub(crate) unsafe fn service_sec_image(
                     let scratch = scratch_base + faults * 0x1000;
                     let (f, fe) = alloc_frame_r();
                     let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                    if pi == 2 && bpage == 0x8230_e000 {
-                        let (old, old_index) = csrss_frame_get_exact(2, 0x8045_1000);
-                        print_str(b"[alias-diag] msgina-before faults=");
-                        print_u64(faults);
-                        print_str(b" scratch=0x");
-                        print_hex((scratch >> 32) as u32);
-                        print_hex(scratch as u32);
-                        print_str(b" new-cap=0x");
-                        print_hex(f as u32);
-                        print_str(b" new-pa=0x");
-                        let new_pa = if fe == 0 { get_frame_paddr(f) } else { 0 };
-                        print_hex((new_pa >> 32) as u32);
-                        print_hex(new_pa as u32);
-                        print_str(b" old-cap=0x");
-                        print_hex(old as u32);
-                        print_str(b" old-pa=0x");
-                        let old_pa = if old != 0 { get_frame_paddr(old) } else { 0 };
-                        print_hex((old_pa >> 32) as u32);
-                        print_hex(old_pa as u32);
-                        print_str(b" old-idx=");
-                        print_u64(if old_index == usize::MAX {
-                            u64::MAX
-                        } else {
-                            old_index as u64
-                        });
-                        print_str(b" retype=");
-                        print_u64(fe);
-                        print_str(b" smap=");
-                        print_u64(se);
-                        print_str(b"\n");
-                    }
                     // ★ ROBUSTNESS (must precede the fill): fill_image_page WRITES the PE bytes THROUGH
                     // the scratch alias. If alloc_frame_r / page_map_r failed (untyped pool or CNode
                     // slots exhausted — the frame pressure eager-map front-loads), the scratch VA is
@@ -6165,21 +6112,6 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     }
                     let _filled_rights = fill_image_page(tpe, rva, scratch);
-                    if pi == 2 && bpage == 0x8045_1000 {
-                        KERNEL32_TABLE_WATCH_SCRATCH.store(scratch, Ordering::Relaxed);
-                        print_str(b"[alias-watch] kernel32 table faults=");
-                        print_u64(faults);
-                        print_str(b" scratch=0x");
-                        print_hex((scratch >> 32) as u32);
-                        print_hex(scratch as u32);
-                        print_str(b" cap=0x");
-                        print_hex(f as u32);
-                        print_str(b" pa=0x");
-                        let pa = get_frame_paddr(f);
-                        print_hex((pa >> 32) as u32);
-                        print_hex(pa as u32);
-                        print_str(b"\n");
-                    }
                     if shareable {
                         dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
                     } else {
@@ -6875,6 +6807,7 @@ pub(crate) unsafe fn service_sec_image(
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
             let mut redirected_user_apc = false;
+            let mut redirected_context_continue = false;
             // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
             // by withholding a reply. Self-termination does not use this flag: its explicit post
             // action deletes the bound Reply cap and caller TCB before receiving again.
@@ -6977,6 +6910,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.post_action = ExecPostAction::None;
                 nt_handler.stop = false;
                 nt_handler.user_apc_redirected = false;
+                nt_handler.context_continue_redirected = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.mutable_hives_dirty = false;
                 nt_handler.hosted_exe_dirty = false;
@@ -7132,6 +7066,9 @@ pub(crate) unsafe fn service_sec_image(
                     if nt_handler.user_apc_redirected {
                         redirected_user_apc = true;
                     }
+                    if nt_handler.context_continue_redirected {
+                        redirected_context_continue = true;
+                    }
                     if nt_handler.stop {
                         handled = false; // handler couldn't service → stop with the SSN recorded
                     }
@@ -7221,6 +7158,67 @@ pub(crate) unsafe fn service_sec_image(
                 // caller immediately. Remote termination tears down its target but still replies to
                 // the caller through the normal tail below.
                 match nt_handler.post_action {
+                    ExecPostAction::ContinueCurrentThread {
+                        tid,
+                        tcb,
+                        registers,
+                    } => {
+                        let reply_dropped = drop_current_syscall_reply();
+                        let write_error = if reply_dropped {
+                            crate::win32k_glue::tcb_write_regs20(tcb, &registers, true)
+                        } else {
+                            1
+                        };
+                        if reply_dropped && write_error == 0 {
+                            print_str(b"[seh-continue] tid=");
+                            print_u64(tid);
+                            print_str(b" rip=0x");
+                            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RIP]);
+                            print_str(b" rsp=0x");
+                            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RSP]);
+                            print_str(b" -> recv without reply\n");
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                recv_full_r12(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                        print_str(b"[seh-continue] failed tid=");
+                        print_u64(tid);
+                        print_str(b" reply-dropped=");
+                        print_u64(reply_dropped as u64);
+                        print_str(b" write=");
+                        print_u64(write_error);
+                        print_str(b"\n");
+                        if reply_dropped {
+                            let _ =
+                                terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                recv_full_r12(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                        result = 0xC000_0001;
+                    }
                     ExecPostAction::TerminateCurrentThread { tid } => {
                         let reply_dropped = drop_current_syscall_reply();
                         let mechanism_deleted =
@@ -13366,7 +13364,8 @@ pub(crate) unsafe fn service_sec_image(
                 // fault reply the redirect staged, not with a syscall result. User APC delivery uses
                 // the same shape because the APC dispatcher frame already carries the eventual
                 // STATUS_USER_APC return in the restored context.
-                let redirected_user_control = redirected_user_callback || redirected_user_apc;
+                let redirected_user_control =
+                    redirected_user_callback || redirected_user_apc || redirected_context_continue;
                 let len = if redirected_user_control { 0 } else { 18 };
                 let (r0, r1, r3) = if redirected_user_control {
                     (0, 0, 0)

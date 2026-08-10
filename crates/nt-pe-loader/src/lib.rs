@@ -62,13 +62,19 @@ impl Protection {
 /// memory queries and fault planning.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageProtection {
-    /// Headers, gaps, or read-only section data.
+    /// Headers, gaps, or shared read-only section data.
     ReadOnly,
-    /// Writable data, initially mapped read-only and made private on first write.
+    /// Shared writable image data.
+    ReadWrite,
+    /// Non-shared data, initially mapped read-only and made private on first write.
     WriteCopy,
+    /// Executable code without read/write access in the section header.
+    Execute,
     /// Executable code, readable but not writable.
     ExecuteRead,
-    /// Executable+writable code/data, initially executable-read and made private on first write.
+    /// Shared executable+writable image data.
+    ExecuteReadWrite,
+    /// Non-shared executable code/data, initially executable-read and made private on first write.
     ExecuteWriteCopy,
 }
 
@@ -77,7 +83,10 @@ impl ImageProtection {
     pub fn executable(self) -> bool {
         matches!(
             self,
-            ImageProtection::ExecuteRead | ImageProtection::ExecuteWriteCopy
+            ImageProtection::Execute
+                | ImageProtection::ExecuteRead
+                | ImageProtection::ExecuteReadWrite
+                | ImageProtection::ExecuteWriteCopy
         )
     }
 
@@ -365,9 +374,10 @@ impl<'a> PeFile<'a> {
 
     /// The NT SEC_IMAGE allocation protection for the page at `rva`.
     ///
-    /// Unlike [`PeFile::protection_at`], writable image sections are write-copy:
-    /// each process initially sees a read-only/executable-read image page and
-    /// receives a private page when it first writes loader fixups or runtime data.
+    /// Unlike [`PeFile::protection_at`], SEC_IMAGE mappings give every
+    /// non-shared section write-copy behavior: processes initially share image
+    /// pages, then receive private pages when loader fixups or runtime writes
+    /// touch them.
     pub fn image_protection_at(&self, rva: u32) -> ImageProtection {
         if rva < page_align_up(self.headers.size_of_headers) {
             return ImageProtection::ReadOnly;
@@ -376,11 +386,20 @@ impl<'a> PeFile<'a> {
             let start = s.virtual_address;
             let size = page_align_up(s.virtual_size.max(s.size_of_raw_data));
             if rva >= start && rva - start < size {
-                return match (s.is_executable(), s.is_writable()) {
-                    (true, true) => ImageProtection::ExecuteWriteCopy,
-                    (true, false) => ImageProtection::ExecuteRead,
-                    (false, true) => ImageProtection::WriteCopy,
-                    (false, false) => ImageProtection::ReadOnly,
+                if !s.is_shared() {
+                    return if s.is_executable() {
+                        ImageProtection::ExecuteWriteCopy
+                    } else {
+                        ImageProtection::WriteCopy
+                    };
+                }
+                return match (s.is_executable(), s.is_readable(), s.is_writable()) {
+                    (true, _, true) => ImageProtection::ExecuteReadWrite,
+                    (true, true, false) => ImageProtection::ExecuteRead,
+                    (true, false, false) => ImageProtection::Execute,
+                    (false, _, true) => ImageProtection::ReadWrite,
+                    (false, true, false) => ImageProtection::ReadOnly,
+                    (false, false, false) => ImageProtection::ReadOnly,
                 };
             }
         }

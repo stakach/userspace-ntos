@@ -135,6 +135,9 @@ pub enum NativeService {
     NtPlugPlayControl,
     NtSetSystemPowerState,
     NtRaiseHardError,
+    // Structured exception handling (§16.6)
+    NtContinue,
+    NtRaiseException,
     // Additional services the executive hosts for real binaries (smss/csrss). These are real
     // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
     // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
@@ -310,6 +313,8 @@ impl NativeService {
             NtPlugPlayControl => "NtPlugPlayControl",
             NtSetSystemPowerState => "NtSetSystemPowerState",
             NtRaiseHardError => "NtRaiseHardError",
+            NtContinue => "NtContinue",
+            NtRaiseException => "NtRaiseException",
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
@@ -530,6 +535,8 @@ impl NativeService {
         NativeService::NtQueryFullAttributesFile,
         NativeService::NtSaveKey,
         NativeService::NtCancelIoFile,
+        NativeService::NtContinue,
+        NativeService::NtRaiseException,
     ];
 }
 

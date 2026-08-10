@@ -24718,6 +24718,7 @@ zw_alias!(
     nt_complete_connect_port
 );
 zw_alias!(zw_connect_port, "ZwConnectPort", nt_connect_port);
+zw_alias!(zw_continue, "ZwContinue", nt_continue);
 zw_alias!(
     zw_create_debug_object,
     "ZwCreateDebugObject",
@@ -25134,6 +25135,11 @@ zw_alias!(
     nt_query_volume_information_file
 );
 zw_alias!(zw_queue_apc_thread, "ZwQueueApcThread", nt_queue_apc_thread);
+zw_alias!(
+    zw_raise_exception,
+    "ZwRaiseException",
+    nt_raise_exception
+);
 zw_alias!(zw_raise_hard_error, "ZwRaiseHardError", nt_raise_hard_error);
 zw_alias!(zw_read_file, "ZwReadFile", nt_read_file);
 zw_alias!(
@@ -30061,6 +30067,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_close_object_audit_alarm as *const () as usize,
         zw_complete_connect_port as *const () as usize,
         zw_connect_port as *const () as usize,
+        zw_continue as *const () as usize,
         zw_create_directory_object as *const () as usize,
         zw_create_event as *const () as usize,
         zw_create_file as *const () as usize,
@@ -30182,6 +30189,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_query_virtual_memory as *const () as usize,
         zw_query_volume_information_file as *const () as usize,
         zw_queue_apc_thread as *const () as usize,
+        zw_raise_exception as *const () as usize,
         zw_raise_hard_error as *const () as usize,
         zw_read_file as *const () as usize,
         zw_read_file_scatter as *const () as usize,

@@ -339,18 +339,54 @@ fn image_protection_uses_sec_image_writecopy() {
         chars: 0xE000_0020, // CODE | EXECUTE | READ | WRITE
         data: vec![0xC3],
     };
+    let shared_ro = Sec {
+        name: *b".sro\0\0\0\0",
+        va: 0x5000,
+        chars: 0x5000_0040, // SHARED | INITIALIZED_DATA | READ
+        data: vec![0u8; 8],
+    };
+    let shared_rw = Sec {
+        name: *b".srw\0\0\0\0",
+        va: 0x6000,
+        chars: 0xD000_0040, // SHARED | INITIALIZED_DATA | READ | WRITE
+        data: vec![0u8; 8],
+    };
+    let shared_x = Sec {
+        name: *b".sx\0\0\0\0\0",
+        va: 0x7000,
+        chars: 0x3000_0020, // SHARED | CODE | EXECUTE
+        data: vec![0xC3],
+    };
+    let shared_xw = Sec {
+        name: *b".sxw\0\0\0\0",
+        va: 0x8000,
+        chars: 0xF000_0020, // SHARED | CODE | EXECUTE | READ | WRITE
+        data: vec![0xC3],
+    };
     let pe_bytes = build_pe(
         BASE,
         0x1000,
-        0x5000,
-        &[text_section(0x1000, vec![0xC3]), rdata, data, wexec],
+        0x9000,
+        &[
+            text_section(0x1000, vec![0xC3]),
+            rdata,
+            data,
+            wexec,
+            shared_ro,
+            shared_rw,
+            shared_x,
+            shared_xw,
+        ],
         &[],
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
 
     assert_eq!(pe.image_protection_at(0x0000), ImageProtection::ReadOnly);
-    assert_eq!(pe.image_protection_at(0x1000), ImageProtection::ExecuteRead);
-    assert_eq!(pe.image_protection_at(0x2000), ImageProtection::ReadOnly);
+    assert_eq!(
+        pe.image_protection_at(0x1000),
+        ImageProtection::ExecuteWriteCopy
+    );
+    assert_eq!(pe.image_protection_at(0x2000), ImageProtection::WriteCopy);
     assert_eq!(pe.image_protection_at(0x3000), ImageProtection::WriteCopy);
     assert_eq!(
         pe.image_protection_at(0x4000),
@@ -360,8 +396,17 @@ fn image_protection_uses_sec_image_writecopy() {
         pe.image_protection_at(0x4fff),
         ImageProtection::ExecuteWriteCopy
     );
+    assert_eq!(pe.image_protection_at(0x5000), ImageProtection::ReadOnly);
+    assert_eq!(pe.image_protection_at(0x6000), ImageProtection::ReadWrite);
+    assert_eq!(pe.image_protection_at(0x7000), ImageProtection::Execute);
+    assert_eq!(
+        pe.image_protection_at(0x8000),
+        ImageProtection::ExecuteReadWrite
+    );
     assert!(pe.image_protection_at(0x4000).executable());
+    assert!(pe.image_protection_at(0x2000).copy_on_write());
     assert!(pe.image_protection_at(0x3000).copy_on_write());
+    assert!(!pe.image_protection_at(0x6000).copy_on_write());
 }
 
 #[test]

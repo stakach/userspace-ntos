@@ -221,6 +221,18 @@ gate (`SUCCESS ... win32k desktop painted (0x003a6ea5)`) with `\net\NtControlPip
 `[pipe-listen] REFUSED unnamed`, `NtCancelIoFile`, `EVENT_CONNECTION_TIMEOUT`, service `Error 1053`,
 or `unhandled-syscall` signatures.
 
+Current branch frontier after the SEC_IMAGE/ntdll SEH slice:
+`.tmp/boot-cow-alias-desktop-20260810-225615.log` rebuilds through the desktop runner and moves past
+the previous winsrv media-event initialization failure. `winsrv.dll` imports are complete,
+`NtUserInitialize` publishes the power/media events, winlogon reaches the real base desktop
+framebuffer readback (`desktop-bg 768/768`), real user callbacks continue, and dynamic service
+children run through wkssvc/browser/srvsvc/wlansvc/spoolsv paths. This is not yet an accepted
+desktop-shell proof: the run was manually stopped before harness success, periodic census still
+reports `explorer total=0`, and repeated service `RpcServerListen() failed (Status 6b1)` messages
+are the active red edge. Continue from generic RPC/NPFS association/listener semantics and dynamic
+service-thread behavior; do not add service-name, executable-order, userinit/explorer, or paint
+fallbacks.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -2673,3 +2685,19 @@ or `unhandled-syscall` signatures.
   `git diff --check`. Review adjustment: rerun exactly one uncontended boot and use the dynamic
   worker trace to decide whether the next shell frontier is SCM pipe liveness, service-control RPC,
   or explorer chrome paint.
+
+- J1/J2 SEC_IMAGE COW and native SEH slice. PE image pages now carry NT-style SEC_IMAGE allocation
+  protections, including shared read/write/execute pages and non-shared write-copy pages. User-fault
+  and kernel-copyout COW promotion preserve process-private ownership plus durable executive aliases,
+  stale hosted image frame registrations are dropped on slot reuse, and image fault replay stops
+  treating a promoted COW page as still filled from the shared source. ntdll now exports and dispatches
+  `NtContinue`/`ZwContinue` and `NtRaiseException`/`ZwRaiseException`, while the executive applies
+  `NtContinue` register state to the current hosted thread and routes last-chance raises through the
+  Dbgk/process termination path. Validation: `cargo fmt --all`, `cargo test -p nt-pe-loader`,
+  `cargo test -p nt-syscall-abi`, `cargo test -p nt-syscall`,
+  `cargo test --manifest-path crates/nt-ntdll/Cargo.toml`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  desktop run `.tmp/boot-cow-alias-desktop-20260810-225615.log`. Result: the winsrv media-event
+  blocker is gone and dynamic services plus winlogon callbacks continue, but explorer has not
+  launched (`explorer total=0`) and repeated service RPC listener failure (`Status 6b1`) is the next
+  real target.

@@ -1156,6 +1156,10 @@ pub const SSN_NT_SUSPEND_PROCESS: u64 = 262;
 /// UUID seed probes the caller buffer but no kernel UUID allocator currently reads the cached value.
 pub const SSN_NT_SET_SYSTEM_POWER_STATE: u64 = 250;
 pub const SSN_NT_SET_UUID_SEED: u64 = 255;
+/// SEH/context native services. `NtContinue` restores a kernel-delivered user context; last-chance
+/// `NtRaiseException` reports to Dbgk when a debugger is attached and otherwise tears the process down.
+pub const SSN_NT_CONTINUE: u64 = 34;
+pub const SSN_NT_RAISE_EXCEPTION: u64 = 189;
 /// **Dbgk — the user-mode debugging plane** (`ntoskrnl/dbgk`). The five debug-object services our
 /// ntdll's `DbgUi*` wrappers issue (`references/reactos/dll/ntdll/dbg/dbgui.c`), each with its
 /// `sysfuncs.lst`-derived SSN (0-based line index — `NtCreateDebugObject` is line 36, …). Serviced
@@ -2818,8 +2822,6 @@ static WINLOGON_HANDLE_FAULT_DIAG_N: AtomicU64 = AtomicU64::new(0);
 /// `RtlEnterCriticalSection` — the `RTL_CRITICAL_SECTION` the caller handed us, so the wall is
 /// MEASURED rather than attributed.
 pub(crate) static WL_CPUEXC_DIAG_N: AtomicU64 = AtomicU64::new(0);
-static KERNEL32_TABLE_WATCH_SCRATCH: AtomicU64 = AtomicU64::new(0);
-static KERNEL32_TABLE_WATCH_CORRUPT: AtomicU64 = AtomicU64::new(0);
 /// (B) SPIN WATCHDOG for the win32k dispatch. A hosted GUI client (notably csrss's user32
 /// RegisterSystemClasses loop) can call the SAME win32k SSN over and over when win32k WALLs the
 /// call (returns STATUS_UNSUCCESSFUL / asserts) — a NON-terminating loop that issues syscalls (so it
@@ -7040,6 +7042,41 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
     }
     None
 }
+
+pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    let start = base & !0xfff;
+    let end = base.saturating_add(size.saturating_sub(1)) & !0xfff;
+    let mut page = start;
+    let mut dropped = 0u64;
+    loop {
+        while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
+            if owns_frame {
+                vm_frame_release(frame, alias_cap);
+            } else {
+                recycle_mapped_cap(frame);
+                if alias_cap != frame {
+                    recycle_mapped_cap(alias_cap);
+                }
+            }
+            if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+                recycle_plain_cap(source_cap);
+            }
+            dropped = dropped.saturating_add(1);
+        }
+        if page >= end {
+            break;
+        }
+        let next = page.saturating_add(0x1000);
+        if next <= page {
+            break;
+        }
+        page = next;
+    }
+    dropped
+}
 /// Exact per-process frame lookup. Unlike `csrss_frame_get`, this never falls back to the shared
 /// executable-page cache, which is important when deciding whether a writable client page has a
 /// persistent private backing frame.
@@ -10065,6 +10102,7 @@ unsafe fn vm_promote_image_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    #[derive(Clone, Copy)]
     enum OldImageMapping {
         Exact {
             alias: u64,
@@ -10073,6 +10111,41 @@ unsafe fn vm_promote_image_cow_page(
             owns_frame: bool,
         },
         Shared,
+    }
+
+    unsafe fn restore_old_image_mapping(
+        pi: usize,
+        page: u64,
+        old_map_cap: u64,
+        old_mapping: OldImageMapping,
+        old_protection: u32,
+        pml4: u64,
+    ) {
+        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
+        match old_mapping {
+            OldImageMapping::Exact {
+                alias,
+                alias_cap,
+                source_cap,
+                owns_frame,
+            } => {
+                if alias != 0 && alias_cap != 0 {
+                    let _ = page_map_r(alias_cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+                let _ = csrss_frame_put_at_cap_source_owned(
+                    pi as u64,
+                    page,
+                    old_map_cap,
+                    alias,
+                    alias_cap,
+                    source_cap,
+                    owns_frame,
+                );
+            }
+            OldImageMapping::Shared => {
+                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
+            }
+        }
     }
 
     let exact_record = csrss_frame_get_exact_record(pi as u64, page);
@@ -10126,58 +10199,60 @@ unsafe fn vm_promote_image_cow_page(
         (map_cap, OldImageMapping::Shared)
     };
     let _ = page_unmap_r(old_map_cap);
+    let retained_alias = match old_mapping {
+        OldImageMapping::Exact {
+            alias, alias_cap, ..
+        } if alias != 0 && alias_cap != 0 => {
+            let _ = page_unmap_r(alias_cap);
+            alias
+        }
+        _ => 0,
+    };
     let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
     if map_error != 0 {
-        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
-        match old_mapping {
-            OldImageMapping::Exact {
-                alias,
-                alias_cap,
-                source_cap,
-                owns_frame,
-            } => {
-                let _ = csrss_frame_put_at_cap_source_owned(
-                    pi as u64,
-                    page,
-                    old_map_cap,
-                    alias,
-                    alias_cap,
-                    source_cap,
-                    owns_frame,
-                );
-            }
-            OldImageMapping::Shared => {
-                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
-            }
-        }
+        restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    if !csrss_frame_put_at_cap_source_owned(pi as u64, page, new_frame, 0, 0, 0, true) {
+
+    let mut new_alias_cap = 0;
+    if retained_alias != 0 {
+        let (alias_cap, alias_copy_error) = copy_cap_r(new_frame);
+        if alias_copy_error != 0 {
+            if alias_cap != 0 {
+                let _ = cnode_delete_recycle_r(alias_cap);
+            }
+            let _ = page_unmap_r(new_frame);
+            restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if page_map_r(alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            let _ = cnode_delete_recycle_r(alias_cap);
+            let _ = page_unmap_r(new_frame);
+            restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        new_alias_cap = alias_cap;
+    }
+
+    if !csrss_frame_put_at_cap_source_owned(
+        pi as u64,
+        page,
+        new_frame,
+        retained_alias,
+        new_alias_cap,
+        0,
+        true,
+    ) {
+        if new_alias_cap != 0 {
+            let _ = page_unmap_r(new_alias_cap);
+            let _ = cnode_delete_recycle_r(new_alias_cap);
+        }
         let _ = page_unmap_r(new_frame);
         vm_frame_release(new_frame, 0);
-        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
-        match old_mapping {
-            OldImageMapping::Exact {
-                alias,
-                alias_cap,
-                source_cap,
-                owns_frame,
-            } => {
-                let _ = csrss_frame_put_at_cap_source_owned(
-                    pi as u64,
-                    page,
-                    old_map_cap,
-                    alias,
-                    alias_cap,
-                    source_cap,
-                    owns_frame,
-                );
-            }
-            OldImageMapping::Shared => {
-                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
-            }
-        }
+        restore_old_image_mapping(pi, page, old_map_cap, old_mapping, old_protection, pml4);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
@@ -10197,6 +10272,35 @@ unsafe fn vm_promote_image_cow_page(
     Ok(())
 }
 
+pub(crate) unsafe fn vm_promote_image_cow_for_kernel_write(
+    pi: usize,
+    page: u64,
+    image_protection: u32,
+    pml4: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let write_plan = nt_address_space::image_view_fault_plan(image_protection, true);
+    if !write_plan.copy_on_write {
+        return Ok(());
+    }
+    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
+        if record.owns_frame {
+            return Ok(());
+        }
+    } else if shared_image_mapping_get(pi as u64, page).is_none() {
+        return Ok(());
+    }
+    let read_plan = nt_address_space::image_view_fault_plan(image_protection, false);
+    vm_promote_image_cow_page(
+        pi,
+        page,
+        read_plan.map_protection,
+        write_plan.map_protection,
+        pml4,
+        scratch_base,
+    )
+}
+
 unsafe fn vm_promote_mapped_cow_page(
     pi: usize,
     page: u64,
@@ -10206,6 +10310,36 @@ unsafe fn vm_promote_mapped_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    unsafe fn restore_old_mapped_mapping(
+        pi: usize,
+        page: u64,
+        old_mapping: Option<(u64, u64, u64, bool)>,
+        retained_alias: u64,
+        old_protection: u32,
+        pml4: u64,
+    ) {
+        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
+            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
+            if retained_alias != 0 && old_alias_cap != 0 {
+                let _ = page_map_r(
+                    old_alias_cap,
+                    retained_alias,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            let _ = csrss_frame_put_at_cap_source_owned(
+                pi as u64,
+                page,
+                old_frame,
+                retained_alias,
+                old_alias_cap,
+                old_source_cap,
+                old_owns_frame,
+            );
+        }
+    }
+
     let exact_record = csrss_frame_get_exact_record(pi as u64, page);
     if let Some(record) = exact_record {
         if record.owns_frame {
@@ -10231,6 +10365,7 @@ unsafe fn vm_promote_mapped_cow_page(
         return Err(status);
     }
 
+    let retained_alias = exact_record.map(|record| record.alias).unwrap_or(0);
     let old_mapping = if exact_record.is_some() {
         let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) =
             csrss_frame_take(pi as u64, page)
@@ -10239,61 +10374,100 @@ unsafe fn vm_promote_mapped_cow_page(
             return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
         };
         let _ = page_unmap_r(old_frame);
+        if retained_alias != 0 && old_alias_cap != 0 {
+            let _ = page_unmap_r(old_alias_cap);
+        }
         Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame))
     } else {
         None
     };
 
     if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
-        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
-            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
-            let _ = csrss_frame_put_at_cap_source_owned(
-                pi as u64,
-                page,
-                old_frame,
-                0,
-                old_alias_cap,
-                old_source_cap,
-                old_owns_frame,
-            );
-        }
+        restore_old_mapped_mapping(
+            pi,
+            page,
+            old_mapping,
+            retained_alias,
+            old_protection,
+            pml4,
+        );
         vm_frame_release(new_frame, 0);
         return Err(status);
     }
 
     let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
     if map_error != 0 {
-        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
-            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
-            let _ = csrss_frame_put_at_cap_source_owned(
-                pi as u64,
-                page,
-                old_frame,
-                0,
-                old_alias_cap,
-                old_source_cap,
-                old_owns_frame,
-            );
-        }
+        restore_old_mapped_mapping(
+            pi,
+            page,
+            old_mapping,
+            retained_alias,
+            old_protection,
+            pml4,
+        );
         vm_frame_release(new_frame, 0);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
-    if !csrss_frame_put_at_cap_source_owned(pi as u64, page, new_frame, 0, 0, 0, true) {
+    let mut new_alias_cap = 0;
+    if retained_alias != 0 {
+        let (alias_cap, alias_copy_error) = copy_cap_r(new_frame);
+        if alias_copy_error != 0 {
+            if alias_cap != 0 {
+                let _ = cnode_delete_recycle_r(alias_cap);
+            }
+            let _ = page_unmap_r(new_frame);
+            restore_old_mapped_mapping(
+                pi,
+                page,
+                old_mapping,
+                retained_alias,
+                old_protection,
+                pml4,
+            );
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if page_map_r(alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            let _ = cnode_delete_recycle_r(alias_cap);
+            let _ = page_unmap_r(new_frame);
+            restore_old_mapped_mapping(
+                pi,
+                page,
+                old_mapping,
+                retained_alias,
+                old_protection,
+                pml4,
+            );
+            vm_frame_release(new_frame, 0);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        new_alias_cap = alias_cap;
+    }
+
+    if !csrss_frame_put_at_cap_source_owned(
+        pi as u64,
+        page,
+        new_frame,
+        retained_alias,
+        new_alias_cap,
+        0,
+        true,
+    ) {
+        if new_alias_cap != 0 {
+            let _ = page_unmap_r(new_alias_cap);
+            let _ = cnode_delete_recycle_r(new_alias_cap);
+        }
         let _ = page_unmap_r(new_frame);
         vm_frame_release(new_frame, 0);
-        if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
-            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
-            let _ = csrss_frame_put_at_cap_source_owned(
-                pi as u64,
-                page,
-                old_frame,
-                0,
-                old_alias_cap,
-                old_source_cap,
-                old_owns_frame,
-            );
-        }
+        restore_old_mapped_mapping(
+            pi,
+            page,
+            old_mapping,
+            retained_alias,
+            old_protection,
+            pml4,
+        );
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
@@ -16157,6 +16331,7 @@ struct ExecNtHandler {
     current_sp: u64,
     current_flags: u64,
     user_apc_redirected: bool,
+    context_continue_redirected: bool,
     post_action: ExecPostAction,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
@@ -16722,6 +16897,11 @@ impl ExecDirectoryOpens {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExecPostAction {
     None,
+    ContinueCurrentThread {
+        tid: u64,
+        tcb: u64,
+        registers: [u64; 20],
+    },
     TerminateCurrentThread {
         tid: u64,
     },
@@ -17653,6 +17833,11 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtSuspendProcess,
                 SSN_NT_SUSPEND_PROCESS as u32,
+            ),
+            (NativeService::NtContinue, SSN_NT_CONTINUE as u32),
+            (
+                NativeService::NtRaiseException,
+                SSN_NT_RAISE_EXCEPTION as u32,
             ),
             // Dbgk: the user-mode debugging plane (DEBUG_OBJECT create/attach/wait/continue/detach).
             (

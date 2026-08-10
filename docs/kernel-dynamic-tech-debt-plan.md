@@ -120,10 +120,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 ### J. SEC_IMAGE And Memory Manager Fidelity
 
-- `[~]` J1: Replace ad hoc image page-right classification with NT SEC_IMAGE allocation
+- `[x]` J1: Replace ad hoc image page-right classification with NT SEC_IMAGE allocation
   protections, including write-copy and execute-write-copy pages, so loader fixups and writable
   image data are backed by process-private ownership rather than broad writable mappings.
-- `[ ]` J2: Boot-verify writable image copy-on-write promotion under real ReactOS loader/service
+- `[~]` J2: Boot-verify writable image copy-on-write promotion under real ReactOS loader/service
   traffic and remove any remaining page-right callers that infer image semantics from section names
   or historical bootstrap assumptions.
 
@@ -2369,3 +2369,22 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
   and `git diff --check`. Review adjustment: J1 remains in progress until a serialized boot proves
   loader fixups and service DLL writable sections still survive the new write-copy bookkeeping.
+- J1 complete / J2 in progress. SEC_IMAGE protection classification now distinguishes shared
+  read/write/executable pages from non-shared write-copy pages, and both user-fault and kernel
+  copyout COW promotion preserve durable executive aliases for the promoted private frame. Reused
+  hosted process slots drop stale SEC_IMAGE frame registrations before publishing fresh main-image
+  and ntdll views, and filled-page replay is cleared when a real COW promotion owns the faulted
+  page. The same slice wires `NtContinue`, `NtRaiseException`, and their Zw/export stubs through
+  ntdll and the executive so native SEH has a real kernel path instead of a breakpoint terminator.
+  Validation: `cargo fmt --all`, `cargo test -p nt-pe-loader`, `cargo test -p nt-syscall-abi`,
+  `cargo test -p nt-syscall`, `cargo test --manifest-path crates/nt-ntdll/Cargo.toml`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Serialized desktop run
+  `.tmp/boot-cow-alias-desktop-20260810-225615.log` moved past the previous winsrv media-event
+  initialization failure: `winsrv.dll` imports are covered, `NtUserInitialize` publishes power/media
+  events, base desktop readback succeeds with `desktop-bg 768/768`, real winlogon user callbacks
+  continue, and dynamic service children reach wkssvc/browser/srvsvc/wlansvc/spoolsv paths. The run
+  was manually stopped before a harness success and still reports `explorer total=0`; the next red
+  edge remains generic service RPC/NPFS listener/association behavior, with repeated
+  `RpcServerListen() failed (Status 6b1)`. Do not paper over this with service-name, executable,
+  launch-order, or shell-paint fallbacks.

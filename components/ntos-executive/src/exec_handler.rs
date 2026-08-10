@@ -13,14 +13,29 @@ const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 const STATUS_PENDING: u32 = 0x0000_0103;
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 const STATUS_CANCELLED: u32 = 0xC000_0120;
+const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
+const AMD64_CONTEXT_EFLAGS_OFFSET: usize = 0x44;
+const CONTEXT_AMD64: u32 = 0x0010_0000;
+const CONTEXT_CONTROL: u32 = 0x0000_0001;
+const CONTEXT_INTEGER: u32 = 0x0000_0002;
+const EXCEPTION_RECORD_SIZE: usize = 0x98;
+const EXCEPTION_RECORD_CODE_OFFSET: usize = 0x00;
+const EXCEPTION_RECORD_FLAGS_OFFSET: usize = 0x04;
+const EXCEPTION_RECORD_RECORD_OFFSET: usize = 0x08;
+const EXCEPTION_RECORD_ADDRESS_OFFSET: usize = 0x10;
+const EXCEPTION_RECORD_PARAMETERS_OFFSET: usize = 0x18;
+const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
+const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
 const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
 const REGISTRY_SERVICE_NAME_COPY_MAX: usize = 512;
@@ -48,6 +63,8 @@ pub(crate) struct NpfsFileRoute {
 }
 
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NT_CONTINUE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -107,6 +124,16 @@ fn print_sanitized_utf16_ascii(units: &[u16], limit: usize) {
             b'.'
         });
     }
+}
+
+#[inline]
+fn read_le_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+#[inline]
+fn read_le_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1883,6 +1910,7 @@ impl ExecNtHandler {
         write_field!(current_sp, 0);
         write_field!(current_flags, 0);
         write_field!(user_apc_redirected, false);
+        write_field!(context_continue_redirected, false);
         write_field!(post_action, ExecPostAction::None);
         write_field!(stop, false);
         write_field!(next_handle, FAKE_HANDLE);
@@ -4846,6 +4874,213 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         Ok(true)
+    }
+
+    unsafe fn nt_continue(&mut self, args: &[u64]) -> u32 {
+        const USER_CONTEXT_RBX: usize = 4;
+        const USER_CONTEXT_RDX: usize = 6;
+        const USER_CONTEXT_RSI: usize = 7;
+        const USER_CONTEXT_RDI: usize = 8;
+        const USER_CONTEXT_RBP: usize = 9;
+        const USER_CONTEXT_R8: usize = 10;
+        const USER_CONTEXT_R9: usize = 11;
+        const USER_CONTEXT_R12: usize = 14;
+        const USER_CONTEXT_R13: usize = 15;
+        const USER_CONTEXT_R14: usize = 16;
+        const USER_CONTEXT_R15: usize = 17;
+
+        let context_ptr = args.first().copied().unwrap_or(0);
+        if context_ptr == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let Some(tcb) = self
+            .hosted_thread_tcb(self.current_tid)
+            .filter(|tcb| *tcb > 1)
+        else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+        if !self.xas_read(context_ptr, &mut context) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
+        if context_flags & CONTEXT_AMD64 == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mut registers = [0u64; 20];
+        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
+
+        if context_flags & CONTEXT_CONTROL != 0 {
+            registers[nt_user_callback::USER_CONTEXT_RIP] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RIP_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RSP] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSP_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RFLAGS] =
+                read_le_u32_at(&context, AMD64_CONTEXT_EFLAGS_OFFSET) as u64;
+            if registers[nt_user_callback::USER_CONTEXT_RIP] == 0
+                || registers[nt_user_callback::USER_CONTEXT_RSP] == 0
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+        if context_flags & CONTEXT_INTEGER != 0 {
+            registers[nt_user_callback::USER_CONTEXT_RAX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RAX_OFFSET as usize);
+            registers[USER_CONTEXT_RBX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBX_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RCX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RCX_OFFSET as usize);
+            registers[USER_CONTEXT_RDX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDX_OFFSET as usize);
+            registers[USER_CONTEXT_RSI] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSI_OFFSET as usize);
+            registers[USER_CONTEXT_RDI] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDI_OFFSET as usize);
+            registers[USER_CONTEXT_RBP] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBP_OFFSET as usize);
+            registers[USER_CONTEXT_R8] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R8_OFFSET as usize);
+            registers[USER_CONTEXT_R9] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R9_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R10] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R10_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R11] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R11_OFFSET as usize);
+            registers[USER_CONTEXT_R12] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R12_OFFSET as usize);
+            registers[USER_CONTEXT_R13] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R13_OFFSET as usize);
+            registers[USER_CONTEXT_R14] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R14_OFFSET as usize);
+            registers[USER_CONTEXT_R15] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R15_OFFSET as usize);
+        }
+
+        let trace = NT_CONTINUE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 16 {
+            print_str(b"[seh-continue] request pi=");
+            print_u64(self.pi as u64);
+            print_str(b" tid=");
+            print_u64(self.current_tid);
+            print_str(b" ctx=0x");
+            print_hex_u64(context_ptr);
+            print_str(b" flags=0x");
+            print_hex(context_flags);
+            print_str(b" rip=0x");
+            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RIP]);
+            print_str(b" rsp=0x");
+            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RSP]);
+            print_str(b"\n");
+        }
+        self.context_continue_redirected = true;
+        self.post_action = ExecPostAction::ContinueCurrentThread {
+            tid: self.current_tid,
+            tcb,
+            registers,
+        };
+        0
+    }
+
+    unsafe fn nt_raise_exception(&mut self, args: &[u64]) -> u32 {
+        let record_ptr = args[0];
+        let context_ptr = args[1];
+        let first_chance = args[2] != 0;
+        if record_ptr == 0 || context_ptr == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut record = [0u8; EXCEPTION_RECORD_SIZE];
+        if !unsafe { self.xas_read(record_ptr, &mut record) } {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+        if !unsafe { self.xas_read(context_ptr, &mut context) } {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let code = read_le_u32_at(&record, EXCEPTION_RECORD_CODE_OFFSET);
+        let flags = read_le_u32_at(&record, EXCEPTION_RECORD_FLAGS_OFFSET);
+        let chained_record = read_le_u64_at(&record, EXCEPTION_RECORD_RECORD_OFFSET);
+        let address = read_le_u64_at(&record, EXCEPTION_RECORD_ADDRESS_OFFSET);
+        let parameter_count = read_le_u32_at(&record, EXCEPTION_RECORD_PARAMETERS_OFFSET);
+        if parameter_count > EXCEPTION_MAXIMUM_PARAMETERS {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let parameter_count = parameter_count as usize;
+        let context_rip = read_le_u64_at(&context, nt_thread_start::CONTEXT_RIP_OFFSET as usize);
+        let context_rsp = read_le_u64_at(&context, nt_thread_start::CONTEXT_RSP_OFFSET as usize);
+        let mut parameters = [0u64; 15];
+        for (index, slot) in parameters.iter_mut().take(parameter_count).enumerate() {
+            *slot = read_le_u64_at(&record, EXCEPTION_RECORD_INFORMATION_OFFSET + index * 8);
+        }
+
+        let trace = NT_RAISE_EXCEPTION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 16 {
+            print_str(b"[seh] NtRaiseException pi=");
+            print_u64(self.pi as u64);
+            print_str(b" tid=");
+            print_u64(self.current_tid);
+            print_str(if first_chance { b" first" } else { b" last" });
+            print_str(b" code=0x");
+            print_hex(code);
+            print_str(b" flags=0x");
+            print_hex(flags);
+            print_str(b" addr=0x");
+            print_hex_u64(address);
+            print_str(b" ctx-rip=0x");
+            print_hex_u64(context_rip);
+            print_str(b" ctx-rsp=0x");
+            print_hex_u64(context_rsp);
+            if parameter_count != 0 {
+                print_str(b" p0=0x");
+                print_hex_u64(parameters[0]);
+            }
+            if parameter_count > 1 {
+                print_str(b" p1=0x");
+                print_hex_u64(parameters[1]);
+            }
+            print_str(b"\n");
+        }
+
+        let debug_record = nt_process::dbgk::ExceptionRecord {
+            exception_code: code,
+            exception_flags: flags,
+            exception_record: chained_record,
+            exception_address: address,
+            number_parameters: parameter_count as u32,
+            exception_information: parameters,
+        };
+        if self.dbgk_forward_exception(self.pi, self.current_tid, debug_record, first_chance) {
+            self.dbgk_block_request = true;
+            return STATUS_UNHANDLED_EXCEPTION;
+        }
+        if first_chance {
+            return STATUS_UNHANDLED_EXCEPTION;
+        }
+
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if let Some(bugcheck) = self.pm.critical_process_termination_code(pid) {
+            self.post_action = ExecPostAction::CriticalTermination {
+                code: bugcheck,
+                object: pid as u64,
+            };
+            return 0;
+        }
+        let exit_time = nt_system_time_100ns() as i64;
+        let exit_status = if code == 0 { STATUS_UNSUCCESSFUL } else { code };
+        match self.pm.terminate_process_at(pid, exit_status, exit_time) {
+            Ok(()) => {
+                self.release_process_handles(pid);
+                self.post_action = ExecPostAction::TerminateProcess {
+                    process_index: self.pi as u8,
+                    current_tid: self.current_tid,
+                    drop_reply: true,
+                };
+                unsafe { wait_wake_dispatcher_set(self) };
+                0
+            }
+            Err(status) => status,
+        }
     }
 
     pub(crate) fn hosted_thread_role(&self, tid: u64) -> Option<HostedThreadRole> {
@@ -11564,6 +11799,75 @@ impl ExecNtHandler {
         }
         true
     }
+
+    unsafe fn current_image_protection_for_page(
+        &self,
+        ctx: ExecLoopCtx,
+        page: u64,
+    ) -> Option<u32> {
+        if page >= PE_LOAD_BASE && page < ctx.img_end {
+            return Some(image_page_protection(&*ctx.pe, PE_LOAD_BASE, page));
+        }
+        if !ctx.ntdll_pe.is_null() && page >= ctx.nt_base && page < ctx.nt_end {
+            return Some(image_page_protection(&*ctx.ntdll_pe, ctx.nt_base, page));
+        }
+        let reg = &*ctx.reg;
+        let dll_pes = ctx.dll_pes();
+        let (index, rva) = reg.dll_for_page(self.pi, page)?;
+        let pe = dll_pes.get(index).and_then(|slot| (*slot).as_ref())?;
+        Some(image_rva_protection(pe, rva))
+    }
+
+    unsafe fn clear_current_scratch_page(&self, ctx: ExecLoopCtx, page: u64) {
+        let filled_pages = &mut *ctx.filled_pages;
+        let faults = (*ctx.faults as usize).min(filled_pages.len());
+        for filled_page in filled_pages.iter_mut().take(faults) {
+            if *filled_page == page {
+                *filled_page = 0;
+            }
+        }
+    }
+
+    unsafe fn promote_current_image_cow_for_write(&self, va: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            return true;
+        };
+        let Some(last) = va.checked_add(len as u64 - 1) else {
+            return false;
+        };
+        let mut page = va & !0xfff;
+        let last_page = last & !0xfff;
+        loop {
+            if let Some(protection) = self.current_image_protection_for_page(ctx, page) {
+                let write_plan = nt_address_space::image_view_fault_plan(protection, true);
+                if write_plan.copy_on_write {
+                    if vm_promote_image_cow_for_kernel_write(
+                        self.pi,
+                        page,
+                        protection,
+                        ctx.pml4,
+                        ctx.scratch_base,
+                    )
+                    .is_err()
+                    {
+                        return false;
+                    }
+                    self.clear_current_scratch_page(ctx, page);
+                }
+            }
+            if page == last_page {
+                return true;
+            }
+            let Some(next) = page.checked_add(0x1000) else {
+                return false;
+            };
+            page = next;
+        }
+    }
+
     /// Cross-AS 8-byte out-param write to the current process's VA `va` — handles a target that lives
     /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
     /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
@@ -11571,6 +11875,9 @@ impl ExecNtHandler {
     /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
         if let Some(ctx) = self.loop_ctx {
+            if !self.promote_current_image_cow_for_write(va, 8) {
+                return false;
+            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
@@ -11617,6 +11924,9 @@ impl ExecNtHandler {
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
         if let Some(ctx) = self.loop_ctx {
+            if !self.promote_current_image_cow_for_write(va, 4) {
+                return false;
+            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
@@ -12261,20 +12571,26 @@ impl ExecNtHandler {
                 ctx.scratch_base,
             );
         }
-        if smss_copyout(va, src) {
-            return true;
-        }
-        if let Some(ctx) = self.loop_ctx.as_ref() {
-            if client_copyout_mapped(
+        if let Some(ctx) = self.loop_ctx {
+            if !self.promote_current_image_cow_for_write(va, src.len()) {
+                return false;
+            }
+            if client_copyout_or_fill_mapped(
                 self.pi as u64,
                 va,
                 src,
-                &*ctx.filled_pages,
-                *ctx.faults as usize,
+                &mut *ctx.filled_pages,
+                &mut *ctx.faults,
                 ctx.scratch_base,
+                &*ctx.reg,
+                ctx.dll_pes(),
+                ctx.pml4,
             ) {
                 return true;
             }
+        }
+        if smss_copyout(va, src) {
+            return true;
         }
         let mut i = 0usize;
         while i < src.len() {
@@ -13831,6 +14147,7 @@ impl ExecNtHandler {
     ) -> Option<nt_exe_image::HostedProcessImageRef<'a>> {
         catalog.probe_image(folded, is_sxs)
     }
+
 }
 impl NativeSyscallHandler for ExecNtHandler {
     /// The dispatcher's entry point. It is a thin wrapper so that ONE thing is guaranteed to run
@@ -17089,6 +17406,8 @@ impl ExecNtHandler {
             NativeService::NtOpenThreadTokenEx => unsafe {
                 self.nt_open_thread_token(args, true)
             },
+            NativeService::NtContinue => unsafe { self.nt_continue(args) },
+            NativeService::NtRaiseException => unsafe { self.nt_raise_exception(args) },
             NativeService::NtRaiseHardError => unsafe {
                 use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
 

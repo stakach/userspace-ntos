@@ -64,8 +64,13 @@ pub(crate) unsafe fn image_page_protection(
 pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
     match pe.image_protection_at(rva) {
         nt_pe_loader::ImageProtection::ReadOnly => nt_address_space::PAGE_READONLY,
+        nt_pe_loader::ImageProtection::ReadWrite => nt_address_space::PAGE_READWRITE,
         nt_pe_loader::ImageProtection::WriteCopy => nt_address_space::PAGE_WRITECOPY,
+        nt_pe_loader::ImageProtection::Execute => nt_address_space::PAGE_EXECUTE,
         nt_pe_loader::ImageProtection::ExecuteRead => nt_address_space::PAGE_EXECUTE_READ,
+        nt_pe_loader::ImageProtection::ExecuteReadWrite => {
+            nt_address_space::PAGE_EXECUTE_READWRITE
+        }
         nt_pe_loader::ImageProtection::ExecuteWriteCopy => {
             nt_address_space::PAGE_EXECUTE_WRITECOPY
         }
@@ -533,6 +538,23 @@ pub(crate) unsafe fn spawn_sec_image(
     // early diagnostics and later live processes, so stale ranges must be cleared at the address-space
     // creation boundary before spawn registers image and environment views.
     process_committed_mapping_reset(pi as usize);
+    let main_image_size = image_extent(pe);
+    let mut dropped_image_frames = csrss_frame_drop_process_range(pi, PE_LOAD_BASE, main_image_size);
+    if let Some((ntdll_base, ntdll_pe)) = ntdll {
+        dropped_image_frames = dropped_image_frames
+            .saturating_add(csrss_frame_drop_process_range(
+                pi,
+                ntdll_base,
+                image_extent(ntdll_pe),
+            ));
+    }
+    if dropped_image_frames != 0 {
+        print_str(b"[frame-reg] dropped stale SEC_IMAGE frames pi=");
+        print_u64(pi);
+        print_str(b" count=");
+        print_u64(dropped_image_frames);
+        print_str(b"\n");
+    }
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
@@ -540,7 +562,6 @@ pub(crate) unsafe fn spawn_sec_image(
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let main_image_size = image_extent(pe);
     let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, main_image_size);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
@@ -1558,8 +1579,13 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
     if va.checked_add(src.len() as u64).is_none() {
         return false;
     }
-    if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src) {
-        return true;
+    if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi {
+        if client_copyout_mapped(pi, va, src, filled_pages, *faults as usize, scratch_base) {
+            return true;
+        }
+        if smss_copyout(va, src) {
+            return true;
+        }
     }
     let mut copied = 0usize;
     while copied < src.len() {

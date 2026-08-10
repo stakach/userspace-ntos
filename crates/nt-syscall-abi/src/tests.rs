@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 216;
-const REQUIRED_ZW_COUNT: usize = 216;
+const REQUIRED_NT_COUNT: usize = 218;
+const REQUIRED_ZW_COUNT: usize = 218;
 
 #[test]
 fn required_counts() {
@@ -105,6 +105,7 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtAllocateVirtualMemory", 18),   // SSN_NT_ALLOCATE_VM = 0x12
         ("NtCallbackReturn", 22),          // SSN_NT_CALLBACK_RETURN = 22
         ("NtClose", 27),                   // SSN_NT_CLOSE = 27
+        ("NtContinue", 34),                // SSN_NT_CONTINUE = 34
         ("NtCreateFile", 39),              // SSN_NT_CREATE_FILE = 39
         ("NtCreatePort", 48),              // SSN_NT_CREATE_PORT = 48
         ("NtCreateSection", 52),           // SSN_NT_CREATE_SECTION = 52
@@ -125,6 +126,7 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
         ("NtResumeProcess", 213),          // SSN_NT_RESUME_PROCESS = 213
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
+        ("NtRaiseException", 189),         // SSN_NT_RAISE_EXCEPTION = 189
         ("NtSetDebugFilterState", 222),    // SSN_NT_SET_DEBUG_FILTER_STATE = 222
         ("NtSetSystemPowerState", 250),    // SSN_NT_SET_SYSTEM_POWER_STATE = 250
         ("NtSetUuidSeed", 255),            // SSN_NT_SET_UUID_SEED = 255
@@ -168,7 +170,9 @@ fn every_service_has_an_exact_arity() {
 fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtClose"), 1);
     assert_eq!(argc_of("NtCallbackReturn"), 3);
+    assert_eq!(argc_of("NtContinue"), 2);
     assert_eq!(argc_of("NtCreateFile"), 11);
+    assert_eq!(argc_of("NtRaiseException"), 3);
     assert_eq!(argc_of("NtWaitForSingleObject"), 3);
     assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest
     assert_eq!(exact_argc_of("NtCreateThreadEx"), Some(11));
