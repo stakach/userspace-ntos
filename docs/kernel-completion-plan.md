@@ -2718,3 +2718,32 @@ natural userinit/explorer launch.
   blocker is gone and dynamic services plus winlogon callbacks continue, but explorer has not
   launched (`explorer total=0`) and repeated service RPC listener failure (`Status 6b1`) is the next
   real target.
+
+- I4 LPC broker handle-identity query staged. The current desktop recovery retry reaches real LSA
+  `NtConnectPort(\LsaAuthenticationPort)` accept/complete and one ApiNumber=3 request/reply, then
+  rejects later LSA requests because the executive only recognizes exact cached client comm-port
+  handles. The port core now exposes `handle_info`, the LPC ABI/client/server expose
+  `LPC_OP_QUERY_HANDLE`, and `ExecNtHandler::lpc_connection_is` verifies uncached handles against the
+  broker before caching a dynamic alias. Verification is strict: the handle must be a connected
+  client communication port and the folded broker port name must match the requested NT port. This is
+  not a service-name fallback; invalid listen/server/stale handles still fail. Validation so far:
+  `cargo fmt --all`, `cargo test -p nt-port-core`, `cargo test -p nt-lpc-server`,
+  `cargo test -p nt-lpc-client`, `cargo test -p nt-lpc-abi`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: run one
+  serialized `./run.sh --desktop` and require the repeated `lpc-cache miss
+  \LsaAuthenticationPort ... handle=0x...2a` edge either to turn into a broker-verified alias or to
+  report a precise endpoint/state mismatch before moving deeper into service RPC/NPFS context-handle
+  handling.
+
+- I4 desktop validation update. Serialized desktop run
+  `.tmp/boot-lpc-handle-query-20260810-234239.log` proves the LPC identity query is doing strict
+  broker-backed resolution. Wrong connected handles are rejected with precise endpoint/state/name
+  evidence (`\smapiport` and `\windows\apiport`), while later real LSA client comm-port handles are
+  inserted dynamically for the requesting process. The boot now moves past the old profile frontier:
+  `NtLoadKey` mounts `\Registry\User\S-1-5-21-2027863616-125950201-1543963175-500`,
+  `WlxActivateUserShell` reads the real SOFTWARE `Userinit` value, `userinit.exe` launches
+  `explorer.exe`, and explorer reaches real win32k/GDI traffic. This is still not a completed desktop
+  paint proof: explorer stops during early shell GUI calls and the deadman reports every hosted thread
+  parked on dispatcher/event waits with no further IPC. Review adjustment: the next slice should
+  inspect the first explorer wait/event edge after SSN `0x1082` and fix generic dispatcher or win32k
+  queue-event wake delivery, not add explorer, shell, or paint-specific success paths.

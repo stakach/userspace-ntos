@@ -13273,8 +13273,45 @@ impl ExecNtHandler {
         true
     }
 
-    pub(crate) fn lpc_connection_is(&self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
-        let found = self.lpc_connections.iter().any(|connection| {
+    pub(crate) fn lpc_connection_is(&mut self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
+        if self.lpc_connection_cache_is(handle, connector_pi, name) {
+            return true;
+        }
+        if let Some(query) = unsafe { lpc_client().and_then(|client| client.query_handle(handle).ok()) } {
+            let endpoint_ok = query.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT;
+            let state_ok = query.state == nt_lpc_abi::connection_state::CONNECTED;
+            let name_ok = Self::lpc_name_equals_ascii(&query.name, name);
+            if endpoint_ok && state_ok && name_ok {
+                return self.cache_lpc_connection_for_pi(
+                    query.connection_id,
+                    handle,
+                    connector_pi,
+                    &query.name,
+                );
+            }
+            if Self::ascii_name_equals(name, b"\\lsaauthenticationport")
+                && LPC_CACHE_MISS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8
+            {
+                print_str(b"[lpc-cache] broker rejected \\LsaAuthenticationPort handle=0x");
+                print_hex_u64(handle);
+                print_str(b" pi=");
+                print_u64(connector_pi as u64);
+                print_str(b" endpoint=");
+                print_u64(query.endpoint as u64);
+                print_str(b" state=");
+                print_u64(query.state as u64);
+                print_str(b" name=");
+                print_sanitized_utf16_ascii(&query.name, 64);
+                print_str(b"\n");
+            }
+            return false;
+        }
+        self.trace_lpc_connection_miss(handle, connector_pi, name);
+        false
+    }
+
+    fn lpc_connection_cache_is(&self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
+        self.lpc_connections.iter().any(|connection| {
             connection.client_handle == handle
                 && connection.connector_pi as usize == connector_pi
                 && connection.name_len as usize == name.len()
@@ -13285,41 +13322,44 @@ impl ExecNtHandler {
                         wide <= 0x7f
                             && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
                     })
+        })
+    }
+
+    fn trace_lpc_connection_miss(&self, handle: u64, connector_pi: usize, name: &[u8]) {
+        if !Self::ascii_name_equals(name, b"\\lsaauthenticationport") {
+            return;
+        }
+        let has_lsa_record = self.lpc_connections.iter().any(|connection| {
+            Self::lpc_name_equals_ascii(
+                &connection.name[..connection.name_len as usize],
+                b"\\lsaauthenticationport",
+            )
         });
-        if !found && Self::ascii_name_equals(name, b"\\lsaauthenticationport") {
-            let has_lsa_record = self.lpc_connections.iter().any(|connection| {
+        if has_lsa_record && LPC_CACHE_MISS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[lpc-cache] miss \\LsaAuthenticationPort pi=");
+            print_u64(connector_pi as u64);
+            print_str(b" handle=0x");
+            print_hex_u64(handle);
+            print_str(b" entries=");
+            print_u64(self.lpc_connections.len() as u64);
+            print_str(b" cap=");
+            print_u64(self.lpc_connections.capacity() as u64);
+            print_str(b"\n");
+            for connection in self.lpc_connections.iter().filter(|connection| {
                 Self::lpc_name_equals_ascii(
                     &connection.name[..connection.name_len as usize],
                     b"\\lsaauthenticationport",
                 )
-            });
-            if has_lsa_record && LPC_CACHE_MISS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
-                print_str(b"[lpc-cache] miss \\LsaAuthenticationPort pi=");
-                print_u64(connector_pi as u64);
+            }) {
+                print_str(b"[lpc-cache]   have pi=");
+                print_u64(connection.connector_pi as u64);
                 print_str(b" handle=0x");
-                print_hex_u64(handle);
-                print_str(b" entries=");
-                print_u64(self.lpc_connections.len() as u64);
-                print_str(b" cap=");
-                print_u64(self.lpc_connections.capacity() as u64);
+                print_hex_u64(connection.client_handle);
+                print_str(b" conn=");
+                print_u64(connection.connection_id);
                 print_str(b"\n");
-                for connection in self.lpc_connections.iter().filter(|connection| {
-                    Self::lpc_name_equals_ascii(
-                        &connection.name[..connection.name_len as usize],
-                        b"\\lsaauthenticationport",
-                    )
-                }) {
-                    print_str(b"[lpc-cache]   have pi=");
-                    print_u64(connection.connector_pi as u64);
-                    print_str(b" handle=0x");
-                    print_hex_u64(connection.client_handle);
-                    print_str(b" conn=");
-                    print_u64(connection.connection_id);
-                    print_str(b"\n");
-                }
             }
         }
-        found
     }
 
     fn lpc_name_equals_ascii(name16: &[u16], expected: &[u8]) -> bool {

@@ -20,7 +20,8 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_lpc_abi::{
     msg_type, opcode, LpcAcceptConnectRequest, LpcCompleteConnectRequest, LpcConnectPortRequest,
-    LpcCreatePortRequest, LpcMessageRequest, LpcReceiveRequest, LpcReply,
+    LpcCreatePortRequest, LpcMessageRequest, LpcQueryHandleRequest, LpcQueryHandleResponse,
+    LpcReceiveRequest, LpcReply,
 };
 use nt_status::NtStatus;
 
@@ -47,6 +48,15 @@ pub struct ReceiveResult {
     pub subsystem_type: u32,
     pub port_context: u64,
     pub connection_info: Vec<u8>,
+}
+
+/// A broker-owned handle identity returned by `LPC_OP_QUERY_HANDLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandleQueryResult {
+    pub endpoint: u16,
+    pub state: u16,
+    pub connection_id: u64,
+    pub name: Vec<u16>,
 }
 
 /// The LPC client.
@@ -161,6 +171,40 @@ impl<B: Backend> LpcClient<B> {
             .call(opcode::LPC_OP_COMPLETE_CONNECT, &buf, &mut []);
         NtStatus(r.status).to_result()?;
         Ok((r.detail0, r.detail1))
+    }
+
+    /// Resolve a broker handle to the live endpoint identity recorded by the port core.
+    pub fn query_handle(&mut self, port_handle: u64) -> Result<HandleQueryResult, NtStatus> {
+        let req = LpcQueryHandleRequest {
+            abi_size: size_of::<LpcQueryHandleRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+        };
+        let buf = bytemuck::bytes_of(&req).to_vec();
+        let mut out = [0u8; size_of::<LpcQueryHandleResponse>()];
+        let r = self
+            .backend
+            .call(opcode::LPC_OP_QUERY_HANDLE, &buf, &mut out);
+        NtStatus(r.status).to_result()?;
+        if r.information as usize != size_of::<LpcQueryHandleResponse>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let response: LpcQueryHandleResponse =
+            bytemuck::try_pod_read_unaligned(&out).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if response.abi_size as usize != size_of::<LpcQueryHandleResponse>() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let name_len = response.name_len_units as usize;
+        if name_len > response.name.len() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(HandleQueryResult {
+            endpoint: response.endpoint,
+            state: response.state,
+            connection_id: response.connection_id,
+            name: response.name[..name_len].to_vec(),
+        })
     }
 
     /// Receive the next message on a port (the connection-request rendezvous drain).

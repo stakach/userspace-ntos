@@ -37,10 +37,14 @@ use core::mem::size_of;
 
 use bytemuck::Pod;
 use nt_lpc_abi::{
-    opcode, LpcAcceptConnectRequest, LpcClosePortRequest, LpcCompleteConnectRequest,
-    LpcConnectPortRequest, LpcCreatePortRequest, LpcMessageRequest, LpcReceiveRequest, LpcReply,
+    connection_state, handle_endpoint, opcode, LpcAcceptConnectRequest, LpcClosePortRequest,
+    LpcCompleteConnectRequest, LpcConnectPortRequest, LpcCreatePortRequest, LpcMessageRequest,
+    LpcQueryHandleRequest, LpcQueryHandleResponse, LpcReceiveRequest, LpcReply,
+    LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
-use nt_port_core::{ConnectOutcome, MessageAttrs, PortApi, PortCore, ReceiveOutcome};
+use nt_port_core::{
+    ConnectOutcome, MessageAttrs, PortApi, PortCore, PortHandleEndpoint, ReceiveOutcome,
+};
 use nt_status::NtStatus;
 
 /// Re-exported from the unified core so existing `nt_lpc_server::{AcceptPolicy,
@@ -142,6 +146,7 @@ impl Server {
             // live bridge microtest). LPC carries NO message attributes.
             opcode::LPC_OP_REQUEST_WAIT_REPLY => self.op_request_wait_reply(in_buf, out_buf),
             opcode::LPC_OP_REPLY_PORT => self.op_reply_port(in_buf),
+            opcode::LPC_OP_QUERY_HANDLE => self.op_query_handle(in_buf, out_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -280,6 +285,37 @@ impl Server {
         self.core.close_port(req.port_handle);
         Ok(ok())
     }
+
+    fn op_query_handle(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcQueryHandleRequest = read_req(buf)?;
+        let info = self
+            .core
+            .handle_info(req.port_handle)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        if out_buf.len() < size_of::<LpcQueryHandleResponse>() {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        if info.port_name.len() > LPC_QUERY_HANDLE_NAME_MAX_UNITS {
+            return Err(NtStatus::BUFFER_TOO_SMALL);
+        }
+        let mut response = LpcQueryHandleResponse {
+            abi_size: size_of::<LpcQueryHandleResponse>() as u16,
+            endpoint: endpoint_code(info.endpoint),
+            state: state_code(info.state),
+            name_len_units: info.port_name.len() as u16,
+            connection_id: info.connection_id,
+            name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
+        };
+        response.name[..info.port_name.len()].copy_from_slice(info.port_name);
+        out_buf[..size_of::<LpcQueryHandleResponse>()]
+            .copy_from_slice(bytemuck::bytes_of(&response));
+        Ok(reply(
+            NtStatus::SUCCESS,
+            size_of::<LpcQueryHandleResponse>() as u32,
+            0,
+            0,
+        ))
+    }
 }
 
 // --- decode helpers (all bounds-checked; never panic) ----------------------
@@ -324,6 +360,25 @@ fn msg_type_of(bytes: &[u8]) -> u16 {
     }
 }
 
+fn endpoint_code(endpoint: PortHandleEndpoint) -> u16 {
+    match endpoint {
+        PortHandleEndpoint::ListenPort => handle_endpoint::LISTEN_PORT,
+        PortHandleEndpoint::ClientCommPort => handle_endpoint::CLIENT_COMM_PORT,
+        PortHandleEndpoint::ServerCommPort => handle_endpoint::SERVER_COMM_PORT,
+    }
+}
+
+fn state_code(state: Option<ConnState>) -> u16 {
+    match state {
+        None => connection_state::NONE,
+        Some(ConnState::Pending) => connection_state::PENDING,
+        Some(ConnState::Received) => connection_state::RECEIVED,
+        Some(ConnState::Accepted) => connection_state::ACCEPTED,
+        Some(ConnState::Connected) => connection_state::CONNECTED,
+        Some(ConnState::Refused) => connection_state::REFUSED,
+    }
+}
+
 fn reply(status: NtStatus, information: u32, detail0: u64, detail1: u64) -> LpcReply {
     LpcReply {
         status: status.raw(),
@@ -340,7 +395,7 @@ fn ok() -> LpcReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nt_lpc_abi::msg_type;
+    use nt_lpc_abi::{connection_state, handle_endpoint, msg_type};
     use nt_lpc_client::LpcClient;
 
     /// In-process backend: drive the server directly (no transport) — the
@@ -503,6 +558,63 @@ mod tests {
             assert_ne!(client_handle, 0);
         }
         assert_eq!(s.connection_state(conn_id), Some(ConnState::Connected));
+    }
+
+    #[test]
+    fn query_handle_reports_broker_endpoint_identity() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let listen;
+        let conn_id;
+        {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            listen = c
+                .create_port(&utf16("\\LsaAuthenticationPort"), 0, 0, 0)
+                .unwrap();
+            conn_id = c
+                .connect_port(&utf16("\\LSAAUTHENTICATIONPORT"), 0, &[])
+                .unwrap()
+                .connection_id;
+        }
+        let (client, server) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(listen).unwrap();
+            let server = c.accept_connect(conn_id, true, 0).unwrap();
+            let client = c.complete_connect(server).unwrap().0;
+            (client, server)
+        };
+        let mut c = LpcClient::new(Direct {
+            server: &mut s,
+            out: [0; 512],
+        });
+        let listen_info = c.query_handle(listen).unwrap();
+        assert_eq!(listen_info.endpoint, handle_endpoint::LISTEN_PORT);
+        assert_eq!(listen_info.connection_id, 0);
+        assert_eq!(listen_info.state, connection_state::NONE);
+        assert_eq!(listen_info.name, utf16("\\lsaauthenticationport"));
+
+        let client_info = c.query_handle(client).unwrap();
+        assert_eq!(client_info.endpoint, handle_endpoint::CLIENT_COMM_PORT);
+        assert_eq!(client_info.connection_id, conn_id);
+        assert_eq!(client_info.state, connection_state::CONNECTED);
+        assert_eq!(client_info.name, utf16("\\lsaauthenticationport"));
+
+        let server_info = c.query_handle(server).unwrap();
+        assert_eq!(server_info.endpoint, handle_endpoint::SERVER_COMM_PORT);
+        assert_eq!(server_info.connection_id, conn_id);
+        assert_eq!(server_info.state, connection_state::CONNECTED);
+        assert_eq!(server_info.name, utf16("\\lsaauthenticationport"));
+
+        assert_eq!(
+            c.query_handle(0xfeed).unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
     }
 
     /// The core-backed LPC message plane (REPLY_PORT send + REPLY_WAIT_RECEIVE

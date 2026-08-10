@@ -42,6 +42,8 @@ pub mod opcode {
     pub const LPC_OP_LISTEN_PORT: u16 = 0x2208;
 
     pub const LPC_OP_CLOSE_PORT: u16 = 0x2209;
+
+    pub const LPC_OP_QUERY_HANDLE: u16 = 0x220a;
 }
 
 /// True if `op` is an LPC opcode.
@@ -59,6 +61,26 @@ pub mod msg_type {
     pub const LPC_CONNECTION_REQUEST: u16 = 10;
     pub const LPC_CONNECTION_REFUSED: u16 = 11;
 }
+
+/// `LPC_OP_QUERY_HANDLE` endpoint codes.
+pub mod handle_endpoint {
+    pub const NONE: u16 = 0;
+    pub const LISTEN_PORT: u16 = 1;
+    pub const CLIENT_COMM_PORT: u16 = 2;
+    pub const SERVER_COMM_PORT: u16 = 3;
+}
+
+/// `LPC_OP_QUERY_HANDLE` connection-state codes. Zero means "not a connection".
+pub mod connection_state {
+    pub const NONE: u16 = 0;
+    pub const PENDING: u16 = 1;
+    pub const RECEIVED: u16 = 2;
+    pub const ACCEPTED: u16 = 3;
+    pub const CONNECTED: u16 = 4;
+    pub const REFUSED: u16 = 5;
+}
+
+pub const LPC_QUERY_HANDLE_NAME_MAX_UNITS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Request payloads. Names / blobs are at `*_offset` for `*_len_bytes` bytes in
@@ -155,6 +177,41 @@ pub struct LpcClosePortRequest {
     pub port_handle: u64,
 }
 
+/// `LPC_OP_QUERY_HANDLE` — resolve a broker handle to its live endpoint identity.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcQueryHandleRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub port_handle: u64,
+}
+
+/// `LPC_OP_QUERY_HANDLE` reply payload.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcQueryHandleResponse {
+    pub abi_size: u16,
+    pub endpoint: u16,
+    pub state: u16,
+    pub name_len_units: u16,
+    pub connection_id: u64,
+    pub name: [u16; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
+}
+
+impl Default for LpcQueryHandleResponse {
+    fn default() -> Self {
+        Self {
+            abi_size: core::mem::size_of::<Self>() as u16,
+            endpoint: handle_endpoint::NONE,
+            state: connection_state::NONE,
+            name_len_units: 0,
+            connection_id: 0,
+            name: [0; LPC_QUERY_HANDLE_NAME_MAX_UNITS],
+        }
+    }
+}
+
 /// A generic reply carried in the SURT CQE. `status` is an `NTSTATUS` as `i32`.
 /// Per op: `detail0` = a handle (port / comm-port), `detail1` = a connection id
 /// or received-message type; `information` = out-payload byte length.
@@ -179,9 +236,12 @@ const _: () = {
     assert!(size_of::<LpcReceiveRequest>() == 24);
     assert!(size_of::<LpcMessageRequest>() == 24);
     assert!(size_of::<LpcClosePortRequest>() == 16);
+    assert!(size_of::<LpcQueryHandleRequest>() == 16);
+    assert!(size_of::<LpcQueryHandleResponse>() == 144);
     assert!(size_of::<LpcReply>() == 24);
     assert!(align_of::<LpcAcceptConnectRequest>() == 8);
     assert!(align_of::<LpcCreatePortRequest>() == 4);
+    assert!(align_of::<LpcQueryHandleResponse>() == 8);
 };
 
 #[cfg(test)]
@@ -193,6 +253,7 @@ mod tests {
         assert!(is_lpc_opcode(opcode::LPC_OP_PING));
         assert!(is_lpc_opcode(opcode::LPC_OP_CONNECT_PORT));
         assert!(is_lpc_opcode(opcode::LPC_OP_CLOSE_PORT));
+        assert!(is_lpc_opcode(opcode::LPC_OP_QUERY_HANDLE));
         assert!(!is_lpc_opcode(0x21ff));
         assert!(!is_lpc_opcode(0x2300));
     }

@@ -82,6 +82,29 @@ pub enum PortApi {
     Alpc,
 }
 
+/// Which endpoint a live port-core handle names.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PortHandleEndpoint {
+    /// A named listen port created by `NtCreatePort`.
+    ListenPort,
+    /// The connector's communication-port handle.
+    ClientCommPort,
+    /// The server's accepted communication-port handle.
+    ServerCommPort,
+}
+
+/// A borrowed description of a live port-core handle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortHandleInfo<'a> {
+    pub endpoint: PortHandleEndpoint,
+    /// Zero for listen ports; the broker connection id for communication ports.
+    pub connection_id: u64,
+    /// `None` for listen ports.
+    pub state: Option<ConnState>,
+    /// Folded target/listen port name.
+    pub port_name: &'a [u16],
+}
+
 /// The outcome of [`PortCore::connect`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -284,6 +307,40 @@ impl PortCore {
             .iter()
             .find(|p| p.named && p.name == folded)
             .map(|p| p.api)
+    }
+
+    /// Resolve a port-core handle to the live listen/communication endpoint it names.
+    pub fn handle_info(&self, handle: u64) -> Option<PortHandleInfo<'_>> {
+        if handle == 0 {
+            return None;
+        }
+        if let Some(port) = self.ports.iter().find(|port| port.handle == handle) {
+            return Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ListenPort,
+                connection_id: 0,
+                state: None,
+                port_name: port.name.as_slice(),
+            });
+        }
+        self.connections.iter().find_map(|conn| {
+            if conn.client_handle == handle {
+                Some(PortHandleInfo {
+                    endpoint: PortHandleEndpoint::ClientCommPort,
+                    connection_id: conn.id,
+                    state: Some(conn.state),
+                    port_name: conn.port_name.as_slice(),
+                })
+            } else if conn.server_handle == handle {
+                Some(PortHandleInfo {
+                    endpoint: PortHandleEndpoint::ServerCommPort,
+                    connection_id: conn.id,
+                    state: Some(conn.state),
+                    port_name: conn.port_name.as_slice(),
+                })
+            } else {
+                None
+            }
+        })
     }
 
     // --- connection rendezvous --------------------------------------------
@@ -673,6 +730,52 @@ mod tests {
         assert_eq!(done, cid);
         assert_ne!(ch, 0);
         assert_eq!(core.connection_state(cid), Some(ConnState::Connected));
+    }
+
+    #[test]
+    fn handle_info_resolves_listen_client_and_server_handles() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core.create_port(&utf16("\\LsaAuthenticationPort"), PortApi::Lpc);
+        let cid = match core
+            .connect(&utf16("\\LSAAUTHENTICATIONPORT"), PortApi::Lpc, 0, &[])
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(cid, true, 0).unwrap();
+        let (client, _) = core.complete(server).unwrap();
+
+        assert_eq!(
+            core.handle_info(listen),
+            Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ListenPort,
+                connection_id: 0,
+                state: None,
+                port_name: &utf16("\\lsaauthenticationport"),
+            })
+        );
+        assert_eq!(
+            core.handle_info(client),
+            Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ClientCommPort,
+                connection_id: cid,
+                state: Some(ConnState::Connected),
+                port_name: &utf16("\\lsaauthenticationport"),
+            })
+        );
+        assert_eq!(
+            core.handle_info(server),
+            Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ServerCommPort,
+                connection_id: cid,
+                state: Some(ConnState::Connected),
+                port_name: &utf16("\\lsaauthenticationport"),
+            })
+        );
+        assert_eq!(core.handle_info(0xdead), None);
     }
 
     #[test]
