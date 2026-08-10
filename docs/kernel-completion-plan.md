@@ -94,24 +94,26 @@ mounted `NtLoadKey` hive and atomically replaces the source `ntuser.dat`; `RegUn
 mount, and the next `NtLoadKey` remounts the checkpoint image. `exec_profile_ntuser_dat_present` and
 `exec_ntloadkey_serviced` are green on that path.
 
-Latest full boot proof `.tmp/boot-reply-pool-kernel-scale-20260810-130750.log` rebuilt the stack
-after scaling reply-cap wait parking through the executive and rust-micro kernel reply pool. It
-reaches `[microtest done]` at `246/295`, keeps `exec_csr_message_plane`, `exec_kbd_layout_opened`,
+Latest full proof before the current slice remains
+`.tmp/boot-reply-pool-kernel-scale-20260810-130750.log`, which rebuilt the stack after scaling reply
+cap wait parking through the executive and rust-micro kernel reply pool. It reached
+`[microtest done]` at `246/295`, kept `exec_csr_message_plane`, `exec_kbd_layout_opened`,
 `exec_lsa_worker_route`, `exec_vm_pool_headroom`, and `exec_win32k_desktop_painted` green, and
-proves real winlogon SAS-window creation plus `NtUserSetLogonNotifyWindow(0x127c)`. The earlier
-reply-pool exhaustion, wait-array `STATUS_INSUFFICIENT_RESOURCES`, and CSR data-plane failures are
-gone.
+proved real winlogon SAS-window creation plus `NtUserSetLogonNotifyWindow(0x127c)`.
 
-Current red gates from that run are the post-SAS/logon chain:
-`exec_winlogon_sas_message_pumped`, `exec_winlogon_sas_windowproc_ran`,
-`exec_winlogon_logged_out_sas`, `exec_msgina_logon_dialog_created`,
-`exec_profile_ntuser_dat_present`, `exec_winlogon_user_shell_activated`,
-`exec_userinit_process_spawned`, `exec_explorer_process_spawned`, and
-`exec_explorer_shell_chrome_painted`. The next useful slice is not explorer framebuffer accounting
-yet; it is the real SAS message pump after the registered logon-notify window. In the proof run,
-post-SAS `GetMessage` remains `0`, so msgina/profile/userinit/explorer are downstream. The broader
-structural queue remains A4 SCM pipe/listener cleanup, B3 real video/driver binding, C4 VM
-regression coverage, and remaining D3/D4 durable hive/profile persistence.
+Latest hosted executable validation
+`.tmp/boot-hosted-exe-record-cap-rerun-20260810.log` was interrupted after a stable no-IPC deadman,
+so it is evidence but not a final gate proof. It does prove the previous
+`userinit.exe` bad-image frontier is gone: winlogon read the real `Userinit` registry value,
+`NtCreateSection(SEC_IMAGE)` and `NtQuerySection` succeeded for `userinit.exe`, the executive
+spawned the real userinit process, CSR accepted it, userinit issued win32k syscalls, and userinit
+then opened/sectioned `explorer.exe` far enough for explorer to issue real win32k traffic. There is
+no `CreateProcessW failed, last error: 193` and no hosted executable record failure trace. The
+current frontier is now later dynamic child process setup and GUI progress: several SCM-started
+service children fail ReactOS `BasePushProcessParameters` with `STATUS_INVALID_HANDLE`, and the run
+eventually deadmans after explorer win32k calls. The next useful slice should inspect the remote
+process-handle/VM-write path used by ReactOS kernel32 when pushing process parameters for dynamic
+service `svchost.exe` children, without reintroducing service-name or executable-name policy.
 
 ### A. SCM-Controlled Service Startup
 
@@ -2437,3 +2439,21 @@ regression coverage, and remaining D3/D4 durable hive/profile persistence.
   already connected to SCM and exchanged pipe/RPC traffic. Review adjustment: next work should
   instrument/repair EventLog `ServiceMain` progress into `ServiceInit`/`RpcThreadRoutine` so the
   genuine `\pipe\EventLog` server endpoint appears before SCM's event logging client bind.
+
+- A4 hosted executable record authority slice. Hosted executable image-open/section/spawn records are
+  now sized independently from `MAX_PI` because they are retained handle-lifetime/publication
+  records, not live process slots. Dynamic process admission remains bounded by `MAX_PI`, but
+  service churn can no longer consume the entire image-record table before winlogon reaches the real
+  shell path. Hosted executable opens now fail loudly with NT status when the record cannot be
+  installed, clear `FileHandle`/IOSB on failure, and only fall through to the read-only disk file
+  fallback after hosted executable recording has either succeeded or been ruled out. Validation:
+  `cargo fmt --all`, `cargo test -p nt-exe-image`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and partial boot `.tmp/boot-hosted-exe-record-cap-rerun-20260810.log`. Result: the old
+  `CreateProcessW failed, last error: 193` userinit frontier is gone; winlogon opens/sections and
+  spawns `userinit.exe`, userinit runs win32k syscalls, and `explorer.exe` opens/sections far enough
+  to run real win32k traffic. The run was interrupted after a repeated deadman, so the next accepted
+  proof still needs a clean harness exit. Review adjustment: the immediate A4 frontier has moved to
+  generic remote process-parameter setup for dynamic service children (`BasePushProcessParameters`
+  returning `STATUS_INVALID_HANDLE`) and then the later explorer GUI-progress deadman; do not add
+  service/executable fallbacks.
