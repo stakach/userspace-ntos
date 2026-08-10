@@ -106,6 +106,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` H3: Re-run one serialized boot after H1/H2 and require the post-SAS path to advance through
   `SetDefaultLanguage(NULL)` without reintroducing synthetic registry success.
 
+### I. NT I/O Manager And Shell IPC Fidelity
+
+- `[x]` I1: Honor NT overlapped event-handle tagging for file, pipe FSCTL, and directory I/O so
+  ReactOS kernel32 can pass `OVERLAPPED.hEvent | 1` without failing event validation.
+- `[ ]` I2: Implement file I/O completion notification modes and audit completion-port packet/event
+  suppression through `NtSetInformationFile(FileIoCompletionNotificationInformation)`.
+- `[ ]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
+  next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
+
 ## Review Log
 
 ### 2026-08-02
@@ -2077,3 +2086,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `armed=1 known=1`, wakes only exact hash-matched fids `0e814c80`/`0e814c81`, and no longer shows
   the previous `known=0`, timeout, cancel, service `Error 1053`, or unhandled-syscall signatures.
   Review adjustment: continue only from the next real red edge after the desktop proof.
+- I1 complete. The executive now strips the NT file-I/O completion-port suppression bit from
+  overlapped event handles before validating, resetting, or signaling events in `NtFsControlFile`,
+  `NtReadFile`, `NtWriteFile`, and `NtQueryDirectoryFile`. A raw `hEvent == 1` is treated as
+  "no event object" rather than an invalid handle, matching the kernel32 convention of using the low
+  bit to suppress completion packets while keeping the real event handle in the upper bits. Review
+  adjustment: the next I/O-manager debt is `FileIoCompletionNotificationInformation`, because
+  ReactOS kernel32 exposes `SetFileCompletionNotificationModes` on top of `NtSetInformationFile`.

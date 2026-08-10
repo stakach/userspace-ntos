@@ -12514,18 +12514,23 @@ impl ExecNtHandler {
         Ok(route)
     }
 
-    /// Validate an optional I/O completion event. Named executive events return their object index;
-    /// legacy anonymous events are typed as Opaque and retain the existing immediate-wait model.
+    /// Validate an optional I/O completion event. NT file I/O callers may set the low bit of
+    /// `OVERLAPPED.hEvent` to suppress completion-port notification; the event object remains the
+    /// untagged handle. Named executive events return their object index; legacy anonymous events are
+    /// typed as Opaque and retain the existing immediate-wait model.
     pub(crate) fn validate_io_event(&self, handle: u64) -> Result<Option<usize>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        if handle == 0 {
+        let Some(event_handle) = nt_io_completion::normalize_io_event_handle(handle) else {
             return Ok(None);
-        }
-        if let Ok(index) = self.event_index_for_handle(handle, 0) {
+        };
+        if let Ok(index) = self.event_index_for_handle(event_handle, 0) {
             return Ok(Some(index));
         }
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
-        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+        match self
+            .pm
+            .lookup_handle(pid, event_handle as nt_process::Handle)
+        {
             Some(nt_process::HandleObject::Opaque(_)) => Ok(None),
             _ => Err(STATUS_INVALID_HANDLE),
         }
@@ -15983,17 +15988,19 @@ impl ExecNtHandler {
                 // EVENT_MODIFY_STATE and clear it before issuing every request. In particular,
                 // rpcrt4 reuses a manual-reset event when it rearms a pipe listener; leaving the
                 // previous completion signalled manufactures a second accepted connection.
-                let event_obj_idx = if args[1] != 0 {
-                    match self.event_index_for_handle(args[1], EVENT_MODIFY_STATE) {
+                let event_obj_idx =
+                    if let Some(event_handle) = nt_io_completion::normalize_io_event_handle(args[1])
+                    {
+                        match self.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
                         Ok(index) => {
                             let _ = self.events.reset_existing(index as u64);
                             index as u64
                         }
                         Err(event_status) => return event_status,
                     }
-                } else {
-                    u64::MAX
-                };
+                    } else {
+                        u64::MAX
+                    };
                 let is_pipe_listen = (fsctl as u32) == FSCTL_PIPE_LISTEN;
                 let raw_input_len = args[7] as u32 as usize;
                 let raw_output_len = args[9] as u32 as usize;
@@ -20008,14 +20015,16 @@ impl ExecNtHandler {
                     );
                     return STATUS_NOT_SUPPORTED;
                 }
-                let event_index = if args[1] == 0 {
-                    None
-                } else {
-                    match self.event_index_for_handle(args[1], 0) {
+                let event_index =
+                    if let Some(event_handle) = nt_io_completion::normalize_io_event_handle(args[1])
+                    {
+                        match self.event_index_for_handle(event_handle, 0) {
                         Ok(index) => Some(index),
                         Err(status) => return status,
                     }
-                };
+                    } else {
+                        None
+                    };
                 // `Length` is a ULONG and `ReturnSingleEntry` / `RestartScan` are BOOLEANs. They
                 // often live in stack slots whose high halves still contain older pointer data, so
                 // the ABI boundary must truncate them before validation for every filesystem path.

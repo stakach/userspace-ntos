@@ -12,6 +12,17 @@ pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 pub const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
 pub const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
 
+/// NT file I/O APIs let callers set the low bit of an overlapped event handle to suppress
+/// completion-port notification. The event object itself is still the handle with that bit cleared.
+pub const fn normalize_io_event_handle(handle: u64) -> Option<u64> {
+    let untagged = handle & !1;
+    if untagged == 0 {
+        None
+    } else {
+        Some(untagged)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FileCompletionBinding {
     pub port_id: u32,
@@ -648,6 +659,14 @@ mod tests {
             ports.create(&[], 1, false),
             Err(STATUS_INSUFFICIENT_RESOURCES)
         );
+    }
+
+    #[test]
+    fn io_event_handles_strip_completion_port_suppression_bit() {
+        assert_eq!(normalize_io_event_handle(0), None);
+        assert_eq!(normalize_io_event_handle(1), None);
+        assert_eq!(normalize_io_event_handle(0x40), Some(0x40));
+        assert_eq!(normalize_io_event_handle(0x41), Some(0x40));
     }
 
     #[test]
