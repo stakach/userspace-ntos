@@ -1381,7 +1381,12 @@ pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WI
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
-pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI;
+/// Ordered image-open/section/spawn records are handle-lifetime records, not process slots. A
+/// published process record is retained after its file/section handles close so later
+/// `NtCreateProcessEx`/publication accounting remains ordered, while dynamic service starts can
+/// consume additional transient records before winlogon reaches the shell. Keep this independent of
+/// `MAX_PI`; process indices are still bounded by `MAX_PI` when dynamic images are admitted.
+pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 /// Per-process VAD extents. A real NT process's VAD is an unbounded AVL tree; ours is a fixed slot
 /// array, and `insert` returns STATUS_INSUFFICIENT_RESOURCES once it is full.
 ///

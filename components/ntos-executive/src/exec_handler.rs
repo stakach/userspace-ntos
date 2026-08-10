@@ -55,6 +55,7 @@ static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
@@ -765,25 +766,35 @@ unsafe fn record_hosted_child_exe_open(
     owner_pi: usize,
     hosted: nt_exe_image::HostedProcessImageRef<'_>,
     file_handle: u64,
-) -> bool {
+) -> Result<(), nt_exe_image::ImageError> {
     let Some(metadata) = (unsafe { loaded_hosted_image_metadata(ctx, hosted) }) else {
-        return false;
+        return Err(nt_exe_image::ImageError::InvalidMetadata);
     };
-    let opened = unsafe { &mut *ctx.exe_images }
-        .open(owner_pi, hosted.leaf, file_handle, metadata)
-        .is_ok();
-    if opened {
-        match hosted.role {
-            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
-                USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-            }
-            nt_exe_image::HostedProcessRole::InteractiveShell => {
-                EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
+    unsafe { &mut *ctx.exe_images }.open(owner_pi, hosted.leaf, file_handle, metadata)?;
+    match hosted.role {
+        nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
+            USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+        nt_exe_image::HostedProcessRole::InteractiveShell => {
+            EXPLORER_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn hosted_exe_open_status(error: nt_exe_image::ImageError) -> u32 {
+    match error {
+        nt_exe_image::ImageError::Full => 0xC000_009A, // STATUS_INSUFFICIENT_RESOURCES
+        nt_exe_image::ImageError::InvalidHandle => STATUS_INVALID_HANDLE,
+        nt_exe_image::ImageError::NotFound => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+        nt_exe_image::ImageError::InvalidPath | nt_exe_image::ImageError::InvalidMetadata => {
+            0xC000_007B // STATUS_INVALID_IMAGE_FORMAT
+        }
+        nt_exe_image::ImageError::HandleCollision | nt_exe_image::ImageError::InvalidState => {
+            STATUS_INVALID_PARAMETER
         }
     }
-    opened
 }
 
 fn dynamic_hosted_nt_image_path(
@@ -13678,41 +13689,6 @@ impl ExecNtHandler {
         let want_dir = args[5] as u32 & FILE_DIRECTORY_FILE as u32 != 0;
         let open_options = args[5] as u32;
         let desired_access = args[1] as u32;
-        let disk_entry = Self::readonly_disk_open_entry(&name16, desired_access, open_options);
-        if let Some((first_cluster, file_size)) = disk_entry {
-            let mut status = nt_fs::STATUS_SUCCESS;
-            let opened_handle =
-                self.mint_disk_file_handle(first_cluster, file_size, desired_access);
-            if let Some(handle) = opened_handle {
-                self.queue_write(file_handle_out, handle);
-            } else {
-                status = 0xC000_009A;
-                self.write_nt_open_file_handle_out(file_handle_out, 0);
-            }
-            let iosb = get_recv_mr(8);
-            if iosb != 0 {
-                self.xas_write_buf(iosb, &status.to_le_bytes());
-                self.xas_write_buf(
-                    iosb + 8,
-                    &(if status == nt_fs::STATUS_SUCCESS {
-                        1u64
-                    } else {
-                        0
-                    })
-                    .to_le_bytes(),
-                );
-            }
-            loader_trace_record(
-                self.pi,
-                LoaderOp::OpenFile,
-                status,
-                None,
-                0,
-                opened_handle.unwrap_or(0),
-                &nb[..nlen],
-            );
-            return status;
-        }
         // Directory opens resolve authoritatively against the mounted FAT volume. The empty
         // volume-relative path denotes the FAT root directory.
         let volume_entry =
@@ -13871,10 +13847,37 @@ impl ExecNtHandler {
                     return status;
                 };
                 opened_handle = h;
-                smss_stack_write(file_handle_out, h);
                 if let Some(image) = hosted_exe_image {
-                    let _ = record_hosted_child_exe_open(ctx, self.pi, image, h);
+                    if let Err(error) = record_hosted_child_exe_open(ctx, self.pi, image, h) {
+                        let status = hosted_exe_open_status(error);
+                        if HOSTED_EXE_OPEN_FAILURE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                            print_str(b"[hosted-exe] open record failed pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" leaf=");
+                            print_str(image.leaf);
+                            print_str(b" status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                        }
+                        self.write_nt_open_file_handle_out(file_handle_out, 0);
+                        let iosb = get_recv_mr(8);
+                        if iosb != 0 {
+                            smss_stack_write32(iosb, status);
+                            smss_stack_write(iosb + 8, 0);
+                        }
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::OpenFile,
+                            status,
+                            dll_i,
+                            0,
+                            0,
+                            &nb[..nlen],
+                        );
+                        return status;
+                    }
                 }
+                smss_stack_write(file_handle_out, h);
                 if let Some(i) = dll_i {
                     reg.set_file_handle(self.pi, i, h);
                 }
@@ -13884,6 +13887,41 @@ impl ExecNtHandler {
                     smss_stack_write(iosb + 8, 1);
                 }
                 0
+            } else if let Some((first_cluster, file_size)) =
+                Self::readonly_disk_open_entry(&name16, desired_access, open_options)
+            {
+                let mut status = nt_fs::STATUS_SUCCESS;
+                let opened_handle =
+                    self.mint_disk_file_handle(first_cluster, file_size, desired_access);
+                if let Some(handle) = opened_handle {
+                    self.queue_write(file_handle_out, handle);
+                } else {
+                    status = 0xC000_009A;
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                }
+                let iosb = get_recv_mr(8);
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(
+                        iosb + 8,
+                        &(if status == nt_fs::STATUS_SUCCESS {
+                            1u64
+                        } else {
+                            0
+                        })
+                        .to_le_bytes(),
+                    );
+                }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    None,
+                    0,
+                    opened_handle.unwrap_or(0),
+                    &nb[..nlen],
+                );
+                return status;
             } else {
                 if self.current_process_is_lsass() {
                     print_str(b"[lsass-open-miss] name=");
