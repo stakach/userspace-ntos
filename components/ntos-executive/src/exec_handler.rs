@@ -20,6 +20,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
+const STATUS_CANCELLED: u32 = 0xC000_0120;
 const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
 const REGISTRY_SERVICE_NAME_COPY_MAX: usize = 512;
@@ -55,6 +56,7 @@ static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NT_CANCEL_IO_FILE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
@@ -1696,6 +1698,7 @@ impl ExecNtHandler {
         write_field!(pipe_listen_fid, 0);
         write_field!(pipe_listen_event_handle, 0);
         write_field!(pipe_listen_iosb_va, 0);
+        write_field!(pipe_name_wait_root_handle, 0);
         write_field!(pipe_name_wait_hash, 0);
         write_field!(pipe_name_wait_iosb_va, 0);
         write_field!(pipe_name_wait_event_obj_idx, u64::MAX);
@@ -6782,6 +6785,152 @@ impl ExecNtHandler {
         if let Ok(Some(port_id)) = self.file_completion.release_file(file_id) {
             let _ = self.io_completion_ports.release(port_id);
         }
+    }
+
+    fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        if handle > u32::MAX as u64 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::File(file_id))
+            | Some(nt_process::HandleObject::RoutedFile { file_id, .. }) => {
+                if file_id == 0 || self.file_completion.is_signaled(file_id).is_err() {
+                    Err(STATUS_INVALID_HANDLE)
+                } else {
+                    Ok((Some(file_id), false))
+                }
+            }
+            Some(nt_process::HandleObject::DiskFile { .. })
+            | Some(nt_process::HandleObject::Directory { .. })
+            | Some(nt_process::HandleObject::OverlayFile(_))
+            | Some(nt_process::HandleObject::BootStatusFile) => Ok((None, false)),
+            Some(nt_process::HandleObject::Opaque(tag)) if tag == NPFS_ROOT_HANDLE_TAG => {
+                Ok((None, true))
+            }
+            Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    unsafe fn write_current_iosb(&self, iosb: u64, status: u32, information: u64) -> bool {
+        if iosb == 0 || !self.probe_user_output(iosb, 16) {
+            return false;
+        }
+        self.xas_write_buf(iosb, &status.to_le_bytes());
+        self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+        true
+    }
+
+    unsafe fn complete_cancelled_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
+        if waiter.iosb_va != 0 {
+            let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
+        }
+        self.post_file_completion(waiter.file_id, waiter.apc_context, STATUS_CANCELLED, 0);
+        if waiter.event_obj_idx != u64::MAX {
+            let _ = self.signal_event_index(waiter.event_obj_idx as usize);
+        }
+        if waiter.reply_cap != 0 {
+            set_reply_mr(15, waiter.resume_ip);
+            set_reply_mr(16, waiter.resume_sp);
+            set_reply_mr(17, waiter.resume_flags);
+            client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
+            release_reply_pool_cap(waiter.reply_cap);
+            thread_wait_state_clear_badge(waiter.badge);
+        }
+        self.release_file_reference(waiter.file_id);
+    }
+
+    unsafe fn complete_cancelled_pipe_listen(&mut self, listen: nt_io_manager::AsyncListen) {
+        if listen.iosb_va != 0 {
+            let _ = self.write_current_iosb(listen.iosb_va, STATUS_CANCELLED, 0);
+        }
+        self.post_file_completion(listen.server_file_id, listen.apc_context, STATUS_CANCELLED, 0);
+        if listen.event_obj_idx != u64::MAX {
+            let _ = self.signal_event_index(listen.event_obj_idx as usize);
+        }
+        self.release_file_reference(listen.server_file_id);
+    }
+
+    unsafe fn complete_cancelled_pipe_name_waiter(&mut self, waiter: nt_io_manager::PipeNameWaiter) {
+        if waiter.iosb_va != 0 {
+            let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
+        }
+        if waiter.event_obj_idx != u64::MAX {
+            let _ = self.signal_event_index(waiter.event_obj_idx as usize);
+        }
+        if waiter.reply_cap != 0 {
+            set_reply_mr(15, waiter.resume_ip);
+            set_reply_mr(16, waiter.resume_sp);
+            set_reply_mr(17, waiter.resume_flags);
+            client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
+            release_reply_pool_cap(waiter.reply_cap);
+            thread_wait_state_clear_badge(waiter.badge);
+        }
+    }
+
+    unsafe fn cancel_pipe_io_for_file_id(&mut self, file_id: u64) -> usize {
+        let tid = self.current_tid;
+        let mut cancelled = 0usize;
+        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS)).cancel_thread_file_with(
+            tid,
+            file_id,
+            |waiter| self.complete_cancelled_pipe_waiter(waiter),
+        );
+        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).cancel_thread_file_with(
+            tid,
+            file_id,
+            |listen| self.complete_cancelled_pipe_listen(listen),
+        );
+        cancelled
+    }
+
+    unsafe fn cancel_pipe_name_waits_for_root_handle(&mut self, root_handle: u64) -> usize {
+        (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS)).cancel_thread_handle_with(
+            self.current_tid,
+            root_handle,
+            |waiter| self.complete_cancelled_pipe_name_waiter(waiter),
+        )
+    }
+
+    unsafe fn nt_cancel_io_file_service(&mut self, args: &[u64]) -> u32 {
+        let file_handle = args[0];
+        let iosb = args[1];
+        if iosb == 0 || !self.probe_user_output(iosb, 16) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let (file_id, is_npfs_root) = match self.cancel_target_for_handle(file_handle) {
+            Ok(target) => target,
+            Err(status) => return status,
+        };
+        let mut cancelled = file_id
+            .map(|file_id| self.cancel_pipe_io_for_file_id(file_id))
+            .unwrap_or(0);
+        if is_npfs_root {
+            cancelled += self.cancel_pipe_name_waits_for_root_handle(file_handle);
+        }
+        self.xas_write_buf(iosb, &0u32.to_le_bytes());
+        self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+        let trace = NT_CANCEL_IO_FILE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 32 || cancelled != 0 {
+            print_str(b"[nt-cancel-io-file] #");
+            print_u64(trace);
+            print_str(b" pi=");
+            print_u64(self.pi as u64);
+            print_str(b" badge=");
+            print_u64(self.current_badge);
+            print_str(b" tid=");
+            print_u64(self.current_tid);
+            print_str(b" handle=0x");
+            print_hex(file_handle as u32);
+            print_str(b" fid=0x");
+            print_hex(file_id.unwrap_or(0) as u32);
+            print_str(b" cancelled=");
+            print_u64(cancelled as u64);
+            print_str(b"\n");
+        }
+        0
     }
     /// ★ CROSS-VSPACE `NtCreateThread` — a genuine ADDITIONAL thread inside a FOREIGN process
     /// (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`; `DbgUiIssueRemoteBreakin`'s
@@ -15875,6 +16024,7 @@ impl ExecNtHandler {
                                                         as u64;
                                             } else {
                                                 self.pipe_name_wait_hash = pipe_wait_name_hash;
+                                                self.pipe_name_wait_root_handle = args[0];
                                                 self.pipe_name_wait_iosb_va = iosb;
                                                 self.pipe_name_wait_event_obj_idx = event_obj_idx;
                                                 self.pipe_name_wait_deadline_100ns =
@@ -16055,6 +16205,7 @@ impl ExecNtHandler {
                                 tid: self.current_tid,
                                 badge: self.current_badge,
                                 iosb_va: iosb,
+                                apc_context: args[3],
                                 // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
                                 // client connect completes ONLY the matching-name listen.
                                 name_hash: crate::pipe_fid_name_hash(fid),
@@ -20824,6 +20975,11 @@ impl ExecNtHandler {
                 }
                 status
             },
+            // NtCancelIoFile(FileHandle[R10], *IoStatusBlock[RDX]). Cancel all pending I/O issued by
+            // the current thread for the target FILE_OBJECT. The cancelled IRPs complete through
+            // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
+            // the cancel request itself as STATUS_SUCCESS, matching ReactOS IoMgr.
+            NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
             // NtWriteFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
             // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ByteOffset[sp+0x40],
             // Key[sp+0x48]). Route typed named-pipe handles through isolated npfs with the caller's

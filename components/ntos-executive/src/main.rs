@@ -1024,6 +1024,8 @@ pub const SSN_NT_ENUMERATE_KEY: u64 = 75;
 pub const SSN_NT_QUERY_KEY: u64 = 167;
 /// ntdll's NtCreateFile SSN (rpcrt4's ncacn_np client opens \Device\NamedPipe\lsarpc; lsass pi 4).
 pub const SSN_NT_CREATE_FILE: u64 = 39;
+/// ntdll's NtCancelIoFile SSN (CancelIo on pending pipe/RPC IRPs).
+pub const SSN_NT_CANCEL_IO_FILE: u64 = 24;
 /// ReactOS completion-port syscall family (`sysfuncs.lst` line minus one).
 pub const SSN_NT_CREATE_IO_COMPLETION: u64 = 40;
 pub const SSN_NT_OPEN_IO_COMPLETION: u64 = 123;
@@ -16340,6 +16342,7 @@ struct ExecNtHandler {
     pipe_listen_fid: u64,
     pipe_listen_event_handle: u64,
     pipe_listen_iosb_va: u64,
+    pipe_name_wait_root_handle: u64,
     pipe_name_wait_hash: u64,
     pipe_name_wait_iosb_va: u64,
     pipe_name_wait_event_obj_idx: u64,
@@ -17307,6 +17310,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
             (NativeService::NtQueryKey, SSN_NT_QUERY_KEY as u32),
             (NativeService::NtCreateFile, SSN_NT_CREATE_FILE as u32),
+            (NativeService::NtCancelIoFile, SSN_NT_CANCEL_IO_FILE as u32),
             (
                 NativeService::NtCreateIoCompletion,
                 SSN_NT_CREATE_IO_COMPLETION as u32,

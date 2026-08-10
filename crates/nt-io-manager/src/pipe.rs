@@ -711,6 +711,24 @@ impl<const N: usize> PipeWaiterTable<N> {
         n
     }
 
+    /// Cancel + free any waiter owned by `tid` for `file_id`, invoking `complete` with every removed
+    /// waiter. This models `NtCancelIoFile`: only IRPs issued by the current thread for the target
+    /// FILE_OBJECT are cancelled, and the caller owns finalizing the waiter surfaces.
+    pub fn cancel_thread_file_with<F>(&mut self, tid: u64, file_id: u64, mut complete: F) -> usize
+    where
+        F: FnMut(PipeWaiter),
+    {
+        let mut count = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|waiter| waiter.tid == tid && waiter.file_id == file_id) {
+                let waiter = slot.take().unwrap();
+                complete(waiter);
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Cancel only reply-cap-blocked operations. Asynchronous requests have already returned to
     /// user mode and must remain owned until the driver produces their final completion.
     pub fn cancel_blocked_thread(&mut self, tid: u64) -> usize {
@@ -809,6 +827,8 @@ pub struct AsyncListen {
     pub badge: u64,
     /// The listen IO_STATUS_BLOCK VA (filled `{Status=SUCCESS, Information=0}` on completion).
     pub iosb_va: u64,
+    /// The I/O completion key/APC context passed to NtFsControlFile.
+    pub apc_context: u64,
     /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, …). A client connect
     /// completes ONLY the listen whose `name_hash` matches the connected pipe — so connecting to
     /// `\ntsvcs` does NOT spuriously wake `\lsarpc`/`\samr` servers. 0 = unset (matches any).
@@ -880,6 +900,8 @@ pub fn decode_pipe_wait_name(input: &[u8]) -> Result<Vec<u16>, NtStatus> {
 /// `NP_VCB::WaitQueue` and completes them when a matching pipe instance becomes available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PipeNameWaiter {
+    /// Process-local NPFS root/control handle that issued this `FSCTL_PIPE_WAIT`.
+    pub root_handle: u64,
     pub name_hash: u64,
     pub pi: u32,
     pub tid: u64,
@@ -980,6 +1002,27 @@ impl<const N: usize> PipeNameWaiterTable<N> {
         }
         count
     }
+
+    /// Cancel one thread's pending root `FSCTL_PIPE_WAIT` requests for the specified root handle.
+    pub fn cancel_thread_handle_with<F>(
+        &mut self,
+        tid: u64,
+        root_handle: u64,
+        mut complete: F,
+    ) -> usize
+    where
+        F: FnMut(PipeNameWaiter),
+    {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if slot.is_some_and(|waiter| waiter.tid == tid && waiter.root_handle == root_handle) {
+                let waiter = slot.take().unwrap();
+                complete(waiter);
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 /// Reset-safe table of pending async server listens.
@@ -1060,6 +1103,23 @@ impl<const N: usize> AsyncListenTable<N> {
                     *slot = None;
                     count += 1;
                 }
+            }
+        }
+        count
+    }
+
+    /// Cancel one thread's pending listen IRPs for one server file object, invoking `complete` with
+    /// every removed listen. This is the file-scoped form used by `NtCancelIoFile`.
+    pub fn cancel_thread_file_with<F>(&mut self, tid: u64, file_id: u64, mut complete: F) -> usize
+    where
+        F: FnMut(AsyncListen),
+    {
+        let mut count = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.is_some_and(|listen| listen.tid == tid && listen.server_file_id == file_id) {
+                let listen = slot.take().unwrap();
+                complete(listen);
+                count += 1;
             }
         }
         count
@@ -1335,6 +1395,27 @@ mod tests {
         assert_eq!(t.cancel_thread(7), 2);
         assert_eq!(t.len(), 1);
         assert!(t.parked_on(0xCC));
+    }
+
+    #[test]
+    fn pipe_waiter_cancel_thread_file_only_removes_matching_file_object() {
+        let mut t = PipeWaiterTable::<4>::new();
+        t.park(wtr(0xAA, 3, 7)).unwrap();
+        t.park(wtr(0xBB, 3, 7)).unwrap();
+        t.park(wtr(0xAA, 3, 8)).unwrap();
+
+        let mut cancelled = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_file_with(7, 0xAA, |waiter| cancelled.push(waiter.file_id)),
+            1
+        );
+        assert_eq!(cancelled, std::vec![0xAA]);
+        let remaining: std::vec::Vec<_> = t
+            .drain_all()
+            .map(|(_, waiter)| (waiter.tid, waiter.file_id))
+            .collect();
+        assert_eq!(remaining, std::vec![(7, 0xBB), (8, 0xAA)]);
+        assert_eq!(t.len(), 2);
     }
 
     #[test]
@@ -1748,6 +1829,7 @@ mod tests {
             tid: 77,
             badge: 7,
             iosb_va: 0x9000 + server_file_id,
+            apc_context: 0,
             name_hash: 0,
         }
     }
@@ -1761,6 +1843,7 @@ mod tests {
 
     fn pnw(name: &[u16], tid: u64, reply_cap: u64, deadline_100ns: u64) -> PipeNameWaiter {
         PipeNameWaiter {
+            root_handle: 0x80,
             name_hash: pipe_name_hash(name),
             pi: 3,
             tid,
@@ -1894,6 +1977,25 @@ mod tests {
         );
         assert_eq!(released, std::vec![0xA, 0xB, 0xC]);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn async_listen_cancel_thread_file_only_removes_matching_listen() {
+        let mut t = AsyncListenTable::<2>::new();
+        t.arm(al(0xA, 1)).unwrap();
+        t.arm(al(0xB, 2)).unwrap();
+        let mut cancelled = std::vec::Vec::new();
+
+        assert_eq!(
+            t.cancel_thread_file_with(77, 0xA, |listen| {
+                cancelled.push((listen.server_file_id, listen.event_obj_idx));
+            }),
+            1
+        );
+        assert_eq!(cancelled, std::vec![(0xA, 1)]);
+        assert!(!t.armed(0xA));
+        assert!(t.armed(0xB));
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
@@ -2082,6 +2184,34 @@ mod tests {
         assert!(!t.has_thread(10));
         assert!(t.has_thread(11));
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn pipe_name_waiter_cancel_thread_handle_only_removes_matching_waits() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let mut t = PipeNameWaiterTable::<4>::new();
+        let mut first = pnw(&eventlog, 10, 0x30, u64::MAX);
+        first.root_handle = 0x80;
+        let mut second = pnw(&ntsvcs, 10, 0x31, 200);
+        second.root_handle = 0x84;
+        let mut third = pnw(&eventlog, 11, 0x32, 300);
+        third.root_handle = 0x80;
+        t.arm(first).unwrap();
+        t.arm(second).unwrap();
+        t.arm(third).unwrap();
+
+        let mut cancelled = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_handle_with(10, 0x80, |waiter| {
+                cancelled.push((waiter.tid, waiter.root_handle, waiter.reply_cap));
+            }),
+            1
+        );
+        assert_eq!(cancelled, std::vec![(10, 0x80, 0x30)]);
+        assert_eq!(t.len(), 2);
+        assert!(t.has_thread(10));
+        assert!(t.has_thread(11));
     }
 
     #[test]

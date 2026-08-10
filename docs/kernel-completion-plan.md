@@ -188,6 +188,22 @@ loads (`shell32`, `browseui`, `shdocvw`, `propsys`), advances pipe control traff
 `\pipe\ntsvcs` listen/connect churn. The next red edge is native service syscall/reply correctness,
 not pipe-listen capacity.
 
+Latest pipe-cancellation validation `.tmp/boot-ntcanceliofile-20260810.log` supersedes that syscall
+`0x18` edge. `NtCancelIoFile` is now registered at SSN 24, validates a target handle as a FILE_OBJECT
+with zero desired access, cancels only pending I/O issued by the current thread for that file, and
+completes the cancelled pipe read/write/transceive, async `FSCTL_PIPE_LISTEN`, and root
+`FSCTL_PIPE_WAIT` records through their own IOSB/event/file-object/IOCP surfaces with
+`STATUS_CANCELLED`. The cancel request's own IOSB reports `STATUS_SUCCESS`, matching ReactOS IoMgr
+semantics. Validation: `cargo fmt --all`, `cargo test -p nt-io-manager cancel_thread -- --nocapture`,
+`cargo test -p nt-syscall -- --nocapture`, `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and a live
+`./run.sh` boot. Result: the log shows `[nt-cancel-io-file] ... cancelled=1`, the unhandled-syscall
+park does not recur, and the harness again reports
+`SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review
+adjustment: the next A4 edge is service-control startup timing/IPC (`WLAN Service`
+`EVENT_CONNECTION_TIMEOUT` / control pipe `Error 1053`) before resuming richer explorer shell
+chrome proofs; do not reintroduce service-name pipe or executable fallbacks.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -2572,3 +2588,19 @@ not pipe-listen capacity.
   run cleanly reaches the base desktop proof again. Review adjustment: continue A4 at the real
   LSA/SAM RPC request and ObjectDirectory query gates; do not reintroduce service/executable
   fallbacks.
+
+- A4 pipe cancellation slice. `NtCancelIoFile` now follows the ReactOS IoMgr contract for the pipe
+  IRP classes modeled by the executive: the syscall probes its caller IOSB, references the target
+  file handle without requiring file access rights, cancels only current-thread IRPs for that file,
+  and lets each cancelled operation complete through its original IOSB, event, file-object signal
+  state, reply cap, and IOCP packet as applicable. `PipeWaiterTable`, `AsyncListenTable`, and
+  `PipeNameWaiterTable` have file/root-handle scoped cancellation helpers, and successful async
+  listens now use the same `post_file_completion` path as cancelled listens. Validation: `cargo fmt
+  --all`, `cargo test -p nt-io-manager cancel_thread -- --nocapture`, `cargo test -p nt-syscall
+  -- --nocapture`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and boot `.tmp/boot-ntcanceliofile-20260810.log`.
+  Result: the previous `services.exe` unhandled syscall `0x18` park is gone, the live trace records
+  a real `[nt-cancel-io-file] ... cancelled=1`, and the harness reports
+  `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review
+  adjustment: the next useful A4 work is generic service-control pipe timing/IPC after the WLAN
+  service timeout, with explorer shell chrome proofs rerun once service startup is stable again.

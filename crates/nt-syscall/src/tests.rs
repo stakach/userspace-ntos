@@ -349,6 +349,7 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtQueryInformationThread, 162),
         (NativeService::NtOpenProcessTokenEx, 130),
         (NativeService::NtDuplicateToken, 72),
+        (NativeService::NtCancelIoFile, 24),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
     assert_eq!(t.len(), pairs.len());
@@ -368,6 +369,8 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtOpenProcess.name(), "NtOpenProcess");
     assert_eq!(NativeService::NtOpenProcess.arg_count(), (4, 4));
     assert_eq!(NativeService::NtOpenThread.name(), "NtOpenThread");
+    assert_eq!(NativeService::NtCancelIoFile.name(), "NtCancelIoFile");
+    assert_eq!(NativeService::NtCancelIoFile.arg_count(), (2, 2));
     assert_eq!(NativeService::NtOpenThread.arg_count(), (4, 4));
     assert_eq!(
         NativeService::NtQueryInformationThread.name(),

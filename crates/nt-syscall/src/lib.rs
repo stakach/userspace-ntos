@@ -63,6 +63,7 @@ pub enum NativeService {
     // File / I/O (§16.2)
     NtCreateFile,
     NtOpenFile,
+    NtCancelIoFile,
     NtReadFile,
     NtWriteFile,
     NtDeviceIoControlFile,
@@ -247,6 +248,7 @@ impl NativeService {
             NtQueryInformationAtom => "NtQueryInformationAtom",
             NtCreateFile => "NtCreateFile",
             NtOpenFile => "NtOpenFile",
+            NtCancelIoFile => "NtCancelIoFile",
             NtReadFile => "NtReadFile",
             NtWriteFile => "NtWriteFile",
             NtDeviceIoControlFile => "NtDeviceIoControlFile",
@@ -527,6 +529,7 @@ impl NativeService {
         NativeService::NtReleaseMutant,
         NativeService::NtQueryFullAttributesFile,
         NativeService::NtSaveKey,
+        NativeService::NtCancelIoFile,
     ];
 }
 

@@ -6882,6 +6882,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
             let mut park_pipe_is_write = false;
+            let mut park_pipe_name_wait_root_handle: u64 = 0;
             let mut park_pipe_name_wait_hash: u64 = 0;
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
             let mut park_pipe_name_wait_event_obj_idx: u64 = u64::MAX;
@@ -7523,6 +7524,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_is_write = nt_handler.pipe_park_is_write;
                 }
                 if nt_handler.pipe_name_wait_hash != 0 {
+                    park_pipe_name_wait_root_handle = nt_handler.pipe_name_wait_root_handle;
                     park_pipe_name_wait_hash = nt_handler.pipe_name_wait_hash;
                     park_pipe_name_wait_iosb_va = nt_handler.pipe_name_wait_iosb_va;
                     park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
@@ -13211,6 +13213,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             if park_pipe_name_wait_hash != 0 && reply_main != 0 {
                 if pipe_name_wait_park(
+                    park_pipe_name_wait_root_handle,
                     park_pipe_name_wait_hash,
                     pi as u32,
                     nt_handler.current_tid,
@@ -18350,6 +18353,7 @@ unsafe fn pipe_wait_park(
 }
 
 unsafe fn pipe_name_wait_park(
+    root_handle: u64,
     name_hash: u64,
     pi: u32,
     tid: u64,
@@ -18370,6 +18374,7 @@ unsafe fn pipe_name_wait_park(
     };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
     let parked = table.arm(nt_io_manager::PipeNameWaiter {
+        root_handle,
         name_hash,
         pi,
         tid,
@@ -18677,16 +18682,10 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
             nt_handler.xas_write_buf(l.iosb_va, &0u32.to_le_bytes());
             nt_handler.xas_write_buf(l.iosb_va + 8, &0u64.to_le_bytes());
         }
-        // NT file objects are waitable: overlapped callers may pass a NULL event and then wait on
-        // the file handle itself. Completing the listen sets the FILE_OBJECT signal state in addition
-        // to any explicit event below.
-        if nt_handler
-            .file_completion
-            .set_signaled(l.server_file_id, true)
-            .is_ok()
-        {
-            let _ = wait_wake_dispatcher_set(nt_handler);
-        }
+        // NT file objects are waitable, and files associated with an I/O completion port receive a
+        // completion packet. Use the shared file-completion path so success and cancellation expose
+        // the same surfaces.
+        nt_handler.post_file_completion(l.server_file_id, l.apc_context, 0, 0);
         // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
         // the exact NtSetEvent wake path: set the event's `signalled` flag then reevaluate waiters.
         if l.event_obj_idx != u64::MAX {

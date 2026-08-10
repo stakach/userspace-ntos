@@ -2047,3 +2047,16 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   desktop proof without the previous `WL: Failed to initialize SAS` abort. The run finishes at the
   current shell frontier (`246/295`, `exec_win32k_desktop_painted` passes); post-SAS
   `GetMessage`/msgina/profile/userinit/explorer gates remain the next blockers.
+- A4 pipe cancellation complete for modeled pipe IRPs. `NtCancelIoFile` is now a real native
+  service at SSN 24 instead of an unhandled syscall: it probes the caller IOSB, validates the target
+  FILE_OBJECT with no required access rights, cancels only current-thread pending pipe read/write,
+  transceive, async listen, and root name-wait operations for that handle, and completes those IRPs
+  through their original IOSB/event/file-object/IOCP surfaces with `STATUS_CANCELLED`. Successful
+  async listens now share the same file-completion path. Validation: `cargo fmt --all`,
+  `cargo test -p nt-io-manager cancel_thread -- --nocapture`, `cargo test -p nt-syscall
+  -- --nocapture`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and boot `.tmp/boot-ntcanceliofile-20260810.log`.
+  Evidence: `[nt-cancel-io-file] ... cancelled=1` appears, the old service `0x18` park does not
+  recur, and the harness reports the base desktop-painted success. Review adjustment: continue A4 at
+  real service-control pipe timing/IPC after the WLAN service `EVENT_CONNECTION_TIMEOUT`; no
+  service-name pipe/executable fallback should be reintroduced.
