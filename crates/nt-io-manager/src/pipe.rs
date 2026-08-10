@@ -601,6 +601,8 @@ pub struct PipeWaiter {
     pub iosb_va: u64,
     /// Caller APC/OVERLAPPED context copied into an associated completion-port packet.
     pub apc_context: u64,
+    /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
+    pub completion_port_suppressed: bool,
     /// Executive event-object index to signal on completion (`u64::MAX` for no event).
     pub event_obj_idx: u64,
     /// The stolen seL4 MCS reply cap that resumes the blocked thread.
@@ -753,6 +755,7 @@ impl<const N: usize> PipeWaiterTable<N> {
                 waiter.buffer_len = 0;
                 waiter.iosb_va = 0;
                 waiter.apc_context = 0;
+                waiter.completion_port_suppressed = false;
                 waiter.event_obj_idx = u64::MAX;
                 waiter.reply_cap = 0;
                 waiter.resume_ip = 0;
@@ -913,6 +916,8 @@ pub struct AsyncListen {
     pub iosb_va: u64,
     /// The I/O completion key/APC context passed to NtFsControlFile.
     pub apc_context: u64,
+    /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
+    pub completion_port_suppressed: bool,
     /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, …). A client connect
     /// completes ONLY the listen whose `name_hash` matches the connected pipe. `0` is incomplete
     /// metadata and never matches.
@@ -1346,6 +1351,7 @@ mod tests {
             buffer_len: 256,
             iosb_va: 0x2000 + file_id,
             apc_context: 0,
+            completion_port_suppressed: false,
             event_obj_idx: u64::MAX,
             reply_cap: 0x40 + file_id,
             resume_ip: 0x3000 + file_id,
@@ -1919,6 +1925,7 @@ mod tests {
             badge: 7,
             iosb_va: 0x9000 + server_file_id,
             apc_context: 0,
+            completion_port_suppressed: false,
             name_hash: 0,
         }
     }

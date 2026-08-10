@@ -16362,6 +16362,7 @@ struct ExecNtHandler {
     pipe_park_buffer_len: u32,
     pipe_park_iosb_va: u64,
     pipe_park_apc_context: u64,
+    pipe_park_completion_port_suppressed: bool,
     pipe_park_event_obj_idx: u64,
     pipe_park_transceive: bool,
     pipe_park_is_write: bool,
@@ -16627,6 +16628,16 @@ impl ExecFileCompletion {
         unsafe { (&*self.table).binding(file_id) }
     }
 
+    fn set_notification_modes(&mut self, file_id: u64, flags: u32) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).set_notification_modes(file_id, flags) }
+    }
+
+    fn notification_modes(&self, file_id: u64) -> Result<u32, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).notification_modes(file_id) }
+    }
+
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
@@ -16640,6 +16651,34 @@ impl ExecFileCompletion {
     fn is_signaled(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_signaled(file_id) }
+    }
+
+    fn complete_file(&mut self, file_id: u64, status: u32) -> Result<bool, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).complete_file(file_id, status) }
+    }
+
+    fn signal_on_completion_association(&mut self, file_id: u64) -> Result<bool, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).signal_on_completion_association(file_id) }
+    }
+
+    fn should_queue_completion_packet(
+        &self,
+        file_id: u64,
+        status: u32,
+        completed_inline: bool,
+        operation_suppressed: bool,
+    ) -> Result<bool, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe {
+            (&*self.table).should_queue_completion_packet(
+                file_id,
+                status,
+                completed_inline,
+                operation_suppressed,
+            )
+        }
     }
 }
 

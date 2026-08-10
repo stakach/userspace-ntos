@@ -6879,6 +6879,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_buffer_len: u32 = 0;
             let mut park_pipe_iosb_va: u64 = 0;
             let mut park_pipe_apc_context: u64 = 0;
+            let mut park_pipe_completion_port_suppressed = false;
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_transceive = false;
             let mut park_pipe_is_write = false;
@@ -6979,6 +6980,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_buffer_len = 0;
                 nt_handler.pipe_park_iosb_va = 0;
                 nt_handler.pipe_park_apc_context = 0;
+                nt_handler.pipe_park_completion_port_suppressed = false;
                 nt_handler.pipe_park_event_obj_idx = u64::MAX;
                 nt_handler.pipe_park_transceive = false;
                 nt_handler.pipe_park_is_write = false;
@@ -7519,6 +7521,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
                     park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
                     park_pipe_apc_context = nt_handler.pipe_park_apc_context;
+                    park_pipe_completion_port_suppressed =
+                        nt_handler.pipe_park_completion_port_suppressed;
                     park_pipe_event_obj_idx = nt_handler.pipe_park_event_obj_idx;
                     park_pipe_transceive = nt_handler.pipe_park_transceive;
                     park_pipe_is_write = nt_handler.pipe_park_is_write;
@@ -13179,6 +13183,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_len,
                     park_pipe_iosb_va,
                     park_pipe_apc_context,
+                    park_pipe_completion_port_suppressed,
                     park_pipe_event_obj_idx,
                     park_pipe_transceive,
                     park_pipe_is_write,
@@ -18312,6 +18317,7 @@ unsafe fn pipe_wait_park(
     buffer_len: u32,
     iosb_va: u64,
     apc_context: u64,
+    completion_port_suppressed: bool,
     event_obj_idx: u64,
     is_transceive: bool,
     is_write: bool,
@@ -18337,6 +18343,7 @@ unsafe fn pipe_wait_park(
         buffer_len,
         iosb_va,
         apc_context,
+        completion_port_suppressed,
         event_obj_idx,
         reply_cap: stolen,
         resume_ip,
@@ -18588,7 +18595,14 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             let _ = nt_handler.events.set_existing(w.event_obj_idx);
             let _ = wait_wake_dispatcher_set(nt_handler);
         }
-        nt_handler.post_file_completion(w.file_id, w.apc_context, status, completed);
+        nt_handler.post_file_completion(
+            w.file_id,
+            w.apc_context,
+            status,
+            completed,
+            false,
+            w.completion_port_suppressed,
+        );
         if nt_handler.io_completion_wake.is_some() {
             let _ = io_completion_deliver(nt_handler);
         }
@@ -18688,7 +18702,14 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
         // NT file objects are waitable, and files associated with an I/O completion port receive a
         // completion packet. Use the shared file-completion path so success and cancellation expose
         // the same surfaces.
-        nt_handler.post_file_completion(l.server_file_id, l.apc_context, 0, 0);
+        nt_handler.post_file_completion(
+            l.server_file_id,
+            l.apc_context,
+            0,
+            0,
+            false,
+            l.completion_port_suppressed,
+        );
         // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
         // the exact NtSetEvent wake path: set the event's `signalled` flag then reevaluate waiters.
         if l.event_obj_idx != u64::MAX {

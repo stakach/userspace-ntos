@@ -110,7 +110,7 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 
 - `[x]` I1: Honor NT overlapped event-handle tagging for file, pipe FSCTL, and directory I/O so
   ReactOS kernel32 can pass `OVERLAPPED.hEvent | 1` without failing event validation.
-- `[ ]` I2: Implement file I/O completion notification modes and audit completion-port packet/event
+- `[x]` I2: Implement file I/O completion notification modes and audit completion-port packet/event
   suppression through `NtSetInformationFile(FileIoCompletionNotificationInformation)`.
 - `[ ]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
   next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
@@ -2093,3 +2093,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   bit to suppress completion packets while keeping the real event handle in the upper bits. Review
   adjustment: the next I/O-manager debt is `FileIoCompletionNotificationInformation`, because
   ReactOS kernel32 exposes `SetFileCompletionNotificationModes` on top of `NtSetInformationFile`.
+- I2 complete. `FileIoCompletionNotificationInformation` is now backed by kernel-owned per-file
+  state: `NtSetInformationFile` records sticky notification flags, `NtQueryInformationFile` returns
+  the real four-byte flag structure, `FileCompletionInformation` association updates FILE_OBJECT
+  waitability unless `FILE_SKIP_SET_EVENT_ON_HANDLE` is active, inline successful completions honor
+  `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, and `OVERLAPPED.hEvent | 1` is carried through pending
+  pipe read/write/transceive/listen records to suppress their final completion-port packet. Local
+  validation: `cargo fmt --all`, `cargo test -p nt-io-completion -- --nocapture`,
+  `cargo test -p nt-io-manager -- --nocapture`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: I3 remains
+  the next accepted proof; use one uncontended boot lane and capture the genuine explorer/shell
+  frontier after this I/O completion state is present.

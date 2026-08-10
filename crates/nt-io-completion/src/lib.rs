@@ -7,10 +7,18 @@ pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 pub const STATUS_NAME_TOO_LONG: u32 = 0xC000_0106;
 pub const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
+
+pub const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u32 = 0x0000_0001;
+pub const FILE_SKIP_SET_EVENT_ON_HANDLE: u32 = 0x0000_0002;
+pub const FILE_SKIP_SET_USER_EVENT_ON_FAST_IO: u32 = 0x0000_0004;
+pub const FILE_IO_COMPLETION_NOTIFICATION_VALID_FLAGS: u32 = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+    | FILE_SKIP_SET_EVENT_ON_HANDLE
+    | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO;
 
 /// NT file I/O APIs let callers set the low bit of an overlapped event handle to suppress
 /// completion-port notification. The event object itself is still the handle with that bit cleared.
@@ -21,6 +29,10 @@ pub const fn normalize_io_event_handle(handle: u64) -> Option<u64> {
     } else {
         Some(untagged)
     }
+}
+
+pub const fn io_event_suppresses_completion_port(handle: u64) -> bool {
+    handle & 1 != 0
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,6 +47,7 @@ struct FileCompletionEntry {
     references: u32,
     synchronous: bool,
     signaled: bool,
+    notification_modes: u32,
     binding: Option<FileCompletionBinding>,
 }
 
@@ -54,6 +67,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
                 references: 0,
                 synchronous: false,
                 signaled: false,
+                notification_modes: 0,
                 binding: None,
             }; FILES],
         }
@@ -89,6 +103,7 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             references: 1,
             synchronous,
             signaled: true,
+            notification_modes: 0,
             binding: None,
         };
         Ok(())
@@ -135,6 +150,21 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         self.entry(file_id).and_then(|entry| entry.binding)
     }
 
+    pub fn set_notification_modes(&mut self, file_id: u64, flags: u32) -> Result<u32, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.synchronous && flags != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.notification_modes |= flags & FILE_IO_COMPLETION_NOTIFICATION_VALID_FLAGS;
+        Ok(entry.notification_modes)
+    }
+
+    pub fn notification_modes(&self, file_id: u64) -> Result<u32, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.notification_modes)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         self.entry(file_id)
             .map(|entry| entry.synchronous)
@@ -151,6 +181,45 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         self.entry(file_id)
             .map(|entry| entry.signaled)
             .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn complete_file(&mut self, file_id: u64, status: u32) -> Result<bool, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if status == STATUS_SUCCESS && entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0
+        {
+            return Ok(false);
+        }
+        entry.signaled = true;
+        Ok(true)
+    }
+
+    pub fn signal_on_completion_association(&mut self, file_id: u64) -> Result<bool, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.notification_modes & FILE_SKIP_SET_EVENT_ON_HANDLE != 0 {
+            return Ok(false);
+        }
+        entry.signaled = true;
+        Ok(true)
+    }
+
+    pub fn should_queue_completion_packet(
+        &self,
+        file_id: u64,
+        status: u32,
+        completed_inline: bool,
+        operation_suppressed: bool,
+    ) -> Result<bool, u32> {
+        let entry = self.entry(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if operation_suppressed {
+            return Ok(false);
+        }
+        if completed_inline
+            && status == STATUS_SUCCESS
+            && entry.notification_modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS != 0
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn entry(&self, file_id: u64) -> Option<&FileCompletionEntry> {
@@ -667,6 +736,8 @@ mod tests {
         assert_eq!(normalize_io_event_handle(1), None);
         assert_eq!(normalize_io_event_handle(0x40), Some(0x40));
         assert_eq!(normalize_io_event_handle(0x41), Some(0x40));
+        assert!(!io_event_suppresses_completion_port(0x40));
+        assert!(io_event_suppresses_completion_port(0x41));
     }
 
     #[test]
@@ -851,6 +922,71 @@ mod tests {
         assert_eq!(files.set_signaled(10, true), Ok(()));
         assert_eq!(files.is_signaled(10), Ok(true));
         assert_eq!(files.set_signaled(20, false), Err(STATUS_INVALID_HANDLE));
+    }
+
+    #[test]
+    fn file_completion_notification_modes_are_sticky_and_reject_sync_files() {
+        let mut files = FileCompletionTable::<2>::new();
+        files.insert_file(10, false).unwrap();
+        files.insert_file(20, true).unwrap();
+
+        assert_eq!(files.notification_modes(10), Ok(0));
+        assert_eq!(
+            files.set_notification_modes(10, FILE_SKIP_SET_EVENT_ON_HANDLE),
+            Ok(FILE_SKIP_SET_EVENT_ON_HANDLE)
+        );
+        assert_eq!(
+            files.set_notification_modes(10, 0),
+            Ok(FILE_SKIP_SET_EVENT_ON_HANDLE)
+        );
+        assert_eq!(
+            files.set_notification_modes(
+                10,
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO | 0x100,
+            ),
+            Ok(FILE_SKIP_SET_EVENT_ON_HANDLE
+                | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+                | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
+        );
+        assert_eq!(
+            files.set_notification_modes(20, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn file_completion_policy_controls_handle_signal_and_port_packets() {
+        let mut files = FileCompletionTable::<1>::new();
+        files.insert_file(10, false).unwrap();
+        files
+            .set_notification_modes(
+                10,
+                FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+            )
+            .unwrap();
+
+        files.set_signaled(10, false).unwrap();
+        assert_eq!(files.complete_file(10, STATUS_SUCCESS), Ok(false));
+        assert_eq!(files.is_signaled(10), Ok(false));
+        assert_eq!(
+            files.should_queue_completion_packet(10, STATUS_SUCCESS, true, false),
+            Ok(false)
+        );
+        assert_eq!(
+            files.should_queue_completion_packet(10, STATUS_SUCCESS, false, false),
+            Ok(true)
+        );
+        assert_eq!(
+            files.should_queue_completion_packet(10, STATUS_TIMEOUT, true, false),
+            Ok(true)
+        );
+        assert_eq!(
+            files.should_queue_completion_packet(10, STATUS_TIMEOUT, true, true),
+            Ok(false)
+        );
+
+        assert_eq!(files.complete_file(10, STATUS_TIMEOUT), Ok(true));
+        assert_eq!(files.is_signaled(10), Ok(true));
     }
 
     #[test]

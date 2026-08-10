@@ -1690,6 +1690,7 @@ impl ExecNtHandler {
         write_field!(pipe_park_buffer_len, 0);
         write_field!(pipe_park_iosb_va, 0);
         write_field!(pipe_park_apc_context, 0);
+        write_field!(pipe_park_completion_port_suppressed, false);
         write_field!(pipe_park_event_obj_idx, u64::MAX);
         write_field!(pipe_park_transceive, false);
         write_field!(pipe_park_is_write, false);
@@ -6791,11 +6792,25 @@ impl ExecNtHandler {
         apc_context: u64,
         status: u32,
         information: u64,
+        completed_inline: bool,
+        operation_suppressed: bool,
     ) {
-        if self.file_completion.set_signaled(file_id, true).is_ok() {
+        if self.file_completion.complete_file(file_id, status).unwrap_or(false) {
             unsafe { wait_wake_dispatcher_set(self) };
         }
         if apc_context == 0 {
+            return;
+        }
+        if !self
+            .file_completion
+            .should_queue_completion_packet(
+                file_id,
+                status,
+                completed_inline,
+                operation_suppressed,
+            )
+            .unwrap_or(false)
+        {
             return;
         }
         if let Some(binding) = self.file_completion.binding(file_id) {
@@ -6862,7 +6877,14 @@ impl ExecNtHandler {
         if waiter.iosb_va != 0 {
             let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
         }
-        self.post_file_completion(waiter.file_id, waiter.apc_context, STATUS_CANCELLED, 0);
+        self.post_file_completion(
+            waiter.file_id,
+            waiter.apc_context,
+            STATUS_CANCELLED,
+            0,
+            false,
+            waiter.completion_port_suppressed,
+        );
         if waiter.event_obj_idx != u64::MAX {
             let _ = self.signal_event_index(waiter.event_obj_idx as usize);
         }
@@ -6881,7 +6903,14 @@ impl ExecNtHandler {
         if listen.iosb_va != 0 {
             let _ = self.write_current_iosb(listen.iosb_va, STATUS_CANCELLED, 0);
         }
-        self.post_file_completion(listen.server_file_id, listen.apc_context, STATUS_CANCELLED, 0);
+        self.post_file_completion(
+            listen.server_file_id,
+            listen.apc_context,
+            STATUS_CANCELLED,
+            0,
+            false,
+            listen.completion_port_suppressed,
+        );
         if listen.event_obj_idx != u64::MAX {
             let _ = self.signal_event_index(listen.event_obj_idx as usize);
         }
@@ -15984,6 +16013,8 @@ impl ExecNtHandler {
                 let fsctl = args[5] as u32 as u64;
                 let mut status: u64;
                 let mut information = 0u64;
+                let completion_port_suppressed =
+                    nt_io_completion::io_event_suppresses_completion_port(args[1]);
                 // Match IopXxxControlFile: validate the caller's completion event for
                 // EVENT_MODIFY_STATE and clear it before issuing every request. In particular,
                 // rpcrt4 reuses a manual-reset event when it rearms a pipe listener; leaving the
@@ -16196,6 +16227,8 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_len = args[9] as u32;
                         self.pipe_park_iosb_va = iosb;
                         self.pipe_park_apc_context = args[3];
+                        self.pipe_park_completion_port_suppressed =
+                            completion_port_suppressed;
                         self.pipe_park_event_obj_idx = event_obj_idx;
                         self.pipe_park_transceive = true;
                     } else {
@@ -16208,6 +16241,7 @@ impl ExecNtHandler {
                             buffer_len: args[9] as u32,
                             iosb_va: iosb,
                             apc_context: args[3],
+                            completion_port_suppressed,
                             event_obj_idx,
                             reply_cap: 0,
                             resume_ip: 0,
@@ -16256,6 +16290,7 @@ impl ExecNtHandler {
                                 badge: self.current_badge,
                                 iosb_va: iosb,
                                 apc_context: args[3],
+                                completion_port_suppressed,
                                 // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
                                 // client connect completes ONLY the matching-name listen.
                                 name_hash: listen_name_hash,
@@ -20229,6 +20264,42 @@ impl ExecNtHandler {
                 let output = args[2];
                 let length = args[3] as u32 as usize;
                 let class = args[4] as u32;
+                if class == 41 {
+                    const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN: usize = 4;
+                    if length < FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN {
+                        return nt_io_completion::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    if iosb == 0 || output == 0 {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    if iosb & 7 != 0 || output & 3 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if !self.probe_user_output(iosb, 16)
+                        || !self.probe_user_output(output, length)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    let file_id = self.npfs_file_id_for(args[0]);
+                    if file_id == 0 {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    }
+                    let flags = match self.file_completion.notification_modes(file_id) {
+                        Ok(flags) => flags,
+                        Err(status) => return status,
+                    };
+                    if !self.xas_try_write_buf(output, &flags.to_le_bytes()) {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[8..16].copy_from_slice(
+                        &(FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN as u64).to_le_bytes(),
+                    );
+                    if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    return nt_fs::STATUS_SUCCESS;
+                }
                 // 40 = the largest class this encoder produces (FILE_BASIC_INFORMATION); it was 24
                 // when FILE_STANDARD_INFORMATION was the only one supported.
                 let mut encoded = [0u8; 40];
@@ -21052,6 +21123,8 @@ impl ExecNtHandler {
                 let event = args[1];
                 let apc_routine = args[2];
                 let apc_context = args[3];
+                let completion_port_suppressed =
+                    nt_io_completion::io_event_suppresses_completion_port(event);
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
                 let mut offset_bytes = [0u8; 8];
                 let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
@@ -21242,6 +21315,8 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_len = 0;
                         self.pipe_park_iosb_va = iosb;
                         self.pipe_park_apc_context = apc_context;
+                        self.pipe_park_completion_port_suppressed =
+                            completion_port_suppressed;
                         self.pipe_park_event_obj_idx = event_obj_idx;
                         self.pipe_park_transceive = false;
                         self.pipe_park_is_write = true;
@@ -21255,6 +21330,7 @@ impl ExecNtHandler {
                             buffer_len: 0,
                             iosb_va: iosb,
                             apc_context,
+                            completion_port_suppressed,
                             event_obj_idx,
                             reply_cap: 0,
                             resume_ip: 0,
@@ -21296,6 +21372,8 @@ impl ExecNtHandler {
                             apc_context,
                             status,
                             information,
+                            true,
+                            completion_port_suppressed,
                         );
                     }
                     // BATCH 33: the bytes are now queued in npfs on the PEER end. Ask the loop to
@@ -21416,6 +21494,8 @@ impl ExecNtHandler {
                 let event = args[1];
                 let apc_routine = args[2];
                 let apc_context = args[3];
+                let completion_port_suppressed =
+                    nt_io_completion::io_event_suppresses_completion_port(event);
                 let completion_event = self.validate_io_event(event);
                 let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
@@ -21645,6 +21725,8 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_len = len as u32;
                         self.pipe_park_iosb_va = iosb;
                         self.pipe_park_apc_context = apc_context;
+                        self.pipe_park_completion_port_suppressed =
+                            completion_port_suppressed;
                         self.pipe_park_event_obj_idx = event_obj_idx;
                         self.pipe_park_transceive = false;
                     } else {
@@ -21657,6 +21739,7 @@ impl ExecNtHandler {
                             buffer_len: len as u32,
                             iosb_va: iosb,
                             apc_context,
+                            completion_port_suppressed,
                             event_obj_idx,
                             reply_cap: 0,
                             resume_ip: 0,
@@ -21693,6 +21776,8 @@ impl ExecNtHandler {
                             apc_context,
                             status,
                             information,
+                            true,
+                            completion_port_suppressed,
                         );
                     }
                     self.pipe_write_redrive = true;
@@ -21914,7 +21999,18 @@ impl ExecNtHandler {
                                                     .file_completion
                                                     .associate(file_id, binding)
                                                 {
-                                                    Ok(()) => nt_io_completion::STATUS_SUCCESS,
+                                                    Ok(()) => {
+                                                        if self
+                                                            .file_completion
+                                                            .signal_on_completion_association(
+                                                                file_id,
+                                                            )
+                                                            .unwrap_or(false)
+                                                        {
+                                                            let _ = wait_wake_dispatcher_set(self);
+                                                        }
+                                                        nt_io_completion::STATUS_SUCCESS
+                                                    }
                                                     Err(status) => {
                                                         let _ = self
                                                             .io_completion_ports
@@ -21925,6 +22021,26 @@ impl ExecNtHandler {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                    41 => {
+                        if length < 4 {
+                            0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+                        } else if args[2] == 0 || !payload_ok {
+                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                        } else {
+                            let file_id = self.npfs_file_id_for(args[0]);
+                            if file_id == 0 {
+                                0xC000_0008 // STATUS_INVALID_HANDLE
+                            } else {
+                                let flags = u32::from_le_bytes(
+                                    payload[0..4].try_into().unwrap(),
+                                );
+                                match self.file_completion.set_notification_modes(file_id, flags) {
+                                    Ok(_) => nt_io_completion::STATUS_SUCCESS,
+                                    Err(status) => status,
                                 }
                             }
                         }
