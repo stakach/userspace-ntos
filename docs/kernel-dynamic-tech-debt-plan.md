@@ -118,6 +118,15 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   startup, using NPFS/RPC/loader semantics rather than service-name, executable, or launch-order
   fallbacks.
 
+### J. SEC_IMAGE And Memory Manager Fidelity
+
+- `[~]` J1: Replace ad hoc image page-right classification with NT SEC_IMAGE allocation
+  protections, including write-copy and execute-write-copy pages, so loader fixups and writable
+  image data are backed by process-private ownership rather than broad writable mappings.
+- `[ ]` J2: Boot-verify writable image copy-on-write promotion under real ReactOS loader/service
+  traffic and remove any remaining page-right callers that infer image semantics from section names
+  or historical bootstrap assumptions.
+
 ## Review Log
 
 ### 2026-08-02
@@ -2339,3 +2348,24 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   generic GUI-client mapping bug; the next blocker remains the generic service RPC/NPFS association
   path (`no context handle found` followed by `RpcServerListen() failed (Status 6b1)`), not explorer
   painting.
+- I4 ntdll completion-worker fleet staged. ReactOS `rpcrt4` queues server request packets through
+  `QueueUserWorkItem(...WT_EXECUTELONGFUNCTION)`, but our on-target ntdll adapter still funneled
+  every `RtlQueueWorkItem`/completion callback through one process-global completion worker even
+  though the pure `nt-rtl-work-item` model already had bounded fleet growth. The target adapter now
+  uses `WorkerFleet` for completion workers, publishes slot TIDs for `rtl_async_on_worker`, starts
+  extra workers for backlog/long-function isolation, retires idle extra workers through the model,
+  and releases slots on unexpected transport exit. Persistent work commits the retirement floor only
+  after a registered wait is published or a work item is successfully posted. Validation:
+  `cargo fmt --all`, `cargo test -p nt-rtl-work-item`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./scripts/build_ntdll_dll.sh`, and `git diff --check`. Review adjustment: run one serialized
+  boot with the rebuilt `.tmp/nt-ntdll.dll` and require the service RPC context-handle frontier to
+  move or produce a narrower NPFS/RPC association fault before changing endpoint semantics.
+- J1 SEC_IMAGE write-copy boundary staged. The PE loader now exposes `ImageProtection`
+  (`ReadOnly`, `WriteCopy`, `ExecuteRead`, `ExecuteWriteCopy`) so the executive can classify SEC_IMAGE
+  pages through NT allocation protection rather than the old executable-vs-RW helper. Image mapping
+  now records process-private image pages only after the process-side map succeeds and retains the
+  source cap needed for later write-copy promotion. Validation: `cargo test -p nt-pe-loader`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `git diff --check`. Review adjustment: J1 remains in progress until a serialized boot proves
+  loader fixups and service DLL writable sections still survive the new write-copy bookkeeping.

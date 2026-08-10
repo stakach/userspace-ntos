@@ -951,6 +951,20 @@ impl WorkerFleet {
         Ok(())
     }
 
+    /// Releases a worker slot after the target worker exits without the idle-retirement handshake.
+    /// This is reserved for native transport failure paths; normal idle retirement should still use
+    /// `request_stop` followed by `finish_stop`.
+    pub fn finish_unexpected_exit(&mut self, id: WorkerId) -> Result<(), FleetError> {
+        let slot = self.slot_mut(id)?;
+        match slot.state {
+            WorkerState::Running | WorkerState::Stopping => {
+                slot.state = WorkerState::Free;
+                Ok(())
+            }
+            WorkerState::Free | WorkerState::Starting => Err(FleetError::InvalidTransition),
+        }
+    }
+
     pub const fn scheduler_state(&self) -> WorkerState {
         self.scheduler.state
     }
@@ -1927,5 +1941,29 @@ mod tests {
         assert_eq!(replacement.id.slot(), old_id.slot());
         assert_ne!(replacement.id.generation(), old_id.generation());
         assert_eq!(fleet.finish_stop(old_id), Err(FleetError::StaleWorker));
+    }
+
+    #[test]
+    fn unexpected_completion_exit_releases_running_slot() {
+        let mut fleet = WorkerFleet::new();
+        let mut counters = PoolCounters::new();
+        let _one = counters
+            .reserve(
+                1,
+                WorkItemPacket::new(1, 1, WorkItemFlags::EXECUTE_DEFAULT, 0),
+            )
+            .unwrap();
+        let first = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        let old_id = finish_worker(&mut fleet, first);
+
+        fleet.finish_unexpected_exit(old_id).unwrap();
+        let replacement =
+            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+        assert_eq!(replacement.id.slot(), old_id.slot());
+        assert_ne!(replacement.id.generation(), old_id.generation());
+        assert_eq!(
+            fleet.finish_unexpected_exit(old_id),
+            Err(FleetError::StaleWorker)
+        );
     }
 }
