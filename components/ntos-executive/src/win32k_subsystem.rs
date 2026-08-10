@@ -129,7 +129,7 @@ pub const WIN32K_KUSER_SHARED_DATA_VA: u64 = 0xFFFF_F780_0000_0000;
 /// KUSER frame before aliasing it into the win32k component at the canonical high VA.
 pub const WIN32K_KUSER_SCRATCH_VA: u64 = WIN32K_AUX_PT_VADDR + 0x1B_0000;
 
-/// The csrss-side VA where win32k's global USER heap arena ([`WIN32K_HEAP_VADDR`] — where gpsi, the
+/// The GUI-client-side VA where win32k's global USER heap arena ([`WIN32K_HEAP_VADDR`] — where gpsi, the
 /// USER handle table `gHandleTable`, and the handle-entry array all live, being `UserHeapAlloc`ed)
 /// is RO-mapped so the Win32 client stack (user32/gdi32) can read the SHAREDINFO the USERCONNECT's
 /// `siClient` pointers name. A full 16 MiB window ([`WIN32K_HEAP_FRAMES`]), 2-MiB-aligned, sitting
@@ -138,7 +138,7 @@ pub const WIN32K_KUSER_SCRATCH_VA: u64 = WIN32K_AUX_PT_VADDR + 0x1B_0000;
 /// win32k-heap NX pages.** 0x9800_0000 is now the explicit DLL-arena end and stays inside the shared
 /// 0x8000_0000..0xC000_0000 1 GiB PD. Delta-relative: the
 /// connect marshaling rewrites `siClient`/`ulSharedDelta` by `WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`,
-/// so moving the base is behavior-preserving for the existing GUI clients (csrss pi 1 / winlogon pi 2).
+/// so moving the base is behavior-preserving for every GUI client.
 pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;
 
 /// The GUI-client-side VA where win32k's POOL arena ([`WIN32K_POOL_VADDR`] — where DESKTOP bodies and
@@ -225,9 +225,9 @@ const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + WIN32K_STACK_TAIL_ARGS as u64 
 // publishes, per dispatch, the two server-VA facts the executive needs to seed the GUI client's
 // TEB.Win32ClientInfo so user32's `ValidateHwnd`/`DesktopPtrToUser`/`IntCallMessageProc` resolve a
 // real window PWND out of win32k's (unified USER+desktop) heap into the client's RO-mapped view:
-//   - SH_SAS_DESKINFO: the bound DESKTOP's DESKTOPINFO server VA (winlogon's CLIENTINFO.pDeskInfo =
-//     this − delta; its pvDesktopBase/pvDesktopLimit are set to bracket the whole heap so
-//     DesktopPtrToUser's range check accepts any heap-resident PWND/CLS).
+//   - SH_SAS_DESKINFO: the bound DESKTOP's DESKTOPINFO server VA. The executive translates it through
+//     whichever shared arena owns the pointer, while CLIENTINFO.ulClientDelta remains the USER-heap
+//     delta used by DesktopPtrToUser for heap-resident PWND/CLS pointers.
 //   - SH_SAS_PTI: the dispatch THREADINFO server VA (== the window's `head.pti`); the client's
 //     TEB.Win32ThreadInfo must equal it so IntCallMessageProc's `Wnd->head.pti == GetW32ThreadInfo()`
 //     same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY → the proc never runs).

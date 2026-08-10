@@ -1993,6 +1993,7 @@ impl ExecNtHandler {
         handler.provision_default_user_shell_folders();
         handler.provision_default_user_ntuser_dat_image();
         handler.provision_normal_system_setup_state();
+        handler.provision_reactos_print_setup();
         handler.provision_reactos_explorer_shell_com_classes();
         handler
     }
@@ -2190,6 +2191,28 @@ impl ExecNtHandler {
             print_hex(mask as u32);
             print_str(b" in mutable hive\n");
         }
+    }
+
+    /// Seed ReactOS print setup state that `hivesys.inf` normally materializes for the native
+    /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
+    /// registry syscalls and then load `winprint.dll` from the real spool directory.
+    fn provision_reactos_print_setup(&mut self) {
+        let stats =
+            nt_hive_core::seed_reactos_print_setup_in_mutable_hives(&mut self.mutable_hives);
+        if stats.total_values() == 0 {
+            print_str(b"[print-setup] ReactOS print setup not provisioned\n");
+            return;
+        }
+        self.mutable_hives_dirty = true;
+        print_str(b"[print-setup] HKLM\\SYSTEM print setup provisioned: root=");
+        print_u64(stats.root_values as u64);
+        print_str(b" env=");
+        print_u64(stats.environment_values as u64);
+        print_str(b" processors=");
+        print_u64(stats.print_processor_values as u64);
+        print_str(b" monitors=");
+        print_u64(stats.monitor_values as u64);
+        print_str(b"\n");
     }
 
     /// Seed the default-user profile shell-folder registry state ReactOS setup normally writes.

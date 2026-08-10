@@ -1759,9 +1759,23 @@ unsafe fn seed_gui_thread_client_info(
         return None;
     }
 
-    let pool_delta = win32k_glue::map_win32k_pool_into_csrss(pml4, pi);
-    let user_delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
-    let client_deskinfo = server_deskinfo.checked_sub(pool_delta)?;
+    let user_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
+    let client_deskinfo = if server_deskinfo >= win32k_subsystem::WIN32K_HEAP_VADDR
+        && server_deskinfo
+            < win32k_subsystem::WIN32K_HEAP_VADDR
+                + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
+    {
+        server_deskinfo.checked_sub(user_delta)?
+    } else if server_deskinfo >= win32k_subsystem::WIN32K_POOL_VADDR
+        && server_deskinfo
+            < win32k_subsystem::WIN32K_POOL_VADDR
+                + win32k_subsystem::WIN32K_POOL_FRAMES * 0x1000
+    {
+        let pool_delta = win32k_glue::map_win32k_pool_into_client(pml4, pi)?;
+        server_deskinfo.checked_sub(pool_delta)?
+    } else {
+        return None;
+    };
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
     core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
@@ -1856,7 +1870,15 @@ unsafe fn complete_ntuser_process_connect_copyout(
     // siClient with pointers into its OWN session-space USER heap (gpsi / gHandleTable / the
     // handle-entry array). Map that USER heap into the GUI client and rewrite siClient to the
     // client-relative view before user32 resumes.
-    let delta = map_win32k_heap_into_csrss(pml4, pi);
+    let Some(delta) = win32k_glue::map_win32k_user_heap_into_client(pml4, pi) else {
+        let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if failures < 8 {
+            print_str(b"[win32k-svc] NtUserProcessConnect USER heap map failed pi=");
+            print_u64(pi as u64);
+            print_str(b"\n");
+        }
+        return false;
+    };
     let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
     let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
     let handler_delta =
@@ -8456,7 +8478,7 @@ pub(crate) unsafe fn service_sec_image(
                 // services pi 3 / lsass pi 4) so it attaches win32k's client window to this client's frames
                 // (per-client cross-AS client memory — services' OBJECT_ATTRIBUTES / USERCONNECT
                 // resolve to SERVICES' frames, not the stale csrss/winlogon frame at the same VA).
-                // The w32_client_attach / csrss_frame_get / map_win32k_heap_into_csrss machinery is
+                // The w32_client_attach / csrss_frame_get / map_win32k_user_heap_into_client machinery is
                 // fully pi-keyed (bit `1<<pi`), so a 3rd GUI client needs no new state — same recipe
                 // that made winlogon the 2nd client. The reply is caller-agnostic: REPLY_MAIN is
                 // bound to THIS caller at its recv, so it resumes exactly services (no reply-spin).
@@ -12479,7 +12501,8 @@ pub(crate) unsafe fn service_sec_image(
                 // client-side ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve real heap-
                 // resident PWNDs in the process' RO-mapped heap view without a syscall:
                 //   - Win32ThreadInfo (TEB+0x78) = pti (server VA), matching Wnd->head.pti.
-                //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO minus the pool-map delta.
+                //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO translated through its owning
+                //     arena's client mapping.
                 //   - CLIENTINFO.ulClientDelta (TEB+0x828) = USER heap server->client delta.
                 // This used to be winlogon-only for the SAS path; explorer's real shell/ATL path uses
                 // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
@@ -17212,33 +17235,17 @@ unsafe fn spawn_requested_tp_worker(
         .is_some_and(|(pool_pi, slot)| {
             pool_pi == pi && nt_handler.is_pool_thread_suspended(pool_pi, slot)
         });
-    let direct_rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
-    let spawned = if direct_rpc_worker {
-        let worker_ep = mint_badged(fault_ep, badge);
-        rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
-            target_pi: pi,
-            slot: worker_slot,
-            pml4,
-            start,
-            cid_proc,
-            cid_thread: tid,
-            fault_ep: worker_ep,
-            use_loader: false,
-            native: true,
-            resume: !suspended,
-        })
-    } else {
-        spawn_tp_worker_thread(
-            pi,
-            worker_slot,
-            pml4,
-            start,
-            cid_proc,
-            tid,
-            fault_ep,
-            !suspended,
-        )
-    };
+    let rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
+    let spawned = spawn_tp_worker_thread(
+        pi,
+        worker_slot,
+        pml4,
+        start,
+        cid_proc,
+        tid,
+        fault_ep,
+        !suspended,
+    );
     if spawned.tcb() == 0 {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
         if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
@@ -17267,7 +17274,7 @@ unsafe fn spawn_requested_tp_worker(
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
 
-    print_str(if direct_rpc_worker {
+    print_str(if rpc_worker {
         b"[rpc-worker] spawned pi="
     } else {
         b"[tp-worker] spawned pi="

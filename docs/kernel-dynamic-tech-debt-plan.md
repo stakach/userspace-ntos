@@ -2297,3 +2297,34 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   25313, and 25486, and the spooler process later hits the existing out-of-image user fault at
   line 25706. Review adjustment: commit the nested loader fix, then make endpoint mapper/RPC server
   listen registration the next target before treating shell chrome pixels as blocked by WMI loading.
+- I4 service RPC worker loader initialization staged. The `0x6b1` listener frontier is not a simple
+  missing-protseq failure: the same run shows `wkssvc`, `browser`, and `srvsvc` posting real
+  `FSCTL_PIPE_LISTEN` waits before their service threads report `RpcServerListen() failed`. The
+  dynamic SCM/LSA worker role path was still spawning those generic same-process threads with
+  `use_loader: false`, a mode documented for targets without ntdll and not for live ReactOS service
+  processes. SCM/LSA RPC worker roles now retain their dynamic runtime identity but enter through the
+  same loader-initialized hosted-thread path as ordinary user threads, allowing per-thread loader
+  attach/TLS setup before the requested start routine runs. Review adjustment: validate with one
+  serialized boot and require the `RpcServerListen() failed (Status 6b1)` edge to move before
+  chasing endpoint-mapper/context-handle state.
+- I4 GUI client shared-arena fix staged. The later `spoolsv.exe` out-of-image user fault from
+  `.tmp/boot-ntdll-path-wmisvc-20260810-210804.log` came from publishing
+  `CLIENTINFO.pDeskInfo=0x96ce9280`, then faulting at `pDeskInfo+0x130`. The live server
+  `DESKTOPINFO` pointer is allocated under the win32k USER heap, not the POOL arena, so the old
+  unconditional pool-delta rewrite made every client-side desktop-info dereference point below the
+  mapped shared window. GUI client seeding now maps the USER heap first, translates `DESKTOPINFO`
+  through whichever arena owns the live server pointer, and refuses to publish CLIENTINFO if the
+  required arena mapping cannot be established. Review adjustment: validate with one serialized
+  `./run.sh --desktop`; require `spoolsv.exe`/pi 12 to receive a `pDeskInfo` in the USER shared
+  window (`0x98...`) and require the old `0x96ce93b0` parked fault not to recur before taking the
+  next shell/print frontier.
+- I4 GUI client shared-arena fix boot-verified by
+  `.tmp/boot-current-desktop-recover-20260810-212412.log`. The run reached the base desktop paint
+  path, then admitted real dynamic `spoolsv.exe` as pi 12 and seeded
+  `CLIENTINFO.pDeskInfo=0x988e9280` with the USER heap delta; the old `0x96ce93b0` parked fault did
+  not recur. `spoolsv.exe` continued through real win32k dispatches until the boot returned to the
+  service RPC frontier, where Browser reports `no context handle found for uuid
+  {2fb14db6-8a4f-4dac-bfe2-98821804da45}` followed by `RpcServerListen() failed (Status 6b1)`.
+  Review adjustment: commit this shared-arena/print-worker progress, then continue I4 at the
+  RPC association/context-handle data path. Do not add UUID-specific handling or service-name
+  fallbacks; the fix belongs in generic RPC/NPFS message transport.

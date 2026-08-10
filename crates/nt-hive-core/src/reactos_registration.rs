@@ -18,6 +18,51 @@ pub const CLSID_START_MENU: &str = "{4622AD11-FF23-11D0-8D34-00A0C90F2719}";
 pub const CLSID_REBAR_BAND_SITE: &str = "{ECD4FC4D-521C-11D0-B792-00A0C90312E1}";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReactOsPrintEnvironmentRegistration {
+    pub environment: &'static str,
+    pub directory: &'static str,
+    pub print_processor: &'static str,
+    pub processor_driver: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReactOsPrintSetupSeedStats {
+    pub root_values: u32,
+    pub environment_values: u32,
+    pub print_processor_values: u32,
+    pub monitor_values: u32,
+}
+
+impl ReactOsPrintSetupSeedStats {
+    pub fn total_values(self) -> u32 {
+        self.root_values
+            + self.environment_values
+            + self.print_processor_values
+            + self.monitor_values
+    }
+}
+
+/// ReactOS `boot/bootdata/hivesys.inf` print setup registrations.
+///
+/// The base `AddReg` block always creates the x86 environment, while `AddReg.NTamd64` creates the
+/// native x64 environment. Hosted x64 `localspl.dll` asks for `"Windows x64"` from
+/// `win32ss/printing/include/prtprocenv.h`, so the setup materialization must expose that section.
+pub const REACTOS_PRINT_ENVIRONMENTS: &[ReactOsPrintEnvironmentRegistration] = &[
+    ReactOsPrintEnvironmentRegistration {
+        environment: "Windows NT x86",
+        directory: "W32X86",
+        print_processor: "winprint",
+        processor_driver: "winprint.dll",
+    },
+    ReactOsPrintEnvironmentRegistration {
+        environment: "Windows x64",
+        directory: "x64",
+        print_processor: "winprint",
+        processor_driver: "winprint.dll",
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReactOsProfileShellFolder {
     pub value_name: &'static str,
     pub path: &'static str,
@@ -473,6 +518,90 @@ fn seed_reactos_user_profile_shell_folders_into<T: RgsSeedTarget>(
     stats
 }
 
+fn seed_reactos_print_setup_into<T: RgsSeedTarget>(target: &mut T) -> ReactOsPrintSetupSeedStats {
+    const PRINT_ROOT: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Print";
+    const ENV_ROOT: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Print\Environments";
+    const MONITORS_ROOT: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors";
+    const PROVIDERS_ROOT: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Control\Print\Providers";
+    const LOCAL_PORT_MONITOR: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port";
+
+    let mut stats = ReactOsPrintSetupSeedStats::default();
+    if !target.create_key(PRINT_ROOT) {
+        return stats;
+    }
+
+    for (name, value) in [
+        ("BeepEnabled", 0u32),
+        ("MajorVersion", 2),
+        ("MinorVersion", 0),
+        ("PortThreadPriority", 0),
+        ("PriorityClass", 0),
+        ("SchedulerThreadPriority", 0),
+    ] {
+        if target.set_value(
+            PRINT_ROOT,
+            name,
+            RegistryValueType::Dword,
+            value.to_le_bytes().to_vec(),
+        ) {
+            stats.root_values += 1;
+        }
+    }
+
+    if !target.create_key(ENV_ROOT) {
+        return stats;
+    }
+    for environment in REACTOS_PRINT_ENVIRONMENTS {
+        let environment_key = join_key_path(ENV_ROOT, environment.environment);
+        if !target.create_key(&environment_key) {
+            continue;
+        }
+        if target.set_value(
+            &environment_key,
+            "Directory",
+            RegistryValueType::Sz,
+            utf16le_sz(environment.directory),
+        ) {
+            stats.environment_values += 1;
+        }
+
+        let processors_key = join_key_path(&environment_key, "Print Processors");
+        if !target.create_key(&processors_key) {
+            continue;
+        }
+        let processor_key = join_key_path(&processors_key, environment.print_processor);
+        if !target.create_key(&processor_key) {
+            continue;
+        }
+        if target.set_value(
+            &processor_key,
+            "Driver",
+            RegistryValueType::Sz,
+            utf16le_sz(environment.processor_driver),
+        ) {
+            stats.print_processor_values += 1;
+        }
+    }
+
+    if target.create_key(MONITORS_ROOT)
+        && target.create_key(LOCAL_PORT_MONITOR)
+        && target.set_value(
+            LOCAL_PORT_MONITOR,
+            "Driver",
+            RegistryValueType::Sz,
+            utf16le_sz("localmon.dll"),
+        )
+    {
+        stats.monitor_values += 1;
+    }
+    target.create_key(PROVIDERS_ROOT);
+
+    stats
+}
+
 /// Seed explorer's shell COM classes under `classes_root` (normally
 /// `\Registry\Machine\Software\Classes`) into the volatile overlay.
 ///
@@ -533,6 +662,17 @@ pub fn seed_reactos_default_user_shell_folders_in_mutable_hives(
         default_user_profile_path,
         "%USERPROFILE%",
     )
+}
+
+/// Seed ReactOS print setup keys from `boot/bootdata/hivesys.inf` into the mounted SYSTEM hive.
+///
+/// This materializes setup-owned registry data. Print provider initialization still uses ordinary
+/// registry opens/enumeration and ordinary DLL loading; this function only fills the installed-boot
+/// configuration that a LiveCD-derived hive can be missing for the hosted architecture.
+pub fn seed_reactos_print_setup_in_mutable_hives(
+    hives: &mut MutableHiveSet,
+) -> ReactOsPrintSetupSeedStats {
+    seed_reactos_print_setup_into(&mut MutableHiveRgsSeedTarget { hives })
 }
 
 #[cfg(test)]
@@ -757,6 +897,55 @@ mod tests {
         assert_eq!(second_stats, stats);
         assert_eq!(
             hives.hive(5).expect("default hive").cell_count(),
+            first_cell_count
+        );
+    }
+
+    #[test]
+    fn seeds_reactos_print_setup_into_mutable_system_hive() {
+        let mut hives = MutableHiveSet::new();
+        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+
+        let stats = seed_reactos_print_setup_in_mutable_hives(&mut hives);
+        assert_eq!(
+            stats,
+            ReactOsPrintSetupSeedStats {
+                root_values: 6,
+                environment_values: 2,
+                print_processor_values: 2,
+                monitor_values: 1,
+            }
+        );
+
+        let (ty, data) = hive_value_bytes(
+            &hives,
+            r"\Registry\Machine\System\CurrentControlSet\Control\Print\Environments\Windows x64",
+            "Directory",
+        );
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("x64"));
+
+        let (ty, data) = hive_value_bytes(
+            &hives,
+            r"\Registry\Machine\System\CurrentControlSet\Control\Print\Environments\Windows x64\Print Processors\winprint",
+            "Driver",
+        );
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("winprint.dll"));
+
+        let (ty, data) = hive_value_bytes(
+            &hives,
+            r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
+            "Driver",
+        );
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("localmon.dll"));
+
+        let first_cell_count = hives.hive(1).expect("system hive").cell_count();
+        let second_stats = seed_reactos_print_setup_in_mutable_hives(&mut hives);
+        assert_eq!(second_stats, stats);
+        assert_eq!(
+            hives.hive(1).expect("system hive").cell_count(),
             first_cell_count
         );
     }

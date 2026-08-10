@@ -19049,17 +19049,17 @@ static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
 /// GUI client's VSpace (the gSharedInfo client-mapping).
 static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WIN32K_USERVM_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
-/// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR — where the DESKTOP body + its DESKTOPINFO
-/// live, `pool_alloc`ed). Retained so the desktop-heap client-window mapping can copy_cap + RO-map the
-/// pool into a GUI client's VSpace, making the bound DESKTOPINFO (winlogon's CLIENTINFO.pDeskInfo)
-/// client-readable — needed for user32's client-side DesktopPtrToUser (it reads pdi->pvDesktopBase).
+/// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR, where session-lifetime object bodies can
+/// live). Retained so pool-resident win32k pointers can be copy_cap + RO-mapped into a GUI client's
+/// VSpace. DESKTOPINFO is translated by the arena that actually owns the live pointer.
 static WIN32K_POOL_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WIN32K_POOL_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
-/// 0 until win32k's USER heap arena has been RO-mapped into csrss (one-time; guards re-mapping on a
-/// second NtUserProcessConnect from the same client).
+/// Per-pi bit set once win32k's USER heap arena has been RO-mapped into that GUI client's VSpace
+/// (gSharedInfo plus desktop-heap objects and any DESKTOPINFO allocated from that arena).
 static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Per-pi bit set once win32k's POOL arena has been RO-mapped into that GUI client's VSpace (the
-/// desktop-heap client-window mapping — makes the bound DESKTOPINFO client-readable).
+/// session-object client window; DESKTOPINFO is translated through POOL only when the live pointer is
+/// actually pool-resident).
 static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE. Frame-cap base of the GDI shared handle table (a
 /// `GDI_TABLE_ENTRY[GDI_HANDLE_COUNT]` array — client-side gdi32 validates every GDI handle through it,
