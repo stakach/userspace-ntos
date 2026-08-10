@@ -30,7 +30,7 @@ use core::ffi::c_void;
 #[cfg(target_arch = "x86_64")]
 use core::mem::MaybeUninit;
 #[cfg(target_arch = "x86_64")]
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use nt_ntdll::heap::{
     Heap, HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError, HeapWalkOutcome, RtlHeapWalkEntry,
@@ -73,8 +73,8 @@ const PROCESS_HEAP_SEGMENT_CAPACITY: usize = 8;
 const PROCESS_HEAP_SEGMENT_MIN: usize = 0x10_0000;
 
 /// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). `None` until
-/// initialization; all later access is covered by [`PROCESS_HEAP_LOCK`] so hosted worker threads
-/// cannot alias its mutable state. A global-alloc call before installation returns null.
+/// initialization; all later access is covered by [`PROCESS_HEAP_REGISTRY_LOCK`] so hosted worker
+/// threads cannot alias its mutable state. A global-alloc call before installation returns null.
 ///
 /// NOTE: the heap type is target-gated (`HeapBacking` is target-only), so this cell only exists on
 /// x86_64; on the host build the allocator is a no-op abort cell (there is no live allocation off
@@ -90,29 +90,6 @@ static mut PROCESS_HEAP_SEGMENTS: [Option<ProcessHeap>; PROCESS_HEAP_SEGMENT_CAP
     [const { None }; PROCESS_HEAP_SEGMENT_CAPACITY];
 
 #[cfg(target_arch = "x86_64")]
-static PROCESS_HEAP_LOCK: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_arch = "x86_64")]
-struct ProcessHeapLockGuard;
-
-#[cfg(target_arch = "x86_64")]
-impl Drop for ProcessHeapLockGuard {
-    fn drop(&mut self) {
-        PROCESS_HEAP_LOCK.store(false, Ordering::Release);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn lock_process_heap() -> ProcessHeapLockGuard {
-    while PROCESS_HEAP_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    ProcessHeapLockGuard
-}
-
 #[cfg(target_arch = "x86_64")]
 fn current_thread_id() -> u64 {
     let thread_id: u64;
@@ -183,6 +160,35 @@ impl HeapCriticalSection {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+static mut PROCESS_HEAP_REGISTRY_LOCK: HeapCriticalSection = HeapCriticalSection::new();
+
+#[cfg(target_arch = "x86_64")]
+struct ProcessHeapLockGuard;
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn process_heap_registry_lock_ptr() -> *mut c_void {
+    core::ptr::addr_of_mut!(PROCESS_HEAP_REGISTRY_LOCK).cast()
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ProcessHeapLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { exports::rtl_leave_critical_section(process_heap_registry_lock_ptr()) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn lock_process_heap() -> ProcessHeapLockGuard {
+    let status = unsafe { exports::rtl_enter_critical_section(process_heap_registry_lock_ptr()) };
+    debug_assert!(
+        (status as i32) >= 0,
+        "process heap registry critical section failed"
+    );
+    ProcessHeapLockGuard
+}
+
 struct HeapLockRecord {
     state: u8,
     handle: u64,
@@ -222,8 +228,8 @@ static mut HEAP_LOCKS: [HeapLockRecord; HEAP_LOCK_CAPACITY] =
 pub(crate) unsafe fn reset_process_heap_state_for_new_process() {
     // A mapped ntdll has private writable state in each process. Make that process boundary
     // explicit so a reused image slot can never observe a prior process's heap registry.
-    PROCESS_HEAP_LOCK.store(false, Ordering::Release);
     unsafe {
+        PROCESS_HEAP_REGISTRY_LOCK = HeapCriticalSection::new();
         PROCESS_HEAPS = MaybeUninit::uninit();
         PROCESS_HEAPS_INITIALIZED = false;
         PROCESS_HEAP_SEGMENTS = [const { None }; PROCESS_HEAP_SEGMENT_CAPACITY];

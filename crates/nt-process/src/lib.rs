@@ -1958,6 +1958,15 @@ impl ProcessManager {
         self.processes.get(&pid).and_then(|p| p.main_thread)
     }
 
+    /// Return whether `current_tid` has another runnable thread. This is the NT scheduler's
+    /// ready-summary predicate in process-manager terms: initialized/suspended/waiting/terminated
+    /// threads are not candidates, while ready and already-running peers are.
+    pub fn has_yield_candidate(&self, current_tid: ThreadId) -> bool {
+        self.threads.iter().any(|(&tid, thread)| {
+            tid != current_tid && matches!(thread.state, ThreadState::Ready | ThreadState::Running)
+        })
+    }
+
     /// A scheduling-state transition (spec §11.2), e.g. `Ready` → `Running` → `Waiting`.
     pub fn set_thread_state(&mut self, tid: ThreadId, state: ThreadState) -> Result<(), u32> {
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;

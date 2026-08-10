@@ -13,6 +13,7 @@ const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 const STATUS_PENDING: u32 = 0x0000_0103;
+const STATUS_NO_YIELD_PERFORMED: u32 = 0x4000_0024;
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -69,6 +70,7 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NT_YIELD_EXECUTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -21247,6 +21249,29 @@ impl ExecNtHandler {
                     }
                     print_str(b"\n");
                 }
+                0
+            }
+            NativeService::NtYieldExecution => {
+                let current_tid = self.current_tid as nt_process::ThreadId;
+                let has_candidate = self.pm.has_yield_candidate(current_tid);
+                let trace = NT_YIELD_EXECUTION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 32 {
+                    print_str(b"[yield-exec] call=");
+                    print_u64(trace + 1);
+                    print_str(b" pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" badge=");
+                    print_u64(self.current_badge);
+                    print_str(b" tid=");
+                    print_u64(self.current_tid);
+                    print_str(b" candidate=");
+                    print_u64(has_candidate as u64);
+                    print_str(b"\n");
+                }
+                if !has_candidate {
+                    return STATUS_NO_YIELD_PERFORMED;
+                }
+                sel4_rt::yield_now();
                 0
             }
             // NtQueryPerformanceCounter(*Counter[R10]=args[0], *Frequency[RDX]=args[1] optional).

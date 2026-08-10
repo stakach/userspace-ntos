@@ -923,6 +923,8 @@ pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
 pub const SSN_NT_QUERY_SYSTEM_TIME_SVC: u64 = 182;
 /// ReactOS x64 NtDelayExecution(Alertable, *DelayInterval).
 pub const SSN_NT_DELAY_EXECUTION: u64 = 61;
+/// ReactOS x64 NtYieldExecution().
+pub const SSN_NT_YIELD_EXECUTION: u64 = 288;
 /// ntdll's NtQueryPerformanceCounter SSN (csrss init seeds timing / RNG from the perf counter).
 pub const SSN_NT_QUERY_PERF_COUNTER: u64 = 173;
 /// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
@@ -17665,6 +17667,10 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtDelayExecution,
                 SSN_NT_DELAY_EXECUTION as u32,
+            ),
+            (
+                NativeService::NtYieldExecution,
+                SSN_NT_YIELD_EXECUTION as u32,
             ),
             (
                 NativeService::NtQueryPerformanceCounter,

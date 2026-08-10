@@ -144,6 +144,18 @@ next serialized desktop run must show whether EventLog's RPC child reaches
 `NtCreateNamedPipeFile(\\pipe\\EventLog)`, blocks on a real syscall before that, fault-loops in user
 setup, or simply needs a longer scheduling window before SCM's first client open retries.
 
+Scheduler handoff slice in progress: ReactOS user32/win32k/kernel32 call `NtYieldExecution` through
+message and `SwitchToThread` paths, but our native table still omitted SSN 288. The current kernel
+slice registers `NtYieldExecution`, backs it with the process manager's global runnable-thread
+predicate and seL4 `yield_now`, and returns `STATUS_NO_YIELD_PERFORMED` when no ready/running peer
+exists. The next serialized desktop proof should show `[yield-exec]` activity and whether the
+EventLog RPC child reaches `NtCreateNamedPipeFile(\\pipe\\EventLog)` before SCM's client open, or
+move the frontier to a precise scheduler/NPFS/RPC edge without adding EventLog, service-order, or
+paint fallbacks. Validation before the proof run: `cargo fmt --all`,
+`cargo test -p nt-process`, `cargo test -p nt-syscall`, `./scripts/build_ntdll_dll.sh`,
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and

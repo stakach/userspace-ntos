@@ -65,6 +65,35 @@ fn process_thread_lifecycle_and_signal() {
 }
 
 #[test]
+fn yield_candidate_requires_runnable_peer_thread() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("yield.exe", None, None);
+    let current = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    pm.set_thread_state(current, ThreadState::Running).unwrap();
+
+    assert!(!pm.has_yield_candidate(current));
+
+    let waiting = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+    pm.set_thread_state(waiting, ThreadState::Waiting).unwrap();
+    assert!(!pm.has_yield_candidate(current));
+
+    let suspended = pm.create_thread(pid, 0x3000, 0, false).unwrap();
+    pm.suspend_thread(suspended).unwrap();
+    assert!(!pm.has_yield_candidate(current));
+
+    let ready = pm.create_thread(pid, 0x4000, 0, false).unwrap();
+    assert!(pm.has_yield_candidate(current));
+
+    pm.set_thread_state(ready, ThreadState::Terminated).unwrap();
+    assert!(!pm.has_yield_candidate(current));
+
+    let other_pid = pm.create_process("other.exe", None, None);
+    let running = pm.create_thread(other_pid, 0x5000, 0, false).unwrap();
+    pm.set_thread_state(running, ThreadState::Running).unwrap();
+    assert!(pm.has_yield_candidate(current));
+}
+
+#[test]
 fn nested_thread_suspend_resume_tracks_previous_count() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("suspended.exe", None, None);
