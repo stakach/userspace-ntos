@@ -217,23 +217,20 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
 }
 
 #[test]
-fn prepared_value_buffer_reuses_existing_storage() {
+fn set_value_replaces_existing_value_atomically() {
     let mut hive = Hive::new(HiveKind::System);
     let key = hive.create_key(r"ControlSet001\Services\Large");
     let mut original = alloc::vec::Vec::new();
     original.resize(1024, 0x5a);
     assert!(hive.set_value(key, "Blob", RegistryValueType::Binary, original));
-    let before_capacity = hive.query_value(key, "Blob").unwrap().1.len();
 
-    let value = hive
-        .prepare_value_buffer(key, "Blob", RegistryValueType::Binary, 768)
-        .expect("prepared existing value");
-    assert!(hive.append_prepared_value_data(value, &[1; 256]));
-    assert!(hive.append_prepared_value_data(value, &[2; 512]));
-    assert_eq!(hive.prepared_value_len(value), Some(768));
+    let mut replacement = alloc::vec::Vec::new();
+    replacement.resize(768, 1);
+    replacement[256..].fill(2);
+    assert!(hive.set_value(key, "Blob", RegistryValueType::Binary, replacement));
     assert_eq!(hive.query_value(key, "Blob").unwrap().1[0], 1);
     assert_eq!(hive.query_value(key, "Blob").unwrap().1[256], 2);
-    assert!(hive.query_value(key, "Blob").unwrap().1.len() < before_capacity);
+    assert_eq!(hive.query_value(key, "Blob").unwrap().1.len(), 768);
 }
 
 #[test]
@@ -271,15 +268,12 @@ fn same_hive_value_copy_shares_payload_until_replacement() {
     assert_eq!(destination_data, source_data);
     assert_eq!(destination_data.as_ptr(), source_ptr);
 
-    let replacement = hive
-        .prepare_value_buffer(
-            destination_key,
-            "AllocConfig",
-            RegistryValueType::ResourceList,
-            3,
-        )
-        .expect("prepare replacement");
-    assert!(hive.append_prepared_value_data(replacement, &[1, 2, 3]));
+    assert!(hive.set_value(
+        destination_key,
+        "AllocConfig",
+        RegistryValueType::ResourceList,
+        alloc::vec![1, 2, 3]
+    ));
     assert_eq!(
         hive.query_value(destination_key, "AllocConfig").unwrap().1,
         &[1, 2, 3]
@@ -298,7 +292,7 @@ fn same_hive_value_copy_shares_payload_until_replacement() {
 }
 
 #[test]
-fn mutable_hive_set_prepares_mounted_value_buffer() {
+fn mutable_hive_set_replaces_mounted_value() {
     let mut system = Hive::new(HiveKind::System);
     system.create_key(r"ControlSet001\Services");
     let mut set = MutableHiveSet::new();
@@ -306,12 +300,7 @@ fn mutable_hive_set_prepares_mounted_value_buffer() {
     let key = set
         .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\Large")
         .expect("large key");
-    let value = set
-        .prepare_value_buffer(key, "Blob", RegistryValueType::Binary, 3)
-        .expect("prepared mounted value");
-    assert!(set.append_prepared_value_data(value, &[1, 2]));
-    assert!(set.append_prepared_value_data(value, &[3]));
-    assert_eq!(set.prepared_value_len(value), Some(3));
+    assert!(set.set_value(key, "Blob", RegistryValueType::Binary, alloc::vec![1, 2, 3]));
     assert_eq!(
         set.query_value(key, "Blob"),
         Some((RegistryValueType::Binary, &[1, 2, 3][..]))
@@ -354,10 +343,12 @@ fn mutable_hive_set_cross_hive_copy_shares_payload_until_replacement() {
     assert_eq!(dest_data[0], 0x10);
     assert_eq!(dest_data[dest_data.len() - 1], 0x90);
 
-    let replacement = set
-        .prepare_value_buffer(dest_key, "BigValue", RegistryValueType::Binary, 3)
-        .expect("prepare destination replacement");
-    assert!(set.append_prepared_value_data(replacement, &[1, 2, 3]));
+    assert!(set.set_value(
+        dest_key,
+        "BigValue",
+        RegistryValueType::Binary,
+        alloc::vec![1, 2, 3]
+    ));
     assert_eq!(set.query_value(dest_key, "BigValue").unwrap().1, &[1, 2, 3]);
     assert_eq!(
         set.query_value(source_key, "BigValue").unwrap().1.as_ptr(),

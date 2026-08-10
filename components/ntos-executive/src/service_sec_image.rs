@@ -6274,6 +6274,12 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 bi += 1;
             }
+            // Image faults bypass the native-syscall reply tail below. Shared RX DLL pages can still
+            // grow the loop-owned shared-image mapping table in this branch, so pin that durable
+            // metadata before the next loop-top heap reset.
+            if take_shared_image_mapping_dirty() {
+                pin_durable_heap_mark(&mut heap_mark);
+            }
             if allocation_failed {
                 if image_protect_failed {
                     park_and_log!(pi, b"image-protect", m0, addr);

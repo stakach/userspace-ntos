@@ -1547,6 +1547,34 @@ mod tests {
     }
 
     #[test]
+    fn reactos_system_hive_import_preserves_nls_language_default() {
+        let bytes =
+            match std::fs::read("../../rust-micro/.tmp/reactos/reactos/system32/config/system")
+                .or_else(|_| std::fs::read("/tmp/ros-system.hiv"))
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    eprintln!("skip: staged ReactOS SYSTEM hive not present");
+                    return;
+                }
+            };
+        let source = RegfHive::new(&bytes).expect("valid regf hive");
+        let (hive, stats) = import_regf_into_hive(&source, HiveKind::System);
+        assert!(stats.values > 0, "expected imported SYSTEM hive values");
+
+        let mut hives = nt_hive_core::MutableHiveSet::new();
+        hives.mount(r"\Registry\Machine\System", 0, hive);
+        let nls_language = hives
+            .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language")
+            .expect("Nls\\Language key must resolve through the mutable SYSTEM hive mount");
+        let (ty, data) = hives
+            .query_value(nls_language, "Default")
+            .expect("Nls\\Language\\Default must survive mutable-hive import");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("0409").as_slice());
+    }
+
+    #[test]
     fn windows_hiv_fixture_parses() {
         // A tiny real Windows hive shipped in references/ — validates base block + root nk.
         let path = "../../references/windows-kits/10/Assessment and Deployment Kit/Deployment Tools/amd64/DISM/WofAdk.hiv";

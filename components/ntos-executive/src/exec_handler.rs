@@ -3638,17 +3638,21 @@ impl ExecNtHandler {
         hive.value_matches(cell, name, value_type, data)
     }
 
-    unsafe fn user_data_readable(
+    unsafe fn read_user_data_vec(
         &self,
         data_ptr: u64,
         data_size: usize,
         scratch_cap: usize,
-    ) -> bool {
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
         if data_size == 0 {
-            return true;
+            return Ok(alloc::vec::Vec::new());
         }
         if data_ptr == 0 {
-            return false;
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut data = alloc::vec::Vec::new();
+        if data.try_reserve_exact(data_size).is_err() {
+            return Err(0xC000_009A);
         }
         let scratch = core::slice::from_raw_parts_mut(
             core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
@@ -3658,11 +3662,12 @@ impl ExecNtHandler {
         while offset < data_size {
             let chunk = (data_size - offset).min(scratch_cap);
             if !self.xas_read(data_ptr + offset as u64, &mut scratch[..chunk]) {
-                return false;
+                return Err(STATUS_ACCESS_VIOLATION);
             }
+            data.extend_from_slice(&scratch[..chunk]);
             offset += chunk;
         }
-        true
+        Ok(data)
     }
 
     unsafe fn user_data_equals(&self, data_ptr: u64, expected: &[u8], scratch_cap: usize) -> bool {
@@ -3683,39 +3688,6 @@ impl ExecNtHandler {
                 return false;
             }
             if scratch[..chunk] != expected[offset..offset + chunk] {
-                return false;
-            }
-            offset += chunk;
-        }
-        true
-    }
-
-    unsafe fn append_user_data_to_prepared_value(
-        &mut self,
-        value: nt_hive_core::ResolvedHiveValue,
-        data_ptr: u64,
-        data_size: usize,
-        staged: Option<&[u8]>,
-        scratch_cap: usize,
-    ) -> bool {
-        if let Some(staged) = staged {
-            return staged.len() == data_size
-                && self.mutable_hives.append_prepared_value_data(value, staged);
-        }
-        let scratch = core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-            scratch_cap,
-        );
-        let mut offset = 0usize;
-        while offset < data_size {
-            let chunk = (data_size - offset).min(scratch_cap);
-            if !self.xas_read(data_ptr + offset as u64, &mut scratch[..chunk]) {
-                return false;
-            }
-            if !self
-                .mutable_hives
-                .append_prepared_value_data(value, &scratch[..chunk])
-            {
                 return false;
             }
             offset += chunk;
@@ -15255,28 +15227,24 @@ impl ExecNtHandler {
                             return 0;
                         }
                     }
-                    if data_view.is_none()
-                        && !self.user_data_readable(data_ptr, data_size, REG_VALUE_SCRATCH_CAP)
-                    {
-                        return 0xC000_0005;
-                    }
-                    let Some(prepared) = self.mutable_hives.prepare_value_buffer(
+                    let value_data = match data_view {
+                        Some(data) => data.to_vec(),
+                        None => match self.read_user_data_vec(
+                            data_ptr,
+                            data_size,
+                            REG_VALUE_SCRATCH_CAP,
+                        ) {
+                            Ok(data) => data,
+                            Err(status) => return status,
+                        },
+                    };
+                    if !self.mutable_hives.set_value(
                         mutable_key,
                         durable_name,
                         value_type,
-                        data_size,
-                    ) else {
-                        return 0xC000_009A;
-                    };
-                    if !self.append_user_data_to_prepared_value(
-                        prepared,
-                        data_ptr,
-                        data_size,
-                        data_view,
-                        REG_VALUE_SCRATCH_CAP,
-                    ) || self.mutable_hives.prepared_value_len(prepared) != Some(data_size)
-                    {
-                        return 0xC000_0005;
+                        value_data,
+                    ) {
+                        return 0xC000_0008;
                     }
                     self.mutable_hives_dirty = true;
                     return 0;

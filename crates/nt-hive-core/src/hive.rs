@@ -199,15 +199,6 @@ impl Hive {
         self.value_blobs.len() - 1
     }
 
-    fn push_empty_value_blob_with_capacity(&mut self, len: usize) -> Option<usize> {
-        let mut data = Vec::new();
-        if data.try_reserve_exact(len).is_err() {
-            return None;
-        }
-        self.value_blobs.push(Rc::new(data));
-        Some(self.value_blobs.len() - 1)
-    }
-
     fn intern_value_blob_handle(&mut self, data: Rc<Vec<u8>>) -> usize {
         if let Some(index) = self
             .value_blobs
@@ -223,16 +214,6 @@ impl Hive {
     fn value_blob_handle(&self, value: CellId) -> Option<Rc<Vec<u8>>> {
         let blob = self.value(value)?.data_blob;
         self.value_blobs.get(blob).cloned()
-    }
-
-    fn value_blob_ref_count(&self, blob: usize) -> usize {
-        self.cells
-            .iter()
-            .filter_map(|cell| match cell {
-                Some(Cell::Value(value)) if value.data_blob == blob => Some(()),
-                _ => None,
-            })
-            .count()
     }
 
     /// Open a subkey by (case-insensitive) name.
@@ -403,96 +384,6 @@ impl Hive {
                 true
             }
         }
-    }
-
-    /// Prepare a value's backing buffer for chunked replacement.
-    ///
-    /// Existing values reuse their current allocation when it is large enough, avoiding a second
-    /// large registry blob on the executive bump heap. On reserve failure the old value is left
-    /// untouched and `None` is returned.
-    pub fn prepare_value_buffer(
-        &mut self,
-        key: CellId,
-        name: &str,
-        value_type: RegistryValueType,
-        len: usize,
-    ) -> Option<CellId> {
-        if self.key(key).is_none() {
-            return None;
-        }
-        if let Some(vid) = self.value_id_by_name(key, name) {
-            let data_blob = self.value(vid)?.data_blob;
-            let reuse_existing_blob = self.value_blob_ref_count(data_blob) == 1
-                && self
-                    .value_blobs
-                    .get(data_blob)
-                    .is_some_and(|data| Rc::strong_count(data) == 1)
-                && self
-                    .value_blobs
-                    .get(data_blob)
-                    .is_some_and(|data| data.capacity() >= len);
-            let prepared_blob = if reuse_existing_blob {
-                data_blob
-            } else {
-                self.push_empty_value_blob_with_capacity(len)?
-            };
-            self.sequence += 1;
-            let seq = self.sequence;
-            let Some(Cell::Value(value)) = self
-                .cells
-                .get_mut(vid.0 as usize)
-                .and_then(|cell| cell.as_mut())
-            else {
-                return None;
-            };
-            value.value_type = value_type;
-            value.data_blob = prepared_blob;
-            if let Some(data) = self
-                .value_blobs
-                .get_mut(prepared_blob)
-                .and_then(Rc::get_mut)
-            {
-                data.clear();
-            }
-            value.last_write_sequence = seq;
-            self.mark_dirty(vid);
-            return Some(vid);
-        }
-
-        let data_blob = self.push_empty_value_blob_with_capacity(len)?;
-        self.sequence += 1;
-        let seq = self.sequence;
-        let vid = self.alloc_id();
-        self.push_cell(Cell::Value(ValueCell {
-            id: vid,
-            parent_key: key,
-            name: name.into(),
-            value_type,
-            data_blob,
-            last_write_sequence: seq,
-        }));
-        self.key_mut(key).unwrap().values.push(vid);
-        self.mark_dirty(key);
-        self.mark_dirty(vid);
-        Some(vid)
-    }
-
-    pub fn append_prepared_value_data(&mut self, value: CellId, chunk: &[u8]) -> bool {
-        let Some(blob) = self.value(value).map(|value| value.data_blob) else {
-            return false;
-        };
-        let Some(data) = self.value_blobs.get_mut(blob).and_then(Rc::get_mut) else {
-            return false;
-        };
-        if data.len().saturating_add(chunk.len()) > data.capacity() {
-            return false;
-        }
-        data.extend_from_slice(chunk);
-        true
-    }
-
-    pub fn prepared_value_len(&self, value: CellId) -> Option<usize> {
-        Some(self.value_data(self.value(value)?)?.len())
     }
 
     /// Set `name` on `key` to share the already-owned payload of `source`.
@@ -1109,29 +1000,6 @@ impl MutableHiveSet {
         self.hive_mut(key.hive).is_some_and(|hive| {
             hive.set_value_from_blob_handle(key.key, name, value_type, source_blob)
         })
-    }
-
-    pub fn prepare_value_buffer(
-        &mut self,
-        key: ResolvedHiveKey,
-        name: &str,
-        value_type: RegistryValueType,
-        len: usize,
-    ) -> Option<ResolvedHiveValue> {
-        let hive = self.hive_mut(key.hive)?;
-        Some(ResolvedHiveValue {
-            hive: key.hive,
-            value: hive.prepare_value_buffer(key.key, name, value_type, len)?,
-        })
-    }
-
-    pub fn append_prepared_value_data(&mut self, value: ResolvedHiveValue, chunk: &[u8]) -> bool {
-        self.hive_mut(value.hive)
-            .is_some_and(|hive| hive.append_prepared_value_data(value.value, chunk))
-    }
-
-    pub fn prepared_value_len(&self, value: ResolvedHiveValue) -> Option<usize> {
-        self.hive(value.hive)?.prepared_value_len(value.value)
     }
 
     pub fn query_resolved_value(
