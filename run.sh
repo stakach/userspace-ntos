@@ -36,6 +36,34 @@ done
 say() { printf '\033[1;36m%s\033[0m\n' "$*"; }
 err() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
 
+BOOT_IMAGE="$RM/.tmp/disk.img"
+
+ensure_boot_image_available() {
+  local image="$1"
+  [ -e "$image" ] || return 0
+
+  local holders=""
+  if command -v lsof >/dev/null 2>&1; then
+    holders="$(lsof "$image" 2>/dev/null || true)"
+    [ -z "$holders" ] && return 0
+    err ""
+    err "Boot image is already open: $image"
+    printf '%s\n' "$holders" >&2
+    err ""
+    err "Stop the existing QEMU/run.sh lane before starting another boot."
+    exit 1
+  fi
+
+  if command -v fuser >/dev/null 2>&1 && fuser "$image" >/dev/null 2>&1; then
+    err ""
+    err "Boot image is already open: $image"
+    fuser -v "$image" >&2 || true
+    err ""
+    err "Stop the existing QEMU/run.sh lane before starting another boot."
+    exit 1
+  fi
+}
+
 # ---- [1/5] preflight dependency check -----------------------------------
 say "[1/5] checking dependencies..."
 
@@ -138,11 +166,13 @@ fi
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
 say "[4/5] building ntos-executive + kernel + disk image..."
+ensure_boot_image_available "$BOOT_IMAGE"
 "$ROOT/scripts/build_ntdll_dll.sh"
 "$ROOT/components/ntos-executive/build.sh"
 ( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
 
 # ---- [5/5] run ----------------------------------------------------------
+ensure_boot_image_available "$BOOT_IMAGE"
 if [ "$GRAPHICS" = 1 ]; then
   say "[5/5] booting QEMU with a DISPLAY window (--desktop)..."
   say "      Watch for the ReactOS desktop background (a blue-grey field, 0x003a6ea5)."

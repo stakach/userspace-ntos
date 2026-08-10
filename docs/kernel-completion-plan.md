@@ -2639,3 +2639,15 @@ or `unhandled-syscall` signatures.
   `SUCCESS ... win32k desktop painted (0x003a6ea5)`; the late `\net\NtControlPipe5` wait is
   `armed=1 known=1`, wakes only exact hash-matched fids `0e814c80`/`0e814c81`, and does not emit
   the previous `known=0`, timeout, cancel, service `Error 1053`, or unhandled-syscall signatures.
+
+- A4 desktop runner contention preflight. A reported `./run.sh --desktop` failure was reproduced as
+  host-runner contention, not accepted as a kernel desktop-paint regression: an existing headless
+  `./run.sh`/QEMU lane was still holding `rust-micro/.tmp/disk.img`, so a second desktop lane could
+  not own the boot image. The active log `.tmp/run-headless-baseline-20260810-182238.log` had only
+  reached the normal post-`\pipe\ntsvcs` RPC/TEB sequence before it was manually stopped, while the
+  prior desktop log `.tmp/run-desktop-shell-20260810-181820.log` had already reached the real
+  win32k base desktop framebuffer proof at `px0=0x003a6ea5`. The root launcher now checks the
+  actual boot image before rebuilding and again before QEMU launch, and fails loudly with the owning
+  process list instead of starting a competing lane. Review adjustment: rerun exactly one
+  uncontended boot lane for the next accepted proof, then continue toward explorer shell chrome
+  pixels from the genuine desktop-paint path.
