@@ -2025,6 +2025,7 @@ const ISR_DONE_BADGE: u64 = 0x80;
 
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
+pub const SYS_NB_RECV: i64 = -8;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
@@ -2525,7 +2526,7 @@ pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
 /// `Recv` the executive makes — that is the whole point, it is how `NtDelayExecution` wakes a parked
 /// waiter while the loop sits in `recv`. The kernel's bound-notification pre-check
 /// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
-/// message registers untouched**.
+/// message registers untouched** without binding the receive's reply capability.
 ///
 /// The main service loop has always handled that (`badge == DELAY_TIMER_BADGE` →
 /// `delay_timer_interrupt` → re-recv). `component_pump` did NOT: it discarded the badge, so a tick
@@ -2534,15 +2535,17 @@ pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
 /// (`[pump] WALL label=0 ip=0x771`): the route is the first thing that arms an HPET one-shot
 /// (`NtDelayExecution` from the RPC worker) WHILE an IRP dispatch is in flight.
 ///
-/// The pump now recognises the tick, counts it here and re-receives. The main service loop drains
-/// the count at the top of its next iteration — `delay_timer_interrupt` wakes the due waiters,
-/// re-arms the comparator and Acks the IRQ. Servicing may coalesce multiple absorbed deliveries,
-/// but the gate accounting still records every tick that interrupted a component receive.
+/// The pump now recognises the tick, counts it here and re-receives. When the service-loop context is
+/// registered, the nested pump immediately runs the same `delay_timer_interrupt` path the loop would
+/// have run; otherwise it only acknowledges the IRQ line and leaves the coalesced tick for the normal
+/// loop top. The gate accounting still records every tick that interrupted a component receive.
 pub(crate) static DELAY_TIMER_TICKS_PENDING: AtomicU64 = AtomicU64::new(0);
 /// Timer ticks absorbed by a component pump's recv and deferred (reported by `exec_lsa_worker_route`).
 pub(crate) static PUMP_TIMER_TICKS_ABSORBED: AtomicU64 = AtomicU64::new(0);
 /// Absorbed ticks accounted as drained by the main service loop.
 pub(crate) static PUMP_TIMER_TICKS_DRAINED: AtomicU64 = AtomicU64::new(0);
+/// Absorbed timer deliveries whose IRQ line was acknowledged from a nested component/rendezvous recv.
+pub(crate) static PUMP_TIMER_NESTED_ACKS: AtomicU64 = AtomicU64::new(0);
 // ═══ ★ A WATCHDOG THAT CAN FIRE WHILE THE LOOP IS BLOCKED IN `recv` ═════════════════════════════
 //
 // The wall-clock stall watchdog runs at the SERVICE-LOOP TOP, so it can only observe a boot that is
@@ -2599,9 +2602,9 @@ fn watchdog_deadline() -> Option<u64> {
     }
 }
 
-/// Arm the deadman. Scoped ON at the POST-LOGON milestone: that is where the frontier is, it is past
-/// every SM/CSR/LSA rendezvous (whose nested receive loops do not screen a bound-notification badge),
-/// and it keeps the added deliveries to the handful this batch actually needs.
+/// Arm the deadman. Scoped ON once the GUI stack has produced authentic desktop pixels. From there
+/// the boot frontier includes SCM/EventLog/shell work that can block inside nested component receives;
+/// any true silence must produce diagnostics instead of leaving the run to hang.
 pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
     if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.swap(1, Ordering::Relaxed) != 0 {
         return;
@@ -2696,6 +2699,7 @@ unsafe fn watchdog_report(messages: u64) {
         print_hex_u64(KEYED_WAITER_KEY[slot].load(Ordering::Relaxed));
         print_str(b"\n");
     }
+    driver_launch::print_active_driver_dispatch_for_deadman();
     print_str(b"[deadman] delay-timer deliveries=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b" woke-nothing=");
@@ -2734,6 +2738,27 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
     WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A component or rendezvous pump received the executive's bound timer notification while the main
+/// service loop is unavailable. The pump cannot pop delay waiters because the wait queues live in
+/// the service loop, so it records the pending tick and uses this helper only to prevent the
+/// level-triggered HPET line from starving the component's real reply.
+pub(crate) unsafe fn delay_timer_nested_ack() {
+    if WATCHDOG_ARMED.load(Ordering::Relaxed) != 0 {
+        watchdog_nested_rearm();
+        return;
+    }
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if handler == 0 {
+        return;
+    }
+    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    config &= !HPET_TN_INT_ENB;
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+    PUMP_TIMER_NESTED_ACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 const DELAY_TIMER_IRQ: u64 = 12;
@@ -11826,9 +11851,10 @@ fn release_reply_pool_cap(cap: u64) {
 /// Reproduce, deterministically and without touching the HPET, the delivery that WALLED npfs on the
 /// first LSA-route boot: a notification BOUND to the executive's root TCB cancelling a
 /// `component_pump` recv. The kernel's bound-notification pre-check
-/// (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0` and leaves the message
-/// registers untouched, so an unscreened pump reads `label = 0` with MR0 still holding the request
-/// tag it just replied with — and suspends + retires the component.
+/// (`syscall_handler.rs::handle_recv`) returns `rdi = badge`, `rsi = 0`, leaves the message
+/// registers untouched, and does not bind the receive's reply capability, so an unscreened pump
+/// reads `label = 0` with MR0 still holding the request tag it just replied with — and suspends +
+/// retires the component.
 ///
 /// Mint a notification badged **`DELAY_TIMER_BADGE`** (the pump screens on exactly that badge, so
 /// this exercises the production path, not a test-only one), bind it to the root TCB, signal it, and

@@ -146,6 +146,7 @@ const _: () = assert!(FSD_EXEC_BASE + FSD_EXEC_STRIDE <= FSD_EXEC_LIMIT);
 #[derive(Clone, Copy)]
 pub(crate) struct ExecVaWindow {
     pub code_va: u64,
+    pub pool_va: u64,
     pub data_va: u64,
     pub shared_va: u64,
     pub arg_va: u64,
@@ -157,6 +158,7 @@ impl ExecVaWindow {
         if instance == 0 {
             Some(ExecVaWindow {
                 code_va: FSD_CODE_VA,
+                pool_va: FSD_POOL_VADDR,
                 data_va: FSD_DATA_VADDR,
                 shared_va: FSD_SHARED_VADDR,
                 arg_va: FSD_ARG_VADDR,
@@ -174,6 +176,7 @@ impl ExecVaWindow {
             // Same RELATIVE offsets as the fixed layout: aux PT (2 MiB) holds DATA/SHARED/ARG.
             Some(ExecVaWindow {
                 code_va: base,                 // 256 KiB image window (fits in the first 2 MiB PT)
+                pool_va: base + 0x0080_0000,   // POOL (2 MiB, own PT)
                 data_va: base + 0x0030_0000,   // DATA (4 frames)
                 shared_va: base + 0x0038_0000, // SHARED (1 frame)
                 arg_va: base + 0x003A_0000,    // ARG (4 frames)
@@ -352,8 +355,19 @@ struct PendingIrp {
 }
 
 static mut DATA_TRACE_COUNT: u32 = 0;
-/// Bounded ENTER/EXIT trace of IRP dispatches (see [`dispatch_irp`]).
-static mut FSD_DISPATCH_TRACE: u32 = 0;
+/// Hosted-driver IRP dispatch sequence. This always increments; the print policy below is bounded.
+static FSD_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+const FSD_DISPATCH_TRACE_CAP: u64 = 256;
+pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_MAJOR: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_FSCTL: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_FID: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_IN: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_OUT: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_DISPATCH_STARTED_100NS: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_WRITE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static FSD_ACTIVE_COMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Narrow NPFS read/write queue-state trace for message-mode RPC over named pipes.
 static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 /// Narrow NPFS transceive queue-state trace for RPC request/reply pipe transactions.
@@ -1659,15 +1673,19 @@ unsafe fn pipe_queue_view(dq: u64) -> PipeQueueView {
     }
 }
 
-unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
+unsafe fn pipe_ccb_view_in_pool(fid: u64, exec_pool_va: u64) -> Option<PipeCcbView> {
     if fid == 0 || fid == 1 {
         return None;
     }
-    let ccb = fid & !1;
-    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    if ccb < FSD_POOL_VADDR + POOL_DATA_OFF || ccb + 0xC0 > pool_end || ccb & 7 != 0 {
+    let component_ccb = fid & !1;
+    let component_pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+    if component_ccb < FSD_POOL_VADDR + POOL_DATA_OFF
+        || component_ccb + 0xC0 > component_pool_end
+        || component_ccb & 7 != 0
+    {
         return None;
     }
+    let ccb = exec_pool_va + (component_ccb - FSD_POOL_VADDR);
     if read_volatile(ccb as *const u16) != NPFS_NTC_CCB {
         return None;
     }
@@ -1677,6 +1695,10 @@ unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
             pipe_queue_view(ccb + NP_CCB_DATA_QUEUE + NP_DATA_QUEUE_SIZE),
         ],
     })
+}
+
+unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
+    pipe_ccb_view_in_pool(fid, FSD_POOL_VADDR)
 }
 
 fn print_pipe_ccb_view(tag: &[u8], view: PipeCcbView) {
@@ -1695,6 +1717,37 @@ fn print_pipe_ccb_view(tag: &[u8], view: PipeCcbView) {
         print_u64(q.byte_offset as u64);
         print_str(b"/");
         print_u64(q.quota_used as u64);
+    }
+}
+
+fn trace_active_write_call_site(phase: &[u8], seq: u64, file_id: u64, handler: u64, irp: u64) {
+    print_str(b"[fsd-active-write] ");
+    print_str(phase);
+    print_str(b" seq=");
+    print_u64(seq);
+    print_str(b" fid=");
+    print_hex64(file_id);
+    print_str(b" handler=");
+    print_hex64(handler);
+    print_str(b" irp=");
+    print_hex64(irp);
+    unsafe {
+        if let Some(view) = pipe_ccb_view(file_id) {
+            print_pipe_ccb_view(b"", view);
+        }
+    }
+    print_str(b"\n");
+}
+
+fn print_hex64(value: u64) {
+    print_str(b"0x");
+    for i in (0..16).rev() {
+        let nib = ((value >> (i * 4)) & 0xf) as u8;
+        debug_put_char(if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + (nib - 10)
+        });
     }
 }
 
@@ -4394,6 +4447,7 @@ const WDM_X64_IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const WDM_X64_IRP_STACK_COUNT_OFFSET: u64 = 0x42;
 const WDM_X64_IRP_IO_STATUS_STATUS_OFFSET: u64 = 0x30;
 const WDM_X64_IRP_PENDING_RETURNED_OFFSET: u64 = 0x41;
+const WDM_X64_IRP_CANCEL_ROUTINE_OFFSET: u64 = 0x68;
 const WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET: u64 = 0x90;
 const WDM_X64_IO_STACK_MINOR_OFFSET: u64 = 0x01;
 const WDM_X64_IO_STACK_CONTROL_OFFSET: u64 = 0x03;
@@ -4464,6 +4518,19 @@ extern "win64" fn s_io_skip_current_irp_stack_location(irp: u64) {
                 current_stack + WDM_X64_IO_STACK_LOCATION_SIZE as u64,
             );
         }
+    }
+}
+
+/// `PDRIVER_CANCEL IoSetCancelRoutine(PIRP, PDRIVER_CANCEL)`.
+extern "win64" fn s_io_set_cancel_routine(irp: u64, cancel_routine: u64) -> u64 {
+    if irp == 0 {
+        return 0;
+    }
+    unsafe {
+        let slot = (irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64;
+        let old = read_unaligned(slot as *const u64);
+        write_unaligned(slot, cancel_routine);
+        old
     }
 }
 
@@ -5472,6 +5539,24 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 /// npfs's deferred list; reclaim that retained request graph here instead of leaking it forever.
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
+        let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
+        if active_seq >= 128
+            && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
+        {
+            print_str(b"[fsd-complete-active] seq=");
+            print_u64(active_seq);
+            print_str(b" irp=");
+            print_hex64(irp);
+            if irp >= FSD_POOL_VADDR + POOL_DATA_OFF
+                && irp + WDM_X64_IRP_SIZE as u64 <= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
+            {
+                print_str(b" status=");
+                print_hex(read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32));
+                print_str(b" info=");
+                print_u64(read_unaligned((irp + 0x38) as *const u64));
+            }
+            print_str(b"\n");
+        }
         // DIAGNOSTIC heartbeat: `NpCompleteDeferredIrps` walks a driver-built LIST_ENTRY chain, so a
         // corrupted (cyclic) deferred list becomes an unbounded completion loop with no other output.
         {
@@ -7141,6 +7226,10 @@ fn register_fsd_trampolines() {
         s_io_skip_current_irp_stack_location as *const () as usize as u64,
     );
     reg.bind(
+        "IoSetCancelRoutine",
+        s_io_set_cancel_routine as *const () as usize as u64,
+    );
+    reg.bind(
         "IoAllocateIrp",
         s_io_allocate_irp as *const () as usize as u64,
     );
@@ -8136,11 +8225,34 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
     // own consistency bugcheck (`NpBugCheck` → `KeBugCheckEx`) we unwind back here and fail THIS
     // dispatch cleanly instead of letting it continue on a broken invariant (or hang the boot).
+    let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
+    let trace_active_write = major == IRP_MJ_WRITE
+        && active_seq >= 128
+        && FSD_ACTIVE_WRITE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16;
+    if trace_active_write {
+        trace_active_write_call_site(b"before-call", active_seq, file_id, handler, irp);
+    }
     let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
     jb[0] = 0;
     jb[1] = 0;
     jb[2] = 0;
     let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr());
+    if trace_active_write {
+        print_str(b"[fsd-active-write] after-call seq=");
+        print_u64(active_seq);
+        print_str(b" ret=");
+        print_hex(ret as u32);
+        print_str(b" irp-status=");
+        print_hex(read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32));
+        print_str(b" info=");
+        print_u64(read_unaligned((irp + 0x38) as *const u64));
+        unsafe {
+            if let Some(view) = pipe_ccb_view(file_id) {
+                print_pipe_ccb_view(b"", view);
+            }
+        }
+        print_str(b"\n");
+    }
     let bugchecked = jb[2] != 0;
     jb[1] = 0; // disarm
     jb[2] = 0;
@@ -8370,6 +8482,10 @@ pub(crate) struct DriverComponent {
     /// The EXECUTIVE-side SHARED-frame VA for THIS instance (where the executive marshals IRP
     /// request/reply fields). Instance 0 == [`FSD_SHARED_VADDR`]; N≥1 == a per-instance window.
     pub exec_shared_va: u64,
+    /// The EXECUTIVE-side mirror of this component's FSD pool frames. Component pointers remain in
+    /// the fixed [`FSD_POOL_VADDR`] range and are translated through this base before executive-side
+    /// diagnostics or teardown read them.
+    pub exec_pool_va: u64,
     /// The EXECUTIVE-side ARG-frame VA for THIS instance (buffered-I/O in/out data).
     pub exec_arg_va: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
@@ -9135,8 +9251,8 @@ unsafe fn load_driver_reserved(
     let run_va = FSD_CODE_VA;
     let img_frames = FSD_IMAGE_FRAMES;
 
-    // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, DATA + SHARED
-    //    arena + ARG in an aux PT. POOL is host-only.
+    // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, POOL in its own
+    //    mirrored 2 MiB PT, and DATA + SHARED + ARG in an aux PT.
     let cpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
     map_instance_exec_pt(instance, cpt, code_va)?;
@@ -9152,6 +9268,13 @@ unsafe fn load_driver_reserved(
     let pool_base = alloc_frame();
     for _ in 1..FSD_POOL_FRAMES {
         let _ = alloc_frame();
+    }
+    let ppt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
+    map_instance_exec_pt(instance, ppt, win.pool_va)?;
+    for i in 0..FSD_POOL_FRAMES {
+        let cap = copy_cap(pool_base + i);
+        map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)?;
     }
     // DATA + SHARED + ARG: caps + an aux PT in the executive VSpace.
     let data_base = alloc_frame();
@@ -9343,6 +9466,7 @@ unsafe fn load_driver_reserved(
         support_verdict,
         finished,
         exec_shared_va: win.shared_va,
+        exec_pool_va: win.pool_va,
         exec_arg_va: win.arg_va,
         instance,
         driver_id,
@@ -10616,6 +10740,7 @@ pub(crate) struct DriverInstance {
     pub fault_ep: u64,
     pub pml4: u64,
     pub exec_shared_va: u64,
+    pub exec_pool_va: u64,
     pub exec_arg_va: u64,
     pub tcb: u64,
     pub reply_cap: u64,
@@ -10633,6 +10758,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     fault_ep: 0,
     pml4: 0,
     exec_shared_va: 0,
+    exec_pool_va: 0,
     exec_arg_va: 0,
     tcb: 0,
     reply_cap: 0,
@@ -10845,6 +10971,7 @@ fn register_instance(dc: &DriverComponent) {
         fault_ep: dc.fault_ep,
         pml4: dc.pml4,
         exec_shared_va: dc.exec_shared_va,
+        exec_pool_va: dc.exec_pool_va,
         exec_arg_va: dc.exec_arg_va,
         tcb: dc.tcb,
         reply_cap: dc.reply_cap,
@@ -11696,6 +11823,67 @@ pub(crate) unsafe fn npfs_last_file_id() -> u64 {
     read_volatile((sh + SH_REQ_FILEID) as *const u64)
 }
 
+pub(crate) fn print_active_driver_dispatch_for_deadman() {
+    let seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
+    if seq == 0 {
+        return;
+    }
+    let inst_index = FSD_ACTIVE_DISPATCH_INST.load(Ordering::Relaxed);
+    let major = FSD_ACTIVE_DISPATCH_MAJOR.load(Ordering::Relaxed);
+    let fsctl = FSD_ACTIVE_DISPATCH_FSCTL.load(Ordering::Relaxed);
+    let file_id = FSD_ACTIVE_DISPATCH_FID.load(Ordering::Relaxed);
+    let started = FSD_ACTIVE_DISPATCH_STARTED_100NS.load(Ordering::Relaxed);
+    let elapsed = monotonic_time_100ns().saturating_sub(started) / 10_000;
+    print_str(b"[deadman] active-driver-dispatch #");
+    print_u64(seq);
+    print_str(b" inst=");
+    print_u64(inst_index);
+    print_str(b" major=");
+    print_u64(major);
+    print_str(b" fsctl=");
+    print_hex64(fsctl);
+    print_str(b" fid=");
+    print_hex64(file_id);
+    print_str(b" in=");
+    print_u64(FSD_ACTIVE_DISPATCH_IN.load(Ordering::Relaxed));
+    print_str(b" out=");
+    print_u64(FSD_ACTIVE_DISPATCH_OUT.load(Ordering::Relaxed));
+    print_str(b" elapsed-ms=");
+    print_u64(elapsed);
+    print_str(b"\n");
+
+    if let Some(inst) = instance(inst_index as usize) {
+        if inst.tcb != 0 {
+            let mut regs = [0u64; 20];
+            unsafe {
+                crate::win32k_glue::tcb_read_regs20(inst.tcb, &mut regs);
+            }
+            let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
+            print_str(b"[deadman] active-driver-regs rip=");
+            print_hex64(rip);
+            if (FSD_CODE_VA..FSD_CODE_VA + FSD_IMAGE_FRAMES * 0x1000).contains(&rip) {
+                print_str(b" rva=");
+                print_hex64(rip - FSD_CODE_VA);
+            }
+            print_str(b" rsp=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
+            print_str(b" rax=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RAX]);
+            print_str(b" rcx=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RCX]);
+            print_str(b" rdx=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+            print_str(b"\n");
+        }
+        unsafe {
+            if let Some(view) = pipe_ccb_view_in_pool(file_id, inst.exec_pool_va) {
+                print_pipe_ccb_view(b"[deadman] active-driver-ccb", view);
+                print_str(b"\n");
+            }
+        }
+    }
+}
+
 /// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop
 /// (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP lands
 /// on its fault EP → demand-map + resume), then read back the completion. Returns `(status,
@@ -11766,27 +11954,51 @@ unsafe fn dispatch_irp_for_instance(
         },
     };
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
-    // DIAGNOSTIC (bounded): an IRP dispatch is the ONE place the executive blocks on a hosted
+    // DIAGNOSTIC (bounded): an IRP dispatch is the one place the executive blocks on a hosted
     // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never
-    // returned (the failure mode that used to end the boot in a 555-second silence).
-    if FSD_DISPATCH_TRACE < 40 {
-        FSD_DISPATCH_TRACE += 1;
+    // returned.
+    let dispatch_seq = FSD_DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    FSD_ACTIVE_DISPATCH_SEQ.store(dispatch_seq, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_INST.store(inst as u64, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_MAJOR.store(major, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_FSCTL.store(fsctl, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_FID.store(file_id, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_IN.store(in_data.len() as u64, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_OUT.store(out.len() as u64, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_STARTED_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+    let trace_dispatch = dispatch_seq <= FSD_DISPATCH_TRACE_CAP;
+    if trace_dispatch {
         print_str(b"[fsd-svc] ENTER inst=");
         print_u64(inst as u64);
+        print_str(b" #");
+        print_u64(dispatch_seq);
         print_str(b" major=");
         print_u64(major);
+        if fsctl != 0 {
+            print_str(b" fsctl=0x");
+            print_hex(fsctl as u32);
+        }
         print_str(b" fid=");
         print_hex(file_id as u32);
+        print_str(b" in=");
+        print_u64(in_data.len() as u64);
+        print_str(b" out=");
+        print_u64(out.len() as u64);
         print_str(b"\n");
     }
     let pr = crate::spawn_hosts::component_pump(&ch);
-    if FSD_DISPATCH_TRACE <= 40 {
+    FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);
+    if trace_dispatch {
         print_str(b"[fsd-svc] EXIT inst=");
         print_u64(inst as u64);
+        print_str(b" #");
+        print_u64(dispatch_seq);
         print_str(b" major=");
         print_u64(major);
         print_str(b" status=");
         print_hex(pr.status as u32);
+        print_str(b" completed=");
+        print_u64(pr.completed as u64);
         print_str(b"\n");
     }
     // Attribute any bugcheck the component raised to THIS instance — the executive is the only side

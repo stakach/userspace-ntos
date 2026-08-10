@@ -2734,6 +2734,24 @@ mod tests {
     }
 
     #[test]
+    fn completed_outer_context_uses_repaired_executable_resume() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        saved[USER_CONTEXT_RSP] = 0x1001_3f4f_e58;
+        saved[USER_CONTEXT_RFLAGS] = 0x202;
+        let repaired =
+            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |ip| ip == 0x7fff_1002).unwrap();
+
+        let completed = completed_outer_context(&saved, 0xcafe_babe, repaired);
+
+        assert_eq!(completed[USER_CONTEXT_RIP], 0x7fff_1002);
+        assert_eq!(completed[USER_CONTEXT_RCX], 0x7fff_1002);
+        assert_eq!(completed[USER_CONTEXT_RAX], 0xcafe_babe);
+        assert_eq!(completed[USER_CONTEXT_RSP], saved[USER_CONTEXT_RSP]);
+        assert_ne!(completed[USER_CONTEXT_RIP], 0x1000_0560_000);
+    }
+
+    #[test]
     fn callback_correlation_rejects_stale_client_or_sequence() {
         let request = request();
         let correlation = CallbackCorrelation::from_request(&request);

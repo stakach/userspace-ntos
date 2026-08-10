@@ -15,7 +15,9 @@ unsafe fn rendezvous_recv_full_r12(
         let received = crate::recv_full_r12(ep, reply);
         if received.0 == DELAY_TIMER_BADGE && (received.1 >> 12) == 0 {
             DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-            watchdog_nested_rearm();
+            if !crate::drain_nested_pump_timer_delivery() {
+                crate::delay_timer_nested_ack();
+            }
             let tick = RENDEZVOUS_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             if tick < 8 {
                 print_str(tag);

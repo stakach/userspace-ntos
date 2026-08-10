@@ -10,6 +10,7 @@
 //! caps). Behaviour is byte-identical to the old bespoke spawners.
 #![allow(clippy::all)]
 use crate::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
 /// Where a region's frame caps come from.
@@ -824,6 +825,18 @@ fn dispatch_depth_leave() {
 /// So the executive's request rides as a length-1 message with the tag in **MR0**. Phase 2 needs
 /// exactly this to tell a nested DISPATCH from a callback RESUME.
 const REQUEST_TAG_LEN: u64 = 1;
+static PUMP_TIMER_FAIR_POLLS: AtomicU64 = AtomicU64::new(0);
+static PUMP_TIMER_FAIR_HITS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
+    label == ch.dispatch_label
+        || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
+        || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
+        || label == 6
+        || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
+}
 
 /// Answer the component's outstanding `Call` on this channel's reply object, recording the
 /// invocation label. Non-blocking by construction (`decode_reply` wakes the bound caller or fails).
@@ -834,6 +847,74 @@ unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
         pump_note_reply_error(ch, e);
     }
     e
+}
+
+/// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
+/// once without blocking. This prevents a ready component Call from sitting behind a stream of timer
+/// badges on the root TCB's bound notification while preserving normal blocking behavior when the
+/// endpoint is still idle.
+#[inline(never)]
+unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
+    PUMP_TIMER_FAIR_POLLS.fetch_add(1, Ordering::Relaxed);
+    let badge: u64;
+    let mi: u64;
+    let m0: u64;
+    let m1: u64;
+    let m2: u64;
+    let m3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_NB_RECV as u64,
+        inout("rdi") ch.fault_ep => badge,
+        lateout("rsi") mi,
+        lateout("r10") m0,
+        lateout("r8") m1,
+        lateout("r9") m2,
+        lateout("r15") m3,
+        in("r12") ch.reply_cap,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    if crate::EXEC_DEADMAN_WATCHDOG {
+        if badge == crate::DELAY_TIMER_BADGE {
+            crate::watchdog_on_tick();
+        } else {
+            crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if badge == crate::DELAY_TIMER_BADGE {
+        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+        if !crate::drain_nested_pump_timer_delivery() {
+            crate::delay_timer_nested_ack();
+        }
+        return None;
+    }
+    let label = mi >> 12;
+    // A timer drain can leave non-endpoint msginfo in the volatile receive registers (for example
+    // the executive's IRQ-ack label). This fairness probe is advisory, so only protocol labels that
+    // the component pump already knows how to service are allowed to short-circuit the next Recv.
+    if !pump_label_can_arrive_after_timer(ch, label) {
+        return None;
+    }
+    let hit = PUMP_TIMER_FAIR_HITS.fetch_add(1, Ordering::Relaxed);
+    if hit < 8 {
+        crate::print_str(b"[pump] timer-fair NBRecv accepted component message label=");
+        crate::print_u64(label);
+        crate::print_str(b"\n");
+    }
+    let m4 = if (mi & 0x7F) > 4 {
+        crate::get_recv_mr(4)
+    } else {
+        0
+    };
+    Some(PumpMessage {
+        mi,
+        m0,
+        m1,
+        m2,
+        m3,
+        m4,
+    })
 }
 
 #[inline(never)]
@@ -897,7 +978,13 @@ macro_rules! pump_recv_into {
             }
             if badge == crate::DELAY_TIMER_BADGE {
                 crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-                crate::watchdog_nested_rearm();
+                if !crate::drain_nested_pump_timer_delivery() {
+                    crate::delay_timer_nested_ack();
+                }
+                if let Some(polled) = pump_try_recv_after_timer($ch) {
+                    $msg = polled;
+                    break;
+                }
                 let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
                 if n < 8 {
                     crate::print_str(
@@ -988,16 +1075,18 @@ impl PumpLoopOutcome {
 /// notification BOUND to it, so this `Recv` has a SECOND thing that can satisfy it besides a
 /// component `Call`: a timer tick. The kernel's bound-notification pre-check
 /// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
-/// message registers untouched**, so a tick absorbed here reads as `label = 0` with MR0 still
-/// holding whatever `pump_reply_on` left there — the request tag. That is a WALL, and it is exactly
-/// what killed the LSA route's npfs READ (`[pump] WALL label=0 ip=0x771`): the route is the first
-/// thing in the boot that arms an HPET one-shot (`NtDelayExecution` from the RPC worker) WHILE a
-/// component dispatch is in flight. The main service loop has always screened this badge; the pump
-/// did not, because before the route nothing ticked during a dispatch.
+/// message registers untouched** without staging `ch.reply_cap` for IPC, so a tick absorbed here
+/// reads as `label = 0` with MR0 still holding whatever `pump_reply_on` left there — the request tag.
+/// That is a WALL, and it is exactly what killed the LSA route's npfs READ
+/// (`[pump] WALL label=0 ip=0x771`): the route is the first thing in the boot that arms an HPET
+/// one-shot (`NtDelayExecution` from the RPC worker) WHILE a component dispatch is in flight. The
+/// main service loop has always screened this badge; the pump did not, because before the route
+/// nothing ticked during a dispatch.
 ///
-/// So: recognise the tick, count it for the main service loop (`DELAY_TIMER_TICKS_PENDING`) and go
-/// back to receiving. The watchdog re-arm path Acks nested deliveries; the service loop then services
-/// the coalesced timer state once while accounting for every pump-absorbed tick.
+/// So: recognise the tick, count it, and ask the service-loop-owned timer hook to drain the real
+/// queues immediately when that context is live. If no service context is registered (early init or
+/// post-loop tests), fall back to acknowledging the IRQ line and let the ordinary loop drain the
+/// coalesced tick later.
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
     loop {
@@ -1031,10 +1120,15 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
         }
         if badge == crate::DELAY_TIMER_BADGE {
             crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-            // The main service loop owns the ordinary re-arm + IRQ Ack, and it cannot run while this
-            // pump is blocked — so a deadlock INSIDE a dispatch would get exactly one tick and could
-            // never trip the deadman. Re-arm it here (see `watchdog_nested_rearm`).
-            crate::watchdog_nested_rearm();
+            // The main service loop owns the delay/wait queues; when that context is live, drain it
+            // here because this nested pump may be the thing preventing the loop top from running.
+            // Early component init has no such context, so it only needs the IRQ-line ack.
+            if !crate::drain_nested_pump_timer_delivery() {
+                crate::delay_timer_nested_ack();
+            }
+            if let Some(polled) = pump_try_recv_after_timer(ch) {
+                return polled;
+            }
             let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
                 crate::print_str(

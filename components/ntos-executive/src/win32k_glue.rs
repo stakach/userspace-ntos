@@ -1814,6 +1814,23 @@ unsafe fn resolve_callback_resume_ip(
     }
 }
 
+pub(crate) unsafe fn resolve_active_callback_syscall_resume_ip(
+    client: Win32kClientContext,
+    message_resume_ip: u64,
+) -> Option<u64> {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    if active.top_for(&identity).is_none() {
+        return Some(message_resume_ip);
+    }
+    let Some(tcb) = callback_context_tcb(client) else {
+        return None;
+    };
+    let mut saved = [0u64; 20];
+    tcb_read_regs20(tcb, &mut saved);
+    resolve_callback_resume_ip(client, message_resume_ip, &saved, b"nested-syscall")
+}
+
 pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     client: Win32kClientContext,
     outer_resume_ip: u64,
@@ -3288,31 +3305,14 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         dispatch_context,
     );
     let completed_client = callback_client_from_frame(request, completed_frame);
-    let completed_role = completed_client.role;
+    let completed_context = win32k_client_context_from_callback_client(completed_client);
     let component = resume_suspended_user_callback_component(request, completed_client);
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
     );
     if component.callback_suspended {
-        let chained_client = Win32kClientContext {
-            pi: request.client_pi,
-            pid: completed_client.pid,
-            badge: request.client_badge,
-            tid: request.client_tid,
-            tcb: completed_client.tcb,
-            eprocess: completed_client.eprocess,
-            ethread: completed_client.ethread,
-            role: completed_role,
-            process_role: completed_client.process_role,
-            top_badge: completed_client.top_badge,
-            teb: completed_client.teb,
-            peb_mirror: completed_client.peb_mirror,
-            scratch_base: completed_client.scratch_base,
-            token_authentication_id: completed_client.token_authentication_id,
-            token_user_sid: completed_client.token_user_sid,
-            token_user_sid_len: completed_client.token_user_sid_len,
-        };
+        let chained_client = completed_context;
         let Some(chained_tcb) = callback_context_tcb(chained_client) else {
             abort_controlled_user_callbacks();
             print_str(b"[user-callback] chained callback missing client TCB\n");
@@ -3330,18 +3330,23 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_str(b"[user-callback] chained callback missing executable callout resume\n");
             return None;
         };
-        if !callback_resume_ip_executable(chained_client, completed_frame.outer_resume_ip()) {
+        let Some(chained_outer_resume_ip) = resolve_callback_resume_ip(
+            chained_client,
+            completed_frame.outer_resume_ip(),
+            completed_frame.saved_user_context(),
+            b"chained-outer",
+        ) else {
             abort_controlled_user_callbacks();
-            print_str(b"[user-callback] chained callback inherited non-executable outer resume=0x");
+            print_str(b"[user-callback] chained callback missing executable outer resume=0x");
             print_crash_hex64(completed_frame.outer_resume_ip());
             print_str(b"\n");
             return None;
-        }
+        };
         if !redirect_pending_user_callback(
             chained_client,
             &chained_context,
             completed_frame.saved_user_context(),
-            completed_frame.outer_resume_ip(),
+            chained_outer_resume_ip,
             chained_callout_resume_ip,
             return_rsp,
             return_flags,
@@ -3381,10 +3386,22 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     else {
         return None;
     };
+    let Some(completed_outer_resume_ip) = resolve_callback_resume_ip(
+        completed_context,
+        completed_frame.outer_resume_ip(),
+        completed_frame.saved_user_context(),
+        b"completed-outer",
+    ) else {
+        abort_controlled_user_callbacks();
+        print_str(b"[user-callback] completed callback missing executable outer resume=0x");
+        print_crash_hex64(completed_frame.outer_resume_ip());
+        print_str(b"\n");
+        return None;
+    };
     let completed = nt_user_callback::completed_outer_context(
         completed_frame.saved_user_context(),
         component.result,
-        completed_frame.outer_resume_ip(),
+        completed_outer_resume_ip,
     );
     if tcb_write_regs20(tcb, &completed, false) != 0 {
         return None;

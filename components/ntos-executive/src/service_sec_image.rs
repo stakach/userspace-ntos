@@ -72,6 +72,9 @@ static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
 static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue<DELAY_WAITER_N> =
     nt_delay_execution::Queue::new();
+static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
+static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
+static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_DLL_PE_STORE_WORK: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
     [const { None }; DLL_REG_COUNT];
 static SERVICE_DLL_PE_NONE: Option<nt_pe_loader::PeFile<'static>> = None;
@@ -1024,6 +1027,47 @@ unsafe fn reset_service_delay_queue_work() -> &'static mut nt_delay_execution::Q
     let slot = core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
     core::ptr::write(slot, nt_delay_execution::Queue::<DELAY_WAITER_N>::new());
     &mut *slot
+}
+
+unsafe fn register_service_delay_drain_context(
+    handler: &mut ExecNtHandler,
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+) {
+    SERVICE_DELAY_DRAIN_HANDLER.store(handler as *mut ExecNtHandler as u64, Ordering::Release);
+    SERVICE_DELAY_DRAIN_QUEUE.store(
+        queue as *mut nt_delay_execution::Queue<DELAY_WAITER_N> as u64,
+        Ordering::Release,
+    );
+}
+
+unsafe fn clear_service_delay_drain_context() {
+    SERVICE_DELAY_DRAIN_QUEUE.store(0, Ordering::Release);
+    SERVICE_DELAY_DRAIN_HANDLER.store(0, Ordering::Release);
+}
+
+pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
+    if DELAY_TIMER_HANDLER.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
+        as *mut nt_delay_execution::Queue<DELAY_WAITER_N>;
+    if handler_ptr.is_null() || queue_ptr.is_null() {
+        return false;
+    }
+    let ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
+    if ticks == 0 {
+        return false;
+    }
+    PUMP_TIMER_TICKS_DRAINED.fetch_add(ticks, Ordering::Relaxed);
+    delay_timer_interrupt(&mut *queue_ptr, &mut *handler_ptr);
+    let n = SERVICE_DELAY_NESTED_DRAINS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        print_str(b"[delay] nested pump drained timer ticks=");
+        print_u64(ticks);
+        print_str(b"\n");
+    }
+    true
 }
 
 unsafe fn load_hosted_bootstrap_image(
@@ -3847,6 +3891,7 @@ pub(crate) unsafe fn service_sec_image(
     );
     nt_handler.register_main_thread_tcb(0, main_tcb);
     let delay_queue = reset_service_delay_queue_work();
+    register_service_delay_drain_context(&mut nt_handler, delay_queue);
     if ntdll.is_some() {
         publish_kuser_clocks();
         let alias = kuser_page_alias_get(0);
@@ -4215,13 +4260,14 @@ pub(crate) unsafe fn service_sec_image(
         for watch_pi in 1..5usize {
             crate::teb_tail_watch(watch_pi, 0, m0, badge);
         }
-        // ★ ARM THE IN-`recv` DEADMAN at the POST-LOGON milestone — the frontier this batch works
-        // on, and safely past every SM/CSR/LSA rendezvous whose nested receive loops do not screen a
-        // bound-notification badge. From here on a boot that stops receiving IPC entirely reports
-        // itself (`[deadman]`) and quiesces to the gate instead of hanging out the run's timeout.
+        // ★ ARM THE IN-`recv` DEADMAN once authentic desktop pixels exist. From here the boot is past
+        // the first real win32k paint and into SCM/EventLog/shell work, where a hosted component can
+        // still block the single executive loop from inside a nested receive. A true silence now
+        // reports itself (`[deadman]`) instead of leaving the run to hang.
         if crate::EXEC_DEADMAN_WATCHDOG
             && crate::WATCHDOG_ARMED.load(Ordering::Relaxed) == 0
-            && WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0
+            && (WINLOGON_PAINT_DONE.load(Ordering::Relaxed) != 0
+                || WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0)
         {
             crate::watchdog_arm(delay_queue);
         }
@@ -6474,7 +6520,7 @@ pub(crate) unsafe fn service_sec_image(
                 wl_ring[wl_ri % 48] = m0 as u16;
                 wl_ri += 1;
             }
-            let resume_ip = m2; // RCX = syscall return address
+            let mut resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let current_tid = nt_handler
@@ -6950,6 +6996,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut redirected_user_callback = false;
             let mut redirected_user_apc = false;
             let mut redirected_context_continue = false;
+            let mut active_callback_bad_resume = false;
             // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
             // by withholding a reply. Self-termination does not use this flag: its explicit post
             // action deletes the bound Reply cap and caller TCB before receiving again.
@@ -11642,6 +11689,23 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
+                let dispatch_peb_mirror = hosted_peb_mirror_for_pi(pi);
+                let dispatch_client_teb = nt_handler
+                    .pm
+                    .thread_teb(current_tid as nt_process::ThreadId)
+                    .filter(|teb| *teb != 0)
+                    .unwrap_or(SMSS_TEB_VA);
+                let dispatch_client = win32k_client_context_for_thread(
+                    &nt_handler,
+                    pi,
+                    badge,
+                    current_tid,
+                    hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                    nt_handler.hosted_thread_role(current_tid),
+                    dispatch_client_teb,
+                    dispatch_peb_mirror,
+                    scratch_base,
+                );
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park
                     || gui_message_wait_park_request
                 {
@@ -11992,25 +12056,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Forward the real syscall-entry stack pointer to win32k. The component derives
                     // exact arity from win32k's SSPT and reads only the required tail args through
                     // the attached client-memory path.
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
-                    let client_teb = nt_handler
-                        .pm
-                        .thread_teb(current_tid as nt_process::ThreadId)
-                        .filter(|teb| *teb != 0)
-                        .unwrap_or(SMSS_TEB_VA);
-                    let client_role = nt_handler.hosted_thread_role(current_tid);
-                    let client_tcb = hosted_thread_tcb_or_zero(&nt_handler, current_tid);
-                    let client = win32k_client_context_for_thread(
-                        &nt_handler,
-                        pi,
-                        badge,
-                        current_tid,
-                        client_tcb,
-                        client_role,
-                        client_teb,
-                        peb_mirror,
-                        scratch_base,
-                    );
+                    let client = dispatch_client;
                     if pi >= 1 && m0 == 0x1077 && a3 != 0 {
                         prefill_client_large_string_pages(
                             pi as u64,
@@ -12621,8 +12667,8 @@ pub(crate) unsafe fn service_sec_image(
                             nt_handler.hosted_process_top_badge(pi).unwrap_or(0),
                             main_tid,
                             nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
-                            client_teb,
-                            peb_mirror,
+                            dispatch_client_teb,
+                            dispatch_peb_mirror,
                             scratch_base,
                             win32k_token_context(&nt_handler, pi),
                         );
@@ -12688,6 +12734,19 @@ pub(crate) unsafe fn service_sec_image(
                         let resumed = win32k_glue::cancel_suspended_user_callback();
                         st = resumed.0 as u32 as u64;
                         ok = resumed.1;
+                    }
+                } else if ok {
+                    if let Some(resolved_resume_ip) =
+                        win32k_glue::resolve_active_callback_syscall_resume_ip(
+                            dispatch_client,
+                            resume_ip,
+                        )
+                    {
+                        resume_ip = resolved_resume_ip;
+                    } else {
+                        active_callback_bad_resume = true;
+                        st = 0xC000_0005;
+                        ok = false;
                     }
                 }
                 if ok && !redirected_user_callback && msg_returns_to_client {
@@ -13270,6 +13329,53 @@ pub(crate) unsafe fn service_sec_image(
                 // (unrecoverable for it) and let the shared loop keep servicing the others.
                 stop_ssn = m0;
                 park_and_log!(pi, b"unhandled-syscall", m0, m0);
+            }
+            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            if active_callback_bad_resume && reply_main != 0 {
+                if drop_current_syscall_reply() {
+                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
+                    drain_deferred_user_callback_returns(
+                        &mut nt_handler,
+                        pi,
+                        faults as usize,
+                        procs,
+                        pfilled,
+                        filled_pages,
+                    );
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    print_str(
+                        b"[user-callback] active callback syscall had no executable resume-ip=0x",
+                    );
+                    print_hex_u64(resume_ip);
+                    print_str(b" ssn=0x");
+                    print_hex_u64(m0);
+                    print_str(b" -> DROP reply and park client\n");
+                    if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                        || (pi == 2
+                            && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
+                        && !defer_quiesce_for_active_user_callbacks(b"bad-callback-resume")
+                    {
+                        print_str(b"[quiesce] active callback bad-resume park reached steady state -> run gate\n");
+                        stop = resume_ip;
+                        break;
+                    }
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                print_str(
+                    b"[user-callback] active callback bad resume could not drop reply -> STATUS_ACCESS_VIOLATION\n",
+                );
+                result = 0xC000_0005;
             }
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
@@ -15739,6 +15845,7 @@ pub(crate) unsafe fn service_sec_image(
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
         delay_timer_shutdown(delay_queue);
+        clear_service_delay_drain_context();
 
         // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
         //

@@ -38,6 +38,21 @@ err() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
 
 BOOT_IMAGE="$RM/.tmp/disk.img"
 
+ensure_no_qemu_lane_running() {
+  local holders=""
+  holders="$(ps -axo pid=,command= 2>/dev/null | awk '
+    /[q]emu-system-x86_64/ || /[r]un_specs[.]sh/ { print }
+  ' || true)"
+  [ -z "$holders" ] && return 0
+
+  err ""
+  err "A QEMU/run_specs boot lane is already running:"
+  printf '%s\n' "$holders" >&2
+  err ""
+  err "Stop the existing desktop/headless run before starting another boot."
+  exit 1
+}
+
 ensure_boot_image_available() {
   local image="$1"
   [ -e "$image" ] || return 0
@@ -166,12 +181,14 @@ fi
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
 say "[4/5] building ntos-executive + kernel + disk image..."
+ensure_no_qemu_lane_running
 ensure_boot_image_available "$BOOT_IMAGE"
 "$ROOT/scripts/build_ntdll_dll.sh"
 "$ROOT/components/ntos-executive/build.sh"
 ( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
 
 # ---- [5/5] run ----------------------------------------------------------
+ensure_no_qemu_lane_running
 ensure_boot_image_available "$BOOT_IMAGE"
 if [ "$GRAPHICS" = 1 ]; then
   say "[5/5] booting QEMU with a DISPLAY window (--desktop)..."

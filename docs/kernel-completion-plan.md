@@ -144,17 +144,22 @@ next serialized desktop run must show whether EventLog's RPC child reaches
 `NtCreateNamedPipeFile(\\pipe\\EventLog)`, blocks on a real syscall before that, fault-loops in user
 setup, or simply needs a longer scheduling window before SCM's first client open retries.
 
-Scheduler handoff slice in progress: ReactOS user32/win32k/kernel32 call `NtYieldExecution` through
-message and `SwitchToThread` paths, but our native table still omitted SSN 288. The current kernel
-slice registers `NtYieldExecution`, backs it with the process manager's global runnable-thread
-predicate and seL4 `yield_now`, and returns `STATUS_NO_YIELD_PERFORMED` when no ready/running peer
-exists. The next serialized desktop proof should show `[yield-exec]` activity and whether the
-EventLog RPC child reaches `NtCreateNamedPipeFile(\\pipe\\EventLog)` before SCM's client open, or
-move the frontier to a precise scheduler/NPFS/RPC edge without adding EventLog, service-order, or
-paint fallbacks. Validation before the proof run: `cargo fmt --all`,
-`cargo test -p nt-process`, `cargo test -p nt-syscall`, `./scripts/build_ntdll_dll.sh`,
+Scheduler handoff slice complete: `NtYieldExecution` is registered, backed by the process manager's
+global runnable-thread predicate plus seL4 `yield_now`, and returns `STATUS_NO_YIELD_PERFORMED` when
+no ready/running peer exists. Serialized headless retry
+`.tmp/boot-headless-current-20260811-ntos.log` reaches `[microtest done]`, restores the base desktop
+paint gate (`PASS exec_win32k_desktop_painted`, `desktop-bg 768/768`, pixel `0x003a6ea5`), and shows
+the IDD_LOGON dialog/control path running real api0 callbacks and GDI queries. The active wall is
+again the generic controlled user-callback completion frame: after a deep nested IDD chain,
+winlogon's client thread jumps to the read-only image header at `PE_LOAD_BASE`. The current slice
+revalidates the recorded outer syscall continuation at final callback completion and when transferring
+an inherited outer continuation into a chained callback, repairing with the x64 `RIP + 2` convention
+only when that repaired address is executable. Next serialized proof should show either the
+`completed-outer` repair/reject trace or progress to the modal `Peek/Get/Dispatch(WM_PAINT)` prefix,
+without synthetic messages, service-order policy, or SEC_IMAGE execute relaxations. Validation for
+this slice: `cargo test -p nt-user-callback -- --nocapture`, `cargo fmt --all`,
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
-and `git diff --check`.
+`git diff --check`, then one `RUN_LOG=... ./run.sh` desktop-paint retry.
 
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
@@ -3088,3 +3093,41 @@ executable-order fallbacks.
   x86_64-unknown-none`. Review adjustment: rerun `./run.sh --desktop` and require the `tcb=27
   cr2=...16001488 rip=...803c719d` loop to be gone before returning to profile/shell paint
   blockers.
+
+- I4 hosted-component reply binding cleanup. Serialized desktop retry
+  `.tmp/boot-desktop-active-write-trace-20260811.typescript` proves the TEB-tail cleanup restored
+  natural base desktop paint (`winlogon NtUserSwitchDesktop ... desktop-bg 768/768`), but explorer
+  still was not launched (`ssn-hist explorer total=0`). The active wall was an NPFS-hosted component
+  dispatch, not a named-pipe write routine hang: deadman showed dispatch `#159` parked with the FSD
+  TCB at `driver_launch::call_on` immediately after the component `syscall`, and there was no
+  matching `[fsd-active-write] before-call` trace. That means the executive attempted to reply to
+  the component's outstanding `Call`, but the component was still blocked in the call transport and
+  never entered `run_irp`.
+
+  The root cause is in the real seL4-MCS receive semantics rather than NPFS policy. The kernel
+  previously staged `Tcb.pending_reply` from `r12` before it knew that `Recv(endpoint, reply=R)` was
+  going to consume endpoint IPC. If the executive's bound HPET notification satisfied the receive
+  first, or if `NBRecv` found no sender, or if the receive consumed a plain `Send`, the reply offer
+  could remain pending on the executive TCB. A later unrelated `Call` could then bind the hosted-FSD
+  reply object to the wrong caller, so `reply_on(R, request)` succeeded without waking the FSD
+  component. `rust-micro::handle_recv` now clears stale offers on entry, stages a reply object only
+  after endpoint rights and bound-notification delivery are resolved, preserves it only when the
+  endpoint receive actually blocks waiting for a future `Call`, and clears unconsumed offers after
+  skipped or plain-send receives. Spec coverage now asserts all three cases. Validation so far:
+  `cargo fmt --all`, `cargo check --manifest-path rust-micro/Cargo.toml --target x86_64-unknown-none
+  --features spec,extern-rootserver`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `cargo test -p nt-user-callback -- --nocapture`, `git diff --check`, and serialized headless retry
+  `.tmp/boot-reply-offer-cleanup-headless-20260811.log`. Result: the disk image is rebuilt
+  noninteractively, the early pump bound-notification selftest no longer walls on a stale label-0
+  request echo, the old FSD dispatch `#159` stall is absent, the run reaches the microtest sentinel,
+  and real base desktop paint is green again (`desktop-bg 768/768`, `exec_win32k_desktop_painted`,
+  221/295 gates). The local `./run.sh --desktop` failure also exposed stale runner hygiene:
+  `make_image.sh` now removes the old disk image before formatting, and the wrapper fails fast when
+  an existing `qemu-system-x86_64`/`run_specs.sh` lane is still alive, even if it holds a deleted old
+  image inode. Review adjustment: the active frontier is now later win32k pump classification after
+  base paint, not NPFS transport. A timer-interrupted winlogon `NtUser...0x1286` dispatch drains the
+  timer, the fairness `NBRecv` observes label `31` with empty payload, and the win32k pump retires
+  the component. The next slice should classify that label source in the generic component pump or
+  kernel receive path; do not add a winlogon, message, paint, service-name, UUID, or executable-order
+  fallback.
