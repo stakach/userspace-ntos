@@ -1676,8 +1676,10 @@ fn hosted_exe_spawn_for<'a>(
     loaded_images: &'a HostedLoadedImageTable,
 ) -> Option<HostedExeSpawn<'a>> {
     let target = request.target?;
-    let image = catalog.get_by_leaf(request.leaf())?;
-    if nt_exe_image::SpawnTarget::from_image(image) != target {
+    let image = catalog.get_by_pi(target.pi)?;
+    if !image.leaf.eq_ignore_ascii_case(request.leaf())
+        || nt_exe_image::SpawnTarget::from_image(image) != target
+    {
         return None;
     }
     let runtime = hosted_process_runtime_for_pi(target.pi)?;

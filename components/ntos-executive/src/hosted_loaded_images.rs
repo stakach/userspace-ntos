@@ -96,6 +96,18 @@ impl HostedLoadedImageTable {
         self.pes.get(pi)?.as_ref()
     }
 
+    pub(crate) unsafe fn pe_and_pool_by_leaf<'a>(
+        &'a self,
+        leaf: &[u8],
+    ) -> Option<(&'a nt_pe_loader::PeFile<'static>, u64)> {
+        let (pi, entry) = self.entries.iter().enumerate().find_map(|(pi, entry)| {
+            let entry = entry.as_ref()?;
+            entry.leaf().eq_ignore_ascii_case(leaf).then_some((pi, entry))
+        })?;
+        let pe = self.pes.get(pi)?.as_ref()?;
+        Some((pe, entry.pool_va()))
+    }
+
     pub(crate) unsafe fn pe_and_pool_for_image<'a>(
         &'a self,
         hosted: nt_exe_image::HostedProcessImageRef<'_>,

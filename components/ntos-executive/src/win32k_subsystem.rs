@@ -422,6 +422,7 @@ const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
+
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
 /// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
 /// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
@@ -7223,9 +7224,9 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     ) else {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     };
-    if !ensure_win32k_process_attached(process_index, process_role)
-        || !ensure_win32k_threadinfo(thread_index, client_teb)
-    {
+    let process_attached = ensure_win32k_process_attached(process_index, process_role);
+    let threadinfo_ready = process_attached && ensure_win32k_threadinfo(thread_index, client_teb);
+    if !process_attached || !threadinfo_ready {
         return (0xC000_009Au32 as i32, 0xC000_009Au32 as u64);
     }
     if matches!(client_pi, 2 | 5 | 6) {
@@ -7500,6 +7501,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let debug_flags = read_volatile((sh + SH_REQ_DEBUG_FLAGS) as *const u64);
     let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
     let staged_nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
+    let request_client_pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
     if staged_nargs > WIN32K_MAX_SERVICE_ARGS {
         return STATUS_INVALID_PARAMETER;
     }
@@ -7557,7 +7559,7 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let explorer_setwndproc = (ssn == SSN_NT_USER_SET_WINDOW_LONG
         || ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR)
         && (a1 as u32) as u64 == GWLP_WNDPROC_INDEX_U32
-        && read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64) == 6;
+        && request_client_pi == 6;
     if explorer_setwndproc {
         if debug_flags & SH_REQ_DEBUG_ATL_REPLAY != 0 {
             WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS.fetch_add(1, Ordering::Relaxed);

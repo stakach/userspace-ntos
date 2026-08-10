@@ -770,7 +770,13 @@ unsafe fn record_hosted_child_exe_open(
     let Some(metadata) = (unsafe { loaded_hosted_image_metadata(ctx, hosted) }) else {
         return Err(nt_exe_image::ImageError::InvalidMetadata);
     };
-    unsafe { &mut *ctx.exe_images }.open(owner_pi, hosted.leaf, file_handle, metadata)?;
+    unsafe { &mut *ctx.exe_images }.open_with_target(
+        owner_pi,
+        hosted.leaf,
+        file_handle,
+        metadata,
+        Some(nt_exe_image::SpawnTarget::from_image(hosted)),
+    )?;
     match hosted.role {
         nt_exe_image::HostedProcessRole::InteractiveShellBootstrap => {
             USERINIT_IMAGE_OPEN_SUCCESSES.fetch_add(1, Ordering::Relaxed);
@@ -884,10 +890,21 @@ unsafe fn admit_dynamic_hosted_exe(
         dynamic_hosted_nt_image_path(&volume_relative, leaf, &mut nt_image_path)?;
     let catalog: &'static nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
         &*ctx.exe_image_catalog;
-    if let Some(existing) = catalog.get_by_leaf(leaf) {
-        return Some((existing, false));
+    if let Some(existing) = catalog.get_latest_by_leaf(leaf) {
+        let unspawned = hosted_process_runtime_for_pi(existing.pi)
+            .and_then(|runtime| runtime.spawned)
+            .is_some_and(|spawned| spawned.load(Ordering::Relaxed) == 0);
+        if unspawned {
+            return Some((existing, false));
+        }
     }
-    let (pe, pool_va) = load_hosted_executable_from_volume_path(&volume_relative, leaf)?;
+    let loaded_alias = (&*ctx.hosted_loaded_images)
+        .pe_and_pool_by_leaf(leaf)
+        .and_then(|(pe, pool_va)| nt_pe_loader::PeFile::parse(pe.bytes()).ok().map(|pe| (pe, pool_va)));
+    let (pe, pool_va) = match loaded_alias {
+        Some(existing) => existing,
+        None => load_hosted_executable_from_volume_path(&volume_relative, leaf)?,
+    };
     let catalog: &'static mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP> =
         &mut *ctx.exe_image_catalog;
     let pi = match catalog.admit_dynamic_executable(
@@ -13710,15 +13727,32 @@ impl ExecNtHandler {
         };
         let volume_not_directory =
             volume_entry.is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
+        let dynamic_role = self.dynamic_child_role();
         let mut hosted_exe_image = {
             let catalog = &*ctx.exe_image_catalog;
-            (!want_dir)
+            let probed = (!want_dir)
                 .then(|| Self::exe_probe_image(catalog, &nb[..nlen], is_sxs))
                 .flatten()
-                .filter(|image| Self::hosted_image_exists(*image))
+                .filter(|image| Self::hosted_image_exists(*image));
+            match (probed, dynamic_role) {
+                (Some(image), Some(_))
+                    if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI =>
+                {
+                    let latest = catalog.get_latest_by_leaf(image.leaf).unwrap_or(image);
+                    let latest_unspawned = hosted_process_runtime_for_pi(latest.pi)
+                        .and_then(|runtime| runtime.spawned)
+                        .is_some_and(|spawned| spawned.load(Ordering::Relaxed) == 0);
+                    if latest_unspawned {
+                        Some(latest)
+                    } else {
+                        None
+                    }
+                }
+                (Some(image), _) => Some(image),
+                (None, _) => None,
+            }
         };
         if hosted_exe_image.is_none() && !want_dir {
-            let dynamic_role = self.dynamic_child_role();
             if let Some((image, admitted)) =
                 admit_dynamic_hosted_exe(ctx, dynamic_role, &name16, &nb[..nlen], is_sxs)
             {
@@ -13961,11 +13995,11 @@ impl ExecNtHandler {
                     let mut leaf = [0u8; nt_exe_image::MAX_EXE_LEAF];
                     let leaf_len = slot.leaf().len();
                     leaf[..leaf_len].copy_from_slice(slot.leaf());
-                    (index, leaf, leaf_len)
+                    (index, leaf, leaf_len, slot.target)
                 })
             })
         };
-        let Some((slot_index, leaf, leaf_len)) = slot_info else {
+        let Some((slot_index, leaf, leaf_len, target)) = slot_info else {
             self.stop = true;
             return 0xC000_0002;
         };
@@ -13982,9 +14016,24 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         let catalog = &*ctx.exe_image_catalog;
-        let Some(image) = catalog.get_by_leaf(leaf) else {
-            self.stop = true;
-            return 0xC000_0002;
+        let image = if let Some(target) = target {
+            let Some(image) = catalog.get_by_pi(target.pi) else {
+                self.stop = true;
+                return 0xC000_0002;
+            };
+            if !image.leaf.eq_ignore_ascii_case(leaf)
+                || nt_exe_image::SpawnTarget::from_image(image) != target
+            {
+                self.stop = true;
+                return 0xC000_000D;
+            }
+            image
+        } else {
+            let Some(image) = catalog.get_by_leaf(leaf) else {
+                self.stop = true;
+                return 0xC000_0002;
+            };
+            image
         };
         if let Err(status) = self.allocate_hosted_process_slot(self.pi, image) {
             return status;

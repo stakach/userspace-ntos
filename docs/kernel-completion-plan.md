@@ -102,18 +102,20 @@ cap wait parking through the executive and rust-micro kernel reply pool. It reac
 proved real winlogon SAS-window creation plus `NtUserSetLogonNotifyWindow(0x127c)`.
 
 Latest hosted executable validation
-`.tmp/boot-hosted-exe-record-cap-rerun-20260810.log` was interrupted after a stable no-IPC deadman,
-so it is evidence but not a final gate proof. It does prove the previous
-`userinit.exe` bad-image frontier is gone: winlogon read the real `Userinit` registry value,
-`NtCreateSection(SEC_IMAGE)` and `NtQuerySection` succeeded for `userinit.exe`, the executive
-spawned the real userinit process, CSR accepted it, userinit issued win32k syscalls, and userinit
-then opened/sectioned `explorer.exe` far enough for explorer to issue real win32k traffic. There is
-no `CreateProcessW failed, last error: 193` and no hosted executable record failure trace. The
-current frontier is now later dynamic child process setup and GUI progress: several SCM-started
-service children fail ReactOS `BasePushProcessParameters` with `STATUS_INVALID_HANDLE`, and the run
-eventually deadmans after explorer win32k calls. The next useful slice should inspect the remote
-process-handle/VM-write path used by ReactOS kernel32 when pushing process parameters for dynamic
-service `svchost.exe` children, without reintroducing service-name or executable-name policy.
+`.tmp/boot-dynamic-probe-instance-scoped-rerun-20260810.log` proves the repeated dynamic executable
+frontier moved forward. The hosted executable catalog can now admit duplicate executable leaf names
+as distinct runtime identities, hosted file opens carry an exact `SpawnTarget`, and
+`NtCreateProcessEx`/the SEC_IMAGE service resolve by that target instead of by leaf. `NtOpenFile`
+also refuses to reuse an already-spawned dynamic image when the caller is opening a new child image,
+so repeated SCM `svchost.exe` starts get fresh identities. The proof lines show fresh dynamic
+admissions and successful spawns for `svchost.exe` at `pi=8`, `pi=10`, `pi=12`, and `pi=13`, plus
+`wlansvc.exe` and `spoolsv.exe`; there is no remaining `BasePushProcessParameters` or
+`STATUS_INVALID_HANDLE` process-parameter failure. The run still parks later, but the active frontier
+has moved to real service GUI/IPC mechanics: `spoolsv.exe` reaches win32k, fails default
+window-station/desktop thread callout with `STATUS_INSUFFICIENT_RESOURCES`, then SCM reports
+`ConnectNamedPipe failed (Error 1450)`. The next useful A4 slice should fix service process win32k
+desktop/winsta assignment and the generic NPFS/dispatcher resource path, not executable-name or
+service-name policy.
 
 ### A. SCM-Controlled Service Startup
 
@@ -233,12 +235,13 @@ service `svchost.exe` children, without reintroducing service-name or executable
    root key handle is used as an object-parse root rather than requiring `KEY_CREATE_SUB_KEY` before
    CM creates the target child; this keeps ReactOS SCM's `Services\<Name>\Security` creation on the
    real registry write path when service keys were opened for read. The latest boot proof
-   `.tmp/boot-handle-reserve-512-20260808.log` now shows services.exe reaching a non-bootstrap
-   `svchost.exe` child through the ordinary dynamic image path: `hosted-exe` admits `svchost.exe`,
-   `NtCreateSection(SEC_IMAGE)`/`NtQuerySection` run, `NtCreateProcessEx` spawns `svchost.exe`, CSR
-   accepts it, and the child runs native and win32k syscalls. A3 is complete. Continue A4 by removing
-   the remaining SCM pipe/listener thread special coordination from the executive once the generic
-   LPC/pipe/thread model can carry it.
+   `.tmp/boot-dynamic-probe-instance-scoped-rerun-20260810.log` now shows services.exe repeatedly
+   reaching non-bootstrap service children through the ordinary dynamic image path: duplicate
+   `svchost.exe` launches admit fresh target-scoped identities, `NtCreateSection(SEC_IMAGE)` and
+   `NtCreateProcessEx` run for each, and the old process-parameter invalid-handle wall is gone. A3 is
+   complete. Continue A4 by removing remaining SCM pipe/listener thread special coordination once the
+   generic LPC/pipe/thread model can carry it, and by fixing the current service GUI frontier through
+   real win32k desktop/winsta object assignment for service processes.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
@@ -2453,7 +2456,20 @@ service `svchost.exe` children, without reintroducing service-name or executable
   `CreateProcessW failed, last error: 193` userinit frontier is gone; winlogon opens/sections and
   spawns `userinit.exe`, userinit runs win32k syscalls, and `explorer.exe` opens/sections far enough
   to run real win32k traffic. The run was interrupted after a repeated deadman, so the next accepted
-  proof still needs a clean harness exit. Review adjustment: the immediate A4 frontier has moved to
-  generic remote process-parameter setup for dynamic service children (`BasePushProcessParameters`
-  returning `STATUS_INVALID_HANDLE`) and then the later explorer GUI-progress deadman; do not add
-  service/executable fallbacks.
+  proof still needs a clean harness exit. Review adjustment: this frontier was superseded by the
+  target-scoped dynamic executable slice below; do not add service/executable fallbacks.
+
+- A4 target-scoped dynamic executable slice. Hosted executable catalog entries now distinguish
+  repeated dynamic executable launches by exact `SpawnTarget` instead of executable leaf, and the
+  image table preserves that target from `NtOpenFile` through SEC_IMAGE section creation and
+  `NtCreateProcessEx`. A spawned dynamic identity is no longer reused for a subsequent child image
+  open, while an unspawned identity remains idempotent for retry paths. Validation: `cargo fmt
+  --all`, `cargo test -p nt-exe-image`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and boot
+  `.tmp/boot-dynamic-probe-instance-scoped-rerun-20260810.log`. Result: repeated SCM
+  `svchost.exe` launches admit and spawn fresh `pi=8`, `pi=10`, `pi=12`, and `pi=13` identities, and
+  `wlansvc.exe`/`spoolsv.exe` also launch through the same generic path. The old
+  `BasePushProcessParameters`/`STATUS_INVALID_HANDLE` wall is gone. Review adjustment: the immediate
+  A4 frontier is now service process GUI/IPC mechanics: `spoolsv.exe` reaches win32k, fails
+  default desktop/winsta thread setup with `STATUS_INSUFFICIENT_RESOURCES`, SCM reports
+  `ConnectNamedPipe failed (Error 1450)`, and the run then parks.

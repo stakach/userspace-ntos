@@ -544,8 +544,29 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             image_root,
             leaf,
         )?;
-        self.register(image)?;
+        self.register_dynamic_instance(image)?;
         Ok(pi)
+    }
+
+    fn register_dynamic_instance(
+        &mut self,
+        image: OwnedHostedProcessImage,
+    ) -> Result<usize, HostedImageRegistrationError> {
+        validate_hosted_image_ref(image.as_ref())?;
+        if self.get_by_pi(image.pi).is_some() {
+            return Err(HostedImageRegistrationError::DuplicatePi);
+        }
+        if self.get_by_top_badge(image.top_badge).is_some() {
+            return Err(HostedImageRegistrationError::DuplicateTopBadge);
+        }
+        let index = self
+            .used
+            .iter()
+            .position(|used| !*used)
+            .ok_or(HostedImageRegistrationError::Full)?;
+        self.entries[index] = image;
+        self.used[index] = true;
+        Ok(index)
     }
 
     pub fn count(&self) -> usize {
@@ -585,6 +606,17 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         self.entries
             .iter()
             .zip(self.used.iter())
+            .filter(|(_, used)| **used)
+            .map(|(image, _)| image)
+            .find(|image| eq_ascii_case(image.leaf(), leaf))
+            .map(OwnedHostedProcessImage::as_ref)
+    }
+
+    pub fn get_latest_by_leaf(&self, leaf: &[u8]) -> Option<HostedProcessImageRef<'_>> {
+        self.entries
+            .iter()
+            .zip(self.used.iter())
+            .rev()
             .filter(|(_, used)| **used)
             .map(|(image, _)| image)
             .find(|image| eq_ascii_case(image.leaf(), leaf))
@@ -671,6 +703,7 @@ pub struct ImageSlot {
     pub desired_access: u32,
     pub process_handle_out: u64,
     pub process_handle: u64,
+    pub target: Option<SpawnTarget>,
     pub state: ImageState,
 }
 
@@ -694,6 +727,7 @@ const EMPTY_SLOT: ImageSlot = ImageSlot {
     desired_access: 0,
     process_handle_out: 0,
     process_handle: 0,
+    target: None,
     state: ImageState::Empty,
 };
 
@@ -703,7 +737,7 @@ impl ImageSlot {
     }
 
     pub fn spawn_request(&self, slot: usize) -> Option<SpawnRequest> {
-        self.spawn_request_with_target(slot, None)
+        self.spawn_request_with_target(slot, self.target)
     }
 
     fn spawn_request_with_target(
@@ -712,6 +746,9 @@ impl ImageSlot {
         target: Option<SpawnTarget>,
     ) -> Option<SpawnRequest> {
         if self.state != ImageState::SpawnReserved {
+            return None;
+        }
+        if self.target != target {
             return None;
         }
         let mut leaf = [0u8; MAX_EXE_LEAF];
@@ -766,6 +803,17 @@ impl<const N: usize> ImageTable<N> {
         file_handle: u64,
         metadata: ImageMetadata,
     ) -> Result<usize, ImageError> {
+        self.open_with_target(owner_pi, path, file_handle, metadata, None)
+    }
+
+    pub fn open_with_target(
+        &mut self,
+        owner_pi: usize,
+        path: &[u8],
+        file_handle: u64,
+        metadata: ImageMetadata,
+        target: Option<SpawnTarget>,
+    ) -> Result<usize, ImageError> {
         if file_handle == 0 {
             return Err(ImageError::InvalidHandle);
         }
@@ -781,6 +829,7 @@ impl<const N: usize> ImageTable<N> {
             return if existing.file_handle == file_handle
                 && eq_ascii_case(existing.leaf(), leaf)
                 && existing.metadata == metadata
+                && existing.target == target
             {
                 Ok(index)
             } else {
@@ -801,6 +850,7 @@ impl<const N: usize> ImageTable<N> {
         slot.owner_pi = owner_pi;
         slot.metadata = metadata;
         slot.file_handle = file_handle;
+        slot.target = target;
         slot.state = ImageState::Opened;
         self.slots[index] = slot;
         Ok(index)
@@ -883,15 +933,28 @@ impl<const N: usize> ImageTable<N> {
         let index = self
             .index_for_section(owner_pi, section_handle)
             .ok_or(ImageError::NotFound)?;
-        let image = catalog
-            .get_by_leaf(self.slots[index].leaf())
-            .ok_or(ImageError::InvalidPath)?;
+        let target = if let Some(target) = self.slots[index].target {
+            let image = catalog
+                .get_by_pi(target.pi)
+                .ok_or(ImageError::InvalidPath)?;
+            if !image.leaf.eq_ignore_ascii_case(self.slots[index].leaf())
+                || SpawnTarget::from_image(image) != target
+            {
+                return Err(ImageError::InvalidPath);
+            }
+            target
+        } else {
+            let image = catalog
+                .get_by_leaf(self.slots[index].leaf())
+                .ok_or(ImageError::InvalidPath)?;
+            SpawnTarget::from_image(image)
+        };
         self.reserve_spawn_with_target(
             owner_pi,
             section_handle,
             desired_access,
             process_handle_out,
-            Some(SpawnTarget::from_image(image)),
+            Some(target),
         )
     }
 
@@ -906,15 +969,28 @@ impl<const N: usize> ImageTable<N> {
         let index = self
             .index_for_section(owner_pi, section_handle)
             .ok_or(ImageError::NotFound)?;
-        let image = catalog
-            .get_by_leaf(self.slots[index].leaf())
-            .ok_or(ImageError::InvalidPath)?;
+        let target = if let Some(target) = self.slots[index].target {
+            let image = catalog
+                .get_by_pi(target.pi)
+                .ok_or(ImageError::InvalidPath)?;
+            if !image.leaf.eq_ignore_ascii_case(self.slots[index].leaf())
+                || SpawnTarget::from_image(image) != target
+            {
+                return Err(ImageError::InvalidPath);
+            }
+            target
+        } else {
+            let image = catalog
+                .get_by_leaf(self.slots[index].leaf())
+                .ok_or(ImageError::InvalidPath)?;
+            SpawnTarget::from_image(image)
+        };
         self.reserve_spawn_with_target(
             owner_pi,
             section_handle,
             desired_access,
             process_handle_out,
-            Some(SpawnTarget::from_image(image)),
+            Some(target),
         )
     }
 
@@ -937,14 +1013,16 @@ impl<const N: usize> ImageTable<N> {
             ImageState::Sectioned => {
                 slot.desired_access = desired_access;
                 slot.process_handle_out = process_handle_out;
+                slot.target = target;
                 slot.state = ImageState::SpawnReserved;
             }
             ImageState::SpawnReserved
                 if slot.desired_access == desired_access
-                    && slot.process_handle_out == process_handle_out => {}
+                    && slot.process_handle_out == process_handle_out
+                    && slot.target == target => {}
             _ => return Err(ImageError::InvalidState),
         }
-        Ok(slot.spawn_request_with_target(index, target).unwrap())
+        Ok(slot.spawn_request(index).unwrap())
     }
 
     pub fn rollback_spawn(&mut self, request: SpawnRequest) -> Result<(), ImageError> {
@@ -1536,6 +1614,43 @@ mod tests {
     }
 
     #[test]
+    fn owned_catalog_admits_repeated_dynamic_executable_instances() {
+        let mut catalog = OwnedHostedImageCatalog::<3>::new();
+        let first = catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+        let second = catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+
+        assert_eq!(first, DYNAMIC_PROCESS_FIRST_PI);
+        assert_eq!(second, DYNAMIC_PROCESS_FIRST_PI + 1);
+        assert_eq!(catalog.get_by_leaf(b"svchost.exe").unwrap().pi, first);
+        assert_eq!(
+            catalog.get_latest_by_leaf(b"svchost.exe").unwrap().pi,
+            second
+        );
+        assert_eq!(
+            catalog.get_by_pi(second).unwrap().top_badge,
+            DYNAMIC_TOP_BADGE_BASE + 1
+        );
+    }
+
+    #[test]
     fn owned_catalog_dynamic_admission_rejects_full_state() {
         let mut catalog = OwnedHostedImageCatalog::<1>::new();
         catalog
@@ -1646,6 +1761,46 @@ mod tests {
                 role: HostedProcessRole::InteractiveShell,
             })
         );
+    }
+
+    #[test]
+    fn spawn_reservation_uses_exact_open_target_for_duplicate_leaf() {
+        let mut catalog = OwnedHostedImageCatalog::<2>::new();
+        let first = catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+        let second = catalog
+            .admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe",
+                HostedImageRoot::System32,
+                16,
+            )
+            .unwrap();
+        let second_image = catalog.get_by_pi(second).unwrap();
+        let target = SpawnTarget::from_image(second_image);
+
+        let mut table = ImageTable::<1>::new();
+        table
+            .open_with_target(3, b"svchost.exe", 0x40, META, Some(target))
+            .unwrap();
+        table.create_section(3, 0x40, 0x44).unwrap();
+        let request = table
+            .reserve_spawn_owned_registered(&catalog, 3, 0x44, 0x1fffff, 0x1000)
+            .unwrap();
+
+        assert_eq!(first, DYNAMIC_PROCESS_FIRST_PI);
+        assert_eq!(request.target, Some(target));
+        assert_eq!(catalog.get_by_leaf(b"svchost.exe").unwrap().pi, first);
     }
 
     #[test]
