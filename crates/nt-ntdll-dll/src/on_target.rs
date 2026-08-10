@@ -83,6 +83,8 @@ static CSR_INSIDE_PROCESS: AtomicBool = AtomicBool::new(false);
 static CSR_NATIVE_STATIC_DATA_PUBLISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 static CSR_CONNECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static THREAD_ATTACH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Process-local cached IFEO roots. A loaded ntdll image has private writable data in each process,
 /// matching ReactOS's `ImageExecOptionsKey` / `Wow64ExecOptionsKey` globals.
@@ -897,6 +899,38 @@ unsafe fn report_recovered_thread_attach_base(index: usize, base: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn report_thread_attach_committed(teb: u64, completed: usize, executable_tls_attached: bool) {
+    let n = THREAD_ATTACH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+    let mut message = [0u8; 64];
+    let mut length = 0usize;
+    for &byte in b"[ldr-thread] committed teb=0x" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u64_hex(&mut message, length, teb);
+    for &byte in b" dlls=" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u32_dec(&mut message, length, completed as u32);
+    for &byte in b" exe_tls=" {
+        if length < message.len() {
+            message[length] = byte;
+            length += 1;
+        }
+    }
+    length = crate::write_u32_dec(&mut message, length, executable_tls_attached as u32);
+    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
+}
+
+#[cfg(target_arch = "x86_64")]
 fn recover_missing_attached_base(table: &ModuleTable) -> Option<u64> {
     let mut candidate = None;
     for module in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
@@ -1054,6 +1088,7 @@ pub unsafe fn ldr_initialize_thread() -> u32 {
     }
     if failure == 0 && unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).commit(teb) }.is_ok()
     {
+        unsafe { report_thread_attach_committed(teb, completed, executable_tls_attached) };
         return 0;
     }
     if failure == 0 {

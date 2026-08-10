@@ -135,6 +135,15 @@ inspect how EventLog creates/publishes its named pipe, why SCM opens `\\??\\pipe
 server instance is visible, and whether pending synchronous `FSCTL_PIPE_TRANSCEIVE`/read completions
 are being completed to both the event/IOCP and waiting thread.
 
+Current EventLog diagnosis: ReactOS creates `\\pipe\\EventLog` only from EventLog's second service
+child, `RpcThreadRoutine`, after the advapi service dispatcher receives the SCM start packet over
+`\\net\\NtControlPipe1`. The first child is `PortThreadRoutine`; it creates `\\ErrorLogPort` and
+parks in `NtListenPort`, which is expected. The current slice now traces ordinary hosted TP-worker
+faults/native SSNs and ntdll secondary-thread attach commits generically, not by service name, so the
+next serialized desktop run must show whether EventLog's RPC child reaches
+`NtCreateNamedPipeFile(\\pipe\\EventLog)`, blocks on a real syscall before that, fault-loops in user
+setup, or simply needs a longer scheduling window before SCM's first client open retries.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and

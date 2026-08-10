@@ -13,6 +13,8 @@ static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static SERVICES_NQIP_TRACE: AtomicU64 = AtomicU64::new(0);
+static GENERIC_TP_WORKER_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
+static GENERIC_TP_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_DIRTY_MARKS: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_WRITEBACKS: AtomicU64 = AtomicU64::new(0);
@@ -4367,6 +4369,26 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 4 per-connection worker)\n");
             }
         }
+        if is_tp_worker && !is_scm_worker && !is_lsa_worker {
+            let n = GENERIC_TP_WORKER_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 64 {
+                print_str(b"[tp-worker-event] #");
+                print_u64(n);
+                print_str(b" badge=");
+                print_u64(badge);
+                if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+                    print_str(b" pi=");
+                    print_u64(tp_pi as u64);
+                    print_str(b" slot=");
+                    print_u64(tp_slot as u64);
+                }
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b"\n");
+            }
+        }
         if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 {
             let ctr = if is_lsass_listener3 {
                 &LSASS_LISTENER3_FAULTS
@@ -6345,6 +6367,28 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(dn);
                     print_str(b" badge=");
                     print_u64(badge);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
+            if is_tp_worker && !is_scm_worker && !is_lsa_worker {
+                let dn = GENERIC_TP_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 128 {
+                    print_str(b"[tp-worker-ssn] #");
+                    print_u64(dn);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+                        print_str(b" pi=");
+                        print_u64(tp_pi as u64);
+                        print_str(b" slot=");
+                        print_u64(tp_slot as u64);
+                    }
                     print_str(b" ssn=");
                     print_u64(ssn);
                     print_str(b" arg1=0x");
