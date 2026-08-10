@@ -112,8 +112,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   ReactOS kernel32 can pass `OVERLAPPED.hEvent | 1` without failing event validation.
 - `[x]` I2: Implement file I/O completion notification modes and audit completion-port packet/event
   suppression through `NtSetInformationFile(FileIoCompletionNotificationInformation)`.
-- `[~]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
+- `[x]` I3: Re-run one serialized desktop boot from the current shell/RPC frontier and capture the
   next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
+- `[~]` I4: Fix the real service-control RPC/context-handle path now exposed by dynamic `wlansvc.exe`,
+  starting with the `FSCTL_PIPE_TRANSCEIVE -> STATUS_PIPE_BUSY` schedule failure and the rpcrt4
+  fault packet, using NPFS/RPC semantics rather than service-name or executable fallbacks.
 
 ## Review Log
 
