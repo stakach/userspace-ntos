@@ -19513,6 +19513,12 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             && copy_len != 0
             && w.buffer_va != 0
         {
+            driver_launch::trace_dcerpc_read_reassembly_from_slice(
+                w.file_id,
+                status,
+                completed,
+                &output[..copy_len],
+            );
             nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
             // ★ LSA SELF-RPC instrumentation: an MS-RPC PDU actually DELIVERED off lsass' own
             // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the

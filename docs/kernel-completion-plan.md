@@ -287,6 +287,13 @@ reaches a real `\ntsvcs` worker, client fid `0e818550` binds with association gr
 not present in the retained-read trace, the next slice reconstructs split synchronous named-pipe
 read fragments per fid and prints complete generic DCE/RPC PDUs before any service-specific
 debugging or fallback behavior is considered.
+Serialized boot `.tmp/boot-rpc-read-reassembly-20260810.log` confirms the split-read assembler
+works for synchronous read fragments and keeps base desktop paint green. It reconstructs the second
+`\ntsvcs` worker bind on server fid `0e8182c1` with association group 4, then shows the remaining
+visibility gap: post-bind requests often arrive through the parked-read redrive path as a 16-byte
+header wake followed by body-only synchronous reads, so the assembler must consume redrive-delivered
+read bytes too. The active failure remains a real rpcrt4 context mismatch, now for
+`{e44be6c8-a98d-40e7-8db7-220913505ca7}`; do not add UUID or service fallback handling.
 
 ### A. SCM-Controlled Service Startup
 

@@ -1128,6 +1128,21 @@ pub(crate) unsafe fn dcerpc_pdu_view_from_slice(payload: &[u8]) -> Option<DceRpc
     dcerpc_pdu_view(payload.as_ptr() as u64, payload.len() as u64)
 }
 
+pub(crate) unsafe fn trace_dcerpc_read_reassembly_from_slice(
+    file_id: u64,
+    status: u32,
+    info: u64,
+    payload: &[u8],
+) {
+    trace_dcerpc_read_reassembly(
+        file_id,
+        status,
+        info,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+}
+
 unsafe fn trace_dcerpc_read_reassembly(file_id: u64, status: u32, info: u64, payload: u64, len: u64) {
     if file_id == 0 || payload == 0 || info == 0 || len == 0 {
         return;
