@@ -2651,3 +2651,15 @@ or `unhandled-syscall` signatures.
   process list instead of starting a competing lane. Review adjustment: rerun exactly one
   uncontended boot lane for the next accepted proof, then continue toward explorer shell chrome
   pixels from the genuine desktop-paint path.
+
+- A4 dynamic RPC worker role slice. The first uncontended post-I2 boot reached the real desktop
+  background and service startup, but it became silent after winlogon connected to `\??\pipe\ntsvcs`;
+  explorer still had `ssn-hist explorer total=0`. The next code slice removes another fixed-worker
+  boundary before retrying that boot: SCM/LSA per-connection workers spawned through generic TP
+  worker slots are now registered as slot-scoped RPC worker roles, service-loop routing and pipe PDU
+  accounting classify them from runtime metadata, and win32k callback metadata preserves those roles.
+  Validation so far: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: the next single boot should show dynamic `role=scm-rpc` workers in the late
+  `\pipe\ntsvcs` path; if the log still parks there, debug the real service-control wait/reply edge
+  from that role-aware trace.

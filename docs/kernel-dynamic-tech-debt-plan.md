@@ -2104,3 +2104,13 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: I3 remains
   the next accepted proof; use one uncontended boot lane and capture the genuine explorer/shell
   frontier after this I/O completion state is present.
+- A4 runtime-role cleanup continued. Dynamically spawned SCM and LSA per-connection workers now keep
+  their exact hosted-thread role while using the generic TP worker badge/stack/TEB window. The
+  runtime table resolves those workers by badge, the service loop treats their role as
+  SCM/LSA-RPC policy metadata instead of relying on the historical fixed worker badges, pipe/RPC PDU
+  accounting uses the registered role, and win32k callback metadata round-trips the slot-scoped
+  roles. Local validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: the next serialized boot should prove the late `\pipe\ntsvcs` worker churn uses
+  `role=scm-rpc` dynamic workers before deciding whether the remaining shell frontier is service IPC
+  liveness or explorer paint itself.

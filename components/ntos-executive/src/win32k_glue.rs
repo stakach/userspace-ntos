@@ -510,6 +510,8 @@ const CALLBACK_ROLE_LSASS_LISTENER3: u32 = 10;
 const CALLBACK_ROLE_LSA_WORKER: u32 = 11;
 const CALLBACK_ROLE_TP_WORKER_BASE: u32 = 0x1000;
 const CALLBACK_ROLE_WINLOGON_WORKER_BASE: u32 = 0x2000;
+const CALLBACK_ROLE_SCM_WORKER_SLOT_BASE: u32 = 0x3000;
+const CALLBACK_ROLE_LSA_WORKER_SLOT_BASE: u32 = 0x4000;
 const CALLBACK_ROLE_SLOT_MASK: u32 = 0x0fff;
 
 fn callback_runtime_role_code(role: Option<HostedThreadRole>) -> u32 {
@@ -517,6 +519,16 @@ fn callback_runtime_role_code(role: Option<HostedThreadRole>) -> u32 {
         Some(HostedThreadRole::Main) => CALLBACK_ROLE_MAIN,
         Some(HostedThreadRole::TpWorker { slot }) if slot <= CALLBACK_ROLE_SLOT_MASK as usize => {
             CALLBACK_ROLE_TP_WORKER_BASE | slot as u32
+        }
+        Some(HostedThreadRole::ScmWorkerSlot { slot })
+            if slot <= CALLBACK_ROLE_SLOT_MASK as usize =>
+        {
+            CALLBACK_ROLE_SCM_WORKER_SLOT_BASE | slot as u32
+        }
+        Some(HostedThreadRole::LsaWorkerSlot { slot })
+            if slot <= CALLBACK_ROLE_SLOT_MASK as usize =>
+        {
+            CALLBACK_ROLE_LSA_WORKER_SLOT_BASE | slot as u32
         }
         Some(HostedThreadRole::SmLoop) => CALLBACK_ROLE_SM_LOOP,
         Some(HostedThreadRole::CsrApi) => CALLBACK_ROLE_CSR_API,
@@ -552,6 +564,16 @@ fn callback_runtime_role_from_code(code: u32) -> Option<HostedThreadRole> {
         CALLBACK_ROLE_LSA_WORKER => Some(HostedThreadRole::LsaWorker),
         code if code & !CALLBACK_ROLE_SLOT_MASK == CALLBACK_ROLE_TP_WORKER_BASE => {
             Some(HostedThreadRole::TpWorker {
+                slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
+            })
+        }
+        code if code & !CALLBACK_ROLE_SLOT_MASK == CALLBACK_ROLE_SCM_WORKER_SLOT_BASE => {
+            Some(HostedThreadRole::ScmWorkerSlot {
+                slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
+            })
+        }
+        code if code & !CALLBACK_ROLE_SLOT_MASK == CALLBACK_ROLE_LSA_WORKER_SLOT_BASE => {
+            Some(HostedThreadRole::LsaWorkerSlot {
                 slot: (code & CALLBACK_ROLE_SLOT_MASK) as usize,
             })
         }
@@ -983,10 +1005,12 @@ fn callback_client_owner_pi(client: crate::spawn_hosts::UserCallbackClient) -> O
             | HostedThreadRole::WinlogonWorker { .. }
             | HostedThreadRole::ServicesListener
             | HostedThreadRole::ScmWorker
+            | HostedThreadRole::ScmWorkerSlot { .. }
             | HostedThreadRole::LsassListener
             | HostedThreadRole::LsassListener2
             | HostedThreadRole::LsassListener3
-            | HostedThreadRole::LsaWorker,
+            | HostedThreadRole::LsaWorker
+            | HostedThreadRole::LsaWorkerSlot { .. },
         ) => Some(pi),
         _ => None,
     }

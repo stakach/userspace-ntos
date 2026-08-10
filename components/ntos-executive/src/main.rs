@@ -12979,11 +12979,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     if suspend == 0 && delete == 0 {
         let pool_slot = handler.pm_pool_slot_for_tid(tid);
         let role = handler.hosted_thread_role(tid);
-        let worker_slot = if let Some(HostedThreadRole::TpWorker { slot }) = role {
-            pool_slot.map(|(pi, _)| (pi, slot))
-        } else {
-            None
-        };
+        let worker_slot = role
+            .and_then(|role| role.worker_window_slot())
+            .and_then(|slot| pool_slot.map(|(pi, _)| (pi, slot)));
         let runtime = handler.release_hosted_thread_runtime(tid);
         if let Some((pi, slot)) = pool_slot {
             let _ = handler.release_pool_usage_slot(pi, slot);
@@ -16851,6 +16849,8 @@ enum ExecPostAction {
 enum HostedThreadRole {
     Main,
     TpWorker { slot: usize },
+    ScmWorkerSlot { slot: usize },
+    LsaWorkerSlot { slot: usize },
     SmLoop,
     CsrApi,
     CsrSbApi,
@@ -16865,6 +16865,23 @@ enum HostedThreadRole {
 }
 
 impl HostedThreadRole {
+    const fn worker_window_slot(self) -> Option<usize> {
+        match self {
+            Self::TpWorker { slot }
+            | Self::ScmWorkerSlot { slot }
+            | Self::LsaWorkerSlot { slot } => Some(slot),
+            _ => None,
+        }
+    }
+
+    const fn is_scm_rpc_worker(self) -> bool {
+        matches!(self, Self::ScmWorker | Self::ScmWorkerSlot { .. })
+    }
+
+    const fn is_lsa_rpc_worker(self) -> bool {
+        matches!(self, Self::LsaWorker | Self::LsaWorkerSlot { .. })
+    }
+
     const fn can_raw_resume_from_nt_resume_thread(self) -> bool {
         match self {
             // This worker is started eagerly and then parks on pipe/event waits. Before the runtime

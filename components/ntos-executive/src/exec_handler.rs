@@ -4507,6 +4507,13 @@ impl ExecNtHandler {
         self.thread_runtime.tcb_by_tid(tid)
     }
 
+    pub(crate) fn hosted_thread_tcb_for_badge(&self, badge: u64) -> Option<u64> {
+        self.thread_runtime
+            .get_by_badge(badge)
+            .map(|runtime| runtime.tcb)
+            .filter(|&tcb| tcb > 1)
+    }
+
     pub(crate) unsafe fn try_deliver_current_user_apc(&mut self) -> Result<bool, u32> {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
@@ -4595,6 +4602,12 @@ impl ExecNtHandler {
     pub(crate) fn hosted_thread_role(&self, tid: u64) -> Option<HostedThreadRole> {
         self.thread_runtime
             .get_by_tid(tid)
+            .map(|runtime| runtime.role)
+    }
+
+    pub(crate) fn hosted_thread_role_for_badge(&self, badge: u64) -> Option<HostedThreadRole> {
+        self.thread_runtime
+            .get_by_badge(badge)
             .map(|runtime| runtime.role)
     }
 
@@ -4776,7 +4789,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn hosted_tp_worker_tcb(&self, pi: usize, slot: usize) -> Option<u64> {
-        self.hosted_thread_tcb_for_role(pi, HostedThreadRole::TpWorker { slot })
+        self.hosted_thread_tcb_for_badge(tp_worker_badge(pi, slot))
     }
 
     pub(crate) fn first_free_hosted_tp_worker_slot(&self, pi: usize) -> Option<usize> {
@@ -4791,7 +4804,20 @@ impl ExecNtHandler {
         slot: usize,
         tid: u64,
     ) -> bool {
+        self.reserve_hosted_worker_window_slot(pi, slot, tid, HostedThreadRole::TpWorker { slot })
+    }
+
+    pub(crate) fn reserve_hosted_worker_window_slot(
+        &mut self,
+        pi: usize,
+        slot: usize,
+        tid: u64,
+        role: HostedThreadRole,
+    ) -> bool {
         if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
+            return false;
+        }
+        if role.worker_window_slot() != Some(slot) {
             return false;
         }
         let Some(bit) = Self::tp_worker_slot_bit(slot) else {
@@ -4801,8 +4827,7 @@ impl ExecNtHandler {
             return false;
         }
         let badge = tp_worker_badge(pi, slot);
-        if !self.reserve_hosted_thread_runtime(pi, tid, badge, HostedThreadRole::TpWorker { slot })
-        {
+        if !self.reserve_hosted_thread_runtime(pi, tid, badge, role) {
             return false;
         }
         self.tp_worker_window_used[pi] |= bit;
@@ -7360,30 +7385,48 @@ impl ExecNtHandler {
         if ntdll_pool_worker_only && preferred_slot.is_none() {
             return None;
         }
+        let rpc_worker_kind = if !ntdll_pool_worker_only && preferred_slot.is_none() {
+            if self.current_process_is_services()
+                && self.current_thread_has_role(HostedThreadRole::ServicesListener)
+                && self
+                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
+                    .is_some()
+            {
+                Some(1u8)
+            } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
+                && self.current_process_is_lsass()
+                && self.current_thread_has_role(HostedThreadRole::LsassListener3)
+                && self
+                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                    .is_some()
+            {
+                Some(2u8)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let preferred_slot_free = preferred_slot.and_then(|slot| {
             Self::tp_worker_slot_bit(slot)
                 .filter(|bit| self.hosted_tp_worker_window_mask(self.pi) & *bit == 0)
                 .map(|_| slot)
         });
         let tp_slot = preferred_slot_free.or_else(|| {
-            let lsa_extra_connection = crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
-                && self.current_process_is_lsass()
-                && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                && self
-                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
-                    .is_some();
             let slot = self.first_free_hosted_tp_worker_slot(self.pi);
-            if lsa_extra_connection {
-                if slot.is_some() {
-                    crate::LSA_RPC_EXTRA_WORKERS_CLAIMED.fetch_add(1, Ordering::Relaxed);
-                    print_str(
-                        b"[lsa-worker] additional \\lsarpc connection: claiming a generic worker slot\n",
-                    );
+            if let Some(kind) = rpc_worker_kind {
+                let prefix: &[u8] = if kind == 1 {
+                    b"[scm-worker] additional \\ntsvcs connection: "
                 } else {
-                    print_str(
-                        b"[lsa-worker] additional \\lsarpc connection: no free generic worker slot\n",
-                    );
-                }
+                    crate::LSA_RPC_EXTRA_WORKERS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                    b"[lsa-worker] additional \\lsarpc connection: "
+                };
+                print_str(prefix);
+                print_str(if slot.is_some() {
+                    b"claiming dynamic worker slot\n"
+                } else {
+                    b"no free dynamic worker slot\n"
+                });
             }
             if preferred_slot.is_some() && slot.is_some() {
                 let trace = TP_WORKER_PREFERRED_BUSY_TRACE_N.fetch_add(1, Ordering::Relaxed);
@@ -7422,13 +7465,18 @@ impl ExecNtHandler {
             print_str(b"\n");
             return Some(0xC000_009A);
         };
+        let hosted_role = match rpc_worker_kind {
+            Some(1) => HostedThreadRole::ScmWorkerSlot { slot: tp_slot },
+            Some(2) => HostedThreadRole::LsaWorkerSlot { slot: tp_slot },
+            _ => HostedThreadRole::TpWorker { slot: tp_slot },
+        };
 
         let Some((pool_slot, tid, handle)) =
             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
         else {
             return Some(0xC000_009A);
         };
-        if !self.reserve_hosted_tp_worker_slot(self.pi, tp_slot, tid) {
+        if !self.reserve_hosted_worker_window_slot(self.pi, tp_slot, tid, hosted_role) {
             self.abandon_created_hosted_thread(pool_slot, tid, handle);
             return Some(0xC000_009A);
         }
@@ -7458,6 +7506,11 @@ impl ExecNtHandler {
         print_hex(start.rip as u32);
         print_str(b" suspended=");
         print_u64(create_suspended as u64);
+        if hosted_role.is_scm_rpc_worker() {
+            print_str(b" role=scm-rpc");
+        } else if hosted_role.is_lsa_rpc_worker() {
+            print_str(b" role=lsa-rpc");
+        }
         if tp_slot != 0 {
             print_str(b" slot=");
             print_u64(tp_slot as u64);
@@ -8757,12 +8810,10 @@ impl ExecNtHandler {
             if tcb <= 1 {
                 return STATUS_UNSUCCESSFUL;
             }
-            let hosted_slot = match runtime.role {
-                HostedThreadRole::TpWorker { slot } | HostedThreadRole::WinlogonWorker { slot } => {
-                    slot
-                }
+            let hosted_slot = runtime.role.worker_window_slot().unwrap_or_else(|| match runtime.role {
+                HostedThreadRole::WinlogonWorker { slot } => slot,
                 _ => slot,
-            };
+            });
             let result = tcb_resume(tcb);
             print_str(b"[thread-life] resume pi=");
             print_u64(runtime.pi as u64);
@@ -21404,7 +21455,7 @@ impl ExecNtHandler {
                 );
                 // ★ LSA SELF-RPC instrumentation. Every MS-RPC PDU (`rpc_ver == 5`) written onto lsass'
                 // OWN `\pipe\lsarpc`, split by which side of the self-RPC wrote it: the per-connection
-                // WORKER (badge LSA_WORKER_BADGE — bind_ack / the LsarOpenPolicy response) versus lsass'
+                // LSA RPC worker (bind_ack / the LsarOpenPolicy response) versus lsass'
                 // main thread acting as the CLIENT (advapi32's auto-bind + the request). Name-scoped via
                 // the fid→pipe-name map, so no other pipe traffic can inflate it.
                 if self.current_process_is_lsass()
@@ -21415,7 +21466,10 @@ impl ExecNtHandler {
                         == lsarpc_pipe_name_hash()
                 {
                     let pdu_type = payload.get(2).copied().unwrap_or(0xFF) as u64;
-                    if self.current_badge == LSA_WORKER_BADGE {
+                    if self
+                        .hosted_thread_role_for_badge(self.current_badge)
+                        .is_some_and(|role| role.is_lsa_rpc_worker())
+                    {
                         LSA_WORKER_PDU_WRITES.fetch_add(1, Ordering::Relaxed);
                         let _ = LSA_WORKER_FIRST_REPLY_TYPE.compare_exchange(
                             0xFF,
@@ -21678,7 +21732,10 @@ impl ExecNtHandler {
                                             {
                                                 let pdu_type =
                                                     output.get(2).copied().unwrap_or(0xFF) as u64;
-                                                if self.current_badge == LSA_WORKER_BADGE {
+                                                if self
+                                                    .hosted_thread_role_for_badge(self.current_badge)
+                                                    .is_some_and(|role| role.is_lsa_rpc_worker())
+                                                {
                                                     LSA_WORKER_PDU_READS
                                                         .fetch_add(1, Ordering::Relaxed);
                                                     let _ = LSA_WORKER_FIRST_PDU_TYPE

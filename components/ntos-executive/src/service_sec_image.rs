@@ -4303,9 +4303,14 @@ pub(crate) unsafe fn service_sec_image(
         // processes use the aux range decoded by tp_worker_identity_from_badge. The role is
         // orthogonal to listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
+        let hosted_thread_role = nt_handler.hosted_thread_role_for_badge(badge);
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
         let is_tp_worker = tp_worker_identity.is_some();
+        let is_scm_worker = is_scm_worker
+            || hosted_thread_role.is_some_and(|role| role.is_scm_rpc_worker());
+        let is_lsa_worker = is_lsa_worker
+            || hosted_thread_role.is_some_and(|role| role.is_lsa_rpc_worker());
         // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
         // multiplex. It runs the wait array (NtWaitForMultipleObjects → parks) that the main thread's
         // signal_state_changed wakes, completing the rpcrt4 server-thread handshake.
@@ -17218,8 +17223,8 @@ unsafe fn spawn_requested_tp_worker(
     caller_sp: u64,
     fault_ep: u64,
 ) {
-    let role = HostedThreadRole::TpWorker { slot: worker_slot };
-    if nt_handler.hosted_thread_tcb_for_role(pi, role).is_some() {
+    let badge = tp_worker_badge(pi, worker_slot);
+    if nt_handler.hosted_thread_tcb_for_badge(badge).is_some() {
         return;
     }
 
@@ -17228,9 +17233,12 @@ unsafe fn spawn_requested_tp_worker(
         |address| unsafe { smss_stack_read(address) },
         context_va,
     );
-    let Some(tid) = nt_handler.hosted_thread_tid_for_role(pi, role) else {
+    let Some(tid) = nt_handler.hosted_thread_tid_for_badge(badge) else {
         return;
     };
+    let role = nt_handler
+        .hosted_thread_role_for_badge(badge)
+        .unwrap_or(HostedThreadRole::TpWorker { slot: worker_slot });
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
     let suspended = nt_handler
         .pm_pool_slot_for_tid(tid)
@@ -17263,7 +17271,7 @@ unsafe fn spawn_requested_tp_worker(
         pi,
         tid,
         spawned,
-        tp_worker_badge(pi, worker_slot),
+        badge,
         role,
     ) {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
@@ -17284,11 +17292,16 @@ unsafe fn spawn_requested_tp_worker(
     print_str(b"[tp-worker] spawned pi=");
     print_u64(pi as u64);
     print_str(b" badge=");
-    print_u64(tp_worker_badge(pi, worker_slot));
+    print_u64(badge);
     print_str(b" tid=");
     print_u64(tid);
     print_str(b" tcb=0x");
     print_hex(spawned.tcb() as u32);
+    if role.is_scm_rpc_worker() {
+        print_str(b" role=scm-rpc");
+    } else if role.is_lsa_rpc_worker() {
+        print_str(b" role=lsa-rpc");
+    }
     if worker_slot != 0 {
         print_str(b" slot=");
         print_u64(worker_slot as u64);
@@ -18574,7 +18587,10 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 && pipe_fid_name_hash(w.file_id) == lsarpc_pipe_name_hash()
             {
                 let pdu_type = output.get(2).copied().unwrap_or(0xFF) as u64;
-                if w.badge == LSA_WORKER_BADGE {
+                if nt_handler
+                    .hosted_thread_role_for_badge(w.badge)
+                    .is_some_and(|role| role.is_lsa_rpc_worker())
+                {
                     LSA_WORKER_PDU_READS.fetch_add(1, Ordering::Relaxed);
                     let _ = LSA_WORKER_FIRST_PDU_TYPE.compare_exchange(
                         0xFF,
