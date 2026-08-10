@@ -2328,3 +2328,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: commit this shared-arena/print-worker progress, then continue I4 at the
   RPC association/context-handle data path. Do not add UUID-specific handling or service-name
   fallbacks; the fix belongs in generic RPC/NPFS message transport.
+- I4 GUI client shared-arena fix re-run with explicit log
+  `.tmp/run-user-arena-sas-20260810-212858.log`. This clean lane rebuilt from the dirty tree and
+  reproduced the moved edge: winlogon's `CLIENTINFO.pDeskInfo` is now `0x982c5600`, later service GUI
+  clients publish `0x98...` USER-window desktop-info pointers (for example pi 3 `0x985c5ef0` and pi
+  12 `0x988e9280`), and the old bad `0x969c5ef0`/`0x96ce93b0` dereference is absent. The lane was
+  externally terminated before the harness summary, so it is not a shell-pixels proof: periodic
+  census still shows `explorer total=0`, and winlogon has not reached the SAS/login message loop in
+  this run. Review adjustment: the shared-arena fix is commit-worthy because it removes a real
+  generic GUI-client mapping bug; the next blocker remains the generic service RPC/NPFS association
+  path (`no context handle found` followed by `RpcServerListen() failed (Status 6b1)`), not explorer
+  painting.
