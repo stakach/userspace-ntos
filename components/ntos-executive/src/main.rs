@@ -6094,8 +6094,12 @@ pub(crate) fn bump_progress() {
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).
 pub(crate) static SVC_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
-/// BATCH 37 DIAG: per-SSN trace counter for the SCM per-connection worker.
+/// BATCH 37 DIAG: per-SSN trace counter for early SCM per-connection workers.
 pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// Dynamic SCM workers can be born well after the global trace cap is exhausted; keep a small
+/// per-slot window so late `\pipe\ntsvcs` accepts remain observable without changing behavior.
+pub(crate) static SCM_WORKER_SLOT_SSN_TRACE: [AtomicU64; TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 /// LSA-RPC DIAG: per-SSN trace counter for lsass' `\pipe\lsarpc` rpcrt4 SERVER thread
 /// (`RPCRT4_server_thread`, badge [`LSASS_LISTENER3_BADGE`]). Bounded; reveals exactly what the
 /// server thread does after `rpcrt4_protseq_np_wait_for_new_connection` returns from an accept

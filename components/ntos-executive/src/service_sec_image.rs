@@ -6313,6 +6313,13 @@ pub(crate) unsafe fn service_sec_image(
             // exits before reading the bind (the self-inspection syscalls + which handle it reads/exits on).
             if is_scm_worker {
                 let dn = SCM_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                let slot_trace = hosted_thread_role
+                    .and_then(|role| match role {
+                        HostedThreadRole::ScmWorkerSlot { slot } if slot < TP_WORKER_SLOT_COUNT => {
+                            Some((slot, SCM_WORKER_SLOT_SSN_TRACE[slot].fetch_add(1, Ordering::Relaxed)))
+                        }
+                        _ => None,
+                    });
                 if dn < 32 {
                     print_str(b"[scm-worker-ssn] #");
                     print_u64(dn);
@@ -6323,6 +6330,21 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" arg2=0x");
                     print_hex(arg2 as u32);
                     print_str(b"\n");
+                }
+                if let Some((slot, slot_dn)) = slot_trace {
+                    if slot_dn < 32 {
+                        print_str(b"[scm-worker-slot-ssn] slot=");
+                        print_u64(slot as u64);
+                        print_str(b" #");
+                        print_u64(slot_dn);
+                        print_str(b" ssn=");
+                        print_u64(ssn);
+                        print_str(b" arg1=0x");
+                        print_hex(arg1 as u32);
+                        print_str(b" arg2=0x");
+                        print_hex(arg2 as u32);
+                        print_str(b"\n");
+                    }
                 }
             }
             // LSA-RPC DIAG: trace lsass' `\pipe\lsarpc` rpcrt4 SERVER thread's native SSNs so the
