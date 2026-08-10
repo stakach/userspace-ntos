@@ -3195,7 +3195,9 @@ executable-order fallbacks.
   `px0=0x003a6ea5`. The old `active-driver-dispatch #159` deadman and repeated spurious HPET drain
   storm do not recur in this base-desktop transcript; only a single deferred component-pump HPET tick
   appears before the production delay timer is armed. This closes the local desktop-paint regression.
-  Because `--desktop` intentionally stops at the visible base desktop window, the next frontier proof
-  should be a longer headless/post-desktop run that continues past the base-paint sentinel into the
-  real profile, userinit, EventLog/SCM, or explorer-shell edge, without reintroducing runner, IRQ,
-  pipe, service-name, executable-order, or paint fallbacks.
+  Desktop mode now also honors `RUN_LOG` and tees the serial stream, so future visible-window retries
+  keep the post-paint gate tail instead of relying on terminal scrollback. Because `--desktop`
+  intentionally stops at the visible base desktop window, the next frontier proof should be a longer
+  headless/post-desktop run that continues past the base-paint sentinel into the real profile,
+  userinit, EventLog/SCM, or explorer-shell edge, without reintroducing runner, IRQ, pipe,
+  service-name, executable-order, or paint fallbacks.

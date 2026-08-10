@@ -193,15 +193,21 @@ ensure_boot_image_available "$BOOT_IMAGE"
 if [ "$GRAPHICS" = 1 ]; then
   say "[5/5] booting QEMU with a DISPLAY window (--desktop)..."
   say "      Watch for the ReactOS desktop background (a blue-grey field, 0x003a6ea5)."
-  say "      Serial log streams here; close the QEMU window to quit."
+  mkdir -p "$ROOT/.tmp"
+  RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-desktop-$(date +%Y%m%d-%H%M%S).log}"
+  say "      Serial log streams here and to: $RUN_LOG"
+  say "      Close the QEMU window to quit."
   # In graphics mode run_specs drops isa-debug-exit, so QEMU stays alive with the
   # painted desktop until the user closes the window (exit status is the window's).
+  set +e
   if [ "${#PASSTHRU[@]}" -gt 0 ]; then
-    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" )
+    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" ) 2>&1 | tee "$RUN_LOG"
   else
-    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh )
+    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh ) 2>&1 | tee "$RUN_LOG"
   fi
-  exit 0
+  rc=${PIPESTATUS[0]}
+  set -e
+  exit "$rc"
 fi
 
 say "[5/5] booting QEMU (headless serial gate)..."
