@@ -11791,10 +11791,11 @@ impl ExecNtHandler {
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
-        if self.current_hosted_thread_user_stack_contains(va, dst.len()) {
-            let Some(ctx) = self.loop_ctx.as_ref() else {
-                return false;
-            };
+        if let Some(ctx) = self
+            .loop_ctx
+            .as_ref()
+            .filter(|_| self.current_hosted_thread_user_stack_contains(va, dst.len()))
+        {
             return client_copyin_mapped(
                 self.pi as u64,
                 va,
@@ -12610,10 +12611,11 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        if self.current_hosted_thread_user_stack_contains(va, src.len()) {
-            let Some(ctx) = self.loop_ctx.as_ref() else {
-                return false;
-            };
+        if let Some(ctx) = self
+            .loop_ctx
+            .as_ref()
+            .filter(|_| self.current_hosted_thread_user_stack_contains(va, src.len()))
+        {
             return client_copyout_mapped(
                 self.pi as u64,
                 va,

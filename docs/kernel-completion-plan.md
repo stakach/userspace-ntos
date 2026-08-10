@@ -2790,3 +2790,21 @@ natural userinit/explorer launch.
   to LSA auth-port request marshalling (`[lsa-rdv] WALL: could not marshal the message into the
   server's RequestMsg`), with msgina modal paint/profile/userinit/explorer gates still downstream of
   that real logon IPC path.
+
+- I4 LSA auth-port peer-copy recovery. The request marshalling wall was caused by a generic
+  cross-address-space helper short-circuit: parked peer copies intentionally clear `loop_ctx` and use
+  mirror/recorded-frame access, but `xas_read`/`xas_try_write_buf` returned false as soon as the
+  target range matched the current hosted thread's runtime stack. That was only visible when the
+  pending LSA request was delivered from the server thread's next `NtReplyWaitReceivePort`, where
+  `current_badge` already named the LSASS auth-port thread. The helpers now use the hosted-stack fast
+  path only when a live loop context exists, otherwise they fall through to the existing
+  mirror/recorded-frame path. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and serialized desktop retry
+  `.tmp/boot-lsa-peer-copy-20260810.log` (stopped after a later no-output window). Result: base
+  desktop paint still occurs (`desktop-bg 768/768`), the LSA ApiNumber 3 request is now relayed to
+  the real LSASS server and replied with `LSA_API_MSG.Status=0`, and the previous
+  `could not marshal the message into the server's RequestMsg` signature is gone. Review adjustment:
+  the next red edge is again generic service RPC context-handle association across dynamic workers:
+  `RpcServerListen() failed (Status 6b1)`, `no context handle found for uuid
+  {819b2278-105d-40eb-8f73-5969e6748dcd}`, then `rpc_message.c:1874` fault-packet status
+  `0x1c00001a`. Userinit/explorer still have not launched in this retry (`explorer total=0`).
