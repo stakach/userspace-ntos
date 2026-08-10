@@ -7482,14 +7482,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let irp_bytes = core::slice::from_raw_parts_mut(irp as *mut u8, WDM_X64_IRP_SIZE);
     if write_wdm_irp(
         irp_bytes,
-            WdmIrpInit {
-                system_buffer: data,
-                user_buffer: data,
-                thread: s_current_process(),
-                stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
-                current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
-                current_stack_location: current_iosl,
-            },
+        WdmIrpInit {
+            system_buffer: data,
+            user_buffer: data,
+            thread: s_current_process(),
+            stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
+            current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
+            current_stack_location: current_iosl,
+        },
     )
     .is_err()
     {
@@ -9216,8 +9216,8 @@ fn dispatch_external_irp_to_driver_record_result(
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let input_len = external_len(in_data.len());
     let output_len = external_len(out.len());
-    let params =
-        external_irp_parameters(major, fsctl, input_len, output_len).ok_or(STATUS_INVALID_PARAMETER as u32)?;
+    let params = external_irp_parameters(major, fsctl, input_len, output_len)
+        .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
     system_buffer.resize(in_data.len().max(out.len()), 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
@@ -9252,8 +9252,8 @@ fn dispatch_external_irp_to_device_record_result(
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let input_len = external_len(in_data.len());
     let output_len = external_len(out.len());
-    let params =
-        external_irp_parameters(major, fsctl, input_len, output_len).ok_or(STATUS_INVALID_PARAMETER as u32)?;
+    let params = external_irp_parameters(major, fsctl, input_len, output_len)
+        .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
     system_buffer.resize(in_data.len().max(out.len()), 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);

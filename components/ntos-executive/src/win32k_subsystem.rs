@@ -106,10 +106,8 @@ const WIN32K_ETHREAD_BYTES: u64 = 0x400;
 /// desktop heaps then allocate inside their own section views, using the same block allocator.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
-const _: () =
-    assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_POOL_VADDR);
-const _: () =
-    assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
+const _: () = assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_POOL_VADDR);
+const _: () = assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
@@ -751,8 +749,7 @@ unsafe fn ftyp_free(p: u64) {
 pub const WIN32K_USERVM_VADDR: u64 = 0x0000_0100_0C00_0000;
 pub const WIN32K_USERVM_FRAMES: u64 = 1024; // 4 MiB, pre-mapped (64 GDI-pool sections)
 const USERVM_GRANULARITY: u64 = 0x1_0000;
-const USERVM_SLOT_COUNT: usize =
-    ((WIN32K_USERVM_FRAMES * 0x1000) / USERVM_GRANULARITY) as usize;
+const USERVM_SLOT_COUNT: usize = ((WIN32K_USERVM_FRAMES * 0x1000) / USERVM_GRANULARITY) as usize;
 const USERVM_FIRST_SLOT: usize = 1; // slot 0 stays reserved for arena metadata/sentinel space
 static WIN32K_USERVM_NEXT_SLOT: AtomicU64 = AtomicU64::new(USERVM_FIRST_SLOT as u64);
 static WIN32K_USERVM_FREE_MASK: AtomicU64 = AtomicU64::new(0);
@@ -2385,7 +2382,10 @@ unsafe fn object_attributes_root_directory(object_attributes: u64) -> u64 {
 
 unsafe fn object_attributes_name_leaf_ascii(
     object_attributes: u64,
-) -> Option<([u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX], usize)> {
+) -> Option<(
+    [u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX],
+    usize,
+)> {
     let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
         return None;
     };
@@ -2438,20 +2438,14 @@ unsafe fn object_attributes_name_leaf_unicode(object_attributes: u64) -> Option<
     (len != 0).then_some((buffer + (start * 2) as u64, len))
 }
 
-unsafe fn desktop_root_from_handle(
-    table: &ObHandleTable,
-    handle: u64,
-) -> Option<(u64, u64)> {
+unsafe fn desktop_root_from_handle(table: &ObHandleTable, handle: u64) -> Option<(u64, u64)> {
     match table.lookup(handle) {
         Some((ObKind::WindowStation, body)) if body != 0 => Some((handle, body)),
         _ => None,
     }
 }
 
-unsafe fn effective_desktop_root(
-    table: &ObHandleTable,
-    requested_root: u64,
-) -> Option<(u64, u64)> {
+unsafe fn effective_desktop_root(table: &ObHandleTable, requested_root: u64) -> Option<(u64, u64)> {
     if requested_root != 0 {
         return desktop_root_from_handle(table, requested_root);
     }
@@ -2507,7 +2501,12 @@ unsafe fn desktop_info_alloc_size(object_attributes: u64) -> u64 {
     align16((DESKTOPINFO_NAME_OFF + name_bytes).max(DESKTOPINFO_MIN_ALLOC))
 }
 
-unsafe fn initialize_desktop_info(dinfo: u64, heap_base: u64, heap_size: u64, object_attributes: u64) {
+unsafe fn initialize_desktop_info(
+    dinfo: u64,
+    heap_base: u64,
+    heap_size: u64,
+    object_attributes: u64,
+) {
     write_volatile(
         (dinfo + DESKTOPINFO_PV_DESKTOP_BASE_OFF) as *mut u64,
         heap_base,
@@ -2585,7 +2584,10 @@ unsafe fn initialize_desktop_heap(
     initialize_desktop_info(dinfo, heap_base, heap_size, object_attributes);
     write_volatile((desk_body + DESKTOP_HSECTION_OFF) as *mut u64, section);
     write_volatile((desk_body + DESKTOP_PHEAP_OFF) as *mut u64, pheap);
-    write_volatile((desk_body + DESKTOP_UL_HEAP_SIZE_OFF) as *mut u64, heap_size);
+    write_volatile(
+        (desk_body + DESKTOP_UL_HEAP_SIZE_OFF) as *mut u64,
+        heap_size,
+    );
     true
 }
 
@@ -2763,22 +2765,38 @@ unsafe fn capture_user_object_security_descriptor(
     let mut current = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
     if sacl_len != 0 {
         copy_component_bytes_to_slice(&mut captured.bytes, current, sacl, sacl_len);
-        write_slice_u32(&mut captured.bytes, SD_REL_SACL_OFF as usize, current as u32);
+        write_slice_u32(
+            &mut captured.bytes,
+            SD_REL_SACL_OFF as usize,
+            current as u32,
+        );
         current += sacl_len;
     }
     if dacl_len != 0 {
         copy_component_bytes_to_slice(&mut captured.bytes, current, dacl, dacl_len);
-        write_slice_u32(&mut captured.bytes, SD_REL_DACL_OFF as usize, current as u32);
+        write_slice_u32(
+            &mut captured.bytes,
+            SD_REL_DACL_OFF as usize,
+            current as u32,
+        );
         current += dacl_len;
     }
     if owner_len != 0 {
         copy_component_bytes_to_slice(&mut captured.bytes, current, owner, owner_len);
-        write_slice_u32(&mut captured.bytes, SD_REL_OWNER_OFF as usize, current as u32);
+        write_slice_u32(
+            &mut captured.bytes,
+            SD_REL_OWNER_OFF as usize,
+            current as u32,
+        );
         current += owner_len;
     }
     if group_len != 0 {
         copy_component_bytes_to_slice(&mut captured.bytes, current, group, group_len);
-        write_slice_u32(&mut captured.bytes, SD_REL_GROUP_OFF as usize, current as u32);
+        write_slice_u32(
+            &mut captured.bytes,
+            SD_REL_GROUP_OFF as usize,
+            current as u32,
+        );
     }
     captured.len = total_len;
     Ok(captured)
@@ -2862,7 +2880,8 @@ extern "win64" fn s_ob_open_object_by_name(
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
                 let requested_root = object_attributes_root_directory(object_attributes);
-                let Some((root, winsta_body)) = effective_desktop_root(table, requested_root) else {
+                let Some((root, winsta_body)) = effective_desktop_root(table, requested_root)
+                else {
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 };
                 let named_leaf = object_attributes_name_leaf_ascii(object_attributes);
@@ -2898,7 +2917,9 @@ extern "win64" fn s_ob_open_object_by_name(
                 let h = table.register_with_security(
                     ObKind::Desktop,
                     body,
-                    security.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+                    security
+                        .as_ref()
+                        .map(CapturedUserObjectSecurityDescriptor::as_slice),
                 );
                 if h == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
@@ -3066,7 +3087,9 @@ extern "win64" fn s_ob_create_object(
         if !table.latch_pending_with_security(
             kind,
             body,
-            security.as_ref().map(CapturedUserObjectSecurityDescriptor::as_slice),
+            security
+                .as_ref()
+                .map(CapturedUserObjectSecurityDescriptor::as_slice),
         ) {
             return STATUS_INSUFFICIENT_RESOURCES_I32;
         }
@@ -3296,7 +3319,13 @@ const HEAP_REALLOC_IN_PLACE_ONLY: u64 = 0x0000_0010;
 
 /// Allocate from a hosted heap arena. The block header stores the aligned payload capacity; free
 /// blocks use the second header word as a next pointer, and live blocks carry a marker.
-unsafe fn heap_alloc_in(arena_base: u64, arena_bytes: u64, size: u64, zero: bool, label: &[u8]) -> u64 {
+unsafe fn heap_alloc_in(
+    arena_base: u64,
+    arena_bytes: u64,
+    size: u64,
+    zero: bool,
+    label: &[u8],
+) -> u64 {
     if size == 0 {
         return 0;
     }
@@ -3529,7 +3558,10 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     }
     write_volatile(base as *mut u64, POOL_DATA_OFF);
     write_volatile((base + 8) as *mut u64, 0);
-    write_volatile((base + HEAP_HANDLE_MAGIC_OFF) as *mut u64, HEAP_HANDLE_MAGIC);
+    write_volatile(
+        (base + HEAP_HANDLE_MAGIC_OFF) as *mut u64,
+        HEAP_HANDLE_MAGIC,
+    );
     write_volatile((base + HEAP_HANDLE_SIZE_OFF) as *mut u64, reserve_size);
     base
 }
@@ -4392,12 +4424,7 @@ pub(crate) fn take_local_event_signal_body() -> Option<u64> {
             return None;
         }
         if WIN32K_LOCAL_EVENT_SIGNAL_PENDING
-            .compare_exchange(
-                pending,
-                pending - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(pending, pending - 1, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
             let read = WIN32K_LOCAL_EVENT_SIGNAL_READ.fetch_add(1, Ordering::Relaxed);
@@ -4415,9 +4442,7 @@ pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
         return None;
     }
     ensure_thread_queue_event(w32thread);
-    let body = read_volatile(
-        (w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *const u64,
-    );
+    let body = read_volatile((w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *const u64);
     (body != 0).then_some(body)
 }
 
@@ -5422,7 +5447,9 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
             let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
             let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
             let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
-            print_str(b"[win32k-host] noninteractive service desktop left to InitThreadCallback pid=");
+            print_str(
+                b"[win32k-host] noninteractive service desktop left to InitThreadCallback pid=",
+            );
             print_u64(pid);
             print_str(b" pi=");
             print_u64(pi);
@@ -8656,7 +8683,8 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
         if desk_body != 0 && object_attributes_name_leaf_eq_ascii(a0, b"default") {
             let rpwinsta = read_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *const u64);
-            let input_winsta = read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
+            let input_winsta =
+                read_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *const u64);
             if rpwinsta != 0 && rpwinsta == input_winsta {
                 publish_default_desktop(hdesk, desk_body, b"NtUserCreateDesktop(Default)");
             }
@@ -8853,10 +8881,16 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
         let hw = mq + USER_MESSAGE_QUEUE_HARDWARE_MESSAGES_OFF;
         ensure_list_head_initialized(hw);
         if read_volatile((mq + USER_MESSAGE_QUEUE_PTI_MOUSE_OFF) as *const u64) == 0 {
-            write_volatile((mq + USER_MESSAGE_QUEUE_PTI_MOUSE_OFF) as *mut u64, w32thread);
+            write_volatile(
+                (mq + USER_MESSAGE_QUEUE_PTI_MOUSE_OFF) as *mut u64,
+                w32thread,
+            );
         }
         if read_volatile((mq + USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF) as *const u64) == 0 {
-            write_volatile((mq + USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF) as *mut u64, w32thread);
+            write_volatile(
+                (mq + USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF) as *mut u64,
+                w32thread,
+            );
         }
         if read_volatile((mq + USER_MESSAGE_QUEUE_CTHREADS_OFF) as *const u32) == 0 {
             write_volatile((mq + USER_MESSAGE_QUEUE_CTHREADS_OFF) as *mut u32, 1);

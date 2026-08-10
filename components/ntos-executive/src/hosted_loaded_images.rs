@@ -102,7 +102,10 @@ impl HostedLoadedImageTable {
     ) -> Option<(&'a nt_pe_loader::PeFile<'static>, u64)> {
         let (pi, entry) = self.entries.iter().enumerate().find_map(|(pi, entry)| {
             let entry = entry.as_ref()?;
-            entry.leaf().eq_ignore_ascii_case(leaf).then_some((pi, entry))
+            entry
+                .leaf()
+                .eq_ignore_ascii_case(leaf)
+                .then_some((pi, entry))
         })?;
         let pe = self.pes.get(pi)?.as_ref()?;
         Some((pe, entry.pool_va()))

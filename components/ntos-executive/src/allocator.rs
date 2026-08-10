@@ -249,7 +249,10 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
             };
             prefix = start - cur;
         }
-        if prefix.checked_add(needed).is_some_and(|total| total <= size) {
+        if prefix
+            .checked_add(needed)
+            .is_some_and(|total| total <= size)
+        {
             unsafe { write_word(prev_link, next) };
             if prefix >= FREE_NODE_SIZE {
                 unsafe { insert_free_block(cur, prefix) };
@@ -267,11 +270,7 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
     null_mut()
 }
 
-unsafe fn grow_in_place_from_adjacent_free(
-    start: usize,
-    old_size: usize,
-    new_size: usize,
-) -> bool {
+unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_size: usize) -> bool {
     let adjacent = match start.checked_add(old_size) {
         Some(adjacent) => adjacent,
         None => return false,
@@ -306,7 +305,13 @@ unsafe fn grow_in_place_from_adjacent_free(
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some(size) = block_size(layout.size()) else {
-            report_oom(layout.size(), layout.align(), unsafe { read_word(CTR) }, 0, usize::MAX);
+            report_oom(
+                layout.size(),
+                layout.align(),
+                unsafe { read_word(CTR) },
+                0,
+                usize::MAX,
+            );
             return null_mut();
         };
         let from_free = unsafe { alloc_from_free_list(layout, size) };
@@ -393,7 +398,13 @@ unsafe impl GlobalAlloc for Bump {
         let cur_end = DATA + unsafe { read_word(CTR) };
         if start >= DATA && old_end <= END && old_end == cur_end {
             let Some(new_end) = start.checked_add(new_block_size) else {
-                report_oom(new_size, old_layout.align(), start - DATA, start - DATA, usize::MAX);
+                report_oom(
+                    new_size,
+                    old_layout.align(),
+                    start - DATA,
+                    start - DATA,
+                    usize::MAX,
+                );
                 return null_mut();
             };
             if new_end <= END {

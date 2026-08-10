@@ -902,7 +902,11 @@ unsafe fn admit_dynamic_hosted_exe(
     }
     let loaded_alias = (&*ctx.hosted_loaded_images)
         .pe_and_pool_by_leaf(leaf)
-        .and_then(|(pe, pool_va)| nt_pe_loader::PeFile::parse(pe.bytes()).ok().map(|pe| (pe, pool_va)));
+        .and_then(|(pe, pool_va)| {
+            nt_pe_loader::PeFile::parse(pe.bytes())
+                .ok()
+                .map(|pe| (pe, pool_va))
+        });
     let (pe, pool_va) = match loaded_alias {
         Some(existing) => existing,
         None => load_hosted_executable_from_volume_path(&volume_relative, leaf)?,
@@ -2131,7 +2135,9 @@ impl ExecNtHandler {
             REG_SZ,
             &system_locale[..system_locale_len],
         ) {
-            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\InstallLanguage mutable write failed\n");
+            print_str(
+                b"[locale-setup] HKLM\\...\\Nls\\Language\\InstallLanguage mutable write failed\n",
+            );
             return;
         }
         self.mutable_hives_dirty = true;
@@ -4133,7 +4139,9 @@ impl ExecNtHandler {
         Some(bytes.len())
     }
 
-    fn hive_service_group_order(hive: &nt_hive_core::Hive) -> alloc::vec::Vec<alloc::string::String> {
+    fn hive_service_group_order(
+        hive: &nt_hive_core::Hive,
+    ) -> alloc::vec::Vec<alloc::string::String> {
         let mut path = alloc::string::String::from(nt_hive_core::CURRENT_CONTROL_SET_TARGET);
         path.push_str("\\Control\\ServiceGroupOrder");
         let Some(key) = hive.open_key(&path) else {
@@ -4682,10 +4690,7 @@ impl ExecNtHandler {
         USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn hosted_thread_runtime_for_nt_resume_thread(
-        &self,
-        tid: u64,
-    ) -> Option<HostedThreadRuntime> {
+    fn hosted_thread_runtime_for_nt_resume_thread(&self, tid: u64) -> Option<HostedThreadRuntime> {
         let runtime = self.thread_runtime.get_by_tid(tid)?;
         runtime
             .role
@@ -5731,7 +5736,8 @@ impl ExecNtHandler {
         }
         match object {
             nt_process::HandleObject::OverlayFile(file_id) => Ok(file_id),
-            nt_process::HandleObject::File(_) | nt_process::HandleObject::RoutedFile { .. }
+            nt_process::HandleObject::File(_)
+            | nt_process::HandleObject::RoutedFile { .. }
             | nt_process::HandleObject::DiskFile { .. }
             | nt_process::HandleObject::Directory { .. }
             | nt_process::HandleObject::BootStatusFile => Err(nt_fs::STATUS_NOT_IMPLEMENTED),
@@ -6820,7 +6826,11 @@ impl ExecNtHandler {
         completed_inline: bool,
         operation_suppressed: bool,
     ) {
-        if self.file_completion.complete_file(file_id, status).unwrap_or(false) {
+        if self
+            .file_completion
+            .complete_file(file_id, status)
+            .unwrap_or(false)
+        {
             unsafe { wait_wake_dispatcher_set(self) };
         }
         if apc_context == 0 {
@@ -6828,12 +6838,7 @@ impl ExecNtHandler {
         }
         if !self
             .file_completion
-            .should_queue_completion_packet(
-                file_id,
-                status,
-                completed_inline,
-                operation_suppressed,
-            )
+            .should_queue_completion_packet(file_id, status, completed_inline, operation_suppressed)
             .unwrap_or(false)
         {
             return;
@@ -6942,7 +6947,10 @@ impl ExecNtHandler {
         self.release_file_reference(listen.server_file_id);
     }
 
-    unsafe fn complete_cancelled_pipe_name_waiter(&mut self, waiter: nt_io_manager::PipeNameWaiter) {
+    unsafe fn complete_cancelled_pipe_name_waiter(
+        &mut self,
+        waiter: nt_io_manager::PipeNameWaiter,
+    ) {
         if waiter.iosb_va != 0 {
             let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
         }
@@ -7393,13 +7401,14 @@ impl ExecNtHandler {
                     .is_some()
             {
                 Some(1u8)
-            } else if crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
+            } else if crate::LSA_WORKER_ROUTE_ENABLED
                 && self.current_process_is_lsass()
                 && self.current_thread_has_role(HostedThreadRole::LsassListener3)
                 && self
-                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
+                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
                     .is_some()
             {
+                LSA_RPC_NEW_CLIENT_REQUESTS.fetch_add(1, Ordering::Relaxed);
                 Some(2u8)
             } else {
                 None
@@ -8810,10 +8819,14 @@ impl ExecNtHandler {
             if tcb <= 1 {
                 return STATUS_UNSUCCESSFUL;
             }
-            let hosted_slot = runtime.role.worker_window_slot().unwrap_or_else(|| match runtime.role {
-                HostedThreadRole::WinlogonWorker { slot } => slot,
-                _ => slot,
-            });
+            let hosted_slot =
+                runtime
+                    .role
+                    .worker_window_slot()
+                    .unwrap_or_else(|| match runtime.role {
+                        HostedThreadRole::WinlogonWorker { slot } => slot,
+                        _ => slot,
+                    });
             let result = tcb_resume(tcb);
             print_str(b"[thread-life] resume pi=");
             print_u64(runtime.pi as u64);
@@ -13824,11 +13837,13 @@ impl ExecNtHandler {
                                 & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                     | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                 != 0;
-                            if let Err(name_status) = crate::pipe_fid_name_remember(fid, pipe_hash) {
+                            if let Err(name_status) = crate::pipe_fid_name_remember(fid, pipe_hash)
+                            {
                                 status = name_status;
                                 None
                             } else {
-                                let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
+                                let handle =
+                                    self.mint_file_handle(fid, args[1] as u32, synchronous);
                                 if handle.is_none() {
                                     crate::pipe_fid_name_forget(fid);
                                     status = 0xC000_009A;
@@ -13899,15 +13914,7 @@ impl ExecNtHandler {
                             0,
                             &nm,
                         );
-                        loader_trace_record(
-                            self.pi,
-                            LoaderOp::OpenFile,
-                            status,
-                            None,
-                            0,
-                            0,
-                            &lc,
-                        );
+                        loader_trace_record(self.pi, LoaderOp::OpenFile, status, None, 0, 0, &lc);
                         return status;
                     }
                 }
@@ -14008,9 +14015,7 @@ impl ExecNtHandler {
                 .flatten()
                 .filter(|image| Self::hosted_image_exists(*image));
             match (probed, dynamic_role) {
-                (Some(image), Some(_))
-                    if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI =>
-                {
+                (Some(image), Some(_)) if image.pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI => {
                     let latest = catalog.get_latest_by_leaf(image.leaf).unwrap_or(image);
                     let latest_unspawned = hosted_process_runtime_for_pi(latest.pi)
                         .and_then(|runtime| runtime.spawned)
@@ -17381,219 +17386,12 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                // ★ BATCH 35 — N-threads multiplex: services.exe's SECOND NtCreateThread = the SCM
-                // RPC listener's PER-CONNECTION worker (rpcrt4 `RPCRT4_new_client`, spawned on
-                // winlogon's accepted connection). BEFORE this batch it fell to the 0xC000_009A
-                // fallthrough below → the worker never spawned → nobody read winlogon's bind PDU / wrote
-                // bind_ack → the SCM RPC round-trip stalled. Route it like the listener: pop a pool
-                // ETHREAD (services' slot 1; slot 0 = listener), set its OWN TEB, queue *ThreadHandle +
-                // ClientId, and signal the LOOP to spawn it RESUMED with a badged fault EP
-                // (SCM_WORKER_BADGE) so it runs into the main multiplex — its faults sub-select to
-                // the SCM worker role via its OWN stack mirror/TEB, and its blocking pipe reads park +
-                // re-drive on winlogon's write (the existing batch-33/34 edges, badge-general).
-                // ★ BATCH 36 FRONTIER GUARD. The full per-connection-worker routing (recognizer + spawn
-                // RESUMED into the multiplex at SCM_WORKER_BADGE with its own TEB/stack-mirror/fault-EP,
-                // + the badge sub-select / mirror_ctx / pipe-park paths) is BUILT, and the BATCH-35
-                // trampoline-entry `cr2=0` fault is now ROOT-CAUSED + FIXED: it was NOT a kernel bug but
-                // an executive VA COLLISION — `SCM_WORKER_ENV_SCRATCH_VA` was 0x107C = winlogon's
-                // process-spawn env-scratch (never unmapped), so `spawn_hosted_thread`'s alias map of the
-                // worker's trampoline frame returned a SILENT `seL4_DeleteFirst` (SYS_SEND-hidden), the
-                // bytes were written to winlogon's stale frame, and the worker's REAL trampoline frame
-                // stayed ZERO → executed `add [rax],al` (rax=0) → read of 0. Moving the scratch to a free
-                // VA (0x1075) FIXED it: with the route ENABLED the worker RUNS its real rpcrt4 entry (4
-                // native syscalls incl. NtQueryInformationThread, label 0x4e54 NOT a fault) and winlogon
-                // crosses the wire with its 72-byte RPC bind PDU (proven `/tmp/boot36fix.log`).
-                // ★ BATCH 37 — ENABLED. The BATCH-36 "worker exits without reading the bind" wall is
-                // FIXED: it was `conn->read_closed == 1`, set by the rpcrt4 SERVER thread's premature
-                // shutdown (`rpcrt4_conn_close_read` over `cps->connections`) because its post-accept
-                // RE-LISTEN failed — our `NtCreateNamedPipeFile` returned STATUS_ACCESS_DENIED for the
-                // 2nd `\ntsvcs` instance (hardcoded FILE_CREATE; real CreateNamedPipe uses FILE_OPEN_IF,
-                // fixed in driver_launch.rs). With that fixed the listener stays alive, `read_closed`
-                // stays 0, and the worker RUNS `rpcrt4_conn_np_read → NtReadFile(conn->pipe, 16)` and is
-                // re-driven on winlogon's bind write (the batch-33 pipe park + FIX-2 overflow copyout).
-                // The boot stays GREEN (worker reads then exits cleanly; listener alive; clean quiesce),
-                // so the route is left ON. bind_ack does not YET flow — see the BATCH 38 NEXT WALL in
-                // ntdll_plan.md (npfs returns wrong bytes for the server read: the pending ReadEntry is
-                // not reconciled with the peer WriteEntry in our synthetic-IRP npfs host).
-                // ★ BATCH 38 — the npfs pending-read/peer-write RECONCILE is FIXED (real bind bytes now
-                // reach the worker: `IofCompleteRequest` bound + the completed read's bytes read from the
-                // IRP's REASSIGNED AssociatedIrp.SystemBuffer, not the stale original). With the route ON
-                // the FULL SCM RPC round-trip runs LIVE: worker reads the real bind `05 00 0b 03…` →
-                // rpcrt4 emits bind_ack `05 00 0c 03…` → winlogon's parked read completes with it →
-                // RROpenSCManagerW request `05 00 00 03…` → response `05 00 02 03…` (all PROVEN in
-                // /tmp/boot38d.log, 8 PDUs both ways). BUT this legitimately changes the SCM thread
-                // lifecycle: with the RPC now SUCCEEDING, services' per-connection worker (badge 15) +
-                // listener (badge 7) STAY ALIVE serving the conversation instead of self-exiting on a
-                // failed connection (as they did when the bind read returned garbage) — so the 3
-                // `exec_live_terminate_thread_{routed,tcb_reclaimed,no_reply}` specs, which counted on
-                // those two self-exits (`>= 3`), drop to 2 (only csrss + lsass). AND winlogon, having
-                // OpenSCManager succeed, advances into GUI code. That route is now enabled: the SCM
-                // RPC success path and persistent listener/worker lifecycle are part of the boot
-                // frontier, so this recognizer remains keyed by caller identity rather than order.
-                const SCM_WORKER_ROUTE_ENABLED: bool = true;
-                if SCM_WORKER_ROUTE_ENABLED
-                    && matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_services()
-                    && self.current_thread_has_role(HostedThreadRole::ServicesListener)
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
-                        .is_some()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ScmWorker)
-                        .is_none()
-                {
-                    unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                SCM_WORKER_BADGE,
-                                HostedThreadRole::ScmWorker,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm
-                                .set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = smss_stack_read(sp + 0x28);
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::ScmWorker);
-                            print_str(b"[scm-worker] recognized services' 2nd NtCreateThread = per-connection RPC worker: entry=0x");
-                            print_hex((start.rip >> 32) as u32);
-                            print_hex(start.rip as u32);
-                            print_str(b" tid=");
-                            print_u64(tid);
-                            print_str(b"\n");
-                            return 0;
-                        }
-                    }
-                }
-                // ★ THE LSA SELF-RPC WORKER — lsass.exe's `NtCreateThread` issued FROM its
-                // `\pipe\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3). In rpcrt4 that call is
-                // `RPCRT4_new_client(cconn)` → `CreateThread(RPCRT4_io_thread, conn)`
-                // (`rpc_server.c:626`), reached from `rpcrt4_protseq_np_wait_for_new_connection`
-                // (`rpc_transport.c:1057`) once the accepted connection has been handed off. It is the
-                // EXACT counterpart of services' SCM `\ntsvcs` worker above, and it is the thread that
-                // reads the LSA RPC bind PDU and answers `LsarOpenPolicy`.
-                //
-                // Before this recognizer existed the call fell through to the generic paths and no
-                // per-connection worker was ever routed — which is why lsass' own `LsaOpenPolicy`
-                // (samsrv's `SampGetAccountDomainInfo`, a SELF-RPC into lsass' own LSA RPC surface)
-                // blocked forever on its bind_ack read. Identified by CALLER IDENTITY (lsass.exe + the
-                // \lsarpc server thread role), never by creation order.
-                //
-                // ★★ ROUTE ENABLED. The formerly isolated wall is no longer the
-                // dispatch-correlation one. With `LSA_WORKER_ROUTE_ENABLED = true` the whole
-                // self-RPC RUNS FOR REAL: the worker reads the 72-byte bind (`05 00 0b 03`),
-                // `process_bind_packet` writes the 68-byte bind_ack (`05 00 0c 03`) which wakes
-                // lsass' own parked client read, the client writes the 56-byte `LsarOpenPolicy`
-                // request (`05 00 00 03`), the worker reads it and `QueueUserWorkItem`s
-                // `RPCRT4_worker_thread`, and that thread runs the real server stub (it opens
-                // `SECURITY\Policy` with KEY_ALL_ACCESS) and writes the 48-byte RESPONSE
-                // (`05 00 02 03`). npfs is exonerated (its write completes: `[fsd-ret] ret=0`,
-                // `[fsd-done] st=0 info=48`), and so is the dispatch CORRELATION: BOTH substrates
-                // now speak seL4 `Call` ⇄ MCS reply objects (`docs/transport-migration.md` Phases
-                // 1-2), so a misordered completion is unrepresentable and the executive's answer is
-                // a non-blocking `reply_on`. The userspace correlation planes this comment used to
-                // name (the `SH_REQ_SEQ` handshake, the per-dispatch token binding) are DELETED.
-                //
-                // ★ THIS IS THE WALL PHASE 4 RE-TESTS. What it stopped on (measured, instrumented,
-                // on the pre-migration transport): the executive's WAKE `Send` for a
-                // fresh top-level win32k dispatch (`csrss -> SSN 0x1002`) never returns. The
-                // instrumented boot sampled win32k's TCB RIP immediately before every wake: 907 of
-                // 908 healthy wakes sample the component's completion-`Send`+2 (win32k runnable, on
-                // its way back to its receive), 3 sample the receive syscall itself — and the ONE
-                // wake that never completes is the only sample at that receive+2. That wake `Send`
-                // NO LONGER EXISTS (the executive replies on a reply object instead). The
-                // dispatch-endpoint cap is stable across all 909 wakes (no cap clobber). So the
-                // remaining wall is win32k RENDEZVOUS AVAILABILITY under the route's extra
-                // concurrency, not reply correlation — a different, newly-separated problem. A
-                // timing-perturbed route-ON run also diverges earlier and loses the desktop paint,
-                // so the route is NOT safe to enable yet. The counter below still records that
-                // `RPCRT4_new_client` was genuinely REACHED. No logon, token or RPC reply is
-                // fabricated.
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_lsass()
-                    && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
-                        .is_some()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
-                        .is_none()
-                {
-                    // Counted whether or not the route is enabled: reaching here PROVES lsass'
-                    // `\lsarpc` server thread got through `rpcrt4_ncacn_np_handoff` (the
-                    // `GetComputerNameA` -> `NtFlushKey` wall) and called `RPCRT4_new_client`.
-                    LSA_RPC_NEW_CLIENT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                }
-                if crate::LSA_WORKER_ROUTE_ENABLED
-                    && matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_lsass()
-                    && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
-                        .is_some()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsaWorker)
-                        .is_none()
-                {
-                    unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                LSA_WORKER_BADGE,
-                                HostedThreadRole::LsaWorker,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm
-                                .set_thread_teb(tid as nt_process::ThreadId, LSA_WORKER_TEB_VA);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = smss_stack_read(sp + 0x28);
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::LsaWorker);
-                            print_str(b"[lsa-worker] recognized lsass' \\lsarpc server-thread NtCreateThread = per-connection RPC worker: entry=0x");
-                            print_hex((start.rip >> 32) as u32);
-                            print_hex(start.rip as u32);
-                            print_str(b" tid=");
-                            print_u64(tid);
-                            print_str(b"\n");
-                            return 0;
-                        }
-                    }
-                }
+                // SCM per-connection RPC workers are now handled by the dynamic hosted worker
+                // window path below. The services listener creates one real ETHREAD per connection,
+                // and the generic local-thread route assigns a reusable slot-backed role.
+                // LSA per-connection RPC workers use the same dynamic worker-window mechanism.
+                // The route proof counter is incremented when the listener-owned create is
+                // classified in `create_generic_local_tp_worker_thread`.
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.current_process_is_smss()
                     && self

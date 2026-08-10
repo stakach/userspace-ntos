@@ -1568,17 +1568,14 @@ struct HostedExeSpawn<'a> {
 #[derive(Clone, Copy)]
 enum HostedMultiplexedThreadSpawner {
     ServicesListener,
-    ScmWorker,
     LsassListener,
     LsassListener2,
     LsassListener3,
-    LsaWorker,
 }
 
 #[derive(Clone, Copy)]
 enum HostedThreadResumeMode {
     PoolState,
-    Always,
 }
 
 #[derive(Clone, Copy)]
@@ -1608,17 +1605,6 @@ fn hosted_multiplexed_thread_spawn_for(
             spawn_prefix: b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x",
             spawned_prefix: b"[svc-thread] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 7)\n",
-        }),
-        HostedThreadSpawnRequest::ScmWorker => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"services.exe",
-            teb: SCM_WORKER_TEB_VA,
-            badge: SCM_WORKER_BADGE,
-            role: HostedThreadRole::ScmWorker,
-            spawner: HostedMultiplexedThreadSpawner::ScmWorker,
-            resume: HostedThreadResumeMode::PoolState,
-            spawn_prefix: b"[scm-worker] spawning REAL per-connection RPC worker: entry=0x",
-            spawned_prefix: b"[scm-worker] spawned tcb=0x",
-            spawned_suffix: b" (multiplexed at badge 15)\n",
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
@@ -1652,18 +1638,6 @@ fn hosted_multiplexed_thread_spawn_for(
             spawn_prefix: b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x",
             spawned_prefix: b"[lsass-thread3] spawned + resumed tcb=0x",
             spawned_suffix: b" (runs into the main multiplex, badge 14)\n",
-        }),
-        HostedThreadSpawnRequest::LsaWorker => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"lsass.exe",
-            teb: LSA_WORKER_TEB_VA,
-            badge: LSA_WORKER_BADGE,
-            role: HostedThreadRole::LsaWorker,
-            spawner: HostedMultiplexedThreadSpawner::LsaWorker,
-            resume: HostedThreadResumeMode::Always,
-            spawn_prefix:
-                b"[lsa-worker] spawning + RESUMING REAL per-connection LSA RPC worker: entry=0x",
-            spawned_prefix: b"[lsa-worker] spawned + resumed tcb=0x",
-            spawned_suffix: b" (runs into the main multiplex, badge 26)\n",
         }),
         _ => None,
     }
@@ -4290,14 +4264,9 @@ pub(crate) unsafe fn service_sec_image(
         // BATCH 35: services' SCM per-connection RPC worker (pi 3, its OWN stack mirror/TEB) — the
         // N-threads multiplex generalized to a DYNAMICALLY-spawned worker (not a pre-created pool
         // listener). It reads winlogon's bind PDU + writes bind_ack; resolved to pi 3 like the listener.
-        let is_scm_worker = badge == SCM_WORKER_BADGE;
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
         let is_lsass_listener3 = badge == LSASS_LISTENER3_BADGE;
-        // lsass' `\pipe\lsarpc` PER-CONNECTION RPC worker (pi 4, its OWN stack mirror/TEB) — the
-        // N-threads multiplex generalized to lsass' dynamically-spawned rpcrt4 io_thread. It reads the
-        // LSA RPC bind PDU and answers `LsarOpenPolicy` for lsass' own self-RPC.
-        let is_lsa_worker = badge == LSA_WORKER_BADGE;
         // Generic workers have one badge per process and slot. The first five processes keep the
         // legacy dense range for slot 0 (16..20) and slot 1 (21..25); extra slots and later hosted
         // processes use the aux range decoded by tp_worker_identity_from_badge. The role is
@@ -4307,10 +4276,8 @@ pub(crate) unsafe fn service_sec_image(
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
         let is_tp_worker = tp_worker_identity.is_some();
-        let is_scm_worker = is_scm_worker
-            || hosted_thread_role.is_some_and(|role| role.is_scm_rpc_worker());
-        let is_lsa_worker = is_lsa_worker
-            || hosted_thread_role.is_some_and(|role| role.is_lsa_rpc_worker());
+        let is_scm_worker = hosted_thread_role.is_some_and(|role| role.is_scm_rpc_worker());
+        let is_lsa_worker = hosted_thread_role.is_some_and(|role| role.is_lsa_rpc_worker());
         // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
         // multiplex. It runs the wait array (NtWaitForMultipleObjects → parks) that the main thread's
         // signal_state_changed wakes, completing the rpcrt4 server-thread handshake.
@@ -4431,16 +4398,12 @@ pub(crate) unsafe fn service_sec_image(
             (tp_worker_stack_base(slot), TP_WORKER_STACK_FRAMES)
         } else if is_svc_listener {
             (SVC_LISTENER_STACK_BASE, SVC_LISTENER_STACK_FRAMES)
-        } else if is_scm_worker {
-            (SCM_WORKER_STACK_BASE, SCM_WORKER_STACK_FRAMES)
         } else if is_lsass_listener {
             (LSASS_LISTENER_STACK_BASE, LSASS_LISTENER_STACK_FRAMES)
         } else if is_lsass_listener2 {
             (LSASS_LISTENER2_STACK_BASE, LSASS_LISTENER2_STACK_FRAMES)
         } else if is_lsass_listener3 {
             (LSASS_LISTENER3_STACK_BASE, LSASS_LISTENER3_STACK_FRAMES)
-        } else if is_lsa_worker {
-            (LSA_WORKER_STACK_BASE, LSA_WORKER_STACK_FRAMES)
         } else if is_wl_worker {
             match badge {
                 WINLOGON_WORKER2_BADGE => (WL_WORKER2_STACK_BASE, WL_WORKER2_STACK_FRAMES),
@@ -4459,9 +4422,6 @@ pub(crate) unsafe fn service_sec_image(
                 // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
                 // stack-arg reads land on its own stack, not services' main-thread stack).
                 SVC_LISTENER_STACK_MIRROR_VA
-            } else if is_scm_worker {
-                // BATCH 35: the SCM worker's OWN stack mirror (its bind-PDU read buffer / out-params).
-                SCM_WORKER_STACK_MIRROR_VA
             } else if is_lsass_listener {
                 // Per-thread sub-selection: lsass' LSA server thread's OWN stack mirror (distinct from
                 // lsass' main-thread stack).
@@ -4470,9 +4430,6 @@ pub(crate) unsafe fn service_sec_image(
                 LSASS_LISTENER2_STACK_MIRROR_VA
             } else if is_lsass_listener3 {
                 LSASS_LISTENER3_STACK_MIRROR_VA
-            } else if is_lsa_worker {
-                // The LSA per-connection worker's OWN mirror (its RPC-PDU read buffers / out-params).
-                LSA_WORKER_STACK_MIRROR_VA
             } else if is_wl_worker {
                 match badge {
                     WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA,
@@ -7537,8 +7494,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_name_wait_hash = nt_handler.pipe_name_wait_hash;
                     park_pipe_name_wait_iosb_va = nt_handler.pipe_name_wait_iosb_va;
                     park_pipe_name_wait_event_obj_idx = nt_handler.pipe_name_wait_event_obj_idx;
-                    park_pipe_name_wait_deadline_100ns =
-                        nt_handler.pipe_name_wait_deadline_100ns;
+                    park_pipe_name_wait_deadline_100ns = nt_handler.pipe_name_wait_deadline_100ns;
                 }
                 // ★ BATCH 34: a client CONNECT to a pipe with a pending async server FSCTL_PIPE_LISTEN
                 // for the SAME pipe name completes that listen — signal its completion event so the
@@ -10007,10 +9963,8 @@ pub(crate) unsafe fn service_sec_image(
                     // kernel that copy belongs at the executive/win32k boundary.
                     let rect_ptr = a1;
                     let rect_needed = rect_ptr != 0
-                        && !(matches!(
-                            m0,
-                            NTUSER_INVALIDATE_RECT_SSN | NTUSER_VALIDATE_RECT_SSN
-                        ) && a0 == 0);
+                        && !(matches!(m0, NTUSER_INVALIDATE_RECT_SSN | NTUSER_VALIDATE_RECT_SSN)
+                            && a0 == 0);
                     if rect_needed {
                         let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                         core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_RECT_STAGE_BYTES);
@@ -10046,12 +10000,9 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b" rect=0x");
                                 print_hex_u64(rect_ptr);
                                 let left = core::ptr::read_unaligned(arg as *const u32);
-                                let top =
-                                    core::ptr::read_unaligned((arg + 4) as *const u32);
-                                let right =
-                                    core::ptr::read_unaligned((arg + 8) as *const u32);
-                                let bottom =
-                                    core::ptr::read_unaligned((arg + 12) as *const u32);
+                                let top = core::ptr::read_unaligned((arg + 4) as *const u32);
+                                let right = core::ptr::read_unaligned((arg + 8) as *const u32);
+                                let bottom = core::ptr::read_unaligned((arg + 12) as *const u32);
                                 print_str(b" value=(");
                                 print_hex(left);
                                 print_str(b",");
@@ -11322,7 +11273,9 @@ pub(crate) unsafe fn service_sec_image(
                         b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n",
                     );
                 }
-                let (mut st, mut ok): (u64, bool) = if wl_milestone_park || gui_message_wait_park_request {
+                let (mut st, mut ok): (u64, bool) = if wl_milestone_park
+                    || gui_message_wait_park_request
+                {
                     // This caller is intentionally parked without a provider dispatch. For GUI
                     // message waits this means the preflight PeekMessage proved the queue is empty,
                     // so dispatching the blocking GetMessage would park the single-threaded host
@@ -12897,7 +12850,11 @@ pub(crate) unsafe fn service_sec_image(
                             bump_progress();
                         }
                     }
-                    if gui_message_wait_was_replied(gui_message_wait_queue_event_body, pi as u32, badge) {
+                    if gui_message_wait_was_replied(
+                        gui_message_wait_queue_event_body,
+                        pi as u32,
+                        badge,
+                    ) {
                         let received =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         badge = received.0;
@@ -16852,7 +16809,6 @@ unsafe fn spawn_requested_multiplexed_thread(
     let suspended = hosted_thread_suspended(nt_handler, tid);
     let resume = match spec.resume {
         HostedThreadResumeMode::PoolState => !suspended,
-        HostedThreadResumeMode::Always => true,
     };
 
     print_str(spec.spawn_prefix);
@@ -16866,9 +16822,6 @@ unsafe fn spawn_requested_multiplexed_thread(
         HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
             pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
         ),
-        HostedMultiplexedThreadSpawner::ScmWorker => spawn_scm_worker_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
-        ),
         HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
             pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
         ),
@@ -16876,9 +16829,6 @@ unsafe fn spawn_requested_multiplexed_thread(
             pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
-        ),
-        HostedMultiplexedThreadSpawner::LsaWorker => spawn_lsa_worker_thread(
             pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
         ),
     };
@@ -17245,16 +17195,33 @@ unsafe fn spawn_requested_tp_worker(
         .is_some_and(|(pool_pi, slot)| {
             pool_pi == pi && nt_handler.is_pool_thread_suspended(pool_pi, slot)
         });
-    let spawned = spawn_tp_worker_thread(
-        pi,
-        worker_slot,
-        pml4,
-        start,
-        cid_proc,
-        tid,
-        fault_ep,
-        !suspended,
-    );
+    let direct_rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
+    let spawned = if direct_rpc_worker {
+        let worker_ep = mint_badged(fault_ep, badge);
+        rendezvous::spawn_slot_thread(&rendezvous::RemoteThreadSpawn {
+            target_pi: pi,
+            slot: worker_slot,
+            pml4,
+            start,
+            cid_proc,
+            cid_thread: tid,
+            fault_ep: worker_ep,
+            use_loader: false,
+            native: true,
+            resume: !suspended,
+        })
+    } else {
+        spawn_tp_worker_thread(
+            pi,
+            worker_slot,
+            pml4,
+            start,
+            cid_proc,
+            tid,
+            fault_ep,
+            !suspended,
+        )
+    };
     if spawned.tcb() == 0 {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
         if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
@@ -17267,13 +17234,7 @@ unsafe fn spawn_requested_tp_worker(
         }
         return;
     }
-    if !nt_handler.register_hosted_thread_spawn(
-        pi,
-        tid,
-        spawned,
-        badge,
-        role,
-    ) {
+    if !nt_handler.register_hosted_thread_spawn(pi, tid, spawned, badge, role) {
         nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
         if let Some((pool_pi, pool_slot)) = nt_handler.pm_pool_slot_for_tid(tid) {
             let _ = nt_handler.pm.set_thread_state(
@@ -17289,7 +17250,11 @@ unsafe fn spawn_requested_tp_worker(
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
 
-    print_str(b"[tp-worker] spawned pi=");
+    print_str(if direct_rpc_worker {
+        b"[rpc-worker] spawned pi="
+    } else {
+        b"[tp-worker] spawned pi="
+    });
     print_u64(pi as u64);
     print_str(b" badge=");
     print_u64(badge);
@@ -17396,11 +17361,6 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
                     SVC_LISTENER_STACK_FRAMES,
                     SVC_LISTENER_STACK_MIRROR_VA,
                 ),
-                SCM_WORKER_BADGE => (
-                    SCM_WORKER_STACK_BASE,
-                    SCM_WORKER_STACK_FRAMES,
-                    SCM_WORKER_STACK_MIRROR_VA,
-                ),
                 LSASS_LISTENER_BADGE => (
                     LSASS_LISTENER_STACK_BASE,
                     LSASS_LISTENER_STACK_FRAMES,
@@ -17415,11 +17375,6 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
                     LSASS_LISTENER3_STACK_BASE,
                     LSASS_LISTENER3_STACK_FRAMES,
                     LSASS_LISTENER3_STACK_MIRROR_VA,
-                ),
-                LSA_WORKER_BADGE => (
-                    LSA_WORKER_STACK_BASE,
-                    LSA_WORKER_STACK_FRAMES,
-                    LSA_WORKER_STACK_MIRROR_VA,
                 ),
                 WINLOGON_WORKER2_BADGE => (
                     WL_WORKER2_STACK_BASE,
@@ -17731,11 +17686,7 @@ unsafe fn gui_message_wait_redrive_event(
             print_hex(staged_message);
             print_str(b" ret=0x");
             print_hex(status as u32);
-            print_str(if copy_ok {
-                b"\n"
-            } else {
-                b" copyout-failed\n"
-            });
+            print_str(if copy_ok { b"\n" } else { b" copyout-failed\n" });
         }
     }
 
@@ -18433,8 +18384,7 @@ pub(crate) unsafe fn pipe_name_wait_complete_one(
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take();
-    let (sb, ss, smv, hmv, imv, scratch_base) =
-        mirror_ctx_for(waiter.badge, waiter.pi as usize);
+    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, waiter.pi as usize);
     ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -18958,14 +18908,15 @@ fn trace_wait_owner_mask_after_mark(
     }
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
     let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
-    let snapshot =
-        hosted_process_wait_snapshot(nt_handler, pi, &mut threads).unwrap_or(HostedProcessWaitSnapshot {
+    let snapshot = hosted_process_wait_snapshot(nt_handler, pi, &mut threads).unwrap_or(
+        HostedProcessWaitSnapshot {
             owner: owner_top_badge_for(nt_handler, badge),
             count: 0,
             live: false,
             all_parked: false,
             overflow: false,
-        });
+        },
+    );
     print_str(b"[wait-owner] #");
     print_u64(n);
     print_str(b" pi=");
@@ -18983,9 +18934,7 @@ fn trace_wait_owner_mask_after_mark(
     print_str(b" remaining=0x");
     print_hex_u64(live & !(crash_parked | wait_parked));
     print_str(b" owner-bit=");
-    print_u64(
-        ((snapshot.owner < 64) && (wait_parked & (1u64 << snapshot.owner)) != 0) as u64,
-    );
+    print_u64(((snapshot.owner < 64) && (wait_parked & (1u64 << snapshot.owner)) != 0) as u64);
     print_str(b" snapshot-live=");
     print_u64(snapshot.live as u64);
     print_str(b" all-parked=");

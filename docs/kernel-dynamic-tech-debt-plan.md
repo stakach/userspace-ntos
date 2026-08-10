@@ -2114,3 +2114,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: the next serialized boot should prove the late `\pipe\ntsvcs` worker churn uses
   `role=scm-rpc` dynamic workers before deciding whether the remaining shell frontier is service IPC
   liveness or explorer paint itself.
+- A4 fixed-worker deletion complete. The historical SCM/LSA per-connection worker recognizers,
+  fixed worker badges, fixed target/mirror/scratch windows, and dedicated spawn helpers are gone.
+  Per-connection SCM/LSA RPC workers are admitted only through the generic same-process worker
+  route, then classified from the caller's registered hosted-thread role as
+  `ScmWorkerSlot`/`LsaWorkerSlot`. The generic high-slot mapper now sizes itself from
+  `TP_WORKER_SLOT_COUNT` instead of reserving space for an extra LSA-specific window. Local
+  validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: retry one uncontended boot next; the expected proof is a real late
+  `role=scm-rpc` worker on the `\pipe\ntsvcs` path, with no fallback fixed badge/window route left
+  to mask the next frontier.

@@ -147,8 +147,7 @@ fn hive_image_ok(bytes: &[u8]) -> bool {
     if RegfHive::new(bytes).is_some_and(|hive| !hive.subkeys(hive.root()).is_empty()) {
         return true;
     }
-    nt_hive_core::decode_image(bytes)
-        .is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
+    nt_hive_core::decode_image(bytes).is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
 }
 
 /// Is `path` a mountable hive image on this volume? Accepts both real on-disk `regf` hives and this
@@ -161,9 +160,7 @@ pub(crate) fn hive_image_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
     let Some(bytes) = fs.file_bytes(path) else {
         return 0;
     };
-    if nt_hive_core::decode_image(bytes)
-        .is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
-    {
+    if nt_hive_core::decode_image(bytes).is_ok_and(|hive| hive.subkey_count(hive.root()) > 0) {
         bytes.len()
     } else {
         0
@@ -239,8 +236,7 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
     *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
     NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
     if let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() {
-        let Some(bytes) = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref()
-        else {
+        let Some(bytes) = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref() else {
             return false;
         };
         fs.provision_file(DEFAULT_USER_NTUSER_DAT, bytes)
@@ -255,8 +251,7 @@ pub(crate) const PROFILES_VOLUME_ROOT_RELATIVE: &[u8] = b"profiles";
 pub(crate) const STAGED_CONFIG_DIR: &[u8] = br"reactos\system32\config";
 pub(crate) const CONFIG_VOLUME_ROOT_RELATIVE: &[u8] = b"reactos\\system32\\config";
 pub(crate) const CONFIG_SYSTEM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\system";
-pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] =
-    b"reactos\\system32\\config\\software";
+pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\software";
 /// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
 /// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
 pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
@@ -551,8 +546,7 @@ fn rename_information(
         .count()
         .checked_mul(2)
         .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
-    let name_len_u32 =
-        u32::try_from(name_len).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    let name_len_u32 = u32::try_from(name_len).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
     let total_len = 20usize
         .checked_add(name_len)
         .ok_or(nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
@@ -843,11 +837,7 @@ unsafe fn provision_staged_tree(
     // Explicit DFS stack (no recursion in the executive): (fat cluster, volume path of the dir).
     let mut stack: alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, u32)> = alloc::vec::Vec::new();
     let _ = fs.provision_directory_relative(volume_root_relative);
-    stack.push((
-        root_cluster,
-        volume_root_relative.to_vec(),
-        0,
-    ));
+    stack.push((root_cluster, volume_root_relative.to_vec(), 0));
     let mut stats = StagedTreeStats::default();
     while let Some((cluster, base, depth)) = stack.pop() {
         // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
@@ -932,8 +922,7 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     // `.Default` checkpoint image. Do not copy raw `config\default`: that prototype lacks setup's
     // installed-user writes and is the bug this path replaces.
     if PROVISION_NTUSER_DAT {
-        let setup_image =
-            (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref();
+        let setup_image = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref();
         match setup_image {
             Some(hive) if hive_image_ok(hive) => {
                 if fs.provision_file(DEFAULT_USER_NTUSER_DAT, hive) {
@@ -976,7 +965,8 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
         print_str(b"[config-source] no FAT volume -> system32\\config NOT materialised\n");
         return;
     };
-    let Some((root_cluster, _, attr)) = crate::fs_loader::fat_open_path_entry(&fat, STAGED_CONFIG_DIR)
+    let Some((root_cluster, _, attr)) =
+        crate::fs_loader::fat_open_path_entry(&fat, STAGED_CONFIG_DIR)
     else {
         print_str(b"[config-source] reactos\\system32\\config ABSENT -> not materialised\n");
         return;
@@ -996,7 +986,9 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
         .is_some_and(hive_image_ok);
     CONFIG_SOURCE_SYSTEM_HIVE_OK.store(system_hive_ok as u64, Ordering::Relaxed);
     CONFIG_SOURCE_SOFTWARE_HIVE_OK.store(software_hive_ok as u64, Ordering::Relaxed);
-    print_str(b"[config-source] materialised reactos\\system32\\config onto the writable volume: dirs=");
+    print_str(
+        b"[config-source] materialised reactos\\system32\\config onto the writable volume: dirs=",
+    );
     print_u64(stats.dirs);
     print_str(b" files=");
     print_u64(stats.files);

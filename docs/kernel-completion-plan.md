@@ -2663,3 +2663,13 @@ or `unhandled-syscall` signatures.
   Review adjustment: the next single boot should show dynamic `role=scm-rpc` workers in the late
   `\pipe\ntsvcs` path; if the log still parks there, debug the real service-control wait/reply edge
   from that role-aware trace.
+
+- A4 fixed RPC worker route deletion. The stricter follow-up removed the old SCM/LSA fixed
+  per-connection worker badges, dedicated VA windows, and dedicated spawn helpers. Those workers now
+  have only the generic same-process worker route, with role metadata assigned from the listener
+  caller and persisted as `ScmWorkerSlot`/`LsaWorkerSlot`; the generic high-slot mapping covers the
+  configured dynamic worker slots directly. Validation: `cargo fmt --all`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`. Review adjustment: rerun exactly one uncontended boot and use the dynamic
+  worker trace to decide whether the next shell frontier is SCM pipe liveness, service-control RPC,
+  or explorer chrome paint.

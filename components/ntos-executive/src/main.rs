@@ -450,87 +450,6 @@ pub const LSASS_LISTENER3_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
 pub const LSASS_LISTENER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107E_0000;
 pub const LSASS_LISTENER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1390_0000;
 pub const LSASS_LISTENER3_BADGE: u64 = 14;
-// --- BATCH 35: services' SCM per-connection RPC WORKER thread (rpcrt4 RPCRT4_new_client, created by
-// the SCM listener via its SECOND NtCreateThread). Runs in services' OWN pml4 (pi 3) at a DISTINCT
-// target-VSpace VA window (a distinct TEB → distinct GS base, distinct stack/tramp/ipcbuf from the
-// SVC_LISTENER which reuses the SM_* VAs) plus distinct executive-side env-scratch + stack-mirror.
-// Same multiplex, badge SCM_WORKER_BADGE. It uses services' pool ETHREAD slot 1 (slot 0 = listener).
-// The target-VSpace window reuses the LSASS_LISTENER3/WL_WORKER3 cluster block (0x1052 stack / 0x1055
-// teb / 0x1057 tramp) — a PROVEN running-thread layout inside the shared WORK_CLUSTER PT (which
-// spawn_sec_image already created in services' pml4). Distinct from SVC_LISTENER (SM block, 0x1044).
-pub const SCM_WORKER_STACK_BASE: u64 = WL_WORKER3_STACK_BASE; // services VSpace (own pml4), 0x1052
-pub const SCM_WORKER_STACK_FRAMES: u64 = 8;
-pub const SCM_WORKER_IPCBUF_VA: u64 = WL_WORKER3_IPCBUF_VA;
-pub const SCM_WORKER_TEB_VA: u64 = WL_WORKER3_TEB_VA;
-pub const SCM_WORKER_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
-/// Executive scratch (3 pages: TEB / TEB2 / trampoline). BATCH 36 ROOT-CAUSE FIX: this WAS 0x107C,
-/// which COLLIDES with **winlogon's process-spawn env-scratch** (`spawn_sec_image` for winlogon uses
-/// scr_base 0x107C — service_sec_image.rs, documented at the `winlogon-spawn (0x107C)` note). Those
-/// spawn-env frames are mapped at winlogon's spawn and NEVER unmapped, so `spawn_hosted_thread`'s
-/// executive-side alias map `page_map(tramp, scr+0x2000)` for the SCM worker hit an already-occupied
-/// leaf PTE → kernel returned `seL4_DeleteFirst` (8); the trampoline bytes were written into
-/// winlogon's STALE env frame while the worker's REAL trampoline frame stayed ZERO → mapped into
-/// services' VSpace zero-filled → the worker executed `00 00` (= `add [rax],al`, rax=0) at entry =
-/// the reproducible `cr2=0` READ fault (err=4) at the trampoline VA. 0x1075 is a genuinely-free gap
-/// (between smss-spawn 0x1074 and services-env 0x1076), still inside the FILEBUF PT (0x1060..0x107F).
-pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1075_0000;
-/// Executive-side stack mirror for the SCM worker (its syscall out-params / stack-arg reads / the
-/// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
-pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
-
-// --- lsass' `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread (rpcrt4 `RPCRT4_new_client` →
-// `CreateThread(RPCRT4_io_thread)`, created by lsass' `\lsarpc` `RPCRT4_server_thread` — badge
-// LSASS_LISTENER3 — once `rpcrt4_ncacn_np_handoff` completes on an accepted connection). This is the
-// EXACT analogue of the SCM `\ntsvcs` worker (SCM_WORKER_BADGE) for pi 4, and it is what makes lsass'
-// **SELF-RPC** work: lsass' MAIN thread is the CLIENT (samsrv `SampGetAccountDomainInfo` →
-// `LsaOpenPolicy` → advapi32's `ncacn_np:\pipe\lsarpc` auto-bind) while lsass' own rpcrt4 server
-// answers it. Same VSpace, so the worker needs its OWN target VAs (distinct TEB → distinct GS base).
-//
-// The three lsass listener blocks already consume the SM (0x1044), 0x104C and WL_WORKER3 (0x1052)
-// windows, and 0x1058..0x105B belong to the generic TP worker slot 0. The generic high worker
-// windows occupy 0x13E0..0x13FB, so this LSA-specific worker sits at the end of the same high thread
-// PT without overlapping any slot that lsass may claim dynamically.
-pub const LSA_WORKER_REGION_BASE: u64 = (TP_WORKER_SLOT1_REGION_BASE
-    + (TP_WORKER_SLOT_COUNT as u64 - 1) * TP_WORKER_EXEC_STRIDE
-    + 0x1f_ffff)
-    & !0x1f_ffff; // lsass VSpace (own pml4), after the generic worker target slots
-pub const LSA_WORKER_STACK_BASE: u64 = LSA_WORKER_REGION_BASE;
-pub const LSA_WORKER_STACK_FRAMES: u64 = 8;
-pub const LSA_WORKER_IPCBUF_VA: u64 = LSA_WORKER_REGION_BASE + 0x1_0000;
-pub const LSA_WORKER_TEB_VA: u64 = LSA_WORKER_REGION_BASE + 0x2_0000; // 2 pages
-pub const LSA_WORKER_TRAMP_VA: u64 = LSA_WORKER_REGION_BASE + 0x3_0000;
-/// Executive-side stack mirror for the LSA worker (its RPC-PDU read buffers + syscall out-params land
-/// on its OWN stack). 8 stack pages + 2 TEB pages, inside the already-created 0x1380 mirror PT and
-/// clear of the SCM worker's 0x1398 window.
-pub const LSA_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1399_0000;
-/// Executive scratch (3 pages: TEB / TEB2 / trampoline, +1 for the spawn self-verify read-back).
-/// The FILEBUF PT's 0x1070..0x107F env-scratch slots are ALL taken, so this lives in the mirror PT
-/// just past the LSA worker's own mirror window (0x1399_0000 + 10 pages).
-pub const LSA_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_139A_0000;
-/// The fault-EP badge for lsass' per-connection LSA RPC worker — the loop maps it to (pi 4, worker),
-/// switching ACTIVE_STACK_MIRROR to the worker's own mirror. Kept just above the legacy generic
-/// worker badge range (slots 0/1, badges 16..25); additional generic slots use the aux badge range.
-pub const LSA_WORKER_BADGE: u64 = 26;
-const _: () = {
-    // The worker's target window must not alias any generic TP worker high-slot window in the SAME
-    // VSpace, and its executive-side mirror + scratch must stay inside the 0x1380 mirror PT and clear
-    // of both the SCM worker's mirror (0x1398) and TP_WORKER_EXEC_BASE (0x13A0).
-    assert!(
-        LSA_WORKER_REGION_BASE
-            >= TP_WORKER_SLOT1_REGION_BASE
-                + (TP_WORKER_SLOT_COUNT as u64 - 1) * TP_WORKER_EXEC_STRIDE
-    );
-    assert!(
-        LSA_WORKER_STACK_MIRROR_VA >= SCM_WORKER_STACK_MIRROR_VA + SCM_WORKER_STACK_FRAMES * 0x1000
-    );
-    assert!(
-        LSA_WORKER_ENV_SCRATCH_VA
-            >= LSA_WORKER_STACK_MIRROR_VA + (LSA_WORKER_STACK_FRAMES + 2) * 0x1000
-    );
-    assert!(LSA_WORKER_ENV_SCRATCH_VA + 0x4000 <= TP_WORKER_EXEC_BASE);
-    assert!(LSA_WORKER_STACK_MIRROR_VA & !0x1f_ffff == LSA_WORKER_ENV_SCRATCH_VA & !0x1f_ffff);
-    assert!(tp_worker_identity_from_badge(LSA_WORKER_BADGE).is_none());
-};
 
 // --- Generic hosted same-process worker threads ----------------------------------------------
 // The established SM/CSR/RPC roles retain their specialized layouts. An NtCreateThread whose
@@ -867,7 +786,6 @@ const _: () = {
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER2_TEB_VA) == WL_WORKER2_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(WL_WORKER3_TEB_VA) == WL_WORKER3_IPCBUF_VA);
     assert!(nt_syscall_abi::native_ipc_buffer_va(SVC_LISTENER_TEB_VA) == SVC_LISTENER_IPCBUF_VA);
-    assert!(nt_syscall_abi::native_ipc_buffer_va(SCM_WORKER_TEB_VA) == SCM_WORKER_IPCBUF_VA);
     assert!(
         nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER_TEB_VA) == LSASS_LISTENER_IPCBUF_VA
     );
@@ -961,7 +879,9 @@ const _: () = {
             <= TP_WORKER_EXEC_BASE + 0x20_0000
     );
     assert!(TP_WORKER_SLOT1_REGION_BASE & 0x1f_ffff == 0);
-    assert!(tp_worker_tramp_va(TP_WORKER_SLOT_COUNT - 1) + 0x1000 <= LSA_WORKER_REGION_BASE);
+    assert!(
+        tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + 0x20_0000 <= TP_WORKER_AUX_EXEC_BASE
+    );
     assert!(
         tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 1) + 0x4000
             <= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000
@@ -987,9 +907,6 @@ const _: () = {
     );
 };
 
-/// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
-/// (pi 3, scm-worker), switching ACTIVE_STACK_MIRROR to the worker's mirror. N-threads sub-selection.
-pub const SCM_WORKER_BADGE: u64 = 15;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
@@ -2562,8 +2479,7 @@ static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Growable fid -> pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` and client
 /// `NtCreateFile`/`NtOpenFile` time. Async LISTEN completion and WAIT probing must be name-scoped;
 /// missing metadata is an error/non-match, never a wildcard.
-static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable =
-    nt_io_manager::PipeFidNameTable::new();
+static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable = nt_io_manager::PipeFidNameTable::new();
 
 /// Record (or update) `fid -> name_hash`. Replaces an existing entry for `fid`.
 pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) -> Result<(), u32> {
@@ -4939,17 +4855,16 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
 ///
 /// Measured on the batch-59 repair boot: winlogon's post-profile `LsaOpenPolicy` opens
 /// `\pipe\lsarpc`, lsass' `\lsarpc` `RPCRT4_server_thread` accepts it and calls `RPCRT4_new_client`
-/// → `CreateThread(RPCRT4_io_thread)` — and that create was REFUSED
-/// (`rpc_server.c:631  failed to create thread, error=5aa`), because the executive had exactly ONE
-/// named per-connection LSA worker slot and lsass' own self-RPC worker holds it forever. rpcrt4
-/// released the connection, so winlogon's async read had no reader on the other end: winlogon
-/// wait-parked, lsass parked in `NtWaitForMultipleObjects`, and the executive blocked in `recv` with
-/// nothing left to signal it (`RUNEXIT=124`, no gate).
+/// → `CreateThread(RPCRT4_io_thread)`. The executive used to have exactly one named
+/// per-connection LSA worker slot, so a later connection could be refused with
+/// `rpc_server.c:631 failed to create thread, error=5aa`. Dynamic hosted worker slots remove that
+/// singleton ceiling: every listener-owned create gets a real ETHREAD, TEB, badge, and thread-window
+/// role or fails with the real resource error.
 ///
 /// Two independent claims, because they fix two different things:
 ///  1. the additional connection really got a worker — `LSA_RPC_NEW_CLIENT_REQUESTS >= 2` (rpcrt4
-///     asked twice) and `LSA_RPC_EXTRA_WORKERS_CLAIMED >= 1` (the second ask was granted a real
-///     generic worker slot, not an opaque handle);
+///     asked twice) and `LSA_RPC_EXTRA_WORKERS_CLAIMED >= 1` (a later ask was granted a real
+///     dynamic worker slot, not an opaque handle);
 ///  2. the DEADMAN is armed and did not have to fire. It is the general answer to "a blocking call
 ///     driven synchronously by the single-threaded loop": armed at the post-logon milestone, joined
 ///     to the delay timer's own deadline `min()`, checked inside `recv_full_r12` so it covers nested
@@ -4964,7 +4879,7 @@ unsafe fn lsarpc_connection_worker_spec(passed: &mut u64) {
     let messages = WATCHDOG_MSGS.load(Ordering::Relaxed);
     print_str(b"[lsa-rpc] first-connection new-client requests=");
     print_u64(requests);
-    print_str(b" extra-connection workers claimed=");
+    print_str(b" dynamic-connection workers claimed=");
     print_u64(claimed);
     print_str(b" | [deadman] armed=");
     print_u64(armed);
@@ -6136,8 +6051,8 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
 /// SCM `\ntsvcs` worker, which does the same job for `services.exe` in ~50 events.
 fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
     let worker_syscalls = LSA_WORKER_SYSCALLS.load(Ordering::Relaxed);
-    let worker_events = BADGE_EVENTS[census_slot(LSA_WORKER_BADGE)].load(Ordering::Relaxed);
-    let scm_events = BADGE_EVENTS[census_slot(SCM_WORKER_BADGE)].load(Ordering::Relaxed);
+    let worker_events = LSA_WORKER_FAULTS.load(Ordering::Relaxed);
+    let scm_events = SCM_WORKER_FAULTS.load(Ordering::Relaxed);
     let delay_calls = DELAY_PARKED_COUNT.load(Ordering::Relaxed);
     print_str(b"[lsa-bounded] route=");
     print_u64(if LSA_WORKER_ROUTE_ENABLED { 1 } else { 0 });
@@ -6193,17 +6108,16 @@ static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 35: services' (pi 3) SCM per-connection RPC WORKER thread — spawned DYNAMICALLY by the SCM
 /// RPC listener via its SECOND NtCreateThread (rpcrt4 `RPCRT4_new_client` per accepted connection).
-/// It runs into the SAME service-loop multiplex keyed by [`SCM_WORKER_BADGE`] (its own stack
-/// mirror/TEB, distinct from services' main thread AND its listener). It is the thread that reads
-/// winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — so routing it (not drop-parking its
-/// NtCreateThread with 0xC000009A) is what closes the bind→bind_ack→RROpenSCManagerW round-trip.
+/// It runs through the generic same-process worker window and is tagged with a ScmWorkerSlot role.
+/// It is the thread that reads winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — so
+/// routing it as a real hosted worker is what closes the bind→bind_ack→RROpenSCManagerW round-trip.
 static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// lsass' (pi 4) `\pipe\lsarpc` PER-CONNECTION RPC WORKER thread — spawned DYNAMICALLY by lsass'
 /// `\lsarpc` `RPCRT4_server_thread` (badge LSASS_LISTENER3) via `RPCRT4_new_client` →
-/// `CreateThread(RPCRT4_io_thread)` on each accepted connection. Runs into the same service-loop
-/// multiplex keyed by [`LSA_WORKER_BADGE`]. This is the thread that reads the LSA RPC bind PDU and
-/// answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued by lsass' own
-/// main thread from samsrv) complete instead of blocking forever on an unserved pipe.
+/// `CreateThread(RPCRT4_io_thread)` on each accepted connection. Runs through the same generic
+/// worker window and is tagged with a LsaWorkerSlot role. This is the thread that reads the LSA RPC
+/// bind PDU and answers `LsarOpenPolicy` — i.e. what makes lsass' SELF-RPC (`LsaOpenPolicy` issued
+/// by lsass' own main thread from samsrv) complete instead of blocking forever on an unserved pipe.
 /// ★★ THE LSA SELF-RPC WORKER ROUTE — **ON** (batch 51; was gated off for three batches).
 ///
 /// Routes lsass' `\pipe\lsarpc` per-connection RPC worker (`RPCRT4_new_client` ->
@@ -6255,11 +6169,7 @@ static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// **Nothing is fabricated**: `Administrator` is not validated, no token is minted, and
 /// `WLX_SAS_ACTION_LOGON` is not returned.
 pub(crate) const LSA_WORKER_ROUTE_ENABLED: bool = true;
-/// Ship switch for the SECOND (and further) `\pipe\lsarpc` per-connection rpcrt4 worker — the one
-/// winlogon's post-profile `LsaOpenPolicy` bind needs. `false` restores the single named slot, the
-/// `rpc_server.c:631 failed to create thread, error=5aa` refusal, and the deadlock behind it.
-pub(crate) const LSA_RPC_EXTRA_CONNECTION_WORKERS: bool = true;
-/// Additional `\lsarpc` connection workers that were given a real generic worker slot.
+/// `\lsarpc` connection workers that were given a real dynamic hosted worker slot.
 pub(crate) static LSA_RPC_EXTRA_WORKERS_CLAIMED: AtomicU64 = AtomicU64::new(0);
 static LSA_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Times lsass' `\pipe\lsarpc` rpcrt4 SERVER thread reached `RPCRT4_new_client`
@@ -8323,8 +8233,7 @@ pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool 
         let rax = regs[nt_user_callback::USER_CONTEXT_RAX];
         let value = regs[nt_user_callback::USER_CONTEXT_RCX] as u32;
         if rip == ip && rax.wrapping_add(0x1250) == addr {
-            regs[nt_user_callback::USER_CONTEXT_RIP] =
-                ip.wrapping_add(RTL_LAST_STATUS_STORE_LEN);
+            regs[nt_user_callback::USER_CONTEXT_RIP] = ip.wrapping_add(RTL_LAST_STATUS_STORE_LEN);
             let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &regs, false);
             if write_error == 0 {
                 core::ptr::write_volatile(
@@ -11161,7 +11070,7 @@ pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
 
 unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
     let mut base = TP_WORKER_SLOT1_REGION_BASE;
-    let end = LSA_WORKER_REGION_BASE + 0x20_0000;
+    let end = tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + 0x20_0000;
     while base < end {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -11919,7 +11828,11 @@ fn wait_reply_pool_has_free() -> bool {
 
 fn wait_reply_pool_used_count() -> u64 {
     (0..WAIT_REPLY_POOL_USED_WORDS)
-        .map(|word| WAIT_REPLY_POOL_USED[word].load(Ordering::Relaxed).count_ones() as u64)
+        .map(|word| {
+            WAIT_REPLY_POOL_USED[word]
+                .load(Ordering::Relaxed)
+                .count_ones() as u64
+        })
         .sum()
 }
 
@@ -16173,9 +16086,7 @@ enum HostedThreadSpawnRequest {
     Csr { slot: usize },
     Winlogon { slot: usize },
     ServicesListener,
-    ScmWorker,
     LsassListener { slot: usize },
-    LsaWorker,
     TpWorker { pi: usize, slot: usize },
 }
 
@@ -16857,11 +16768,9 @@ enum HostedThreadRole {
     WinlogonListener,
     WinlogonWorker { slot: usize },
     ServicesListener,
-    ScmWorker,
     LsassListener,
     LsassListener2,
     LsassListener3,
-    LsaWorker,
 }
 
 impl HostedThreadRole {
@@ -16875,23 +16784,16 @@ impl HostedThreadRole {
     }
 
     const fn is_scm_rpc_worker(self) -> bool {
-        matches!(self, Self::ScmWorker | Self::ScmWorkerSlot { .. })
+        matches!(self, Self::ScmWorkerSlot { .. })
     }
 
     const fn is_lsa_rpc_worker(self) -> bool {
-        matches!(self, Self::LsaWorker | Self::LsaWorkerSlot { .. })
+        matches!(self, Self::LsaWorkerSlot { .. })
     }
 
     const fn can_raw_resume_from_nt_resume_thread(self) -> bool {
-        match self {
-            // This worker is started eagerly and then parks on pipe/event waits. Before the runtime
-            // table existed it had no legacy TCB cell, so NtResumeThread cleared bookkeeping but did
-            // not raw-resume its TCB; the pipe/event redrive path owns wakeup ordering.
-            Self::LsaWorker => false,
-            _ => true,
-        }
+        true
     }
-
 }
 
 const fn hosted_thread_runtime_gate_bit(pi: usize, role: HostedThreadRole) -> u64 {
