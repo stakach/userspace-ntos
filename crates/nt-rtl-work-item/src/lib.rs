@@ -691,7 +691,13 @@ impl Default for WorkerStartLatch {
     }
 }
 
-pub const MAX_COMPLETION_WORKERS: usize = 3;
+/// Completion workers available inside one hosted process.
+///
+/// ReactOS permits up to 256 pool workers, but our current hosted runtime exposes sixteen generic
+/// worker windows per process and the async scheduler may occupy one of them. Keep ntdll's pool
+/// dynamic within that kernel-provided capacity instead of silently capping real service fan-out at
+/// the old three-worker staging limit.
+pub const MAX_COMPLETION_WORKERS: usize = 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerRole {
@@ -1702,12 +1708,13 @@ mod tests {
     fn short_work_reuses_running_worker_but_backlog_grows_to_capacity() {
         let mut fleet = WorkerFleet::new();
         let mut counters = PoolCounters::new();
-        let _one = counters
+        let one = counters
             .reserve(
                 1,
                 WorkItemPacket::new(1, 1, WorkItemFlags::EXECUTE_DEFAULT, 0),
             )
             .unwrap();
+        let mut held = std::vec![one];
         let first = reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
         assert_eq!(first.reason, GrowthReason::Bootstrap);
         assert_eq!(finish_worker(&mut fleet, first).slot(), 0);
@@ -1716,33 +1723,29 @@ mod tests {
             EnsureWorker::Ready
         );
 
-        let _two = counters
-            .reserve(
-                2,
-                WorkItemPacket::new(1, 2, WorkItemFlags::EXECUTE_DEFAULT, 0),
-            )
-            .unwrap();
-        let second =
-            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
-        assert_eq!(second.reason, GrowthReason::Backlog);
-        assert_eq!(finish_worker(&mut fleet, second).slot(), 1);
+        for request in 2..=MAX_COMPLETION_WORKERS {
+            held.push(
+                counters
+                    .reserve(
+                        request as u64,
+                        WorkItemPacket::new(1, request as u64, WorkItemFlags::EXECUTE_DEFAULT, 0),
+                    )
+                    .unwrap(),
+            );
+            let next =
+                reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters));
+            assert_eq!(next.reason, GrowthReason::Backlog);
+            assert_eq!(finish_worker(&mut fleet, next).slot(), (request - 1) as u8);
+        }
 
-        let _three = counters
-            .reserve(
-                3,
-                WorkItemPacket::new(1, 3, WorkItemFlags::EXECUTE_IN_IO_THREAD, 0),
-            )
-            .unwrap();
-        let third =
-            reservation(fleet.ensure_completion(WorkItemFlags::EXECUTE_IN_IO_THREAD, &counters));
-        assert_eq!(finish_worker(&mut fleet, third).slot(), 2);
-
-        let _four = counters
-            .reserve(
-                4,
-                WorkItemPacket::new(1, 4, WorkItemFlags::EXECUTE_DEFAULT, 0),
-            )
-            .unwrap();
+        held.push(
+            counters
+                .reserve(
+                    0xFF,
+                    WorkItemPacket::new(1, 0xFF, WorkItemFlags::EXECUTE_DEFAULT, 0),
+                )
+                .unwrap(),
+        );
         assert_eq!(
             fleet.ensure_completion(WorkItemFlags::EXECUTE_DEFAULT, &counters),
             EnsureWorker::CapacityReached

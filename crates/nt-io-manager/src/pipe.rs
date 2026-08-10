@@ -33,9 +33,12 @@ use nt_status::NtStatus;
 /// `FILE_PIPE_BYTE_STREAM_TYPE` / `FILE_PIPE_MESSAGE_TYPE`.
 pub const FILE_PIPE_BYTE_STREAM_TYPE: u32 = 0x0000_0000;
 pub const FILE_PIPE_MESSAGE_TYPE: u32 = 0x0000_0001;
-/// `FILE_PIPE_*_MODE` (read/completion mode).
+/// `FILE_PIPE_*_MODE` (read mode).
 pub const FILE_PIPE_BYTE_STREAM_MODE: u32 = 0x0000_0000;
 pub const FILE_PIPE_MESSAGE_MODE: u32 = 0x0000_0001;
+/// `FILE_PIPE_*_OPERATION` (completion mode).
+pub const FILE_PIPE_QUEUE_OPERATION: u32 = 0x0000_0000;
+pub const FILE_PIPE_COMPLETE_OPERATION: u32 = 0x0000_0001;
 /// `FILE_PIPE_INBOUND` / `OUTBOUND` / `FULL_DUPLEX` (`NamedPipeConfiguration`).
 /// Also the `DataQueue[2]` index convention: `INBOUND`=client→server,
 /// `OUTBOUND`=server→client.
@@ -187,6 +190,23 @@ impl DataQueue {
                     more = true; // message truncated → BUFFER_OVERFLOW semantics
                 }
             }
+        } else {
+            // Byte-mode reads still consume bytes from message-type pipes. Keep the
+            // message-boundary queue aligned so a later read-mode switch cannot see
+            // a stale boundary for bytes that were already drained.
+            let mut remaining = take;
+            while remaining != 0 {
+                let Some(front) = self.msgs.front_mut() else {
+                    break;
+                };
+                if remaining >= *front {
+                    remaining -= *front;
+                    self.msgs.pop_front();
+                } else {
+                    *front -= remaining;
+                    break;
+                }
+            }
         }
         (out, more)
     }
@@ -205,6 +225,8 @@ pub struct PipeConnection {
     queues: [DataQueue; 2],
     /// Per-end read mode (`NP_CCB.ReadMode[2]`): byte vs message.
     read_message_mode: [bool; 2],
+    /// Per-end completion mode (`NP_CCB.CompletionMode[2]`).
+    completion_mode: [u32; 2],
     /// The pipe's write type (byte-stream vs message) from the FCB config.
     write_message_mode: bool,
     /// The pipe's duplex direction (`FILE_PIPE_INBOUND/OUTBOUND/FULL_DUPLEX`).
@@ -214,6 +236,7 @@ pub struct PipeConnection {
 impl PipeConnection {
     fn new(params: &PipeParams) -> Self {
         let msg = params.pipe_type == FILE_PIPE_MESSAGE_TYPE;
+        let server_msg = params.read_mode == FILE_PIPE_MESSAGE_MODE;
         PipeConnection {
             state: PipeState::Disconnected,
             server_attached: true, // created by the server side
@@ -222,7 +245,8 @@ impl PipeConnection {
                 DataQueue::new(params.inbound_quota),
                 DataQueue::new(params.outbound_quota),
             ],
-            read_message_mode: [msg, msg],
+            read_message_mode: [false, server_msg],
+            completion_mode: [FILE_PIPE_QUEUE_OPERATION, params.completion_mode],
             write_message_mode: msg,
             configuration: params.configuration,
         }
@@ -278,6 +302,10 @@ pub struct PipeParams {
     pub pipe_type: u32,
     /// `NamedPipeConfiguration`: INBOUND / OUTBOUND / FULL_DUPLEX.
     pub configuration: u32,
+    /// Initial server-end read mode from `NAMED_PIPE_CREATE_PARAMETERS.ReadMode`.
+    pub read_mode: u32,
+    /// Initial server-end completion mode from `NAMED_PIPE_CREATE_PARAMETERS.CompletionMode`.
+    pub completion_mode: u32,
     /// The client→server queue quota.
     pub inbound_quota: usize,
     /// The server→client queue quota.
@@ -291,10 +319,19 @@ impl Default for PipeParams {
             max_instances: u32::MAX,
             pipe_type: FILE_PIPE_BYTE_STREAM_TYPE,
             configuration: FILE_PIPE_FULL_DUPLEX,
+            read_mode: FILE_PIPE_BYTE_STREAM_MODE,
+            completion_mode: FILE_PIPE_QUEUE_OPERATION,
             inbound_quota: 4096,
             outbound_quota: 4096,
         }
     }
+}
+
+/// `FILE_PIPE_INFORMATION` for `NtQueryInformationFile`/`NtSetInformationFile`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PipeInformation {
+    pub read_mode: u32,
+    pub completion_mode: u32,
 }
 
 /// A named pipe (`NP_FCB`): a name + its config + the live connection instances.
@@ -357,6 +394,14 @@ impl PipeRegistry {
         name: &str,
         params: PipeParams,
     ) -> Result<PipeHandle, NtStatus> {
+        if !valid_pipe_type(params.pipe_type)
+            || !valid_pipe_mode(params.read_mode)
+            || !valid_completion_mode(params.completion_mode)
+            || (params.pipe_type == FILE_PIPE_BYTE_STREAM_TYPE
+                && params.read_mode == FILE_PIPE_MESSAGE_MODE)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let fcb_idx = match self.find_fcb(name) {
             Some(idx) => {
                 // Additional instance — enforce MaximumInstances.
@@ -427,6 +472,8 @@ impl PipeRegistry {
         };
         let conn = &mut fcb.connections[conn_idx];
         conn.client_attached = true;
+        conn.read_message_mode[FILE_PIPE_CLIENT_END] = false;
+        conn.completion_mode[FILE_PIPE_CLIENT_END] = FILE_PIPE_QUEUE_OPERATION;
         conn.state = PipeState::Connected;
         Ok(PipeHandle {
             fcb: fcb_idx,
@@ -537,6 +584,41 @@ impl PipeRegistry {
         Ok(self.conn(h)?.readable_bytes(h.end))
     }
 
+    /// `FilePipeInformation` query for one end of a named-pipe connection.
+    pub fn query_pipe_information(&self, h: PipeHandle) -> Result<PipeInformation, NtStatus> {
+        let conn = self.conn(h)?;
+        let end = h.end.to_raw();
+        Ok(PipeInformation {
+            read_mode: if conn.read_message_mode[end] {
+                FILE_PIPE_MESSAGE_MODE
+            } else {
+                FILE_PIPE_BYTE_STREAM_MODE
+            },
+            completion_mode: conn.completion_mode[end],
+        })
+    }
+
+    /// `FilePipeInformation` set for one end of a named-pipe connection.
+    pub fn set_pipe_information(
+        &mut self,
+        h: PipeHandle,
+        information: PipeInformation,
+    ) -> Result<(), NtStatus> {
+        if !valid_pipe_mode(information.read_mode)
+            || !valid_completion_mode(information.completion_mode)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let conn = self.conn_mut(h)?;
+        if information.read_mode == FILE_PIPE_MESSAGE_MODE && !conn.write_message_mode {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let end = h.end.to_raw();
+        conn.read_message_mode[end] = information.read_mode == FILE_PIPE_MESSAGE_MODE;
+        conn.completion_mode[end] = information.completion_mode;
+        Ok(())
+    }
+
     // --- internals ---------------------------------------------------------
 
     fn conn(&self, h: PipeHandle) -> Result<&PipeConnection, NtStatus> {
@@ -552,6 +634,24 @@ impl PipeRegistry {
             .and_then(|f| f.connections.get_mut(h.conn))
             .ok_or(NtStatus::INVALID_HANDLE)
     }
+}
+
+fn valid_pipe_type(pipe_type: u32) -> bool {
+    matches!(
+        pipe_type,
+        FILE_PIPE_BYTE_STREAM_TYPE | FILE_PIPE_MESSAGE_TYPE
+    )
+}
+
+fn valid_pipe_mode(mode: u32) -> bool {
+    matches!(mode, FILE_PIPE_BYTE_STREAM_MODE | FILE_PIPE_MESSAGE_MODE)
+}
+
+fn valid_completion_mode(mode: u32) -> bool {
+    matches!(
+        mode,
+        FILE_PIPE_QUEUE_OPERATION | FILE_PIPE_COMPLETE_OPERATION
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1376,6 +1476,26 @@ mod tests {
         PipeRegistry::new()
     }
 
+    fn message_params() -> PipeParams {
+        PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            read_mode: FILE_PIPE_MESSAGE_MODE,
+            ..PipeParams::default()
+        }
+    }
+
+    fn set_message_read(registry: &mut PipeRegistry, handle: PipeHandle) {
+        registry
+            .set_pipe_information(
+                handle,
+                PipeInformation {
+                    read_mode: FILE_PIPE_MESSAGE_MODE,
+                    completion_mode: FILE_PIPE_QUEUE_OPERATION,
+                },
+            )
+            .unwrap();
+    }
+
     fn wtr(file_id: u64, pi: u32, tid: u64) -> PipeWaiter {
         PipeWaiter {
             file_id,
@@ -1573,6 +1693,99 @@ mod tests {
     }
 
     #[test]
+    fn message_pipe_client_connect_defaults_to_byte_read_mode() {
+        let mut r = dx();
+        let s = r.create_server_pipe("rpc", message_params()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("rpc").unwrap();
+
+        assert_eq!(
+            r.query_pipe_information(s).unwrap(),
+            PipeInformation {
+                read_mode: FILE_PIPE_MESSAGE_MODE,
+                completion_mode: FILE_PIPE_QUEUE_OPERATION,
+            }
+        );
+        assert_eq!(
+            r.query_pipe_information(c).unwrap(),
+            PipeInformation {
+                read_mode: FILE_PIPE_BYTE_STREAM_MODE,
+                completion_mode: FILE_PIPE_QUEUE_OPERATION,
+            }
+        );
+
+        r.pipe_write(s, b"HELLO").unwrap();
+        let (part, more) = r.pipe_read(c, 3).unwrap();
+        assert_eq!(&part, b"HEL");
+        assert!(
+            !more,
+            "client read mode is byte stream until user mode changes it"
+        );
+        assert_eq!(r.pipe_read(c, 8).unwrap().0, b"LO");
+    }
+
+    #[test]
+    fn file_pipe_information_switches_client_to_message_read_mode() {
+        let mut r = dx();
+        let s = r.create_server_pipe("rpc", message_params()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("rpc").unwrap();
+
+        set_message_read(&mut r, c);
+        assert_eq!(
+            r.query_pipe_information(c).unwrap(),
+            PipeInformation {
+                read_mode: FILE_PIPE_MESSAGE_MODE,
+                completion_mode: FILE_PIPE_QUEUE_OPERATION,
+            }
+        );
+        r.pipe_write(s, b"HELLO").unwrap();
+        let (part, more) = r.pipe_read(c, 3).unwrap();
+        assert_eq!(&part, b"HEL");
+        assert!(more);
+        assert_eq!(r.pipe_read(c, 8).unwrap().0, b"LO");
+    }
+
+    #[test]
+    fn byte_read_consumes_message_boundaries_before_mode_switch() {
+        let mut r = dx();
+        let s = r.create_server_pipe("rpc", message_params()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("rpc").unwrap();
+
+        r.pipe_write(s, b"HELLO").unwrap();
+        assert_eq!(r.pipe_read(c, 5).unwrap().0, b"HELLO");
+        set_message_read(&mut r, c);
+        r.pipe_write(s, b"ABC").unwrap();
+        let (got, more) = r.pipe_read(c, 8).unwrap();
+        assert_eq!(&got, b"ABC");
+        assert!(
+            !more,
+            "drained byte-mode data must not leave a stale message boundary"
+        );
+    }
+
+    #[test]
+    fn byte_stream_pipe_rejects_message_read_mode() {
+        let mut r = dx();
+        let s = r.create_server_pipe("byte", PipeParams::default()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("byte").unwrap();
+
+        assert_eq!(
+            r.set_pipe_information(
+                c,
+                PipeInformation {
+                    read_mode: FILE_PIPE_MESSAGE_MODE,
+                    completion_mode: FILE_PIPE_QUEUE_OPERATION,
+                },
+            )
+            .unwrap_err(),
+            NtStatus::INVALID_PARAMETER
+        );
+    }
+
+    #[test]
     fn server_write_client_read_exact_bytes() {
         let mut r = dx();
         let s = r.create_server_pipe("p", PipeParams::default()).unwrap();
@@ -1606,10 +1819,7 @@ mod tests {
         // 56 bytes queued for the next read. The executive's pipe re-drive must copy those partial
         // bytes to the reader even though the status is not SUCCESS — this reproduces that contract.
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("ntsvcs", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("ntsvcs").unwrap();
@@ -1649,10 +1859,7 @@ mod tests {
         // IRP's ORIGINAL buffer instead of the buffer npfs REASSIGNED into AssociatedIrp.SystemBuffer on
         // completion, so the reader got 16 zero bytes; this model asserts the byte-exact reconcile.)
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("ntsvcs", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("ntsvcs").unwrap();
@@ -1687,10 +1894,7 @@ mod tests {
         // write, a 16-byte read (returns the first 16 WITH overflow), then a 56-byte read (drains the
         // rest, no overflow). Asserts the message-mode partial-read semantics the reconcile relies on.
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("p", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("p").unwrap();
@@ -1809,13 +2013,11 @@ mod tests {
         // Model an RPC request/reply. The first transceive queues the request and pends because the
         // reply is not available yet; the later read drains the reply bytes.
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("p", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("p").unwrap();
+        set_message_read(&mut r, c);
         assert_eq!(r.transceive(c, b"req", 16), Err(STATUS_PENDING));
         // Server reads it and writes the reply.
         assert_eq!(r.pipe_read(s, 16).unwrap().0, b"req");
@@ -1827,13 +2029,11 @@ mod tests {
     #[test]
     fn transceive_without_reply_pends_after_queuing_request() {
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("ntcontrol", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("ntcontrol").unwrap();
+        set_message_read(&mut r, c);
 
         assert_eq!(r.transceive(c, b"svc-control", 4), Err(STATUS_PENDING));
 
@@ -1846,13 +2046,11 @@ mod tests {
     #[test]
     fn transceive_rejects_unread_reply_without_writing_request() {
         let mut r = dx();
-        let params = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let params = message_params();
         let s = r.create_server_pipe("busy", params).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("busy").unwrap();
+        set_message_read(&mut r, c);
 
         r.pipe_write(s, b"old-reply").unwrap();
         assert_eq!(r.transceive(c, b"new-request", 16), Err(STATUS_PIPE_BUSY));
@@ -1863,13 +2061,11 @@ mod tests {
     #[test]
     fn message_mode_reads_one_message_at_a_time() {
         let mut r = dx();
-        let p = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let p = message_params();
         let s = r.create_server_pipe("m", p).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("m").unwrap();
+        set_message_read(&mut r, c);
         r.pipe_write(s, b"AAA").unwrap();
         r.pipe_write(s, b"BB").unwrap();
         // First read returns exactly the first message, not both coalesced.
@@ -1880,13 +2076,11 @@ mod tests {
     #[test]
     fn message_mode_truncation_reports_more() {
         let mut r = dx();
-        let p = PipeParams {
-            pipe_type: FILE_PIPE_MESSAGE_TYPE,
-            ..PipeParams::default()
-        };
+        let p = message_params();
         let s = r.create_server_pipe("m", p).unwrap();
         r.listen(s).unwrap();
         let c = r.connect_client("m").unwrap();
+        set_message_read(&mut r, c);
         r.pipe_write(s, b"HELLO").unwrap();
         let (part1, more1) = r.pipe_read(c, 3).unwrap();
         assert_eq!(&part1, b"HEL");

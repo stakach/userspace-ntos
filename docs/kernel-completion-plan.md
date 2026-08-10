@@ -2916,3 +2916,25 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
   listener ordering, or I/O scheduler semantics so a context handle created on one accepted pipe
   association is not consumed through another server association. Do not add UUID, service-name,
   executable-order, RPC-byte, or paint fallbacks.
+
+- I4 NPFS pipe-mode/work-pool capacity slice complete for the current evidence. The host-testable
+  NPFS connection model now carries `FilePipeInformation` read/completion mode state, resets the
+  client end to byte-read/queued completion on connect like ReactOS `NpSetConnectedPipeState`, keeps
+  message boundaries coherent across byte-mode reads before a later `SetNamedPipeHandleState`, and
+  rejects message-read mode on byte-stream pipes. The ntdll work-item fleet also removes the old
+  three-completion-worker staging cap and grows dynamically up to the current hosted runtime worker
+  capacity, leaving one slot for the async scheduler. Validation: `cargo test -p nt-io-manager pipe
+  -- --nocapture`, `cargo test -p nt-rtl-work-item -- --nocapture`, `cargo fmt --all`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `git diff --check`, and serialized desktop retry
+  `.tmp/boot-pipe-mode-workpool-20260811-043339.log`. Result: the run reaches the microtest sentinel
+  at `250/295`, keeps real win32k base desktop paint green (`desktop-bg 768/768` and
+  `exec_win32k_desktop_painted`), launches later dynamic services, and still reports
+  `RpcServerListen() failed (Status 6b1)` for Browser/Srvsvc-style service RPC listeners. This is
+  not a shell-chrome proof: `ProfileList` live opens remain zero, `NtLoadKey` is not reached for the
+  user hive, `userinit.exe` and `explorer.exe` have zero image opens/spawns, and
+  `exec_explorer_shell_chrome_painted` remains red. Review adjustment: the immediate next slice
+  should restore the real winlogon logon-token/profile path (`NtCreateToken`, LSA auth-port client
+  connection, mounted SOFTWARE `ProfileList`, `NtLoadKey`, profile copy) before expecting natural
+  userinit/explorer paint. No service-name, UUID, launch-order, RPC-byte, or paint fallback has been
+  introduced.
