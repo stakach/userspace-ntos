@@ -2060,3 +2060,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   recur, and the harness reports the base desktop-painted success. Review adjustment: continue A4 at
   real service-control pipe timing/IPC after the WLAN service `EVENT_CONNECTION_TIMEOUT`; no
   service-name pipe/executable fallback should be reintroduced.
+- A4 pipe fid-name authority continued. The next service-control timeout came from internal pipe
+  metadata authority, not a missing policy shortcut: the old fixed 32-entry fid-name table dropped
+  late service pipe fids, and async-listen completion treated `name_hash == 0` as a wildcard. A
+  client connect for `\net\NtControlPipe5` could therefore wake an unrelated pending listen while
+  the actual SCM control pipe stayed pending until `NtCancelIoFile`. `PipeFidNameTable` is now a
+  growable host-tested structure, zero hashes are invalid/non-matching, named-pipe create/open
+  records the leaf hash before publishing a handle, `FSCTL_PIPE_LISTEN` fails rather than arming an
+  unnamed server fid, and file-id mappings are removed only after the last file-completion reference
+  is released. Local validation: `cargo fmt --all`, `cargo test -p nt-io-manager pipe_fid_name
+  -- --nocapture`, `cargo test -p nt-io-manager async_listen -- --nocapture`,
+  `cargo test -p nt-io-manager -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Serialized boot proof in `.tmp/boot-current-headless-20260810.log` reaches
+  `SUCCESS ... win32k desktop painted (0x003a6ea5)`; the late `\net\NtControlPipe5` wait is
+  `armed=1 known=1`, wakes only exact hash-matched fids `0e814c80`/`0e814c81`, and no longer shows
+  the previous `known=0`, timeout, cancel, service `Error 1053`, or unhandled-syscall signatures.
+  Review adjustment: continue only from the next real red edge after the desktop proof.

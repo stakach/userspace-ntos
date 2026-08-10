@@ -809,6 +809,90 @@ impl<const N: usize> PipeWaiterTable<N> {
 // executive wires the signal through its EXISTING `wait_wake_event_set` (NtSetEvent → WOKE parked
 // waiter) path, exactly like an `NtSetEvent`.
 
+/// A growable fid -> pipe-name-hash map. The executive records both server and client pipe
+/// FILE_OBJECT ids here so later async LISTEN, WAIT, and trace paths can stay name-scoped without a
+/// fixed cap or wildcard matching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PipeFidName {
+    pub file_id: u64,
+    pub name_hash: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipeFidNameTable {
+    entries: Vec<PipeFidName>,
+}
+
+impl Default for PipeFidNameTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipeFidNameTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn remember(&mut self, file_id: u64, name_hash: u64) -> Result<(), ()> {
+        if file_id == 0 || name_hash == 0 {
+            return Err(());
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.file_id == file_id)
+        {
+            entry.name_hash = name_hash;
+            return Ok(());
+        }
+        if self.entries.len() == self.entries.capacity() {
+            let reserve = if self.entries.capacity() == 0 { 32 } else { 1 };
+            self.entries.try_reserve(reserve).map_err(|_| ())?;
+        }
+        self.entries.push(PipeFidName { file_id, name_hash });
+        Ok(())
+    }
+
+    pub fn name_hash(&self, file_id: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.file_id == file_id)
+            .map(|entry| entry.name_hash)
+    }
+
+    pub fn contains_name_hash(&self, name_hash: u64) -> bool {
+        name_hash != 0
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.name_hash == name_hash)
+    }
+
+    pub fn forget(&mut self, file_id: u64) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.file_id == file_id)
+        {
+            self.entries.swap_remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// A pending async server-side `FSCTL_PIPE_LISTEN` awaiting a client connect. Keyed by the SERVER
 /// end's npfs `file_id`. On the peer connect/write the executive completes it: fills `iosb_va` with
 /// SUCCESS (in the server's VSpace) and signals `event_obj_idx` (waking the server's wait-array).
@@ -830,8 +914,8 @@ pub struct AsyncListen {
     /// The I/O completion key/APC context passed to NtFsControlFile.
     pub apc_context: u64,
     /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, …). A client connect
-    /// completes ONLY the listen whose `name_hash` matches the connected pipe — so connecting to
-    /// `\ntsvcs` does NOT spuriously wake `\lsarpc`/`\samr` servers. 0 = unset (matches any).
+    /// completes ONLY the listen whose `name_hash` matches the connected pipe. `0` is incomplete
+    /// metadata and never matches.
     pub name_hash: u64,
 }
 
@@ -1188,12 +1272,14 @@ impl<const N: usize> AsyncListenTable<N> {
     /// Is there a pending listen matching `name_hash` without consuming it?
     ///
     /// This is the `FSCTL_PIPE_WAIT` check: user mode asks whether a named pipe has a listening
-    /// instance before it opens the client end. Matching follows the same wildcard contract as
-    /// [`complete_by_name`], but leaves the pending listen armed for the later client create.
+    /// instance before it opens the client end. Matching is exact and nonzero, but leaves the
+    /// pending listen armed for the later client create.
     pub fn armed_name(&self, name_hash: u64) -> bool {
-        self.slots.iter().any(|slot| {
-            slot.is_some_and(|l| name_hash == 0 || l.name_hash == 0 || l.name_hash == name_hash)
-        })
+        name_hash != 0
+            && self
+                .slots
+                .iter()
+                .any(|slot| slot.is_some_and(|l| l.name_hash != 0 && l.name_hash == name_hash))
     }
 
     /// Complete + free the listen on `server_file_id` (a client connected). Returns the completed
@@ -1222,14 +1308,17 @@ impl<const N: usize> AsyncListenTable<N> {
     }
 
     /// Complete + free the FIRST pending listen matching `name_hash` (a client connected to that
-    /// specific pipe name). `name_hash == 0` or a stored `name_hash == 0` matches any (unset). Returns
-    /// the completed record so the caller can signal its event + fill its IOSB. `None` if no match —
-    /// so a connect to `\ntsvcs` does NOT complete `\lsarpc`/`\samr` server listens. Idempotent: the
-    /// matched listen is consumed once; a fresh re-arm (re-post) is a NEW record.
+    /// specific pipe name). `0` never matches; a listen without real name metadata must not satisfy an
+    /// unrelated client connect. Returns the completed record so the caller can signal its event +
+    /// fill its IOSB. `None` if no match. Idempotent: the matched listen is consumed once; a fresh
+    /// re-arm (re-post) is a NEW record.
     pub fn complete_by_name(&mut self, name_hash: u64) -> Option<AsyncListen> {
+        if name_hash == 0 {
+            return None;
+        }
         for slot in self.slots.iter_mut() {
             if let Some(l) = *slot {
-                if name_hash == 0 || l.name_hash == 0 || l.name_hash == name_hash {
+                if l.name_hash != 0 && l.name_hash == name_hash {
                     return slot.take();
                 }
             }
@@ -2033,6 +2122,7 @@ mod tests {
 
         assert!(t.armed_name(pipe_name_hash(&ntsvcs)));
         assert!(!t.armed_name(pipe_name_hash(&lsarpc)));
+        assert!(!t.armed_name(0));
         assert_eq!(t.len(), 1, "wait probing must not consume the listen");
 
         let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
@@ -2083,30 +2173,50 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_complete_by_name_wildcards_on_unset_hash() {
-        // The `name_hash == 0` (unset) contract on BOTH sides: a stored listen with name_hash==0 is
-        // matched by ANY connect (legacy/unnamed arm), and a query name_hash==0 matches the FIRST armed
-        // listen (a connect whose name we couldn't hash). Both are the documented wildcard branches.
+    fn async_listen_complete_by_name_rejects_unset_hash() {
+        // Missing name metadata is an internal resource/registration problem, not a wildcard. A later
+        // client connect must never complete an unrelated listen just because either hash is zero.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        // Stored unset → matched by a specific query.
         let mut t = AsyncListenTable::<8>::new();
         t.arm(al(0xA, 1)).unwrap(); // al() leaves name_hash == 0
-        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
-        assert_eq!(
-            done.event_obj_idx, 1,
-            "an unset stored name_hash matches any connect"
-        );
-        assert!(t.is_empty());
-        // Query unset (hash 0) → matches the FIRST armed listen regardless of its stored name.
+        assert!(t.complete_by_name(pipe_name_hash(&ntsvcs)).is_none());
+        assert!(t.complete_by_name(0).is_none());
+        assert_eq!(t.len(), 1);
+
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
         let mut t2 = AsyncListenTable::<8>::new();
         t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
-        let done2 = t2.complete_by_name(0).unwrap();
-        assert_eq!(
-            done2.event_obj_idx, 2,
-            "a hash-0 query matches the first armed listen"
-        );
-        assert!(t2.is_empty());
+        assert!(t2.complete_by_name(0).is_none());
+        assert_eq!(t2.len(), 1);
+    }
+
+    #[test]
+    fn pipe_fid_name_table_grows_updates_and_rejects_zero() {
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
+        let ntsvcs_hash = pipe_name_hash(&ntsvcs);
+        let lsarpc_hash = pipe_name_hash(&lsarpc);
+        let mut table = PipeFidNameTable::new();
+
+        assert!(table.is_empty());
+        assert!(table.remember(0, ntsvcs_hash).is_err());
+        assert!(table.remember(0x10, 0).is_err());
+        for i in 0..40 {
+            table.remember(0x100 + i, ntsvcs_hash).unwrap();
+        }
+        assert_eq!(table.len(), 40);
+        assert_eq!(table.name_hash(0x123), Some(ntsvcs_hash));
+        assert!(table.contains_name_hash(ntsvcs_hash));
+        assert!(!table.contains_name_hash(0));
+
+        table.remember(0x123, lsarpc_hash).unwrap();
+        assert_eq!(table.len(), 40, "updating a fid does not duplicate it");
+        assert_eq!(table.name_hash(0x123), Some(lsarpc_hash));
+        assert!(table.contains_name_hash(lsarpc_hash));
+        assert!(table.forget(0x123));
+        assert_eq!(table.name_hash(0x123), None);
+        assert_eq!(table.len(), 39);
+        assert!(!table.forget(0x123));
     }
 
     #[test]

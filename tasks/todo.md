@@ -212,9 +212,10 @@ Winlogon client connect got fid 0x0e802d50 (pairs by name in npfs prefix table).
 ## Phase A — host-test backfill (DONE)
 Backfilled meaningful HOST unit tests for under-covered subsystems from the recent arc. NO boot, NO
 executive/rust-micro change (test-only additions in the crates). All three targeted crates green.
-- **nt-io-manager 73 → 83** (+10): AsyncListenTable name-hash WILDCARD branches (stored `name_hash==0`
-  matches any connect; query hash-0 matches first armed; first-of-same-name consumed once + re-arm is a
-  new record); PipeWaiterTable `cancel_thread` clears `parked_on` + reopens slots (+ no-match no-op) +
+- **nt-io-manager 73 → 83** (+10): AsyncListenTable name-hash specificity branches. Historical
+  hash-zero wildcard behavior has since been removed: stored `name_hash==0` and query hash zero do
+  not match; first-of-same-name is consumed once and re-arm is a new record. PipeWaiterTable
+  `cancel_thread` clears `parked_on` + reopens slots (+ no-match no-op) +
   `drain_all` stable slot-order/lowest-free reuse; half-duplex OUTBOUND READ direction reject (only
   WRITE dir was covered); `dequeue(max=0)` no-drain; `enqueue` full-queue → 0 accepted; `transceive`
   propagates wrong-direction + disconnected write errors.

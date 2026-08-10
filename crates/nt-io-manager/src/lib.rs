@@ -58,9 +58,9 @@ pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pipe::{
     decode_pipe_wait_name, decode_pipe_wait_request, pipe_name_hash, AsyncListen, AsyncListenTable,
-    PipeConnection, PipeEnd, PipeFcb, PipeHandle, PipeNameWaiter, PipeNameWaiterTable, PipeParams,
-    PipeRegistry, PipeState, PipeWaitRequest, PipeWaiter, PipeWaiterTable,
-    FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,
+    PipeConnection, PipeEnd, PipeFcb, PipeFidName, PipeFidNameTable, PipeHandle, PipeNameWaiter,
+    PipeNameWaiterTable, PipeParams, PipeRegistry, PipeState, PipeWaitRequest, PipeWaiter,
+    PipeWaiterTable, FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,
     FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND, FILE_PIPE_MESSAGE_MODE, FILE_PIPE_MESSAGE_TYPE,
     FILE_PIPE_OUTBOUND, FILE_PIPE_SERVER_END, STATUS_INSTANCE_NOT_AVAILABLE, STATUS_PIPE_BUSY,
     STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,

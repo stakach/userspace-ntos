@@ -6782,8 +6782,13 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn release_file_reference(&mut self, file_id: u64) {
-        if let Ok(Some(port_id)) = self.file_completion.release_file(file_id) {
-            let _ = self.io_completion_ports.release(port_id);
+        if let Ok(port_id) = self.file_completion.release_file(file_id) {
+            if self.file_completion.is_signaled(file_id).is_err() {
+                crate::pipe_fid_name_forget(file_id);
+            }
+            if let Some(port_id) = port_id {
+                let _ = self.io_completion_ports.release(port_id);
+            }
         }
     }
 
@@ -13708,17 +13713,24 @@ impl ExecNtHandler {
                 match self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
                     Ok((st, fid)) => {
                         let mut status = st as u32;
+                        let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                         let opened_handle = if status == 0 && fid != 0 {
                             let options = args[5] as u32;
                             let synchronous = options
                                 & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                     | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                 != 0;
-                            let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
-                            if handle.is_none() {
-                                status = 0xC000_009A;
+                            if let Err(name_status) = crate::pipe_fid_name_remember(fid, pipe_hash) {
+                                status = name_status;
+                                None
+                            } else {
+                                let handle = self.mint_file_handle(fid, args[1] as u32, synchronous);
+                                if handle.is_none() {
+                                    crate::pipe_fid_name_forget(fid);
+                                    status = 0xC000_009A;
+                                }
+                                handle
                             }
-                            handle
                         } else {
                             if status == 0 {
                                 status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
@@ -13728,11 +13740,7 @@ impl ExecNtHandler {
                         if let Some(handle) = opened_handle {
                             self.queue_write(file_handle_out, handle);
                             if status == 0 {
-                                self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
-                                crate::pipe_fid_name_remember(
-                                    fid,
-                                    nt_io_manager::pipe_name_hash(&leaf),
-                                );
+                                self.pipe_connect_redrive = pipe_hash;
                             }
                         } else {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
@@ -15864,11 +15872,18 @@ impl ExecNtHandler {
 
                 let status = match self.npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0) {
                     Ok((0, fid)) if fid != 0 => {
-                        routed_file_id = fid;
                         // Remember this server fid -> its pipe leaf name-hash, so a client connect
                         // completes only the matching-name server listen.
-                        crate::pipe_fid_name_remember(fid, nt_io_manager::pipe_name_hash(&leaf));
-                        nt_fs::STATUS_SUCCESS
+                        match crate::pipe_fid_name_remember(
+                            fid,
+                            nt_io_manager::pipe_name_hash(&leaf),
+                        ) {
+                            Ok(()) => {
+                                routed_file_id = fid;
+                                nt_fs::STATUS_SUCCESS
+                            }
+                            Err(name_status) => name_status,
+                        }
                     }
                     Ok((0, _)) => nt_fs::STATUS_INVALID_DEVICE_REQUEST,
                     Ok((st, _)) => st as u32,
@@ -15897,6 +15912,7 @@ impl ExecNtHandler {
                     != 0;
                 let Some(h) = self.mint_file_handle(routed_file_id, args[1] as u32, synchronous)
                 else {
+                    crate::pipe_fid_name_forget(routed_file_id);
                     if self.pi >= 2 {
                         self.queue_write(file_handle_out, 0);
                         if iosb != 0 {
@@ -16191,7 +16207,15 @@ impl ExecNtHandler {
                 if is_pipe_listen && (status as u32) == STATUS_PENDING && fid != 0 {
                     let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
                     let already_armed = table.armed(fid);
-                    let retain_status = if already_armed {
+                    let listen_name_hash = crate::pipe_fid_name_hash(fid);
+                    let retain_status = if listen_name_hash == 0 {
+                        print_str(b"[pipe-listen] REFUSED unnamed server fid=0x");
+                        print_hex(fid as u32);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b"\n");
+                        Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+                    } else if already_armed {
                         Ok(())
                     } else {
                         self.file_completion.retain_file(fid)
@@ -16208,7 +16232,7 @@ impl ExecNtHandler {
                                 apc_context: args[3],
                                 // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
                                 // client connect completes ONLY the matching-name listen.
-                                name_hash: crate::pipe_fid_name_hash(fid),
+                                name_hash: listen_name_hash,
                             })
                             .is_some()
                     {
@@ -16222,7 +16246,7 @@ impl ExecNtHandler {
                         print_str(b"\n");
                         // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
                         self.pipe_listen_fid = fid;
-                        self.pipe_name_wait_redrive = crate::pipe_fid_name_hash(fid);
+                        self.pipe_name_wait_redrive = listen_name_hash;
                     } else {
                         if !already_armed && retain_status.is_ok() {
                             self.release_file_reference(fid);
@@ -20789,12 +20813,17 @@ impl ExecNtHandler {
                             Ok((st, file_id)) => {
                                 status = st as u32;
                                 if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
+                                    let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                                     let options = args[8] as u32;
                                     let synchronous = options
                                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                             | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                         != 0;
-                                    if let Some(handle) =
+                                    if let Err(name_status) =
+                                        crate::pipe_fid_name_remember(file_id, pipe_hash)
+                                    {
+                                        status = name_status;
+                                    } else if let Some(handle) =
                                         self.mint_file_handle(file_id, args[1] as u32, synchronous)
                                     {
                                         self.queue_write(args[0], handle);
@@ -20803,10 +20832,9 @@ impl ExecNtHandler {
                                         // paired with the server end by name → complete the pending async
                                         // server listen FOR THAT PIPE NAME (signal its completion event → the
                                         // SCM listener's NtWaitForMultipleObjects wakes to read the bind PDU).
-                                        let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                                         self.pipe_connect_redrive = pipe_hash;
-                                        crate::pipe_fid_name_remember(file_id, pipe_hash);
                                     } else {
+                                        crate::pipe_fid_name_forget(file_id);
                                         status = 0xC000_009A;
                                     }
                                 } else if status == nt_fs::STATUS_SUCCESS {

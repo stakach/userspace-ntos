@@ -204,6 +204,23 @@ adjustment: the next A4 edge is service-control startup timing/IPC (`WLAN Servic
 `EVENT_CONNECTION_TIMEOUT` / control pipe `Error 1053`) before resuming richer explorer shell
 chrome proofs; do not reintroduce service-name pipe or executable fallbacks.
 
+Latest pipe fid-name authority slice removes the service-control pipe miscorrelation found in
+`.tmp/boot-ntcanceliofile-20260810.log`: a later client connect to `\net\NtControlPipe5` could
+complete an unrelated armed listen because the old fixed 32-entry fid-name table silently lost
+metadata and hash zero was treated as a wildcard. The pipe metadata table is now growable,
+zero hashes are invalid/non-matching, pipe endpoint create/open records the leaf hash before a
+handle is handed to user mode, `FSCTL_PIPE_LISTEN` refuses to arm without recorded metadata, and
+fid mappings are forgotten only after the last file-completion reference/handle is released.
+Local validation is green (`cargo fmt --all`, `cargo test -p nt-io-manager pipe_fid_name
+-- --nocapture`, `cargo test -p nt-io-manager async_listen -- --nocapture`,
+`cargo test -p nt-io-manager -- --nocapture`, `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`).
+Serialized boot proof in `.tmp/boot-current-headless-20260810.log` reaches the real desktop-painted
+gate (`SUCCESS ... win32k desktop painted (0x003a6ea5)`) with `\net\NtControlPipe5` reported as
+`armed=1 known=1`, exact-hash wakes for fids `0e814c80` and `0e814c81`, and no `known=0`,
+`[pipe-listen] REFUSED unnamed`, `NtCancelIoFile`, `EVENT_CONNECTION_TIMEOUT`, service `Error 1053`,
+or `unhandled-syscall` signatures.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -2604,3 +2621,21 @@ chrome proofs; do not reintroduce service-name pipe or executable fallbacks.
   `SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review
   adjustment: the next useful A4 work is generic service-control pipe timing/IPC after the WLAN
   service timeout, with explorer shell chrome proofs rerun once service startup is stable again.
+
+- A4 pipe fid-name authority slice. The service-control timeout root cause in
+  `.tmp/boot-ntcanceliofile-20260810.log` was not a missing pipe fallback; it was stale internal
+  authority. The fixed 32-entry fid-name table could drop later server/client pipe fids, and the
+  async-listen name match treated missing hash metadata (`0`) as a wildcard. That let a client
+  connect for `\net\NtControlPipe5` complete an unrelated listen while the real SCM control-pipe
+  server fid stayed pending until timeout/cancel. `PipeFidNameTable` is now growable and
+  host-tested, zero hashes are rejected/non-matching, endpoint create/open records pipe leaf names
+  before returning handles, listen arming fails honestly if metadata is missing, and mappings are
+  removed only after the final file-completion reference is released. Validation so far:
+  `cargo fmt --all`, `cargo test -p nt-io-manager pipe_fid_name -- --nocapture`,
+  `cargo test -p nt-io-manager async_listen -- --nocapture`,
+  `cargo test -p nt-io-manager -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Serialized boot proof in `.tmp/boot-current-headless-20260810.log` reaches
+  `SUCCESS ... win32k desktop painted (0x003a6ea5)`; the late `\net\NtControlPipe5` wait is
+  `armed=1 known=1`, wakes only exact hash-matched fids `0e814c80`/`0e814c81`, and does not emit
+  the previous `known=0`, timeout, cancel, service `Error 1053`, or unhandled-syscall signatures.

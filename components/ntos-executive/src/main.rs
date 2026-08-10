@@ -2559,52 +2559,36 @@ static PIPE_NAME_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-/// A tiny fid → pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` (server) and queried at
-/// FSCTL_PIPE_LISTEN arm time — so the async-listen record carries the pipe name-hash and a client
-/// connect completes ONLY the matching-name server listen. Fixed cap, `.bss`, single-threaded.
-const PIPE_FID_NAME_N: usize = 32;
-static PIPE_FID_NAME_FID: [AtomicU64; PIPE_FID_NAME_N] =
-    [const { AtomicU64::new(0) }; PIPE_FID_NAME_N];
-static PIPE_FID_NAME_HASH: [AtomicU64; PIPE_FID_NAME_N] =
-    [const { AtomicU64::new(0) }; PIPE_FID_NAME_N];
-/// Record (or update) `fid → name_hash`. Replaces an existing entry for `fid`.
-pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) {
-    if fid == 0 {
-        return;
-    }
-    // Update existing.
-    for i in 0..PIPE_FID_NAME_N {
-        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == fid {
-            PIPE_FID_NAME_HASH[i].store(name_hash, Ordering::Relaxed);
-            return;
-        }
-    }
-    // Insert into a free slot.
-    for i in 0..PIPE_FID_NAME_N {
-        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == 0 {
-            PIPE_FID_NAME_FID[i].store(fid, Ordering::Relaxed);
-            PIPE_FID_NAME_HASH[i].store(name_hash, Ordering::Relaxed);
-            return;
-        }
+/// Growable fid -> pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` and client
+/// `NtCreateFile`/`NtOpenFile` time. Async LISTEN completion and WAIT probing must be name-scoped;
+/// missing metadata is an error/non-match, never a wildcard.
+static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable =
+    nt_io_manager::PipeFidNameTable::new();
+
+/// Record (or update) `fid -> name_hash`. Replaces an existing entry for `fid`.
+pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) -> Result<(), u32> {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES))
+            .remember(fid, name_hash)
+            .map_err(|_| nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
 
+pub(crate) fn pipe_fid_name_forget(fid: u64) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES)).forget(fid) }
+}
+
 pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
-    name_hash != 0
-        && (0..PIPE_FID_NAME_N).any(|i| {
-            PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) != 0
-                && PIPE_FID_NAME_HASH[i].load(Ordering::Relaxed) == name_hash
-        })
+    unsafe { (&*core::ptr::addr_of!(PIPE_FID_NAMES)).contains_name_hash(name_hash) }
 }
 
 /// The name-hash recorded for `fid` (0 = unknown).
 pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
-    for i in 0..PIPE_FID_NAME_N {
-        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == fid {
-            return PIPE_FID_NAME_HASH[i].load(Ordering::Relaxed);
-        }
+    unsafe {
+        (&*core::ptr::addr_of!(PIPE_FID_NAMES))
+            .name_hash(fid)
+            .unwrap_or(0)
     }
-    0
 }
 const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
