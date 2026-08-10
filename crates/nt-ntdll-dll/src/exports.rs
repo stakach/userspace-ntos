@@ -1943,29 +1943,6 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 // =================================================================================================
 
 #[cfg(target_arch = "x86_64")]
-static CRITICAL_SECTION_EVENT_DIAGNOSTICS: AtomicU32 = AtomicU32::new(0);
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn report_critical_section_event(cs: *mut c_void, handle: u64) {
-    if CRITICAL_SECTION_EVENT_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) >= 8 {
-        return;
-    }
-    let mut message = [0u8; 64];
-    let mut length = 0usize;
-    for &byte in b"[cs-event] cs=0x" {
-        message[length] = byte;
-        length += 1;
-    }
-    length = crate::write_u64_hex(&mut message, length, cs as u64);
-    for &byte in b" handle=0x" {
-        message[length] = byte;
-        length += 1;
-    }
-    length = crate::write_u64_hex(&mut message, length, handle);
-    unsafe { crate::dbg_print_bytes(message.as_ptr(), length) };
-}
-
-#[cfg(target_arch = "x86_64")]
 unsafe fn critical_section_create_event() -> Result<u64, NtStatus> {
     let mut handle = 0u64;
     let status = unsafe {
@@ -2004,7 +1981,6 @@ unsafe fn critical_section_wait_handle(cs: *mut c_void) -> u64 {
         return existing;
     }
     let candidate = unsafe { critical_section_create_event() }.unwrap_or(u64::MAX);
-    unsafe { report_critical_section_event(cs, candidate) };
     match slot.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => candidate,
         Err(installed) => {
@@ -23910,6 +23886,28 @@ pub unsafe extern "system" fn rtl_destroy_heap(heap: *mut c_void) -> *mut c_void
     }
 }
 
+/// `RtlGetProcessHeap() -> PVOID` — return the process heap handle published in the PEB.
+///
+/// ReactOS kernel32 and several subsystem DLLs use this as the canonical heap handle accessor.
+/// The loader publishes `Peb->ProcessHeap` after creating the process heap; this export reports
+/// that real handle and never fabricates one before initialization.
+#[export_name = "RtlGetProcessHeap"]
+pub unsafe extern "system" fn rtl_get_process_heap() -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
+        if peb == 0 {
+            return core::ptr::null_mut();
+        }
+        core::ptr::read_volatile((peb + 0x30) as *const *mut c_void)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
 /// `RtlGetProcessHeaps(ULONG Count, PVOID* Heaps) -> ULONG` — enumerate the process's heaps. We have
 /// one (the process heap = `Peb->ProcessHeap` @ gs:[0x60]->0x30).
 ///
@@ -30262,6 +30260,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_destroy_heap as usize,
         rtl_multiple_allocate_heap as usize,
         rtl_multiple_free_heap as usize,
+        rtl_get_process_heap as usize,
         rtl_get_process_heaps as usize,
         rtl_lock_heap as usize,
         rtl_unlock_heap as usize,

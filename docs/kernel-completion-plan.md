@@ -31,18 +31,26 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Active boot-fix slice: `.tmp/boot-dynamic-tp-lanes-20260810-104012.log` rebuilt ntdll,
-the executive, rust-micro, and the disk image, then moved past the previous EventLog/rpcrt4 local
-worker exhaustion wall. EventLog connected, SCM/EventLog exchanged real
-`\ntsvcs`/`\pipe\EventLog` traffic, services continued, SRM accepted `\SeRmCommandPort`, LSA server
-threads parked on `NtListenPort`, and winlogon demand-loaded `msgina` and `shsvcs`. The old
-`STATUS_INSUFFICIENT_RESOURCES` / Win32 `1450` worker-slot frontier did not recur: when
-eventlog.exe requested another ntdll completion worker while its preferred low lane was busy, the
-kernel claimed dynamic slot 6 and the worker spawned. The current frontier is now a services.exe
-main-image-header fault (`cr2=PE_LOAD_BASE+0x20` from the main thread, later `PE_LOAD_BASE+0x10`
-from a services worker) that the committed-image fault owner rejects as `vmf-out`; other services
-threads keep processing RPC afterward, so the next slice should audit committed-image registration
-and lifetime for the services process rather than reintroducing an `img_end` fallback.
+Completed boot-fix slice: `.tmp/boot-clean-async-setevent-20260810-123921.log` rebuilt ntdll,
+the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
+the sentinel and the harness reporting `SUCCESS -- the ReactOS stack booted and the win32k desktop
+painted (0x003a6ea5)`. The services.exe main-image-header/list-walk fault
+(`PE_LOAD_BASE+0x20`, later `PE_LOAD_BASE+0x10`) was service-list memory corruption, not image
+ownership: an internal ntdll async wake called `NtSetEvent` with a stale non-null previous-state
+pointer after queuing a work item. The fix keeps async wake on the canonical `NtSetEvent(handle,
+NULL)` export stub, removes the stale fixed-address EventLog/list diagnostics, and keeps the native
+seL4-Call helpers honest by not claiming `options(nostack)` while reserving stack space. The proof
+lines are `scm-worker-ssn #22 ssn=228 ... arg2=0x00000000` and `#28 ... arg2=0x00000000`; the old
+services list `vmf-out` no longer appears.
+
+The current frontier is later profile/logon shell activation, not SCM list integrity. The latest
+boot still paints the base desktop and services/LSA/SAM paths progress, but user profile resolution
+and shell activation remain red in that harness run: `ProfileList` opens stay at zero,
+`NtLoadKey`/profile copy do not run, `userinit.exe` is not spawned, and explorer shell chrome is not
+painted beyond the magenta sentinel strip. The next slice should stay in real registry/profile/logon
+mechanisms: make winlogon's profile directory and `ProfileList` reads route through the mounted
+SOFTWARE hive and writable overlay, then drive `LoadUserProfile`/`NtLoadKey` far enough for
+`userinit.exe` to launch naturally.
 
 The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a bounded name waiter with real
 timeout/deadline handling and exact name completion, `NtOpenFile` clears failed output handles, and

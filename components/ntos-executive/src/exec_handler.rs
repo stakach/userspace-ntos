@@ -46,7 +46,6 @@ pub(crate) struct NpfsFileRoute {
     device_id: u64,
 }
 
-static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -8923,28 +8922,6 @@ impl ExecNtHandler {
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
-        }
-        if self.current_process_is_winlogon()
-            && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
-        {
-            print_str(b"[winlogon-vm] base_ptr=0x");
-            print_hex((base_ptr >> 32) as u32);
-            print_hex(base_ptr as u32);
-            print_str(b" size_ptr=0x");
-            print_hex((size_ptr >> 32) as u32);
-            print_hex(size_ptr as u32);
-            print_str(b" base_in=0x");
-            print_hex((base_in >> 32) as u32);
-            print_hex(base_in as u32);
-            print_str(b" want=0x");
-            print_hex((want >> 32) as u32);
-            print_hex(want as u32);
-            print_str(b" type=0x");
-            print_hex(args[4] as u32);
-            print_str(b" selected=0x");
-            print_hex((plan.base >> 32) as u32);
-            print_hex(plan.base as u32);
-            print_str(b"\n");
         }
 
         let mut page = plan.base;

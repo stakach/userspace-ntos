@@ -81,6 +81,8 @@ static mut CSR_PROCESS_ID: u64 = 0;
 static CSR_INSIDE_PROCESS: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 static CSR_NATIVE_STATIC_DATA_PUBLISHED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static CSR_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 /// Process-local cached IFEO roots. A loaded ntdll image has private writable data in each process,
 /// matching ReactOS's `ImageExecOptionsKey` / `Wow64ExecOptionsKey` globals.
@@ -1440,6 +1442,23 @@ struct LoadedMod {
     attach_failed: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl LoadedMod {
+    const fn empty() -> Self {
+        Self {
+            name: [0u8; 32],
+            nlen: 0,
+            base: 0,
+            attached: false,
+            attaching: false,
+            imports_ready: false,
+            imports_in_progress: false,
+            imports_failed: false,
+            attach_failed: false,
+        }
+    }
+}
+
 /// The per-drive module table (single-threaded loader; a process's LdrpInitialize runs once, on one
 /// thread, before any other thread exists). Not shared across processes — each spawn re-runs the
 /// drive fresh in its own VSpace.
@@ -1450,26 +1469,23 @@ struct ModuleTable {
     attach_order: nt_ntdll::loader::lifecycle::AttachLedger<MODULE_TABLE_CAP>,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl ModuleTable {
+    const fn new() -> Self {
+        Self {
+            mods: [const { LoadedMod::empty() }; MODULE_TABLE_CAP],
+            count: 0,
+            attach_order: nt_ntdll::loader::lifecycle::AttachLedger::new(),
+        }
+    }
+}
+
 /// The PROCESS-WIDE loaded-module table. Single-threaded loader context (the process's LdrpInitialize
 /// + all subsequent `LdrLoadDll`/`LdrGetDllHandle` calls run before any competing thread touches it —
 /// csrsrv's CsrLoadServerDll runs on the main thread during CsrServerInitialization). Seeded by
 /// [`snap_all_imports`] (ntdll + the EXE's static deps), then extended by runtime `LdrLoadDll`.
 #[cfg(target_arch = "x86_64")]
-static mut MODULE_TABLE: ModuleTable = ModuleTable {
-    mods: [LoadedMod {
-        name: [0u8; 32],
-        nlen: 0,
-        base: 0,
-        attached: false,
-        attaching: false,
-        imports_ready: false,
-        imports_in_progress: false,
-        imports_failed: false,
-        attach_failed: false,
-    }; MODULE_TABLE_CAP],
-    count: 0,
-    attach_order: nt_ntdll::loader::lifecycle::AttachLedger::new(),
-};
+static mut MODULE_TABLE: ModuleTable = ModuleTable::new();
 
 /// Balances future per-thread attach and detach callouts. No current thread is committed until the
 /// secondary-thread initialization path begins issuing DLL_THREAD_ATTACH.
@@ -2816,13 +2832,20 @@ struct LdrState {
 }
 
 #[cfg(target_arch = "x86_64")]
-static mut LDR_STATE: LdrState = LdrState {
-    cursor: 0,
-    region_end: 0,
-    ldr_va: 0,
-    entry_vas: [0u64; LDR_MAX_ENTRIES],
-    count: 0,
-};
+static mut LDR_STATE: LdrState = LdrState::new();
+
+#[cfg(target_arch = "x86_64")]
+impl LdrState {
+    const fn new() -> Self {
+        Self {
+            cursor: 0,
+            region_end: 0,
+            ldr_va: 0,
+            entry_vas: [0u64; LDR_MAX_ENTRIES],
+            count: 0,
+        }
+    }
+}
 
 /// Bump `n` bytes (16-aligned) from the Ldr region; returns the VA (0 on exhaustion).
 ///
@@ -3037,7 +3060,7 @@ unsafe fn thread_ldr_lists() {
 /// On-target; `exe_base` + every `table` base are mapped PE images; the process heap is installed;
 /// `gs:[0x60]` = PEB (byte-exact x64 layout).
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
+unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
     // SAFETY: on-target; reserve the region + raw writes into it + the gs-relative PEB write.
     unsafe {
         // Reserve the process-lifetime region for the head + entries + name buffers.
@@ -3889,7 +3912,6 @@ unsafe fn native_syscall8(
             status = out(reg) status,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-            options(nostack),
         );
     }
     status
@@ -3960,7 +3982,6 @@ unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) ->
             status = out(reg) status,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-            options(nostack),
         );
     }
     status
@@ -4028,7 +4049,6 @@ unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [
             status = out(reg) status,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
             out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-            options(nostack),
         );
     }
     status
@@ -4154,17 +4174,12 @@ pub unsafe fn csr_client_connect_to_server(
     // CsrClientConnectToServer; the second+ calls must be no-op successes (the PEB CSR fields are
     // already published) — otherwise we redundantly re-drive the executive's CSR rendezvous.
     // SAFETY: single-threaded during loader init; a benign racy re-store is harmless (idempotent).
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        static CSR_CONNECTED: AtomicBool = AtomicBool::new(false);
-        if CSR_CONNECTED.swap(true, Ordering::Relaxed) {
-            if !connection_info_size.is_null() {
-                // SAFETY: writable ULONG or NULL (checked). 0x38 = sizeof(CSR_API_CONNECTINFO) x64.
-                unsafe { core::ptr::write(connection_info_size, 0x38) };
-            }
-            return 0; // STATUS_SUCCESS — already connected.
+    if CSR_CONNECTED.swap(true, Ordering::Relaxed) {
+        if !connection_info_size.is_null() {
+            // SAFETY: writable ULONG or NULL (checked). 0x38 = sizeof(CSR_API_CONNECTINFO) x64.
+            unsafe { core::ptr::write(connection_info_size, 0x38) };
         }
+        return 0; // STATUS_SUCCESS — already connected.
     }
 
     // Build the PortName = "<ObjectDirectory>\ApiPort". ObjectDirectory is L"\Windows" for the base
@@ -5328,14 +5343,20 @@ struct RtlAsyncCriticalSection {
     spin_count: usize,
 }
 
-static mut RTL_ASYNC_LOCK: RtlAsyncCriticalSection = RtlAsyncCriticalSection {
-    debug_info: u64::MAX,
-    lock_count: AtomicI32::new(-1),
-    recursion_count: 0,
-    owning_thread: AtomicU64::new(0),
-    lock_semaphore: AtomicU64::new(0),
-    spin_count: 0,
-};
+impl RtlAsyncCriticalSection {
+    const fn new() -> Self {
+        Self {
+            debug_info: u64::MAX,
+            lock_count: AtomicI32::new(-1),
+            recursion_count: 0,
+            owning_thread: AtomicU64::new(0),
+            lock_semaphore: AtomicU64::new(0),
+            spin_count: 0,
+        }
+    }
+}
+
+static mut RTL_ASYNC_LOCK: RtlAsyncCriticalSection = RtlAsyncCriticalSection::new();
 
 struct RtlAsyncGuard;
 
@@ -5509,7 +5530,6 @@ const SSN_NT_DELAY_EXECUTION: u32 = 61;
 const SSN_NT_QUERY_SYSTEM_TIME: u32 = 182;
 const SSN_NT_REMOVE_IO_COMPLETION: u32 = 198;
 const SSN_NT_RESUME_THREAD: u32 = 214;
-const SSN_NT_SET_EVENT: u32 = 228;
 const SSN_NT_SET_INFORMATION_FILE: u32 = 233;
 const SSN_NT_SET_IO_COMPLETION: u32 = 241;
 const SSN_NT_TERMINATE_THREAD: u32 = 267;
@@ -5547,6 +5567,44 @@ static RTL_COMPLETION_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
 static WORK_POOL_COUNTER_LOCK: AtomicBool = AtomicBool::new(false);
 static mut WORK_POOL_COUNTERS: nt_rtl_work_item::PoolCounters =
     nt_rtl_work_item::PoolCounters::new();
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn reset_process_runtime_state_for_new_process() {
+    unsafe {
+        CSR_API_PORT = 0;
+        CSR_PORT_MEMORY_DELTA = 0;
+        CSR_PROCESS_ID = 0;
+    }
+    CSR_INSIDE_PROCESS.store(false, Ordering::Release);
+    CSR_NATIVE_STATIC_DATA_PUBLISHED.store(false, Ordering::Release);
+    CSR_CONNECTED.store(false, Ordering::Release);
+    IMAGE_EXEC_OPTIONS_KEY.store(0, Ordering::Release);
+
+    unsafe {
+        MODULE_TABLE = ModuleTable::new();
+        THREAD_INIT_LEDGER = nt_ntdll::loader::lifecycle::ThreadInitLedger::new();
+        STATIC_TLS_CATALOG = nt_ntdll::loader::tls::StaticTlsCatalog::new();
+        EXE_BASE = 0;
+        SEH_SELFTEST_DONE = false;
+        LDR_STATE = LdrState::new();
+
+        RTL_ASYNC_LOCK = RtlAsyncCriticalSection::new();
+        RTL_TIMER_QUEUES = [const { RtlTimerQueueSlot::new() }; RTL_TIMER_QUEUE_CAPACITY];
+        RTL_TIMER_HANDLES = [const { RtlTimerHandleSlot::new() }; RTL_TIMER_HANDLE_CAPACITY];
+        RTL_REGISTERED_WAITS = [const { RtlRegisteredWaitSlot::new() };
+            RTL_REGISTERED_WAIT_CAPACITY];
+        WORK_POOL_COUNTERS = nt_rtl_work_item::PoolCounters::new();
+    }
+    RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
+    WORK_POOL_INIT_STATE.store(POOL_UNINITIALIZED, Ordering::Release);
+    WORK_POOL_PORT.store(0, Ordering::Release);
+    RTL_ASYNC_WAKE_EVENT.store(0, Ordering::Release);
+    RTL_SCHEDULER_WORKER_TID.store(0, Ordering::Release);
+    RTL_COMPLETION_WORKER_TID.store(0, Ordering::Release);
+    RTL_SCHEDULER_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+    RTL_COMPLETION_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+    WORK_POOL_COUNTER_LOCK.store(false, Ordering::Release);
+}
 
 #[cfg(feature = "rtl_work_item_probe")]
 const WORK_ITEM_PROBE_IDLE: u32 = 0;
@@ -5867,7 +5925,12 @@ unsafe fn rtl_async_create_event(event_type: u64) -> Result<u64, u32> {
 
 unsafe fn rtl_async_set_event(handle: u64) {
     if handle != 0 {
-        let _ = unsafe { syscall4(SSN_NT_SET_EVENT, handle, 0, 0, 0) };
+        let _ = unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64, *mut c_void) -> u32,
+            >(nt_ntdll::trap_stubs::nt_set_event)(handle, core::ptr::null_mut())
+        };
     }
 }
 

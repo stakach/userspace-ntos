@@ -218,6 +218,19 @@ impl HeapLockRecord {
 static mut HEAP_LOCKS: [HeapLockRecord; HEAP_LOCK_CAPACITY] =
     [const { HeapLockRecord::new() }; HEAP_LOCK_CAPACITY];
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn reset_process_heap_state_for_new_process() {
+    // A mapped ntdll has private writable state in each process. Make that process boundary
+    // explicit so a reused image slot can never observe a prior process's heap registry.
+    PROCESS_HEAP_LOCK.store(false, Ordering::Release);
+    unsafe {
+        PROCESS_HEAPS = MaybeUninit::uninit();
+        PROCESS_HEAPS_INITIALIZED = false;
+        PROCESS_HEAP_SEGMENTS = [const { None }; PROCESS_HEAP_SEGMENT_CAPACITY];
+        HEAP_LOCKS = [const { HeapLockRecord::new() }; HEAP_LOCK_CAPACITY];
+    }
+}
+
 unsafe fn heap_lock_record_locked(
     handle: *mut u8,
     allow_retired: bool,
@@ -1338,6 +1351,10 @@ pub unsafe extern "C" fn LdrpInitialize(
                 unsafe { exports::rtl_raise_status(status) };
             }
             return;
+        }
+        unsafe {
+            reset_process_heap_state_for_new_process();
+            on_target::reset_process_runtime_state_for_new_process();
         }
         // (1) The Step-4.A proof line (kept as a diagnostic; stack buffer — see dbg_print_bytes).
         let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
