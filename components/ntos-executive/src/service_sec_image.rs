@@ -12574,9 +12574,28 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
                 if dialog_modal_dispatch && !callback_suspended {
-                    let hwnd = if a0 != 0 { smss_stack_read(a0) } else { 0 };
-                    let message = if a0 != 0 {
-                        smss_stack_read(a0 + 8) as u32
+                    let staged_msg =
+                        msg_syscall && d_a0 == win32k_subsystem::WIN32K_ARG_VADDR;
+                    let msg_ptr = if staged_msg {
+                        win32k_subsystem::WIN32K_ARG_VADDR
+                    } else {
+                        a0
+                    };
+                    let hwnd = if msg_ptr != 0 {
+                        if staged_msg {
+                            core::ptr::read_unaligned(msg_ptr as *const u64)
+                        } else {
+                            smss_stack_read(msg_ptr)
+                        }
+                    } else {
+                        0
+                    };
+                    let message = if msg_ptr != 0 {
+                        if staged_msg {
+                            core::ptr::read_unaligned((msg_ptr + 8) as *const u32)
+                        } else {
+                            smss_stack_read(msg_ptr + 8) as u32
+                        }
                     } else {
                         0
                     };
@@ -13687,6 +13706,13 @@ pub(crate) unsafe fn service_sec_image(
             // yet resumed the caller. A transition seen here is the executive's own handler; a
             // transition that only ever shows at tag 0 happened while the CLIENT was running.
             crate::teb_tail_watch(pi, 3, m0, badge);
+            let redirected_user_control =
+                redirected_user_callback || redirected_user_apc || redirected_context_continue;
+            if !park_caller && !redirected_user_control {
+                set_reply_mr(15, resume_ip);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+            }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
@@ -13698,8 +13724,6 @@ pub(crate) unsafe fn service_sec_image(
                 // fault reply the redirect staged, not with a syscall result. User APC delivery uses
                 // the same shape because the APC dispatcher frame already carries the eventual
                 // STATUS_USER_APC return in the restored context.
-                let redirected_user_control =
-                    redirected_user_callback || redirected_user_apc || redirected_context_continue;
                 let len = if redirected_user_control { 0 } else { 18 };
                 let (r0, r1, r3) = if redirected_user_control {
                     (0, 0, 0)

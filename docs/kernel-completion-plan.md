@@ -2876,3 +2876,22 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
   `exec_winlogon_logon_action_returned` remain red), with later `RpcServerListen(Status 6b1)` still
   present. Continue by implementing the missing generic security/token/logon authority and service RPC
   listener semantics, without service-name, executable-order, RPC UUID, or paint fallbacks.
+
+- I4 desktop retry syscall-return recovery. A local `./run.sh --desktop` failure reproduced a
+  winlogon/user32 return-frame corruption after the IDD_LOGON modal-paint prefix: an ordinary syscall
+  returned with `RSP` restored from the executive shared-buffer region (`0x1001400...`) instead of
+  the caller trap frame, then faulted at the user32 syscall-stub `ret`. The executive now restages
+  `RIP`/`RSP`/`RFLAGS` into the reply message for every ordinary syscall reply rather than trusting
+  the incoming IPC buffer to survive nested component work; redirected user callbacks, APCs, and
+  context-continues still use their explicitly staged redirect frames. The modal observer also reads
+  the staged win32k `MSG` copy for message syscalls so `Peek`/`Get`/`Dispatch` correlation follows
+  the data actually handed to win32k. Validation: `cargo fmt --all`,
+  `cargo test -p nt-user-callback -- --nocapture`, executive `cargo check`, `git diff --check`, and
+  desktop retry `.tmp/boot-syscall-resume-frame-20260811-034946.log`. Result: the old
+  `rip=0x801ef0c1 rsp=0x1001400...` crash does not recur and the boot advances into later dynamic
+  service RPC. Review adjustment: the run still does not reach the desktop sentinel; it plateaus at
+  Browser/EventLog ncacn_np context-handle association, where a context UUID created on one accepted
+  `\EventLog` pipe connection is later used on another association and ReactOS rpcrt4 returns
+  `NCA_S_FAULT_CONTEXT_MISMATCH` (`0x1c00001a`). The next slice should fix generic RPC/NPFS
+  association behavior or the scheduler/IO ordering that exposes the cross-association context reuse,
+  not add UUID, service-name, executable-order, or paint fallbacks.
