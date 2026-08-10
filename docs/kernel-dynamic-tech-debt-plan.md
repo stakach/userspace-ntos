@@ -2146,3 +2146,14 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   `git diff --check`. Review adjustment: run one serialized desktop boot next; expected proof is
   that the late slot-6 `NtReadFile` reaches NPFS/pends or completes instead of returning
   pre-route `0xc000009a`.
+- I3 growable-pipe-waiter boot proof captured in
+  `.tmp/boot-growable-pipe-waiters-20260810-193356.log`. The old pre-route failure is gone:
+  dynamic SCM worker slot 6 now routes `NtReadFile` on fid `0e8138d1` through NPFS, gets real
+  synchronous reads and `STATUS_PENDING` parks, and is later woken by pipe redrive. The boot still
+  paints the winlogon desktop background (`desktop-bg 768/768`) and now reaches a genuine dynamic
+  `wlansvc.exe` process (`pi=11`, pid 652) with its own control pipe and worker threads. Explorer
+  has not launched (`ssn-hist explorer total=0`). The next red edge is `wlansvc`/rpcrt4 service
+  control IPC: ReactOS logs `TransactNamedPipe(Schedule, 80) failed (Error 231)`, then reports no
+  context handle for UUID `{60ed3641-4ff2-4e3b-adc8-7747e364f201}` and a fault packet with status
+  `0x1c00001a`. Review adjustment: continue at real RPC/context-handle semantics for that service
+  path; do not reintroduce service-name, executable, or pipe-capacity fallbacks.
