@@ -113,7 +113,7 @@ pub const DESKTOP_BODY_SIZE: u64 = 0x200;
 pub const DESKTOPINFO_SIZE: u64 = 0x120;
 
 /// Number of live win32k objects the table can hold. Slot 0 is reserved (handle 0 == `NULL`).
-pub const OB_TABLE_LEN: usize = 16;
+pub const OB_TABLE_LEN: usize = 32;
 
 /// Number of `Event` objects the table can track by external handle value. win32k only references
 /// the handful of events passed into it (winsrv's power + media request events); a small ring
@@ -121,7 +121,11 @@ pub const OB_TABLE_LEN: usize = 16;
 pub const OB_EVENTS_LEN: usize = 4;
 
 /// Number of externally visible aliases created by `NtDuplicateObject` for USER objects.
-pub const OB_ALIASES_LEN: usize = 8;
+pub const OB_ALIASES_LEN: usize = 32;
+/// Number of named desktop links tracked under window-station directories.
+pub const OB_NAMED_DESKTOPS_LEN: usize = 32;
+/// Maximum ASCII desktop leaf name retained for open-by-name lookups.
+pub const OB_NAMED_DESKTOP_NAME_MAX: usize = 48;
 /// Keep duplicate aliases disjoint from both native EPROCESS handles and win32k's dense Ob handles.
 pub const OB_ALIAS_HANDLE_BASE: u64 = 0x7FF0_0000;
 /// Maximum self-relative security descriptor bytes stored for one modeled USER object.
@@ -177,6 +181,40 @@ impl ObjectEntry {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NamedDesktopEntry {
+    root_body: u64,
+    leaf_len: u8,
+    leaf: [u8; OB_NAMED_DESKTOP_NAME_MAX],
+    handle: u64,
+}
+
+impl NamedDesktopEntry {
+    fn new(root_body: u64, leaf: &[u8], handle: u64) -> Option<Self> {
+        if root_body == 0
+            || leaf.is_empty()
+            || leaf.len() > OB_NAMED_DESKTOP_NAME_MAX
+            || handle == 0
+        {
+            return None;
+        }
+        let mut entry = Self {
+            root_body,
+            leaf_len: leaf.len() as u8,
+            leaf: [0; OB_NAMED_DESKTOP_NAME_MAX],
+            handle,
+        };
+        entry.leaf[..leaf.len()].copy_from_slice(leaf);
+        Some(entry)
+    }
+
+    fn matches(self, root_body: u64, leaf: &[u8]) -> bool {
+        self.root_body == root_body
+            && self.leaf_len as usize == leaf.len()
+            && self.leaf[..leaf.len()].eq_ignore_ascii_case(leaf)
+    }
+}
+
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
 /// Handles are minted densely from 1; the client-visible `HANDLE` is `idx << 2` (a real Ob handle
@@ -201,6 +239,9 @@ pub struct ObHandleTable {
     events_next: usize,
     /// USER-object aliases minted for `NtDuplicateObject`, indexed by a high-range external handle.
     aliases: [Option<(ObKind, u64)>; OB_ALIASES_LEN],
+    /// Named DESKTOP objects under WINDOWSTATION directories. Real Ob lookup uses the root directory
+    /// handle and leaf name; this compact table preserves that semantic without allocating.
+    named_desktops: [Option<NamedDesktopEntry>; OB_NAMED_DESKTOPS_LEN],
 }
 
 impl Default for ObHandleTable {
@@ -221,6 +262,7 @@ impl ObHandleTable {
             events: [None; OB_EVENTS_LEN],
             events_next: 0,
             aliases: [None; OB_ALIASES_LEN],
+            named_desktops: [None; OB_NAMED_DESKTOPS_LEN],
         }
     }
 
@@ -400,6 +442,49 @@ impl ObHandleTable {
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
     pub fn lookup_body(&self, handle: u64) -> u64 {
         self.lookup(handle).map(|(_, body)| body).unwrap_or(0)
+    }
+
+    fn window_station_body_for_handle(&self, root_handle: u64) -> Option<u64> {
+        match self.lookup(root_handle) {
+            Some((ObKind::WindowStation, body)) if body != 0 => Some(body),
+            _ => None,
+        }
+    }
+
+    /// Resolve a named desktop under a window-station root handle.
+    pub fn desktop_handle_for_name(&self, root_handle: u64, leaf: &[u8]) -> Option<u64> {
+        let root_body = self.window_station_body_for_handle(root_handle)?;
+        let entry = self
+            .named_desktops
+            .iter()
+            .flatten()
+            .find(|entry| entry.matches(root_body, leaf))?;
+        matches!(self.lookup(entry.handle), Some((ObKind::Desktop, _))).then_some(entry.handle)
+    }
+
+    /// Record the name of a desktop created under a window-station root handle.
+    pub fn remember_desktop_name(&mut self, root_handle: u64, leaf: &[u8], handle: u64) -> bool {
+        if !matches!(self.lookup(handle), Some((ObKind::Desktop, _))) {
+            return false;
+        }
+        let Some(root_body) = self.window_station_body_for_handle(root_handle) else {
+            return false;
+        };
+        let Some(entry) = NamedDesktopEntry::new(root_body, leaf, handle) else {
+            return false;
+        };
+        for slot in self.named_desktops.iter_mut() {
+            if slot.is_some_and(|existing| existing.matches(root_body, leaf)) {
+                *slot = Some(entry);
+                return true;
+            }
+        }
+        if let Some(slot) = self.named_desktops.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+            true
+        } else {
+            false
+        }
     }
 
     fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
@@ -876,6 +961,41 @@ mod tests {
         assert_eq!(t.lookup(alias), Some((ObKind::Desktop, 0xD00D_0000)));
         assert!(t.close(alias));
         assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
+    }
+
+    #[test]
+    fn named_desktop_lookup_is_scoped_to_window_station_body() {
+        let mut t = ObHandleTable::new();
+        let interactive_winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+        let service_winsta = t.register_uncached(ObKind::WindowStation, 0x5700_1000);
+        let interactive_default = t.register(ObKind::Desktop, 0xD00D_0000);
+        let service_default = t.register(ObKind::Desktop, 0xD00D_1000);
+
+        assert!(t.remember_desktop_name(interactive_winsta, b"Default", interactive_default));
+        assert!(t.remember_desktop_name(service_winsta, b"default", service_default));
+
+        assert_eq!(
+            t.desktop_handle_for_name(interactive_winsta, b"default"),
+            Some(interactive_default)
+        );
+        assert_eq!(
+            t.desktop_handle_for_name(service_winsta, b"Default"),
+            Some(service_default)
+        );
+    }
+
+    #[test]
+    fn named_desktop_lookup_accepts_root_aliases() {
+        let mut t = ObHandleTable::new();
+        let winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+        let winsta_alias = t.duplicate(winsta).unwrap();
+        let desktop = t.register(ObKind::Desktop, 0xD00D_0000);
+
+        assert!(t.remember_desktop_name(winsta, b"Default", desktop));
+        assert_eq!(
+            t.desktop_handle_for_name(winsta_alias, b"Default"),
+            Some(desktop)
+        );
     }
 
     #[test]

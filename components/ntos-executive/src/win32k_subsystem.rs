@@ -2283,6 +2283,49 @@ unsafe fn object_attributes_name_leaf_eq_ascii(object_attributes: u64, leaf: &[u
     true
 }
 
+unsafe fn object_attributes_root_directory(object_attributes: u64) -> u64 {
+    if object_attributes == 0 {
+        0
+    } else {
+        read_unaligned((object_attributes + 0x08) as *const u64)
+    }
+}
+
+unsafe fn object_attributes_name_leaf_ascii(
+    object_attributes: u64,
+) -> Option<([u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX], usize)> {
+    let Some((buffer, units)) = object_attributes_unicode_buffer(object_attributes) else {
+        return None;
+    };
+    if units == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < units {
+        let unit = read_unaligned((buffer + (index * 2) as u64) as *const u16);
+        if unit == b'\\' as u16 || unit == b'/' as u16 {
+            start = index + 1;
+        }
+        index += 1;
+    }
+    let len = units - start;
+    if len == 0 || len > nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX {
+        return None;
+    }
+    let mut leaf = [0u8; nt_object_manager::win32k_ob::OB_NAMED_DESKTOP_NAME_MAX];
+    let mut offset = 0usize;
+    while offset < len {
+        let unit = read_unaligned((buffer + ((start + offset) * 2) as u64) as *const u16);
+        if unit > 0x7f {
+            return None;
+        }
+        leaf[offset] = (unit as u8).to_ascii_lowercase();
+        offset += 1;
+    }
+    Some((leaf, len))
+}
+
 struct CapturedUserObjectSecurityDescriptor {
     len: usize,
     bytes: [u8; nt_object_manager::win32k_ob::OB_SECURITY_DESCRIPTOR_MAX],
@@ -2555,6 +2598,22 @@ extern "win64" fn s_ob_open_object_by_name(
         let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
         match classify_type(obj_type) {
             Some(ObKind::Desktop) => {
+                let root = object_attributes_root_directory(object_attributes);
+                let named_leaf = object_attributes_name_leaf_ascii(object_attributes);
+                if let Some((leaf, len)) = named_leaf {
+                    if let Some(existing) = table.desktop_handle_for_name(root, &leaf[..len]) {
+                        if !handle.is_null() {
+                            write_unaligned(handle, existing);
+                        }
+                        if parse_context != 0 {
+                            write_volatile(parse_context as *mut u8, 0);
+                        }
+                        return 0;
+                    }
+                }
+                if parse_context == 0 {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
                 let security = match object_attributes_security_descriptor(object_attributes) {
                     Ok(security) => security,
                     Err(status) => return status,
@@ -2563,6 +2622,12 @@ extern "win64" fn s_ob_open_object_by_name(
                 if body == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
                 }
+                if let Some((ObKind::WindowStation, winsta_body)) = table.lookup(root) {
+                    write_volatile(
+                        (body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64,
+                        winsta_body,
+                    );
+                }
                 let h = table.register_with_security(
                     ObKind::Desktop,
                     body,
@@ -2570,6 +2635,9 @@ extern "win64" fn s_ob_open_object_by_name(
                 );
                 if h == 0 {
                     return STATUS_INSUFFICIENT_RESOURCES_I32;
+                }
+                if let Some((leaf, len)) = named_leaf {
+                    let _ = table.remember_desktop_name(root, &leaf[..len], h);
                 }
                 if !handle.is_null() {
                     write_unaligned(handle, h);
@@ -3637,7 +3705,7 @@ static WIN32K_SERVICE_WINSTA_HANDLES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_NONINTERACTIVE_WINSTA_SKIPS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_NONINTERACTIVE_WINSTA_RESOLVES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CSRSS_BOOTSTRAP_REKEYS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_HANDLE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_DEFAULT_DESKTOP_BODY: AtomicU64 = AtomicU64::new(0);
@@ -4315,13 +4383,11 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
         publish_selected_context(process_index, thread_index);
     }
 
-    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
-        let ppi = current_w32process();
-        if let Some((hdesk, desk_body, pdeskinfo)) =
-            selected_thread_desktop(process_role, ppi, w32thread)
-        {
-            publish_thread_desktop_binding(w32thread, hdesk, desk_body, pdeskinfo);
-        }
+    let ppi = current_w32process();
+    if let Some((hdesk, desk_body, pdeskinfo)) =
+        selected_thread_desktop(process_role, ppi, w32thread)
+    {
+        publish_thread_desktop_binding(w32thread, hdesk, desk_body, pdeskinfo);
     }
 
     if trace_resume {
@@ -4698,12 +4764,12 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
     );
     link_processinfo_to_eprocess(process_index);
     if process_role == HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
-        let n = WIN32K_NONINTERACTIVE_WINSTA_SKIPS.fetch_add(1, Ordering::Relaxed);
+        let n = WIN32K_NONINTERACTIVE_WINSTA_RESOLVES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
             let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
             let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
-            print_str(b"[win32k-host] noninteractive service keeps winsta/desktop unresolved pid=");
+            print_str(b"[win32k-host] noninteractive service desktop left to InitThreadCallback pid=");
             print_u64(pid);
             print_str(b" pi=");
             print_u64(pi);
@@ -7311,10 +7377,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     // Reassert the selected client's own desktop binding before normal dispatch. Logon threads keep
     // the secure desktop they established through NtUserSetThreadDesktop; shell clients inherit the
     // process startup desktop that winlogon supplied through WinSta0\Default.
-    if top_level
-        && ssn != SSN_NT_USER_SET_THREAD_DESKTOP
-        && process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
-    {
+    if top_level && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
         let ppi = current_w32process();
         if let Some((hdesk, desk_body, pdeskinfo)) = selected_thread_desktop(process_role, ppi, t) {
             publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);

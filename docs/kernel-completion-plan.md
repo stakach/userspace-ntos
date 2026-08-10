@@ -117,6 +117,27 @@ window-station/desktop thread callout with `STATUS_INSUFFICIENT_RESOURCES`, then
 desktop/winsta assignment and the generic NPFS/dispatcher resource path, not executable-name or
 service-name policy.
 
+Latest service desktop validation
+`.tmp/boot-service-desktop-cache-20260810.log` moves that win32k service-process frontier forward.
+The win32k Ob layer now models desktop opens by `(RootDirectory window-station, leaf name)`, keeps
+service window stations from replacing the cached interactive WinSta0 identity, and gives the USER
+object table enough handle/alias capacity for service desktop creation. Noninteractive processes no
+longer get an executive-side WinSta0 shortcut: ReactOS `InitThreadCallback` resolves their
+`Service-<LUID>$\Default` desktop through the real Ob open/create path, and the dispatcher only
+reasserts a desktop that the real path has selected. Validation: `cargo fmt --all`,
+`cargo test -p nt-object-manager`, `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and boot
+`.tmp/boot-service-desktop-cache-20260810.log`. Result: `services.exe` reaches
+`NtUserProcessConnect`, `InitThreadCallback` publishes a W32THREAD with `status=0`, the old
+`ObOpenObjectByName failed to open/create desktop` / `Failed to assign default desktop and winsta`
+errors are absent, and the harness exits cleanly with
+`SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. Review
+adjustment: the immediate boot frontier is now LSA/SAM RPC completion and generic ObjectDirectory
+query behavior. The LSA RPC worker reads bind/request PDUs and writes bind_ack, but then spends the
+quiesce window in `NtDelayExecution`; `exec_lsa_msv1_0_sam_validation_reached`,
+`exec_winlogon_logon_token_received`, userinit/explorer spawn, and `exec_services_query_dir_object`
+remain red.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -2473,3 +2494,17 @@ service-name policy.
   A4 frontier is now service process GUI/IPC mechanics: `spoolsv.exe` reaches win32k, fails
   default desktop/winsta thread setup with `STATUS_INSUFFICIENT_RESOURCES`, SCM reports
   `ConnectNamedPipe failed (Error 1450)`, and the run then parks.
+
+- A4 service desktop/object-manager slice. Win32k Ob desktop lookup now reopens an existing desktop
+  by leaf name under the exact root window-station handle/body, so `Service-<LUID>$\Default` behaves
+  like a real object-manager child instead of allocating duplicate desktop bodies. Service window
+  stations are tracked per token authentication ID without replacing the cached interactive WinSta0,
+  and noninteractive process desktop binding is left to ReactOS `InitThreadCallback` instead of
+  being inherited from the interactive station. Validation: `cargo fmt --all`,
+  `cargo test -p nt-object-manager`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and boot
+  `.tmp/boot-service-desktop-cache-20260810.log`. Result: the previous service desktop/winsta
+  `STATUS_INSUFFICIENT_RESOURCES` failure is gone, `exec_services_win32k_connect` passes, and the
+  run cleanly reaches the base desktop proof again. Review adjustment: continue A4 at the real
+  LSA/SAM RPC request and ObjectDirectory query gates; do not reintroduce service/executable
+  fallbacks.
