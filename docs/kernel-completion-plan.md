@@ -3230,3 +3230,17 @@ executable-order fallbacks.
   adjustment: the active frontier is now the post-paint delay timer / receive handoff that should
   advance the shell path after base paint, not CSR system-information output probing and not
   hardcoded userinit/explorer launch scaffolding.
+
+- Post-paint HPET rearm cleanup. The visible `./run.sh --desktop` regression that painted only the
+  base background stopped at the first production delay/watchdog rearm after
+  `NtUserSwitchDesktop`: enabling HPET timer 0 while stale level-triggered status was still latched
+  let timer delivery starve the executive before winlogon could drive shell activation. The timer
+  path now disables delivery before every comparator update, clears HPET status on both sides of the
+  comparator write, then enables and ACKs the isolated IRQ. Serialized retry
+  `.tmp/boot-hpet-rearm-clean-20260811.log` proves the old post-background stall is gone: services,
+  LSASS, CSR, real `\LsaAuthenticationPort`, `\lsarpc` NPFS/RPC traffic, and `services.exe`
+  `CheckSetup()` all run after the base desktop paint. Review adjustment: explorer still does not
+  launch in that retry. The current frontier is the real logon/profile transition after LSA/RPC
+  activity, with IO completion removers and LSASS RPC worker traffic visible; continue by fixing the
+  next generic kernel mechanism shown in the boot log, not by restoring executable, service, message,
+  or paint scaffolding.

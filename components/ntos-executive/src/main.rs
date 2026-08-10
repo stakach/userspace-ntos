@@ -2722,9 +2722,9 @@ unsafe fn watchdog_report(messages: u64) {
 /// Re-arm the HPET from inside a NESTED component-pump receive. The main service loop's
 /// `delay_timer_interrupt` (which owns the ordinary re-arm + IRQ Ack) cannot run while the pump is
 /// blocked, and the IOAPIC line stays masked until that Ack — so without this a nested deadlock
-/// would get exactly ONE tick and could never TRIP. The sequence mirrors `delay_timer_interrupt`'s
-/// exactly: comparator strictly AHEAD of `now` first, then clear the level-triggered status, then
-/// Ack — the ordering that keeps a still-asserted line from storming.
+/// would get exactly ONE tick and could never TRIP. The sequence mirrors the ordinary one-shot
+/// rearm: disable delivery, clear the level-triggered HPET status, program a comparator strictly
+/// AHEAD of `now`, clear any status latched by the old comparator, enable, then Ack.
 pub(crate) unsafe fn watchdog_nested_rearm() {
     if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
         return;
@@ -2736,14 +2736,19 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     }
     let step = nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
     let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    config &= !HPET_TN_INT_ENB;
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     core::ptr::write_volatile(
         (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
         now.saturating_add(step),
     );
-    let config =
-        core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) | HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    core::ptr::write_volatile(
+        (HPET_VADDR + HPET_T0_CONFIG) as *mut u64,
+        config | HPET_TN_INT_ENB,
+    );
     let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
     WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
 }
@@ -11956,11 +11961,16 @@ unsafe fn delay_timer_init() -> bool {
         print_str(b"[delay] HPET unavailable; refusing nonzero immediate-success fallback\n");
         return false;
     }
-    let route_cap =
-        (core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) >> 32) as u32;
+    let initial_config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    let route_cap = (initial_config >> 32) as u32;
     if route_cap == 0 {
         return false;
     }
+    core::ptr::write_volatile(
+        (HPET_VADDR + HPET_T0_CONFIG) as *mut u64,
+        initial_config & !HPET_TN_INT_ENB,
+    );
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let used_mask = ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Relaxed));
     let Some(pin) = select_delay_hpet_route_pin(route_cap, used_mask) else {
         print_str(b"[delay] HPET timer0 has no non-shared IOAPIC route route_cap=0x");
@@ -12023,6 +12033,9 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         return;
     }
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    config &= !HPET_TN_INT_ENB;
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let event_deadline = (0..WAITER_N)
         .filter(|slot| WAITER_EVENT_IDX[*slot].load(Ordering::Relaxed) != u64::MAX)
         .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
@@ -12088,7 +12101,9 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
             (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
             target.max(now.saturating_add(1)),
         );
-        // ARM. The comparator is written FIRST so the enable edge arms against the new deadline.
+        core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+        // ARM. The comparator is written before the enable edge, with stale level status cleared on
+        // both sides of the comparator write so an old assertion cannot storm as soon as we unmask.
         config |= HPET_TN_INT_ENB;
     } else {
         // DISARM — nothing is waiting on time, so the timer must stop delivering entirely.
