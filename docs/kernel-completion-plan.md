@@ -94,16 +94,24 @@ mounted `NtLoadKey` hive and atomically replaces the source `ntuser.dat`; `RegUn
 mount, and the next `NtLoadKey` remounts the checkpoint image. `exec_profile_ntuser_dat_present` and
 `exec_ntloadkey_serviced` are green on that path.
 
-Current red gates from the last uncontended full gate are `exec_kbd_layout_opened`,
-`exec_msgina_logon_dialog_created`, `exec_vm_pool_headroom`, and
-`exec_explorer_shell_chrome_painted`. The keyboard-layout proof has since been moved onto the
-common registry-open authority in commit `68b2529`; rerun the full gate in a clean single QEMU lane
-before removing it from this frontier.
-Explorer still leaves broad non-background framebuffer evidence, but `BeginPaint`/`EndPaint`
-accounting is `0/0`; the next useful shell slice is the real explorer paint/update-region path, not
-a framebuffer-only proof. The broader structural queue remains A4 SCM pipe/listener cleanup, B3 real
-video/driver binding, C4 VM regression coverage, and remaining D3/D4 durable hive/profile
-persistence.
+Latest full boot proof `.tmp/boot-reply-pool-kernel-scale-20260810-130750.log` rebuilt the stack
+after scaling reply-cap wait parking through the executive and rust-micro kernel reply pool. It
+reaches `[microtest done]` at `246/295`, keeps `exec_csr_message_plane`, `exec_kbd_layout_opened`,
+`exec_lsa_worker_route`, `exec_vm_pool_headroom`, and `exec_win32k_desktop_painted` green, and
+proves real winlogon SAS-window creation plus `NtUserSetLogonNotifyWindow(0x127c)`. The earlier
+reply-pool exhaustion, wait-array `STATUS_INSUFFICIENT_RESOURCES`, and CSR data-plane failures are
+gone.
+
+Current red gates from that run are the post-SAS/logon chain:
+`exec_winlogon_sas_message_pumped`, `exec_winlogon_sas_windowproc_ran`,
+`exec_winlogon_logged_out_sas`, `exec_msgina_logon_dialog_created`,
+`exec_profile_ntuser_dat_present`, `exec_winlogon_user_shell_activated`,
+`exec_userinit_process_spawned`, `exec_explorer_process_spawned`, and
+`exec_explorer_shell_chrome_painted`. The next useful slice is not explorer framebuffer accounting
+yet; it is the real SAS message pump after the registered logon-notify window. In the proof run,
+post-SAS `GetMessage` remains `0`, so msgina/profile/userinit/explorer are downstream. The broader
+structural queue remains A4 SCM pipe/listener cleanup, B3 real video/driver binding, C4 VM
+regression coverage, and remaining D3/D4 durable hive/profile persistence.
 
 ### A. SCM-Controlled Service Startup
 

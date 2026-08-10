@@ -232,19 +232,10 @@ unsafe fn steal_main_reply() -> Option<u64> {
     if stolen == 0 {
         return None;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    for index in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << index) != 0 {
-            continue;
-        }
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        if cap != 0 {
-            WAIT_REPLY_POOL_USED.fetch_or(1u64 << index, Ordering::Relaxed);
-            REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
-            return Some(stolen);
-        }
-    }
-    None
+    let (index, cap) = wait_reply_pool_find_free()?;
+    wait_reply_pool_mark_used(index);
+    REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
+    Some(stolen)
 }
 
 fn trace_deferred_user_callback_return_refusal(reason: &[u8]) {
@@ -257,8 +248,8 @@ fn trace_deferred_user_callback_return_refusal(reason: &[u8]) {
         print_u64(active_depth as u64);
         print_str(b" continuation-depth=");
         print_u64(continuation_depth as u64);
-        print_str(b" reply-used=0x");
-        print_hex_u64(WAIT_REPLY_POOL_USED.load(Ordering::Relaxed));
+        print_str(b" reply-used=");
+        print_u64(wait_reply_pool_used_count());
         print_str(b" reply-pool=");
         print_u64(WAIT_REPLY_POOL_N as u64);
         print_str(b" active-reply=0x");
@@ -17474,11 +17465,7 @@ unsafe fn gui_message_wait_park(
     if stolen == 0 {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh)) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
-    }) else {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
     table[slot] = GuiMessageWaiter {
@@ -17497,7 +17484,7 @@ unsafe fn gui_message_wait_park(
         resume_sp: sp,
         resume_flags: flags,
     };
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
     if n < 32 {
@@ -17765,11 +17752,7 @@ unsafe fn io_completion_park(
     if stolen == 0 {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh)) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
-    }) else {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
     if nt_handler.io_completion_ports.retain(port_id).is_err() {
@@ -17792,7 +17775,7 @@ unsafe fn io_completion_park(
         let _ = nt_handler.io_completion_ports.release(port_id);
         return false;
     }
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     IO_COMPLETION_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -18339,22 +18322,9 @@ unsafe fn pipe_wait_park(
         return false;
     }
     // Find a FREE pool object to become the new active REPLY_MAIN (same rotation as wait_park_multi).
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let mut fresh = 0u64;
-    let mut fresh_bit = 0usize;
-    for i in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << i) == 0 {
-            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
-            if cp != 0 {
-                fresh = cp;
-                fresh_bit = i;
-                break;
-            }
-        }
-    }
-    if fresh == 0 {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false; // pool exhausted → caller returns PENDING directly
-    }
+    };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let parked = table.park(nt_io_manager::PipeWaiter {
         file_id,
@@ -18377,7 +18347,7 @@ unsafe fn pipe_wait_park(
         return false; // table exhausted → caller returns PENDING directly
     }
     // Commit the reply-cap rotation only after the waiter is recorded.
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     PIPE_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -18399,22 +18369,9 @@ unsafe fn pipe_name_wait_park(
     if stolen == 0 {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let mut fresh = 0u64;
-    let mut fresh_bit = 0usize;
-    for i in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << i) == 0 {
-            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
-            if cp != 0 {
-                fresh = cp;
-                fresh_bit = i;
-                break;
-            }
-        }
-    }
-    if fresh == 0 {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
-    }
+    };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
     let parked = table.arm(nt_io_manager::PipeNameWaiter {
         name_hash,
@@ -18432,7 +18389,7 @@ unsafe fn pipe_name_wait_park(
     if parked.is_none() {
         return false;
     }
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     PIPE_NAME_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true

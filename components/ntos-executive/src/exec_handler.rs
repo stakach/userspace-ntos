@@ -15603,16 +15603,10 @@ impl ExecNtHandler {
                                         } else {
                                             let waiters =
                                                 &*core::ptr::addr_of!(crate::PIPE_NAME_WAITERS);
-                                            let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
                                             let reply_capacity = REPLY_MAIN_SLOT
                                                 .load(Ordering::Relaxed)
                                                 != 0
-                                                && (0..WAIT_REPLY_POOL_N).any(|index| {
-                                                    used & (1u64 << index) == 0
-                                                        && WAIT_REPLY_POOL[index]
-                                                            .load(Ordering::Relaxed)
-                                                            != 0
-                                                });
+                                                && wait_reply_pool_has_free();
                                             if !waiters.has_capacity() || !reply_capacity {
                                                 status =
                                                     nt_io_completion::STATUS_INSUFFICIENT_RESOURCES
@@ -15682,12 +15676,8 @@ impl ExecNtHandler {
                                 .is_synchronous(route.file_id)
                                 .unwrap_or(true);
                             let sync_reply_capacity = if synchronous {
-                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
                                 REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                    && (0..WAIT_REPLY_POOL_N).any(|index| {
-                                        used & (1u64 << index) == 0
-                                            && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-                                    })
+                                    && wait_reply_pool_has_free()
                             } else {
                                 true
                             };
@@ -20721,11 +20711,7 @@ impl ExecNtHandler {
                                 && (PIPE_FULL_DUPLEX_PARK
                                     || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
-                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-                                (0..WAIT_REPLY_POOL_N).any(|index| {
-                                    used & (1u64 << index) == 0
-                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-                                })
+                                wait_reply_pool_has_free()
                             } else {
                                 true
                             };
@@ -21098,11 +21084,7 @@ impl ExecNtHandler {
                                 && (PIPE_FULL_DUPLEX_PARK
                                     || !waiter_table.parked_on(file_id));
                             let sync_reply_capacity = if synchronous {
-                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-                                (0..WAIT_REPLY_POOL_N).any(|index| {
-                                    used & (1u64 << index) == 0
-                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-                                })
+                                wait_reply_pool_has_free()
                             } else {
                                 true
                             };

@@ -2284,7 +2284,8 @@ pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
 /// subsequent recvs. On `NtSetEvent(that event)` the loop does `client_reply_on(stolen_cap, WAIT_0)` to
 /// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
-const WAIT_REPLY_POOL_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
+const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_RUNTIME_CAP + 1;
+const WAIT_REPLY_POOL_USED_WORDS: usize = (WAIT_REPLY_POOL_N + 63) / 64;
 /// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
 /// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
 /// (into a waiter slot) and installs a free spare as the new active.
@@ -2292,7 +2293,8 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
     [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_N];
 /// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
 /// by a parked waiter). Managed by wait_park / wait_wake_event.
-static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
+static WAIT_REPLY_POOL_USED: [AtomicU64; WAIT_REPLY_POOL_USED_WORDS] =
+    [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_USED_WORDS];
 
 #[derive(Clone, Copy)]
 struct ThreadWaitParkTable<const N: usize> {
@@ -2416,9 +2418,8 @@ impl WaitObject {
 /// A single-object wait (NtWaitForSingleObject) records ONE wait object in slot 0 of its set
 /// (count 1); a multi-object wait (NtWaitForMultipleObjects) records up to `WAITER_MAX_EVENTS`
 /// typed wait objects + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == `WaitObject::FREE.raw()` means
-/// the slot is free (it doubles as event[0]). Fixed-capacity; parking past capacity fails visibly
-/// with STATUS_INSUFFICIENT_RESOURCES.
-const WAITER_N: usize = 16;
+/// the slot is free (it doubles as event[0]).
+const WAITER_N: usize = HOSTED_THREAD_RUNTIME_CAP;
 /// NT's architectural maximum for one multi-object wait.
 const WAITER_MAX_EVENTS: usize = 64;
 /// object[0] of each waiter's set (u64::MAX = free slot). Kept as the slot-free sentinel for backward
@@ -2454,9 +2455,14 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WAKE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAIT_PARK_INVALID_SET: AtomicU64 = AtomicU64::new(0);
+static WAIT_PARK_NO_WAITER_SLOT: AtomicU64 = AtomicU64::new(0);
+static WAIT_PARK_NO_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
+static mut WAIT_WAKE_INDEX_WORK: [u64; WAITER_N] = [u64::MAX; WAITER_N];
+static mut WAIT_WAKE_OBJECT_WORK: [u64; WAITER_N] = [WaitObject::FREE.raw(); WAITER_N];
 
-/// Blocking `NtRemoveIoCompletion` calls. Fifteen waiters leave one of the sixteen reply objects active
-/// so the executive can continue receiving while every other reply cap is parked.
+/// Blocking `NtRemoveIoCompletion` calls. One reply object remains active so the executive can
+/// continue receiving while every other reply cap is parked.
 const IO_COMPLETION_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable<IO_COMPLETION_WAITER_N> =
     nt_io_completion::CompletionWaiterTable::new();
@@ -2535,6 +2541,8 @@ static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN
 const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
     nt_io_manager::PipeNameWaiterTable::new();
+static mut PIPE_IO_CANCEL_REPLY_CAPS_WORK: [u64; PIPE_WAITER_N] = [0; PIPE_WAITER_N];
+static mut PIPE_NAME_CANCEL_REPLY_CAPS_WORK: [u64; PIPE_NAME_WAITER_N] = [0; PIPE_NAME_WAITER_N];
 /// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
 static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_LISTEN_SIGNALLED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -11840,10 +11848,65 @@ fn print_hex_u64(value: u64) {
     print_hex(value as u32);
 }
 
+fn wait_reply_pool_bit(index: usize) -> Option<(usize, u64)> {
+    if index >= WAIT_REPLY_POOL_N {
+        return None;
+    }
+    Some((index / 64, 1u64 << (index % 64)))
+}
+
+fn wait_reply_pool_index_used(index: usize) -> bool {
+    let Some((word, bit)) = wait_reply_pool_bit(index) else {
+        return false;
+    };
+    WAIT_REPLY_POOL_USED[word].load(Ordering::Relaxed) & bit != 0
+}
+
+fn wait_reply_pool_mark_used(index: usize) {
+    if let Some((word, bit)) = wait_reply_pool_bit(index) {
+        WAIT_REPLY_POOL_USED[word].fetch_or(bit, Ordering::Relaxed);
+    }
+}
+
+fn wait_reply_pool_mark_free(index: usize) {
+    if let Some((word, bit)) = wait_reply_pool_bit(index) {
+        WAIT_REPLY_POOL_USED[word].fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+fn wait_reply_pool_reset_used() {
+    for word in 0..WAIT_REPLY_POOL_USED_WORDS {
+        WAIT_REPLY_POOL_USED[word].store(0, Ordering::Relaxed);
+    }
+}
+
+fn wait_reply_pool_find_free() -> Option<(usize, u64)> {
+    (0..WAIT_REPLY_POOL_N).find_map(|index| {
+        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+        (!wait_reply_pool_index_used(index) && cap != 0).then_some((index, cap))
+    })
+}
+
+fn wait_reply_pool_has_free() -> bool {
+    wait_reply_pool_find_free().is_some()
+}
+
+fn wait_reply_pool_used_count() -> u64 {
+    (0..WAIT_REPLY_POOL_USED_WORDS)
+        .map(|word| WAIT_REPLY_POOL_USED[word].load(Ordering::Relaxed).count_ones() as u64)
+        .sum()
+}
+
+fn wait_reply_pool_live_count() -> u64 {
+    (0..WAIT_REPLY_POOL_N)
+        .filter(|index| WAIT_REPLY_POOL[*index].load(Ordering::Relaxed) != 0)
+        .count() as u64
+}
+
 fn release_reply_pool_cap(cap: u64) {
     for index in 0..WAIT_REPLY_POOL_N {
         if WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == cap {
-            WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << index), Ordering::Relaxed);
+            wait_reply_pool_mark_free(index);
             break;
         }
     }
@@ -12064,10 +12127,7 @@ unsafe fn delay_park(
     if reply_cap == 0 || !delay_timer_init() {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let Some(fresh_index) = (0..WAIT_REPLY_POOL_N).find(|&index| {
-        used & (1u64 << index) == 0 && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-    }) else {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
     let waiter = nt_delay_execution::Waiter {
@@ -12083,8 +12143,7 @@ unsafe fn delay_park(
     if queue.insert(waiter).is_err() {
         return false;
     }
-    let fresh = WAIT_REPLY_POOL[fresh_index].load(Ordering::Relaxed);
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     delay_timer_rearm(queue);
@@ -12408,12 +12467,8 @@ unsafe fn dbgk_reporter_park(
     if stolen == 0 {
         return None;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let (fresh_index, fresh) = (0..WAIT_REPLY_POOL_N).find_map(|index| {
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        (used & (1u64 << index) == 0 && cap != 0).then_some((index, cap))
-    })?;
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    let (fresh_index, fresh) = wait_reply_pool_find_free()?;
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let block = nt_process::dbgk::ReporterBlock {
         kind,
@@ -12529,22 +12584,9 @@ unsafe fn keyed_wait_park(
     if stolen == 0 {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let mut fresh = 0u64;
-    let mut fresh_bit = 0usize;
-    for index in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << index) == 0 {
-            let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-            if cap != 0 {
-                fresh = cap;
-                fresh_bit = index;
-                break;
-            }
-        }
-    }
-    if fresh == 0 {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
-    }
+    };
 
     KEYED_WAITER_REPLY_CAP[slot].store(stolen, Ordering::Relaxed);
     KEYED_WAITER_TID[slot].store(tid, Ordering::Relaxed);
@@ -12553,7 +12595,7 @@ unsafe fn keyed_wait_park(
     KEYED_WAITER_RESUME_SP[slot].store(sp, Ordering::Relaxed);
     KEYED_WAITER_RESUME_FLAGS[slot].store(flags, Ordering::Relaxed);
     KEYED_WAITER_KEY[slot].store(key, Ordering::Relaxed);
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     KEYED_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -12677,17 +12719,13 @@ unsafe fn drop_current_syscall_reply() -> bool {
     if active == 0 {
         return false;
     }
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
     let active_index = (0..WAIT_REPLY_POOL_N)
         .find(|&index| WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == active);
-    let fresh_index = (0..WAIT_REPLY_POOL_N).find(|&index| {
-        used & (1u64 << index) == 0 && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-    });
-    let (active_index, fresh_index) = match (active_index, fresh_index) {
-        (Some(active_index), Some(fresh_index)) => (active_index, fresh_index),
+    let fresh = wait_reply_pool_find_free();
+    let (active_index, fresh_index, fresh) = match (active_index, fresh) {
+        (Some(active_index), Some((fresh_index, fresh))) => (active_index, fresh_index, fresh),
         _ => return false,
     };
-    let fresh = WAIT_REPLY_POOL[fresh_index].load(Ordering::Relaxed);
     let delete = cnode_delete_r(active);
     if delete != 0 {
         print_str(b"[thread-term] reply-drop cap=0x");
@@ -12697,8 +12735,8 @@ unsafe fn drop_current_syscall_reply() -> bool {
         print_str(b"\n");
         return false;
     }
-    WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << active_index), Ordering::Relaxed);
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    wait_reply_pool_mark_free(active_index);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, active);
     if retype != 0 {
@@ -12770,7 +12808,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 
 unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-    let mut reply_caps = [0u64; PIPE_WAITER_N];
+    let reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_IO_CANCEL_REPLY_CAPS_WORK);
     let mut count = 0usize;
     for (_, waiter) in table
         .drain_all()
@@ -12794,9 +12832,8 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
         }
     }
     let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
-    let mut name_wait_reply_caps = [0u64; PIPE_NAME_WAITER_N];
-    let name_wait_count =
-        name_waiters.cancel_thread_collect_reply_caps(tid, &mut name_wait_reply_caps);
+    let name_wait_reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_NAME_CANCEL_REPLY_CAPS_WORK);
+    let name_wait_count = name_waiters.cancel_thread_collect_reply_caps(tid, name_wait_reply_caps);
     for index in 0..name_wait_count.min(name_wait_reply_caps.len()) {
         let cap = name_wait_reply_caps[index];
         if cap != 0 {
@@ -12940,6 +12977,7 @@ unsafe fn wait_park_multi(
         || objects.len() > WAITER_MAX_EVENTS
         || result_indices.len() != objects.len()
     {
+        WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     // Find a free waiter slot.
@@ -12951,31 +12989,21 @@ unsafe fn wait_park_multi(
         }
     }
     if wslot == usize::MAX {
+        WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     // The reply object bound to this caller is the active REPLY_MAIN.
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
+        WAIT_PARK_NO_REPLY_CAP.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     // Find a FREE pool object to become the new active REPLY_MAIN. The stolen one is (still) marked
     // used; we need a different free bit.
-    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-    let mut fresh = 0u64;
-    let mut fresh_bit = 0usize;
-    for i in 0..WAIT_REPLY_POOL_N {
-        if used & (1u64 << i) == 0 {
-            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
-            if cp != 0 {
-                fresh = cp;
-                fresh_bit = i;
-                break;
-            }
-        }
-    }
-    if fresh == 0 {
+    let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
+        WAIT_PARK_NO_REPLY_CAP.fetch_add(1, Ordering::Relaxed);
         return false; // pool exhausted → caller reports STATUS_INSUFFICIENT_RESOURCES
-    }
+    };
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
     for (k, &object) in objects.iter().enumerate() {
@@ -12996,7 +13024,7 @@ unsafe fn wait_park_multi(
     // WAITER_EVENT_IDX doubles as the slot-free sentinel: set it LAST (after the set) so a slot never
     // looks "used but empty".
     WAITER_EVENT_IDX[wslot].store(objects[0].raw(), Ordering::Relaxed);
-    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -13014,8 +13042,12 @@ unsafe fn wait_wake_dispatcher_pulse(just_set: usize, handler: &mut ExecNtHandle
 }
 
 unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<usize>) -> u64 {
-    let mut wake_indices = [u64::MAX; WAITER_N];
-    let mut wake_objects = [WaitObject::FREE.raw(); WAITER_N];
+    let wake_indices = &mut *core::ptr::addr_of_mut!(WAIT_WAKE_INDEX_WORK);
+    let wake_objects = &mut *core::ptr::addr_of_mut!(WAIT_WAKE_OBJECT_WORK);
+    for i in 0..WAITER_N {
+        wake_indices[i] = u64::MAX;
+        wake_objects[i] = WaitObject::FREE.raw();
+    }
     for i in 0..WAITER_N {
         let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
         if slot_ev0 == u64::MAX {
@@ -13114,12 +13146,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
             client_reply_on(cap, 18, wake_index, 0, 0, 0);
             // Return this reply object to the pool (clear its used bit).
-            for p in 0..WAIT_REPLY_POOL_N {
-                if WAIT_REPLY_POOL[p].load(Ordering::Relaxed) == cap {
-                    WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << p), Ordering::Relaxed);
-                    break;
-                }
-            }
+            release_reply_pool_cap(cap);
             let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace < 96 {
                 let tid = WAITER_TID[i].load(Ordering::Relaxed);
@@ -19816,7 +19843,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WAIT_REPLY_POOL[i].store(rp, Ordering::Relaxed);
             }
         }
-        WAIT_REPLY_POOL_USED.store(1, Ordering::Relaxed); // bit 0 = pool[0] is the active REPLY_MAIN
+        wait_reply_pool_reset_used();
+        wait_reply_pool_mark_used(0); // pool[0] is the active REPLY_MAIN
+        print_str(b"[reply-pool] live=");
+        print_u64(wait_reply_pool_live_count());
+        print_str(b" capacity=");
+        print_u64(WAIT_REPLY_POOL_N as u64);
+        print_str(b"\n");
     }
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);

@@ -1,6 +1,6 @@
 # Kernel Dynamic Tech Debt Plan
 
-Last updated: 2026-08-05
+Last updated: 2026-08-10
 
 ## Objective
 
@@ -2000,3 +2000,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   explorer paint proof was `begin/end=6/6`, `direct-gdi-returns=47`,
   `batch-flush/records=41/41`, and framebuffer readback found `27375` non-background pixels over
   bounds `0,384..1023,767`.
+
+### 2026-08-10
+
+- Wait/reply-cap capacity cleanup complete. The executive wait parking path no longer depends on a
+  single-word reply-cap bitmap or a fixed 16-slot dispatcher waiter table: reply caps and waiter
+  records now scale with the hosted-thread runtime capacity, all parkers share the same reply-pool
+  helpers, and rust-micro's `extern-rootserver` profile has enough kernel Reply objects for the
+  larger NT rootserver shape. Validation: `cargo fmt --all`,
+  `cd rust-micro && cargo +nightly fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and full boot `.tmp/boot-reply-pool-kernel-scale-20260810-130750.log`.
+  Evidence: the boot prints `reply-pool live=545 capacity=545`, has no reply-pool exhaustion or
+  wait-array resource failures, passes `exec_csr_message_plane`, and reaches real winlogon SAS HWND
+  creation plus `NtUserSetLogonNotifyWindow(0x127c)`. Review adjustment: the next honest shell
+  frontier is the post-SAS message loop. In that boot, `exec_winlogon_sas_window` and
+  `exec_win32k_desktop_painted` pass, but post-SAS `GetMessage` remains `0`, so msgina dialog
+  creation/profile activation/userinit/explorer are downstream again.
