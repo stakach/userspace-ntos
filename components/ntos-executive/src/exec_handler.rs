@@ -4730,44 +4730,42 @@ impl ExecNtHandler {
             .map(|runtime| runtime.badge)
     }
 
-    pub(crate) fn live_hosted_thread_badges_for_pi(
+    pub(crate) fn hosted_thread_quiesce_records_for_pi(
         &self,
         pi: usize,
-        out: &mut [u64],
-    ) -> usize {
-        let raw_count = self.thread_runtime.live_badges_for_pi(pi, out);
+        out: &mut [HostedThreadQuiesceRecord],
+    ) -> (usize, bool) {
         let mut count = 0usize;
-        for index in 0..raw_count {
-            let badge = out[index];
-            if out[..count].contains(&badge) {
+        let mut overflow = false;
+        let table = unsafe { &*self.thread_runtime.table };
+        for runtime in table.entries.iter().copied() {
+            if !runtime.is_live() || runtime.tcb <= 1 || runtime.pi != pi {
                 continue;
             }
-            let Some(tid) = self.hosted_thread_tid_for_badge(badge) else {
+            if runtime.tid > nt_process::ThreadId::MAX as u64 {
                 continue;
             };
-            if !self.hosted_thread_can_make_progress(tid) {
+            if out[..count]
+                .iter()
+                .any(|record| record.badge == runtime.badge)
+            {
                 continue;
             }
-            out[count] = badge;
+            if count == out.len() {
+                overflow = true;
+                continue;
+            }
+            out[count] = HostedThreadQuiesceRecord {
+                badge: runtime.badge,
+                tid: runtime.tid,
+                state: self
+                    .pm
+                    .thread(runtime.tid as nt_process::ThreadId)
+                    .map(|thread| thread.state),
+            };
             count += 1;
         }
-        count
-    }
-
-    fn hosted_thread_can_make_progress(&self, tid: u64) -> bool {
-        if tid == 0 || tid > nt_process::ThreadId::MAX as u64 {
-            return false;
-        }
-        self.pm
-            .thread(tid as nt_process::ThreadId)
-            .is_some_and(|thread| {
-                matches!(
-                    thread.state,
-                    nt_process::ThreadState::Ready
-                        | nt_process::ThreadState::Running
-                        | nt_process::ThreadState::Waiting
-                )
-            })
+        (count, overflow)
     }
 
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
@@ -6251,7 +6249,7 @@ impl ExecNtHandler {
         match action {
             WakeAction::None => {}
             WakeAction::Resume => {
-                dbgk_reporter_resume(&block);
+                dbgk_reporter_resume(self, &block);
             }
             WakeAction::LeaveBlocked => {
                 dbgk_reporter_abandon(&block);
@@ -6320,7 +6318,7 @@ impl ExecNtHandler {
                     dbgk_reporter_abandon(&block);
                     crate::win32k_glue::unwind_dead_client_user_callbacks(block.pi);
                 } else {
-                    dbgk_reporter_resume(&block);
+                    dbgk_reporter_resume(self, &block);
                 }
                 DBGK_REPORTERS_RELEASED.fetch_add(1, Ordering::Relaxed);
             }
@@ -6874,7 +6872,7 @@ impl ExecNtHandler {
             set_reply_mr(17, waiter.resume_flags);
             client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
             release_reply_pool_cap(waiter.reply_cap);
-            thread_wait_state_clear_badge(waiter.badge);
+            thread_wait_state_clear_badge_ready(self, waiter.badge);
         }
         self.release_file_reference(waiter.file_id);
     }
@@ -6903,7 +6901,7 @@ impl ExecNtHandler {
             set_reply_mr(17, waiter.resume_flags);
             client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
             release_reply_pool_cap(waiter.reply_cap);
-            thread_wait_state_clear_badge(waiter.badge);
+            thread_wait_state_clear_badge_ready(self, waiter.badge);
         }
     }
 
@@ -8694,17 +8692,6 @@ impl ExecNtHandler {
             }
             nt_user_host::ThreadMechanismKind::Pool { slot } => (mechanism.pi, slot),
         };
-
-        if self.hosted_thread_role(tid) == Some(HostedThreadRole::ScmWorker) {
-            let _ = self.take_pool_thread_suspended(pi, slot);
-            if previous_count != 0
-                && !self.user_memory_write(memory, previous_count, &1u32.to_le_bytes())
-            {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            print_str(b"[scm-worker] NtResumeThread -> SUCCESS (not resumed; trampoline-entry fault, see frontier)\n");
-            return 0;
-        }
 
         let Some(previous) = self.take_pool_thread_suspended(pi, slot) else {
             return nt_process::STATUS_INVALID_PARAMETER;

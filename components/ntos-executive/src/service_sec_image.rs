@@ -1615,11 +1615,10 @@ fn hosted_multiplexed_thread_spawn_for(
             badge: SCM_WORKER_BADGE,
             role: HostedThreadRole::ScmWorker,
             spawner: HostedMultiplexedThreadSpawner::ScmWorker,
-            resume: HostedThreadResumeMode::Always,
-            spawn_prefix:
-                b"[scm-worker] spawning + RESUMING REAL per-connection RPC worker: entry=0x",
-            spawned_prefix: b"[scm-worker] spawned + resumed tcb=0x",
-            spawned_suffix: b" (runs into the main multiplex, badge 15)\n",
+            resume: HostedThreadResumeMode::PoolState,
+            spawn_prefix: b"[scm-worker] spawning REAL per-connection RPC worker: entry=0x",
+            spawned_prefix: b"[scm-worker] spawned tcb=0x",
+            spawned_suffix: b" (multiplexed at badge 15)\n",
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
             owner_leaf: b"lsass.exe",
@@ -4115,9 +4114,8 @@ pub(crate) unsafe fn service_sec_image(
     // crash-parked or wait-parked, QUIESCE (break -> the gate runs). `$ip` is the reported stop value.
     macro_rules! mark_wait_parked {
         ($pi:expr, $ip:expr) => {{
-            thread_wait_state_park_badge(badge);
+            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
             wait_parked = wait_parked_owner_mask(&nt_handler);
-            wait_parked |= wait_parked_owner_bit_for_pi(&nt_handler, $pi);
             trace_wait_owner_mask_after_mark(
                 &nt_handler,
                 $pi,
@@ -4391,7 +4389,7 @@ pub(crate) unsafe fn service_sec_image(
         let pi = live_hosted_pi_for_fault_badge(&nt_handler, badge).unwrap_or(0);
         // This thread is producing an event, so it is runnable even if the owning process still has
         // other parked threads. The owner mask is derived from all live hosted threads below.
-        thread_wait_state_clear_badge(badge);
+        thread_wait_state_clear_badge_running(&mut nt_handler, badge);
         wait_parked = wait_parked_owner_mask(&nt_handler);
         if hosted_main_badge_has_role(
             &nt_handler,
@@ -12757,7 +12755,7 @@ pub(crate) unsafe fn service_sec_image(
                     // ★ LSA rendezvous safety: never leave the LSA client blocked on a server that
                     // just walled — release it with the real failure so its own error path runs.
                     if LSA_SRV_LIVE_BADGE.load(Ordering::Relaxed) == badge {
-                        let _ = lsa_release_client_on_server_wall(m0);
+                        let _ = lsa_release_client_on_server_wall(&mut nt_handler, m0);
                     }
                     if is_wl_worker && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
                     {
@@ -12967,21 +12965,23 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             if let Some(deadline) = park_delay_deadline {
+                let delay_tid = nt_handler.current_tid;
                 if delay_park(
+                    &mut nt_handler,
                     delay_queue,
                     deadline,
                     reply_main,
                     resume_ip,
                     sp,
                     flags,
-                    nt_handler.current_tid,
+                    delay_tid,
                     badge,
                 ) {
                     if DELAY_PARKED_COUNT.load(Ordering::Relaxed) <= 16 {
                         print_str(b"[delay] PARKED badge=");
                         print_u64(badge);
                         print_str(b" tid=");
-                        print_u64(nt_handler.current_tid);
+                        print_u64(delay_tid);
                         print_str(b" queued=");
                         print_u64(delay_queue.len() as u64);
                         print_str(b" -> receive continues\n");
@@ -17692,7 +17692,7 @@ unsafe fn gui_message_wait_redrive_event(
         set_reply_mr(17, waiter.resume_flags);
         client_reply_on(waiter.reply_cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
-        thread_wait_state_clear_badge(waiter.badge);
+        thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
         {
             let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
             if table[slot].used && table[slot].reply_cap == waiter.reply_cap {
@@ -17839,7 +17839,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
         0,
     );
     release_reply_pool_cap(waiter.reply_cap);
-    thread_wait_state_clear_badge(waiter.badge);
+    thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
     let _ = nt_handler.io_completion_ports.release(waiter.port_id);
     IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -18018,7 +18018,7 @@ unsafe fn lsa_server_park(
 /// The real LSA server thread hit a syscall this executive does not service while a client was
 /// blocked on its half of the exchange. Release the client with a real failure (its own error path
 /// then runs) instead of leaving it blocked forever, and record the wall for the report.
-unsafe fn lsa_release_client_on_server_wall(ssn: u64) -> bool {
+unsafe fn lsa_release_client_on_server_wall(nt_handler: &mut ExecNtHandler, ssn: u64) -> bool {
     let cap = LSA_CLI_REPLY_CAP.swap(0, Ordering::Relaxed);
     if cap == 0 {
         return false;
@@ -18038,7 +18038,7 @@ unsafe fn lsa_release_client_on_server_wall(ssn: u64) -> bool {
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
     if badge != LSA_CONTEXT_UNSET {
-        thread_wait_state_clear_badge(badge);
+        thread_wait_state_clear_badge_ready(nt_handler, badge);
     }
     lsa_clear_client_context();
     true
@@ -18095,7 +18095,7 @@ unsafe fn lsa_server_deliver(
         LSA_SRV_SP.load(Ordering::Relaxed),
         LSA_SRV_FLAGS.load(Ordering::Relaxed),
     );
-    thread_wait_state_clear_badge(badge);
+    thread_wait_state_clear_badge_ready(nt_handler, badge);
     true
 }
 
@@ -18204,7 +18204,7 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
-    thread_wait_state_clear_badge(cli_badge);
+    thread_wait_state_clear_badge_ready(nt_handler, cli_badge);
     lsa_clear_client_context();
     true
 }
@@ -18292,7 +18292,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
-    thread_wait_state_clear_badge(cli_badge);
+    thread_wait_state_clear_badge_ready(nt_handler, cli_badge);
     lsa_clear_client_context();
     true
 }
@@ -18437,7 +18437,7 @@ pub(crate) unsafe fn pipe_name_wait_complete_one(
         set_reply_mr(17, waiter.resume_flags);
         client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
-        thread_wait_state_clear_badge(waiter.badge);
+        thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
     }
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
@@ -18601,7 +18601,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             set_reply_mr(17, w.resume_flags);
             client_reply_on(cap, 18, status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_badge(w.badge);
+            thread_wait_state_clear_badge_ready(nt_handler, w.badge);
         }
         nt_handler.release_file_reference(w.file_id);
         // Free the slot (re-armable for the next PDU).
@@ -18836,20 +18836,30 @@ fn wait_parked_owner_mask(nt_handler: &ExecNtHandler) -> u64 {
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
     let mut mask = 0u64;
     for pi in 0..MAX_PI {
-        let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
-        if let Some((owner, _, true)) = hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
-        {
-            mask |= 1u64 << owner;
+        let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
+        if let Some(snapshot) = hosted_process_wait_snapshot(nt_handler, pi, &mut threads) {
+            if snapshot.all_parked {
+                mask |= 1u64 << snapshot.owner;
+            }
         }
     }
     mask
 }
 
+#[derive(Clone, Copy)]
+struct HostedProcessWaitSnapshot {
+    owner: u64,
+    count: usize,
+    live: bool,
+    all_parked: bool,
+    overflow: bool,
+}
+
 fn hosted_process_wait_snapshot(
     nt_handler: &ExecNtHandler,
     pi: usize,
-    badges: &mut [u64],
-) -> Option<(u64, usize, bool)> {
+    threads: &mut [HostedThreadQuiesceRecord],
+) -> Option<HostedProcessWaitSnapshot> {
     if !hosted_process_pi_can_run(nt_handler, pi) {
         return None;
     }
@@ -18857,31 +18867,34 @@ fn hosted_process_wait_snapshot(
     if owner >= 64 {
         return None;
     }
-    let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, badges);
-    if count > badges.len() {
-        count = badges.len();
-    }
-    if !badges[..count].contains(&owner) {
-        if count == badges.len() {
-            return Some((owner, count, false));
+    let (count, overflow) = nt_handler.hosted_thread_quiesce_records_for_pi(pi, threads);
+    let mut relevant = 0usize;
+    let mut all_parked = true;
+    for thread in threads[..count].iter().copied() {
+        match thread.state {
+            Some(nt_process::ThreadState::Ready) | Some(nt_process::ThreadState::Running) => {
+                relevant += 1;
+                all_parked = false;
+            }
+            Some(nt_process::ThreadState::Waiting) => {
+                relevant += 1;
+                if !thread_wait_state_badge_parked(thread.badge) {
+                    all_parked = false;
+                }
+            }
+            Some(nt_process::ThreadState::Initialized)
+            | Some(nt_process::ThreadState::Suspended)
+            | Some(nt_process::ThreadState::Terminated)
+            | None => {}
         }
-        badges[count] = owner;
-        count += 1;
     }
-    let all_parked = count != 0
-        && badges[..count]
-            .iter()
-            .copied()
-            .all(thread_wait_state_badge_parked);
-    Some((owner, count, all_parked))
-}
-
-fn wait_parked_owner_bit_for_pi(nt_handler: &ExecNtHandler, pi: usize) -> u64 {
-    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
-    let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
-    hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
-        .and_then(|(owner, _, all_parked)| all_parked.then_some(1u64 << owner))
-        .unwrap_or(0)
+    Some(HostedProcessWaitSnapshot {
+        owner,
+        count,
+        live: overflow || relevant != 0,
+        all_parked: !overflow && relevant != 0 && all_parked,
+        overflow,
+    })
 }
 
 fn hosted_process_pi_can_run(nt_handler: &ExecNtHandler, pi: usize) -> bool {
@@ -18907,9 +18920,15 @@ fn trace_wait_owner_mask_after_mark(
         return;
     }
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
-    let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
-    let (owner, count, all_parked) = hosted_process_wait_snapshot(nt_handler, pi, &mut badges)
-        .unwrap_or_else(|| (owner_top_badge_for(nt_handler, badge), 0, false));
+    let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
+    let snapshot =
+        hosted_process_wait_snapshot(nt_handler, pi, &mut threads).unwrap_or(HostedProcessWaitSnapshot {
+            owner: owner_top_badge_for(nt_handler, badge),
+            count: 0,
+            live: false,
+            all_parked: false,
+            overflow: false,
+        });
     print_str(b"[wait-owner] #");
     print_u64(n);
     print_str(b" pi=");
@@ -18917,7 +18936,7 @@ fn trace_wait_owner_mask_after_mark(
     print_str(b" badge=");
     print_u64(badge);
     print_str(b" owner=");
-    print_u64(owner);
+    print_u64(snapshot.owner);
     print_str(b" live=0x");
     print_hex_u64(live);
     print_str(b" crash=0x");
@@ -18927,19 +18946,39 @@ fn trace_wait_owner_mask_after_mark(
     print_str(b" remaining=0x");
     print_hex_u64(live & !(crash_parked | wait_parked));
     print_str(b" owner-bit=");
-    print_u64(((owner < 64) && (wait_parked & (1u64 << owner)) != 0) as u64);
+    print_u64(
+        ((snapshot.owner < 64) && (wait_parked & (1u64 << snapshot.owner)) != 0) as u64,
+    );
+    print_str(b" snapshot-live=");
+    print_u64(snapshot.live as u64);
     print_str(b" all-parked=");
-    print_u64(all_parked as u64);
+    print_u64(snapshot.all_parked as u64);
+    print_str(b" overflow=");
+    print_u64(snapshot.overflow as u64);
     print_str(b" threads=");
-    for thread_badge in badges[..count].iter().copied() {
-        print_u64(thread_badge);
-        print_str(if thread_wait_state_badge_parked(thread_badge) {
-            b":P "
-        } else {
-            b":R "
-        });
+    for thread in threads[..snapshot.count].iter().copied() {
+        print_wait_snapshot_thread(thread);
     }
     print_str(b"\n");
+}
+
+fn print_wait_snapshot_thread(thread: HostedThreadQuiesceRecord) {
+    print_u64(thread.badge);
+    print_str(b":");
+    match thread.state {
+        Some(nt_process::ThreadState::Initialized) => print_str(b"I"),
+        Some(nt_process::ThreadState::Ready) => print_str(b"Ready"),
+        Some(nt_process::ThreadState::Running) => print_str(b"Run"),
+        Some(nt_process::ThreadState::Waiting) => print_str(b"Wait"),
+        Some(nt_process::ThreadState::Suspended) => print_str(b"S"),
+        Some(nt_process::ThreadState::Terminated) => print_str(b"T"),
+        None => print_str(b"?"),
+    }
+    print_str(if thread_wait_state_badge_parked(thread.badge) {
+        b"/P "
+    } else {
+        b"/- "
+    });
 }
 
 /// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
@@ -19004,12 +19043,17 @@ fn pi_is_top_level(nt_handler: &ExecNtHandler, badge: u64) -> bool {
 /// process is crash-parked (so the loop's next `recv` would block on the fault-EP forever).
 #[inline]
 unsafe fn live_top_badges(nt_handler: &ExecNtHandler) -> u64 {
-    (0..MAX_PI)
-        .filter_map(|pi| {
-            hosted_process_pi_can_run(nt_handler, pi)
-                .then_some(hosted_top_badge_for_pi(nt_handler, pi))
-        })
-        .fold(0u64, |mask, badge| mask | (1u64 << badge))
+    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
+    let mut mask = 0u64;
+    for pi in 0..MAX_PI {
+        let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
+        if let Some(snapshot) = hosted_process_wait_snapshot(nt_handler, pi, &mut threads) {
+            if snapshot.live {
+                mask |= 1u64 << snapshot.owner;
+            }
+        }
+    }
+    mask
 }
 
 /// One-line progress trace for the dbgk target-blocking self-test: which fault the throwaway client

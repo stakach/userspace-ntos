@@ -12141,6 +12141,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
 }
 
 unsafe fn delay_park(
+    handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
     deadline_100ns: u64,
     reply_cap: u64,
@@ -12172,11 +12173,15 @@ unsafe fn delay_park(
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    thread_wait_state_mark_badge_waiting(handler, badge);
     delay_timer_rearm(queue);
     true
 }
 
-unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) -> u64 {
+unsafe fn delay_wake_due(
+    handler: &mut ExecNtHandler,
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+) -> u64 {
     let now = monotonic_time_100ns();
     let mut woken = 0;
     while let Some(waiter) = queue.pop_due(now) {
@@ -12185,6 +12190,7 @@ unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) 
         set_reply_mr(17, waiter.resume_flags);
         client_reply_on(waiter.reply_cap, 18, 0, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
+        thread_wait_state_clear_badge_ready(handler, waiter.badge);
         woken += 1;
         let wake_number = DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         if wake_number < 16 {
@@ -12223,7 +12229,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
             0,
         );
         release_reply_pool_cap(waiter.reply_cap);
-        thread_wait_state_clear_badge(waiter.badge);
+        thread_wait_state_clear_badge_ready(handler, waiter.badge);
         let _ = handler.io_completion_ports.release(waiter.port_id);
         IO_COMPLETION_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
         woken += 1;
@@ -12265,15 +12271,65 @@ fn thread_wait_state_park_badge(badge: u64) {
     }
 }
 
+fn thread_wait_state_set_tid(
+    handler: &mut ExecNtHandler,
+    tid: u64,
+    state: nt_process::ThreadState,
+) {
+    if tid == 0 || tid > nt_process::ThreadId::MAX as u64 {
+        return;
+    }
+    let _ = handler
+        .pm
+        .set_thread_state(tid as nt_process::ThreadId, state);
+}
+
+fn thread_wait_state_set_badge(
+    handler: &mut ExecNtHandler,
+    badge: u64,
+    state: nt_process::ThreadState,
+) {
+    if let Some(tid) = handler.hosted_thread_tid_for_badge(badge) {
+        thread_wait_state_set_tid(handler, tid, state);
+    }
+}
+
+fn thread_wait_state_park_badge_waiting(handler: &mut ExecNtHandler, badge: u64) {
+    thread_wait_state_park_badge(badge);
+    thread_wait_state_set_badge(handler, badge, nt_process::ThreadState::Waiting);
+}
+
+fn thread_wait_state_mark_badge_waiting(handler: &mut ExecNtHandler, badge: u64) {
+    thread_wait_state_set_badge(handler, badge, nt_process::ThreadState::Waiting);
+}
+
 fn thread_wait_state_clear_badge(badge: u64) {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).clear(badge);
     }
 }
 
+fn thread_wait_state_clear_badge_ready(handler: &mut ExecNtHandler, badge: u64) {
+    thread_wait_state_clear_badge(badge);
+    thread_wait_state_set_badge(handler, badge, nt_process::ThreadState::Ready);
+}
+
+fn thread_wait_state_clear_badge_running(handler: &mut ExecNtHandler, badge: u64) {
+    thread_wait_state_clear_badge(badge);
+    thread_wait_state_set_badge(handler, badge, nt_process::ThreadState::Running);
+}
+
 fn thread_wait_state_clear_tid(handler: &ExecNtHandler, tid: u64) {
     if let Some(badge) = handler.hosted_thread_badge_for_tid(tid) {
         thread_wait_state_clear_badge(badge);
+    }
+}
+
+fn thread_wait_state_clear_tid_ready(handler: &mut ExecNtHandler, tid: u64) {
+    if let Some(badge) = handler.hosted_thread_badge_for_tid(tid) {
+        thread_wait_state_clear_badge_ready(handler, badge);
+    } else {
+        thread_wait_state_set_tid(handler, tid, nt_process::ThreadState::Ready);
     }
 }
 
@@ -12290,7 +12346,7 @@ unsafe fn delay_timer_interrupt(
     // it must not be counted as a spurious wake — `exec_delay_timer_disarms`' `spurious <= 64`
     // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
     let watchdog_tick = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
-    let woken = delay_wake_due(queue)
+    let woken = delay_wake_due(handler, queue)
         + wait_wake_due(handler)
         + keyed_wait_wake_due(handler)
         + io_completion_wake_due(handler)
@@ -12522,7 +12578,10 @@ unsafe fn dbgk_reporter_park(
 /// * **VMFault / DebugException** — no register transfer at all; a length-0, label-0 reply restarts
 ///   the faulter (the `#PF` retries the faulting instruction, the int3 resumes past it).
 /// In every case label 0 = restart (`handleFaultReply`'s `label == 0` rule).
-unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool {
+unsafe fn dbgk_reporter_resume(
+    handler: &mut ExecNtHandler,
+    block: &nt_process::dbgk::ReporterBlock,
+) -> bool {
     use nt_process::dbgk::{DBGK_BLOCK_SYSCALL, DBGK_BLOCK_USER_EXCEPTION};
     if !block.is_blocked() {
         return false;
@@ -12546,7 +12605,7 @@ unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool 
         _ => client_reply_on(block.reply_cap, 0, 0, 0, 0, 0),
     }
     release_reply_pool_cap(block.reply_cap);
-    thread_wait_state_clear_badge(block.badge);
+    thread_wait_state_clear_badge_ready(handler, block.badge);
     DBGK_REPORTERS_RESUMED.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -12628,7 +12687,7 @@ unsafe fn keyed_wait_park(
 }
 
 /// Wake one caller parked on `key`, returning `true` when a matching waiter was resumed.
-unsafe fn keyed_wait_wake_one(handler: &ExecNtHandler, key: u64, status: u64) -> bool {
+unsafe fn keyed_wait_wake_one(handler: &mut ExecNtHandler, key: u64, status: u64) -> bool {
     for slot in 0..KEYED_WAITER_N {
         if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) != key {
             continue;
@@ -12643,7 +12702,7 @@ unsafe fn keyed_wait_wake_one(handler: &ExecNtHandler, key: u64, status: u64) ->
         set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
         client_reply_on(cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(cap);
-        thread_wait_state_clear_tid(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
+        thread_wait_state_clear_tid_ready(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
         keyed_wait_clear_slot(slot);
         KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         return true;
@@ -12688,7 +12747,7 @@ fn keyed_release_remember_pending(key: u64) -> bool {
     false
 }
 
-unsafe fn keyed_wait_wake_due(handler: &ExecNtHandler) -> u64 {
+unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
     let now = monotonic_time_100ns();
     let mut woken = 0;
     for slot in 0..KEYED_WAITER_N {
@@ -12704,7 +12763,10 @@ unsafe fn keyed_wait_wake_due(handler: &ExecNtHandler) -> u64 {
             set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
+            thread_wait_state_clear_tid_ready(
+                handler,
+                KEYED_WAITER_TID[slot].load(Ordering::Relaxed),
+            );
             woken += 1;
         }
         keyed_wait_clear_slot(slot);
@@ -13195,7 +13257,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
                 print_u64(WAITER_WAIT_ALL[i].load(Ordering::Relaxed));
                 print_str(b"\n");
             }
-            thread_wait_state_clear_tid(handler, WAITER_TID[i].load(Ordering::Relaxed));
+            thread_wait_state_clear_tid_ready(handler, WAITER_TID[i].load(Ordering::Relaxed));
             woken += 1;
             WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -13209,7 +13271,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
     woken
 }
 
-unsafe fn wait_wake_due(handler: &ExecNtHandler) -> u64 {
+unsafe fn wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
     let now = monotonic_time_100ns();
     let mut woken = 0;
     for slot in 0..WAITER_N {
@@ -13225,7 +13287,7 @@ unsafe fn wait_wake_due(handler: &ExecNtHandler) -> u64 {
             set_reply_mr(17, WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid(handler, WAITER_TID[slot].load(Ordering::Relaxed));
+            thread_wait_state_clear_tid_ready(handler, WAITER_TID[slot].load(Ordering::Relaxed));
             woken += 1;
         }
         WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
@@ -16885,6 +16947,23 @@ impl HostedThreadRuntime {
 
     const fn is_live(self) -> bool {
         self.tid != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedThreadQuiesceRecord {
+    pub(crate) badge: u64,
+    pub(crate) tid: u64,
+    pub(crate) state: Option<nt_process::ThreadState>,
+}
+
+impl HostedThreadQuiesceRecord {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            badge: 0,
+            tid: 0,
+            state: None,
+        }
     }
 }
 
