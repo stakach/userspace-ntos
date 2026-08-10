@@ -325,6 +325,7 @@ const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
 /// FILE_OBJECT must remain available for close. See [`FILE_OBJECTS`].
 const IRP_MJ_CLOSE: u64 = 0x02;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -359,6 +360,9 @@ static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 static mut PIPE_TRANSCEIVE_TRACE_COUNT: u32 = 0;
 const PIPE_RW_TRACE_CAP: u32 = 768;
 const PIPE_TRANSCEIVE_TRACE_CAP: u32 = 384;
+const DCERPC_READ_REASSEMBLY_CAP: usize = 16;
+const DCERPC_READ_REASSEMBLY_BYTES: usize = 512;
+const DCERPC_READ_REASSEMBLY_TRACE_CAP: u32 = 160;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
 static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
@@ -1013,6 +1017,26 @@ pub(crate) struct DceRpcPduView {
     context_handles: [Option<DceRpcContextHandleView>; DCERPC_CONTEXT_HANDLE_TRACE_CAP],
 }
 
+#[derive(Clone, Copy)]
+struct DceRpcReadAssembly {
+    fid: u64,
+    frag_len: u16,
+    len: u16,
+    buf: [u8; DCERPC_READ_REASSEMBLY_BYTES],
+}
+
+const EMPTY_DCERPC_READ_ASSEMBLY: DceRpcReadAssembly = DceRpcReadAssembly {
+    fid: 0,
+    frag_len: 0,
+    len: 0,
+    buf: [0; DCERPC_READ_REASSEMBLY_BYTES],
+};
+
+static mut DCERPC_READ_REASSEMBLY: [DceRpcReadAssembly; DCERPC_READ_REASSEMBLY_CAP] =
+    [EMPTY_DCERPC_READ_ASSEMBLY; DCERPC_READ_REASSEMBLY_CAP];
+static mut DCERPC_READ_REASSEMBLY_CURSOR: usize = 0;
+static mut DCERPC_READ_REASSEMBLY_TRACE_COUNT: u32 = 0;
+
 impl PipeCcbView {
     fn has_queued_state(&self) -> bool {
         self.q.iter().any(|q| {
@@ -1102,6 +1126,128 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
 
 pub(crate) unsafe fn dcerpc_pdu_view_from_slice(payload: &[u8]) -> Option<DceRpcPduView> {
     dcerpc_pdu_view(payload.as_ptr() as u64, payload.len() as u64)
+}
+
+unsafe fn trace_dcerpc_read_reassembly(file_id: u64, status: u32, info: u64, payload: u64, len: u64) {
+    if file_id == 0 || payload == 0 || info == 0 || len == 0 {
+        return;
+    }
+    if status != 0 && status != STATUS_BUFFER_OVERFLOW {
+        return;
+    }
+
+    let chunk_len = core::cmp::min(info, len);
+    if chunk_len == 0 {
+        return;
+    }
+
+    if let Some(index) = dcerpc_read_reassembly_active_slot(file_id) {
+        let complete = dcerpc_read_reassembly_append(index, payload, chunk_len);
+        if complete {
+            dcerpc_read_reassembly_emit(index, status, info);
+            dcerpc_read_reassembly_clear(index);
+        }
+        return;
+    }
+
+    if chunk_len < 16 || read_volatile(payload as *const u8) != 5 {
+        return;
+    }
+
+    let frag_len = u16::from_le_bytes([
+        read_volatile((payload + 8) as *const u8),
+        read_volatile((payload + 9) as *const u8),
+    ]);
+    if frag_len < 16 {
+        return;
+    }
+
+    let index = dcerpc_read_reassembly_new_slot(file_id);
+    dcerpc_read_reassembly_start(index, file_id, frag_len);
+    let complete = dcerpc_read_reassembly_append(index, payload, chunk_len);
+    if complete {
+        dcerpc_read_reassembly_emit(index, status, info);
+        dcerpc_read_reassembly_clear(index);
+    }
+}
+
+unsafe fn dcerpc_read_reassembly_active_slot(fid: u64) -> Option<usize> {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    for (index, entry) in table.iter().enumerate() {
+        if entry.fid == fid && entry.frag_len >= 16 && entry.len < entry.frag_len {
+            return Some(index);
+        }
+    }
+    None
+}
+
+unsafe fn dcerpc_read_reassembly_new_slot(fid: u64) -> usize {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    for (index, entry) in table.iter().enumerate() {
+        if entry.fid == 0 || entry.fid == fid {
+            return index;
+        }
+    }
+    let index = DCERPC_READ_REASSEMBLY_CURSOR % DCERPC_READ_REASSEMBLY_CAP;
+    DCERPC_READ_REASSEMBLY_CURSOR =
+        (DCERPC_READ_REASSEMBLY_CURSOR + 1) % DCERPC_READ_REASSEMBLY_CAP;
+    index
+}
+
+unsafe fn dcerpc_read_reassembly_start(index: usize, fid: u64, frag_len: u16) {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    table[index] = DceRpcReadAssembly {
+        fid,
+        frag_len,
+        len: 0,
+        buf: [0; DCERPC_READ_REASSEMBLY_BYTES],
+    };
+}
+
+unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u64) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let entry = &mut table[index];
+    let target_len = core::cmp::min(entry.frag_len as usize, DCERPC_READ_REASSEMBLY_BYTES);
+    let have = entry.len as usize;
+    if have >= target_len {
+        return true;
+    }
+    let copy_len = core::cmp::min(target_len - have, chunk_len as usize);
+    for offset in 0..copy_len {
+        entry.buf[have + offset] = read_volatile((payload + offset as u64) as *const u8);
+    }
+    entry.len = (have + copy_len) as u16;
+    entry.len as usize >= target_len
+}
+
+unsafe fn dcerpc_read_reassembly_emit(index: usize, status: u32, info: u64) {
+    if DCERPC_READ_REASSEMBLY_TRACE_COUNT >= DCERPC_READ_REASSEMBLY_TRACE_CAP {
+        return;
+    }
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let entry = table[index];
+    let view = dcerpc_pdu_view(entry.buf.as_ptr() as u64, entry.len as u64);
+    if view.is_none() {
+        return;
+    }
+    DCERPC_READ_REASSEMBLY_TRACE_COUNT += 1;
+    print_str(b"[fsd-pipe-rpc-read] fid=0x");
+    print_hex(entry.fid as u32);
+    print_str(b" captured=");
+    print_u64(entry.len as u64);
+    print_str(b" frag=");
+    print_u64(entry.frag_len as u64);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(info);
+    print_dcerpc_pdu_view(view);
+    print_str(b"\n");
+}
+
+unsafe fn dcerpc_read_reassembly_clear(index: usize) {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    table[index] = EMPTY_DCERPC_READ_ASSEMBLY;
 }
 
 unsafe fn dcerpc_context_handles(
@@ -1344,9 +1490,12 @@ unsafe fn trace_pipe_rw_result(
         return;
     }
     let after = pipe_ccb_view(if fsctx != 0 { fsctx } else { file_id });
+    if major == IRP_MJ_READ {
+        trace_dcerpc_read_reassembly(file_id, status, info, payload, payload_len);
+    }
     let pdu = dcerpc_pdu_view(payload, payload_len);
     let interesting = status == STATUS_PENDING
-        || status == 0x8000_0005
+        || status == STATUS_BUFFER_OVERFLOW
         || info != 0
         || pdu.is_some()
         || before.is_some_and(|view| view.has_queued_state())
@@ -1393,7 +1542,7 @@ unsafe fn trace_pipe_transceive_result(
     let after = pipe_ccb_view(if fsctx != 0 { fsctx } else { file_id });
     let pdu = dcerpc_pdu_view(payload, payload_len);
     let interesting = status == STATUS_PENDING
-        || status == 0x8000_0005
+        || status == STATUS_BUFFER_OVERFLOW
         || status == 0xC000_00AE
         || info != 0
         || pdu.is_some()

@@ -277,7 +277,16 @@ reproduced the context mismatch on a second `\ntsvcs` pipe instance using associ
 the rejected UUID only appeared in rpcrt4's diagnostic. The next slice adds the same generic
 DCE/RPC PDU summary at the retained-IRP redrive boundary so completed pending reads are visible too;
 that should prove whether the missing handle was created on another accepted instance, hidden in a
-split read, or lost through association/FILE_OBJECT lifetime.
+split read, or lost through association/FILE_OBJECT lifetime. Follow-up boot
+`.tmp/boot-redrive-rpc-trace-20260810.log` proves the retained-IRP redrive trace is working and the
+base desktop still paints (`desktop-bg 768/768`), while explorer remains naturally absent
+(`explorer total=0`). The active failure is still generic RPC/NPFS association state: `browser`
+reaches a real `\ntsvcs` worker, client fid `0e818550` binds with association group 4, server fid
+`0e818551` accepts split synchronous reads, and rpcrt4 faults
+`{6d603716-38dc-4251-8a3e-16479f35f6d0}` with `NCA_S_FAULT_CONTEXT_MISMATCH`. Because that UUID is
+not present in the retained-read trace, the next slice reconstructs split synchronous named-pipe
+read fragments per fid and prints complete generic DCE/RPC PDUs before any service-specific
+debugging or fallback behavior is considered.
 
 ### A. SCM-Controlled Service Startup
 
