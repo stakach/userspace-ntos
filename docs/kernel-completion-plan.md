@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 ## Objective
 
@@ -74,6 +74,22 @@ is now removed so client TEB pages stay writable by their owning process, while 
 remains win32k-side read-only/COW TEB-tail mapping. Next desktop retry should prove that CSR can
 leave kernel32 startup and reach the base desktop paint gate again, then continue at the next real
 logon/profile or RPC edge.
+
+Desktop retry `.tmp/boot-teb-tail-cleanup-20260811-0529.log` proves that cleanup restored the base
+desktop paint gate: `exec_win32k_desktop_painted` passes and `desktop-bg match 768/768` reports the
+expected `0x003a6ea5` framebuffer. The active wall moved to the SRM/LSA handoff. LSASS creates its
+own `\SeLsaCommandPort`, connects to the kernel-owned `\SeRmCommandPort`, then its real
+`LsapRmServerThread` calls `NtListenPort(SeLsaCommandPort, ...)`. NT's kernel SRM side accepts the
+`\SeRmCommandPort` connection and then connects back to `\SeLsaCommandPort`; our synchronous
+`connect_srm_command_port` accepted the first half but never queued that reverse connection, so the
+LSASS listener failed before `LSA_RPC_SERVER_ACTIVE` could be signalled. The current fix keeps this
+inside the LPC broker: after accepting `\SeRmCommandPort`, the executive enqueues a real pending
+broker connect to `\SeLsaCommandPort`, leaving LSASS' `NtListenPort`/`NtAcceptConnectPort`/
+`NtCompleteConnectPort` path to complete normally. Host coverage:
+`cargo test -p nt-lpc-server srm_two_port_handshake_queues_reverse_lsa_connect -- --nocapture`;
+target coverage: `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`. Next desktop retry should prove the old `LsapRmServerThread - Port Listen
+failed 0xc000000d` line is gone and then continue at the next real LSA/profile/userinit edge.
 
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches

@@ -13653,6 +13653,38 @@ impl ExecNtHandler {
 
         self.queue_write(port_handle_out, client_handle);
         self.cache_lpc_connection(connect.connection_id, client_handle, name16);
+
+        let lsa_command_name: alloc::vec::Vec<u16> =
+            "\\SeLsaCommandPort".encode_utf16().collect();
+        if self.lpc_port_handle_for_name16(&lsa_command_name).is_none() {
+            print_str(
+                b"[srm-rdv] \\SeLsaCommandPort is not registered for kernel reverse connect\n",
+            );
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        match lpc.connect_port(&lsa_command_name, 0, &[]) {
+            Ok(reverse) if reverse.pending && reverse.connection_id != 0 => {
+                print_str(b"[srm-rdv] kernel SRM queued \\SeLsaCommandPort reverse connect conn=");
+                print_u64(reverse.connection_id);
+                print_str(b"\n");
+            }
+            Ok(reverse) => {
+                print_str(b"[srm-rdv] expected pending \\SeLsaCommandPort reverse connect, got handle=0x");
+                print_hex((reverse.handle >> 32) as u32);
+                print_hex(reverse.handle as u32);
+                print_str(b" pending=");
+                print_u64(reverse.pending as u64);
+                print_str(b"\n");
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                print_str(b"[srm-rdv] broker rejected \\SeLsaCommandPort reverse connect status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                return status.raw() as u32;
+            }
+        }
+
         LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
         print_str(b"[srm-rdv] kernel SRM accepted \\SeRmCommandPort conn=");
         print_u64(connect.connection_id);

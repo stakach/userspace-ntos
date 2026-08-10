@@ -561,6 +561,57 @@ mod tests {
     }
 
     #[test]
+    fn srm_two_port_handshake_queues_reverse_lsa_connect() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+
+        let (rm_listen, lsa_listen, rm_conn) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let lsa_listen = c
+                .create_port(&utf16("\\SeLsaCommandPort"), 0, 0x148, 0)
+                .unwrap();
+            let rm_listen = c
+                .create_port(&utf16("\\SeRmCommandPort"), 0, 0x148, 0)
+                .unwrap();
+            let rm = c.connect_port(&utf16("\\SeRmCommandPort"), 0, &[]).unwrap();
+            assert!(rm.pending);
+            (rm_listen, lsa_listen, rm.connection_id)
+        };
+
+        {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let rm_request = c.reply_wait_receive(rm_listen).unwrap();
+            assert_eq!(rm_request.connection_id, rm_conn);
+            assert_eq!(rm_request.msg_type, msg_type::LPC_CONNECTION_REQUEST);
+            let rm_server = c.accept_connect(rm_conn, true, 0).unwrap();
+            assert_ne!(rm_server, 0);
+            let (rm_client, completed) = c.complete_connect(rm_server).unwrap();
+            assert_ne!(rm_client, 0);
+            assert_eq!(completed, rm_conn);
+
+            let lsa = c
+                .connect_port(&utf16("\\SeLsaCommandPort"), 0, &[])
+                .unwrap();
+            assert!(lsa.pending);
+
+            let lsa_request = c.reply_wait_receive(lsa_listen).unwrap();
+            assert_eq!(lsa_request.connection_id, lsa.connection_id);
+            assert_eq!(lsa_request.msg_type, msg_type::LPC_CONNECTION_REQUEST);
+            let lsa_server = c.accept_connect(lsa.connection_id, true, 0).unwrap();
+            assert_ne!(lsa_server, 0);
+            let (lsa_client, lsa_completed) = c.complete_connect(lsa_server).unwrap();
+            assert_ne!(lsa_client, 0);
+            assert_eq!(lsa_completed, lsa.connection_id);
+        }
+    }
+
+    #[test]
     fn query_handle_reports_broker_endpoint_identity() {
         let mut s = Server::new();
         s.set_accept_policy(AcceptPolicy::Manual);
