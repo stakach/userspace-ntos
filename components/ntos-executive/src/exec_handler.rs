@@ -13244,25 +13244,36 @@ impl ExecNtHandler {
         Ok(route)
     }
 
-    /// Validate an optional I/O completion event. NT file I/O callers may set the low bit of
-    /// `OVERLAPPED.hEvent` to suppress completion-port notification; the event object remains the
-    /// untagged handle. Named executive events return their object index; legacy anonymous events are
-    /// typed as Opaque and retain the existing immediate-wait model.
-    pub(crate) fn validate_io_event(&self, handle: u64) -> Result<Option<usize>, u32> {
+    /// Reference an optional file-I/O event with EVENT_MODIFY_STATE and clear it before the IRP is
+    /// issued. NT callers may set the low bit of `OVERLAPPED.hEvent` to suppress completion-port
+    /// notification; the event object remains the untagged handle. Legacy opaque wait handles are
+    /// accepted for the hosted immediate-wait model, but a real typed event must satisfy the same
+    /// access check ReactOS uses before `KeClearEvent`.
+    pub(crate) fn prepare_io_event_for_request(&mut self, handle: u64) -> Result<Option<usize>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         let Some(event_handle) = nt_io_completion::normalize_io_event_handle(handle) else {
             return Ok(None);
         };
-        if let Ok(index) = self.event_index_for_handle(event_handle, 0) {
-            return Ok(Some(index));
-        }
-        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
-        match self
-            .pm
-            .lookup_handle(pid, event_handle as nt_process::Handle)
-        {
-            Some(nt_process::HandleObject::Opaque(_)) => Ok(None),
-            _ => Err(STATUS_INVALID_HANDLE),
+        match self.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
+            Ok(index) => {
+                let _ = self.events.reset_existing(index as u64);
+                Ok(Some(index))
+            }
+            Err(event_status) => {
+                let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+                match self
+                    .pm
+                    .lookup_handle(pid, event_handle as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::Opaque(tag))
+                        if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
+                    {
+                        Err(event_status)
+                    }
+                    Some(nt_process::HandleObject::Opaque(_)) => Ok(None),
+                    _ => Err(event_status),
+                }
+            }
         }
     }
 
@@ -16848,23 +16859,15 @@ impl ExecNtHandler {
                 let mut information = 0u64;
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(args[1]);
-                // Match IopXxxControlFile: validate the caller's completion event for
-                // EVENT_MODIFY_STATE and clear it before issuing every request. In particular,
-                // rpcrt4 reuses a manual-reset event when it rearms a pipe listener; leaving the
-                // previous completion signalled manufactures a second accepted connection.
-                let event_obj_idx =
-                    if let Some(event_handle) = nt_io_completion::normalize_io_event_handle(args[1])
-                    {
-                        match self.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
-                        Ok(index) => {
-                            let _ = self.events.reset_existing(index as u64);
-                            index as u64
-                        }
-                        Err(event_status) => return event_status,
-                    }
-                    } else {
-                        u64::MAX
-                    };
+                // Match IopXxxControlFile: clear the caller's completion event before issuing every
+                // request. In particular, rpcrt4 reuses a manual-reset event when it rearms a pipe
+                // listener; leaving the previous completion signalled manufactures a second accepted
+                // connection.
+                let event_obj_idx = match self.prepare_io_event_for_request(args[1]) {
+                    Ok(Some(index)) => index as u64,
+                    Ok(None) => u64::MAX,
+                    Err(event_status) => return event_status,
+                };
                 let is_pipe_listen = (fsctl as u32) == FSCTL_PIPE_LISTEN;
                 let raw_input_len = args[7] as u32 as usize;
                 let raw_output_len = args[9] as u32 as usize;
@@ -20700,16 +20703,6 @@ impl ExecNtHandler {
                     );
                     return STATUS_NOT_SUPPORTED;
                 }
-                let event_index =
-                    if let Some(event_handle) = nt_io_completion::normalize_io_event_handle(args[1])
-                    {
-                        match self.event_index_for_handle(event_handle, 0) {
-                        Ok(index) => Some(index),
-                        Err(status) => return status,
-                    }
-                    } else {
-                        None
-                    };
                 // `Length` is a ULONG and `ReturnSingleEntry` / `RestartScan` are BOOLEANs. They
                 // often live in stack slots whose high halves still contain older pointer data, so
                 // the ABI boundary must truncate them before validation for every filesystem path.
@@ -20787,6 +20780,10 @@ impl ExecNtHandler {
                             }
                         };
                         let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
+                        let event_index = match self.prepare_io_event_for_request(args[1]) {
+                            Ok(index) => index,
+                            Err(status) => return status,
+                        };
                         let scratch_len = length.min(DIR_QUERY_SCRATCH_CAP);
                         let encoded = core::slice::from_raw_parts_mut(
                             core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
@@ -20851,6 +20848,10 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let pattern = (args[9] != 0).then_some(&pattern[..pattern_len]);
+                let event_index = match self.prepare_io_event_for_request(args[1]) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
 
                 let mut entry_count = 0usize;
                 fat_visit_directory(&fs, first_cluster, |_| {
@@ -21813,8 +21814,7 @@ impl ExecNtHandler {
                     self.xas_read(buffer, &mut payload)
                 };
 
-                let completion_event = self.validate_io_event(event);
-                let completion_event_index = completion_event.ok().flatten();
+                let mut completion_event_index = None;
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut completion_file_id = 0u64;
@@ -21834,115 +21834,122 @@ impl ExecNtHandler {
                         // No executive user-APC queue exists yet; do not pretend the callback ran.
                         0xC000_00BB // STATUS_NOT_SUPPORTED
                     }
-                } else if let Err(event_status) = completion_event {
-                    event_status
-                } else if self.boot_status_handle_access(fh).is_ok() {
-                    match self.boot_status_write_file(fh, buffer, len, byte_offset) {
-                        Ok(written) => {
-                            information = written;
-                            nt_fs::STATUS_SUCCESS
-                        }
-                        Err(status) => status,
-                    }
-                } else if let Some(file_id) = overlay_file {
-                    // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
-                    // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
-                    // advances the file object's own position, exactly like an FSD.
-                    let explicit = (byte_offset != 0 && offset_ok)
-                        .then_some(offset_value)
-                        .filter(|value| *value != u64::MAX);
-                    let scratch = core::slice::from_raw_parts(
-                        core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
-                        len,
-                    );
-                    let (status, written) = crate::writable_fs::write(file_id, explicit, scratch);
-                    if status == nt_fs::STATUS_SUCCESS {
-                        self.writable_fs_dirty = true;
-                    }
-                    information = written as u64;
-                    status
                 } else {
-                    match self.npfs_write_file_route_for(fh) {
-                        Err(handle_status) => handle_status,
-                        Ok(route) => {
-                            let file_id = route.file_id;
-                            completion_file_id = file_id;
-                            let synchronous =
-                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
-                            // ★★ PER-DIRECTION PIPE PARKING — MEASURED, GATED OFF (Phase 4).
-                            //
-                            // The direction-BLIND predicate makes a connection half-duplex: an
-                            // already-pending READ refuses this WRITE with
-                            // STATUS_INSUFFICIENT_RESOURCES. That is a silent functional degrade,
-                            // and it is the EXACT reason the LSA self-RPC's 48-byte `LsarOpenPolicy`
-                            // RESPONSE is lost, so `LsaOpenPolicy` never returns to samsrv —
-                            // rpcrt4's ncacn_np server keeps a read pending on the connection while
-                            // `RPCRT4_worker_thread` writes the response on the SAME connection. The
-                            // re-drive already completes the two from separate per-direction stashes
-                            // (`take_completed_write` / `take_completed_read`), so allowing one
-                            // pending read AND one pending write per connection is well-formed
-                            // (`PipeWaiterTable::parked_on_dir`, host-tested).
-                            //
-                            // MEASURED WITH IT ON, one foreground boot: the response writes SUCCEED
-                            // (status=0 info=48, repeatedly), `SamIConnect-null-root-miss` goes
-                            // 1 -> 0, `sam-setup-keys` 2 -> 36, `sam-mount-opens` 1 -> 2, and lsass
-                            // reaches `NtCreateNamedPipeFile(\samr)` — i.e. `SamIConnect` succeeds
-                            // and samsrv publishes its own RPC endpoint. It is a REAL advance.
-                            //
-                            // It was gated OFF for one batch on the reading that the boot then
-                            // "spends its whole budget cycling that self-RPC" and loses the desktop
-                            // paint to the 45 s no-progress watchdog. That reading was WRONG: the
-                            // budget was being eaten by an HPET interrupt storm in the executive's
-                            // own delay timer (2,745,189 deliveries that woke nothing in one boot),
-                            // which the self-RPC was merely the first thing to arm. See
-                            // `LSA_WORKER_ROUTE_ENABLED` and `exec_delay_timer_disarms`. With the
-                            // timer fixed the paint is deterministic (768/768 over six consecutive
-                            // boots) and this is ON.
-                            const PIPE_FULL_DUPLEX_PARK: bool = true;
-                            let sync_reply_capacity = if synchronous {
-                                wait_reply_pool_has_free()
-                            } else {
-                                true
-                            };
-                            let waiter_capacity = if sync_reply_capacity {
-                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-                                !waiter_table.parked_on_dir(file_id, true)
-                                    && (PIPE_FULL_DUPLEX_PARK
-                                        || !waiter_table.parked_on(file_id))
-                                    && waiter_table.ensure_capacity()
-                            } else {
-                                false
-                            };
-                            let prepared = if !waiter_capacity || !sync_reply_capacity {
-                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                            } else {
-                                self.file_completion.retain_file(file_id).map(|()| {
-                                    async_file_retained = true;
-                                })
-                            };
-                            match prepared {
-                                Err(status) => status,
-                                Ok(()) => {
-                                    if let Some(index) = completion_event_index {
-                                        let _ = self.events.reset_existing(index as u64);
+                    match self.prepare_io_event_for_request(event) {
+                        Err(event_status) => event_status,
+                        Ok(event_index) => {
+                            completion_event_index = event_index;
+                            if self.boot_status_handle_access(fh).is_ok() {
+                                match self.boot_status_write_file(fh, buffer, len, byte_offset) {
+                                    Ok(written) => {
+                                        information = written;
+                                        nt_fs::STATUS_SUCCESS
                                     }
-                                    let mut output = [];
-                                    match self.npfs_route_raw_for(
-                                        route,
-                                        major::IRP_MJ_WRITE as u64,
-                                        0,
-                                        &payload,
-                                        &mut output,
-                                    ) {
-                                        Ok((driver_status, completed, _)) => {
-                                            routed = true;
-                                            information = completed;
-                                            if driver_status as u32 == 0x0000_0103 {
-                                                pending_write_fid = file_id;
+                                    Err(status) => status,
+                                }
+                            } else if let Some(file_id) = overlay_file {
+                                // ★ THE WRITABLE FILESYSTEM OVERLAY: a real write of the caller's real bytes.
+                                // `ByteOffset == NULL` (or the FILE_USE_FILE_POINTER_POSITION sentinel) uses and
+                                // advances the file object's own position, exactly like an FSD.
+                                let explicit = (byte_offset != 0 && offset_ok)
+                                    .then_some(offset_value)
+                                    .filter(|value| *value != u64::MAX);
+                                let scratch = core::slice::from_raw_parts(
+                                    core::ptr::addr_of!(OVERLAY_WRITE_SCRATCH) as *const u8,
+                                    len,
+                                );
+                                let (status, written) =
+                                    crate::writable_fs::write(file_id, explicit, scratch);
+                                if status == nt_fs::STATUS_SUCCESS {
+                                    self.writable_fs_dirty = true;
+                                }
+                                information = written as u64;
+                                status
+                            } else {
+                                match self.npfs_write_file_route_for(fh) {
+                                    Err(handle_status) => handle_status,
+                                    Ok(route) => {
+                                        let file_id = route.file_id;
+                                        completion_file_id = file_id;
+                                        let synchronous = self
+                                            .file_completion
+                                            .is_synchronous(file_id)
+                                            .unwrap_or(true);
+                                        // ★★ PER-DIRECTION PIPE PARKING — MEASURED, GATED OFF (Phase 4).
+                                        //
+                                        // The direction-BLIND predicate makes a connection half-duplex: an
+                                        // already-pending READ refuses this WRITE with
+                                        // STATUS_INSUFFICIENT_RESOURCES. That is a silent functional degrade,
+                                        // and it is the EXACT reason the LSA self-RPC's 48-byte `LsarOpenPolicy`
+                                        // RESPONSE is lost, so `LsaOpenPolicy` never returns to samsrv —
+                                        // rpcrt4's ncacn_np server keeps a read pending on the connection while
+                                        // `RPCRT4_worker_thread` writes the response on the SAME connection. The
+                                        // re-drive already completes the two from separate per-direction stashes
+                                        // (`take_completed_write` / `take_completed_read`), so allowing one
+                                        // pending read AND one pending write per connection is well-formed
+                                        // (`PipeWaiterTable::parked_on_dir`, host-tested).
+                                        //
+                                        // MEASURED WITH IT ON, one foreground boot: the response writes SUCCEED
+                                        // (status=0 info=48, repeatedly), `SamIConnect-null-root-miss` goes
+                                        // 1 -> 0, `sam-setup-keys` 2 -> 36, `sam-mount-opens` 1 -> 2, and lsass
+                                        // reaches `NtCreateNamedPipeFile(\samr)` — i.e. `SamIConnect` succeeds
+                                        // and samsrv publishes its own RPC endpoint. It is a REAL advance.
+                                        //
+                                        // It was gated OFF for one batch on the reading that the boot then
+                                        // "spends its whole budget cycling that self-RPC" and loses the desktop
+                                        // paint to the 45 s no-progress watchdog. That reading was WRONG: the
+                                        // budget was being eaten by an HPET interrupt storm in the executive's
+                                        // own delay timer (2,745,189 deliveries that woke nothing in one boot),
+                                        // which the self-RPC was merely the first thing to arm. See
+                                        // `LSA_WORKER_ROUTE_ENABLED` and `exec_delay_timer_disarms`. With the
+                                        // timer fixed the paint is deterministic (768/768 over six consecutive
+                                        // boots) and this is ON.
+                                        const PIPE_FULL_DUPLEX_PARK: bool = true;
+                                        let sync_reply_capacity = if synchronous {
+                                            wait_reply_pool_has_free()
+                                        } else {
+                                            true
+                                        };
+                                        let waiter_capacity = if sync_reply_capacity {
+                                            let waiter_table =
+                                                &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+                                            !waiter_table.parked_on_dir(file_id, true)
+                                                && (PIPE_FULL_DUPLEX_PARK
+                                                    || !waiter_table.parked_on(file_id))
+                                                && waiter_table.ensure_capacity()
+                                        } else {
+                                            false
+                                        };
+                                        let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                        } else {
+                                            self.file_completion.retain_file(file_id).map(|()| {
+                                                async_file_retained = true;
+                                            })
+                                        };
+                                        match prepared {
+                                            Err(status) => status,
+                                            Ok(()) => {
+                                                let mut output = [];
+                                                match self.npfs_route_raw_for(
+                                                    route,
+                                                    major::IRP_MJ_WRITE as u64,
+                                                    0,
+                                                    &payload,
+                                                    &mut output,
+                                                ) {
+                                                    Ok((driver_status, completed, _)) => {
+                                                        routed = true;
+                                                        information = completed;
+                                                        if driver_status as u32 == 0x0000_0103 {
+                                                            pending_write_fid = file_id;
+                                                        }
+                                                        driver_status as u32
+                                                    }
+                                                    Err(route_status) => route_status,
+                                                }
                                             }
-                                            driver_status as u32
                                         }
-                                        Err(route_status) => route_status,
                                     }
                                 }
                             }
@@ -22149,7 +22156,6 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
-                let completion_event = self.validate_io_event(event);
                 let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
@@ -22179,6 +22185,8 @@ impl ExecNtHandler {
                 let mut async_file_retained = false;
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
                 let mut npfs_route_fid = 0u64;
+                let mut completion_event_index = None;
+                let mut completion_event_trace = Ok(None);
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !matches!(disk_file, Ok(Some(_)))
@@ -22197,175 +22205,206 @@ impl ExecNtHandler {
                     } else {
                         0xC000_00BB // STATUS_NOT_SUPPORTED
                     }
-                } else if let Err(event_status) = completion_event {
-                    event_status
                 } else if let Err(handle_status) = disk_file {
                     handle_status
-                } else if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
-                    if len == 0 {
-                        nt_fs::STATUS_SUCCESS
-                    } else if byte_offset == 0 {
-                        0xC000_000D // STATUS_INVALID_PARAMETER: implicit positions are not modeled yet
-                    } else {
-                        let mut offset_bytes = [0u8; 8];
-                        if !self.xas_read(byte_offset, &mut offset_bytes) {
-                            0xC000_0005 // STATUS_ACCESS_VIOLATION
-                        } else {
-                            let offset = i64::from_le_bytes(offset_bytes);
-                            if offset < 0 || offset > u32::MAX as i64 {
-                                0xC000_000D // STATUS_INVALID_PARAMETER
-                            } else if offset as u32 >= file_size {
-                                0xC000_0011 // STATUS_END_OF_FILE
-                            } else {
-                                match self.readonly_disk_read_to_user(
-                                    first_cluster,
-                                    file_size,
-                                    offset as u32,
-                                    buffer,
-                                    len,
-                                ) {
-                                    Ok(read) => {
+                } else {
+                    match self.prepare_io_event_for_request(event) {
+                        Err(event_status) => {
+                            completion_event_trace = Err(event_status);
+                            event_status
+                        }
+                        Ok(event_index) => {
+                            completion_event_trace = Ok(event_index);
+                            completion_event_index = event_index;
+                            if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
+                                if len == 0 {
+                                    nt_fs::STATUS_SUCCESS
+                                } else if byte_offset == 0 {
+                                    0xC000_000D // STATUS_INVALID_PARAMETER: implicit positions are not modeled yet
+                                } else {
+                                    let mut offset_bytes = [0u8; 8];
+                                    if !self.xas_read(byte_offset, &mut offset_bytes) {
+                                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                    } else {
+                                        let offset = i64::from_le_bytes(offset_bytes);
+                                        if offset < 0 || offset > u32::MAX as i64 {
+                                            0xC000_000D // STATUS_INVALID_PARAMETER
+                                        } else if offset as u32 >= file_size {
+                                            0xC000_0011 // STATUS_END_OF_FILE
+                                        } else {
+                                            match self.readonly_disk_read_to_user(
+                                                first_cluster,
+                                                file_size,
+                                                offset as u32,
+                                                buffer,
+                                                len,
+                                            ) {
+                                                Ok(read) => {
+                                                    information = read as u64;
+                                                    nt_fs::STATUS_SUCCESS
+                                                }
+                                                Err(status) => status,
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(file_id) = overlay_file {
+                                // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
+                                let mut explicit = None;
+                                let mut bad_offset = false;
+                                if byte_offset != 0 {
+                                    let mut offset_bytes = [0u8; 8];
+                                    if self.xas_read(byte_offset, &mut offset_bytes) {
+                                        let value = u64::from_le_bytes(offset_bytes);
+                                        if value != u64::MAX {
+                                            explicit = Some(value);
+                                        }
+                                    } else {
+                                        bad_offset = true;
+                                    }
+                                }
+                                if bad_offset {
+                                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                } else {
+                                    let scratch = core::slice::from_raw_parts_mut(
+                                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                                        OVERLAY_IO_CAP,
+                                    );
+                                    let (status, read) = crate::writable_fs::read_into(
+                                        file_id,
+                                        explicit,
+                                        &mut scratch[..len],
+                                    );
+                                    if status == nt_fs::STATUS_SUCCESS
+                                        && read != 0
+                                        && !self.xas_try_write_buf(buffer, &scratch[..read])
+                                    {
+                                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                    } else {
                                         information = read as u64;
+                                        status
+                                    }
+                                }
+                            } else if self.boot_status_handle_access(fh).is_ok() {
+                                match self.boot_status_read_file(fh, buffer, len, byte_offset) {
+                                    Ok(read) => {
+                                        information = read;
                                         nt_fs::STATUS_SUCCESS
                                     }
                                     Err(status) => status,
                                 }
-                            }
-                        }
-                    }
-                } else if let Some(file_id) = overlay_file {
-                    // ★ THE WRITABLE FILESYSTEM OVERLAY: read back what was really written.
-                    let mut explicit = None;
-                    let mut bad_offset = false;
-                    if byte_offset != 0 {
-                        let mut offset_bytes = [0u8; 8];
-                        if self.xas_read(byte_offset, &mut offset_bytes) {
-                            let value = u64::from_le_bytes(offset_bytes);
-                            if value != u64::MAX {
-                                explicit = Some(value);
-                            }
-                        } else {
-                            bad_offset = true;
-                        }
-                    }
-                    if bad_offset {
-                        0xC000_0005 // STATUS_ACCESS_VIOLATION
-                    } else {
-                        let scratch = core::slice::from_raw_parts_mut(
-                            core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
-                            OVERLAY_IO_CAP,
-                        );
-                        let (status, read) =
-                            crate::writable_fs::read_into(file_id, explicit, &mut scratch[..len]);
-                        if status == nt_fs::STATUS_SUCCESS
-                            && read != 0
-                            && !self.xas_try_write_buf(buffer, &scratch[..read])
-                        {
-                            0xC000_0005 // STATUS_ACCESS_VIOLATION
-                        } else {
-                            information = read as u64;
-                            status
-                        }
-                    }
-                } else if self.boot_status_handle_access(fh).is_ok() {
-                    match self.boot_status_read_file(fh, buffer, len, byte_offset) {
-                        Ok(read) => {
-                            information = read;
-                            nt_fs::STATUS_SUCCESS
-                        }
-                        Err(status) => status,
-                    }
-                } else {
-                    match self.npfs_read_file_route_for(fh) {
-                        Err(handle_status) => {
-                            npfs_route_status = handle_status;
-                            handle_status
-                        }
-                        Ok(route) => {
-                            npfs_route_status = nt_fs::STATUS_SUCCESS;
-                            let file_id = route.file_id;
-                            npfs_route_fid = file_id;
-                            completion_file_id = file_id;
-                            let synchronous =
-                                self.file_completion.is_synchronous(file_id).unwrap_or(true);
-                            // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
-                            // pre-check, which carries the full rationale + measurements). ON.
-                            const PIPE_FULL_DUPLEX_PARK: bool = true;
-                            let sync_reply_capacity = if synchronous {
-                                wait_reply_pool_has_free()
                             } else {
-                                true
-                            };
-                            let waiter_capacity = if sync_reply_capacity {
-                                let waiter_table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-                                !waiter_table.parked_on_dir(file_id, false)
-                                    && (PIPE_FULL_DUPLEX_PARK
-                                        || !waiter_table.parked_on(file_id))
-                                    && waiter_table.ensure_capacity()
-                            } else {
-                                false
-                            };
-                            let prepared = if !waiter_capacity || !sync_reply_capacity {
-                                Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
-                            } else {
-                                self.file_completion.retain_file(file_id).map(|()| {
-                                    async_file_retained = true;
-                                })
-                            };
-                            match prepared {
-                                Err(status) => status,
-                                Ok(()) => {
-                                    if let Ok(Some(index)) = completion_event {
-                                        let _ = self.events.reset_existing(index as u64);
+                                match self.npfs_read_file_route_for(fh) {
+                                    Err(handle_status) => {
+                                        npfs_route_status = handle_status;
+                                        handle_status
                                     }
-                                    match self.npfs_route_raw_for(
-                                        route,
-                                        major::IRP_MJ_READ as u64,
-                                        0,
-                                        &[],
-                                        &mut output,
-                                    ) {
-                                    Ok((driver_status, completed, _)) => {
-                                        routed = true;
-                                        information = completed;
-                                        let copy_len = (completed as usize).min(output.len());
-                                        if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
-                                            self.xas_write_buf(buffer, &output[..copy_len]);
-                                            // LSA self-RPC: a PDU delivered SYNCHRONOUSLY (npfs had
-                                            // the peer's message already queued). Same attribution as
-                                            // the parked-read re-drive path.
-                                            if self.current_process_is_lsass()
-                                                && output.first() == Some(&5)
-                                                && crate::pipe_fid_name_hash(file_id)
-                                                    == lsarpc_pipe_name_hash()
-                                            {
-                                                let pdu_type =
-                                                    output.get(2).copied().unwrap_or(0xFF) as u64;
-                                                if self
-                                                    .hosted_thread_role_for_badge(self.current_badge)
-                                                    .is_some_and(|role| role.is_lsa_rpc_worker())
-                                                {
-                                                    LSA_WORKER_PDU_READS
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    let _ = LSA_WORKER_FIRST_PDU_TYPE
-                                                        .compare_exchange(
-                                                            0xFF,
-                                                            pdu_type,
-                                                            Ordering::Relaxed,
-                                                            Ordering::Relaxed,
-                                                        );
-                                                } else {
-                                                    LSA_SELF_RPC_CLIENT_READS
-                                                        .fetch_add(1, Ordering::Relaxed);
+                                    Ok(route) => {
+                                        npfs_route_status = nt_fs::STATUS_SUCCESS;
+                                        let file_id = route.file_id;
+                                        npfs_route_fid = file_id;
+                                        completion_file_id = file_id;
+                                        let synchronous = self
+                                            .file_completion
+                                            .is_synchronous(file_id)
+                                            .unwrap_or(true);
+                                        // Per-direction (see `PIPE_FULL_DUPLEX_PARK` at the NtWriteFile
+                                        // pre-check, which carries the full rationale + measurements). ON.
+                                        const PIPE_FULL_DUPLEX_PARK: bool = true;
+                                        let sync_reply_capacity = if synchronous {
+                                            wait_reply_pool_has_free()
+                                        } else {
+                                            true
+                                        };
+                                        let waiter_capacity = if sync_reply_capacity {
+                                            let waiter_table =
+                                                &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+                                            !waiter_table.parked_on_dir(file_id, false)
+                                                && (PIPE_FULL_DUPLEX_PARK
+                                                    || !waiter_table.parked_on(file_id))
+                                                && waiter_table.ensure_capacity()
+                                        } else {
+                                            false
+                                        };
+                                        let prepared = if !waiter_capacity || !sync_reply_capacity {
+                                            Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+                                        } else {
+                                            self.file_completion.retain_file(file_id).map(|()| {
+                                                async_file_retained = true;
+                                            })
+                                        };
+                                        match prepared {
+                                            Err(status) => status,
+                                            Ok(()) => {
+                                                match self.npfs_route_raw_for(
+                                                    route,
+                                                    major::IRP_MJ_READ as u64,
+                                                    0,
+                                                    &[],
+                                                    &mut output,
+                                                ) {
+                                                    Ok((driver_status, completed, _)) => {
+                                                        routed = true;
+                                                        information = completed;
+                                                        let copy_len =
+                                                            (completed as usize).min(output.len());
+                                                        if driver_status as u32 != 0x0000_0103
+                                                            && copy_len != 0
+                                                        {
+                                                            self.xas_write_buf(
+                                                                buffer,
+                                                                &output[..copy_len],
+                                                            );
+                                                            // LSA self-RPC: a PDU delivered SYNCHRONOUSLY (npfs had
+                                                            // the peer's message already queued). Same attribution as
+                                                            // the parked-read re-drive path.
+                                                            if self.current_process_is_lsass()
+                                                                && output.first() == Some(&5)
+                                                                && crate::pipe_fid_name_hash(file_id)
+                                                                    == lsarpc_pipe_name_hash()
+                                                            {
+                                                                let pdu_type = output
+                                                                    .get(2)
+                                                                    .copied()
+                                                                    .unwrap_or(0xFF)
+                                                                    as u64;
+                                                                if self
+                                                                    .hosted_thread_role_for_badge(
+                                                                        self.current_badge,
+                                                                    )
+                                                                    .is_some_and(|role| {
+                                                                        role.is_lsa_rpc_worker()
+                                                                    })
+                                                                {
+                                                                    LSA_WORKER_PDU_READS.fetch_add(
+                                                                        1,
+                                                                        Ordering::Relaxed,
+                                                                    );
+                                                                    let _ = LSA_WORKER_FIRST_PDU_TYPE
+                                                                        .compare_exchange(
+                                                                            0xFF,
+                                                                            pdu_type,
+                                                                            Ordering::Relaxed,
+                                                                            Ordering::Relaxed,
+                                                                        );
+                                                                } else {
+                                                                    LSA_SELF_RPC_CLIENT_READS
+                                                                        .fetch_add(
+                                                                            1,
+                                                                            Ordering::Relaxed,
+                                                                        );
+                                                                }
+                                                            }
+                                                        }
+                                                        if driver_status as u32 == 0x0000_0103 {
+                                                            pending_read_fid = file_id;
+                                                        }
+                                                        driver_status as u32
+                                                    }
+                                                    Err(route_status) => route_status,
                                                 }
                                             }
                                         }
-                                        if driver_status as u32 == 0x0000_0103 {
-                                            pending_read_fid = file_id;
-                                        }
-                                        driver_status as u32
-                                    }
-                                    Err(route_status) => route_status,
                                     }
                                 }
                             }
@@ -22381,10 +22420,8 @@ impl ExecNtHandler {
                         .file_completion
                         .is_synchronous(pending_read_fid)
                         .unwrap_or(true);
-                    let event_obj_idx = completion_event
-                        .ok()
-                        .flatten()
-                        .map_or(u64::MAX, |index| index as u64);
+                    let event_obj_idx =
+                        completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
                         self.pipe_park_fid = pending_read_fid;
                         self.pipe_park_buffer_va = buffer;
@@ -22447,7 +22484,7 @@ impl ExecNtHandler {
                     self.pipe_write_redrive = true;
                 }
                 if status != 0x0000_0103 {
-                    if let Ok(Some(index)) = completion_event {
+                    if let Some(index) = completion_event_index {
                         let _ = self.signal_event_index(index);
                         self.io_signal_event = index as i64;
                     }
@@ -22481,7 +22518,7 @@ impl ExecNtHandler {
                         byte_offset,
                         apc_routine,
                         apc_context,
-                        completion_event,
+                        completion_event_trace,
                         disk_file,
                         overlay_file,
                         npfs_route_status,

@@ -2895,3 +2895,24 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
   `NCA_S_FAULT_CONTEXT_MISMATCH` (`0x1c00001a`). The next slice should fix generic RPC/NPFS
   association behavior or the scheduler/IO ordering that exposes the cross-association context reuse,
   not add UUID, service-name, executable-order, or paint fallbacks.
+
+- I4 file-I/O user-event preparation slice. Read/write/query-directory/FSCTL now use one executive
+  helper for optional file-I/O events: strip the `OVERLAPPED.hEvent` completion-port suppression bit,
+  require `EVENT_MODIFY_STATE` for real typed events, clear the event before issuing accepted file
+  requests, and preserve the legacy opaque immediate-wait model only for non-event opaque handles.
+  This removes the old split where `NtFsControlFile` had correct reset semantics while
+  `NtReadFile`/`NtWriteFile` performed ad hoc NPFS-only resets and `NtQueryDirectoryFile` validated
+  without clearing. Validation so far: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `cargo test -p nt-io-completion -- --nocapture`,
+  `cargo test -p nt-io-manager pipe -- --nocapture`, `git diff --check`, and serialized desktop
+  retry `.tmp/boot-io-event-reset-20260811-041059.log`. Result: the old syscall-return crash does
+  not recur, the real base desktop readback remains green (`desktop-bg 768/768`), and the boot moves
+  through genuine explorer shell dependency loading into Browser `ServiceMain`. This is still not a
+  shell-chrome proof: explorer remains absent in the periodic census, no sentinel is reached, and the
+  run was manually stopped after Browser emitted `RpcServerListen() failed (Status 6b1)` and returned
+  `NCA_S_FAULT_CONTEXT_MISMATCH` (`0x1c00001a`). Review adjustment: the stale completion-event
+  hypothesis is closed. The next slice should fix generic DCE/RPC ncacn_np association grouping,
+  listener ordering, or I/O scheduler semantics so a context handle created on one accepted pipe
+  association is not consumed through another server association. Do not add UUID, service-name,
+  executable-order, RPC-byte, or paint fallbacks.
