@@ -51,6 +51,7 @@ static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -6868,8 +6869,9 @@ impl ExecNtHandler {
         let completion_entry = NTDLL_BASE.wrapping_add(completion_rva);
 
         // Native ntdll starts directly at RtlpWorkerThread. Kernel32's installed hook starts at
-        // BaseThreadStartup and carries RtlpWorkerThread in RCX. Keep those stable slot preferences;
-        // all other same-process creates claim the next available generic worker slot.
+        // BaseThreadStartup and carries RtlpWorkerThread in RCX. Prefer the historical low lanes
+        // while they are free, but do not pin real NT thread creation to them: rpcrt4 and ntdll can
+        // legitimately create more than one worker with the same entry point.
         let preferred_slot = if scheduler_rva != 0
             && (start.rip == scheduler_entry || start.rcx == scheduler_entry)
         {
@@ -6921,11 +6923,12 @@ impl ExecNtHandler {
         if ntdll_pool_worker_only && preferred_slot.is_none() {
             return None;
         }
-        let tp_slot = if let Some(slot) = preferred_slot {
+        let preferred_slot_free = preferred_slot.and_then(|slot| {
             Self::tp_worker_slot_bit(slot)
                 .filter(|bit| self.hosted_tp_worker_window_mask(self.pi) & *bit == 0)
                 .map(|_| slot)
-        } else {
+        });
+        let tp_slot = preferred_slot_free.or_else(|| {
             let lsa_extra_connection = crate::LSA_RPC_EXTRA_CONNECTION_WORKERS
                 && self.current_process_is_lsass()
                 && self.current_thread_has_role(HostedThreadRole::LsassListener3)
@@ -6945,8 +6948,22 @@ impl ExecNtHandler {
                     );
                 }
             }
+            if preferred_slot.is_some() && slot.is_some() {
+                let trace = TP_WORKER_PREFERRED_BUSY_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 8 {
+                    print_str(b"[tp-worker] preferred lane busy pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" preferred=");
+                    print_u64(preferred_slot.unwrap_or(usize::MAX) as u64);
+                    print_str(b" claimed=");
+                    print_u64(slot.unwrap_or(usize::MAX) as u64);
+                    print_str(b" windows-used=0x");
+                    print_hex(self.hosted_tp_worker_window_mask(self.pi) as u32);
+                    print_str(b"\n");
+                }
+            }
             slot
-        };
+        });
         let Some(tp_slot) = tp_slot else {
             print_str(b"[tp-worker] no free local worker slot pi=");
             print_u64(self.pi as u64);
@@ -6956,6 +6973,12 @@ impl ExecNtHandler {
             print_hex(self.hosted_tp_worker_window_mask(self.pi) as u32);
             print_str(b" pool-used=0x");
             print_hex(self.pool_used_mask(self.pi) as u32);
+            print_str(b" slots=");
+            print_u64(TP_WORKER_SLOT_COUNT as u64);
+            if let Some(slot) = preferred_slot {
+                print_str(b" preferred=");
+                print_u64(slot as u64);
+            }
             print_str(b" entry=0x");
             print_hex((start.rip >> 32) as u32);
             print_hex(start.rip as u32);
@@ -15778,10 +15801,6 @@ impl ExecNtHandler {
                         {
                             transceive_pending_async = true;
                         } else {
-                            if transceive_file_retained {
-                                self.release_file_reference(fid);
-                                transceive_file_retained = false;
-                            }
                             status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                         }
                     }

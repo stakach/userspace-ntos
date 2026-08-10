@@ -31,15 +31,18 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Active boot-fix slice: `.tmp/boot-rpc-opnum-20260810-101528.log` rebuilt ntdll,
-the executive, rust-micro, and the disk image, then reached real services/EventLog progress before
-timing out. The per-thread wait-state cleanup moved the edge forward: EventLog connects to SCM,
-SCM and EventLog exchange real `\ntsvcs` pipe traffic, and bounded DCE/RPC decode proves EventLog's
-blocked service-control request is `RSetServiceStatus` (`opnum 7`). While handling that request SCM
-probes `\pipe\EventLog` before the EventLog RPC endpoint exists and gets the real
-`STATUS_OBJECT_NAME_NOT_FOUND`. The delayed SCM worker is timer-woken instead of falsely quiescing,
-but no further IPC reaches the executive after that wake. The next slice is generic root
-`WaitNamedPipe`/RPC-unwind evidence around that live SCM/EventLog RPC wait set.
+Active boot-fix slice: `.tmp/boot-dynamic-tp-lanes-20260810-104012.log` rebuilt ntdll,
+the executive, rust-micro, and the disk image, then moved past the previous EventLog/rpcrt4 local
+worker exhaustion wall. EventLog connected, SCM/EventLog exchanged real
+`\ntsvcs`/`\pipe\EventLog` traffic, services continued, SRM accepted `\SeRmCommandPort`, LSA server
+threads parked on `NtListenPort`, and winlogon demand-loaded `msgina` and `shsvcs`. The old
+`STATUS_INSUFFICIENT_RESOURCES` / Win32 `1450` worker-slot frontier did not recur: when
+eventlog.exe requested another ntdll completion worker while its preferred low lane was busy, the
+kernel claimed dynamic slot 6 and the worker spawned. The current frontier is now a services.exe
+main-image-header fault (`cr2=PE_LOAD_BASE+0x20` from the main thread, later `PE_LOAD_BASE+0x10`
+from a services worker) that the committed-image fault owner rejects as `vmf-out`; other services
+threads keep processing RPC afterward, so the next slice should audit committed-image registration
+and lifetime for the services process rather than reintroducing an `img_end` fallback.
 
 The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a bounded name waiter with real
 timeout/deadline handling and exact name completion, `NtOpenFile` clears failed output handles, and
@@ -50,8 +53,15 @@ live hosted thread with a real TCB is parked. The old SCM-listener exit/read-par
 role-counted quiesce shortcuts have been removed. The active diagnostic slice adds generic named-pipe
 I/O traces, DCE/RPC PDU summaries, dispatcher wake traces, root `NtOpenFile` pipe traces, root
 `FSCTL_PIPE_WAIT` branch traces, and post-park owner-mask traces so the remaining `\ntsvcs` stall can
-be fixed in the pipe/wait/RPC-unwind machinery rather than through service identity. Follow-up
-structural debt: the NPFS root handle should become a real hosted-FSD file object so
+be fixed in the pipe/wait/RPC-unwind machinery rather than through service identity. The latest
+implementation slice removes another static thread-hosting assumption: ntdll scheduler/completion
+entries still prefer their historical low worker lanes, but real `NtCreateThread` is no longer
+rejected just because that preferred lane is occupied; it can claim any available per-process
+runtime lane. The slice also keeps `FSCTL_PIPE_TRANSCEIVE` on the same synchronous-vs-overlapped
+split as `NtReadFile`/`NtWriteFile`: synchronous pipe handles park the syscall on a reply cap, while
+overlapped pipe handles return `STATUS_PENDING` immediately and complete later through the pipe
+waiter, IOSB, event, and IOCP paths. Follow-up structural debt: the NPFS root handle should become
+a real hosted-FSD file object so
 `FSCTL_PIPE_WAIT` pending IRPs live inside the npfs driver instead of the executive carrying a
 root-handle wait queue.
 
