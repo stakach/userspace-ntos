@@ -363,6 +363,11 @@ const PIPE_TRANSCEIVE_TRACE_CAP: u32 = 384;
 const DCERPC_READ_REASSEMBLY_CAP: usize = 16;
 const DCERPC_READ_REASSEMBLY_BYTES: usize = 512;
 const DCERPC_READ_REASSEMBLY_TRACE_CAP: u32 = 160;
+const DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_CAP: u32 = 192;
+const DCERPC_CONTEXT_FLOW_CAP: usize = 256;
+const DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP: u32 = 64;
+const DCERPC_CONTEXT_FLOW_USE_TRACE_CAP: u32 = 96;
+const DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP: u32 = 96;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
 static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
@@ -1025,6 +1030,20 @@ struct DceRpcReadAssembly {
     buf: [u8; DCERPC_READ_REASSEMBLY_BYTES],
 }
 
+#[derive(Clone, Copy)]
+struct DceRpcContextFlow {
+    uuid: [u8; 16],
+    first_response_fid: u64,
+    last_response_fid: u64,
+    first_request_fid: u64,
+    last_request_fid: u64,
+    first_response_call: u32,
+    first_request_call: u32,
+    first_request_op: u16,
+    response_count: u16,
+    request_count: u16,
+}
+
 const EMPTY_DCERPC_READ_ASSEMBLY: DceRpcReadAssembly = DceRpcReadAssembly {
     fid: 0,
     frag_len: 0,
@@ -1032,10 +1051,30 @@ const EMPTY_DCERPC_READ_ASSEMBLY: DceRpcReadAssembly = DceRpcReadAssembly {
     buf: [0; DCERPC_READ_REASSEMBLY_BYTES],
 };
 
+const EMPTY_DCERPC_CONTEXT_FLOW: DceRpcContextFlow = DceRpcContextFlow {
+    uuid: [0; 16],
+    first_response_fid: 0,
+    last_response_fid: 0,
+    first_request_fid: 0,
+    last_request_fid: 0,
+    first_response_call: 0,
+    first_request_call: 0,
+    first_request_op: 0,
+    response_count: 0,
+    request_count: 0,
+};
+
 static mut DCERPC_READ_REASSEMBLY: [DceRpcReadAssembly; DCERPC_READ_REASSEMBLY_CAP] =
     [EMPTY_DCERPC_READ_ASSEMBLY; DCERPC_READ_REASSEMBLY_CAP];
 static mut DCERPC_READ_REASSEMBLY_CURSOR: usize = 0;
 static mut DCERPC_READ_REASSEMBLY_TRACE_COUNT: u32 = 0;
+static mut DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT: u32 = 0;
+static mut DCERPC_CONTEXT_FLOW: [DceRpcContextFlow; DCERPC_CONTEXT_FLOW_CAP] =
+    [EMPTY_DCERPC_CONTEXT_FLOW; DCERPC_CONTEXT_FLOW_CAP];
+static mut DCERPC_CONTEXT_FLOW_DROPS: u32 = 0;
+static mut DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT: u32 = 0;
+static mut DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT: u32 = 0;
+static mut DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT: u32 = 0;
 
 impl PipeCcbView {
     fn has_queued_state(&self) -> bool {
@@ -1236,16 +1275,25 @@ unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u
 }
 
 unsafe fn dcerpc_read_reassembly_emit(index: usize, status: u32, info: u64) {
-    if DCERPC_READ_REASSEMBLY_TRACE_COUNT >= DCERPC_READ_REASSEMBLY_TRACE_CAP {
-        return;
-    }
     let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
     let entry = table[index];
     let view = dcerpc_pdu_view(entry.buf.as_ptr() as u64, entry.len as u64);
-    if view.is_none() {
+    let Some(view) = view else {
         return;
+    };
+    dcerpc_trace_context_flow(entry.fid, view);
+    let force_late = dcerpc_pdu_has_context(view) || view.ptype == 3;
+    if DCERPC_READ_REASSEMBLY_TRACE_COUNT >= DCERPC_READ_REASSEMBLY_TRACE_CAP {
+        if !force_late
+            || DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT
+                >= DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_CAP
+        {
+            return;
+        }
+        DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT += 1;
+    } else {
+        DCERPC_READ_REASSEMBLY_TRACE_COUNT += 1;
     }
-    DCERPC_READ_REASSEMBLY_TRACE_COUNT += 1;
     print_str(b"[fsd-pipe-rpc-read] fid=0x");
     print_hex(entry.fid as u32);
     print_str(b" captured=");
@@ -1256,7 +1304,167 @@ unsafe fn dcerpc_read_reassembly_emit(index: usize, status: u32, info: u64) {
     print_hex(status);
     print_str(b" info=");
     print_u64(info);
-    print_dcerpc_pdu_view(view);
+    print_dcerpc_pdu_view(Some(view));
+    print_str(b"\n");
+}
+
+fn dcerpc_pdu_has_context(pdu: DceRpcPduView) -> bool {
+    pdu.context_handles.iter().any(Option::is_some)
+}
+
+unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
+    if !matches!(pdu.ptype, 0 | 2 | 3) {
+        return;
+    }
+    for context in pdu.context_handles.iter().flatten() {
+        let existing_index = dcerpc_context_flow_find(context.uuid);
+        let seen_response = existing_index
+            .map(|index| {
+                let table = &*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW);
+                table[index].response_count != 0
+            })
+            .unwrap_or(false);
+        let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(context.uuid))
+        else {
+            if pdu.ptype == 0 && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP {
+                DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                dcerpc_print_context_flow(b"drop", fid, pdu, *context, None, false);
+            }
+            continue;
+        };
+
+        let table = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
+        let entry = &mut table[index];
+        match pdu.ptype {
+            0 => {
+                if entry.first_request_fid == 0 {
+                    entry.first_request_fid = fid;
+                    entry.first_request_call = pdu.call_id;
+                    entry.first_request_op = pdu.opnum.unwrap_or(0);
+                }
+                entry.last_request_fid = fid;
+                entry.request_count = entry.request_count.saturating_add(1);
+                if seen_response {
+                    let first_use = entry.request_count == 1;
+                    if first_use && DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_USE_TRACE_CAP {
+                        DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT += 1;
+                        dcerpc_print_context_flow(b"use", fid, pdu, *context, Some(*entry), true);
+                    }
+                } else if DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP {
+                    DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                    dcerpc_print_context_flow(b"miss", fid, pdu, *context, Some(*entry), false);
+                }
+            }
+            2 => {
+                let first_response = entry.response_count == 0;
+                if first_response {
+                    entry.first_response_fid = fid;
+                    entry.first_response_call = pdu.call_id;
+                }
+                entry.last_response_fid = fid;
+                entry.response_count = entry.response_count.saturating_add(1);
+                if first_response
+                    && DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT
+                        < DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP
+                {
+                    DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT += 1;
+                    dcerpc_print_context_flow(b"create", fid, pdu, *context, Some(*entry), true);
+                }
+            }
+            3 => {
+                if !seen_response
+                    && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+                {
+                    DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
+                    dcerpc_print_context_flow(b"fault-miss", fid, pdu, *context, Some(*entry), false);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe fn dcerpc_context_flow_find(uuid: [u8; 16]) -> Option<usize> {
+    let table = &*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW);
+    for (index, entry) in table.iter().enumerate() {
+        if (entry.response_count != 0 || entry.request_count != 0) && entry.uuid == uuid {
+            return Some(index);
+        }
+    }
+    None
+}
+
+unsafe fn dcerpc_context_flow_alloc(uuid: [u8; 16]) -> Option<usize> {
+    let table = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
+    for (index, entry) in table.iter_mut().enumerate() {
+        if entry.response_count == 0 && entry.request_count == 0 {
+            *entry = DceRpcContextFlow {
+                uuid,
+                ..EMPTY_DCERPC_CONTEXT_FLOW
+            };
+            return Some(index);
+        }
+    }
+    DCERPC_CONTEXT_FLOW_DROPS = DCERPC_CONTEXT_FLOW_DROPS.saturating_add(1);
+    None
+}
+
+unsafe fn dcerpc_print_context_flow(
+    kind: &[u8],
+    fid: u64,
+    pdu: DceRpcPduView,
+    context: DceRpcContextHandleView,
+    entry: Option<DceRpcContextFlow>,
+    seen_response: bool,
+) {
+    print_str(b"[fsd-pipe-rpc-ctx] ");
+    print_str(kind);
+    print_str(b" fid=0x");
+    print_hex(fid as u32);
+    print_str(b" rpc=");
+    print_str(dcerpc_ptype_name(pdu.ptype));
+    print_str(b" call=");
+    print_u64(pdu.call_id as u64);
+    if let Some(opnum) = pdu.opnum {
+        print_str(b" op=");
+        print_u64(opnum as u64);
+    }
+    if let Some(status) = pdu.fault_status {
+        print_str(b" fault=0x");
+        print_hex(status);
+    }
+    print_str(b" ctx@");
+    print_u64(context.offset as u64);
+    print_str(b" attr=");
+    print_u64(context.attributes as u64);
+    print_str(b" uuid=");
+    print_uuid(context.uuid);
+    print_str(b" seen_rsp=");
+    print_u64(seen_response as u64);
+    if let Some(entry) = entry {
+        print_str(b" rsp_fid=0x");
+        print_hex(entry.first_response_fid as u32);
+        print_str(b" last_rsp=0x");
+        print_hex(entry.last_response_fid as u32);
+        print_str(b" req_fid=0x");
+        print_hex(entry.first_request_fid as u32);
+        print_str(b" last_req=0x");
+        print_hex(entry.last_request_fid as u32);
+        print_str(b" rsp_n=");
+        print_u64(entry.response_count as u64);
+        print_str(b" req_n=");
+        print_u64(entry.request_count as u64);
+        if entry.first_request_call != 0 {
+            print_str(b" first_req_call=");
+            print_u64(entry.first_request_call as u64);
+            print_str(b" first_req_op=");
+            print_u64(entry.first_request_op as u64);
+        }
+    }
+    if DCERPC_CONTEXT_FLOW_DROPS != 0 {
+        print_str(b" drops=");
+        print_u64(DCERPC_CONTEXT_FLOW_DROPS as u64);
+    }
     print_str(b"\n");
 }
 
@@ -1509,6 +1717,9 @@ unsafe fn trace_pipe_rw_result(
         trace_dcerpc_read_reassembly(file_id, status, info, payload, payload_len);
     }
     let pdu = dcerpc_pdu_view(payload, payload_len);
+    if let Some(view) = pdu {
+        dcerpc_trace_context_flow(file_id, view);
+    }
     let interesting = status == STATUS_PENDING
         || status == STATUS_BUFFER_OVERFLOW
         || info != 0
@@ -1556,6 +1767,9 @@ unsafe fn trace_pipe_transceive_result(
 ) {
     let after = pipe_ccb_view(if fsctx != 0 { fsctx } else { file_id });
     let pdu = dcerpc_pdu_view(payload, payload_len);
+    if let Some(view) = pdu {
+        dcerpc_trace_context_flow(file_id, view);
+    }
     let interesting = status == STATUS_PENDING
         || status == STATUS_BUFFER_OVERFLOW
         || status == 0xC000_00AE

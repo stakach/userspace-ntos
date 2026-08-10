@@ -2843,3 +2843,14 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
   `RpcServerListen() failed (Status 6b1)`, `no context handle found for uuid
   {819b2278-105d-40eb-8f73-5969e6748dcd}`, then `rpc_message.c:1874` fault-packet status
   `0x1c00001a`. Userinit/explorer still have not launched in this retry (`explorer total=0`).
+
+- I4 RPC context-flow diagnostic slice. Redrive-delivered read fragments now feed the same generic
+  DCE/RPC read assembler as direct synchronous reads, but the latest desktop retry still reaches a
+  late `NCA_S_FAULT_CONTEXT_MISMATCH` after the ordinary PDU trace cap is exhausted. The current
+  slice keeps transport behavior unchanged and adds bounded context-handle correlation inside the
+  named-pipe driver shim: request/response/fault PDUs record UUID-shaped NDR context handles in a
+  fixed table, first server-created handles and first client reuses are logged with their fids, and
+  request/fault context PDUs continue to print after the ordinary read-reassembly cap. The next
+  serialized `./run.sh --desktop` should classify the desktop blocker as wrong NPFS instance routing,
+  lost ReactOS server association lifetime, or an unobserved context creation path before any real
+  behavioral fix is made.
