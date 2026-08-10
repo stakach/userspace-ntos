@@ -21806,7 +21806,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = alloc_frame();
             }
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
-            for page_table in 0..win32k_subsystem::WIN32K_HEAP_FRAMES / 512 {
+            for page_table in 0..(win32k_subsystem::WIN32K_HEAP_FRAMES + 511) / 512 {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
                 let _ = paging_struct_map(

@@ -104,11 +104,15 @@ const WIN32K_BOOTSTRAP_PI: usize = 1;
 const WIN32K_BOOTSTRAP_TID: u64 = FAKE_PROCESS_HANDLE + 0x100;
 const WIN32K_EPROCESS_BYTES: u64 = 0x1000;
 const WIN32K_ETHREAD_BYTES: u64 = 0x400;
-/// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers
-/// bump-allocate from (counter at +0, data at +0x1000). win32k creates its session heap + maps
-/// several ~1 MiB session views; give it 16 MiB. Its own 8 PT window (0x0740_0000..0x0840_0000).
+/// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers allocate
+/// from (counter at +0, free-list head at +8, data at +0x1000). The arena is reclaimed through the
+/// hosted RtlFreeHeap path instead of being grown to mask leaks.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
+const _: () =
+    assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_POOL_VADDR);
+const _: () =
+    assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
@@ -147,7 +151,7 @@ pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;
 /// read `pci->pDeskInfo->pvDesktopBase/pvDesktopLimit` (the DESKTOPINFO lives in the POOL, NOT the
 /// USER heap). Sits immediately ABOVE the 16 MiB USER-heap window (0x9800_0000..0x9900_0000) and below
 /// the NLS section (0xA000_0000), inside the shared 0x8000_0000..0xC000_0000 1 GiB PD. The client VA of
-/// a pool object = its server VA − ([`WIN32K_POOL_VADDR`] − `CSRSS_W32_POOL_VA`).
+/// a pool object = its server VA - ([`WIN32K_POOL_VADDR`] - `CSRSS_W32_POOL_VA`).
 pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
 // The USER-heap window (16 MiB) must end at or below the POOL window base so the two client windows
 // never overlap; the POOL window (8 MiB) must end below the NLS section (0xA000_0000).
@@ -558,17 +562,9 @@ pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
-// A real free-list allocator (NOT a leak-forever bump arena): win32k's GUI bring-up ALLOC/FREEs
-// pool in tight churn loops (font/GDI object caches), and with no-op `ExFreePool` those leak
-// unbounded — the pool exhausted at EXACTLY whatever cap was set (1 MiB, then 8 MiB). So each block
-// carries a 16-byte header ([hdr+0]=capacity, [hdr+8]=next-free when on the list); `pool_free`
-// pushes the block onto a single free list (head word at [POOL_VADDR+8]); `pool_alloc` first-fits
-// that list before bumping. Same-size churn (the common case) reuses the freed block immediately →
-// bounded. The bump counter lives at [POOL_VADDR+0]; data starts at POOL_DATA_OFF (0x1000).
-
-// Pure bump arena (matches the known-good committed baseline, just larger + relocated). NOTE: a real
-// free list was tried and reverted — win32k's GUI init froze with it (a churn path did not compose
-// with reclaimed blocks). `ExFreePool` stays a no-op; the arena is sized generously instead.
+// The main win32k pool remains the known-good pure bump arena; earlier attempts to reclaim general
+// pool blocks froze GUI init when reclaimed object bodies were reused across incompatible paths.
+// FreeType/session-heap churn is reclaimed by dedicated allocators below, where ownership is clear.
 
 unsafe fn pool_alloc(size: u64) -> u64 {
     let ctr = WIN32K_POOL_VADDR as *mut u64;
@@ -3021,17 +3017,62 @@ fn ob_type_mismatch_trace(handle: u64, obj_type: u64, which: &[u8]) {
     }
 }
 
-/// Bump-allocate from the win32k session-heap arena (RtlAllocateHeap). Same shape as `pool_alloc`
-/// but over its own 4 MiB region.
-unsafe fn heap_alloc(size: u64) -> u64 {
+const HEAP_HDR_SIZE: u64 = 16;
+const HEAP_ALLOC_MARKER: u64 = 0xffff_ffff_ffff_fffd;
+const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
+const HEAP_REALLOC_IN_PLACE_ONLY: u64 = 0x0000_0010;
+
+/// Allocate from the win32k session-heap arena. The block header stores the aligned payload
+/// capacity; free blocks use the second header word as a next pointer, and live blocks carry a marker.
+unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    let want = align16(size);
+    let head = (WIN32K_HEAP_VADDR + 8) as *mut u64;
+    let mut prev = 0u64;
+    let mut cur = read_volatile(head);
+    let mut scanned = 0usize;
+    while cur != 0 && scanned < 4096 {
+        let cap = read_volatile(cur as *const u64);
+        let next = read_volatile((cur + 8) as *const u64);
+        if cap >= want {
+            if prev == 0 {
+                write_volatile(head, next);
+            } else {
+                write_volatile((prev + 8) as *mut u64, next);
+            }
+            if cap >= want + HEAP_HDR_SIZE + 16 {
+                let split = cur + HEAP_HDR_SIZE + want;
+                write_volatile(split as *mut u64, cap - want - HEAP_HDR_SIZE);
+                write_volatile((split + 8) as *mut u64, next);
+                if prev == 0 {
+                    write_volatile(head, split);
+                } else {
+                    write_volatile((prev + 8) as *mut u64, split);
+                }
+                write_volatile(cur as *mut u64, want);
+            }
+            write_volatile((cur + 8) as *mut u64, HEAP_ALLOC_MARKER);
+            let payload = cur + HEAP_HDR_SIZE;
+            if zero {
+                core::ptr::write_bytes(payload as *mut u8, 0, size as usize);
+            }
+            return payload;
+        }
+        prev = cur;
+        cur = next;
+        scanned += 1;
+    }
+
     let ctr = WIN32K_HEAP_VADDR as *mut u64;
     let mut cur = read_volatile(ctr);
     if cur < POOL_DATA_OFF {
         cur = POOL_DATA_OFF;
     }
-    let start = (WIN32K_HEAP_VADDR + cur + 15) & !15;
+    let hdr = align16(WIN32K_HEAP_VADDR + cur);
     let cap = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
-    if size == 0 || start + size > cap {
+    if hdr + HEAP_HDR_SIZE + want > cap {
         print_str(b"[win32k-host] HEAP EXHAUSTED size=0x");
         print_hex(size as u32);
         print_str(b" used=0x");
@@ -3039,17 +3080,147 @@ unsafe fn heap_alloc(size: u64) -> u64 {
         print_str(b"\n");
         return 0;
     }
-    write_volatile(ctr, (start + size) - WIN32K_HEAP_VADDR);
-    start
+    write_volatile(ctr, (hdr + HEAP_HDR_SIZE + want) - WIN32K_HEAP_VADDR);
+    write_volatile(hdr as *mut u64, want);
+    write_volatile((hdr + 8) as *mut u64, HEAP_ALLOC_MARKER);
+    let payload = hdr + HEAP_HDR_SIZE;
+    if zero {
+        core::ptr::write_bytes(payload as *mut u8, 0, size as usize);
+    }
+    payload
+}
+
+unsafe fn heap_block_capacity(p: u64) -> Option<u64> {
+    let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
+    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    if p < arena_start + HEAP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
+        return None;
+    }
+    let hdr = p - HEAP_HDR_SIZE;
+    let cap = read_volatile(hdr as *const u64);
+    let marker = read_volatile((hdr + 8) as *const u64);
+    if marker != HEAP_ALLOC_MARKER || cap == 0 || (cap & 15) != 0 {
+        return None;
+    }
+    if hdr < arena_start || hdr + HEAP_HDR_SIZE + cap > arena_end {
+        return None;
+    }
+    Some(cap)
+}
+
+unsafe fn heap_free(p: u64) -> bool {
+    let Some(cap) = heap_block_capacity(p) else {
+        return false;
+    };
+    let hdr = p - HEAP_HDR_SIZE;
+
+    let head = (WIN32K_HEAP_VADDR + 8) as *mut u64;
+    let mut prev = 0u64;
+    let mut cur = read_volatile(head);
+    let mut scanned = 0usize;
+    while cur != 0 && cur < hdr && scanned < 4096 {
+        prev = cur;
+        cur = read_volatile((cur + 8) as *const u64);
+        scanned += 1;
+    }
+    if scanned >= 4096 {
+        return false;
+    }
+
+    write_volatile(hdr as *mut u64, cap);
+    write_volatile((hdr + 8) as *mut u64, cur);
+    if prev == 0 {
+        write_volatile(head, hdr);
+    } else {
+        write_volatile((prev + 8) as *mut u64, hdr);
+    }
+
+    let mut block = hdr;
+    let mut block_cap = cap;
+    if cur != 0 && block + HEAP_HDR_SIZE + block_cap == cur {
+        let cur_cap = read_volatile(cur as *const u64);
+        let cur_next = read_volatile((cur + 8) as *const u64);
+        block_cap += HEAP_HDR_SIZE + cur_cap;
+        write_volatile(block as *mut u64, block_cap);
+        write_volatile((block + 8) as *mut u64, cur_next);
+    }
+    if prev != 0 {
+        let prev_cap = read_volatile(prev as *const u64);
+        if prev + HEAP_HDR_SIZE + prev_cap == block {
+            let next = read_volatile((block + 8) as *const u64);
+            block = prev;
+            block_cap += HEAP_HDR_SIZE + prev_cap;
+            write_volatile(block as *mut u64, block_cap);
+            write_volatile((block + 8) as *mut u64, next);
+        }
+    }
+
+    let ctr = WIN32K_HEAP_VADDR as *mut u64;
+    let high = WIN32K_HEAP_VADDR + read_volatile(ctr);
+    if block + HEAP_HDR_SIZE + block_cap == high {
+        let mut list_prev = 0u64;
+        let mut list_cur = read_volatile(head);
+        let mut scanned = 0usize;
+        while list_cur != 0 && list_cur != block && scanned < 4096 {
+            list_prev = list_cur;
+            list_cur = read_volatile((list_cur + 8) as *const u64);
+            scanned += 1;
+        }
+        if list_cur == block {
+            let next = read_volatile((block + 8) as *const u64);
+            if list_prev == 0 {
+                write_volatile(head, next);
+            } else {
+                write_volatile((list_prev + 8) as *mut u64, next);
+            }
+            write_volatile(ctr, block - WIN32K_HEAP_VADDR);
+        }
+    }
+    true
+}
+
+unsafe fn heap_realloc(flags: u64, p: u64, size: u64) -> u64 {
+    if p == 0 {
+        return heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0);
+    }
+    if size == 0 {
+        heap_free(p);
+        return 0;
+    }
+    let Some(old_cap) = heap_block_capacity(p) else {
+        return 0;
+    };
+    let want = align16(size);
+    if want <= old_cap {
+        return p;
+    }
+    if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
+        return 0;
+    }
+    let newp = heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0);
+    if newp == 0 {
+        return 0;
+    }
+    core::ptr::copy_nonoverlapping(
+        p as *const u8,
+        newp as *mut u8,
+        core::cmp::min(old_cap, size) as usize,
+    );
+    heap_free(p);
+    newp
 }
 
 /// A GENERAL_LOOKASIDE's default Allocate `PVOID(POOL_TYPE, SIZE_T, ULONG Tag)` — bump the heap
 /// arena (the lookaside is a per-type object cache; slow-path allocation on an empty free-list).
 extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u64 {
-    unsafe { heap_alloc(size) }
+    unsafe { heap_alloc(size, false) }
 }
-/// A GENERAL_LOOKASIDE's default Free `VOID(PVOID)` — no-op (bump arena never frees).
-extern "win64" fn s_lookaside_free(_buf: u64) {}
+/// A GENERAL_LOOKASIDE's default Free `VOID(PVOID)`.
+extern "win64" fn s_lookaside_free(buf: u64) {
+    unsafe {
+        heap_free(buf);
+    }
+}
 
 /// Initialize a GENERAL_LOOKASIDE via the real [`nt_kernel_exec::init_general_lookaside`] primitive
 /// (host-tested x64 layout), defaulting the Allocate/Free callbacks to this host's pool trampolines
@@ -3129,17 +3300,28 @@ extern "win64" fn s_ex_init_npaged_lookaside(
 }
 
 /// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)` — win32k
-/// creates its session heap. Return a non-null fake handle; RtlAllocateHeap bumps the arena.
+/// creates its session heap. Return a non-null fake handle; RtlAllocateHeap uses the arena above.
 extern "win64" fn s_rtl_create_heap() -> u64 {
     WIN32K_HEAP_HANDLE
 }
-/// `PVOID RtlAllocateHeap(HeapHandle, Flags, Size)` — bump the session-heap arena.
-extern "win64" fn s_rtl_allocate_heap(_heap: u64, _flags: u64, size: u64) -> u64 {
-    unsafe { heap_alloc(size) }
+/// `PVOID RtlAllocateHeap(HeapHandle, Flags, Size)`.
+extern "win64" fn s_rtl_allocate_heap(_heap: u64, flags: u64, size: u64) -> u64 {
+    unsafe { heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0) }
 }
-/// `BOOLEAN RtlFreeHeap(HeapHandle, Flags, Base)` — no-op (bump arena never frees).
-extern "win64" fn s_rtl_free_heap() -> u64 {
-    1
+/// `BOOLEAN RtlFreeHeap(HeapHandle, Flags, Base)`.
+extern "win64" fn s_rtl_free_heap(_heap: u64, _flags: u64, base: u64) -> u64 {
+    if base == 0 {
+        return 1;
+    }
+    unsafe { heap_free(base) as u64 }
+}
+/// `SIZE_T RtlSizeHeap(HeapHandle, Flags, Base)`.
+extern "win64" fn s_rtl_size_heap(_heap: u64, _flags: u64, base: u64) -> u64 {
+    unsafe { heap_block_capacity(base).unwrap_or(u64::MAX) }
+}
+/// `PVOID RtlReAllocateHeap(HeapHandle, Flags, Base, Size)`.
+extern "win64" fn s_rtl_reallocate_heap(_heap: u64, flags: u64, base: u64, size: u64) -> u64 {
+    unsafe { heap_realloc(flags, base, size) }
 }
 
 use nt_kernel_exec::session_section::{
@@ -3155,14 +3337,14 @@ const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
 unsafe fn section_view(section: u64, size_hint: u64) -> (u64, u64) {
     if is_section(section as *const u8) {
         let sz = section_size(section as *const u8);
-        (map_section(section as *mut u8, |s| heap_alloc(s)), sz)
+        (map_section(section as *mut u8, |s| heap_alloc(s, true)), sz)
     } else {
         let mut size = size_hint;
         if size == 0 || size > 0x0040_0000 {
             size = 0x0010_0000; // default/cap the view at 1 MiB
         }
         size = (size + 0xFFF) & !0xFFF;
-        (heap_alloc(size), size)
+        (heap_alloc(size, true), size)
     }
 }
 
@@ -6433,6 +6615,8 @@ fn register_trampolines() {
     reg.bind("RtlCreateHeap", s_rtl_create_heap as usize as u64);
     reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as usize as u64);
     reg.bind("RtlFreeHeap", s_rtl_free_heap as usize as u64);
+    reg.bind("RtlSizeHeap", s_rtl_size_heap as usize as u64);
+    reg.bind("RtlReAllocateHeap", s_rtl_reallocate_heap as usize as u64);
     // --- batch 2: RTL_BITMAP (GDI pool slot allocator) ---
     reg.bind(
         "RtlInitializeBitMap",

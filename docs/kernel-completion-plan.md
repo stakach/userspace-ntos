@@ -138,6 +138,25 @@ quiesce window in `NtDelayExecution`; `exec_lsa_msv1_0_sam_validation_reached`,
 `exec_winlogon_logon_token_received`, userinit/explorer spawn, and `exec_services_query_dir_object`
 remain red.
 
+Latest TP-worker/runtime validation
+`.tmp/boot-tp-resume-runtime-slot-20260810.log` removes the LSA/SAM completion-worker stall without
+adding service policy. `NtResumeThread` now resolves the target hosted thread by its runtime identity
+before raw-resuming its TCB, while the process-manager pool slot remains the owner of the suspended
+bit. This matters for generic TP workers whose hosted runtime slot can differ from the process-manager
+thread slot. Proof: the LSASS worker `tid=316` resumes at runtime `slot=1` while the pool slot is `4`,
+then services real IOCP/pipe syscalls and writes LSA RPC responses. No `NtQueryDirectoryObject`
+caller appears in this boot, so the previous `exec_services_query_dir_object` red gate is stale proof
+debt rather than a justified synthetic implementation target.
+
+The current implementation slice addresses the new generic resource frontier exposed by that run:
+dynamic service startup reaches `spoolsv.exe`, `spoolsv` calls the real win32k
+`NtUserProcessConnect`, and ReactOS `InitThreadCallback` fails because the hosted win32k session heap
+exhausts at a 1 MiB desktop-heap allocation with about 15.2 MiB already used. A 32 MiB pre-mapped
+heap candidate was rejected after `.tmp/boot-win32k-heap-32m-20260810.log` regressed early in dxg
+private mapping. The current fix keeps the known 16 MiB VA/layout and replaces the old no-op
+`RtlFreeHeap` path with reclaiming heap blocks plus `RtlSizeHeap`/`RtlReAllocateHeap` support; it is
+intentionally not a spooler or service-name special case.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
@@ -261,8 +280,10 @@ remain red.
    `svchost.exe` launches admit fresh target-scoped identities, `NtCreateSection(SEC_IMAGE)` and
    `NtCreateProcessEx` run for each, and the old process-parameter invalid-handle wall is gone. A3 is
    complete. Continue A4 by removing remaining SCM pipe/listener thread special coordination once the
-   generic LPC/pipe/thread model can carry it, and by fixing the current service GUI frontier through
-   real win32k desktop/winsta object assignment for service processes.
+   generic LPC/pipe/thread model can carry it. The service GUI desktop/winsta assignment has moved onto
+   the real win32k/Ob path; the active A4 validation frontier is generic hosted TP-worker resume
+   identity plus reclaiming win32k session heap allocations for multiple dynamic GUI-capable service
+   clients.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM

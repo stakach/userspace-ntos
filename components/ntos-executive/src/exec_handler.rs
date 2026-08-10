@@ -4665,14 +4665,15 @@ impl ExecNtHandler {
         USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn hosted_thread_tcb_for_nt_resume_thread(&self, tid: u64) -> Option<u64> {
-        if let Some(runtime) = self.thread_runtime.get_by_tid(tid) {
-            if !runtime.role.can_raw_resume_from_nt_resume_thread() {
-                return None;
-            }
-            return (runtime.tcb > 1).then_some(runtime.tcb);
-        }
-        None
+    fn hosted_thread_runtime_for_nt_resume_thread(
+        &self,
+        tid: u64,
+    ) -> Option<HostedThreadRuntime> {
+        let runtime = self.thread_runtime.get_by_tid(tid)?;
+        runtime
+            .role
+            .can_raw_resume_from_nt_resume_thread()
+            .then_some(runtime)
     }
 
     pub(crate) fn hosted_main_thread_tcb_for_pi(&self, pi: usize) -> Option<u64> {
@@ -8545,16 +8546,27 @@ impl ExecNtHandler {
                 print_str(b" previous=1\n");
                 return 0;
             }
-            let tcb = self
-                .hosted_thread_tcb_for_nt_resume_thread(tid)
-                .unwrap_or(0);
+            // `slot` is the process-manager pool slot. Generic TP workers also have a hosted
+            // window slot, and the TCB belongs to that hosted role rather than the PM slot index.
+            let Some(runtime) = self.hosted_thread_runtime_for_nt_resume_thread(tid) else {
+                return STATUS_UNSUCCESSFUL;
+            };
+            let tcb = runtime.tcb;
             if tcb <= 1 {
                 return STATUS_UNSUCCESSFUL;
             }
+            let hosted_slot = match runtime.role {
+                HostedThreadRole::TpWorker { slot } | HostedThreadRole::WinlogonWorker { slot } => {
+                    slot
+                }
+                _ => slot,
+            };
             let result = tcb_resume(tcb);
             print_str(b"[thread-life] resume pi=");
-            print_u64(pi as u64);
+            print_u64(runtime.pi as u64);
             print_str(b" slot=");
+            print_u64(hosted_slot as u64);
+            print_str(b" pool_slot=");
             print_u64(slot as u64);
             print_str(b" tid=");
             print_u64(tid);
