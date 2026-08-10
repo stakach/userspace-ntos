@@ -238,6 +238,9 @@ impl<B: Backend> LpcClient<B> {
         let r = self
             .backend
             .call(opcode::LPC_OP_REPLY_WAIT_RECEIVE, &buf, &mut out);
+        if r.status == NtStatus::PENDING.raw() {
+            return Err(NtStatus::PENDING);
+        }
         NtStatus(r.status).to_result()?;
         let msg_type = r.detail1 as u16;
         let is_connection = msg_type == msg_type::LPC_CONNECTION_REQUEST;
@@ -285,6 +288,9 @@ impl<B: Backend> LpcClient<B> {
         buf.extend_from_slice(message);
         let mut out = [0u8; 512];
         let r = self.backend.call(opcode, &buf, &mut out);
+        if opcode == opcode::LPC_OP_REQUEST_WAIT_REPLY && r.status == NtStatus::PENDING.raw() {
+            return Ok(Vec::new());
+        }
         NtStatus(r.status).to_result()?;
         Ok(out[..(r.information as usize).min(out.len())].to_vec())
     }

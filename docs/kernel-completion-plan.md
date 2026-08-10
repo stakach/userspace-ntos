@@ -91,6 +91,24 @@ target coverage: `cargo check --manifest-path components/ntos-executive/Cargo.to
 x86_64-unknown-none`. Next desktop retry should prove the old `LsapRmServerThread - Port Listen
 failed 0xc000000d` line is gone and then continue at the next real LSA/profile/userinit edge.
 
+Desktop retry `.tmp/boot-srm-reverse-connect-20260811-0558.log` proved the reverse SRM connect:
+the base desktop still painted (`desktop-bg 768/768`), `\SeRmCommandPort` was accepted, and the
+kernel side queued a real pending `\SeLsaCommandPort` connect for LSASS to listen/accept/complete.
+The next wall was in the same generic LPC receive path: after `NtCompleteConnectPort`, LSASS'
+`LsapRmServerThread` called `NtReplyWaitReceivePort(MessagePort, NULL, NULL, &Message.Header)` on an
+idle accepted comm port, but the client wrapper decoded broker `STATUS_PENDING` as an empty
+successful receive because `NT_SUCCESS(STATUS_PENDING)` is true. The executive then attempted to
+copy an empty receive buffer and returned `STATUS_ACCESS_VIOLATION`, causing the repeated
+`Failed to get message: 0xc0000005` loop. The current fix makes
+`reply_wait_receive_with_reply` surface pending receives as `Err(STATUS_PENDING)` while preserving
+`NtRequestWaitReplyPort`'s existing "request queued, no reply yet" empty-result contract. Host
+coverage now asserts that an idle accepted SRM comm port returns pending, and that a reply can still
+be sent before a pending receive. Validation: `cargo test -p nt-lpc-server -- --nocapture`,
+`cargo test -p nt-lpc-client -- --nocapture`, `cargo fmt --all`,
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Next desktop retry should require the LSASS SRM server thread to park
+instead of spinning on `0xc0000005`, then continue to the real LSA RPC/profile/userinit edge.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and

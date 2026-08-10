@@ -608,6 +608,10 @@ mod tests {
             let (lsa_client, lsa_completed) = c.complete_connect(lsa_server).unwrap();
             assert_ne!(lsa_client, 0);
             assert_eq!(lsa_completed, lsa.connection_id);
+            assert_eq!(
+                c.reply_wait_receive(lsa_server).unwrap_err(),
+                NtStatus::PENDING
+            );
         }
     }
 
@@ -767,8 +771,8 @@ mod tests {
             assert_eq!(request.port_context, 0x5a5a);
             let next = c
                 .reply_wait_receive_with_reply(listen, b"response")
-                .unwrap();
-            assert!(next.connection_info.is_empty());
+                .unwrap_err();
+            assert_eq!(next, NtStatus::PENDING);
             let response = c.reply_wait_receive(client).unwrap();
             assert_eq!(response.connection_info, b"response");
         }
