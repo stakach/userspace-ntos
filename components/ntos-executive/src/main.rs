@@ -2642,6 +2642,20 @@ unsafe fn watchdog_report(messages: u64) {
     print_str(b" nested-rearms=");
     print_u64(WATCHDOG_NESTED_REARMS.load(Ordering::Relaxed));
     print_str(b"\n");
+    let w32_bucket = W32_PREV_BUCKET.load(Ordering::Relaxed);
+    if w32_bucket != u64::MAX {
+        let w32_ssn = if w32_bucket < SSN_HIST_NATIVE as u64 {
+            w32_bucket
+        } else {
+            0x1000 + (w32_bucket - SSN_HIST_NATIVE as u64)
+        };
+        print_str(b"[deadman] last-win32k-ssn=0x");
+        print_hex(w32_ssn as u32);
+        print_str(b" entered-at-ms=");
+        print_u64(W32_PREV_T.load(Ordering::Relaxed) / 10_000);
+        print_str(b"\n");
+        win32k_glue::win32k_dispatch_backtrace();
+    }
     for slot in 0..WAITER_N {
         if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX {
             continue;

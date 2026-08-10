@@ -2416,3 +2416,23 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   userinit/explorer shell paint. Continue I4 from generic NPFS/RPC association, context-handle, and
   service-thread semantics; do not add service-name, executable-order, CSR-success, or paint
   fallbacks.
+- I4 service listener real-stack slice boot-verified. The latest desktop retry reached real winlogon
+  base desktop paint and dynamic service/explorer dependency loading, but the SCM listener's first
+  `NtCreateEvent` failed with `STATUS_ACCESS_VIOLATION` even though its out-param stack page was
+  backed. Root cause: hosted listener threads enter through the loader bootstrap stack, then
+  `LdrInitializeThread` restores the caller-created `InitialTeb` stack; syscall probing still trusted
+  only the historical bootstrap `ACTIVE_STACK_BASE` window or winlogon's legacy listener stack.
+  Multiplexed service/LSA listener spawns now record their real `InitialTeb` stack range in the
+  hosted-thread runtime table, and `xas_read`, `xas_try_write_buf`, and `probe_user_output` accept
+  current-thread stack ranges only when the caller's VSpace has real backing. The same slice removes
+  the service-specific protseq/create-event diagnostics and tightens NPFS server listen state so
+  client connects only match listening server endpoints. Validation: `cargo fmt --all`, `cargo test
+  -p nt-io-manager pipe -- --nocapture`, the executive `cargo check`, `git diff --check`, and
+  serialized desktop run `.tmp/boot-hosted-listener-stack-20260811-010115.log`. The old
+  `probe-failed`/`STATUS_ACCESS_VIOLATION` wall is gone; the run reaches
+  `desktop-bg 768/768`, drives hundreds of real NPFS/RPC reads/writes, completes pending server
+  listens by exact endpoint, and then exposes the next generic RPC frontier:
+  `RpcServerListen() failed (Status 6b1)` followed by `no context handle found for uuid
+  {fb1f958e-c047-4b4f-ba6c-97645a18f1a1}` while explorer still has zero syscalls. Review
+  adjustment: continue I4 in RPC context-handle association and server-side endpoint state; do not
+  add service-name, executable-order, stack-window, or paint fallbacks.

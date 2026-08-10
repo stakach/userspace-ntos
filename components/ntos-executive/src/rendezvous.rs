@@ -2302,20 +2302,16 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             _ => return HostedThreadSpawnResult::failed(),
         };
     let worker_ep = mint_badged(main_fault_ep, badge);
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+        return HostedThreadSpawnResult::failed();
+    };
     spawn_hosted_thread(&HostedThread {
         pml4,
         client_pi: 2,
         entry_rip: start.rip,
         arg0: start.rcx,
         arg1: start.rdx,
-        loader_context: (slot == 0)
-            .then(|| img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed))
-            .filter(|&rva| rva != 0)
-            .map(|rva| LoaderThreadContext {
-                loader_va: NTDLL_BASE + rva,
-                start,
-                initial_teb,
-            }),
+        loader_context: Some(loader_context),
         scr,
         teb_va,
         stack_base,
@@ -2337,6 +2333,18 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         // main parks on.
         native: true,
         diag: false,
+    })
+}
+
+fn hosted_loader_thread_context(
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
+) -> Option<LoaderThreadContext> {
+    let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
+    (loader_rva != 0).then_some(LoaderThreadContext {
+        loader_va: NTDLL_BASE + loader_rva,
+        start,
+        initial_teb,
     })
 }
 
@@ -2489,22 +2497,24 @@ pub(crate) unsafe fn spawn_slot_thread(spawn: &RemoteThreadSpawn) -> HostedThrea
 /// = the shared service-loop endpoint (this fn mints the badged cap). Returns the TCB.
 pub(crate) unsafe fn spawn_svc_listener_thread(
     svc_pml4: u64,
-    entry_rip: u64,
-    arg0: u64,
-    arg1: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+        return HostedThreadSpawnResult::failed();
+    };
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
         client_pi: 3,
-        entry_rip,
-        arg0,
-        arg1,
-        loader_context: None,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: Some(loader_context),
         scr: SVC_LISTENER_ENV_SCRATCH_VA,
         teb_va: SVC_LISTENER_TEB_VA,
         stack_base: SVC_LISTENER_STACK_BASE,
@@ -2536,22 +2546,24 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
 /// Returns the TCB.
 pub(crate) unsafe fn spawn_lsass_listener_thread(
     lsass_pml4: u64,
-    entry_rip: u64,
-    arg0: u64,
-    arg1: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+        return HostedThreadSpawnResult::failed();
+    };
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         client_pi: 4,
-        entry_rip,
-        arg0,
-        arg1,
-        loader_context: None,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: Some(loader_context),
         scr: LSASS_LISTENER_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER_TEB_VA,
         stack_base: LSASS_LISTENER_STACK_BASE,
@@ -2580,22 +2592,24 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
 /// VAs (distinct TEB/stack/tramp) + badge (LSASS_LISTENER2_BADGE).
 pub(crate) unsafe fn spawn_lsass_listener2_thread(
     lsass_pml4: u64,
-    entry_rip: u64,
-    arg0: u64,
-    arg1: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+        return HostedThreadSpawnResult::failed();
+    };
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         client_pi: 4,
-        entry_rip,
-        arg0,
-        arg1,
-        loader_context: None,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: Some(loader_context),
         scr: LSASS_LISTENER2_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER2_TEB_VA,
         stack_base: LSASS_LISTENER2_STACK_BASE,
@@ -2617,22 +2631,24 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
 
 pub(crate) unsafe fn spawn_lsass_listener3_thread(
     lsass_pml4: u64,
-    entry_rip: u64,
-    arg0: u64,
-    arg1: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
     resume: bool,
 ) -> HostedThreadSpawnResult {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+        return HostedThreadSpawnResult::failed();
+    };
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         client_pi: 4,
-        entry_rip,
-        arg0,
-        arg1,
-        loader_context: None,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: Some(loader_context),
         scr: LSASS_LISTENER3_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER3_TEB_VA,
         stack_base: LSASS_LISTENER3_STACK_BASE,

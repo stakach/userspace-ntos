@@ -16975,6 +16975,11 @@ unsafe fn spawn_requested_multiplexed_thread(
     };
 
     let (_ctx_va, start) = requested_thread_start(caller_sp);
+    let initial_teb_va = smss_stack_read(caller_sp + 0x38);
+    let initial_teb = nt_thread_start::InitialTeb64::read(
+        |address| unsafe { smss_stack_read(address) },
+        initial_teb_va,
+    );
     let suspended = hosted_thread_suspended(nt_handler, tid);
     let resume = match spec.resume {
         HostedThreadResumeMode::PoolState => !suspended,
@@ -16989,20 +16994,46 @@ unsafe fn spawn_requested_multiplexed_thread(
 
     let spawned = match spec.spawner {
         HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
         ),
         HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
-            pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep, resume,
+            pml4,
+            start,
+            initial_teb,
+            cid_proc,
+            tid,
+            fault_ep,
+            resume,
         ),
     };
 
-    nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role);
+    if nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role) {
+        let _ = nt_handler.remember_hosted_thread_user_stack(tid, initial_teb);
+    }
     nt_handler
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, spec.teb);

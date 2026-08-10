@@ -2747,3 +2747,19 @@ natural userinit/explorer launch.
   parked on dispatcher/event waits with no further IPC. Review adjustment: the next slice should
   inspect the first explorer wait/event edge after SSN `0x1082` and fix generic dispatcher or win32k
   queue-event wake delivery, not add explorer, shell, or paint-specific success paths.
+
+- I4 hosted listener stack/runtime slice boot-verified. A follow-up desktop run reached real base
+  desktop paint and deep dynamic service/explorer dependency loading, then exposed a generic hosted-thread
+  stack-context bug in the SCM listener: after `LdrInitializeThread`, listener syscalls use the
+  caller-created `InitialTeb` stack, but `probe_user_output` still checked the loader bootstrap stack
+  window. Multiplexed service/LSA listener spawns now retain that real stack range in hosted-thread
+  runtime metadata, and the executive's cross-address-space read/write/probe helpers accept current
+  hosted-thread stack ranges only when the target process has real page backing. NPFS server pipe
+  creation/listen state is also stricter: clients connect to listening server endpoints, not to
+  disconnected or historical endpoints. Validation: `cargo fmt --all`, `cargo test -p nt-io-manager
+  pipe -- --nocapture`, the executive `cargo check`, `git diff --check`, and serialized desktop run
+  `.tmp/boot-hosted-listener-stack-20260811-010115.log`. Result: the SCM listener `NtCreateEvent`
+  probe wall is gone, base desktop paint is restored (`desktop-bg 768/768`), and the next red edge is
+  later service RPC context-handle association: `RpcServerListen() failed (Status 6b1)` followed by
+  `no context handle found for uuid {fb1f958e-c047-4b4f-ba6c-97645a18f1a1}` before explorer issues
+  any syscalls.

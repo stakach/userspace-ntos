@@ -5095,6 +5095,33 @@ impl ExecNtHandler {
             .map(|runtime| runtime.role)
     }
 
+    fn current_hosted_thread_user_stack_range(&self) -> Option<(u64, u64)> {
+        let runtime = self
+            .thread_runtime
+            .get_by_badge(self.current_badge)
+            .or_else(|| self.thread_runtime.get_by_tid(self.current_tid))?;
+        if runtime.pi != self.pi {
+            return None;
+        }
+        let allocation_base = runtime.user_stack_allocation_base;
+        let stack_base = runtime.user_stack_base;
+        if allocation_base == 0 || stack_base <= allocation_base {
+            return None;
+        }
+        Some((allocation_base, stack_base))
+    }
+
+    fn current_hosted_thread_user_stack_contains(&self, va: u64, len: usize) -> bool {
+        let Some(end) = va.checked_add(len as u64) else {
+            return false;
+        };
+        let Some((allocation_base, stack_base)) = self.current_hosted_thread_user_stack_range()
+        else {
+            return false;
+        };
+        va >= allocation_base && end <= stack_base
+    }
+
     pub(crate) fn remember_hosted_thread_user_stack(
         &mut self,
         tid: u64,
@@ -11735,9 +11762,7 @@ impl ExecNtHandler {
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
-        let dynamic_stack =
-            self.current_process_is_winlogon() && wl_listener_stack_contains(va, dst.len());
-        if dynamic_stack {
+        if self.current_hosted_thread_user_stack_contains(va, dst.len()) {
             let Some(ctx) = self.loop_ctx.as_ref() else {
                 return false;
             };
@@ -11998,7 +12023,7 @@ impl ExecNtHandler {
             return true;
         };
         let end = va + len as u64;
-        if self.current_process_is_winlogon() && wl_listener_stack_contains(va, len) {
+        if self.current_hosted_thread_user_stack_contains(va, len) {
             return client_range_has_backing(self.pi as u64, va, len);
         }
         let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
@@ -12556,9 +12581,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        let dynamic_stack =
-            self.current_process_is_winlogon() && wl_listener_stack_contains(va, src.len());
-        if dynamic_stack {
+        if self.current_hosted_thread_user_stack_contains(va, src.len()) {
             let Some(ctx) = self.loop_ctx.as_ref() else {
                 return false;
             };
@@ -18411,7 +18434,8 @@ impl ExecNtHandler {
                         let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                             return 0xC000_009A;
                         };
-                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32)
+                        else {
                             self.rollback_new_event(index);
                             return 0xC000_009A;
                         };

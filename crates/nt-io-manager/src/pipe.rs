@@ -349,7 +349,7 @@ impl PipeRegistry {
 
     /// `IRP_MJ_CREATE_NAMED_PIPE` / `NtCreateNamedPipeFile` — create (or add a new
     /// instance to) the server side of a named pipe. Returns a SERVER-end handle
-    /// in the `Disconnected` state (the caller then issues FSCTL_PIPE_LISTEN).
+    /// in the `Listening` state.
     ///
     /// Mirrors `NpCreateServerEnd`: the first create makes the FCB; subsequent
     /// creates add another instance up to `MaximumInstances`.
@@ -377,7 +377,8 @@ impl PipeRegistry {
             }
         };
         let fcb = &mut self.pipes[fcb_idx];
-        let conn = PipeConnection::new(&fcb.params);
+        let mut conn = PipeConnection::new(&fcb.params);
+        conn.state = PipeState::Listening;
         fcb.connections.push(conn);
         Ok(PipeHandle {
             fcb: fcb_idx,
@@ -387,9 +388,7 @@ impl PipeRegistry {
     }
 
     /// `FSCTL_PIPE_LISTEN` — a server end waits for a client. Transitions
-    /// `Disconnected → Listening`. If a client is already waiting (connect raced
-    /// ahead) NPFS would pair immediately; in our synchronous model the client
-    /// connect does the pairing, so listen just arms the instance.
+    /// `Disconnected → Listening`.
     ///
     /// Returns `STATUS_PIPE_LISTENING` (pending) if no client yet, or
     /// `STATUS_PIPE_CONNECTED` if the connect already paired this instance.
@@ -409,26 +408,21 @@ impl PipeRegistry {
     }
 
     /// `IRP_MJ_CREATE` on `\??\pipe\NAME` / `NtCreateFile` — the client connect.
-    /// Pairs with a listening (or freshly-created) server instance and transitions
-    /// it to `Connected`. Returns a CLIENT-end handle.
+    /// Pairs with a listening server instance and transitions it to `Connected`.
+    /// Returns a CLIENT-end handle.
     ///
-    /// Mirrors `NpCreateClientEnd`: find the FCB by name, find an available server
-    /// instance (Listening preferred, else Disconnected), attach the client end.
+    /// Mirrors `NpCreateClientEnd`: find the FCB by name, find a
+    /// `FILE_PIPE_LISTENING_STATE` server instance, attach the client end. A
+    /// disconnected-but-not-listening server instance is not available to clients;
+    /// callers such as `WaitNamedPipe` retry or wait until `FSCTL_PIPE_LISTEN` is
+    /// posted.
     pub fn connect_client(&mut self, name: &str) -> Result<PipeHandle, NtStatus> {
         let fcb_idx = self.find_fcb(name).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
         let fcb = &mut self.pipes[fcb_idx];
-        // Prefer a Listening instance; NPFS also allows connecting to a
-        // just-created Disconnected server instance (the listen may not have run
-        // yet in our synchronous ordering).
         let conn_idx = fcb
             .connections
             .iter()
-            .position(|c| c.state == PipeState::Listening && !c.client_attached)
-            .or_else(|| {
-                fcb.connections
-                    .iter()
-                    .position(|c| c.state == PipeState::Disconnected && !c.client_attached)
-            });
+            .position(|c| c.state == PipeState::Listening && !c.client_attached);
         let Some(conn_idx) = conn_idx else {
             // No available server instance.
             return Err(STATUS_PIPE_NOT_AVAILABLE);
@@ -1565,12 +1559,12 @@ mod tests {
     }
 
     #[test]
-    fn create_then_connect_reaches_connected() {
+    fn create_listening_then_connect_reaches_connected() {
         let mut r = dx();
         let s = r
             .create_server_pipe("lsarpc", PipeParams::default())
             .unwrap();
-        assert_eq!(r.state(s).unwrap(), PipeState::Disconnected);
+        assert_eq!(r.state(s).unwrap(), PipeState::Listening);
         assert_eq!(r.listen(s).unwrap(), STATUS_PIPE_LISTENING);
         assert_eq!(r.state(s).unwrap(), PipeState::Listening);
         let c = r.connect_client("lsarpc").unwrap();
@@ -1741,13 +1735,15 @@ mod tests {
     }
 
     #[test]
-    fn connect_before_listen_still_pairs() {
+    fn create_starts_listening_and_client_connect_pairs() {
         let mut r = dx();
         let s = r.create_server_pipe("p", PipeParams::default()).unwrap();
-        // Client connects before the server calls FSCTL_PIPE_LISTEN.
+        // ReactOS NPFS `NtCreateNamedPipeFile` initializes new CCBs in
+        // FILE_PIPE_LISTENING_STATE, and `NpCreateClientEnd` only connects to
+        // listening instances.
+        assert_eq!(r.state(s).unwrap(), PipeState::Listening);
         let c = r.connect_client("p").unwrap();
         assert_eq!(r.state(s).unwrap(), PipeState::Connected);
-        // A subsequent listen reports already-connected.
         assert_eq!(r.listen(s).unwrap(), STATUS_PIPE_CONNECTED);
         r.pipe_write(s, b"hi").unwrap();
         assert_eq!(r.pipe_read(c, 8).unwrap().0, b"hi");
