@@ -58,8 +58,8 @@ pub const STATUS_INVALID_PIPE_STATE: NtStatus = NtStatus(0xC000_00ADu32 as i32);
 pub const STATUS_PIPE_DISCONNECTED: NtStatus = NtStatus(0xC000_00B0u32 as i32);
 /// `STATUS_PIPE_LISTENING` (0xC00000B3): FSCTL_PIPE_LISTEN, no client yet.
 pub const STATUS_PIPE_LISTENING: NtStatus = NtStatus(0xC000_00B3u32 as i32);
-/// `STATUS_PIPE_CONNECTED` (0xC00000B4): already connected.
-pub const STATUS_PIPE_CONNECTED: NtStatus = NtStatus(0xC000_00B4u32 as i32);
+/// `STATUS_PIPE_CONNECTED` (0xC00000B2): already connected.
+pub const STATUS_PIPE_CONNECTED: NtStatus = NtStatus(0xC000_00B2u32 as i32);
 /// `STATUS_INSTANCE_NOT_AVAILABLE` (0xC00000AB): the max-instances limit hit.
 pub const STATUS_INSTANCE_NOT_AVAILABLE: NtStatus = NtStatus(0xC000_00ABu32 as i32);
 /// `STATUS_PENDING` (0x00000103): an async pipe read/write/transceive IRP is queued.
@@ -71,8 +71,7 @@ const FILE_PIPE_WAIT_NAME_OFFSET: usize = 14;
 /// `NP_CCB.NamedPipeState`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum PipeState {
-    /// A server instance exists but is not yet listening (freshly created, or the
-    /// peer disconnected).
+    /// A server instance exists but is not listening, usually after a peer disconnect.
     #[default]
     Disconnected,
     /// The server end is waiting (FSCTL_PIPE_LISTEN) for a client to connect.
@@ -414,8 +413,7 @@ impl PipeRegistry {
     /// Mirrors `NpCreateClientEnd`: find the FCB by name, find a
     /// `FILE_PIPE_LISTENING_STATE` server instance, attach the client end. A
     /// disconnected-but-not-listening server instance is not available to clients;
-    /// callers such as `WaitNamedPipe` retry or wait until `FSCTL_PIPE_LISTEN` is
-    /// posted.
+    /// callers such as `WaitNamedPipe` retry or wait until a listening instance exists.
     pub fn connect_client(&mut self, name: &str) -> Result<PipeHandle, NtStatus> {
         let fcb_idx = self.find_fcb(name).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
         let fcb = &mut self.pipes[fcb_idx];

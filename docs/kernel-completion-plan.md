@@ -2854,3 +2854,25 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
   serialized `./run.sh --desktop` should classify the desktop blocker as wrong NPFS instance routing,
   lost ReactOS server association lifetime, or an unobserved context creation path before any real
   behavioral fix is made.
+
+- I4 desktop retry current edge. Serialized run `.tmp/boot-desktop-current-20260811-032444.log`
+  restores the real base desktop paint (`desktop-bg 768/768`) but still does not reach explorer
+  shell chrome (`explorer total=0`). The active blocker is later EventLog DCE/RPC context-handle
+  association: a context created on one EventLog server connection is reused on a different server
+  association and faults with `NCA_S_FAULT_CONTEXT_MISMATCH` / `0x1c00001a`. The current code slice
+  fixes generic I/O-manager completion fidelity rather than patching RPC bytes: the pure named-pipe
+  model now uses the real `STATUS_PIPE_CONNECTED` value (`0xC00000B2`), and `NtFsControlFile`
+  terminal NPFS endpoint FSCTLs now run the same file-I/O completion surfaces as read/write
+  operations (IOSB, caller event, FILE_OBJECT signalling, and IOCP packet policy) while preserving
+  the existing pending listen/transceive park paths. Validation so far: `cargo fmt --all`,
+  `cargo test -p nt-io-manager pipe -- --nocapture`, `cargo test -p nt-io-completion -- --nocapture`,
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Desktop validation `.tmp/boot-fsctl-terminal-completion-20260811-033754.log`
+  keeps the base desktop paint green and moves past the prior EventLog `0x1c00001a` context-fault
+  signature; the run reaches the microtest sentinel at `250/295` checks after launching later dynamic
+  services (`svchost`, `rpcss`, `wlansvc`, `spoolsv`). Review adjustment: the next frontier is not
+  paint or EventLog UUID routing; it is the real logon-token/profile path before userinit
+  (`exec_se_create_token_serviced`, `exec_winlogon_logon_token_received`, and
+  `exec_winlogon_logon_action_returned` remain red), with later `RpcServerListen(Status 6b1)` still
+  present. Continue by implementing the missing generic security/token/logon authority and service RPC
+  listener semantics, without service-name, executable-order, RPC UUID, or paint fallbacks.

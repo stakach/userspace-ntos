@@ -7347,6 +7347,32 @@ impl ExecNtHandler {
         }
     }
 
+    pub(crate) fn complete_terminal_file_io(
+        &mut self,
+        file_id: u64,
+        event_obj_idx: u64,
+        apc_context: u64,
+        status: u32,
+        information: u64,
+        completed_inline: bool,
+        completion_port_suppressed: bool,
+    ) {
+        if file_id != 0 {
+            self.post_file_completion(
+                file_id,
+                apc_context,
+                status,
+                information,
+                completed_inline,
+                completion_port_suppressed,
+            );
+        }
+        if event_obj_idx != u64::MAX {
+            let _ = self.signal_event_index(event_obj_idx as usize);
+            self.io_signal_event = event_obj_idx as i64;
+        }
+    }
+
     pub(crate) fn release_file_reference(&mut self, file_id: u64) {
         if let Ok(release) = self.file_completion.release_file(file_id) {
             self.complete_file_reference_release(file_id, release);
@@ -16852,6 +16878,7 @@ impl ExecNtHandler {
                 let mut pipe_wait_trace_hash = 0u64;
                 let mut pipe_wait_trace_armed = false;
                 let mut pipe_wait_trace_known = false;
+                let mut routed_endpoint_fsctl = false;
                 if is_pipe_wait && self.is_npfs_root_handle(args[0]) {
                     const PIPE_WAIT_INPUT_CAP: usize = 0x1_000c;
                     if !driver_launch::npfs_ready() {
@@ -17000,6 +17027,7 @@ impl ExecNtHandler {
                                     &mut output,
                                 ) {
                                     Ok((st, completed, _)) => {
+                                        routed_endpoint_fsctl = true;
                                         status = st as u64;
                                         information = completed;
                                         if completed != 0 && args[8] != 0 {
@@ -17136,6 +17164,22 @@ impl ExecNtHandler {
                 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                }
+                if routed_endpoint_fsctl
+                    && (status as u32) != STATUS_PENDING
+                    && self.pipe_park_fid == 0
+                    && self.pipe_listen_fid == 0
+                    && !transceive_pending_async
+                {
+                    self.complete_terminal_file_io(
+                        fid,
+                        event_obj_idx,
+                        args[3],
+                        status as u32,
+                        information,
+                        true,
+                        completion_port_suppressed,
+                    );
                 }
                 // A TRANSCEIVE writes the request before reading the reply. Even when the read half
                 // pends, that request may satisfy the peer's parked read, so re-drive readers for both
