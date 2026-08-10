@@ -31,7 +31,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Completed boot-fix slice: `.tmp/boot-clean-async-setevent-20260810-123921.log` rebuilt ntdll,
+Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
 the sentinel and the harness reporting `SUCCESS -- the ReactOS stack booted and the win32k desktop
 painted (0x003a6ea5)`. The services.exe main-image-header/list-walk fault
