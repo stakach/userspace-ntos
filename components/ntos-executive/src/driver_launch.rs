@@ -1751,6 +1751,14 @@ fn print_hex64(value: u64) {
     }
 }
 
+fn print_tcb_debug_opt(value: u64) {
+    if value == crate::win32k_glue::TCB_DEBUG_NONE {
+        print_str(b"none");
+    } else {
+        print_u64(value);
+    }
+}
+
 unsafe fn trace_pipe_rw_result(
     major: u64,
     file_id: u64,
@@ -11873,6 +11881,44 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_hex64(regs[nt_user_callback::USER_CONTEXT_RCX]);
             print_str(b" rdx=");
             print_hex64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+            print_str(b"\n");
+
+            let mut state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
+            unsafe {
+                crate::win32k_glue::tcb_read_debug_state(inst.tcb, inst.reply_cap, &mut state);
+            }
+            print_str(b"[deadman] active-driver-tcb state=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_STATE]);
+            print_str(b" sched=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_SCHEDULABLE]);
+            print_str(b" enq=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_ENQUEUED]);
+            print_str(b" prio=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_PRIORITY]);
+            print_str(b" sc=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_SC]);
+            print_str(b" active_sc=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_ACTIVE_SC]);
+            print_str(b" pend_reply=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_PENDING_REPLY]);
+            print_str(b" reply_to=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_REPLY_TO]);
+            print_str(b" ntfn=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_BOUND_NOTIFICATION]);
+            print_str(b" call=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_BLOCKED_IS_CALL]);
+            print_str(b" grant=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_BLOCKED_CAN_GRANT]);
+            print_str(b" donated=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_DONATED_SC]);
+            print_str(b" fault=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_PENDING_FAULT]);
+            print_str(b" hosted=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_HOSTED_SYSCALLS]);
+            print_str(b" reply_bound=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_REPLY_BOUND_TCB]);
+            print_str(b" current=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CURRENT_TCB]);
             print_str(b"\n");
         }
         unsafe {

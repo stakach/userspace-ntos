@@ -2025,6 +2025,7 @@ const ISR_DONE_BADGE: u64 = 0x80;
 
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
+pub const SYS_NB_SEND_RECV: i64 = -3;
 pub const SYS_NB_RECV: i64 = -8;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
@@ -2061,6 +2062,13 @@ const _: () = assert!(HOSTED_PCI_COMMON_BUFFER_LEN <= 0x20_0000);
 pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
+const Q35_PCI_INTX_IOAPIC_ROUTE_MASK: u32 = 0x00FF_0000;
+/// The PIT is routed through GSI 2 on PC/q35 systems. HPET Timer 0 advertises it as legal, but
+/// sharing the executive delay timer with the kernel tick gives the delay path false expiries.
+const LEGACY_PIT_IOAPIC_ROUTE_MASK: u32 = 1u32 << 2;
+const HPET_SHARED_IOAPIC_ROUTE_MASK: u32 =
+    Q35_PCI_INTX_IOAPIC_ROUTE_MASK | LEGACY_PIT_IOAPIC_ROUTE_MASK;
+const IOAPIC_ROUTE_PIN_NONE: u64 = u64::MAX;
 
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
@@ -2768,6 +2776,8 @@ const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
+static HPET_PROBE_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
+static DELAY_TIMER_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
 static KUSER_CLOCK_INIT_OK: AtomicBool = AtomicBool::new(false);
 static KUSER_CLOCK_INITIAL_TICK: AtomicU64 = AtomicU64::new(0);
 static KUSER_CLOCK_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -6040,6 +6050,7 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     let spurious = TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed);
     let past = TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed);
     let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    let delay_pin = DELAY_TIMER_IOAPIC_PIN.load(Ordering::Relaxed);
     let config = if handler != 0 {
         unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) }
     } else {
@@ -6055,6 +6066,12 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     print_u64(past);
     print_str(b" T0_CONFIG=0x");
     print_hex_u64(config);
+    print_str(b" pin=");
+    if delay_pin == IOAPIC_ROUTE_PIN_NONE {
+        print_str(b"none");
+    } else {
+        print_u64(delay_pin);
+    }
     print_str(b" (bit1=level bit2=enable)\n");
     // A boot that never armed the timer must show no deliveries at all (nothing is fabricated);
     // a boot that did must show BOUNDED deliveries that overwhelmingly did real work, on a timer
@@ -6062,7 +6079,13 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     let shape = if handler == 0 {
         seen == 0 && spurious == 0
     } else {
-        (config & HPET_TN_INT_TYPE_LEVEL) != 0 && seen >= 1 && seen <= 4096 && spurious <= 64
+        let isolated_route = delay_pin != IOAPIC_ROUTE_PIN_NONE
+            && (ioapic_route_pin_mask(delay_pin) & HPET_SHARED_IOAPIC_ROUTE_MASK) == 0;
+        (config & HPET_TN_INT_TYPE_LEVEL) != 0
+            && isolated_route
+            && seen >= 1
+            && seen <= 4096
+            && spurious <= 64
     };
     check(b"exec_delay_timer_disarms", shape, passed);
 }
@@ -11904,6 +11927,26 @@ unsafe fn retract_bound_notification_tick() {
     let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
 }
 
+fn ioapic_route_pin_mask(pin: u64) -> u32 {
+    if pin < 32 {
+        1u32 << (pin as u32)
+    } else {
+        0
+    }
+}
+
+fn highest_ioapic_route_pin(mask: u32) -> Option<u64> {
+    if mask == 0 {
+        None
+    } else {
+        Some((31 - mask.leading_zeros()) as u64)
+    }
+}
+
+fn select_delay_hpet_route_pin(route_cap: u32, used_mask: u32) -> Option<u64> {
+    highest_ioapic_route_pin(route_cap & !used_mask & !HPET_SHARED_IOAPIC_ROUTE_MASK)
+}
+
 unsafe fn delay_timer_init() -> bool {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 {
         return true;
@@ -11918,13 +11961,17 @@ unsafe fn delay_timer_init() -> bool {
     if route_cap == 0 {
         return false;
     }
-    let already_used = 31 - route_cap.leading_zeros();
-    let remaining = route_cap & !(1u32 << already_used);
-    if remaining == 0 {
-        print_str(b"[delay] HPET timer0 has no spare IOAPIC route\n");
+    let used_mask = ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Relaxed));
+    let Some(pin) = select_delay_hpet_route_pin(route_cap, used_mask) else {
+        print_str(b"[delay] HPET timer0 has no non-shared IOAPIC route route_cap=0x");
+        print_hex(route_cap);
+        print_str(b" used=0x");
+        print_hex(used_mask);
+        print_str(b" shared=0x");
+        print_hex(HPET_SHARED_IOAPIC_ROUTE_MASK);
+        print_str(b"\n");
         return false;
-    }
-    let pin = (31 - remaining.leading_zeros()) as u64;
+    };
     let notification = make_object(OBJ_NOTIFICATION);
     let badged = alloc_slot();
     let _ = syscall5(
@@ -11957,6 +12004,7 @@ unsafe fn delay_timer_init() -> bool {
     let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
+    DELAY_TIMER_IOAPIC_PIN.store(pin, Ordering::Relaxed);
     print_str(b"[delay] timer ready pin=");
     print_u64(pin);
     print_str(b" irq=");
@@ -20620,6 +20668,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         if route_cap != 0 {
             let pin = (31 - route_cap.leading_zeros()) as u64; // highest allowed pin
+            HPET_PROBE_IOAPIC_PIN.store(pin, Ordering::Relaxed);
             print_str(b"[ntos-exec] HPET timer0 IOAPIC pin = ");
             print_u64(pin);
             print_str(b", vector = ");
@@ -20690,6 +20739,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 got == ISR_DONE_BADGE,
                 &mut passed,
             );
+
+            // Timer 0 is re-used later by the executive delay/deadman clock. The proof interrupt
+            // routes it through a throwaway isolated ISR host that cannot acknowledge the IRQ-handler
+            // cap (least privilege), so the executive must retire the hardware state it created here:
+            // stop timer 0, clear the HPET level status, then Ack the proof handler to unmask the
+            // IOAPIC line. Leaving this asserted made the later delay timer inherit stray deliveries
+            // even when its comparator was still in the future.
+            let mut proof_cfg =
+                core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+            proof_cfg &= !HPET_TN_INT_ENB;
+            core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, proof_cfg);
+            core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+            let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+            core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
         }
     }
 

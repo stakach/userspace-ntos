@@ -5356,6 +5356,50 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
     }
 }
 
+pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 16;
+pub(crate) const TCB_DEBUG_NONE: u64 = u64::MAX;
+pub(crate) const TCB_DBG_STATE: usize = 0;
+pub(crate) const TCB_DBG_SCHEDULABLE: usize = 1;
+pub(crate) const TCB_DBG_ENQUEUED: usize = 2;
+pub(crate) const TCB_DBG_PRIORITY: usize = 3;
+pub(crate) const TCB_DBG_SC: usize = 4;
+pub(crate) const TCB_DBG_ACTIVE_SC: usize = 5;
+pub(crate) const TCB_DBG_PENDING_REPLY: usize = 6;
+pub(crate) const TCB_DBG_REPLY_TO: usize = 7;
+pub(crate) const TCB_DBG_BOUND_NOTIFICATION: usize = 8;
+pub(crate) const TCB_DBG_BLOCKED_IS_CALL: usize = 9;
+pub(crate) const TCB_DBG_BLOCKED_CAN_GRANT: usize = 10;
+pub(crate) const TCB_DBG_DONATED_SC: usize = 11;
+pub(crate) const TCB_DBG_PENDING_FAULT: usize = 12;
+pub(crate) const TCB_DBG_HOSTED_SYSCALLS: usize = 13;
+pub(crate) const TCB_DBG_REPLY_BOUND_TCB: usize = 14;
+pub(crate) const TCB_DBG_CURRENT_TCB: usize = 15;
+
+/// rust-micro extension: `TCB::ReadDebugState(reply_cap)` returns compact scheduler/IPC state for
+/// a target TCB and, when `reply_cap != 0`, the TCB currently bound to that reply object.
+pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u64; 16]) {
+    let (r0, r1, r2, r3): (u64, u64, u64, u64);
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") LBL_TCB_READ_DEBUG_STATE << 12 => _,
+        inout("r10") reply_cap => r0,
+        lateout("r8") r1,
+        lateout("r9") r2,
+        lateout("r15") r3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    out[0] = r0;
+    out[1] = r1;
+    out[2] = r2;
+    out[3] = r3;
+    for (i, slot) in out.iter_mut().enumerate().take(TCB_DEBUG_STATE_WORDS).skip(4) {
+        *slot = crate::get_recv_mr(i);
+    }
+}
+
 /// Print the win32k call chain (return-address RVAs, deepest first) at a `win32k_dispatch` wall.
 /// Mirrors win32k's ACTIVE stack (fault-time RSP .. stack_top) into the executive's own VSpace and
 /// scans it for return addresses in win32k's image — same technique as the DriverEntry-path backtrace.

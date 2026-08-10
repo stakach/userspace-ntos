@@ -3125,9 +3125,77 @@ executable-order fallbacks.
   221/295 gates). The local `./run.sh --desktop` failure also exposed stale runner hygiene:
   `make_image.sh` now removes the old disk image before formatting, and the wrapper fails fast when
   an existing `qemu-system-x86_64`/`run_specs.sh` lane is still alive, even if it holds a deleted old
-  image inode. Review adjustment: the active frontier is now later win32k pump classification after
-  base paint, not NPFS transport. A timer-interrupted winlogon `NtUser...0x1286` dispatch drains the
-  timer, the fairness `NBRecv` observes label `31` with empty payload, and the win32k pump retires
-  the component. The next slice should classify that label source in the generic component pump or
-  kernel receive path; do not add a winlogon, message, paint, service-name, UUID, or executable-order
-  fallback.
+  image inode. Serialized desktop retries `.tmp/boot-desktop-pump-nbrecv6-20260811.typescript` and
+  `.tmp/boot-desktop-pump-nbrecv7-20260811.typescript` keep the rust-micro reply-cap specs green,
+  pass both pump gates, and reach natural desktop pixels (`desktop-bg 768/768`,
+  `px0=0x003a6ea5`). Review adjustment: the active frontier is now later timer-pressure/component
+  receive ordering after base paint, not NPFS policy. Label `31` is the executive's `LBL_IRQ_ACK`,
+  not a win32k/FSD protocol message, so the post-timer `NBRecv` fast path is restricted to labels
+  already serviced by the component pump (`dispatch`, win32k user callback, win32k GDI load, VM
+  fault, and gated user-exception labels). Unexpected labels fall through to the ordinary blocking
+  receive path and must not become synthetic dispatch success.
+
+  The executive-side yield experiment did not move the frontier: retry
+  `.tmp/boot-pump-yield-after-timer-20260811.log` reached the same real desktop pixels and then
+  stopped with hosted FSD dispatch `#159 major=4` still never reaching its `before-call` trace while
+  nested HPET drains continued. That patch was removed. The generic fix is now in the microkernel
+  receive path: `rust-micro::handle_recv` gives an already queued endpoint sender priority over an
+  active bound notification, preventing a level-triggered timer notification from repeatedly
+  satisfying the executive's endpoint `Recv` before a ready component `Call` is accepted. Regression
+  coverage is `recv_prefers_queued_endpoint_over_bound_notification`, alongside the existing reply-cap
+  offer specs. The executive delay timer also now refuses q35 PCI INTx and legacy PIT/shared HPET
+  routes, records the probe/delay IOAPIC pins, and requires an isolated route in
+  `exec_delay_timer_disarms`; sharing the delay line with the kernel tick was producing false
+  expiries under desktop timer pressure. Validation so far: `cargo fmt --all`, `cargo fmt --all`
+  inside `rust-micro`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `./rust-micro/scripts/build_kernel.sh extern-rootserver`. Host
+  `cargo test --manifest-path rust-micro/Cargo.toml` is not applicable on macOS for this no-std
+  kernel target (`x86_64` cfg and duplicate panic handler fail before the specs can run). The next
+  serialized desktop retry should prove the hosted FSD reaches `run_irp`/`before-call` after timer
+  pressure or move the frontier past EventLog/SCM traffic; do not add a winlogon, message, paint,
+  service-name, UUID, executable-order, or IRQ fallback.
+
+  Review update: serialized desktop retry
+  `.tmp/boot-tcb-debug-desktop-20260810.typescript` kept the rust-micro specs green and restored
+  real base desktop paint (`desktop-bg 768/768`), but the late `#159` write still stalled. The TCB
+  debug state changed the diagnosis: the hosted FSD is **not** blocked on its reply object at the
+  stall. It is runnable/enqueued at `driver_launch::call_on+0x20`, immediately after the executive
+  answered the component's parked `Call` with the request. The root executive TCB is still current,
+  absorbing HPET/deadman notifications before it ever blocks in the receive half, so the priority-100
+  FSD never gets CPU to consume the request and reach `run_irp`/`before-call`. The timer log also
+  shows spurious HPET deliveries while the counter is still below the comparator, and the early HPET
+  proof previously left timer 0's proof IRQ handler unacknowledged after the isolated ISR reported
+  success. Current cleanup retires that proof state explicitly (disable timer 0, clear HPET status,
+  Ack the proof handler) before the production delay timer reuses timer 0, and fixes the x86_64
+  syscall return classifier so `SysNBSendRecv`/`SysNBSendWait` are treated as receive paths. Next
+  validation must show spurious delay ticks collapse and `#159` moves past the request handoff.
+
+  Review update: serialized retry `.tmp/boot-tcb-debug-fsd159-20260811.log` sharpened the same
+  diagnosis. The active hosted-FSD TCB was runnable, schedulable, enqueued, priority 100, not faulted,
+  not hosted-syscall trapped, and not bound to any reply object, yet the executive remained current
+  after delivering the request. The remaining race was between a standalone reply followed by a
+  separate endpoint receive: if the executive's bound HPET notification satisfied the receive before
+  equal-priority scheduling selected the just-woken component, the component could sit runnable at
+  `driver_launch::call_on` while the executive consumed timer returns. The current implementation
+  removes that window for component dispatch by moving request/fault replies to `SysNBSendRecv`, a
+  composite reply+receive syscall. `rust-micro` now also records the reply cap's bound TCB before the
+  send half; when the receive half is satisfied by a bound notification and the reply target is
+  equal-or-higher priority, runnable, schedulable, enqueued, and on the same CPU/domain, the syscall
+  tail clears the current TCB so the scheduler picks the woken component before the executive loops.
+  Spec coverage: `NBSendRecv reply wake yields after bound-notification receive`. Validation so far:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `./rust-micro/scripts/build_kernel.sh extern-rootserver`. Next serialized
+  desktop retry must rebuild the parent rootserver with the composite pump and prove either
+  `[fsd-active-write] before-call seq=159` or the next real shell/profile frontier.
+
+  Desktop-runner validation `.tmp/boot-hpet-proof-cleanup-desktop-20260810.typescript` now rebuilds
+  ntdll, the parent rootserver, rust-micro, and the disk image through the same top-level
+  `./run.sh --desktop` path that was failing locally, then reaches genuine winlogon
+  `NtUserSwitchDesktop` framebuffer paint: `changed 768/768`, `desktop-bg 768/768`, and
+  `px0=0x003a6ea5`. The old `active-driver-dispatch #159` deadman and repeated spurious HPET drain
+  storm do not recur in this base-desktop transcript; only a single deferred component-pump HPET tick
+  appears before the production delay timer is armed. This closes the local desktop-paint regression.
+  Because `--desktop` intentionally stops at the visible base desktop window, the next frontier proof
+  should be a longer headless/post-desktop run that continues past the base-paint sentinel into the
+  real profile, userinit, EventLog/SCM, or explorer-shell edge, without reintroducing runner, IRQ,
+  pipe, service-name, executable-order, or paint fallbacks.

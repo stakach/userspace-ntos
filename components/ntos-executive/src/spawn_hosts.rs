@@ -581,7 +581,8 @@ pub(crate) unsafe fn spawn_storage_host(
 /// `Call` transport the question becomes a statement about the reply object:
 ///
 /// * [`InitialAction::ReplyRequest`] — the component is blocked in a `Call` bound to this channel's
-///   reply object, so the pump ANSWERS that Call with the request (`reply_on`, which cannot block).
+///   reply object, so the pump answers that Call and receives the next component message in one
+///   composite kernel entry.
 /// * [`InitialAction::RecvFirst`] — the component is not yet blocked in a dispatch `Call` (it is
 ///   mid-DriverEntry: either blocked in a fault Call or about to issue its ready Call), so the pump
 ///   starts by RECEIVING.
@@ -713,14 +714,14 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 // ★ THE `Call` ⇄ MCS REPLY-OBJECT TRANSPORT (the IRP substrate; `docs/transport-migration.md`).
 //
 // The component is always the CALLER, the executive always the SERVER. The component's ONE
-// `call_on` publishes its completion AND returns the next request; the executive answers with
-// `reply_on` — a `Send` on a `Cap::Reply`, which NEVER blocks.
+// `call_on` publishes its completion AND returns the next request; the executive answers with the
+// reply half of `SysNBSendRecv`, then receives the component's next Call in the same kernel entry.
 //
 // This is not a correlation *mechanism* we maintain; it is a correlation *fact the kernel keeps*:
 //
 //   * a recv registering reply object `R` (`recv_full_r12`) makes the kernel bind `R` to whichever
 //     thread's Call pairs with it — `endpoint.rs::finish_call` → `replies[i].bound_tcb = sender`;
-//   * `reply_on(R, …)` (`invocation.rs::decode_reply`) resumes exactly `bound_tcb` and CLEARS the
+//   * sending on `R` (`invocation.rs::decode_reply`) resumes exactly `bound_tcb` and CLEARS the
 //     binding, or fails with `seL4_InvalidCapability` if there is none;
 //   * a thread blocked in `Call` is `BlockedOnReply` and cannot race ahead to publish a second
 //     completion.
@@ -728,13 +729,12 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 // Therefore a stale or misdirected completion is UNREPRESENTABLE: the component cannot speak again
 // until we reply, and our reply cannot reach anyone but the thread the kernel bound. The
 // `SH_REQ_SEQ` sequence handshake and the per-dispatch token stack that used to reconstruct this
-// property in userspace are deleted — `PUMP_REPLY_ERRORS == 0` over a whole boot is the kernel
-// attesting the invariant held on every single request.
+// property in userspace are deleted.
 // =============================================================================================
 
-/// Requests answered on a component's reply object (`reply_on(R, tag)`), BY KIND. Every one of them
-/// returned label 0, i.e. the kernel confirmed `R` was BOUND — which is only true if the component
-/// had issued exactly one `Call` since our last reply.
+/// Requests answered on a component's reply object, BY KIND. Every one of them uses the composite
+/// reply+receive syscall, so the executive cannot keep running between reply delivery and the next
+/// receive boundary.
 static PUMP_CALL_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Dispatches whose completion arrived as the return value of the COMPONENT'S OWN `Call` on the
 /// bound reply object, BY KIND. Must equal [`HARNESS_IRP_DISPATCHES`] /
@@ -749,11 +749,10 @@ pub(crate) fn pump_call_requests(kind: ReqKind) -> u64 {
 pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
     PUMP_CALL_DISPATCHES[kind as usize].load(Ordering::Relaxed)
 }
-/// ★ Non-zero `reply_on` invocation labels. MUST be **0** for the whole boot: a non-zero label means
-/// we replied to an UNBOUND reply object, i.e. our belief "the component is blocked in a Call" was
-/// wrong — an invariant break. Risk R3: reply-object rebinding is silent in the kernel, so this
-/// error-returning reply is the only diagnostic there is. Asserted 0 by
-/// `exec_irp_transport_call_bound`.
+/// Legacy counter retained for transport gates that assert no component reply-object error was
+/// observed. The component pump now uses composite reply+receive rather than the older standalone
+/// `reply_on` helper, so this remains zero unless a future explicit error-returning component reply
+/// path is added.
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
@@ -838,17 +837,6 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
 
-/// Answer the component's outstanding `Call` on this channel's reply object, recording the
-/// invocation label. Non-blocking by construction (`decode_reply` wakes the bound caller or fails).
-#[inline(never)]
-unsafe fn pump_reply_on(ch: &PumpChannel, msginfo: u64, r0: u64) -> u64 {
-    let e = crate::reply_on(ch.reply_cap, msginfo, r0, 0, 0, 0);
-    if e != 0 {
-        pump_note_reply_error(ch, e);
-    }
-    e
-}
-
 /// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
 /// once without blocking. This prevents a ready component Call from sitting behind a stream of timer
 /// badges on the root TCB's bound notification while preserving normal blocking behavior when the
@@ -917,19 +905,6 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
     })
 }
 
-#[inline(never)]
-unsafe fn pump_note_reply_error(ch: &PumpChannel, e: u64) {
-    if PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
-        crate::print_str(b"[pump] reply_on error label=");
-        crate::print_u64(e);
-        crate::print_str(b" cap=0x");
-        crate::print_hex(ch.reply_cap as u32);
-        crate::print_str(
-            b" -> the reply object was NOT bound (component was not blocked in a Call)\n",
-        );
-    }
-}
-
 #[derive(Clone, Copy)]
 struct PumpMessage {
     mi: u64,
@@ -947,81 +922,9 @@ impl PumpMessage {
     }
 }
 
-macro_rules! pump_recv_into {
-    ($ch:expr, $msg:ident) => {{
-        loop {
-            let badge: u64;
-            let mi: u64;
-            let m0: u64;
-            let m1: u64;
-            let m2: u64;
-            let m3: u64;
-            core::arch::asm!(
-                "syscall",
-                in("rdx") crate::SYS_RECV as u64,
-                inout("rdi") $ch.fault_ep => badge,
-                lateout("rsi") mi,
-                lateout("r10") m0,
-                lateout("r8") m1,
-                lateout("r9") m2,
-                lateout("r15") m3,
-                in("r12") $ch.reply_cap,
-                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-                options(nostack),
-            );
-            if crate::EXEC_DEADMAN_WATCHDOG {
-                if badge == crate::DELAY_TIMER_BADGE {
-                    crate::watchdog_on_tick();
-                } else {
-                    crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            if badge == crate::DELAY_TIMER_BADGE {
-                crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-                if !crate::drain_nested_pump_timer_delivery() {
-                    crate::delay_timer_nested_ack();
-                }
-                if let Some(polled) = pump_try_recv_after_timer($ch) {
-                    $msg = polled;
-                    break;
-                }
-                let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
-                    crate::print_str(
-                        b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
-                    );
-                }
-                continue;
-            }
-            let m4 = if (mi & 0x7F) > 4 { crate::get_recv_mr(4) } else { 0 };
-            $msg = PumpMessage { mi, m0, m1, m2, m3, m4 };
-            break;
-        }
-    }};
-}
-
 macro_rules! pump_reply_recv_into {
     ($ch:expr, $msg:ident, $len:expr, $r0:expr) => {{
-        let reply_len = $len as u64;
-        let reply_r0 = $r0 as u64;
-        let reply_label: u64;
-        core::arch::asm!(
-            "syscall",
-            inout("rdx") crate::SYS_CALL as u64 => _,
-            inout("rdi") $ch.reply_cap => _,
-            inout("rsi") reply_len => reply_label,
-            inout("r10") reply_r0 => _,
-            inout("r8") 0u64 => _,
-            inout("r9") 0u64 => _,
-            inout("r15") 0u64 => _,
-            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
-        let reply_error = reply_label >> 12;
-        if reply_error != 0 {
-            pump_note_reply_error($ch, reply_error);
-        }
-        pump_recv_into!($ch, $msg);
+        $msg = pump_reply_recv($ch, $len as u64, $r0 as u64);
     }};
 }
 
@@ -1076,7 +979,7 @@ impl PumpLoopOutcome {
 /// component `Call`: a timer tick. The kernel's bound-notification pre-check
 /// (`syscall_handler.rs::handle_recv`) returns `rdi = DELAY_TIMER_BADGE`, `rsi = 0` and **leaves the
 /// message registers untouched** without staging `ch.reply_cap` for IPC, so a tick absorbed here
-/// reads as `label = 0` with MR0 still holding whatever `pump_reply_on` left there — the request tag.
+/// reads as `label = 0` with MR0 still holding the reply-half request tag.
 /// That is a WALL, and it is exactly what killed the LSA route's npfs READ
 /// (`[pump] WALL label=0 ip=0x771`): the route is the first thing in the boot that arms an HPET
 /// one-shot (`NtDelayExecution` from the RPC worker) WHILE a component dispatch is in flight. The
@@ -1153,6 +1056,69 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
     }
 }
 
+/// Reply to the component's outstanding `Call` and receive the next component message in one kernel
+/// entry. The send half targets the reply cap in r13; the receive half offers the same reply cap in
+/// r12 so the next component `Call` binds to the same kernel reply object.
+#[inline(never)]
+unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -> PumpMessage {
+    let badge: u64;
+    let mi: u64;
+    let m0: u64;
+    let m1: u64;
+    let m2: u64;
+    let m3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_NB_SEND_RECV as u64,
+        inout("rdi") ch.fault_ep => badge,
+        inout("rsi") reply_msginfo => mi,
+        inout("r10") reply_r0 => m0,
+        inout("r8") 0u64 => m1,
+        inout("r9") 0u64 => m2,
+        inout("r15") 0u64 => m3,
+        in("r12") ch.reply_cap,
+        in("r13") ch.reply_cap,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    if crate::EXEC_DEADMAN_WATCHDOG {
+        if badge == crate::DELAY_TIMER_BADGE {
+            crate::watchdog_on_tick();
+        } else {
+            crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if badge == crate::DELAY_TIMER_BADGE {
+        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+        if !crate::drain_nested_pump_timer_delivery() {
+            crate::delay_timer_nested_ack();
+        }
+        if let Some(polled) = pump_try_recv_after_timer(ch) {
+            return polled;
+        }
+        let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            crate::print_str(
+                b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
+            );
+        }
+        return pump_recv(ch);
+    }
+    let m4 = if (mi & 0x7F) > 4 {
+        crate::get_recv_mr(4)
+    } else {
+        0
+    };
+    PumpMessage {
+        mi,
+        m0,
+        m1,
+        m2,
+        m3,
+        m4,
+    }
+}
+
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
 /// dispatch loop (sent `dispatch_label`); `false` = it hit a wall (fault we won't demand-map).
 #[derive(Clone, Copy)]
@@ -1209,15 +1175,16 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // object per component suffices at ANY nesting depth: the component host has ONE TCB, so it is
     // blocked in at most one Call, and the "stack" of suspended levels is its own C stack.
     //
-    // The request TAG rides in MR0, NOT in the message label — `reply_on` is a `SYS_CALL` on a
-    // non-endpoint cap, so a non-zero label is parsed as an `InvocationLabel` and rejected before it
-    // ever reaches `decode_reply` (see [`REQUEST_TAG_LEN`]). A fresh dispatch hands over
+    // The request TAG rides in MR0, NOT in the message label. A fresh dispatch hands over
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
     let request_tag = pump_request_tag(ch, resume_user_callback);
     let owns_depth = pump_enter_depth(ch, resume_user_callback);
-    pump_deliver_initial_request(ch, request_tag);
-    let first = pump_recv(ch);
+    let first = if let Some(msg) = pump_deliver_initial_request(ch, request_tag) {
+        msg
+    } else {
+        pump_recv(ch)
+    };
     let outcome = component_pump_loop(ch, first);
     pump_leave_depth(owns_depth, outcome.callback_suspended);
     pump_suspend_walled_component(ch, outcome);
@@ -1250,16 +1217,15 @@ fn pump_enter_depth(ch: &PumpChannel, resume_user_callback: bool) -> bool {
 }
 
 #[inline(never)]
-unsafe fn pump_deliver_initial_request(ch: &PumpChannel, request_tag: u64) {
-    // ★ ONE non-blocking reply hands over the request. There is no wake `Send` any more, so there is
-    // no window in which the executive can block against a component that is running rather than
-    // receiving (defect 3). `RecvFirst` means the component has not yet issued the Call we would be
-    // answering (mid-DriverEntry), so we just receive.
-    if ch.initial == InitialAction::ReplyRequest
-        && pump_reply_on(ch, REQUEST_TAG_LEN, request_tag) == 0
-    {
-        PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
+unsafe fn pump_deliver_initial_request(ch: &PumpChannel, request_tag: u64) -> Option<PumpMessage> {
+    // ★ ONE composite reply+receive hands over the request. `RecvFirst` means the component has not
+    // yet issued the Call we would be answering (mid-DriverEntry), so the caller performs a plain
+    // receive instead.
+    if ch.initial != InitialAction::ReplyRequest {
+        return None;
     }
+    PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
+    Some(pump_reply_recv(ch, REQUEST_TAG_LEN, request_tag))
 }
 
 #[inline(never)]
@@ -1323,10 +1289,10 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 break;
             }
             outcome.demand += 1;
-            // Resume the server + recv the next fault/DONE: `reply_on(R, len 0)` — a VMFault reply,
-            // which `apply_fault_reply` restarts unconditionally (`fault.rs`) — followed by a recv
-            // that re-registers `R`. A nested demand fault therefore rides the SAME reply object as
-            // the dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
+            // Resume the server + recv the next fault/DONE with one composite reply+receive. A
+            // VMFault reply is restarted unconditionally (`fault.rs`), and the receive half
+            // re-registers `R`. A nested demand fault therefore rides the SAME reply object as the
+            // dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
             // REPLY_MAIN binding is untouched) with no second transport to keep gated.
             pump_reply_recv_into!(ch, msg, 0, 0);
             continue;
