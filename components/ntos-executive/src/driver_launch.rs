@@ -993,10 +993,12 @@ struct PipeCcbView {
 
 #[derive(Clone, Copy)]
 struct DceRpcContextHandleView {
-    offset: u8,
+    offset: u16,
     attributes: u32,
     uuid: [u8; 16],
 }
+
+const DCERPC_CONTEXT_HANDLE_TRACE_CAP: usize = 4;
 
 #[derive(Clone, Copy)]
 struct DceRpcPduView {
@@ -1008,7 +1010,7 @@ struct DceRpcPduView {
     alloc_hint: Option<u32>,
     opnum: Option<u16>,
     fault_status: Option<u32>,
-    context_handle: Option<DceRpcContextHandleView>,
+    context_handles: [Option<DceRpcContextHandleView>; DCERPC_CONTEXT_HANDLE_TRACE_CAP],
 }
 
 impl PipeCcbView {
@@ -1084,13 +1086,7 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
     } else {
         None
     };
-    let context_handle = match ptype {
-        // Request/response/fault bodies begin after the 24-byte PDU-specific header. When the first
-        // NDR argument is a context handle, its wire shape is attributes(u32) + UUID. This is a
-        // transport trace only: invalid candidates are ignored and no service/interface names leak in.
-        0 | 2 | 3 => dcerpc_context_handle_at(payload, len, 24),
-        _ => None,
-    };
+    let context_handles = dcerpc_context_handles(payload, len, ptype, frag_len);
     Some(DceRpcPduView {
         ptype,
         flags,
@@ -1100,14 +1096,68 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
         alloc_hint,
         opnum,
         fault_status,
-        context_handle,
+        context_handles,
     })
+}
+
+unsafe fn dcerpc_context_handles(
+    payload: u64,
+    len: u64,
+    ptype: u8,
+    frag_len: u16,
+) -> [Option<DceRpcContextHandleView>; DCERPC_CONTEXT_HANDLE_TRACE_CAP] {
+    let mut handles = [None; DCERPC_CONTEXT_HANDLE_TRACE_CAP];
+    if !matches!(ptype, 0 | 2 | 3) {
+        return handles;
+    }
+    let wire_len = core::cmp::min(len, frag_len as u64);
+    if wire_len < 44 {
+        return handles;
+    }
+
+    // Request/response/fault bodies begin after the 24-byte PDU-specific header. Many stubs place a
+    // context handle there, but later arguments can carry the same NDR wire shape too.
+    if let Some(context) = dcerpc_context_handle_at(payload, wire_len, 24) {
+        dcerpc_push_context_handle(&mut handles, context);
+    }
+
+    let mut offset = 28u64;
+    while offset + 20 <= wire_len && offset <= u16::MAX as u64 {
+        if let Some(context) = dcerpc_context_handle_at(payload, wire_len, offset as u16) {
+            dcerpc_push_context_handle(&mut handles, context);
+        }
+        if handles
+            .last()
+            .copied()
+            .flatten()
+            .is_some()
+        {
+            break;
+        }
+        offset += 4;
+    }
+    handles
+}
+
+fn dcerpc_push_context_handle(
+    handles: &mut [Option<DceRpcContextHandleView>; DCERPC_CONTEXT_HANDLE_TRACE_CAP],
+    context: DceRpcContextHandleView,
+) {
+    if handles.iter().flatten().any(|existing| {
+        existing.offset == context.offset
+            || (existing.attributes == context.attributes && existing.uuid == context.uuid)
+    }) {
+        return;
+    }
+    if let Some(slot) = handles.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(context);
+    }
 }
 
 unsafe fn dcerpc_context_handle_at(
     payload: u64,
     len: u64,
-    offset: u8,
+    offset: u16,
 ) -> Option<DceRpcContextHandleView> {
     let offset_u64 = offset as u64;
     if len < offset_u64 + 20 {
@@ -1180,7 +1230,7 @@ fn print_dcerpc_pdu_view(view: Option<DceRpcPduView>) {
         print_str(b" fault=0x");
         print_hex(status);
     }
-    if let Some(context) = pdu.context_handle {
+    for context in pdu.context_handles.iter().flatten() {
         print_str(b" ctx@");
         print_u64(context.offset as u64);
         print_str(b" attr=");

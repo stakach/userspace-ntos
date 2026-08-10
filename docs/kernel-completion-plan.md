@@ -260,6 +260,14 @@ quiet period, periodic census still reports `explorer total=0`, and the next red
 service/RPC/NPFS association behavior with repeated `RpcServerListen() failed (Status 6b1)` before
 natural userinit/explorer launch.
 
+Current RPC association diagnostic slice: the existing PDU trace only reported a context handle when
+the first NDR argument started at request/response/fault body offset 24. Recent failures show ReactOS
+rpcrt4 rejecting context handles whose UUID is not visible in that narrow trace, so the executive
+now scans a bounded set of aligned NDR context-handle candidates across each generic DCE/RPC
+request/response/fault body and prints their offsets without changing transport behavior. The next
+serialized desktop run should use those lines to decide whether the missing desktop path is an NPFS
+instance routing issue, an association-group lifetime issue, or a thread teardown/reuse issue.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
