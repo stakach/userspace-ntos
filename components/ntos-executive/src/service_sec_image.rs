@@ -198,6 +198,9 @@ struct DeferredCallbackReturn {
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
     reply_cap: u64,
 }
 
@@ -210,6 +213,9 @@ impl DeferredCallbackReturn {
         result_pointer: 0,
         result_length: 0,
         callback_status: 0,
+        resume_ip: 0,
+        resume_sp: 0,
+        resume_flags: 0,
         reply_cap: 0,
     };
 
@@ -268,6 +274,9 @@ unsafe fn defer_user_callback_return(
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
 ) -> bool {
     let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
     let Some(slot) = (0..DEFERRED_CALLBACK_RETURN_N).find(|&index| !table[index].used) else {
@@ -286,6 +295,9 @@ unsafe fn defer_user_callback_return(
         result_pointer,
         result_length,
         callback_status,
+        resume_ip,
+        resume_sp,
+        resume_flags,
         reply_cap,
     };
     let count = USER_CALLBACK_DEFERRED_RETURNS_PARKED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -395,6 +407,9 @@ unsafe fn drain_deferred_user_callback_returns(
             deferred.result_pointer,
             deferred.result_length,
             deferred.callback_status,
+            deferred.resume_ip,
+            deferred.resume_sp,
+            deferred.resume_flags,
         );
         let mut effects_ok;
         if let Some(completion) = completion {
@@ -6500,6 +6515,9 @@ pub(crate) unsafe fn service_sec_image(
                             get_recv_mr(9),
                             m3,
                             get_recv_mr(7),
+                            resume_ip,
+                            sp,
+                            flags,
                         ) {
                             procs[pi].faults = faults;
                             procs[pi].first = first;
@@ -6537,6 +6555,9 @@ pub(crate) unsafe fn service_sec_image(
                             get_recv_mr(9),
                             m3,
                             get_recv_mr(7),
+                            resume_ip,
+                            sp,
+                            flags,
                         ) {
                             sync_completed_user_callback_win32k_context(
                                 &mut nt_handler,

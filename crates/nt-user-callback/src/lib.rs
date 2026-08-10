@@ -1778,6 +1778,7 @@ pub const USER_CONTEXT_R14: usize = 16;
 pub const USER_CONTEXT_R15: usize = 17;
 pub const USER_CONTEXT_FS_BASE: usize = 18;
 pub const USER_CONTEXT_GS_BASE: usize = 19;
+pub const X64_SYSCALL_INSTRUCTION_LEN: u64 = 2;
 
 /// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
 /// path. The dispatcher takes its arguments from the `UCALLOUT_FRAME` on RSP, so the kernel-facing
@@ -1837,6 +1838,28 @@ pub const fn syscall_resume_ip_from_context(saved: &[u64; 20]) -> u64 {
         saved[USER_CONTEXT_RIP]
     } else {
         rcx
+    }
+}
+
+/// Pick the post-`syscall` resume IP for a controlled user callback.
+///
+/// The fault IPC carries the authoritative x64 `syscall` return address in MR2. If that value is
+/// missing or stale, a suspended `TCB_ReadRegisters` context normally reports the trapping
+/// `syscall` instruction in `RIP`, so the real user-mode continuation is `RIP + 2`. The caller owns
+/// the address-space check because executability is process-specific.
+pub fn repaired_syscall_resume_ip(
+    message_resume_ip: u64,
+    saved: &[u64; 20],
+    mut executable: impl FnMut(u64) -> bool,
+) -> Option<u64> {
+    if message_resume_ip != 0 && executable(message_resume_ip) {
+        return Some(message_resume_ip);
+    }
+    let fallback = saved[USER_CONTEXT_RIP].checked_add(X64_SYSCALL_INSTRUCTION_LEN)?;
+    if executable(fallback) {
+        Some(fallback)
+    } else {
+        None
     }
 }
 
@@ -2677,6 +2700,36 @@ mod tests {
         assert_eq!(
             syscall_resume_ip_from_context(&current),
             current[USER_CONTEXT_RIP]
+        );
+    }
+
+    #[test]
+    fn repaired_syscall_resume_ip_prefers_executable_fault_message_ip() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        assert_eq!(
+            repaired_syscall_resume_ip(0x7fff_2000, &saved, |ip| ip == 0x7fff_2000),
+            Some(0x7fff_2000)
+        );
+    }
+
+    #[test]
+    fn repaired_syscall_resume_ip_uses_tcb_fault_ip_plus_syscall_length() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        assert_eq!(
+            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |ip| ip == 0x7fff_1002),
+            Some(0x7fff_1002)
+        );
+    }
+
+    #[test]
+    fn repaired_syscall_resume_ip_fails_closed_without_executable_continuation() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        assert_eq!(
+            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |_| false),
+            None
         );
     }
 

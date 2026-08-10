@@ -109,6 +109,32 @@ be sent before a pending receive. Validation: `cargo test -p nt-lpc-server -- --
 and `git diff --check`. Next desktop retry should require the LSASS SRM server thread to park
 instead of spinning on `0xc0000005`, then continue to the real LSA RPC/profile/userinit edge.
 
+Desktop retry `.tmp/boot-lpc-pending-receive-20260811-0628.log` proves that SRM pending receives
+now park correctly: the old `Port Listen failed 0xc000000d` and `Failed to get message:
+0xc0000005` LSASS loops are gone, the base desktop paint gate remains green, and the SRM side shows
+the real reverse-connect/accepted-port path. The active wall moved earlier than profile/userinit:
+winlogon correlates the IDD_LOGON dialog, but before its modal pump starts the client faults while
+executing the read-only image header at `PE_LOAD_BASE`. The callback table is already valid and many
+real api0 callbacks succeed before the fault, so the current slice fixes the generic controlled
+callback continuation frame: preserve the authoritative `NtCallbackReturn` syscall frame through
+immediate and deferred returns, validate callback resume IPs against the process mapping table, and
+repair stale suspended-TCB contexts with the x64 `RIP + 2` syscall return convention rather than
+relaxing SEC_IMAGE execute protection.
+
+Desktop retry `.tmp/boot-callback-resume-ip-20260811-0554.log` proves that continuation repair:
+two chained-callout resume frames were repaired from a missing/stale primary IP to the executable
+post-`syscall` address, the old winlogon image-header execute fault did not recur, and winlogon
+again switched to the desktop with natural framebuffer readback `desktop-bg 768/768`. The run was
+interrupted after a later quiet park, before the harness summary, so this is a frontier move rather
+than a complete desktop proof. The active wall has moved to real service RPC/NPFS behavior:
+services.exe and lsass.exe launch, LSASS serves `\lsarpc`, EventLog starts workers and exchanges
+`\\net\\NtControlPipe1` traffic, SCM accepts an additional `\\ntsvcs` connection and spawns a
+dynamic RPC worker, then the system parks around pending `\\ntsvcs` reads plus a failed
+`\\??\\pipe\\EventLog` open. The next slice should stay in generic NPFS/RPC/SCM-service mechanics:
+inspect how EventLog creates/publishes its named pipe, why SCM opens `\\??\\pipe\\EventLog` before a
+server instance is visible, and whether pending synchronous `FSCTL_PIPE_TRANSCEIVE`/read completions
+are being completed to both the event/IOCP and waiting thread.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and

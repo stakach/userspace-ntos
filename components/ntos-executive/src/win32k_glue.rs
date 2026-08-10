@@ -29,6 +29,8 @@ static USER_CALLBACK_EXPLORER_ATL_CREATE_DATA_TRACES: AtomicU64 = AtomicU64::new
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_RESUME_IP_REPAIRS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_RESUME_IP_REJECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
@@ -1749,6 +1751,69 @@ fn callback_context_tcb(client: Win32kClientContext) -> Option<u64> {
     (client.tcb > 1).then_some(client.tcb)
 }
 
+fn callback_resume_ip_executable(client: Win32kClientContext, ip: u64) -> bool {
+    if ip == 0 {
+        return false;
+    }
+    let Some(info) =
+        (unsafe { crate::process_committed_mapping_basic_information(client.pi as u64, ip) })
+    else {
+        return false;
+    };
+    let access = nt_address_space::FaultAccess::Execute;
+    match info.type_ {
+        nt_address_space::MEM_IMAGE => {
+            nt_address_space::image_view_fault_access_status(info.protect, access).is_ok()
+        }
+        nt_address_space::MEM_MAPPED | nt_address_space::MEM_PRIVATE => {
+            nt_address_space::mapped_view_fault_access_status(info.protect, access).is_ok()
+        }
+        _ => false,
+    }
+}
+
+unsafe fn resolve_callback_resume_ip(
+    client: Win32kClientContext,
+    message_resume_ip: u64,
+    saved: &[u64; 20],
+    phase: &[u8],
+) -> Option<u64> {
+    let resolved = nt_user_callback::repaired_syscall_resume_ip(message_resume_ip, saved, |ip| {
+        callback_resume_ip_executable(client, ip)
+    });
+    match resolved {
+        Some(ip) if ip != message_resume_ip => {
+            let n = USER_CALLBACK_RESUME_IP_REPAIRS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[user-callback] repaired ");
+                print_str(phase);
+                print_str(b" resume-ip primary=0x");
+                print_crash_hex64(message_resume_ip);
+                print_str(b" tcb-rip=0x");
+                print_crash_hex64(saved[nt_user_callback::USER_CONTEXT_RIP]);
+                print_str(b" repaired=0x");
+                print_crash_hex64(ip);
+                print_str(b"\n");
+            }
+            Some(ip)
+        }
+        Some(ip) => Some(ip),
+        None => {
+            let n = USER_CALLBACK_RESUME_IP_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[user-callback] rejected ");
+                print_str(phase);
+                print_str(b" resume-ip primary=0x");
+                print_crash_hex64(message_resume_ip);
+                print_str(b" tcb-rip=0x");
+                print_crash_hex64(saved[nt_user_callback::USER_CONTEXT_RIP]);
+                print_str(b"\n");
+            }
+            None
+        }
+    }
+}
+
 pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     client: Win32kClientContext,
     outer_resume_ip: u64,
@@ -1760,6 +1825,11 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     };
     let mut saved = [0u64; 20];
     tcb_read_regs20(tcb, &mut saved);
+    let Some(outer_resume_ip) =
+        resolve_callback_resume_ip(client, outer_resume_ip, &saved, b"outer")
+    else {
+        return false;
+    };
     redirect_pending_user_callback(
         client,
         &saved,
@@ -2654,8 +2724,17 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
     let mut callback_returns = 0u64;
     let mut outer_resumed = false;
     for _ in 0..8 {
-        let Some(returned) =
-            complete_controlled_user_callback(client.pi, badge, tid, 0, 0, STATUS_UNSUCCESSFUL)
+        let Some(returned) = complete_controlled_user_callback(
+            client.pi,
+            badge,
+            tid,
+            0,
+            0,
+            STATUS_UNSUCCESSFUL,
+            victim_rip,
+            victim_rsp,
+            victim_flags,
+        )
         else {
             break;
         };
@@ -2973,6 +3052,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
+    return_resume_ip: u64,
+    return_rsp: u64,
+    return_flags: u64,
 ) -> Option<CompletedUserCallback> {
     // `NtCallbackReturn` returns the callback that is innermost ON THE CALLING THREAD — the caller's
     // own identity selects the frame, never the interleaved stack's global top.
@@ -3238,18 +3320,31 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         };
         let mut chained_context = [0u64; 20];
         tcb_read_regs20(chained_tcb, &mut chained_context);
-        let chained_rsp = chained_context[nt_user_callback::USER_CONTEXT_RSP];
-        let chained_flags = chained_context[nt_user_callback::USER_CONTEXT_RFLAGS];
-        let chained_callout_resume_ip =
-            nt_user_callback::syscall_resume_ip_from_context(&chained_context);
+        let Some(chained_callout_resume_ip) = resolve_callback_resume_ip(
+            chained_client,
+            return_resume_ip,
+            &chained_context,
+            b"chained-callout",
+        ) else {
+            abort_controlled_user_callbacks();
+            print_str(b"[user-callback] chained callback missing executable callout resume\n");
+            return None;
+        };
+        if !callback_resume_ip_executable(chained_client, completed_frame.outer_resume_ip()) {
+            abort_controlled_user_callbacks();
+            print_str(b"[user-callback] chained callback inherited non-executable outer resume=0x");
+            print_crash_hex64(completed_frame.outer_resume_ip());
+            print_str(b"\n");
+            return None;
+        }
         if !redirect_pending_user_callback(
             chained_client,
             &chained_context,
             completed_frame.saved_user_context(),
             completed_frame.outer_resume_ip(),
             chained_callout_resume_ip,
-            chained_rsp,
-            chained_flags,
+            return_rsp,
+            return_flags,
         ) {
             abort_controlled_user_callbacks();
             print_str(b"[user-callback] chained callback redirect failed\n");
