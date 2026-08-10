@@ -4808,9 +4808,6 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
 ///  * `StaticUnicodeString.MaximumLength == 522` and `.Buffer == TEB+0x1268` at the gate — the exact
 ///    shape kernel32 asserts, read from winlogon's LIVE tail;
 ///  * `TEB+0x2C8` still addresses the private ACS page (batch 53's fix is still standing);
-///  * the protection was really LIVE (`WL_TEB2_CYCLES >= 1`) and really saw client traffic
-///    (`WL_TEB2_EMULATED + WL_TEB2_WRITE_FAULTS >= 1`), so an intact tail is CONTAINMENT, not the
-///    absence of anything happening;
 ///  * win32k took ZERO unexpected stores on it; the allowed GDI batch-count clear is counted by
 ///    `GDI_BATCH_TEB_TAIL_WRITE_WINDOWS`.
 unsafe fn teb_tail_protected_spec(passed: &mut u64) {
@@ -4823,9 +4820,6 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     let batch_write_windows = GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.load(Ordering::Relaxed);
     let ro_maps = W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed);
     let repairs = TEB_TAIL_REPAIRS.load(Ordering::Relaxed);
-    let cycles = WL_TEB2_CYCLES.load(Ordering::Relaxed);
-    let emulated = WL_TEB2_EMULATED.load(Ordering::Relaxed);
-    let client_stores = WL_TEB2_WRITE_FAULTS.load(Ordering::Relaxed);
     print_str(b"[teb-tail] winlogon MaximumLength=");
     print_u64(maximum_length as u64);
     print_str(b" Buffer=0x");
@@ -4844,14 +4838,6 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     print_u64(batch_write_windows);
     print_str(b" shadows=");
     print_u64(W32_TEB_TAIL_SHADOWS.load(Ordering::Relaxed));
-    print_str(b" | client protected=");
-    print_u64(WL_TEB2_PROTECTED.load(Ordering::Relaxed));
-    print_str(b" arms=");
-    print_u64(cycles);
-    print_str(b" emulated=");
-    print_u64(emulated);
-    print_str(b" reported-stores=");
-    print_u64(client_stores);
     print_str(b" descriptor-restores=");
     print_u64(repairs);
     print_str(b"\n");
@@ -4861,10 +4847,7 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
             && maximum_length == 522
             && buffer == SMSS_TEB_VA + 0x1268
             && actctx == ACS_PAGE_VA
-            // The protection was live and really saw the client writing this page…
-            && cycles >= 1
-            && emulated + client_stores >= 1
-            // …and win32k, the accused, never took an unexpected store path. The only legitimate
+            // win32k, the accused, never took an unexpected store path. The only legitimate
             // write-through is `NtGdiFlushUserBatch` clearing `TEB.GdiBatchCount`.
             && write_faults == 0,
         passed,
@@ -8125,210 +8108,6 @@ pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
     print_str(b"\n");
 }
 
-// --- CLIENT-SIDE TEB-TAIL WRITE WATCH (the measurement that names the real writer) --------------
-/// Diagnostic switch: map winlogon's SECOND TEB page READ-ONLY *in winlogon's own VSpace* from the
-/// post-logon milestone on, so every store the CLIENT makes to it faults and reports its RIP. This
-/// is the same trick as the win32k-side protection, aimed at the address space the evidence actually
-/// points at.
-pub(crate) const WL_TEB_TAIL_WRITE_WATCH: bool = true;
-/// The cap winlogon's own TEB-tail mapping uses, so the protection can be toggled.
-pub(crate) static WL_TEB2_CAP: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WL_TEB2_PML4: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WL_TEB2_PROTECTED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WL_TEB2_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WL_TEB2_CYCLES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static WL_TEB2_EMULATED: AtomicU64 = AtomicU64::new(0);
-static WL_TEB2_PROTECT_REPORTS: AtomicU64 = AtomicU64::new(0);
-static WL_TEB2_PROTECT_FAILS: AtomicU64 = AtomicU64::new(0);
-static WL_TEB2_EMULATION_FAILS: AtomicU64 = AtomicU64::new(0);
-const WL_TEB2_MAX_CYCLES: u64 = 60_000;
-static RTL_LAST_STATUS_STORE_RVA: AtomicU64 = AtomicU64::new(0);
-
-/// ★ THE ENFORCED INVARIANT. `TEB.StaticUnicodeString` is a per-thread SCRATCH descriptor whose
-/// shape (`MaximumLength == sizeof(StaticUnicodeBuffer)`, `Buffer == &StaticUnicodeBuffer`) is set
-/// once at thread creation and never legitimately changes — `RtlAnsiStringToUnicodeString(dst, src,
-/// FALSE)` writes only `Length`. kernel32 ASSERTs exactly that shape on every ANSI file call
-/// (`client/file/fileutils.c:26`), and its `int 3` is fatal. Re-assert it through the executive's
-/// persistent alias whenever the protection is (re-)armed and after every store that faults on the
-/// page: idempotent, and a no-op on a boot that never breaks it.
-pub(crate) unsafe fn wl_teb2_reassert_descriptor() {
-    if TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << 2) == 0 {
-        return;
-    }
-    let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + 0x258;
-    let maximum_length = core::ptr::read_volatile((tail + 2) as *const u16);
-    let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
-    if maximum_length == 522 && buffer == SMSS_TEB_VA + 0x1268 {
-        return;
-    }
-    core::ptr::write_volatile((tail + 2) as *mut u16, 522);
-    core::ptr::write_volatile((tail + 8) as *mut u64, SMSS_TEB_VA + 0x1268);
-    let n = TEB_TAIL_REPAIRS.fetch_add(1, Ordering::Relaxed);
-    let _ = TEB_TAIL_FIRST_BAD.compare_exchange(
-        0xFFFF,
-        maximum_length as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    if n < 4 {
-        print_str(b"[teb-tail] StaticUnicodeString descriptor RESTORED (was MaximumLength=");
-        print_u64(maximum_length as u64);
-        print_str(b" Buffer=0x");
-        print_hex_u64(buffer);
-        print_str(b")\n");
-    }
-}
-
-/// Re-arm the read-only protection (idempotent, bounded).
-pub(crate) unsafe fn wl_teb2_protect() {
-    if !WL_TEB_TAIL_WRITE_WATCH {
-        return;
-    }
-    // The invariant is enforced on EVERY service-loop event, not only when the protection re-arms —
-    // a store that lands while the page happens to be writable is still caught before the client's
-    // next kernel32 ANSI file call can assert on it.
-    wl_teb2_reassert_descriptor();
-    if WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0 {
-        return;
-    }
-    let cap = WL_TEB2_CAP.load(Ordering::Relaxed);
-    let pml4 = WL_TEB2_PML4.load(Ordering::Relaxed);
-    if cap == 0 || pml4 == 0 || WL_TEB2_CYCLES.fetch_add(1, Ordering::Relaxed) >= WL_TEB2_MAX_CYCLES
-    {
-        return;
-    }
-    let unmap = page_unmap_r(cap);
-    let map = page_map_r(cap, SMSS_TEB_VA + 0x1000, RO_NX, pml4);
-    if map == 0 {
-        WL_TEB2_PROTECTED.store(1, Ordering::Relaxed);
-    }
-    if WL_TEB2_PROTECT_REPORTS.fetch_add(1, Ordering::Relaxed) < 3 || map != 0 {
-        if WL_TEB2_PROTECT_FAILS.load(Ordering::Relaxed) < 4 {
-            if map != 0 {
-                WL_TEB2_PROTECT_FAILS.fetch_add(1, Ordering::Relaxed);
-            }
-            print_str(b"[teb-writer] protect unmap=");
-            print_u64(unmap);
-            print_str(b" map=");
-            print_u64(map);
-            print_str(b"\n");
-        }
-    }
-}
-
-/// `RtlNtStatusToDosError`'s `mov [rax+0x1250], ecx`, the 4-byte `TEB.LastStatusValue` store. It is
-/// BY FAR the most frequent write to the tail page (every failing syscall makes one) and it is
-/// entirely legitimate. The RVA is still derived from the loaded ntdll image at boot; on a protected
-/// write fault the executive copies ECX into the trusted TEB mirror and advances the fault frame so
-/// the protection stays continuously armed.
-const RTL_LAST_STATUS_STORE_LEN: u64 = 6;
-const RTL_LAST_STATUS_STORE_OPCODE: [u8; RTL_LAST_STATUS_STORE_LEN as usize] =
-    [0x89, 0x88, 0x50, 0x12, 0x00, 0x00];
-
-unsafe fn derive_rtl_last_status_store_rva(pe: &nt_pe_loader::PeFile) -> u64 {
-    let Some(rtl_nt_status_to_dos_error) = pe.exports().ok().and_then(|exports| {
-        exports
-            .into_iter()
-            .find(|export| export.name == "RtlNtStatusToDosError")
-            .map(|export| export.rva)
-    }) else {
-        return 0;
-    };
-    let mut offset = 0u32;
-    while offset < 0x100 {
-        let candidate = rtl_nt_status_to_dos_error.wrapping_add(offset);
-        let mut matched = true;
-        for (index, expected) in RTL_LAST_STATUS_STORE_OPCODE.iter().enumerate() {
-            if img_spawn::pe_byte_at_rva(pe, candidate.wrapping_add(index as u32))
-                != Some(*expected)
-            {
-                matched = false;
-                break;
-            }
-        }
-        if matched {
-            return candidate as u64;
-        }
-        offset += 1;
-    }
-    0
-}
-
-/// A client store into the protected tail: report WHO (RIP + the byte it aimed at). Known-legitimate
-/// ntdll status traffic is emulated in place; every other store drops the protection only long
-/// enough for the original instruction to complete, then the service loop re-arms it.
-pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool {
-    let offset = addr & 0xFFF;
-    let last_status_store_rva = RTL_LAST_STATUS_STORE_RVA.load(Ordering::Relaxed);
-    let last_status_store = offset == 0x250
-        && last_status_store_rva != 0
-        && ip == NTDLL_BASE.wrapping_add(last_status_store_rva);
-    let n = WL_TEB2_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
-    let descriptor = (0x258..0x268).contains(&offset);
-    if n < 48 || descriptor {
-        print_str(if descriptor {
-            b"[teb-writer] ***DESCRIPTOR*** client store TEB+0x1"
-        } else {
-            b"[teb-writer] client store TEB+0x1"
-        });
-        print_hex(offset as u32);
-        print_str(b" from ip=0x");
-        print_hex_u64(ip);
-        print_str(b" ntdll+0x");
-        print_hex(ip.wrapping_sub(NTDLL_BASE) as u32);
-        print_str(b" image+0x");
-        print_hex(ip.wrapping_sub(PE_LOAD_BASE) as u32);
-        if last_status_store {
-            print_str(b" last-status");
-        }
-        print_str(b" #");
-        print_u64(n);
-        print_str(b"\n");
-    }
-    if last_status_store && tcb != 0 {
-        let mut regs = [0u64; 20];
-        crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
-        let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
-        let rax = regs[nt_user_callback::USER_CONTEXT_RAX];
-        let value = regs[nt_user_callback::USER_CONTEXT_RCX] as u32;
-        if rip == ip && rax.wrapping_add(0x1250) == addr {
-            regs[nt_user_callback::USER_CONTEXT_RIP] = ip.wrapping_add(RTL_LAST_STATUS_STORE_LEN);
-            let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &regs, false);
-            if write_error == 0 {
-                core::ptr::write_volatile(
-                    (WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + offset) as *mut u32,
-                    value,
-                );
-                WL_TEB2_EMULATED.fetch_add(1, Ordering::Relaxed);
-                wl_teb2_reassert_descriptor();
-                return true;
-            }
-            if WL_TEB2_EMULATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
-                print_str(b"[teb-writer] last-status emulation TCB_WriteRegisters failed err=");
-                print_u64(write_error);
-                print_str(b"\n");
-            }
-        } else if WL_TEB2_EMULATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
-            print_str(b"[teb-writer] last-status emulation context mismatch rip=0x");
-            print_hex_u64(rip);
-            print_str(b" rax=0x");
-            print_hex_u64(rax);
-            print_str(b" addr=0x");
-            print_hex_u64(addr);
-            print_str(b"\n");
-        }
-    }
-    let cap = WL_TEB2_CAP.load(Ordering::Relaxed);
-    let pml4 = WL_TEB2_PML4.load(Ordering::Relaxed);
-    if cap != 0 && pml4 != 0 {
-        let _ = page_unmap_r(cap);
-        let _ = page_map_r(cap, SMSS_TEB_VA + 0x1000, RW_NX, pml4);
-    }
-    WL_TEB2_PROTECTED.store(0, Ordering::Relaxed);
-    wl_teb2_reassert_descriptor();
-    false
-}
-
 /// Tail pages that were really mapped READ-ONLY into win32k. Without this the "win32k took zero
 /// write faults" reading would be unfalsifiable — it could just mean win32k never touched the page.
 pub(crate) static W32_TEB_TAIL_RO_MAPS: AtomicU64 = AtomicU64::new(0);
@@ -8388,14 +8167,7 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
             print_u64(prev_tag);
             print_str(b" aux=0x");
             print_hex_u64(prev_aux);
-            // ★ THE DECISIVE BIT: was winlogon's OWN mapping of the page read-only across the
-            // window in which the value changed? If it was, no CLIENT store could have done it
-            // without faulting — which leaves win32k's view or an executive-side alias.
-            print_str(b") client-protected=");
-            print_u64(WL_TEB2_PROTECTED.load(Ordering::Relaxed));
-            print_str(b" client-store-faults=");
-            print_u64(WL_TEB2_WRITE_FAULTS.load(Ordering::Relaxed));
-            print_str(b" w32-ro-maps=");
+            print_str(b") w32-ro-maps=");
             print_u64(W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed));
             print_str(b" w32-store-faults=");
             print_u64(W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed));
@@ -24125,7 +23897,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
-                    let rtl_last_status_store_rva = derive_rtl_last_status_store_rva(&ntdll_pe);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
@@ -24139,11 +23910,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_COMPLETION_WORKER_RVA
                         .store(tp_completion_worker_rva, Ordering::Relaxed);
-                    RTL_LAST_STATUS_STORE_RVA.store(rtl_last_status_store_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
-                    print_str(b" RtlLastStatusStore RVA=0x");
-                    print_hex(rtl_last_status_store_rva as u32);
                     print_str(b"\n");
                     let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a

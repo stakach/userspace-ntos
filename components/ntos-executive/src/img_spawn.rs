@@ -753,10 +753,6 @@ pub(crate) unsafe fn spawn_sec_image(
         }
         let teb2_client_cap = copy_cap(teb2);
         let _ = page_map(teb2_client_cap, SMSS_TEB_VA + 0x1000, RW_NX, pml4);
-        if pi == 2 {
-            crate::WL_TEB2_CAP.store(teb2_client_cap, core::sync::atomic::Ordering::Relaxed);
-            crate::WL_TEB2_PML4.store(pml4, core::sync::atomic::Ordering::Relaxed);
-        }
         csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
         register_spawn_private_mapping(pi, SMSS_TEB_VA, 0x2000, nt_address_space::PAGE_READWRITE);
         // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's

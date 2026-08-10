@@ -4208,12 +4208,6 @@ pub(crate) unsafe fn service_sec_image(
         {
             crate::watchdog_arm(delay_queue);
         }
-        // Keep the client-side TEB-tail watch armed from winlogon's SPAWN on (bounded by
-        // WL_TEB2_MAX_CYCLES). Arming it at the post-logon milestone was measured to be TOO LATE —
-        // the descriptor was already corrupt one second before the first arm.
-        if crate::WL_TEB_TAIL_WRITE_WATCH {
-            crate::wl_teb2_protect();
-        }
         // ★ DRAIN timer ticks a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
         // which cannot service it (the delay queue lives here). The pump latches it instead; this
@@ -4920,31 +4914,6 @@ pub(crate) unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
-            // ★ CLIENT-SIDE TEB-TAIL WRITE WATCH — a WRITE fault on winlogon's own (present,
-            // read-only) second TEB page. This is the measurement that names the code corrupting
-            // `StaticUnicodeString`: win32k is exonerated (it is never handed this page, and the
-            // good→bad transition never straddles a dispatch), so the writer runs in the client.
-            if crate::WL_TEB_TAIL_WRITE_WATCH
-                && hosted_pi_has_role(
-                    &nt_handler,
-                    pi,
-                    nt_exe_image::HostedProcessRole::InteractiveLogon,
-                )
-                && page == SMSS_TEB_VA + 0x1000
-                && (m3 & 0x2) != 0
-                && crate::WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0
-            {
-                let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
-                let _emulated = crate::wl_teb2_report_write(m0, addr, tcb);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
-                badge = nb;
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
-            }
             if pi == 2
                 && (m3 & 0x7) == 0x7
                 && WINLOGON_HANDLE_FAULT_DIAG_N.fetch_add(1, Ordering::Relaxed) == 0

@@ -64,6 +64,17 @@ enough to get back to base desktop paint; if it parks, the next fix should be a 
 receive waiter or the next logon/profile syscall shown by the boot log, not a profile, service-name,
 UUID, launch-order, or paint fallback.
 
+Desktop retry `.tmp/boot-timer-lpc-receive-20260811-0515.log` did not reach paint; it classified a
+pre-desktop CSR runtime fault instead of a timer/LPC receive wall. `csrss.exe` mapped `csrsrv`,
+started the real CSR API/SB workers, accepted the winlogon `\Windows\ApiPort` connection, then the
+main CSR thread fault-looped on a normal client write to `TEB.TlsSlots` (`TEB+0x1488`) because the
+old winlogon-only client-side TEB-tail write watcher kept the client's own second TEB page
+read-only. That watcher was historical diagnostic machinery from the TEB-clobber investigation; it
+is now removed so client TEB pages stay writable by their owning process, while the real boundary
+remains win32k-side read-only/COW TEB-tail mapping. Next desktop retry should prove that CSR can
+leave kernel32 startup and reach the base desktop paint gate again, then continue at the next real
+logon/profile or RPC edge.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and
@@ -2982,3 +2993,17 @@ executable-order fallbacks.
   the remaining blocker is wakeable LPC receive delivery, user timer APC delivery, or the next real
   logon/profile syscall. Do not add profile, service-name, UUID, launch-order, RPC-byte, or paint
   fallback behavior.
+
+- I4 CSR pre-desktop TEB-tail cleanup. Serialized desktop retry
+  `.tmp/boot-timer-lpc-receive-20260811-0515.log` moved past the old unserviced timer/LPC receive
+  edge but hit an earlier CSR startup loop: `csrss.exe` accepted the real winlogon
+  `\Windows\ApiPort` connection and then faulted repeatedly at `kernel32` writing `TEB+0x1488`
+  (`TlsSlots`). The fault was self-inflicted by the old client-side winlogon TEB-tail write watcher,
+  which remapped the client's own TEB tail read-only on every service-loop event. That watcher and
+  its `RtlNtStatusToDosError` store emulation are removed. Client TEB tails are again writable by
+  the owning process; only win32k's attached view remains read-only/COW, which is the actual NT
+  boundary being protected. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rerun `./run.sh --desktop` and require the `tcb=27
+  cr2=...16001488 rip=...803c719d` loop to be gone before returning to profile/shell paint
+  blockers.
