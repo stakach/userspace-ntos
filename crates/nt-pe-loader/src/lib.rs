@@ -58,6 +58,38 @@ impl Protection {
     }
 }
 
+/// The allocation protection a SEC_IMAGE page should expose through NT virtual
+/// memory queries and fault planning.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageProtection {
+    /// Headers, gaps, or read-only section data.
+    ReadOnly,
+    /// Writable data, initially mapped read-only and made private on first write.
+    WriteCopy,
+    /// Executable code, readable but not writable.
+    ExecuteRead,
+    /// Executable+writable code/data, initially executable-read and made private on first write.
+    ExecuteWriteCopy,
+}
+
+impl ImageProtection {
+    /// True if a page with this protection can be executed.
+    pub fn executable(self) -> bool {
+        matches!(
+            self,
+            ImageProtection::ExecuteRead | ImageProtection::ExecuteWriteCopy
+        )
+    }
+
+    /// True if writes should be handled through image copy-on-write.
+    pub fn copy_on_write(self) -> bool {
+        matches!(
+            self,
+            ImageProtection::WriteCopy | ImageProtection::ExecuteWriteCopy
+        )
+    }
+}
+
 /// A structured PE-loader error. No parse path panics; every failure is one of
 /// these.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -331,10 +363,38 @@ impl<'a> PeFile<'a> {
         Protection::ReadOnly // headers / gaps
     }
 
+    /// The NT SEC_IMAGE allocation protection for the page at `rva`.
+    ///
+    /// Unlike [`PeFile::protection_at`], writable image sections are write-copy:
+    /// each process initially sees a read-only/executable-read image page and
+    /// receives a private page when it first writes loader fixups or runtime data.
+    pub fn image_protection_at(&self, rva: u32) -> ImageProtection {
+        if rva < page_align_up(self.headers.size_of_headers) {
+            return ImageProtection::ReadOnly;
+        }
+        for s in self.sections() {
+            let start = s.virtual_address;
+            let size = page_align_up(s.virtual_size.max(s.size_of_raw_data));
+            if rva >= start && rva - start < size {
+                return match (s.is_executable(), s.is_writable()) {
+                    (true, true) => ImageProtection::ExecuteWriteCopy,
+                    (true, false) => ImageProtection::ExecuteRead,
+                    (false, true) => ImageProtection::WriteCopy,
+                    (false, false) => ImageProtection::ReadOnly,
+                };
+            }
+        }
+        ImageProtection::ReadOnly
+    }
+
     /// Map the image into a fresh buffer at `load_base`, copying headers +
     /// sections and applying base relocations (spec §7.2, §9). The result is ready
     /// for import patching + execution.
     pub fn map(&self, load_base: u64) -> Result<MappedImage, PeError> {
         MappedImage::build(self, load_base)
     }
+}
+
+fn page_align_up(n: u32) -> u32 {
+    n.saturating_add(0x0fff) & !0x0fffu32
 }

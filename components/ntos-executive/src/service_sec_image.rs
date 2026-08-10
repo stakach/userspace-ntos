@@ -5994,7 +5994,7 @@ pub(crate) unsafe fn service_sec_image(
                 // fixed base + pre-relocated) → filled ONCE into a frame, mapped READ-ONLY (RX) into
                 // every process that faults it — real image sharing.
                 let shareable =
-                    base != PE_LOAD_BASE && page_rights(tpe, rva) == 2 && !image_map_writable;
+                    base != PE_LOAD_BASE && image_rva_executable(tpe, rva) && !image_map_writable;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 if is_fault_page && image_fault_plan.copy_on_write {
                     let read_fault_protection =
@@ -6045,17 +6045,17 @@ pub(crate) unsafe fn service_sec_image(
                 // dropped / never landed / the demand loader re-touches it) and we naively re-FILL it
                 // from the raw PE, we DISCARD the loader's fixups — a snapped IAT slot reverts to its
                 // raw ILT thunk (a bare IMAGE_IMPORT_BY_NAME RVA), a relocated pointer loses its base.
-                // OBSERVED (lsass, BATCH 24): kernel32's ntdll-IAT page (RVA 0x77000, in .rdata → RW)
+                // OBSERVED (lsass, BATCH 24): kernel32's ntdll-IAT page (RVA 0x77000, in .rdata -> RW)
                 // reverted → CloseHandle's `call *[IAT]` jumped to the bare RVA 0x3a288 (should be
                 // NTDLL_BASE+0x3a288) → instr-fetch fault, before SetEvent(LSA_RPC_SERVER_ACTIVE).
                 // FIX: for a per-process page THIS process already has a frame recorded for
-                // (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every pi>=1 process),
-                // RE-MAP that SAME frame (which holds the loader's in-memory fixups) instead of filling a
+                // (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every hosted image
+                // process), RE-MAP that SAME frame (which holds the loader's in-memory fixups) instead of filling a
                 // fresh raw frame. `csrss_frame_get` falls back to the shared DLL cache, so restrict to
                 // `!shareable` (a genuine per-process frame the caller recorded). Applies to ANY page in
                 // the window (not just the faulting one) so an eager whole-image pass re-maps, never
                 // re-fills, a page whose fixups already landed.
-                if !shareable && pi >= 1 {
+                if !shareable {
                     let existing = csrss_frame_get(pi as u64, bpage);
                     if existing != 0 && existing != dll_cache_get(bpage) {
                         if is_fault_page {
@@ -6098,9 +6098,9 @@ pub(crate) unsafe fn service_sec_image(
                     bi += 1;
                     continue;
                 }
-                let (frame, rights) = if cached != 0 {
+                let (frame, rights, private_alias, private_source_cap) = if cached != 0 {
                     DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
-                    (cached, image_map_rights) // shared text → live read/execute protection
+                    (cached, image_map_rights, 0, 0) // shared text -> live read/execute protection
                 } else {
                     // MISS (shared, first process) or a per-process page: fill a fresh frame `f`,
                     // mapped at a UNIQUE monotonic scratch slot (seL4 records the mapping on the frame
@@ -6183,18 +6183,11 @@ pub(crate) unsafe fn service_sec_image(
                     if shareable {
                         dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
                     } else {
-                        // Per-process page (main image, or DLL headers/rdata/data/IAT): record it for
-                        // copy-out via its scratch alias, and mirror the main image so smss_copyin can
-                        // read static-string args from .rdata.
+                        // Per-process page (main image, or DLL headers/rdata/data/IAT): keep its
+                        // scratch alias as the source frame for copyin/copyout and possible COW
+                        // promotion. The process-side mapping cap is recorded after that map succeeds.
                         if (faults as usize) < filled_pages.len() {
                             filled_pages[faults as usize] = bpage;
-                        }
-                        if pi >= 1 {
-                            // Record every process's private image page so a later overlapping forward
-                            // prefetch can reuse it instead of allocating and attempting a second map.
-                            // For GUI clients the same record also lets win32k identity-map live client
-                            // data such as PFNCLIENT arrays and stack-built OBJECT_ATTRIBUTES.
-                            csrss_frame_put_at(pi as u64, bpage, f, scratch);
                         }
                         if base == PE_LOAD_BASE {
                             let off = bpage - PE_LOAD_BASE;
@@ -6211,7 +6204,12 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     faults += 1; // a fill consumed a scratch slot; shared HITs do not
                     bump_progress(); // (B) a fresh page filled = real memory progress (resets stall)
-                    (f, image_map_rights)
+                    (
+                        f,
+                        image_map_rights,
+                        if shareable { 0 } else { scratch },
+                        if shareable { 0 } else { f },
+                    )
                 };
                 // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
                 let (cc, ce) = copy_cap_r(frame);
@@ -6248,6 +6246,34 @@ pub(crate) unsafe fn service_sec_image(
                         let _ = page_unmap_r(cc);
                         let _ = cnode_delete_recycle_r(cc);
                         print_str(b"[image-shared] register failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" page=0x");
+                        print_hex((bpage >> 32) as u32);
+                        print_hex(bpage as u32);
+                        print_str(b"\n");
+                        allocation_failed = true;
+                        break;
+                    }
+                }
+                if mapped_into_process && !shareable && private_source_cap != 0 {
+                    // Record every hosted process's private image page using the process-side map cap.
+                    // The scratch cap remains the stable alias/source for kernel copy helpers and for
+                    // write-copy promotion; without the retained map cap, COW cannot unmap the
+                    // read-only process view before installing the private writable copy.
+                    if !csrss_frame_put_at_cap_source_owned(
+                        pi as u64,
+                        bpage,
+                        cc,
+                        private_alias,
+                        private_source_cap,
+                        private_source_cap,
+                        false,
+                    ) {
+                        let _ = page_unmap_r(cc);
+                        let _ = cnode_delete_recycle_r(cc);
+                        let _ = page_unmap_r(private_source_cap);
+                        let _ = cnode_delete_recycle_r(private_source_cap);
+                        print_str(b"[image-map] register failed pi=");
                         print_u64(pi as u64);
                         print_str(b" page=0x");
                         print_hex((bpage >> 32) as u32);

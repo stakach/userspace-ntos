@@ -58,14 +58,22 @@ pub(crate) unsafe fn image_page_protection(
     image_base: u64,
     page: u64,
 ) -> u32 {
-    let rights = page_rights(pe, (page - image_base) as u32);
-    if rights & PAGE_EXECUTE_NEVER == 0 {
-        nt_address_space::PAGE_EXECUTE_READ
-    } else if rights & 1 != 0 {
-        nt_address_space::PAGE_READWRITE
-    } else {
-        nt_address_space::PAGE_READONLY
+    image_rva_protection(pe, (page - image_base) as u32)
+}
+
+pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
+    match pe.image_protection_at(rva) {
+        nt_pe_loader::ImageProtection::ReadOnly => nt_address_space::PAGE_READONLY,
+        nt_pe_loader::ImageProtection::WriteCopy => nt_address_space::PAGE_WRITECOPY,
+        nt_pe_loader::ImageProtection::ExecuteRead => nt_address_space::PAGE_EXECUTE_READ,
+        nt_pe_loader::ImageProtection::ExecuteWriteCopy => {
+            nt_address_space::PAGE_EXECUTE_WRITECOPY
+        }
     }
+}
+
+pub(crate) fn image_rva_executable(pe: &nt_pe_loader::PeFile, rva: u32) -> bool {
+    pe.image_protection_at(rva).executable()
 }
 
 pub(crate) unsafe fn register_image_committed_mappings(
@@ -430,31 +438,11 @@ pub(crate) unsafe fn spawn_pe_thread(
     pml4
 }
 
-/// Fill one page of a SEC_IMAGE view at `rva` from the PE FILE, translating RVA -> file offset
-/// per the PE layout: the headers page comes from file offset 0; each section's pages come from
-/// its `pointer_to_raw_data` (BSS beyond `size_of_raw_data` stays zero). Returns the page rights
-/// (RX for executable sections, RW_NX otherwise). This is the memory-efficient image mapping:
-/// only touched pages are ever materialized (vs pre-building the whole mapped image).
-/// The mapping rights `fill_image_page` WOULD return for `rva`, WITHOUT filling — RX (2) for an
-/// executable section, RW_NX otherwise (headers/rdata/data/gaps). Lets the fault router classify a
-/// page before deciding whether it's a shareable text page (RX) or a per-process page.
-pub(crate) unsafe fn page_rights(pe: &nt_pe_loader::PeFile, rva: u32) -> u64 {
-    let soh = pe.headers().size_of_headers;
-    let page_up = |n: u32| (n + 0xFFF) & !0xFFFu32;
-    if rva < page_up(soh) {
-        return RW_NX; // headers
-    }
-    for s in pe.sections() {
-        if rva >= s.virtual_address && rva < s.virtual_address + page_up(s.virtual_size) {
-            return if s.is_executable() {
-                2 /* RX */
-            } else {
-                RW_NX
-            };
-        }
-    }
-    RW_NX // gap
-}
+/// Fill one page of a SEC_IMAGE view at `rva` from the PE file, translating RVA to file offset.
+/// Headers come from file offset 0; section pages come from `pointer_to_raw_data`; BSS beyond
+/// `size_of_raw_data` stays zero. The return value is the immediate seL4 W^X page-map rights for
+/// bootstrap paths. NT allocation/query protection is tracked separately through
+/// [`image_rva_protection`].
 pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 {
     for j in 0..0x1000u64 {
         core::ptr::write_volatile((dst + j) as *mut u8, 0);

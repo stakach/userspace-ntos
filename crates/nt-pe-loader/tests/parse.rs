@@ -1,7 +1,7 @@
 //! PE-loader tests against hand-crafted PE32+ images: parse, map, relocate,
 //! import listing, and malformed-image rejection (no panics).
 
-use nt_pe_loader::{ImportRef, PeError, PeFile, Protection};
+use nt_pe_loader::{ImageProtection, ImportRef, PeError, PeFile, Protection};
 
 // --- a minimal PE32+ image builder -----------------------------------------
 
@@ -317,6 +317,51 @@ fn protection_from_section_characteristics() {
     assert_eq!(pe.protection_at(0x1000), Protection::ReadExecute); // .text
     assert_eq!(pe.protection_at(0x2000), Protection::ReadWrite); // .data
     assert_eq!(pe.protection_at(0), Protection::ReadOnly); // headers
+}
+
+#[test]
+fn image_protection_uses_sec_image_writecopy() {
+    let rdata = Sec {
+        name: *b".rdata\0\0",
+        va: 0x2000,
+        chars: 0x4000_0040, // INITIALIZED_DATA | READ
+        data: vec![0u8; 8],
+    };
+    let data = Sec {
+        name: *b".data\0\0\0",
+        va: 0x3000,
+        chars: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+        data: vec![0u8; 8],
+    };
+    let wexec = Sec {
+        name: *b".wexec\0\0",
+        va: 0x4000,
+        chars: 0xE000_0020, // CODE | EXECUTE | READ | WRITE
+        data: vec![0xC3],
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x5000,
+        &[text_section(0x1000, vec![0xC3]), rdata, data, wexec],
+        &[],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+
+    assert_eq!(pe.image_protection_at(0x0000), ImageProtection::ReadOnly);
+    assert_eq!(pe.image_protection_at(0x1000), ImageProtection::ExecuteRead);
+    assert_eq!(pe.image_protection_at(0x2000), ImageProtection::ReadOnly);
+    assert_eq!(pe.image_protection_at(0x3000), ImageProtection::WriteCopy);
+    assert_eq!(
+        pe.image_protection_at(0x4000),
+        ImageProtection::ExecuteWriteCopy
+    );
+    assert_eq!(
+        pe.image_protection_at(0x4fff),
+        ImageProtection::ExecuteWriteCopy
+    );
+    assert!(pe.image_protection_at(0x4000).executable());
+    assert!(pe.image_protection_at(0x3000).copy_on_write());
 }
 
 #[test]
