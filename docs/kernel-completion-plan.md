@@ -264,9 +264,14 @@ Current RPC association diagnostic slice: the existing PDU trace only reported a
 the first NDR argument started at request/response/fault body offset 24. Recent failures show ReactOS
 rpcrt4 rejecting context handles whose UUID is not visible in that narrow trace, so the executive
 now scans a bounded set of aligned NDR context-handle candidates across each generic DCE/RPC
-request/response/fault body and prints their offsets without changing transport behavior. The next
-serialized desktop run should use those lines to decide whether the missing desktop path is an NPFS
-instance routing issue, an association-group lifetime issue, or a thread teardown/reuse issue.
+request/response/fault body and prints their offsets without changing transport behavior. The first
+broadened run (`.tmp/boot-rpc-context-scan-20260810.log`) reproduced the browser/service
+`NCA_S_FAULT_CONTEXT_MISMATCH` edge for `{3fbf3a60-8daf-458d-8c09-882755293bfc}` after base desktop
+paint and real browser service DLL load, but also showed that counted strings and pointer fields were
+crowding out the real deeper context handle candidates. The trace now keeps only UUID-shaped
+generated context handles so the next serialized desktop run can decide whether the missing desktop
+path is an NPFS instance routing issue, an association-group lifetime issue, or a thread
+teardown/reuse issue.
 
 ### A. SCM-Controlled Service Startup
 

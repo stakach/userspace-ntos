@@ -1178,7 +1178,7 @@ unsafe fn dcerpc_context_handle_at(
         *byte = read_volatile((payload + offset_u64 + 4 + i as u64) as *const u8);
         any |= *byte != 0;
     }
-    if !any {
+    if !any || !dcerpc_uuid_looks_generated(&uuid) {
         return None;
     }
     Some(DceRpcContextHandleView {
@@ -1186,6 +1186,14 @@ unsafe fn dcerpc_context_handle_at(
         attributes,
         uuid,
     })
+}
+
+fn dcerpc_uuid_looks_generated(uuid: &[u8; 16]) -> bool {
+    // RPC context handles are assigned with UuidCreate before being marshalled. Filtering to normal
+    // UUID version/variant bits keeps counted strings and small pointer fields out of the trace.
+    let version = uuid[7] >> 4;
+    let variant = uuid[8] & 0xc0;
+    (1..=5).contains(&version) && variant == 0x80
 }
 
 fn dcerpc_ptype_name(ptype: u8) -> &'static [u8] {
