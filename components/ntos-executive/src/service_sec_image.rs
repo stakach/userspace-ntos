@@ -2,7 +2,6 @@
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
-use nt_io_abi::major;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
@@ -18465,14 +18464,13 @@ unsafe fn pipe_name_wait_complete_named(nt_handler: &mut ExecNtHandler, name_has
     woken
 }
 
-/// BATCH 33 — RE-DRIVE every parked pipe read after a peer write. The executive has no peer→reader
-/// map (npfs pairs the two ends internally by name), so on ANY completed pipe write we re-issue EVERY
-/// parked read against npfs: npfs's own FCB pairing makes the reader whose peer just wrote return data
-/// (non-PENDING) while the others stay PENDING. For each reader that now has bytes we copy them into
-/// its buffer + fill its IOSB (through ITS OWN VSpace mirrors — switched in for the copyout, since the
-/// active process is the WRITER, then restored) and reply to its stolen reply cap (restoring its
-/// native-syscall resume context, exactly like the event wake), then free the slot. Idempotent: a read
-/// still PENDING leaves the waiter parked (re-armable for the next PDU / write). Returns woken count.
+/// BATCH 33 — finalize parked pipe I/O after a peer operation. Pending pipe IRPs stay owned by npfs:
+/// when a peer write satisfies one, npfs completes the retained IRP through `IoCompleteRequest` and
+/// the driver bridge stashes the exact completion payload keyed by the waiting file id. This redrive
+/// step consumes those stashes, copies results through the waiter's own VSpace mirrors, signals its
+/// event/file completion surfaces, and releases the waiter. If no real completion is present yet, the
+/// waiter stays parked; issuing a fresh read here would create a second outstanding IRP for the same
+/// FILE_OBJECT and violates `FSCTL_PIPE_TRANSCEIVE`'s single retained read half. Returns woken count.
 unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
     // Snapshot the active-mirror context + handler identity so we can restore after each re-drive.
@@ -18489,14 +18487,11 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let table = &*core::ptr::addr_of!(PIPE_WAITERS);
     let snapshot: alloc::vec::Vec<(usize, nt_io_manager::PipeWaiter)> = table.drain_all().collect();
     for (slot, w) in snapshot {
-        // Re-issue this reader's read against npfs; if still PENDING, leave it parked.
         let want = (w.buffer_len as usize).min(transport_capacity).max(1);
         let mut output = alloc::vec![0u8; want];
-        // BATCH 37: FIRST check for a completed-pending-read stash for this fid. When this reader's
-        // original read went PENDING, npfs retained the read IRP; the peer WRITE already completed it
-        // (copying the payload into THAT IRP) — so a fresh re-drive read would find the queue drained
-        // and return garbage/PENDING. `take_completed_read` hands back the exact bytes npfs delivered
-        // to the pending read IRP (this is how the rpcrt4 worker gets winlogon's bind PDU).
+        // BATCH 37/I4: a pending READ/TRANSCEIVE is completed only by the IRP npfs retained. A second
+        // read here manufactures another data-queue entry and can make the next SCM
+        // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
         let (status, completed) = if w.is_write {
             match driver_launch::take_completed_write(w.file_id) {
                 Some(completion) => completion,
@@ -18506,17 +18501,6 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             let n = (bytes.len()).min(output.len());
             output[..n].copy_from_slice(&bytes[..n]);
             (st, info)
-        } else if w.is_transceive {
-            match nt_handler.npfs_route_raw(
-                major::IRP_MJ_READ as u64,
-                0,
-                w.file_id,
-                &[],
-                &mut output,
-            ) {
-                Ok((st, info, _)) => (st as u32, info),
-                Err(_) => continue,
-            }
         } else {
             continue;
         };

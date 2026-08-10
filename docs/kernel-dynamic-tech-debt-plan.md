@@ -2171,3 +2171,11 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   Review adjustment: validate this with focused pipe tests/checks, then run one serialized desktop
   boot to see whether the remaining `wlansvc` context-handle fault is association reuse or the next
   service-control pipe semantic gap.
+- I4 validation boot `.tmp/boot-shell-chrome-20260810-194922.log` moved the dynamic service path as
+  far as `wlansvc.exe` (`pi=11`, pid 652) but did not reach explorer. The exact-listen change is
+  working (`[pipe-listen] completed 1 pending server listen(s) on client connect`), and the
+  ReactOS-faithful `NpTransceive` precondition exposed the next real bug:
+  `TransactNamedPipe(Schedule, 80)` now returns `STATUS_PIPE_BUSY` because the executive redrive path
+  was issuing a second synthetic `IRP_MJ_READ` for a parked transceive instead of consuming the
+  retained npfs completion stash. Review adjustment: parked READ/TRANSCEIVE completion must be
+  delivered only from `IoCompleteRequest`'s exact completed-read stash; no executive re-read fallback.
