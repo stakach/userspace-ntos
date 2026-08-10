@@ -1570,7 +1570,7 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
     if va.checked_add(src.len() as u64).is_none() {
         return false;
     }
-    if smss_copyout(va, src) {
+    if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src) {
         return true;
     }
     let mut copied = 0usize;
@@ -1661,7 +1661,7 @@ pub(crate) unsafe fn csrss_out_write(
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
     pml4: u64,
 ) -> bool {
-    if smss_copyout(va, &val.to_le_bytes()) {
+    if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, &val.to_le_bytes()) {
         return true;
     }
     if va & 0xFFF > 0xFF8 {

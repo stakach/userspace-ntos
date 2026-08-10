@@ -2220,3 +2220,33 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   (`shell32`) before it reached the prior late service/RPC context-handle fault. Review adjustment:
   run one fresh serialized graphics/no-exit boot after committing this cleanup; the proof must show
   either genuine explorer syscalls/paint or the next precise red edge after the LSA handle fix.
+- I4 LSA LPC copyout/request follow-up. The accepted handle was still vulnerable to a wrong-process
+  publication: `client_copyout_or_fill_mapped(pi, ...)` tried the current `ACTIVE_*` mirrors before
+  its explicit target process path, so an LSA completion running in lsass could report success after
+  writing through lsass' image mirror instead of the connector's image/global storage. Explicit
+  copyout helpers now only use active mirrors when `ACTIVE_CLIENT_PI == pi`, and
+  `lsa_complete_connect` selects the parked client's mirror context while publishing `*PortHandle`
+  and `ConnectInfo`. The LSA data plane also no longer fails a valid client request just because the
+  real server has not yet re-entered `NtReplyWaitReceivePort`; it parks the client request and
+  delivers the stored payload when the server parks again. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized headless boot
+  `.tmp/boot-lsa-request-timing-20260810-204100.log` (previous proof:
+  `.tmp/boot-lsa-copyout-active-pi-stream-20260810-203714.log`). Both boots passed the base
+  desktop-background gate (`exec_win32k_desktop_painted`) but quiesced before any
+  `\LsaAuthenticationPort` client connect was delivered: services' LSA/SCM RPC workers loop in real
+  `NtDelayExecution(Alertable = FALSE, Timeout = 0x1058fd30)` after starting worker threads. Review
+  adjustment: keep these LPC/copyout semantics, then resolve that service-delay/progress edge so the
+  dynamic service wave reaches `wkssvc`/LSA again; do not relax quiesce with synthetic progress.
+- I4 LSA request timing fix staged. The later serialized headless run
+  `.tmp/run-headless-lsa-lpc-20260810-203214.log` did reach `wkssvc`'s real
+  `NtConnectPort(\LsaAuthenticationPort)`, copied back and cached the accepted handle, then exposed a
+  real LPC wait-order bug: `wkssvc` immediately issued `LsaLookupAuthenticationPackage` while the LSA
+  server thread was between receive calls, so the executive fell through to the generic
+  `NtRequestWaitReplyPort` failure path and returned `STATUS_INVALID_HANDLE`. NT parks that request
+  until the server calls `NtReplyWaitReceivePort`; the LSA rendezvous now stores one parked request
+  payload with the caller CID and delivers it as soon as the real LSA server re-enters its receive
+  syscall. Local validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: run one
+  serialized boot next and require the old `LsaLookupAuthenticationPackage() failed! (Status
+  0xc0000008)` edge to disappear before returning to the rpcrt4 context-handle frontier.

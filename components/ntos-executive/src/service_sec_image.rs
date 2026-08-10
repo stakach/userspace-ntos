@@ -6702,7 +6702,10 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = lsa_deliver_reply(&mut nt_handler, replymsg);
                 }
                 if lsa_server_park(badge, pi, recvmsg, ctx_out, resume_ip, sp, flags) {
-                    if LSA_SERVER_PARKS.load(Ordering::Relaxed) <= 4 {
+                    let delivered_waiting_request = lsa_try_deliver_pending_request(&mut nt_handler);
+                    if delivered_waiting_request {
+                        bump_progress();
+                    } else if LSA_SERVER_PARKS.load(Ordering::Relaxed) <= 4 {
                         print_str(b"[lsa-rdv] real LSA server thread (badge ");
                         print_u64(badge);
                         print_str(
@@ -6715,7 +6718,9 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    mark_wait_parked!(pi, m0);
+                    if !delivered_waiting_request {
+                        mark_wait_parked!(pi, m0);
+                    }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -6736,7 +6741,6 @@ pub(crate) unsafe fn service_sec_image(
             // dynamically launched services use the same LSA data plane.
             if LSA_RENDEZVOUS_ENABLED
                 && m0 == SSN_NT_REQUEST_WAIT_REPLY_PORT
-                && lsa_server_parked()
                 && LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
                 && nt_handler.lpc_connection_is(get_recv_mr(9), pi, b"\\lsaauthenticationport")
             {
@@ -6764,50 +6768,37 @@ pub(crate) unsafe fn service_sec_image(
                             .try_into()
                             .unwrap(),
                     ) as u64;
-                    let client_pid = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
-                    if lsa_client_park(2, badge, pi, replymsg, 0, 0, resume_ip, sp, flags) {
-                        let delivered = lsa_server_deliver(
-                            &mut nt_handler,
-                            LSA_MSG_TYPE_REQUEST,
-                            client_pid,
-                            current_tid,
+                    if lsa_client_park(
+                        2,
+                        badge,
+                        pi,
+                        current_tid,
+                        replymsg,
+                        0,
+                        0,
+                        resume_ip,
+                        sp,
+                        flags,
+                    ) {
+                        lsa_store_request_payload(
+                            api_number,
                             &message[LSA_PORT_MESSAGE_HEADER as usize..length],
-                            LSA_PORT_CONTEXT.load(Ordering::Relaxed),
                         );
+                        let delivered = lsa_try_deliver_pending_request(&mut nt_handler);
                         if delivered {
-                            LSA_REQUESTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
-                            LSA_LAST_API_NUMBER.store(api_number, Ordering::Relaxed);
-                            // ApiNumber 2 = LsaLogonUser: mark the credential validation IN FLIGHT
-                            // so registry reads the real MSV1_0/lsasrv code makes while servicing it
-                            // (notably `GetAccountDomainSid`'s `PolAcDm*` reads) are attributable to
-                            // the logon rather than to LSA init.
-                            LSA_LOGON_IN_FLIGHT
-                                .store(u64::from(api_number == 2), Ordering::Relaxed);
-                            if api_number < 64 {
-                                LSA_API_MASK.fetch_or(1u64 << api_number, Ordering::Relaxed);
-                            }
-                            print_str(
-                                b"[lsa-rdv] REQUEST relayed to the real LSA server: ApiNumber=",
-                            );
+                            bump_progress();
+                        } else {
+                            print_str(b"[lsa-rdv] REQUEST parked until the real LSA server receives: ApiNumber=");
                             print_u64(api_number);
                             print_str(b" bytes=");
                             print_u64(length as u64);
-                            print_str(b" -> connector BLOCKED on the reply\n");
-                            bump_progress();
-                        } else {
-                            // Nothing was woken on the server side — release the connector with a
-                            // real failure rather than leaving it blocked forever.
-                            let cap = LSA_CLI_REPLY_CAP.swap(0, Ordering::Relaxed);
-                            LSA_CLI_KIND.store(0, Ordering::Relaxed);
-                            lsa_wake(cap, 0xC000_0001, resume_ip, sp, flags);
+                            print_str(b"\n");
                         }
                         procs[pi].faults = faults;
                         procs[pi].first = first;
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
-                        if delivered {
-                            mark_wait_parked!(pi, resume_ip);
-                        }
+                        mark_wait_parked!(pi, resume_ip);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -7666,6 +7657,7 @@ pub(crate) unsafe fn service_sec_image(
                             1,
                             badge,
                             pi,
+                            current_tid,
                             out_ptr,
                             conn_info_ptr,
                             conn_info_len as u64,
@@ -17905,6 +17897,10 @@ static LSA_CLI_CONNINFO_LEN: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_IP: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_SP: AtomicU64 = AtomicU64::new(0);
 static LSA_CLI_FLAGS: AtomicU64 = AtomicU64::new(0);
+static LSA_CLI_TID: AtomicU64 = AtomicU64::new(0);
+static LSA_CLI_REQUEST_API: AtomicU64 = AtomicU64::new(u64::MAX);
+static LSA_CLI_REQUEST_LEN: AtomicU64 = AtomicU64::new(0);
+static mut LSA_CLI_REQUEST: [u8; LSA_API_MSG_MAX] = [0; LSA_API_MSG_MAX];
 
 /// Steal the Reply object bound to the caller the loop is currently servicing and rotate a fresh pool
 /// object into `REPLY_MAIN_SLOT` — the SAME mechanism `wait_park_multi` / `pipe_wait_park` /
@@ -17987,6 +17983,9 @@ fn lsa_clear_client_context() {
     LSA_CLI_IP.store(0, Ordering::Relaxed);
     LSA_CLI_SP.store(0, Ordering::Relaxed);
     LSA_CLI_FLAGS.store(0, Ordering::Relaxed);
+    LSA_CLI_TID.store(0, Ordering::Relaxed);
+    LSA_CLI_REQUEST_API.store(u64::MAX, Ordering::Relaxed);
+    LSA_CLI_REQUEST_LEN.store(0, Ordering::Relaxed);
 }
 
 /// PARK the real LSA server thread on its `NtReplyWaitReceivePort` — the reply capability is RETAINED
@@ -18108,6 +18107,7 @@ unsafe fn lsa_client_park(
     kind: u64,
     badge: u64,
     pi: usize,
+    tid: u64,
     out: u64,
     conninfo: u64,
     conninfo_len: u64,
@@ -18121,6 +18121,7 @@ unsafe fn lsa_client_park(
     LSA_CLI_KIND.store(kind, Ordering::Relaxed);
     LSA_CLI_BADGE.store(badge, Ordering::Relaxed);
     LSA_CLI_PI.store(pi as u64, Ordering::Relaxed);
+    LSA_CLI_TID.store(tid, Ordering::Relaxed);
     LSA_CLI_OUT.store(out, Ordering::Relaxed);
     LSA_CLI_CONNINFO.store(conninfo, Ordering::Relaxed);
     LSA_CLI_CONNINFO_LEN.store(conninfo_len, Ordering::Relaxed);
@@ -18129,6 +18130,60 @@ unsafe fn lsa_client_park(
     LSA_CLI_FLAGS.store(flags, Ordering::Relaxed);
     LSA_CLI_REPLY_CAP.store(cap, Ordering::Relaxed);
     true
+}
+
+unsafe fn lsa_store_request_payload(api_number: u64, payload: &[u8]) {
+    let length = payload.len().min(LSA_API_MSG_MAX);
+    if length != 0 {
+        let dst = core::ptr::addr_of_mut!(LSA_CLI_REQUEST) as *mut u8;
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), dst, length);
+    }
+    LSA_CLI_REQUEST_API.store(api_number, Ordering::Relaxed);
+    LSA_CLI_REQUEST_LEN.store(length as u64, Ordering::Relaxed);
+}
+
+unsafe fn lsa_try_deliver_pending_request(nt_handler: &mut ExecNtHandler) -> bool {
+    if LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
+        || LSA_CLI_KIND.load(Ordering::Relaxed) != 2
+        || LSA_SRV_REPLY_CAP.load(Ordering::Relaxed) == 0
+    {
+        return false;
+    }
+    let length = (LSA_CLI_REQUEST_LEN.load(Ordering::Relaxed) as usize).min(LSA_API_MSG_MAX);
+    if length == 0 {
+        return false;
+    }
+    let Some(cli_pi) = lsa_recorded_pi(&LSA_CLI_PI) else {
+        return false;
+    };
+    let client_pid = nt_handler.pm_pid_for_pi(cli_pi).unwrap_or(0) as u64;
+    let client_tid = LSA_CLI_TID.load(Ordering::Relaxed);
+    let api_number = LSA_CLI_REQUEST_API.load(Ordering::Relaxed);
+    let payload =
+        core::slice::from_raw_parts(core::ptr::addr_of!(LSA_CLI_REQUEST) as *const u8, length);
+    let delivered = lsa_server_deliver(
+        nt_handler,
+        LSA_MSG_TYPE_REQUEST,
+        client_pid,
+        client_tid,
+        payload,
+        LSA_PORT_CONTEXT.load(Ordering::Relaxed),
+    );
+    if delivered {
+        LSA_CLI_REQUEST_LEN.store(0, Ordering::Relaxed);
+        LSA_REQUESTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        LSA_LAST_API_NUMBER.store(api_number, Ordering::Relaxed);
+        LSA_LOGON_IN_FLIGHT.store(u64::from(api_number == 2), Ordering::Relaxed);
+        if api_number < 64 {
+            LSA_API_MASK.fetch_or(1u64 << api_number, Ordering::Relaxed);
+        }
+        print_str(b"[lsa-rdv] REQUEST relayed to the real LSA server: ApiNumber=");
+        print_u64(api_number);
+        print_str(b" bytes=");
+        print_u64((length + LSA_PORT_MESSAGE_HEADER as usize) as u64);
+        print_str(b" -> connector BLOCKED on the reply\n");
+    }
+    delivered
 }
 
 /// Finish the CONNECT half: the real server completed (or refused) the connection. Copy the
@@ -18179,32 +18234,34 @@ unsafe fn lsa_complete_connect(
     let cli_filled = &mut pfilled[cli_pi];
     let cli_faults = &mut procs[cli_pi].faults;
     let mut copyout_ok = true;
-    if outcome == 1 && out != 0 && client_handle != 0 {
-        copyout_ok = img_spawn::client_copyout_or_fill_mapped(
-            cli_pi as u64,
-            out,
-            &client_handle.to_le_bytes(),
-            cli_filled,
-            cli_faults,
-            cli_scratch_base,
-            reg,
-            dll_pes,
-            cli_pml4,
-        );
-    }
-    if copyout_ok && have_info && conninfo != 0 && conninfo_len != 0 {
-        copyout_ok = img_spawn::client_copyout_or_fill_mapped(
-            cli_pi as u64,
-            conninfo,
-            &connect_info[..conninfo_len],
-            cli_filled,
-            cli_faults,
-            cli_scratch_base,
-            reg,
-            dll_pes,
-            cli_pml4,
-        );
-    }
+    lsa_with_peer(nt_handler, cli_badge, cli_pi, |_handler| {
+        if outcome == 1 && out != 0 && client_handle != 0 {
+            copyout_ok = img_spawn::client_copyout_or_fill_mapped(
+                cli_pi as u64,
+                out,
+                &client_handle.to_le_bytes(),
+                cli_filled,
+                cli_faults,
+                cli_scratch_base,
+                reg,
+                dll_pes,
+                cli_pml4,
+            );
+        }
+        if copyout_ok && have_info && conninfo != 0 && conninfo_len != 0 {
+            copyout_ok = img_spawn::client_copyout_or_fill_mapped(
+                cli_pi as u64,
+                conninfo,
+                &connect_info[..conninfo_len],
+                cli_filled,
+                cli_faults,
+                cli_scratch_base,
+                reg,
+                dll_pes,
+                cli_pml4,
+            );
+        }
+    });
     if outcome == 1 && !copyout_ok {
         print_str(b"[lsa-rdv] WALL: failed client connect copyout pi=");
         print_u64(cli_pi as u64);
