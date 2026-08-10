@@ -52,6 +52,9 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
@@ -83,6 +86,118 @@ fn print_sanitized_ascii(bytes: &[u8], limit: usize) {
             b'.'
         });
     }
+}
+
+fn print_sanitized_utf16_ascii(units: &[u16], limit: usize) {
+    for &unit in units.iter().take(limit) {
+        debug_put_char(if (0x20..0x7f).contains(&unit) {
+            unit as u8
+        } else {
+            b'.'
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_named_pipe_io(
+    pi: usize,
+    badge: u64,
+    tid: u64,
+    op: &[u8],
+    handle: u64,
+    file_id: u64,
+    len: usize,
+    status: u32,
+    info: u64,
+    event: u64,
+    apc_context: u64,
+    sample: &[u8],
+) {
+    let name_hash = crate::pipe_fid_name_hash(file_id);
+    if file_id == 0 || name_hash == 0 {
+        return;
+    }
+    let n = NAMED_PIPE_IO_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 256 {
+        return;
+    }
+    print_str(b"[pipe-io] #");
+    print_u64(n);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" op=");
+    print_str(op);
+    print_str(b" handle=0x");
+    print_hex(handle as u32);
+    print_str(b" fid=0x");
+    print_hex(file_id as u32);
+    print_str(b" name_hash=0x");
+    print_hex_u64(name_hash);
+    print_str(b" len=");
+    print_u64(len as u64);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(info);
+    print_str(b" event=0x");
+    print_hex(event as u32);
+    print_str(b" apc_ctx=0x");
+    print_hex(apc_context as u32);
+    print_str(b" sample=");
+    for &byte in sample.iter().take(16) {
+        print_hex(byte as u32);
+        print_str(b" ");
+    }
+    print_str(b"\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_pipe_open(
+    api: &[u8],
+    pi: usize,
+    badge: u64,
+    tid: u64,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    status: u32,
+    info: u64,
+    name16: &[u16],
+) {
+    let n = PIPE_OPEN_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 96 && status == nt_fs::STATUS_SUCCESS {
+        return;
+    }
+    print_str(b"[pipe-open] #");
+    print_u64(n);
+    print_str(b" api=");
+    print_str(api);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" access=0x");
+    print_hex(access);
+    print_str(b" share=0x");
+    print_hex(share);
+    print_str(b" disposition=0x");
+    print_hex(disposition);
+    print_str(b" options=0x");
+    print_hex(options);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(info);
+    print_str(b" name=\"");
+    print_sanitized_utf16_ascii(name16, 96);
+    print_str(b"\"\n");
 }
 
 fn trace_explorer_io_completion(
@@ -4381,10 +4496,18 @@ impl ExecNtHandler {
             .filter(|&tid| tid != 0)
     }
 
-    pub(crate) fn hosted_thread_role_for_badge(&self, badge: u64) -> Option<HostedThreadRole> {
+    pub(crate) fn hosted_thread_badge_for_tid(&self, tid: u64) -> Option<u64> {
         self.thread_runtime
-            .get_by_badge(badge)
-            .map(|runtime| runtime.role)
+            .get_by_tid(tid)
+            .map(|runtime| runtime.badge)
+    }
+
+    pub(crate) fn live_hosted_thread_badges_for_pi(
+        &self,
+        pi: usize,
+        out: &mut [u64],
+    ) -> usize {
+        self.thread_runtime.live_badges_for_pi(pi, out)
     }
 
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
@@ -13160,16 +13283,29 @@ impl ExecNtHandler {
                 } else {
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
+                let info = if status == nt_fs::STATUS_SUCCESS {
+                    nt_fs::FILE_OPENED as u64
+                } else {
+                    0
+                };
                 let iosb = get_recv_mr(8);
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
-                    let info = if status == nt_fs::STATUS_SUCCESS {
-                        nt_fs::FILE_OPENED as u64
-                    } else {
-                        0
-                    };
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                 }
+                trace_pipe_open(
+                    b"NtOpenFile",
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    args[1] as u32,
+                    args[4] as u32,
+                    nt_fs::FILE_OPEN,
+                    args[5] as u32,
+                    status,
+                    info,
+                    &nm,
+                );
                 loader_trace_record(
                     self.pi,
                     LoaderOp::OpenFile,
@@ -13216,12 +13352,25 @@ impl ExecNtHandler {
                         } else {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
                         }
+                        let info = if status == 0 { 1u64 } else { 0 };
                         let iosb = get_recv_mr(8);
                         if iosb != 0 {
                             self.xas_write_buf(iosb, &status.to_le_bytes());
-                            let info = if status == 0 { 1u64 } else { 0 };
                             self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                         }
+                        trace_pipe_open(
+                            b"NtOpenFile",
+                            self.pi,
+                            self.current_badge,
+                            self.current_tid,
+                            args[1] as u32,
+                            args[4] as u32,
+                            nt_fs::FILE_OPEN,
+                            args[5] as u32,
+                            status,
+                            info,
+                            &nm,
+                        );
                         loader_trace_record(
                             self.pi,
                             LoaderOp::OpenFile,
@@ -13240,6 +13389,19 @@ impl ExecNtHandler {
                             self.xas_write_buf(iosb, &status.to_le_bytes());
                             self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                         }
+                        trace_pipe_open(
+                            b"NtOpenFile",
+                            self.pi,
+                            self.current_badge,
+                            self.current_tid,
+                            args[1] as u32,
+                            args[4] as u32,
+                            nt_fs::FILE_OPEN,
+                            args[5] as u32,
+                            status,
+                            0,
+                            &nm,
+                        );
                         loader_trace_record(
                             self.pi,
                             LoaderOp::OpenFile,
@@ -15394,6 +15556,11 @@ impl ExecNtHandler {
                 let is_pipe_wait = (fsctl as u32) == FSCTL_PIPE_WAIT;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
                 let mut transceive_file_retained = false;
+                let mut transceive_pending_async = false;
+                let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
+                let mut pipe_wait_trace_hash = 0u64;
+                let mut pipe_wait_trace_armed = false;
+                let mut pipe_wait_trace_known = false;
                 if is_pipe_wait && self.is_npfs_root_handle(args[0]) {
                     const PIPE_WAIT_INPUT_CAP: usize = 0x1_000c;
                     if !driver_launch::npfs_ready() {
@@ -15417,10 +15584,16 @@ impl ExecNtHandler {
                                 Ok(wait_request) => {
                                     let leaf = Self::pipe_leaf16(&wait_request.name);
                                     let pipe_wait_name_hash = nt_io_manager::pipe_name_hash(&leaf);
+                                    pipe_wait_trace_name = Some(leaf.clone());
+                                    pipe_wait_trace_hash = pipe_wait_name_hash;
                                     let listens = &*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS);
-                                    if listens.armed_name(pipe_wait_name_hash) {
+                                    pipe_wait_trace_armed =
+                                        listens.armed_name(pipe_wait_name_hash);
+                                    pipe_wait_trace_known =
+                                        crate::pipe_name_hash_known(pipe_wait_name_hash);
+                                    if pipe_wait_trace_armed {
                                         status = nt_fs::STATUS_SUCCESS as u64;
-                                    } else if !crate::pipe_name_hash_known(pipe_wait_name_hash) {
+                                    } else if !pipe_wait_trace_known {
                                         status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND as u64;
                                     } else {
                                         let deadline = pipe_wait_deadline_100ns(&wait_request);
@@ -15459,6 +15632,32 @@ impl ExecNtHandler {
                             }
                         }
                     }
+                    let trace = PIPE_WAIT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                    if trace < 96 || status != nt_fs::STATUS_SUCCESS as u64 {
+                        print_str(b"[pipe-wait] #");
+                        print_u64(trace);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" tid=");
+                        print_u64(self.current_tid);
+                        print_str(b" status=0x");
+                        print_hex(status as u32);
+                        print_str(b" hash=0x");
+                        print_hex_u64(pipe_wait_trace_hash);
+                        print_str(b" armed=");
+                        print_u64(pipe_wait_trace_armed as u64);
+                        print_str(b" known=");
+                        print_u64(pipe_wait_trace_known as u64);
+                        print_str(b" in_len=");
+                        print_u64(raw_input_len as u64);
+                        print_str(b" name=\"");
+                        if let Some(name) = pipe_wait_trace_name.as_ref() {
+                            print_sanitized_utf16_ascii(name, 96);
+                        }
+                        print_str(b"\"\n");
+                    }
                 } else if is_pipe_wait {
                     status = if fid == 0 {
                         STATUS_INVALID_HANDLE
@@ -15478,15 +15677,23 @@ impl ExecNtHandler {
                     } else {
                         let prepared = if is_pipe_transceive {
                             let waiter_table = &*core::ptr::addr_of!(PIPE_WAITERS);
-                            let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
-                            let reply_capacity = REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
-                                && (0..WAIT_REPLY_POOL_N).any(|index| {
-                                    used & (1u64 << index) == 0
-                                        && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
-                                });
+                            let synchronous = self
+                                .file_completion
+                                .is_synchronous(route.file_id)
+                                .unwrap_or(true);
+                            let sync_reply_capacity = if synchronous {
+                                let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+                                REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+                                    && (0..WAIT_REPLY_POOL_N).any(|index| {
+                                        used & (1u64 << index) == 0
+                                            && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+                                    })
+                            } else {
+                                true
+                            };
                             if !waiter_table.has_capacity()
-                                || waiter_table.parked_on(route.file_id)
-                                || !reply_capacity
+                                || waiter_table.parked_on_dir(route.file_id, false)
+                                || !sync_reply_capacity
                             {
                                 Err(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                             } else {
@@ -15538,13 +15745,46 @@ impl ExecNtHandler {
                     && (status as u32) == STATUS_PENDING
                     && args[8] != 0
                 {
-                    self.pipe_park_fid = fid;
-                    self.pipe_park_buffer_va = args[8];
-                    self.pipe_park_buffer_len = args[9] as u32;
-                    self.pipe_park_iosb_va = iosb;
-                    self.pipe_park_apc_context = args[3];
-                    self.pipe_park_event_obj_idx = event_obj_idx;
-                    self.pipe_park_transceive = true;
+                    let synchronous = self.file_completion.is_synchronous(fid).unwrap_or(true);
+                    if synchronous {
+                        self.pipe_park_fid = fid;
+                        self.pipe_park_buffer_va = args[8];
+                        self.pipe_park_buffer_len = args[9] as u32;
+                        self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_context = args[3];
+                        self.pipe_park_event_obj_idx = event_obj_idx;
+                        self.pipe_park_transceive = true;
+                    } else {
+                        let waiter = nt_io_manager::PipeWaiter {
+                            file_id: fid,
+                            pi: self.pi as u32,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
+                            buffer_va: args[8],
+                            buffer_len: args[9] as u32,
+                            iosb_va: iosb,
+                            apc_context: args[3],
+                            event_obj_idx,
+                            reply_cap: 0,
+                            resume_ip: 0,
+                            resume_sp: 0,
+                            resume_flags: 0,
+                            is_transceive: true,
+                            is_write: false,
+                        };
+                        if (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
+                            .park(waiter)
+                            .is_some()
+                        {
+                            transceive_pending_async = true;
+                        } else {
+                            if transceive_file_retained {
+                                self.release_file_reference(fid);
+                                transceive_file_retained = false;
+                            }
+                            status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                        }
+                    }
                 }
                 // A server posting an overlapped FSCTL_PIPE_LISTEN that NPFS returns STATUS_PENDING for
                 // keeps running until a client connect completes the listen. Record the completion event
@@ -15598,13 +15838,19 @@ impl ExecNtHandler {
                     && self.pipe_park_fid == 0
                     && self.pipe_listen_fid == 0
                     && self.pipe_name_wait_hash == 0
+                    && !transceive_pending_async
                 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
-                // A TRANSCEIVE that COMPLETED synchronously (it wrote request bytes into npfs) may also
-                // satisfy the peer's parked read — ask the loop to re-drive.
-                if fid != 0 && is_pipe_transceive && (status as u32) != STATUS_PENDING {
+                // A TRANSCEIVE writes the request before reading the reply. Even when the read half
+                // pends, that request may satisfy the peer's parked read, so re-drive readers for both
+                // successful synchronous completion and STATUS_PENDING.
+                if fid != 0
+                    && is_pipe_transceive
+                    && ((status as u32) == STATUS_PENDING
+                        || (status as u32) & 0xC000_0000 != 0xC000_0000)
+                {
                     self.pipe_write_redrive = true;
                 }
                 status as u32
@@ -17826,7 +18072,7 @@ impl ExecNtHandler {
                 let key = args[1];
                 let _alertable = args[2];
                 let timeout_ptr = args[3];
-                if keyed_wait_wake_one(key, 0) {
+                if keyed_wait_wake_one(self, key, 0) {
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
                     print_hex_u64(key);
                     print_str(b" -> WAKE one\n");
@@ -20290,6 +20536,10 @@ impl ExecNtHandler {
                         print_u64(trace);
                         print_str(b" pi=");
                         print_u64(self.pi as u64);
+                        print_str(b" badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" tid=");
+                        print_u64(self.current_tid);
                         print_str(b" access=0x");
                         print_hex(args[1] as u32);
                         print_str(b" share=0x");
@@ -20604,6 +20854,20 @@ impl ExecNtHandler {
                         self.io_signal_event = index as i64;
                     }
                 }
+                trace_named_pipe_io(
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    b"write",
+                    fh,
+                    completion_file_id,
+                    len,
+                    status,
+                    information,
+                    event,
+                    apc_context,
+                    &payload,
+                );
                 // ★ LSA SELF-RPC instrumentation. Every MS-RPC PDU (`rpc_ver == 5`) written onto lsass'
                 // OWN `\pipe\lsarpc`, split by which side of the self-RPC wrote it: the per-connection
                 // WORKER (badge LSA_WORKER_BADGE — bind_ack / the LsarOpenPolicy response) versus lsass'
@@ -20987,6 +21251,20 @@ impl ExecNtHandler {
                         self.io_signal_event = index as i64;
                     }
                 }
+                trace_named_pipe_io(
+                    self.pi,
+                    self.current_badge,
+                    self.current_tid,
+                    b"read",
+                    fh,
+                    completion_file_id,
+                    len,
+                    status,
+                    information,
+                    event,
+                    apc_context,
+                    &output[..(information as usize).min(output.len())],
+                );
                 if NT_READ_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-read-file] pi=");
                     print_u64(self.pi as u64);

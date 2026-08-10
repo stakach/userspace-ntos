@@ -31,17 +31,29 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Active boot-fix slice: `.tmp/boot-openfile-pipe-wait-20260810-092820.log` rebuilt ntdll,
-the executive, rust-micro, and the disk image, then reached real services/EventLog progress after
-the desktop path before timing out. The last stable frontier is not an `EventLog` shortcut:
-EventLog connects to SCM, SCM and EventLog exchange real pipe traffic, and the SCM worker later
-probes `\pipe\EventLog` before the EventLog RPC endpoint exists, receiving the real
-`STATUS_OBJECT_NAME_NOT_FOUND`. The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a
-bounded name waiter with real timeout/deadline handling and exact name completion, `NtOpenFile`
-clears failed output handles, and main threads plus persistent server-loop roles count their owning
-process when they take a deadline-less wait. Follow-up structural debt: the NPFS root handle should
-become a real hosted-FSD file object so `FSCTL_PIPE_WAIT` pending IRPs live inside the npfs driver
-instead of the executive carrying a root-handle wait queue.
+Active boot-fix slice: `.tmp/boot-rpc-opnum-20260810-101528.log` rebuilt ntdll,
+the executive, rust-micro, and the disk image, then reached real services/EventLog progress before
+timing out. The per-thread wait-state cleanup moved the edge forward: EventLog connects to SCM,
+SCM and EventLog exchange real `\ntsvcs` pipe traffic, and bounded DCE/RPC decode proves EventLog's
+blocked service-control request is `RSetServiceStatus` (`opnum 7`). While handling that request SCM
+probes `\pipe\EventLog` before the EventLog RPC endpoint exists and gets the real
+`STATUS_OBJECT_NAME_NOT_FOUND`. The delayed SCM worker is timer-woken instead of falsely quiescing,
+but no further IPC reaches the executive after that wake. The next slice is generic root
+`WaitNamedPipe`/RPC-unwind evidence around that live SCM/EventLog RPC wait set.
+
+The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a bounded name waiter with real
+timeout/deadline handling and exact name completion, `NtOpenFile` clears failed output handles, and
+hosted-thread quiesce now tracks the actual parked thread badges. Dispatcher waits, pipe reads,
+pipe-name waits, keyed waits, IOCP removers, GUI message waits, Dbgk blocks, and LSA rendezvous parks
+all update one per-thread parked-state table; a process owner only counts as wait-parked when every
+live hosted thread with a real TCB is parked. The old SCM-listener exit/read-park flags and
+role-counted quiesce shortcuts have been removed. The active diagnostic slice adds generic named-pipe
+I/O traces, DCE/RPC PDU summaries, dispatcher wake traces, root `NtOpenFile` pipe traces, root
+`FSCTL_PIPE_WAIT` branch traces, and post-park owner-mask traces so the remaining `\ntsvcs` stall can
+be fixed in the pipe/wait/RPC-unwind machinery rather than through service identity. Follow-up
+structural debt: the NPFS root handle should become a real hosted-FSD file object so
+`FSCTL_PIPE_WAIT` pending IRPs live inside the npfs driver instead of the executive carrying a
+root-handle wait queue.
 
 Boot proof `.tmp/boot-dynamic-hive-flush-gate-20260810.log` reaches `[microtest done]` at
 `291/295`:

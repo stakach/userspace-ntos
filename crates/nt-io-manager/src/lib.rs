@@ -2175,6 +2175,7 @@ mod tests {
             WdmIrpInit {
                 system_buffer: 0x1111,
                 user_buffer: 0x2222,
+                thread: 0x4444,
                 stack_count: 1,
                 current_location: 1,
                 current_stack_location: 0x3333,
@@ -2185,6 +2186,7 @@ mod tests {
         assert_eq!(irp[0x42], 1);
         assert_eq!(irp[0x43], 1);
         assert_eq!(le_u64(&irp, 0x70), 0x2222);
+        assert_eq!(le_u64(&irp, 0xa8), 0x4444);
         assert_eq!(le_u64(&irp, 0xb8), 0x3333);
 
         let mut stack = [0xCC; WDM_X64_IO_STACK_LOCATION_SIZE];

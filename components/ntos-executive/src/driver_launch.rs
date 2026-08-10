@@ -354,6 +354,8 @@ struct PendingIrp {
 static mut DATA_TRACE_COUNT: u32 = 0;
 /// Bounded ENTER/EXIT trace of IRP dispatches (see [`dispatch_irp`]).
 static mut FSD_DISPATCH_TRACE: u32 = 0;
+/// Narrow NPFS read/write queue-state trace for message-mode RPC over named pipes.
+static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
 static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
@@ -841,7 +843,7 @@ pub(crate) static FSD_FO_DANGLING: AtomicU64 = AtomicU64::new(0);
 /// …and no longer even CONTAINS a FILE_OBJECT (`Type != IO_TYPE_FILE` / wrong `Size`) — the hard,
 /// non-circular evidence of a use-after-free: the pool recycled the block under npfs' feet.
 pub(crate) static FSD_FO_CORRUPTED: AtomicU64 = AtomicU64::new(0);
-/// Opens whose FILE_OBJECT had to be transient because [`FILE_OBJECTS`] was full (bounded fallback).
+/// Opens rejected because the per-open FILE_OBJECT table was full.
 pub(crate) static FSD_FO_TABLE_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// The per-open FILE_OBJECT for `fid`, or 0.
@@ -856,6 +858,11 @@ unsafe fn fo_lookup(fid: u64) -> u64 {
         }
     }
     0
+}
+
+unsafe fn fo_has_free_slot() -> bool {
+    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
+    table.iter().any(|slot| slot.fid == 0)
 }
 
 /// Is `fo` one of the live per-open FILE_OBJECTs?
@@ -963,6 +970,212 @@ unsafe fn queue_dump(tag: &[u8], dq: u64, state: u32, entries: u32, walked: u32,
         print_u64(read_volatile((dq + 0x20) as *const u32) as u64);
         print_str(b" quota=");
         print_u64(read_volatile((dq + 0x24) as *const u32) as u64);
+    }
+    print_str(b"\n");
+}
+
+#[derive(Clone, Copy)]
+struct PipeQueueView {
+    state: u32,
+    bytes: u32,
+    entries: u32,
+    quota_used: u32,
+    byte_offset: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PipeCcbView {
+    q: [PipeQueueView; 2],
+}
+
+#[derive(Clone, Copy)]
+struct DceRpcPduView {
+    ptype: u8,
+    flags: u8,
+    frag_len: u16,
+    call_id: u32,
+    opnum: Option<u16>,
+}
+
+impl PipeCcbView {
+    fn has_queued_state(&self) -> bool {
+        self.q.iter().any(|q| {
+            q.state != NP_QUEUE_EMPTY
+                || q.bytes != 0
+                || q.entries != 0
+                || q.quota_used != 0
+                || q.byte_offset != 0
+        })
+    }
+}
+
+unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
+    if payload == 0 || len < 16 {
+        return None;
+    }
+    let version = read_volatile(payload as *const u8);
+    if version != 5 {
+        return None;
+    }
+    let ptype = read_volatile((payload + 2) as *const u8);
+    if ptype > 19 {
+        return None;
+    }
+    let flags = read_volatile((payload + 3) as *const u8);
+    let frag_len = u16::from_le_bytes([
+        read_volatile((payload + 8) as *const u8),
+        read_volatile((payload + 9) as *const u8),
+    ]);
+    let call_id = u32::from_le_bytes([
+        read_volatile((payload + 12) as *const u8),
+        read_volatile((payload + 13) as *const u8),
+        read_volatile((payload + 14) as *const u8),
+        read_volatile((payload + 15) as *const u8),
+    ]);
+    let opnum = if ptype == 0 && len >= 24 {
+        Some(u16::from_le_bytes([
+            read_volatile((payload + 22) as *const u8),
+            read_volatile((payload + 23) as *const u8),
+        ]))
+    } else {
+        None
+    };
+    Some(DceRpcPduView {
+        ptype,
+        flags,
+        frag_len,
+        call_id,
+        opnum,
+    })
+}
+
+fn dcerpc_ptype_name(ptype: u8) -> &'static [u8] {
+    match ptype {
+        0 => b"request",
+        2 => b"response",
+        3 => b"fault",
+        11 => b"bind",
+        12 => b"bind_ack",
+        13 => b"bind_nak",
+        14 => b"alter",
+        15 => b"alter_ack",
+        _ => b"pdu",
+    }
+}
+
+fn print_dcerpc_pdu_view(view: Option<DceRpcPduView>) {
+    let Some(pdu) = view else {
+        return;
+    };
+    print_str(b" rpc=");
+    print_str(dcerpc_ptype_name(pdu.ptype));
+    print_str(b" call=");
+    print_u64(pdu.call_id as u64);
+    print_str(b" frag=");
+    print_u64(pdu.frag_len as u64);
+    print_str(b" flags=0x");
+    print_hex(pdu.flags as u32);
+    if let Some(opnum) = pdu.opnum {
+        print_str(b" op=");
+        print_u64(opnum as u64);
+    }
+}
+
+unsafe fn pipe_queue_view(dq: u64) -> PipeQueueView {
+    PipeQueueView {
+        state: read_volatile((dq + 0x10) as *const u32),
+        bytes: read_volatile((dq + 0x14) as *const u32),
+        entries: read_volatile((dq + 0x18) as *const u32),
+        quota_used: read_volatile((dq + 0x1c) as *const u32),
+        byte_offset: read_volatile((dq + 0x20) as *const u32),
+    }
+}
+
+unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
+    if fid == 0 || fid == 1 {
+        return None;
+    }
+    let ccb = fid & !1;
+    let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+    if ccb < FSD_POOL_VADDR + POOL_DATA_OFF || ccb + 0xC0 > pool_end || ccb & 7 != 0 {
+        return None;
+    }
+    if read_volatile(ccb as *const u16) != NPFS_NTC_CCB {
+        return None;
+    }
+    Some(PipeCcbView {
+        q: [
+            pipe_queue_view(ccb + NP_CCB_DATA_QUEUE),
+            pipe_queue_view(ccb + NP_CCB_DATA_QUEUE + NP_DATA_QUEUE_SIZE),
+        ],
+    })
+}
+
+fn print_pipe_ccb_view(tag: &[u8], view: PipeCcbView) {
+    print_str(tag);
+    for end in 0..2usize {
+        let q = view.q[end];
+        print_str(b" q");
+        print_u64(end as u64);
+        print_str(b"=");
+        print_u64(q.state as u64);
+        print_str(b"/");
+        print_u64(q.bytes as u64);
+        print_str(b"/");
+        print_u64(q.entries as u64);
+        print_str(b"/");
+        print_u64(q.byte_offset as u64);
+        print_str(b"/");
+        print_u64(q.quota_used as u64);
+    }
+}
+
+unsafe fn trace_pipe_rw_result(
+    major: u64,
+    file_id: u64,
+    fsctx: u64,
+    length: u64,
+    status: u32,
+    info: u64,
+    before: Option<PipeCcbView>,
+    payload: u64,
+    payload_len: u64,
+) {
+    if major != IRP_MJ_READ && major != IRP_MJ_WRITE {
+        return;
+    }
+    let after = pipe_ccb_view(if fsctx != 0 { fsctx } else { file_id });
+    let pdu = dcerpc_pdu_view(payload, payload_len);
+    let interesting = status == STATUS_PENDING
+        || status == 0x8000_0005
+        || info != 0
+        || pdu.is_some()
+        || before.is_some_and(|view| view.has_queued_state())
+        || after.is_some_and(|view| view.has_queued_state());
+    if !interesting || PIPE_RW_TRACE_COUNT >= 192 {
+        return;
+    }
+    PIPE_RW_TRACE_COUNT += 1;
+    print_str(b"[fsd-pipe-rw] major=");
+    print_u64(major);
+    print_str(b" fid=0x");
+    print_hex(file_id as u32);
+    print_str(b" end=");
+    print_u64(file_id & 1);
+    print_str(b" fsctx=0x");
+    print_hex(fsctx as u32);
+    print_str(b" len=");
+    print_u64(length);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(info);
+    print_dcerpc_pdu_view(pdu);
+    if let Some(view) = before {
+        print_pipe_ccb_view(b" before", view);
+    }
+    if let Some(view) = after {
+        print_pipe_ccb_view(b" after", view);
     }
     print_str(b"\n");
 }
@@ -7040,6 +7253,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if uses_file_object {
         audit_ccb(file_id);
     }
+    let pipe_rw_before = if major == IRP_MJ_READ || major == IRP_MJ_WRITE {
+        pipe_ccb_view(file_id)
+    } else {
+        None
+    };
 
     // FILE_OBJECT — ONE per OPEN, reused by every IRP on that open, freed at CLEANUP/CLOSE.
     // A FILE_OBJECT outlives the IRP that introduced it (npfs stores it in `Ccb->FileObject[end]`
@@ -7050,6 +7268,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         0
     };
     let owns_fo = uses_file_object && existing == 0;
+    if owns_fo && crate::FSD_FILE_OBJECT_PER_OPEN && !fo_has_free_slot() {
+        FSD_FO_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
     let fo = if !uses_file_object {
         0
     } else if owns_fo {
@@ -7260,13 +7482,14 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let irp_bytes = core::slice::from_raw_parts_mut(irp as *mut u8, WDM_X64_IRP_SIZE);
     if write_wdm_irp(
         irp_bytes,
-        WdmIrpInit {
-            system_buffer: data,
-            user_buffer: data,
-            stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
-            current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
-            current_stack_location: current_iosl,
-        },
+            WdmIrpInit {
+                system_buffer: data,
+                user_buffer: data,
+                thread: s_current_process(),
+                stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
+                current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
+                current_stack_location: current_iosl,
+            },
     )
     .is_err()
     {
@@ -7341,6 +7564,21 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         print_u64(info);
         print_str(b"\n");
     }
+    trace_pipe_rw_result(
+        major,
+        file_id,
+        fsctx,
+        if major == IRP_MJ_READ { outlen } else { inlen },
+        st as u32,
+        info,
+        pipe_rw_before,
+        data,
+        if major == IRP_MJ_READ {
+            info.min(outlen)
+        } else {
+            inlen
+        },
+    );
     if st as u32 == STATUS_PENDING {
         let inserted = insert_pending_irp(PendingIrp {
             irp,

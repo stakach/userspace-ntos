@@ -3950,15 +3950,12 @@ pub(crate) unsafe fn service_sec_image(
     let mut crash_parked: u64 = 0;
     // Which THREAD badges have already logged a `[parked]` fault line (see `park_and_log!`).
     let mut crash_logged: u64 = 0;
-    // Cooperative-wait bitmask: top-level process badges currently parked in a WAKEABLE wait
-    // (NtWaitForSingleObject/MultipleObjects on an unsignalled event, or a lsass-post-signal
-    // containment park). A wait-parked process CAN still be woken by a RUNNING process's NtSetEvent,
-    // so it stays in the live set — UNLESS every live process is now parked (crash OR wait), in which
-    // case no signaler remains → deadlock → quiesce. Cleared at loop-top when the process produces an
-    // event (it's running again). This closes the quiesce gap: winlogon WaitForLsass-parked + lsass
-    // server-thread-parked + services crash-parked would otherwise block `recv` forever (boot timeout,
-    // gate never runs). See the `maybe_quiesce_all_parked!` uses at the wait-park sites.
-    let mut wait_parked: u64 = 0;
+    // Cooperative-wait owner mask, derived from THREAD_WAIT_PARKED. Each deadline-less park records
+    // the actual hosted thread badge; completion paths clear that badge when they resume the stolen
+    // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
+    // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
+    thread_wait_state_reset();
+    let mut wait_parked: u64;
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
     // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
@@ -4120,15 +4117,21 @@ pub(crate) unsafe fn service_sec_image(
             __blocked
         }};
     }
-    // mark_wait_parked!(pi): record that this top-level process is now cooperatively wait-parked, and
-    // if EVERY live top-level process is now parked (crash OR wait) — i.e. no runnable thread remains
-    // to signal any waiter — QUIESCE (break → the gate runs). Called right before a wait-park's
-    // recv-without-reply. Non-diverging in the common case (just sets the bit); breaks only at true
-    // all-parked deadlock. `$ip` is used as the reported stop value.
+    // mark_wait_parked!(pi): record the current hosted thread as blocked in a deadline-less wait, then
+    // recompute which process owners have no runnable hosted threads left. If every live owner is now
+    // crash-parked or wait-parked, QUIESCE (break -> the gate runs). `$ip` is the reported stop value.
     macro_rules! mark_wait_parked {
         ($pi:expr, $ip:expr) => {{
-            let __owner = owner_top_badge_for(&nt_handler, badge);
-            wait_parked |= 1u64 << __owner;
+            thread_wait_state_park_badge(badge);
+            wait_parked = wait_parked_owner_mask(&nt_handler);
+            trace_wait_owner_mask_after_mark(
+                &nt_handler,
+                $pi,
+                badge,
+                live_top_badges(&nt_handler),
+                crash_parked,
+                wait_parked,
+            );
             if (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
             {
@@ -4392,9 +4395,10 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         let pi = live_hosted_pi_for_fault_badge(&nt_handler, badge).unwrap_or(0);
-        // This process is producing an event → it's running, not wait-parked. Clear its cooperative
-        // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
-        wait_parked &= !(1u64 << owner_top_badge_for(&nt_handler, badge));
+        // This thread is producing an event, so it is runnable even if the owning process still has
+        // other parked threads. The owner mask is derived from all live hosted threads below.
+        thread_wait_state_clear_badge(badge);
+        wait_parked = wait_parked_owner_mask(&nt_handler);
         if hosted_main_badge_has_role(
             &nt_handler,
             badge,
@@ -6830,6 +6834,9 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].first = first;
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
+                        if delivered {
+                            mark_wait_parked!(pi, resume_ip);
+                        }
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -7199,13 +7206,6 @@ pub(crate) unsafe fn service_sec_image(
                 // the caller through the normal tail below.
                 match nt_handler.post_action {
                     ExecPostAction::TerminateCurrentThread { tid } => {
-                        // BATCH 34: if the SCM RPC listener (svc-listener, badge 7) terminates, mark the
-                        // SCM server no-longer-live so winlogon's SCM read-park becomes terminal (quiesce)
-                        // instead of hanging the loop's recv (no signaler left until the per-connection
-                        // worker is routed — the flagged N-threads follow-up).
-                        if is_svc_listener {
-                            SVC_LISTENER_TERMINATED.store(1, Ordering::Relaxed);
-                        }
                         let reply_dropped = drop_current_syscall_reply();
                         let mechanism_deleted =
                             terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
@@ -7223,19 +7223,6 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].first = first;
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
-                        // BATCH 34: the SCM listener just exited AND winlogon is already SCM-read-parked
-                        // (waiting for bind_ack). No live signaler remains (BATCH 35 routes the
-                        // per-connection worker but it PARKS on a trampoline-entry fault — see the frontier
-                        // note; it does not yet write bind_ack), so QUIESCE now → run the gate + clean
-                        // qemu_exit instead of blocking to timeout.
-                        if is_svc_listener
-                            && WINLOGON_SCM_PARKED.load(Ordering::Relaxed) != 0
-                            && !defer_quiesce_for_active_user_callbacks(b"scm-listener-exited")
-                        {
-                            print_str(b"[wl-main] SCM listener exited while winlogon SCM-read-parked (no worker routed yet) -> QUIESCE; run gate\n");
-                            stop = m1;
-                            break;
-                        }
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -7733,6 +7720,9 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
+                            if delivered {
+                                mark_wait_parked!(pi, resume_ip);
+                            }
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -12787,48 +12777,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    // BATCH 40: a PURE-SERVER listener (services pi3 / lsass pi4) reaching its RPC
-                    // receive loop is a terminal cooperative park (it blocks forever waiting for a
-                    // client, and by now its process' main thread is done its bring-up). Count its
-                    // OWNER process toward the all-parked quiesce so the boot reaches the gate once
-                    // every live process is parked — otherwise (now that winlogon crosses msgina and no
-                    // longer CRASHES to trigger a quiesce) the main loop blocks in recv forever after
-                    // the last listener parks. EXCLUDE is_wl_worker: it shares winlogon's badge whose
-                    // MAIN thread has its own SCM-RPC-read quiesce path — marking winlogon here while its
-                    // main is still active would quiesce prematurely. mark_wait_parked! only breaks at
-                    // true all-parked deadlock; otherwise it just records the bit and recv proceeds.
-                    if is_svc_listener {
-                        // The SCM listener parking → no live signaler for winlogon's SCM read.
-                        SVC_LISTENER_PARKED.store(1, Ordering::Relaxed);
-                    }
-                    if !is_wl_worker {
-                        mark_wait_parked!(pi, m0);
-                    }
-                    // BATCH 40 terminal backstop: once winlogon has CROSSED its msgina GINA init
-                    // (WINLOGON_KEY_OPENED > 0 — WlxInitialize got a non-NULL context, no
-                    // WlxShutdown(NULL) crash) AND lsass has signalled LSA_RPC_SERVER_ACTIVE, the boot
-                    // has reached steady state: the only remaining live top-level processes are the
-                    // persistent SCM/LSA/CSR RPC SERVERS with no live terminating client. A server
-                    // listener parking here (SSN=24 = its blocking receive) means it will block forever
-                    // waiting for a client the (crashed/parked) clients will never send — so the main
-                    // loop's next recv would hang forever (winlogon no longer CRASHES to trigger the
-                    // old msgina-wall quiesce). QUIESCE to the gate. Gated on the msgina-crossed +
-                    // LSA-signalled steady state so it never fires during live bring-up.
-                    // Gate the terminal quiesce on winlogon having reached its SAS MESSAGE-LOOP milestone
-                    // (WINLOGON_MSGLOOP_MILESTONE) in addition to the msgina + LSA steady state. Without
-                    // this, a server listener parking races winlogon's post-InitializeSAS flow: it fires
-                    // right after SetDefaultLanguage (SSN 224) and stops the loop before winlogon issues
-                    // PostMessage(WLX_WM_SAS) / enters GetMessage. Requiring the message-loop milestone makes
-                    // the quiesce deterministic — winlogon is parked at its genuine steady state first.
-                    if WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
-                        && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-                        && WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed) >= 2
-                        && !defer_quiesce_for_active_user_callbacks(b"server-listener-steady")
-                    {
-                        print_str(b"[quiesce] server listener parked + winlogon parked at empty SAS message loop + LSA signalled -> steady state -> run gate\n");
-                        stop = m0;
-                        break;
-                    }
+                    mark_wait_parked!(pi, m0);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -12967,9 +12916,7 @@ pub(crate) unsafe fn service_sec_image(
                         crash_parked,
                         wait_parked,
                     );
-                    if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                        mark_wait_parked!(pi, resume_ip);
-                    }
+                    mark_wait_parked!(pi, resume_ip);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13010,9 +12957,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                            mark_wait_parked!(pi, resume_ip);
-                        }
+                        mark_wait_parked!(pi, resume_ip);
                     }
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
@@ -13079,6 +13024,16 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
+                    if park_keyed_wait_deadline.is_none() {
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        mark_wait_parked!(pi, resume_ip);
+                    }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -13138,14 +13093,11 @@ pub(crate) unsafe fn service_sec_image(
                     park_wait_deadline,
                 ) {
                     delay_timer_rearm(delay_queue);
-                    // An INDEFINITE (no-deadline) wait by a main thread or persistent server-loop
-                    // worker can be quiesce-relevant: if every live owner is now parked, no signaler
-                    // remains -> run the gate. A deadline-bounded wait is timer-woken, so it never
-                    // deadlocks; don't count it.
                     if winlogon_worker_can_signal {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
-                    } else if park_wait_deadline.is_none() {
+                    }
+                    if park_wait_deadline.is_none() {
                         trace_indefinite_wait_park(
                             &nt_handler,
                             badge,
@@ -13153,9 +13105,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                            mark_wait_parked!(pi, resume_ip);
-                        }
+                        mark_wait_parked!(pi, resume_ip);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -13205,9 +13155,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                            mark_wait_parked!(pi, resume_ip);
-                        }
+                        mark_wait_parked!(pi, resume_ip);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -13251,80 +13199,14 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" fid=0x");
                     print_hex(park_pipe_fid as u32);
                     print_str(b" -> PARK reader (re-driven on peer write)\n");
-                    // Quiesce accounting: a top-level process (winlogon) parked on a pipe read whose
-                    // peer may never write is quiesce-relevant — if every live process is now parked
-                    // (crash OR wait OR pipe) with no runnable signaler, break to the gate rather than
-                    // block the loop's recv forever. A listener/worker sub-thread parking is NOT
-                    // quiesce-relevant (its parent process may still run + write).
-                    if pi_is_top_level(&nt_handler, badge) {
-                        // ★ BATCH 34 — the SCM server round-trip is now LIVE. winlogon's SCM-RPC read
-                        // parking (recoverable, re-drivable) is NO LONGER terminal once its ncacn_np
-                        // SERVER peer (services' SCM listener) has been connected: a client connect
-                        // completed the server's async FSCTL_PIPE_LISTEN + signalled its event, so the
-                        // svc-listener is a RUNNABLE (non-top-level, badge 7) signaler that will read the
-                        // bind PDU and write bind_ack — which re-drives THIS parked read (batch-33 edge).
-                        // The all-top-level-parked quiesce test does NOT see the runnable svc-listener, so
-                        // marking winlogon parked here would falsely quiesce. So while the server is live
-                        // (a listen was signalled), DON'T mark_wait_parked! (skip the immediate quiesce)
-                        // — just continue the loop's recv: the runnable server produces events, and the
-                        // 45s wall-clock progress watchdog still stops the loop cleanly if it truly stalls.
-                        // The SCM server is LIVE only while its listener is signalled AND still running
-                        // (not terminated). BATCH 35 routes the per-connection RPC worker into the
-                        // multiplex, but until the worker's trampoline-entry fault is resolved (it PARKS
-                        // unrecoverably — see the BATCH 35 frontier note) it is NOT a live signaler, so we
-                        // do NOT treat a spawned-but-faulted worker as keeping the server live (that would
-                        // hang the loop's recv with no signaler → boot timeout). Once the listener exits
-                        // there is no signaler for winlogon's SCM read, so parking is terminal → quiesce.
-                        let scm_server_live = hosted_pi_has_role(
-                            &nt_handler,
-                            pi,
-                            nt_exe_image::HostedProcessRole::InteractiveLogon,
-                        )
-                            && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-                            && PIPE_LISTEN_SIGNALLED_COUNT.load(Ordering::Relaxed) != 0
-                            && SVC_LISTENER_TERMINATED.load(Ordering::Relaxed) == 0
-                            // BATCH 40: a PARKED listener (persistent-server world) is no longer a live
-                            // signaler either — treat it like TERMINATED so winlogon's read-park becomes
-                            // terminal and the boot quiesces (else the loop's recv hangs forever).
-                            && SVC_LISTENER_PARKED.load(Ordering::Relaxed) == 0;
-                        if !scm_server_live {
-                            mark_wait_parked!(pi, resume_ip);
-                            // Terminal backstop: winlogon's SCM read parking with NO live server signaler
-                            // (no listen ever signalled, or the listener has exited) after LSA is signalled
-                            // is its steady state — run the gate rather than block recv forever.
-                            if hosted_pi_has_role(
-                                &nt_handler,
-                                pi,
-                                nt_exe_image::HostedProcessRole::InteractiveLogon,
-                            ) && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-                                && !defer_quiesce_for_active_user_callbacks(
-                                    b"winlogon-scm-read-parked",
-                                )
-                            {
-                                print_str(b"[wl-main] winlogon SCM-RPC read parked (no live server signaler) + LSA signalled -> QUIESCE; run gate\n");
-                                stop = resume_ip;
-                                break;
-                            }
-                        } else {
-                            // BATCH 43: only log on the FIRST 0→1 transition (this fires on every SCM read
-                            // retry; serial writes dominate the TCG per-round-trip cost, and the boot budget
-                            // is now tight with winlogon's heavier post-win32k-wall flow).
-                            let first = WINLOGON_SCM_PARKED.swap(1, Ordering::Relaxed) == 0;
-                            // BATCH 39 — defense-in-depth REASSERT of winlogon's client CLIENTINFO on the
-                            // SCM-RPC read-park path (winlogon's LAST activity before its post-OpenSCManager
-                            // GUI init calls user32 GetThreadDesktopWnd). win32k's IntSetThreadDesktop ELSE
-                            // branch clears TEB.Win32ThreadInfo(+0x78)/pDeskInfo(+0x820); re-seed via the
-                            // executive's persistent alias of winlogon's TEB frame. (The primary guarantee
-                            // is the spawn seed + the fault-time repair; this keeps the window minimal.)
-                            let _ = seed_winlogon_thread_client_info(
-                                WINLOGON_MAIN_TEB_MIRROR_VA,
-                                procs[2].pml4,
-                            );
-                            if first {
-                                print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
-                            }
-                        }
-                    }
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13369,9 +13251,7 @@ pub(crate) unsafe fn service_sec_image(
                             crash_parked,
                             wait_parked,
                         );
-                        if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                            mark_wait_parked!(pi, resume_ip);
-                        }
+                        mark_wait_parked!(pi, resume_ip);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -13417,9 +13297,7 @@ pub(crate) unsafe fn service_sec_image(
                     // A blocked reporter is a COOPERATIVE wait (the debugger's continue wakes it),
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
-                    if indefinite_wait_counts_for_owner(&nt_handler, badge) {
-                        mark_wait_parked!(pi, resume_ip);
-                    }
+                    mark_wait_parked!(pi, resume_ip);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -17825,6 +17703,7 @@ unsafe fn gui_message_wait_redrive_event(
         set_reply_mr(17, waiter.resume_flags);
         client_reply_on(waiter.reply_cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
+        thread_wait_state_clear_badge(waiter.badge);
         {
             let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
             if table[slot].used && table[slot].reply_cap == waiter.reply_cap {
@@ -17975,6 +17854,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
         0,
     );
     release_reply_pool_cap(waiter.reply_cap);
+    thread_wait_state_clear_badge(waiter.badge);
     let _ = nt_handler.io_completion_ports.release(waiter.port_id);
     IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
     true
@@ -18164,6 +18044,7 @@ unsafe fn lsa_release_client_on_server_wall(ssn: u64) -> bool {
     print_str(b"[lsa-rdv] WALL: the real LSA server walled on SSN=");
     print_u64(ssn);
     print_str(b" with a client blocked -> releasing the client with STATUS_UNSUCCESSFUL\n");
+    let badge = LSA_CLI_BADGE.load(Ordering::Relaxed);
     lsa_wake(
         cap,
         0xC000_0001,
@@ -18171,6 +18052,9 @@ unsafe fn lsa_release_client_on_server_wall(ssn: u64) -> bool {
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    if badge != LSA_CONTEXT_UNSET {
+        thread_wait_state_clear_badge(badge);
+    }
     lsa_clear_client_context();
     true
 }
@@ -18226,6 +18110,7 @@ unsafe fn lsa_server_deliver(
         LSA_SRV_SP.load(Ordering::Relaxed),
         LSA_SRV_FLAGS.load(Ordering::Relaxed),
     );
+    thread_wait_state_clear_badge(badge);
     true
 }
 
@@ -18334,6 +18219,7 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    thread_wait_state_clear_badge(cli_badge);
     lsa_clear_client_context();
     true
 }
@@ -18411,6 +18297,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
     print_str(b" bytes=");
     print_u64(length as u64);
     print_str(b"\n");
+    let cli_badge = LSA_CLI_BADGE.load(Ordering::Relaxed);
     LSA_CLI_REPLY_CAP.store(0, Ordering::Relaxed);
     LSA_CLI_KIND.store(0, Ordering::Relaxed);
     lsa_wake(
@@ -18420,6 +18307,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
         LSA_CLI_SP.load(Ordering::Relaxed),
         LSA_CLI_FLAGS.load(Ordering::Relaxed),
     );
+    thread_wait_state_clear_badge(cli_badge);
     lsa_clear_client_context();
     true
 }
@@ -18588,6 +18476,7 @@ pub(crate) unsafe fn pipe_name_wait_complete_one(
         set_reply_mr(17, waiter.resume_flags);
         client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
+        thread_wait_state_clear_badge(waiter.badge);
     }
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
@@ -18751,6 +18640,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             set_reply_mr(17, w.resume_flags);
             client_reply_on(cap, 18, status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
+            thread_wait_state_clear_badge(w.badge);
         }
         nt_handler.release_file_reference(w.file_id);
         // Free the slot (re-armable for the next PDU).
@@ -18758,9 +18648,11 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         table_mut.complete(slot);
         woken += 1;
         PIPE_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
             print_str(b"[pipe-redrive] WOKE reader fid=0x");
             print_hex(w.file_id as u32);
+            print_str(b" name_hash=0x");
+            print_hex_u64(pipe_fid_name_hash(w.file_id));
             print_str(b" pi=");
             print_u64(w.pi as u64);
             print_str(b" badge=");
@@ -18985,11 +18877,91 @@ fn owner_top_badge_for(nt_handler: &ExecNtHandler, badge: u64) -> u64 {
         .unwrap_or(0)
 }
 
+fn wait_parked_owner_mask(nt_handler: &ExecNtHandler) -> u64 {
+    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
+    let mut mask = 0u64;
+    for pi in 0..MAX_PI {
+        if !hosted_process_pi_is_live(pi) {
+            continue;
+        }
+        let Some(owner) = nt_handler.hosted_process_top_badge(pi) else {
+            continue;
+        };
+        if owner >= 64 {
+            continue;
+        }
+        let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
+        let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, &mut badges);
+        if !badges[..count].contains(&owner) && count < badges.len() {
+            badges[count] = owner;
+            count += 1;
+        }
+        if count != 0
+            && badges[..count]
+                .iter()
+                .copied()
+                .all(thread_wait_state_badge_parked)
+        {
+            mask |= 1u64 << owner;
+        }
+    }
+    mask
+}
+
+fn trace_wait_owner_mask_after_mark(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    badge: u64,
+    live: u64,
+    crash_parked: u64,
+    wait_parked: u64,
+) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 160 {
+        return;
+    }
+    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
+    let owner = owner_top_badge_for(nt_handler, badge);
+    let mut badges = [0u64; OWNER_THREAD_BADGE_SNAPSHOT];
+    let mut count = nt_handler.live_hosted_thread_badges_for_pi(pi, &mut badges);
+    if !badges[..count].contains(&owner) && count < badges.len() {
+        badges[count] = owner;
+        count += 1;
+    }
+    print_str(b"[wait-owner] #");
+    print_u64(n);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" owner=");
+    print_u64(owner);
+    print_str(b" live=0x");
+    print_hex(live as u32);
+    print_str(b" crash=0x");
+    print_hex(crash_parked as u32);
+    print_str(b" wait=0x");
+    print_hex(wait_parked as u32);
+    print_str(b" remaining=0x");
+    print_hex((live & !(crash_parked | wait_parked)) as u32);
+    print_str(b" threads=");
+    for thread_badge in badges[..count].iter().copied() {
+        print_u64(thread_badge);
+        print_str(if thread_wait_state_badge_parked(thread_badge) {
+            b":P "
+        } else {
+            b":R "
+        });
+    }
+    print_str(b"\n");
+}
+
 /// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
 /// woken by another RUNNABLE thread, and if none is left the loop's next `recv` blocks forever —
 /// past even the wall-clock stall watchdog, which lives at the loop top and therefore never runs.
-/// Main-thread waits and selected persistent server-loop worker waits can count their owner toward
-/// quiesce; trace each indefinite park with the masks the quiesce test reads.
+/// Trace each indefinite park with the masks read by the quiesce test. The wait owner mask is derived
+/// from live per-thread parked state, not from the current thread's role.
 fn trace_indefinite_wait_park(
     nt_handler: &ExecNtHandler,
     badge: u64,
@@ -18998,7 +18970,7 @@ fn trace_indefinite_wait_park(
     wait_parked: u64,
 ) {
     static N: AtomicU64 = AtomicU64::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 24 {
+    if N.fetch_add(1, Ordering::Relaxed) >= 96 {
         return;
     }
     print_str(b"[wait-park] badge=");
@@ -19007,8 +18979,6 @@ fn trace_indefinite_wait_park(
     print_u64(owner_top_badge_for(nt_handler, badge));
     print_str(b" top-level=");
     print_u64(pi_is_top_level(nt_handler, badge) as u64);
-    print_str(b" counts-owner=");
-    print_u64(indefinite_wait_counts_for_owner(nt_handler, badge) as u64);
     print_str(b" live=0x");
     print_hex(live as u32);
     print_str(b" crash=0x");
@@ -19042,14 +19012,6 @@ fn userinit_shell_frontier_pending(
 #[inline]
 fn pi_is_top_level(nt_handler: &ExecNtHandler, badge: u64) -> bool {
     hosted_pi_for_top_badge(nt_handler, badge).is_some()
-}
-
-#[inline]
-fn indefinite_wait_counts_for_owner(nt_handler: &ExecNtHandler, badge: u64) -> bool {
-    pi_is_top_level(nt_handler, badge)
-        || nt_handler
-            .hosted_thread_role_for_badge(badge)
-            .is_some_and(HostedThreadRole::counts_owner_for_indefinite_wait)
 }
 
 /// The bitmask of LIVE top-level process badges (smss is always live; the rest once SPAWNED).

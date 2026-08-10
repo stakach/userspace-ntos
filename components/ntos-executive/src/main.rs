@@ -2293,6 +2293,53 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
 /// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
 /// by a parked waiter). Managed by wait_park / wait_wake_event.
 static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct ThreadWaitParkTable<const N: usize> {
+    badges_plus_one: [u64; N],
+}
+
+impl<const N: usize> ThreadWaitParkTable<N> {
+    const fn new() -> Self {
+        Self {
+            badges_plus_one: [0; N],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.badges_plus_one = [0; N];
+    }
+
+    fn contains(&self, badge: u64) -> bool {
+        let needle = badge.saturating_add(1);
+        needle != 0 && self.badges_plus_one.contains(&needle)
+    }
+
+    fn park(&mut self, badge: u64) {
+        let encoded = badge.saturating_add(1);
+        if encoded == 0 || self.contains(badge) {
+            return;
+        }
+        if let Some(slot) = self.badges_plus_one.iter_mut().find(|slot| **slot == 0) {
+            *slot = encoded;
+        }
+    }
+
+    fn clear(&mut self, badge: u64) {
+        let encoded = badge.saturating_add(1);
+        if encoded == 0 {
+            return;
+        }
+        for slot in &mut self.badges_plus_one {
+            if *slot == encoded {
+                *slot = 0;
+            }
+        }
+    }
+}
+
+static mut THREAD_WAIT_PARKED: ThreadWaitParkTable<HOSTED_THREAD_RUNTIME_CAP> =
+    ThreadWaitParkTable::new();
 /// Compact identity for an NT object that can satisfy a native wait.
 ///
 /// Dispatcher namespace objects keep their historical raw encoding (the obj_ns index), so existing
@@ -2406,6 +2453,7 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 /// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAIT_WAKE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Blocking `NtRemoveIoCompletion` calls. Fifteen waiters leave one of the sixteen reply objects active
 /// so the executive can continue receiving while every other reply cap is parked.
@@ -2495,25 +2543,6 @@ static PIPE_NAME_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Set once the SCM RPC listener thread (svc-listener, badge 7) has TERMINATED. rpcrt4's ncacn_np
-/// listener, after accepting winlogon's connect, spawns a per-connection WORKER thread (NtCreateThread)
-/// to service the bind/request and re-parks its OWN listen — then the listener may exit. The
-/// per-connection worker (which would read the bind + write bind_ack) is NOT yet spawned into the
-/// multiplex (the "N threads per process" follow-up), so once the listener is gone there is no live SCM
-/// signaler: winlogon's SCM read-park is then terminal → quiesce (run the gate) rather than hang the
-/// loop's recv. See the winlogon SCM-read-park guard.
-pub(crate) static SVC_LISTENER_TERMINATED: AtomicU64 = AtomicU64::new(0);
-/// BATCH 40: set once the SCM (`\ntsvcs`, pi 3) listener has cooperatively PARKED on its RPC receive
-/// loop (reached its blocking server syscall). Like SVC_LISTENER_TERMINATED, a parked listener is no
-/// longer a live signaler for winlogon's SCM read — so winlogon's SCM-RPC read-park becomes terminal
-/// and the boot can QUIESCE to the gate. (Distinct from TERMINATED: the persistent-server world parks
-/// the listener rather than exiting it.)
-pub(crate) static SVC_LISTENER_PARKED: AtomicU64 = AtomicU64::new(0);
-/// Set once winlogon's main thread has parked on its SCM-RPC pipe read (waiting for bind_ack). Used so
-/// the loop can QUIESCE the moment the SCM listener terminates (no signaler left) even though winlogon
-/// parked earlier while the server was still live — avoids a hung recv. Cleared is never needed (once
-/// winlogon SCM-parks it stays the terminal steady state for this boot).
-pub(crate) static WINLOGON_SCM_PARKED: AtomicU64 = AtomicU64::new(0);
 /// A tiny fid → pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` (server) and queried at
 /// FSCTL_PIPE_LISTEN arm time — so the async-listen record carries the pipe name-hash and a client
 /// connect completes ONLY the matching-name server listen. Fixed cap, `.bss`, single-threaded.
@@ -12109,6 +12138,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
             0,
         );
         release_reply_pool_cap(waiter.reply_cap);
+        thread_wait_state_clear_badge(waiter.badge);
         let _ = handler.io_completion_ports.release(waiter.port_id);
         IO_COMPLETION_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
         woken += 1;
@@ -12138,6 +12168,34 @@ unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
+fn thread_wait_state_reset() {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).reset();
+    }
+}
+
+fn thread_wait_state_park_badge(badge: u64) {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).park(badge);
+    }
+}
+
+fn thread_wait_state_clear_badge(badge: u64) {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).clear(badge);
+    }
+}
+
+fn thread_wait_state_clear_tid(handler: &ExecNtHandler, tid: u64) {
+    if let Some(badge) = handler.hosted_thread_badge_for_tid(tid) {
+        thread_wait_state_clear_badge(badge);
+    }
+}
+
+fn thread_wait_state_badge_parked(badge: u64) -> bool {
+    unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).contains(badge) }
+}
+
 unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
     handler: &mut ExecNtHandler,
@@ -12148,8 +12206,8 @@ unsafe fn delay_timer_interrupt(
     // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
     let watchdog_tick = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
     let woken = delay_wake_due(queue)
-        + wait_wake_due()
-        + keyed_wait_wake_due()
+        + wait_wake_due(handler)
+        + keyed_wait_wake_due(handler)
         + io_completion_wake_due(handler)
         + pipe_name_wait_wake_due(handler)
         + watchdog_tick;
@@ -12252,6 +12310,7 @@ unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u6
         if deleted == 0 && retyped == 0 {
             release_reply_pool_cap(cap);
         }
+        thread_wait_state_clear_badge(waiter.badge);
         let _ = handler.io_completion_ports.release(waiter.port_id);
     }
 }
@@ -12270,6 +12329,7 @@ unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_inde
         if deleted == 0 && retyped == 0 {
             release_reply_pool_cap(cap);
         }
+        thread_wait_state_clear_badge(waiter.badge);
         let _ = handler.io_completion_ports.release(waiter.port_id);
     }
 }
@@ -12293,7 +12353,7 @@ unsafe fn wait_park(
     wait_park_multi(&[object], &[0], false, resume_ip, sp, flags, tid, deadline)
 }
 
-unsafe fn wait_cancel_thread(tid: u64) {
+unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
     for slot in 0..WAITER_N {
         if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
             || WAITER_TID[slot].load(Ordering::Relaxed) != tid
@@ -12318,6 +12378,7 @@ unsafe fn wait_cancel_thread(tid: u64) {
         WAITER_TID[slot].store(0, Ordering::Relaxed);
         WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
     }
+    thread_wait_state_clear_tid(handler, tid);
 }
 
 /// ═══ Dbgk TARGET-SIDE BLOCKING: park / resume / abandon a REPORTING thread ═══════════════════
@@ -12404,6 +12465,7 @@ unsafe fn dbgk_reporter_resume(block: &nt_process::dbgk::ReporterBlock) -> bool 
         _ => client_reply_on(block.reply_cap, 0, 0, 0, 0, 0),
     }
     release_reply_pool_cap(block.reply_cap);
+    thread_wait_state_clear_badge(block.badge);
     DBGK_REPORTERS_RESUMED.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -12498,7 +12560,7 @@ unsafe fn keyed_wait_park(
 }
 
 /// Wake one caller parked on `key`, returning `true` when a matching waiter was resumed.
-unsafe fn keyed_wait_wake_one(key: u64, status: u64) -> bool {
+unsafe fn keyed_wait_wake_one(handler: &ExecNtHandler, key: u64, status: u64) -> bool {
     for slot in 0..KEYED_WAITER_N {
         if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) != key {
             continue;
@@ -12513,6 +12575,7 @@ unsafe fn keyed_wait_wake_one(key: u64, status: u64) -> bool {
         set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
         client_reply_on(cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(cap);
+        thread_wait_state_clear_tid(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
         keyed_wait_clear_slot(slot);
         KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         return true;
@@ -12557,7 +12620,7 @@ fn keyed_release_remember_pending(key: u64) -> bool {
     false
 }
 
-unsafe fn keyed_wait_wake_due() -> u64 {
+unsafe fn keyed_wait_wake_due(handler: &ExecNtHandler) -> u64 {
     let now = monotonic_time_100ns();
     let mut woken = 0;
     for slot in 0..KEYED_WAITER_N {
@@ -12573,6 +12636,7 @@ unsafe fn keyed_wait_wake_due() -> u64 {
             set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
+            thread_wait_state_clear_tid(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
             woken += 1;
         }
         keyed_wait_clear_slot(slot);
@@ -12580,7 +12644,7 @@ unsafe fn keyed_wait_wake_due() -> u64 {
     woken
 }
 
-unsafe fn keyed_wait_cancel_thread(tid: u64) {
+unsafe fn keyed_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
     for slot in 0..KEYED_WAITER_N {
         if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
             || KEYED_WAITER_TID[slot].load(Ordering::Relaxed) != tid
@@ -12601,6 +12665,7 @@ unsafe fn keyed_wait_cancel_thread(tid: u64) {
         }
         keyed_wait_clear_slot(slot);
     }
+    thread_wait_state_clear_tid(handler, tid);
 }
 
 /// Consume the Reply object bound to the current native-syscall fault without sending on it, then
@@ -12746,6 +12811,7 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
             }
         }
     }
+    thread_wait_state_clear_tid(handler, tid);
 }
 
 unsafe fn terminate_hosted_thread_mechanism(
@@ -12756,8 +12822,8 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_cancel_thread(delay_queue, tid);
     io_completion_cancel_thread(handler, tid);
     delay_timer_rearm(delay_queue);
-    wait_cancel_thread(tid);
-    keyed_wait_cancel_thread(tid);
+    wait_cancel_thread(handler, tid);
+    keyed_wait_cancel_thread(handler, tid);
     pipe_io_cancel_thread(tid, handler);
     let abandoned_mutants = handler.abandon_mutants_for_thread(tid);
     if abandoned_mutants != 0 {
@@ -12949,6 +13015,7 @@ unsafe fn wait_wake_dispatcher_pulse(just_set: usize, handler: &mut ExecNtHandle
 
 unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<usize>) -> u64 {
     let mut wake_indices = [u64::MAX; WAITER_N];
+    let mut wake_objects = [WaitObject::FREE.raw(); WAITER_N];
     for i in 0..WAITER_N {
         let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
         if slot_ev0 == u64::MAX {
@@ -12982,6 +13049,9 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             }
             wake = all;
             wake_index = 0; // WaitAll returns WAIT_OBJECT_0
+            if wake {
+                wake_objects[i] = WAITER_EVENTS[i][0].load(Ordering::Relaxed);
+            }
         } else {
             // WaitAny: the first (lowest-index) signalled event determines the return value.
             let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
@@ -12995,6 +13065,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
                     wake = true;
                     selected_slot = k;
                     wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
+                    wake_objects[i] = object.raw();
                     break;
                 }
             }
@@ -13049,6 +13120,31 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
                     break;
                 }
             }
+            let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if trace < 96 {
+                let tid = WAITER_TID[i].load(Ordering::Relaxed);
+                let object = WaitObject::from_raw(wake_objects[i]).unwrap_or(WaitObject::FREE);
+                print_str(b"[wait-wake] #");
+                print_u64(trace);
+                print_str(b" tid=");
+                print_u64(tid);
+                if let Some(badge) = handler.hosted_thread_badge_for_tid(tid) {
+                    print_str(b" badge=");
+                    print_u64(badge);
+                }
+                print_str(b" object=");
+                print_str(object.describe());
+                print_str(b"/");
+                print_u64(object.id());
+                print_str(b" result=");
+                print_u64(wake_index);
+                print_str(b" count=");
+                print_u64(WAITER_EVENT_COUNT[i].load(Ordering::Relaxed));
+                print_str(b" wait_all=");
+                print_u64(WAITER_WAIT_ALL[i].load(Ordering::Relaxed));
+                print_str(b"\n");
+            }
+            thread_wait_state_clear_tid(handler, WAITER_TID[i].load(Ordering::Relaxed));
             woken += 1;
             WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -13062,7 +13158,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
     woken
 }
 
-unsafe fn wait_wake_due() -> u64 {
+unsafe fn wait_wake_due(handler: &ExecNtHandler) -> u64 {
     let now = monotonic_time_100ns();
     let mut woken = 0;
     for slot in 0..WAITER_N {
@@ -13078,6 +13174,7 @@ unsafe fn wait_wake_due() -> u64 {
             set_reply_mr(17, WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
+            thread_wait_state_clear_tid(handler, WAITER_TID[slot].load(Ordering::Relaxed));
             woken += 1;
         }
         WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
@@ -16649,23 +16746,6 @@ impl HostedThreadRole {
         }
     }
 
-    const fn counts_owner_for_indefinite_wait(self) -> bool {
-        match self {
-            Self::Main
-            | Self::ServicesListener
-            | Self::ScmWorker
-            | Self::LsassListener
-            | Self::LsassListener2
-            | Self::LsassListener3
-            | Self::LsaWorker => true,
-            Self::TpWorker { .. }
-            | Self::SmLoop
-            | Self::CsrApi
-            | Self::CsrSbApi
-            | Self::WinlogonListener
-            | Self::WinlogonWorker { .. } => false,
-        }
-    }
 }
 
 const fn hosted_thread_runtime_gate_bit(pi: usize, role: HostedThreadRole) -> u64 {
@@ -16936,6 +17016,25 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
             .find(|entry| entry.is_live() && entry.badge == badge)
     }
 
+    fn live_badges_for_pi(&self, pi: usize, out: &mut [u64]) -> usize {
+        let mut count = 0usize;
+        for entry in self.entries.iter().copied() {
+            if !entry.is_live()
+                || entry.tcb <= 1
+                || entry.pi != pi
+                || out[..count].contains(&entry.badge)
+            {
+                continue;
+            }
+            if count == out.len() {
+                break;
+            }
+            out[count] = entry.badge;
+            count += 1;
+        }
+        count
+    }
+
     fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
         self.get_by_role(pi, role)
             .map(|entry| entry.tcb)
@@ -17038,6 +17137,11 @@ impl HostedThreadRuntimes {
     fn get_by_badge(&self, badge: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_badge(badge) }
+    }
+
+    fn live_badges_for_pi(&self, pi: usize, out: &mut [u64]) -> usize {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).live_badges_for_pi(pi, out) }
     }
 
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
