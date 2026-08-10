@@ -138,8 +138,8 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ExSystemTimeToLocalTime", StubSuccess, "applies a zero bias (UTC==local on the host)"),
     e("ExEventObjectType", Partial, "data export: object-type pointer (nt-object-manager)"),
     // --- Zw ---
-    e("ZwAllocateVirtualMemory", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
-    e("ZwFreeVirtualMemory", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
+    e("ZwAllocateVirtualMemory", Partial, "win32k GDI user-attribute arena reserves reusable 64 KiB slots; commit is pre-mapped"),
+    e("ZwFreeVirtualMemory", Partial, "win32k GDI user-attribute arena releases 64 KiB reservations back to the slot allocator"),
     e("ZwCreateEvent", Partial, "event object routed to nt-kernel-exec + nt-object-manager"),
     e("ZwCreateSection", Partial, "virtual-memory/section ops routed to nt-memory-manager/nt-address-space"),
     e("ZwCreateKey", Partial, "registry ops routed to nt-config-manager"),

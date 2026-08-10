@@ -148,14 +148,23 @@ then services real IOCP/pipe syscalls and writes LSA RPC responses. No `NtQueryD
 caller appears in this boot, so the previous `exec_services_query_dir_object` red gate is stale proof
 debt rather than a justified synthetic implementation target.
 
-The current implementation slice addresses the new generic resource frontier exposed by that run:
-dynamic service startup reaches `spoolsv.exe`, `spoolsv` calls the real win32k
-`NtUserProcessConnect`, and ReactOS `InitThreadCallback` fails because the hosted win32k session heap
-exhausts at a 1 MiB desktop-heap allocation with about 15.2 MiB already used. A 32 MiB pre-mapped
-heap candidate was rejected after `.tmp/boot-win32k-heap-32m-20260810.log` regressed early in dxg
-private mapping. The current fix keeps the known 16 MiB VA/layout and replaces the old no-op
-`RtlFreeHeap` path with reclaiming heap blocks plus `RtlSizeHeap`/`RtlReAllocateHeap` support; it is
-intentionally not a spooler or service-name special case.
+Latest win32k resource validation `.tmp/boot-win32k-uservm-reclaim-20260810.log` keeps the ReactOS
+desktop paint gate green while removing another no-op resource path. The boot rebuilds ntdll, the
+executive, rust-micro, and the disk image, then reports
+`SUCCESS -- the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)`. The earlier
+`.tmp/boot-win32k-heap-reclaim-20260810.log` proof moved `spoolsv.exe` past the old session-heap
+exhaustion wall: `spoolsv` reaches real `NtUserProcessConnect`, publishes its `W32THREAD` with
+`status=0`, and continues issuing win32k syscalls. The previous 32 MiB pre-mapped heap candidate was
+rejected after `.tmp/boot-win32k-heap-32m-20260810.log` regressed early in dxg private mapping. The
+current fix keeps the known VA layout, replaces the old no-op `RtlFreeHeap` path with reclaiming
+heap blocks plus `RtlSizeHeap`/`RtlReAllocateHeap`, and makes win32k's GDI user-attribute
+`ZwFreeVirtualMemory(MEM_RELEASE)` return released 64 KiB reservation slots to the pre-mapped
+`WIN32K_USERVM` arena instead of keeping a no-op success path. The active red edge is still generic
+resource lifetime: the later `svchost.exe` GUI connect (`pi=15`) now reaches real
+`NtUserProcessConnect` but fails desktop heap mapping with `[win32k-host] HEAP EXHAUSTED
+size=0x00100000 used=0x00f082a0`, then desktop assignment unwinds and SCM pipe control reports
+`ConnectNamedPipe failed (Error 1450)`. The next slice should make win32k session desktop heaps real
+allocation objects with teardown/reuse, not expand static heap VA or add service-specific policy.
 
 ### A. SCM-Controlled Service Startup
 
@@ -282,8 +291,8 @@ intentionally not a spooler or service-name special case.
    complete. Continue A4 by removing remaining SCM pipe/listener thread special coordination once the
    generic LPC/pipe/thread model can carry it. The service GUI desktop/winsta assignment has moved onto
    the real win32k/Ob path; the active A4 validation frontier is generic hosted TP-worker resume
-   identity plus reclaiming win32k session heap allocations for multiple dynamic GUI-capable service
-   clients.
+   identity plus reclaiming win32k session-heap and GDI user-VM allocations for multiple dynamic
+   GUI-capable service clients.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
