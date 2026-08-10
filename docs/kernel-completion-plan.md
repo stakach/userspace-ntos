@@ -233,6 +233,23 @@ are the active red edge. Continue from generic RPC/NPFS association/listener sem
 service-thread behavior; do not add service-name, executable-order, userinit/explorer, or paint
 fallbacks.
 
+Current desktop recovery target after `.tmp/boot-desktop-retry-20260810-230340.log`: the service/RPC
+frontier narrowed to the CSR/LPC receive path. A dynamic Win32 client reached
+`NtSecureConnectPort(\Windows\ApiPort)` at connection 16, but the nested `csr_rendezvous` receive saw
+a seL4 timer notification as `label=0`, treated it as an unexpected worker message, and dropped the
+real `CsrApiRequestThread` parked-receive latch. The next `BaseCreateThread` CSR notification then
+failed because no parked CSR worker remained. The current slice screens timer notifications in the
+nested SM/CSR/SB rendezvous receivers, matching the main loop and component pump, and records
+dynamic CSRSS `CsrApiRequestThread` receive parks on the main endpoint so ReactOS-created CSR API
+workers remain available if the static private worker is exhausted. Serialized boot
+`.tmp/boot-csr-dynamic-workers-20260810-231746.log` proves the old ApiPort connection-16 wall is gone:
+pi=11 and pi=12 both complete real `NtSecureConnectPort(\Windows\ApiPort)`, a timer notification is
+absorbed inside CSR API rendezvous instead of becoming `unexpected label=0`, and later CSR request
+traffic continues. This is still not a desktop-shell proof: the run was manually stopped after a
+quiet period, periodic census still reports `explorer total=0`, and the next red edge remains generic
+service/RPC/NPFS association behavior with repeated `RpcServerListen() failed (Status 6b1)` before
+natural userinit/explorer launch.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

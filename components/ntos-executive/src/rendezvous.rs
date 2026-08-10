@@ -4,6 +4,29 @@
 #![allow(clippy::all)]
 use crate::*;
 
+static RENDEZVOUS_TIMER_TICKS_ABSORBED: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn rendezvous_recv_full_r12(
+    ep: u64,
+    reply: u64,
+    tag: &[u8],
+) -> (u64, u64, u64, u64, u64, u64) {
+    loop {
+        let received = crate::recv_full_r12(ep, reply);
+        if received.0 == DELAY_TIMER_BADGE && (received.1 >> 12) == 0 {
+            DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+            watchdog_nested_rearm();
+            let tick = RENDEZVOUS_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+            if tick < 8 {
+                print_str(tag);
+                print_str(b" absorbed timer notification while driving real server worker\n");
+            }
+            continue;
+        }
+        return received;
+    }
+}
+
 fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
     let target_leaf = nt_exe_image::canonical_exe_leaf(leaf)?;
     for pi in 0..MAX_PI {
@@ -796,9 +819,9 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
             client_reply_on(reply, 18, 0, 0, 0, SM_RECV_RDX.load(Ordering::Relaxed));
-            recv_full_r12(ep, reply)
+            rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]")
         } else {
-            recv_full_r12(ep, reply)
+            rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]")
         };
     loop {
         guard += 1;
@@ -853,7 +876,8 @@ pub(crate) unsafe fn sm_rendezvous(
                 break;
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
-            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            let (_b, nmi, nm0, nm1, nm2, nm3) =
+                rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -871,7 +895,8 @@ pub(crate) unsafe fn sm_rendezvous(
                     && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD)
                 {
                     client_reply_on(reply, 3, fip + 3, m1, m2, 0);
-                    let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+                    let (_b, nmi, nm0, nm1, nm2, nm3) =
+                        rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
                     mi = nmi;
                     m0 = nm0;
                     m1 = nm1;
@@ -1097,7 +1122,8 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
-            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            let (_b, nmi, nm0, nm1, nm2, nm3) =
+                rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -1215,7 +1241,8 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     client_reply_on(reply, 18, 0, 0, 0, 0);
 
     let mut fill_idx = 0;
-    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        rendezvous_recv_full_r12(ep, reply, b"[sm-api]");
     for _ in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
@@ -1438,9 +1465,14 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 set_reply_mr(17, flags);
                 client_reply_on(reply, 18, result, 0, 0, rdx);
             }
+            0 => {
+                print_str(b"[csr-api] empty label while draining worker -> ack and continue\n");
+                client_reply_on(reply, 0, 0, 0, 0, 0);
+            }
             _ => return false,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+            rendezvous_recv_full_r12(ep, reply, b"[sm-api]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -1563,7 +1595,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
 
     let mut fill_idx = 0;
-    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
     for _ in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
@@ -2023,7 +2056,8 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
             }
             _ => return false,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+            rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -2130,7 +2164,8 @@ pub(crate) unsafe fn csr_sb_startup(
         return false;
     }
     let mut fill_idx = 0;
-    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        rendezvous_recv_full_r12(ep, reply, b"[csr-sb]");
     for _ in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
@@ -2202,7 +2237,8 @@ pub(crate) unsafe fn csr_sb_startup(
                 return false;
             }
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+            rendezvous_recv_full_r12(ep, reply, b"[csr-sb]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -3187,7 +3223,8 @@ unsafe fn csr_sb_accept_connection(
 
     let mut client_handle = 0;
     let mut fill_idx = 0;
-    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        rendezvous_recv_full_r12(ep, reply, b"[csr-sb-rdv]");
     for _ in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
@@ -3282,7 +3319,8 @@ unsafe fn csr_sb_accept_connection(
             }
             _ => return 0,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+            rendezvous_recv_full_r12(ep, reply, b"[csr-sb-rdv]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -3396,7 +3434,8 @@ unsafe fn csr_sb_api_request_rendezvous(
     client_reply_on(reply, 18, 0, 0, 0, 0);
 
     let mut fill_idx = 0;
-    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        rendezvous_recv_full_r12(ep, reply, b"[csr-sb-api]");
     for _ in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
@@ -3646,7 +3685,8 @@ unsafe fn csr_sb_api_request_rendezvous(
             }
             _ => return false,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        let (_badge, nmi, nm0, nm1, nm2, nm3) =
+            rendezvous_recv_full_r12(ep, reply, b"[csr-sb-api]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -3729,9 +3769,9 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
             set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
             client_reply_on(reply, 18, 0, 0, 0, CSR_API_RECV_RDX.load(Ordering::Relaxed));
-            recv_full_r12(ep, reply)
+            rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
         } else {
-            recv_full_r12(ep, reply)
+            rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]")
         };
     loop {
         guard += 1;
@@ -3787,7 +3827,8 @@ pub(crate) unsafe fn csr_rendezvous(
                 break;
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
-            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            let (_b, nmi, nm0, nm1, nm2, nm3) =
+                rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -3803,7 +3844,8 @@ pub(crate) unsafe fn csr_rendezvous(
                     && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD)
                 {
                     client_reply_on(reply, 3, fip + 3, m1, m2, 0);
-                    let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+                    let (_b, nmi, nm0, nm1, nm2, nm3) =
+                        rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
                     mi = nmi;
                     m0 = nm0;
                     m1 = nm1;
@@ -4003,6 +4045,18 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
+            let (_b, nmi, nm0, nm1, nm2, nm3) =
+                rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
+            continue;
+        }
+        if label == 0 {
+            print_str(b"[csr-rdv] empty label while draining CSR worker -> ack and continue\n");
+            client_reply_on(reply, 0, 0, 0, 0, 0);
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
             mi = nmi;
             m0 = nm0;

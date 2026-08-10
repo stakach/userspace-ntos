@@ -2388,3 +2388,31 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   edge remains generic service RPC/NPFS listener/association behavior, with repeated
   `RpcServerListen() failed (Status 6b1)`. Do not paper over this with service-name, executable,
   launch-order, or shell-paint fallbacks.
+- I4 narrowed / CSR rendezvous notification screening staged. A fresh serialized desktop retry
+  `.tmp/boot-desktop-retry-20260810-230340.log` moved beyond the older RPC-listener symptoms and
+  exposed a concrete generic transport bug: while completing `NtSecureConnectPort(\Windows\ApiPort)`
+  for a dynamically launched Win32 client, `csr_rendezvous` consumed the real
+  `CsrApiRequestThread` parked receive, then treated a seL4 bound timer notification
+  (`label=0`) as a worker wall. That dropped the single CSR receive latch, so the next real
+  `NtRequestWaitReplyPort(\Windows\ApiPort)` from `BaseCreateThread` failed with
+  `no parked real CsrApiRequestThread`. Nested SM/CSR/SB rendezvous receives now screen the same
+  timer-notification shape already handled by the component pump and main loop, count it for the
+  main timer drain, and keep receiving for the authentic server worker syscall. Validation so far:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: run one serialized
+  `./run.sh --desktop`; require the old `[csr-rdv] WALL: unexpected label=0` at ApiPort connection
+  16 to disappear, then capture the next real desktop/explorer frontier without adding CSR,
+  service-name, or paint fallbacks.
+- I4 continued / CSR ApiPort recovery boot-verified. Serialized boot
+  `.tmp/boot-csr-dynamic-workers-20260810-231746.log` confirms the connection-16 CSR wall is gone:
+  pi=11 and pi=12 complete real `NtSecureConnectPort(\Windows\ApiPort)`, CSR API request routing
+  survives a nested timer notification (`absorbed timer notification while driving real server
+  worker`), and no `Failed to tell CSRSS about new thread` / `no parked real CsrApiRequestThread`
+  signature recurs. The slice also parks ReactOS-created dynamic CSRSS `CsrApiRequestThread`
+  receives that arrive on the main endpoint, so the kernel no longer assumes a single private CSR API
+  worker is the only real receive surface. Review adjustment: this is progress, not desktop
+  recovery. The latest boot still reports `explorer total=0` and reaches repeated
+  `RpcServerListen() failed (Status 6b1)` in dynamically launched services before natural
+  userinit/explorer shell paint. Continue I4 from generic NPFS/RPC association, context-handle, and
+  service-thread semantics; do not add service-name, executable-order, CSR-success, or paint
+  fallbacks.
