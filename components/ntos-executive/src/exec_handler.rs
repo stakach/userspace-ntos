@@ -13740,18 +13740,12 @@ impl ExecNtHandler {
         }
         None
     }
-    /// Does a `\SystemRoot\System32` file with this probe's leaf name exist? Extracts the leaf (last
-    /// `\`-component) of the folded probe path and looks it up under System32 on the REAL \reactos
-    /// FS by-path (`sys32_exists` → `open_sys32` → `fat_open_path`) — path-form independent (the
-    /// loader probes many directory prefixes for the same DLL) and the SOLE existence authority (no
-    /// hand-maintained SYSTEM32_FILES list): a file exists iff it's present on the actual volume.
-    /// nt-dll-registry keeps the SEC_IMAGE base/geometry role for CONTENT.
+    /// Does a `\SystemRoot\System32` file for this probe exist? Resolve any caller-supplied
+    /// System32-relative subpath on the REAL \reactos FS by-path (`sys32_exists` → `open_sys32` →
+    /// `fat_open_path`). This is the sole existence authority: a file exists iff it is present on the
+    /// actual volume. nt-dll-registry keeps the SEC_IMAGE base/geometry role for CONTENT.
     pub(crate) fn fs_system32_has(&self, folded: &[u8]) -> bool {
-        let leaf = match folded.iter().rposition(|&c| c == b'\\') {
-            Some(p) => &folded[p + 1..],
-            None => folded,
-        };
-        unsafe { sys32_exists(leaf) }
+        unsafe { sys32_exists(sys32_probe_relative_path(folded)) }
     }
     /// Does `\reactos\<leaf>` exist as a regular file on the executive's mounted FAT volume?
     /// `explorer.exe` is a shell image at `%SystemRoot%`, not System32, so its admission has to use

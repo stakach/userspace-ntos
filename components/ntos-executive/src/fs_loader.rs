@@ -541,24 +541,70 @@ pub(crate) unsafe fn load_dll_from_fs(
     (None, 0)
 }
 
-/// Extract a loadable image leaf and its registry key from a folded requested object name. `.dll`
-/// keeps the historical extensionless key; an explicit `.drv` keeps its full leaf because registry
-/// normalization strips only the default DLL extension.
-fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
+fn last_path_component_start(name: &[u8]) -> usize {
     // Find the last path separator; the leaf is everything after it.
-    let start = name
-        .iter()
+    name.iter()
         .rposition(|&c| c == b'\\' || c == b'/')
         .map(|p| p + 1)
-        .unwrap_or(0);
-    let leaf = &name[start..];
+        .unwrap_or(0)
+}
+
+fn path_has_root_prefix(name: &[u8]) -> bool {
+    name.first()
+        .copied()
+        .is_some_and(|c| c == b'\\' || c == b'/')
+        || (name.len() >= 2 && name[1] == b':')
+}
+
+/// Convert a loader probe into the path that should be looked up below `\reactos\system32`.
+/// Full DOS/NT paths keep the suffix after their `system32` component (for example
+/// `c:\windows\system32\wbem\wmisvc.dll` -> `wbem\wmisvc.dll`), while already-relative loader paths
+/// keep their subdirectories. Absolute paths outside System32 return an empty path here: callers
+/// that support full paths must resolve them through the exact mounted-volume path, not through the
+/// System32 search.
+pub(crate) fn sys32_probe_relative_path(name: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= name.len() {
+        let is_sep = i == name.len() || name[i] == b'\\' || name[i] == b'/';
+        if is_sep {
+            if i > start && name[start..i].eq_ignore_ascii_case(b"system32") {
+                let mut rel = i + 1;
+                while rel < name.len() && (name[rel] == b'\\' || name[rel] == b'/') {
+                    rel += 1;
+                }
+                if rel < name.len() {
+                    return &name[rel..];
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if !path_has_root_prefix(name) && last_path_component_start(name) != 0 {
+        name
+    } else if !path_has_root_prefix(name) {
+        &name[last_path_component_start(name)..]
+    } else {
+        b""
+    }
+}
+
+/// Extract a default System32-relative image path and registry key from a folded requested object
+/// name. `.dll` keeps the historical extensionless key; an explicit `.drv` keeps its full leaf
+/// because registry normalization strips only the default DLL extension. Full paths still key by the
+/// final component; `open_dll_read_result` decides whether to read an exact mounted-volume path or
+/// use the returned System32-relative fallback.
+fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
+    let fallback = sys32_probe_relative_path(name);
+    let leaf = &name[last_path_component_start(name)..];
     if leaf.len() < 5 {
         return None;
     }
     if leaf.ends_with(b".dll") {
-        Some((leaf, &leaf[..leaf.len() - 4]))
+        Some((fallback, &leaf[..leaf.len() - 4]))
     } else if leaf.ends_with(b".drv") {
-        Some((leaf, leaf))
+        Some((fallback, leaf))
     } else {
         None
     }
@@ -601,7 +647,8 @@ impl DemandLoadError {
 }
 
 /// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
-/// the real `\reactos\system32` FS, load its bytes into the (reset-safe, cap-mapped) pool, claim a
+/// the mounted ReactOS volume (or the default `\reactos\system32` search for bare dependency
+/// names), load its bytes into the (reset-safe, cap-mapped) pool, claim a
 /// pre-reserved registry slot, activate it (stem + geometry, assigning a compact collision-free base),
 /// relocate the pool bytes to that base + patch its ImageBase, store the parsed `PeFile` into the
 /// caller's `dll_pe_store` slot, and return the slot index. The demand-fault router + the
@@ -648,7 +695,7 @@ pub(crate) unsafe fn demand_load_dll_result(
         return Err(DemandLoadError::StoreTooSmall { slot, store_len });
     }
     let fs = exec_fs().ok_or(DemandLoadError::NoMountedFs)?;
-    let (va, sz) = open_sys32_read_result(&fs, leaf)?;
+    let (va, sz) = open_dll_read_result(&fs, folded_name, leaf)?;
     let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
     let pe = nt_pe_loader::PeFile::parse(bytes).map_err(|_| DemandLoadError::PeParseFailed)?;
     let ext = image_extent(&pe);
@@ -682,10 +729,108 @@ pub(crate) unsafe fn demand_load_dll_result(
     Ok(slot)
 }
 
-/// Read `\reactos\system32\<leaf>` into a fresh pool buffer, returning `(va, size)`. Like
-/// `load_file_to_pool` but with the System32 prefix built in.
-unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), DemandLoadError> {
-    let (cluster, size) = open_sys32(fs, leaf).ok_or(DemandLoadError::FileMissing)?;
+fn is_rooted_or_device_path(name: &[u8]) -> bool {
+    name.starts_with(b"\\")
+        || name.starts_with(b"/")
+        || name.get(1).is_some_and(|byte| *byte == b':')
+}
+
+fn push_path_byte(out: &mut [u8], n: &mut usize, byte: u8) -> Option<()> {
+    if *n >= out.len() {
+        return None;
+    }
+    out[*n] = if byte == b'/' { b'\\' } else { byte };
+    *n += 1;
+    Some(())
+}
+
+fn push_path_component(out: &mut [u8], n: &mut usize, component: &[u8]) -> Option<()> {
+    if component.is_empty() || component == b"." {
+        return Some(());
+    }
+    if component == b".." || component.contains(&b':') {
+        return None;
+    }
+    if *n != 0 {
+        push_path_byte(out, n, b'\\')?;
+    }
+    for &byte in component {
+        push_path_byte(out, n, byte.to_ascii_lowercase())?;
+    }
+    Some(())
+}
+
+fn push_path_suffix(out: &mut [u8], n: &mut usize, suffix: &[u8]) -> Option<()> {
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= suffix.len() {
+        let is_sep = i == suffix.len() || suffix[i] == b'\\' || suffix[i] == b'/';
+        if is_sep {
+            push_path_component(out, n, &suffix[start..i])?;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    Some(())
+}
+
+fn drive_path_to_volume_relative_into(
+    path_after_drive: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut n = 0usize;
+    let mut relative = path_after_drive;
+    while relative.starts_with(b"\\") || relative.starts_with(b"/") {
+        relative = &relative[1..];
+    }
+    if relative == b"windows" || relative.starts_with(b"windows\\") || relative.starts_with(b"windows/")
+    {
+        push_path_component(out, &mut n, b"reactos")?;
+        push_path_suffix(out, &mut n, &relative[b"windows".len()..])?;
+    } else {
+        push_path_suffix(out, &mut n, relative)?;
+    }
+    Some(n)
+}
+
+fn folded_dll_path_to_volume_relative_into(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let system_prefix = b"\\systemroot";
+    if path.starts_with(system_prefix)
+        && path
+            .get(system_prefix.len())
+            .is_none_or(|byte| *byte == b'\\' || *byte == b'/')
+    {
+        let mut n = 0usize;
+        push_path_component(out, &mut n, b"reactos")?;
+        push_path_suffix(out, &mut n, &path[system_prefix.len()..])?;
+        return Some(n);
+    }
+
+    let mut p = path;
+    if let Some(rest) = p.strip_prefix(b"\\??\\") {
+        p = rest;
+    } else if let Some(rest) = p.strip_prefix(b"\\dosdevices\\") {
+        p = rest;
+    }
+    if p.len() >= 3 && p[0] == b'c' && p[1] == b':' && (p[2] == b'\\' || p[2] == b'/') {
+        return drive_path_to_volume_relative_into(&p[2..], out);
+    }
+    None
+}
+
+unsafe fn open_volume_relative_read_result(
+    fs: &Fat32,
+    path: &[u8],
+) -> Result<(u64, u32), DemandLoadError> {
+    let (cluster, size) = fat_open_path(fs, path).ok_or(DemandLoadError::FileMissing)?;
+    open_cluster_read_result(fs, cluster, size)
+}
+
+unsafe fn open_cluster_read_result(
+    fs: &Fat32,
+    cluster: u32,
+    size: u32,
+) -> Result<(u64, u32), DemandLoadError> {
     if size == 0 {
         return Err(DemandLoadError::EmptyFile);
     }
@@ -698,6 +843,35 @@ unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), 
         });
     }
     Ok((va, size))
+}
+
+unsafe fn open_dll_read_result(
+    fs: &Fat32,
+    folded_name: &[u8],
+    sys32_relative: &[u8],
+) -> Result<(u64, u32), DemandLoadError> {
+    let mut relative = [0u8; 192];
+    if let Some(relative_len) =
+        folded_dll_path_to_volume_relative_into(folded_name, &mut relative)
+    {
+        return open_volume_relative_read_result(fs, &relative[..relative_len]);
+    }
+    if is_rooted_or_device_path(folded_name) {
+        return Err(DemandLoadError::FileMissing);
+    }
+    let fallback = if !sys32_relative.is_empty() {
+        sys32_relative
+    } else {
+        &folded_name[last_path_component_start(folded_name)..]
+    };
+    open_sys32_read_result(fs, fallback)
+}
+
+/// Read `\reactos\system32\<leaf>` into a fresh pool buffer, returning `(va, size)`. Like
+/// `load_file_to_pool` but with the System32 prefix built in.
+unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), DemandLoadError> {
+    let (cluster, size) = open_sys32(fs, leaf).ok_or(DemandLoadError::FileMissing)?;
+    open_cluster_read_result(fs, cluster, size)
 }
 
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.

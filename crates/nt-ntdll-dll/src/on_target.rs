@@ -2170,26 +2170,28 @@ unsafe fn resolve_export_addr(
     }
 }
 
-/// Load a dependent DLL BY NAME (the executive resolves it against the real `\reactos\system32` FS +
+/// Load a dependent DLL BY NAME/PATH (the executive resolves it against the mounted ReactOS volume +
 /// its DLL registry, assigning the module its fixed base — csrsrv → 0x8000_0000). Issues
 /// `NtOpenFile → NtCreateSection(SEC_IMAGE) → NtMapViewOfSection`; returns the mapped base (0 on
-/// failure). `name_lc` is the lowercased leaf with a trailing `.dll` removed. We add the default
-/// extension only when the leaf has no extension, preserving names such as `winspool.drv`.
+/// failure). `open_name_lc` is the lowercased object name to open: either a bare module stem/leaf or
+/// a caller-supplied path such as `c:\windows\system32\wbem\wmisvc.dll`. We add the default
+/// extension only when the final component has no extension, preserving names such as `winspool.drv`.
 ///
 /// # Safety
 /// On-target hosted process; issues real syscalls the executive services.
 #[cfg(target_arch = "x86_64")]
-unsafe fn load_dependent_dll(name_lc: &[u8]) -> u64 {
-    // Build a NUL-terminated UTF-16 leaf for the OBJECT_ATTRIBUTES.ObjectName. The
-    // executive's NtOpenFile matches the DLL by a substring of the object name (reg.resolve_name /
-    // demand_load_dll), so a bare leaf suffices.
-    let mut wname = [0u16; 40];
+unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
+    // Build a NUL-terminated UTF-16 object name for OBJECT_ATTRIBUTES.ObjectName. Static import
+    // dependencies arrive as bare stems and use the default System32 search. Runtime LdrLoadDll
+    // callers may provide a full DOS/NT path, which must be preserved so service DLLs in
+    // subdirectories (for example system32\wbem) open the exact file.
+    let mut wname = [0u16; 180];
     let mut wn = 0usize;
-    for &b in name_lc.iter().take(32) {
+    for &b in open_name_lc.iter().take(wname.len() - 5) {
         wname[wn] = b as u16;
         wn += 1;
     }
-    if !name_lc.contains(&b'.') {
+    if !dll_leaf_has_extension(open_name_lc) {
         for &b in b".dll" {
             wname[wn] = b as u16;
             wn += 1;
@@ -3265,53 +3267,101 @@ unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
 // walker, over the process-wide MODULE_TABLE.
 // ---------------------------------------------------------------------------------------------
 
-/// Read a `UNICODE_STRING`'s wide `Buffer` into a lowercased ASCII base name (`.dll` stripped) — the
-/// key MODULE_TABLE uses. Returns the byte length written (0 on a null/empty string).
+fn dll_leaf_has_extension(name: &[u8]) -> bool {
+    let start = name
+        .iter()
+        .rposition(|&c| c == b'\\' || c == b'/')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    name[start..].contains(&b'.')
+}
+
+#[cfg(target_arch = "x86_64")]
+struct DllLoadName {
+    key: [u8; 32],
+    key_len: usize,
+    open: [u8; 160],
+    open_len: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DllLoadName {
+    const fn new() -> Self {
+        Self {
+            key: [0; 32],
+            key_len: 0,
+            open: [0; 160],
+            open_len: 0,
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key[..self.key_len]
+    }
+
+    fn open_name(&self) -> &[u8] {
+        &self.open[..self.open_len]
+    }
+}
+
+/// Read a `UNICODE_STRING`'s wide `Buffer` into both loader identities:
+/// - `key`: lowercased basename with a trailing `.dll` stripped, used by MODULE_TABLE/PEB->Ldr.
+/// - `open`: lowercased object name preserving caller-supplied paths, used for NtOpenFile.
+///
+/// Returns `false` on a null/empty string or a name too large for the fixed loader buffers.
 ///
 /// # Safety
 /// `us` a valid `UNICODE_STRING*` (Length @0 u16, Buffer @8 ptr).
 #[cfg(target_arch = "x86_64")]
-unsafe fn unicode_basename_lc(us: *const c_void, out: &mut [u8; 32]) -> usize {
+unsafe fn unicode_dll_load_name(us: *const c_void, out: &mut DllLoadName) -> bool {
     if us.is_null() {
-        return 0;
+        return false;
     }
     // SAFETY: us is a valid UNICODE_STRING per the contract.
     unsafe {
         let length = core::ptr::read_unaligned(us as *const u16) as usize; // Length (bytes)
         let buffer = core::ptr::read_unaligned((us as *const u8).add(8) as *const u64); // Buffer
         if buffer == 0 || length == 0 {
-            return 0;
+            return false;
         }
         let nchars = length / 2;
-        // Find the last path separator so we key by the leaf name.
         let mut start = 0usize;
         for i in 0..nchars {
             let c = core::ptr::read_unaligned((buffer as *const u16).add(i));
             if c == b'\\' as u16 || c == b'/' as u16 {
                 start = i + 1;
             }
+            if c > 0x7f || out.open_len >= out.open.len() {
+                return false;
+            }
+            let mut byte = (c as u8).to_ascii_lowercase();
+            if byte == b'/' {
+                byte = b'\\';
+            }
+            out.open[out.open_len] = byte;
+            out.open_len += 1;
         }
-        let mut n = 0usize;
         for i in start..nchars {
             let c = core::ptr::read_unaligned((buffer as *const u16).add(i)) as u32;
             if c > 0x7f {
-                break;
+                return false;
             }
-            if n < 32 {
-                out[n] = (c as u8).to_ascii_lowercase();
-                n += 1;
+            if out.key_len >= out.key.len() {
+                return false;
             }
+            out.key[out.key_len] = (c as u8).to_ascii_lowercase();
+            out.key_len += 1;
         }
         // Strip a trailing ".dll".
-        if n >= 4
-            && out[n - 4] == b'.'
-            && out[n - 3] == b'd'
-            && out[n - 2] == b'l'
-            && out[n - 1] == b'l'
+        if out.key_len >= 4
+            && out.key[out.key_len - 4] == b'.'
+            && out.key[out.key_len - 3] == b'd'
+            && out.key[out.key_len - 2] == b'l'
+            && out.key[out.key_len - 1] == b'l'
         {
-            n -= 4;
+            out.key_len -= 4;
         }
-        n
+        out.key_len != 0 && out.open_len != 0
     }
 }
 
@@ -3322,13 +3372,13 @@ unsafe fn unicode_basename_lc(us: *const c_void, out: &mut [u8; 32]) -> usize {
 /// On-target; `dll_name` a valid `UNICODE_STRING*`; `base_addr` writable.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void) -> u32 {
-    let mut name = [0u8; 32];
+    let mut name = DllLoadName::new();
     // SAFETY: dll_name a valid UNICODE_STRING per the contract.
-    let n = unsafe { unicode_basename_lc(dll_name, &mut name) };
-    if n == 0 {
+    if !unsafe { unicode_dll_load_name(dll_name, &mut name) } {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
-    let dep = &name[..n];
+    let dep = name.key();
+    let open_name = name.open_name();
     // SAFETY: single-threaded loader; MODULE_TABLE touched only here + snap.
     unsafe {
         let table_ptr = core::ptr::addr_of_mut!(MODULE_TABLE);
@@ -3357,7 +3407,7 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
             let loaded = if retained != 0 {
                 retained
             } else {
-                let loaded = load_dependent_dll(dep);
+                let loaded = load_dependent_dll(open_name);
                 if loaded == 0 {
                     return 0xC000_0135; // STATUS_DLL_NOT_FOUND
                 }
@@ -3626,16 +3676,16 @@ unsafe fn collect_reference_modules_dfs(
 /// On-target; `dll_name` a valid `UNICODE_STRING*`; `dll_handle` writable.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_get_dll_handle(dll_name: *const c_void, dll_handle: *mut *mut c_void) -> u32 {
-    let mut name = [0u8; 32];
+    let mut name = DllLoadName::new();
     // SAFETY: dll_name a valid UNICODE_STRING per the contract.
-    let n = unsafe { unicode_basename_lc(dll_name, &mut name) };
-    if n == 0 {
+    if !unsafe { unicode_dll_load_name(dll_name, &mut name) } {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
+    let dep = name.key();
     // SAFETY: single-threaded loader table read.
     let base = unsafe {
         let table = &*core::ptr::addr_of!(MODULE_TABLE);
-        table.find(&name[..n])
+        table.find(dep)
     };
     if base == 0 {
         return 0xC000_0135; // STATUS_DLL_NOT_FOUND

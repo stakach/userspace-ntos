@@ -2272,3 +2272,28 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   the run reached the same real red edge: `wmisvc.dll` file-missing demand load followed by rpcrt4
   context-handle fault `0x1c00001a`. Review adjustment: commit this cleanup, then implement the
   loader/image-demand path for nested `system32\wbem` DLLs before returning to RPC association state.
+- I4 nested service DLL loader boundary staged. Our ntdll runtime loader no longer collapses every
+  `LdrLoadDll` request to a basename before issuing `NtOpenFile`; it now keeps a separate module key
+  (`wmisvc`) and open name (`c:\windows\system32\wbem\wmisvc.dll`) so full service-DLL paths reach
+  the kernel. The executive demand loader now resolves exact DOS/NT paths against the mounted
+  ReactOS volume and uses `\reactos\system32` search only for bare or System32-relative dependency
+  names. `NtQueryAttributesFile`/`NtOpenFile` System32 existence probes also preserve nested
+  subdirectories such as `wbem\wmisvc.dll` instead of dropping to the leaf. Absolute paths outside
+  System32 are no longer claimed by the System32 leaf search; they must resolve by exact volume path.
+  Local validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `scripts/build_ntdll_dll.sh`, and `git diff --check`. Review adjustment: run one serialized boot
+  next and require the old `LoadLibraryExW(c:\windows\system32\wbem\wmisvc.dll)` /
+  `wmisvc.dll` file-missing edge to disappear before taking the rpcrt4 context-handle fault as the
+  active frontier again.
+- I4 nested service DLL loader boundary boot-verified. The serialized headless boot
+  `.tmp/boot-ntdll-path-wmisvc-20260810-210804.log` reached desktop background paint at line 5163,
+  then loaded WMI from the nested System32 path: `DEMAND-LOAD wmisvc` at line 24908,
+  `NtCreateSection(SEC_IMAGE) for wmisvc` at line 24911, and `NtMapViewOfSection wmisvc` at line
+  24918. The prior `wmisvc.dll` file-missing edge did not recur; the only demand miss in this run
+  was the intentional `apphelp.dll` denied-diverter probe. The run continued through genuine Browser
+  service entry (`ServiceMain` at line 25233), then loaded `srvsvc` and `wuauserv`. Current frontier:
+  real service RPC listeners still fail with `RpcServerListen() failed (Status 6b1)` at lines 24842,
+  25313, and 25486, and the spooler process later hits the existing out-of-image user fault at
+  line 25706. Review adjustment: commit the nested loader fix, then make endpoint mapper/RPC server
+  listen registration the next target before treating shell chrome pixels as blocked by WMI loading.
