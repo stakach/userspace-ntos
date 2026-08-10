@@ -62,6 +62,8 @@ static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static NT_CANCEL_IO_FILE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static LPC_CACHE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static LPC_CACHE_MISS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
@@ -1938,6 +1940,7 @@ impl ExecNtHandler {
         write_field!(csr_rendezvous_conn, 0);
         write_field!(csr_rendezvous_out, 0);
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
+        write_field!(lpc_connections_dirty, false);
         write_field!(winlogon_csr_view, 0);
         write_field!(csr_view_mask, 0);
         write_field!(pm, pm);
@@ -12846,15 +12849,64 @@ impl ExecNtHandler {
 
     /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
     /// capacity so the push never reallocates across the per-syscall bump reset. `connector_pi` =
-    /// the current process (0=smss, 1=csrss).
+    /// the current process.
     pub(crate) fn cache_lpc_connection(
         &mut self,
         connection_id: u64,
         client_handle: u64,
         name: &[u16],
-    ) {
-        if self.lpc_connections.len() >= self.lpc_connections.capacity() {
-            return;
+    ) -> bool {
+        self.cache_lpc_connection_for_pi(connection_id, client_handle, self.pi, name)
+    }
+
+    /// Cache a connection whose server-side accept completed while another hosted process was
+    /// running. Manual LSA/CSR rendezvous paths finish in the server thread, but the client comm-port
+    /// handle still belongs to the original connector process.
+    pub(crate) fn cache_lpc_connection_for_pi(
+        &mut self,
+        connection_id: u64,
+        client_handle: u64,
+        connector_pi: usize,
+        name: &[u16],
+    ) -> bool {
+        if client_handle == 0 {
+            return false;
+        }
+        let connector_pi = connector_pi.min(u8::MAX as usize) as u8;
+        let trace_lsa = Self::lpc_name_equals_ascii(name, b"\\lsaauthenticationport");
+        if let Some(connection) = self.lpc_connections.iter_mut().find(|connection| {
+            connection.client_handle == client_handle && connection.connector_pi == connector_pi
+        }) {
+            connection.connection_id = connection_id;
+            let n = name.len().min(connection.name.len());
+            connection.name = [0; 32];
+            connection.name[..n].copy_from_slice(&name[..n]);
+            connection.name_len = n as u8;
+            if trace_lsa && LPC_CACHE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[lpc-cache] update \\LsaAuthenticationPort conn=");
+                print_u64(connection_id);
+                print_str(b" pi=");
+                print_u64(connector_pi as u64);
+                print_str(b" handle=0x");
+                print_hex_u64(client_handle);
+                print_str(b" len=");
+                print_u64(self.lpc_connections.len() as u64);
+                print_str(b" cap=");
+                print_u64(self.lpc_connections.capacity() as u64);
+                print_str(b"\n");
+            }
+            return true;
+        }
+        if self.lpc_connections.len() == self.lpc_connections.capacity() {
+            let additional = self.lpc_connections.capacity().max(16);
+            if self.lpc_connections.try_reserve(additional).is_err() {
+                print_str(b"[lpc-cache] failed to grow established LPC connection table\n");
+                return false;
+            }
+            self.lpc_connections_dirty = true;
+            print_str(b"[lpc-cache] grew established LPC connection table capacity=");
+            print_u64(self.lpc_connections.capacity() as u64);
+            print_str(b"\n");
         }
         let mut buf = [0u16; 32];
         let n = name.len().min(32);
@@ -12862,14 +12914,28 @@ impl ExecNtHandler {
         self.lpc_connections.push(LpcConnRecord {
             connection_id,
             client_handle,
-            connector_pi: self.pi as u8,
+            connector_pi,
             name: buf,
             name_len: n as u8,
         });
+        if trace_lsa && LPC_CACHE_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[lpc-cache] insert \\LsaAuthenticationPort conn=");
+            print_u64(connection_id);
+            print_str(b" pi=");
+            print_u64(connector_pi as u64);
+            print_str(b" handle=0x");
+            print_hex_u64(client_handle);
+            print_str(b" len=");
+            print_u64(self.lpc_connections.len() as u64);
+            print_str(b" cap=");
+            print_u64(self.lpc_connections.capacity() as u64);
+            print_str(b"\n");
+        }
+        true
     }
 
     pub(crate) fn lpc_connection_is(&self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
-        self.lpc_connections.iter().any(|connection| {
+        let found = self.lpc_connections.iter().any(|connection| {
             connection.client_handle == handle
                 && connection.connector_pi as usize == connector_pi
                 && connection.name_len as usize == name.len()
@@ -12880,7 +12946,41 @@ impl ExecNtHandler {
                         wide <= 0x7f
                             && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
                     })
-        })
+        });
+        if !found && Self::ascii_name_equals(name, b"\\lsaauthenticationport") {
+            let has_lsa_record = self.lpc_connections.iter().any(|connection| {
+                Self::lpc_name_equals_ascii(
+                    &connection.name[..connection.name_len as usize],
+                    b"\\lsaauthenticationport",
+                )
+            });
+            if has_lsa_record && LPC_CACHE_MISS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[lpc-cache] miss \\LsaAuthenticationPort pi=");
+                print_u64(connector_pi as u64);
+                print_str(b" handle=0x");
+                print_hex_u64(handle);
+                print_str(b" entries=");
+                print_u64(self.lpc_connections.len() as u64);
+                print_str(b" cap=");
+                print_u64(self.lpc_connections.capacity() as u64);
+                print_str(b"\n");
+                for connection in self.lpc_connections.iter().filter(|connection| {
+                    Self::lpc_name_equals_ascii(
+                        &connection.name[..connection.name_len as usize],
+                        b"\\lsaauthenticationport",
+                    )
+                }) {
+                    print_str(b"[lpc-cache]   have pi=");
+                    print_u64(connection.connector_pi as u64);
+                    print_str(b" handle=0x");
+                    print_hex_u64(connection.client_handle);
+                    print_str(b" conn=");
+                    print_u64(connection.connection_id);
+                    print_str(b"\n");
+                }
+            }
+        }
+        found
     }
 
     fn lpc_name_equals_ascii(name16: &[u16], expected: &[u8]) -> bool {
@@ -12888,6 +12988,14 @@ impl ExecNtHandler {
             && name16.iter().zip(expected.iter()).all(|(&wide, &ascii)| {
                 wide <= 0x7f && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
             })
+    }
+
+    fn ascii_name_equals(name: &[u8], expected: &[u8]) -> bool {
+        name.len() == expected.len()
+            && name
+                .iter()
+                .zip(expected.iter())
+                .all(|(&actual, &expected)| actual.to_ascii_lowercase() == expected.to_ascii_lowercase())
     }
 
     pub(crate) unsafe fn connect_srm_command_port(

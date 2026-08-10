@@ -2194,3 +2194,29 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   (`{2d5427c4-1402-43d3-8929-6d5b131898a2}` / fault `0x1c00001a`) plus `browser`
   `RpcServerListen() failed (Status 6b1)`; keep the next slice on real RPC association/context-handle
   state and do not add service-name, executable, or pipe read fallbacks.
+- I4 LSA LPC data-plane cleanup staged. The same boot also exposed a separate pre-RPC boundary:
+  dynamically launched service clients such as `wkssvc` could complete a real
+  `NtConnectPort(\LsaAuthenticationPort)`, but their accepted client handles were not cached in the
+  generic LPC connection table. Their subsequent `NtRequestWaitReplyPort(LsaHandle, ...)` therefore
+  fell through as an unregistered LPC handle and `LsaLookupAuthenticationPackage` failed with
+  `STATUS_INVALID_HANDLE`. The first fix cached every successful manual accept under the original
+  connector process and keyed the LSA request recognizer off the generic `\LsaAuthenticationPort`
+  connection record instead of winlogon's milestone latch. Serialized boot
+  `.tmp/boot-lsa-lpc-cache-20260810-200140.log` proved that was still insufficient: the
+  pre-reserved LPC connection vector had reached its fixed 16-entry capacity and silently refused the
+  late `wkssvc` LSA record. The cache now deduplicates by client handle, grows in chunks, marks its
+  storage dirty when it reallocates, and the service loop pins that storage even for post-dispatch
+  manual rendezvous completions. Review adjustment: revalidate with a serialized desktop boot and
+  require the old unregistered-LPC `LsaLookupAuthenticationPackage` failure to disappear before
+  returning to the rpcrt4 context-handle frontier.
+- I4 LSA LPC copyout cleanup continued. Manual LSA accepts can complete while the server process is
+  running, but the connector's `PortHandle` and `ConnectInfo` buffers live in the original client's
+  address space. `lsa_complete_connect` now performs those writes through the same mapped/fill
+  copyout path used by ordinary cross-process syscall completions before caching the successful
+  `\LsaAuthenticationPort` connection for that connector process. A short headless validation
+  `.tmp/boot-lsa-copyout-headless-20260810-202925.log` still reaches the base desktop-background
+  gate (`desktop-bg 768/768`), while the long graphics/no-exit boot
+  `.tmp/boot-lsa-copyout-20260810-202758.log` was interrupted during later explorer DLL demand-load
+  (`shell32`) before it reached the prior late service/RPC context-handle fault. Review adjustment:
+  run one fresh serialized graphics/no-exit boot after committing this cleanup; the proof must show
+  either genuine explorer syscalls/paint or the next precise red edge after the LSA handle fix.

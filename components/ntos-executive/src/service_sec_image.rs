@@ -6728,16 +6728,17 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             // ═══ `\LsaAuthenticationPort` RENDEZVOUS — client DATA plane ═════════════════════════
-            // winlogon's `LsaLookupAuthenticationPackage` / `LsaLogonUser` / … marshal an `LSA_API_MSG`
-            // and issue `NtRequestWaitReplyPort(LsaHandle, &ApiMessage, &ApiMessage)`
+            // ReactOS LSA clients (`LsaLookupAuthenticationPackage` / `LsaLogonUser` / …) marshal an
+            // `LSA_API_MSG` and issue `NtRequestWaitReplyPort(LsaHandle, &ApiMessage, &ApiMessage)`
             // (`references/reactos/sdk/lib/lsalib/lsa.c`). Relay the message VERBATIM into the parked
-            // real server's `RequestMsg` and BLOCK this caller until the server replies.
+            // real server's `RequestMsg` and BLOCK this caller until the server replies. The handle
+            // check is the generic LPC connection cache, not winlogon's diagnostic milestone latch, so
+            // dynamically launched services use the same LSA data plane.
             if LSA_RENDEZVOUS_ENABLED
                 && m0 == SSN_NT_REQUEST_WAIT_REPLY_PORT
                 && lsa_server_parked()
                 && LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) == 0
-                && WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed) != 0
-                && get_recv_mr(9) == WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed)
+                && nt_handler.lpc_connection_is(get_recv_mr(9), pi, b"\\lsaauthenticationport")
             {
                 nt_handler.pi = pi;
                 nt_handler.current_badge = badge;
@@ -6940,6 +6941,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.hosted_exe_dirty = false;
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
+                nt_handler.lpc_connections_dirty = false;
                 nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
@@ -7331,6 +7333,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.process_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                if nt_handler.lpc_connections_dirty {
+                    nt_handler.lpc_connections_dirty = false;
+                    pin_durable_heap_mark(&mut heap_mark);
+                }
                 if take_object_namespace_growth_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -7603,7 +7609,14 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     let outcome = LSA_COMPLETE_PENDING.swap(0, Ordering::Relaxed);
                     if outcome != 0 {
-                        let _ = lsa_complete_connect(&mut nt_handler, outcome);
+                        let _ = lsa_complete_connect(
+                            &mut nt_handler,
+                            outcome,
+                            pfilled,
+                            procs,
+                            &reg,
+                            &dll_pes,
+                        );
                         bump_progress();
                     }
                 }
@@ -7914,6 +7927,10 @@ pub(crate) unsafe fn service_sec_image(
                             result = 0; // STATUS_SUCCESS
                         }
                     }
+                }
+                if nt_handler.lpc_connections_dirty {
+                    nt_handler.lpc_connections_dirty = false;
+                    pin_durable_heap_mark(&mut heap_mark);
                 }
             } else if m0 == 223 {
                 // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
@@ -18118,7 +18135,14 @@ unsafe fn lsa_client_park(
 /// `ConnectInfo` the server itself wrote (`OperationalMode = 0x43218765`, `Status`) back into the
 /// connector's buffer, publish the broker's client comm-port handle into its `*PortHandle`, and
 /// resume it. Returns true if a client was woken.
-unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> bool {
+unsafe fn lsa_complete_connect(
+    nt_handler: &mut ExecNtHandler,
+    outcome: u64,
+    pfilled: &mut [[u64; 512]; MAX_PI],
+    procs: &mut [ProcExec; MAX_PI],
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) -> bool {
     let cap = LSA_CLI_REPLY_CAP.load(Ordering::Relaxed);
     if cap == 0 || LSA_CLI_KIND.load(Ordering::Relaxed) != 1 {
         return false;
@@ -18135,7 +18159,7 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         && lsa_with_peer(nt_handler, srv_badge, srv_pi, |handler| {
             handler.xas_read(recvmsg + LSA_PORT_MESSAGE_HEADER, &mut connect_info)
         });
-    let status = if outcome == 1 {
+    let mut status = if outcome == 1 {
         u32::from_le_bytes(connect_info[0..4].try_into().unwrap()) as u64
     } else {
         0xC000_0022 // STATUS_ACCESS_DENIED — the real server passed Accept = FALSE
@@ -18150,17 +18174,59 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
     let conninfo = LSA_CLI_CONNINFO.load(Ordering::Relaxed);
     let conninfo_len =
         (LSA_CLI_CONNINFO_LEN.load(Ordering::Relaxed) as usize).min(LSA_CONNECTION_INFO_SIZE);
-    lsa_with_peer(nt_handler, cli_badge, cli_pi, |handler| {
-        if outcome == 1 && out != 0 && client_handle != 0 {
-            let _ = handler.xas_write_u64(out, client_handle);
-        }
-        if have_info && conninfo != 0 && conninfo_len != 0 {
-            handler.xas_write_buf(conninfo, &connect_info[..conninfo_len]);
-        }
-    });
-    if outcome == 1 {
+    let cli_pml4 = procs[cli_pi].pml4;
+    let cli_scratch_base = procs[cli_pi].scratch_base;
+    let cli_filled = &mut pfilled[cli_pi];
+    let cli_faults = &mut procs[cli_pi].faults;
+    let mut copyout_ok = true;
+    if outcome == 1 && out != 0 && client_handle != 0 {
+        copyout_ok = img_spawn::client_copyout_or_fill_mapped(
+            cli_pi as u64,
+            out,
+            &client_handle.to_le_bytes(),
+            cli_filled,
+            cli_faults,
+            cli_scratch_base,
+            reg,
+            dll_pes,
+            cli_pml4,
+        );
+    }
+    if copyout_ok && have_info && conninfo != 0 && conninfo_len != 0 {
+        copyout_ok = img_spawn::client_copyout_or_fill_mapped(
+            cli_pi as u64,
+            conninfo,
+            &connect_info[..conninfo_len],
+            cli_filled,
+            cli_faults,
+            cli_scratch_base,
+            reg,
+            dll_pes,
+            cli_pml4,
+        );
+    }
+    if outcome == 1 && !copyout_ok {
+        print_str(b"[lsa-rdv] WALL: failed client connect copyout pi=");
+        print_u64(cli_pi as u64);
+        print_str(b" out=0x");
+        print_hex_u64(out);
+        print_str(b" conninfo=0x");
+        print_hex_u64(conninfo);
+        print_str(b"\n");
+    }
+    if outcome == 1 && copyout_ok {
         LSA_CONNECT_COMPLETED.fetch_add(1, Ordering::Relaxed);
         LSA_OPERATIONAL_MODE.store(operational_mode, Ordering::Relaxed);
+        let lsa_name16 = b"\\LsaAuthenticationPort"
+            .iter()
+            .map(|&b| b as u16)
+            .collect::<alloc::vec::Vec<u16>>();
+        nt_handler.cache_lpc_connection_for_pi(
+            LSA_PENDING_CONN.load(Ordering::Relaxed),
+            client_handle,
+            cli_pi,
+            &lsa_name16,
+        );
         if hosted_pi_has_role(
             nt_handler,
             cli_pi,
@@ -18178,7 +18244,12 @@ unsafe fn lsa_complete_connect(nt_handler: &mut ExecNtHandler, outcome: u64) -> 
         print_hex(operational_mode as u32);
         print_str(b"\n");
     } else {
-        print_str(b"[lsa-rdv] CONNECT REFUSED by the real LSA server\n");
+        status = if outcome == 1 {
+            0xC000_0005
+        } else {
+            print_str(b"[lsa-rdv] CONNECT REFUSED by the real LSA server\n");
+            status
+        };
     }
     LSA_CLI_REPLY_CAP.store(0, Ordering::Relaxed);
     LSA_CLI_KIND.store(0, Ordering::Relaxed);

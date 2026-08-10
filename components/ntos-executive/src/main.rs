@@ -16307,9 +16307,11 @@ struct ExecNtHandler {
     /// completes through the server, the executive records the connection here so the future message
     /// bulk (NtRequestWaitReplyPort/NtReplyWaitReceivePort/NtReplyPort) is served by DIRECT cross-
     /// badge delivery against this cache — never a per-message round-trip to the server. Pre-reserved
-    /// below the heap mark so pushes never reallocate across the per-syscall
-    /// bump reset. Records are `Copy` (inline name, no nested heap).
+    /// below the heap mark and grown as needed. Records are `Copy` (inline name, no nested heap);
+    /// when the vector itself grows above the loop's heap mark, `lpc_connections_dirty` asks the
+    /// service loop to pin that storage before the next per-syscall bump reset.
     lpc_connections: alloc::vec::Vec<LpcConnRecord>,
+    lpc_connections_dirty: bool,
     /// winlogon's CSR client-connect LpcWrite heap-view base (0 = the CSR regions haven't been mapped
     /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
     /// connect; guards the one-time region mapping (heap view + static server data) in that handler.

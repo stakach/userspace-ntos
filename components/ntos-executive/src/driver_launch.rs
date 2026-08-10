@@ -358,6 +358,8 @@ static mut FSD_DISPATCH_TRACE: u32 = 0;
 static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 /// Narrow NPFS transceive queue-state trace for RPC request/reply pipe transactions.
 static mut PIPE_TRANSCEIVE_TRACE_COUNT: u32 = 0;
+const PIPE_RW_TRACE_CAP: u32 = 768;
+const PIPE_TRANSCEIVE_TRACE_CAP: u32 = 384;
 /// Diagnostic heartbeat counters for the two unbounded-loop-capable driver callbacks.
 static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
@@ -991,12 +993,23 @@ struct PipeCcbView {
 }
 
 #[derive(Clone, Copy)]
+struct DceRpcContextHandleView {
+    offset: u8,
+    attributes: u32,
+    uuid: [u8; 16],
+}
+
+#[derive(Clone, Copy)]
 struct DceRpcPduView {
     ptype: u8,
     flags: u8,
     frag_len: u16,
     call_id: u32,
+    assoc_gid: Option<u32>,
+    alloc_hint: Option<u32>,
     opnum: Option<u16>,
+    fault_status: Option<u32>,
+    context_handle: Option<DceRpcContextHandleView>,
 }
 
 impl PipeCcbView {
@@ -1034,6 +1047,26 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
         read_volatile((payload + 14) as *const u8),
         read_volatile((payload + 15) as *const u8),
     ]);
+    let alloc_hint = if (ptype == 0 || ptype == 2 || ptype == 3) && len >= 20 {
+        Some(u32::from_le_bytes([
+            read_volatile((payload + 16) as *const u8),
+            read_volatile((payload + 17) as *const u8),
+            read_volatile((payload + 18) as *const u8),
+            read_volatile((payload + 19) as *const u8),
+        ]))
+    } else {
+        None
+    };
+    let assoc_gid = if (ptype == 11 || ptype == 12) && len >= 24 {
+        Some(u32::from_le_bytes([
+            read_volatile((payload + 20) as *const u8),
+            read_volatile((payload + 21) as *const u8),
+            read_volatile((payload + 22) as *const u8),
+            read_volatile((payload + 23) as *const u8),
+        ]))
+    } else {
+        None
+    };
     let opnum = if ptype == 0 && len >= 24 {
         Some(u16::from_le_bytes([
             read_volatile((payload + 22) as *const u8),
@@ -1042,12 +1075,67 @@ unsafe fn dcerpc_pdu_view(payload: u64, len: u64) -> Option<DceRpcPduView> {
     } else {
         None
     };
+    let fault_status = if ptype == 3 && len >= 28 {
+        Some(u32::from_le_bytes([
+            read_volatile((payload + 24) as *const u8),
+            read_volatile((payload + 25) as *const u8),
+            read_volatile((payload + 26) as *const u8),
+            read_volatile((payload + 27) as *const u8),
+        ]))
+    } else {
+        None
+    };
+    let context_handle = match ptype {
+        // Request/response/fault bodies begin after the 24-byte PDU-specific header. When the first
+        // NDR argument is a context handle, its wire shape is attributes(u32) + UUID. This is a
+        // transport trace only: invalid candidates are ignored and no service/interface names leak in.
+        0 | 2 | 3 => dcerpc_context_handle_at(payload, len, 24),
+        _ => None,
+    };
     Some(DceRpcPduView {
         ptype,
         flags,
         frag_len,
         call_id,
+        assoc_gid,
+        alloc_hint,
         opnum,
+        fault_status,
+        context_handle,
+    })
+}
+
+unsafe fn dcerpc_context_handle_at(
+    payload: u64,
+    len: u64,
+    offset: u8,
+) -> Option<DceRpcContextHandleView> {
+    let offset_u64 = offset as u64;
+    if len < offset_u64 + 20 {
+        return None;
+    }
+    let attributes = u32::from_le_bytes([
+        read_volatile((payload + offset_u64) as *const u8),
+        read_volatile((payload + offset_u64 + 1) as *const u8),
+        read_volatile((payload + offset_u64 + 2) as *const u8),
+        read_volatile((payload + offset_u64 + 3) as *const u8),
+    ]);
+    if attributes > 2 {
+        return None;
+    }
+    let mut uuid = [0u8; 16];
+    let mut any = false;
+    for (i, byte) in uuid.iter_mut().enumerate() {
+        *byte = read_volatile((payload + offset_u64 + 4 + i as u64) as *const u8);
+        any |= *byte != 0;
+    }
+    if !any {
+        return None;
+    }
+    Some(DceRpcContextHandleView {
+        offset,
+        attributes,
+        uuid,
     })
 }
 
@@ -1077,10 +1165,58 @@ fn print_dcerpc_pdu_view(view: Option<DceRpcPduView>) {
     print_u64(pdu.frag_len as u64);
     print_str(b" flags=0x");
     print_hex(pdu.flags as u32);
+    if let Some(assoc_gid) = pdu.assoc_gid {
+        print_str(b" assoc=");
+        print_u64(assoc_gid as u64);
+    }
+    if let Some(alloc_hint) = pdu.alloc_hint {
+        print_str(b" hint=");
+        print_u64(alloc_hint as u64);
+    }
     if let Some(opnum) = pdu.opnum {
         print_str(b" op=");
         print_u64(opnum as u64);
     }
+    if let Some(status) = pdu.fault_status {
+        print_str(b" fault=0x");
+        print_hex(status);
+    }
+    if let Some(context) = pdu.context_handle {
+        print_str(b" ctx@");
+        print_u64(context.offset as u64);
+        print_str(b" attr=");
+        print_u64(context.attributes as u64);
+        print_str(b" uuid=");
+        print_uuid(context.uuid);
+    }
+}
+
+fn print_hex_byte(byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    debug_put_char(HEX[(byte >> 4) as usize]);
+    debug_put_char(HEX[(byte & 0xf) as usize]);
+}
+
+fn print_uuid(uuid: [u8; 16]) {
+    debug_put_char(b'{');
+    print_hex_byte(uuid[3]);
+    print_hex_byte(uuid[2]);
+    print_hex_byte(uuid[1]);
+    print_hex_byte(uuid[0]);
+    debug_put_char(b'-');
+    print_hex_byte(uuid[5]);
+    print_hex_byte(uuid[4]);
+    debug_put_char(b'-');
+    print_hex_byte(uuid[7]);
+    print_hex_byte(uuid[6]);
+    debug_put_char(b'-');
+    print_hex_byte(uuid[8]);
+    print_hex_byte(uuid[9]);
+    debug_put_char(b'-');
+    for byte in &uuid[10..16] {
+        print_hex_byte(*byte);
+    }
+    debug_put_char(b'}');
 }
 
 unsafe fn pipe_queue_view(dq: u64) -> PipeQueueView {
@@ -1154,7 +1290,7 @@ unsafe fn trace_pipe_rw_result(
         || pdu.is_some()
         || before.is_some_and(|view| view.has_queued_state())
         || after.is_some_and(|view| view.has_queued_state());
-    if !interesting || PIPE_RW_TRACE_COUNT >= 192 {
+    if !interesting || PIPE_RW_TRACE_COUNT >= PIPE_RW_TRACE_CAP {
         return;
     }
     PIPE_RW_TRACE_COUNT += 1;
@@ -1202,7 +1338,7 @@ unsafe fn trace_pipe_transceive_result(
         || pdu.is_some()
         || before.is_some_and(|view| view.has_queued_state())
         || after.is_some_and(|view| view.has_queued_state());
-    if !interesting || PIPE_TRANSCEIVE_TRACE_COUNT >= 128 {
+    if !interesting || PIPE_TRANSCEIVE_TRACE_COUNT >= PIPE_TRANSCEIVE_TRACE_CAP {
         return;
     }
     PIPE_TRANSCEIVE_TRACE_COUNT += 1;
