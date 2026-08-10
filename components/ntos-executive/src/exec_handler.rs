@@ -14228,13 +14228,13 @@ impl ExecNtHandler {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
                 let root_dir = u64::from_le_bytes(rd);
-                // Noninteractive services: RegOpenKeyExW key-name strings are RTL_CONSTANT_STRING
-                // literals in DLL `.rdata` pages that the process NEVER dereferences (the
-                // executive is the first reader), so the page is not demand-faulted → unreachable by
-                // the mirror/frame table. Read the static content straight from the backing PE image
-                // (`read_objattr_name_pe`). Scoped by hosted image role so winlogon/csrss paint-time
-                // OA-name reads stay mirror-only (byte-identical).
-                let name16 = if self.current_process_is_noninteractive_service() {
+                // Hosted ReactOS processes often pass RegOpenKeyExW key-name strings from untouched
+                // DLL `.rdata` pages. The process may never dereference those literals itself, so a
+                // mirror-only read can observe an empty OBJECT_ATTRIBUTES name. Use the same
+                // cross-address-space reader as NtQueryValueKey for hosted roles so HKLM/HKU opens
+                // are resolved by the registry authority rather than image-specific recovery arms.
+                let pe_backed_registry_strings = self.current_process_uses_pe_backed_registry_strings();
+                let name16 = if pe_backed_registry_strings {
                     self.read_objattr_name_pe(oa)
                 } else {
                     smss_read_objattr_name(oa)
@@ -14311,10 +14311,9 @@ impl ExecNtHandler {
                 if let Some(status) = self.open_user_namespace_key(root_target, &path, oa, args) {
                     return status;
                 }
-                // winlogon (pi 2) — msgina's registry names are often `RTL_CONSTANT_STRING` literals
-                // in `.rdata` pages winlogon/advapi32 never touch, so the plain copyin mirror returns
-                // EMPTY. Recover the exact name from the backing PE image, then resolve only the
-                // predefined `\Registry\Machine` root and the real Winlogon SOFTWARE-hive key here.
+                // winlogon (pi 2) — msgina's older registry recovery paths are retained for names
+                // that still arrive empty, but normal hosted-role key opens above now resolve through
+                // the common registry authority first.
                 if self.current_process_is_winlogon() {
                     let eff_name = if !path.is_empty() {
                         path.clone()

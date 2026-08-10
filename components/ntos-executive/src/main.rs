@@ -8179,6 +8179,7 @@ pub(crate) static WL_TEB2_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WL_TEB2_EMULATED: AtomicU64 = AtomicU64::new(0);
 static WL_TEB2_PROTECT_REPORTS: AtomicU64 = AtomicU64::new(0);
 static WL_TEB2_PROTECT_FAILS: AtomicU64 = AtomicU64::new(0);
+static WL_TEB2_EMULATION_FAILS: AtomicU64 = AtomicU64::new(0);
 const WL_TEB2_MAX_CYCLES: u64 = 60_000;
 static RTL_LAST_STATUS_STORE_RVA: AtomicU64 = AtomicU64::new(0);
 
@@ -8256,10 +8257,9 @@ pub(crate) unsafe fn wl_teb2_protect() {
 
 /// `RtlNtStatusToDosError`'s `mov [rax+0x1250], ecx`, the 4-byte `TEB.LastStatusValue` store. It is
 /// BY FAR the most frequent write to the tail page (every failing syscall makes one) and it is
-/// entirely legitimate. The watch recognizes it so the logs can distinguish normal status traffic
-/// from descriptor writes, but it still lets the real client instruction execute after the page is
-/// remapped writable. That keeps the boundary honest: no synthesized register surgery on a live
-/// client thread, and the RVA is still derived from the loaded ntdll image at boot.
+/// entirely legitimate. The RVA is still derived from the loaded ntdll image at boot; on a protected
+/// write fault the executive copies ECX into the trusted TEB mirror and advances the fault frame so
+/// the protection stays continuously armed.
 const RTL_LAST_STATUS_STORE_LEN: u64 = 6;
 const RTL_LAST_STATUS_STORE_OPCODE: [u8; RTL_LAST_STATUS_STORE_LEN as usize] =
     [0x89, 0x88, 0x50, 0x12, 0x00, 0x00];
@@ -8293,10 +8293,10 @@ unsafe fn derive_rtl_last_status_store_rva(pe: &nt_pe_loader::PeFile) -> u64 {
     0
 }
 
-/// A client store into the protected tail: report WHO (RIP + the byte it aimed at), drop the
-/// protection so the instruction can complete, and let the loop re-arm it. Returns true if the store
-/// was emulated in place (currently never; the natural write path is intentional).
-pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, _tcb: u64) -> bool {
+/// A client store into the protected tail: report WHO (RIP + the byte it aimed at). Known-legitimate
+/// ntdll status traffic is emulated in place; every other store drops the protection only long
+/// enough for the original instruction to complete, then the service loop re-arms it.
+pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, tcb: u64) -> bool {
     let offset = addr & 0xFFF;
     let last_status_store_rva = RTL_LAST_STATUS_STORE_RVA.load(Ordering::Relaxed);
     let last_status_store = offset == 0x250
@@ -8323,6 +8323,40 @@ pub(crate) unsafe fn wl_teb2_report_write(ip: u64, addr: u64, _tcb: u64) -> bool
         print_str(b" #");
         print_u64(n);
         print_str(b"\n");
+    }
+    if last_status_store && tcb != 0 {
+        let mut regs = [0u64; 20];
+        crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+        let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
+        let rax = regs[nt_user_callback::USER_CONTEXT_RAX];
+        let value = regs[nt_user_callback::USER_CONTEXT_RCX] as u32;
+        if rip == ip && rax.wrapping_add(0x1250) == addr {
+            regs[nt_user_callback::USER_CONTEXT_RIP] =
+                ip.wrapping_add(RTL_LAST_STATUS_STORE_LEN);
+            let write_error = crate::win32k_glue::tcb_write_regs20(tcb, &regs, false);
+            if write_error == 0 {
+                core::ptr::write_volatile(
+                    (WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000 + offset) as *mut u32,
+                    value,
+                );
+                WL_TEB2_EMULATED.fetch_add(1, Ordering::Relaxed);
+                wl_teb2_reassert_descriptor();
+                return true;
+            }
+            if WL_TEB2_EMULATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[teb-writer] last-status emulation TCB_WriteRegisters failed err=");
+                print_u64(write_error);
+                print_str(b"\n");
+            }
+        } else if WL_TEB2_EMULATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[teb-writer] last-status emulation context mismatch rip=0x");
+            print_hex_u64(rip);
+            print_str(b" rax=0x");
+            print_hex_u64(rax);
+            print_str(b" addr=0x");
+            print_hex_u64(addr);
+            print_str(b"\n");
+        }
     }
     let cap = WL_TEB2_CAP.load(Ordering::Relaxed);
     let pml4 = WL_TEB2_PML4.load(Ordering::Relaxed);

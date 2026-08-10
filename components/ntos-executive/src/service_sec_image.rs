@@ -4975,20 +4975,8 @@ pub(crate) unsafe fn service_sec_image(
                 && (m3 & 0x2) != 0
                 && crate::WL_TEB2_PROTECTED.load(Ordering::Relaxed) != 0
             {
-                let tcb = if hosted_owner_has_role(
-                    &nt_handler,
-                    badge,
-                    nt_exe_image::HostedProcessRole::InteractiveLogon,
-                ) && hosted_main_badge_has_role(
-                    &nt_handler,
-                    badge,
-                    nt_exe_image::HostedProcessRole::InteractiveLogon,
-                ) {
-                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0)
-                } else {
-                    0
-                };
-                crate::wl_teb2_report_write(m0, addr, tcb);
+                let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
+                let _emulated = crate::wl_teb2_report_write(m0, addr, tcb);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
