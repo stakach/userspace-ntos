@@ -15642,30 +15642,6 @@ fn is_keyboard_layout_key(path: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b.to_ascii_lowercase()))
 }
-/// True if `path` names the NLS default-language key `System\CurrentControlSet\Control\Nls\Language`
-/// (HKLM-relative form, with or without a leading `\` or `\Registry\Machine\` prefix). winlogon's
-/// InitializeSAS → SetDefaultLanguage(NULL) opens it to read the `Default` LCID; it exists in the real
-/// staged SYSTEM hive. Matched EXACTLY (its 6 trailing components, in order) so no other Control subkey
-/// is spuriously satisfied — paint-safety, like the keyboard-layout / Winlogon-key matchers.
-pub(crate) fn is_nls_language_key(path: &str) -> bool {
-    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
-    // Strip an optional leading \Registry\Machine.
-    let tail: &[&str] = if comps.len() >= 2
-        && comps[0].eq_ignore_ascii_case("Registry")
-        && comps[1].eq_ignore_ascii_case("Machine")
-    {
-        &comps[2..]
-    } else {
-        &comps[..]
-    };
-    tail.len() == 5
-        && tail[0].eq_ignore_ascii_case("System")
-        && (tail[1].eq_ignore_ascii_case("CurrentControlSet")
-            || tail[1].eq_ignore_ascii_case("ControlSet001"))
-        && tail[2].eq_ignore_ascii_case("Control")
-        && tail[3].eq_ignore_ascii_case("Nls")
-        && tail[4].eq_ignore_ascii_case("Language")
-}
 /// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
 /// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
 /// so no other Software subkey is spuriously satisfied.

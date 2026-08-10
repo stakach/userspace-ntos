@@ -57,6 +57,7 @@ static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
+static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
 static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; 1024] = [0; 1024];
@@ -74,6 +75,7 @@ static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
 const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
+const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
@@ -1277,6 +1279,156 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     }
 }
 
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| x.eq_ignore_ascii_case(&y))
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .first()
+        .is_some_and(|b| matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        bytes = &bytes[1..];
+    }
+    while bytes
+        .last()
+        .is_some_and(|b| matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn strip_inf_comment(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b';' {
+            end = i;
+            break;
+        }
+        i += 1;
+    }
+    &bytes[..end]
+}
+
+fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut seen = false;
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit as u32)?;
+        seen = true;
+    }
+    seen.then_some(value)
+}
+
+fn parse_unattend_locale_id(bytes: &[u8]) -> Option<u32> {
+    let mut in_unattend = false;
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = trim_ascii(strip_inf_comment(raw_line));
+        if line.is_empty() {
+            continue;
+        }
+        if line.first() == Some(&b'[') {
+            let end = line.iter().position(|byte| *byte == b']')?;
+            in_unattend = ascii_eq_ignore_case(trim_ascii(&line[1..end]), b"Unattend");
+            continue;
+        }
+        if !in_unattend {
+            continue;
+        }
+        let Some(eq) = line.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let key = trim_ascii(&line[..eq]);
+        if !ascii_eq_ignore_case(key, b"LocaleID") {
+            continue;
+        }
+        let mut value = trim_ascii(&line[eq + 1..]);
+        if value.len() >= 2
+            && ((value[0] == b'"' && value[value.len() - 1] == b'"')
+                || (value[0] == b'\'' && value[value.len() - 1] == b'\''))
+        {
+            value = trim_ascii(&value[1..value.len() - 1]);
+        }
+        return parse_hex_u32(value);
+    }
+    None
+}
+
+fn lower_hex_digit(value: u32) -> u8 {
+    match value & 0xf {
+        digit @ 0..=9 => b'0' + digit as u8,
+        digit => b'a' + (digit as u8 - 10),
+    }
+}
+
+fn locale_id_ascii8(locale_id: u32, out: &mut [u8; 8]) {
+    let mut i = 0usize;
+    while i < 8 {
+        let shift = (7 - i) * 4;
+        out[i] = lower_hex_digit(locale_id >> shift);
+        i += 1;
+    }
+}
+
+fn utf16le_ascii_z(ascii: &[u8], out: &mut [u8]) -> Option<usize> {
+    if out.len() < ascii.len().checked_add(1)?.checked_mul(2)? {
+        return None;
+    }
+    let mut n = 0usize;
+    for &byte in ascii {
+        out[n] = byte;
+        out[n + 1] = 0;
+        n += 2;
+    }
+    out[n] = 0;
+    out[n + 1] = 0;
+    Some(n + 2)
+}
+
+fn parse_utf16le_ascii_hex_u32(bytes: &[u8]) -> Option<u32> {
+    let mut ascii = [0u8; 16];
+    let mut len = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() && len < ascii.len() {
+        let lo = bytes[i];
+        let hi = bytes[i + 1];
+        if lo == 0 && hi == 0 {
+            break;
+        }
+        if hi != 0 {
+            return None;
+        }
+        ascii[len] = lo;
+        len += 1;
+        i += 2;
+    }
+    parse_hex_u32(trim_ascii(&ascii[..len]))
+}
+
+unsafe fn setup_locale_id_from_unattend() -> Option<u32> {
+    let fs = crate::fs_loader::exec_fs()?;
+    let (cluster, size, attributes) =
+        crate::fs_loader::fat_open_path_entry(&fs, SETUP_UNATTEND_PATH)?;
+    if attributes & 0x10 != 0 {
+        return None;
+    }
+    let scratch = &mut *core::ptr::addr_of_mut!(SETUP_UNATTEND_SCRATCH);
+    let wanted = (size as usize).min(scratch.len());
+    let read = crate::fs_loader::fat_read_file_range(&fs, cluster, size, 0, &mut scratch[..wanted]);
+    parse_unattend_locale_id(&scratch[..read])
+}
+
 impl ExecNtHandler {
     #[inline(never)]
     pub(crate) unsafe fn initialize_in(
@@ -1856,11 +2008,10 @@ impl ExecNtHandler {
     /// A LiveCD never runs it, so the hive it ships has no locale — the same shape of gap as the
     /// missing `ntuser.dat`.
     ///
-    /// This performs that step, at setup's own location, with the machine's OWN language id: the
-    /// REG_SZ under `HKLM\SYSTEM\CurrentControlSet\Control\Nls\Language\Default` in the staged
-    /// SYSTEM hive — which is the same value `SetDefaultLanguage(NULL)` (the SYSTEM path, already
-    /// live in this boot: it is what makes `InitializeSAS` succeed) reads. Nothing is invented:
-    /// if the SYSTEM hive has no such value, nothing is written and the miss stands.
+    /// This performs that setup step at setup's own locations. ReactOS setup reads `LocaleID` from
+    /// `reactos\unattend.inf`, formats it as eight lowercase hex digits, writes that full string to
+    /// HKU `.DEFAULT\Control Panel\International\Locale`, then writes the low four digits to
+    /// HKLM `SYSTEM\CurrentControlSet\Control\Nls\Language::{Default,InstallLanguage}`.
     ///
     /// ★ BYPASS SWITCH `PROVISION_DEFAULT_USER_LOCALE`.
     ///
@@ -1874,26 +2025,47 @@ impl ExecNtHandler {
         const NLS_LANGUAGE: &str =
             r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
         const USER_INTERNATIONAL: &str = r"\Registry\User\.Default\Control Panel\International";
-        // The machine's language id, out of the real SYSTEM hive.
-        let Some((source_ty, language_id)) = self
-            .resolve_key(NLS_LANGUAGE)
-            .and_then(|key| self.registry_value(key, "Default"))
-        else {
-            print_str(
-                b"[locale-setup] HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
-            );
+        const REG_SZ: u32 = 1;
+        let mut locale_ascii = [0u8; 8];
+        let locale_source: &[u8] = if let Some(locale_id) = setup_locale_id_from_unattend() {
+            locale_id_ascii8(locale_id, &mut locale_ascii);
+            b"reactos\\unattend.inf"
+        } else {
+            let Some((source_ty, language_id)) = self
+                .resolve_key(NLS_LANGUAGE)
+                .and_then(|key| self.registry_value(key, "Default"))
+            else {
+                print_str(
+                    b"[locale-setup] no LocaleID in unattend.inf and HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
+                );
+                return;
+            };
+            if source_ty != REG_SZ {
+                print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not REG_SZ -> no user locale\n");
+                return;
+            }
+            let Some(locale_id) = parse_utf16le_ascii_hex_u32(&language_id) else {
+                print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not a hex LCID -> no user locale\n");
+                return;
+            };
+            locale_id_ascii8(locale_id, &mut locale_ascii);
+            b"HKLM\\SYSTEM\\...\\Nls\\Language\\Default"
+        };
+        let system_ascii = &locale_ascii[4..8];
+        let mut user_locale = [0u8; 18];
+        let Some(user_locale_len) = utf16le_ascii_z(&locale_ascii, &mut user_locale) else {
             return;
         };
-        // `SetDefaultLanguage` rejects every other type, and setup's
-        // `ProcessLocaleRegistry` writes REG_SZ explicitly rather than copying the source type.
-        const REG_SZ: u32 = 1;
-        if source_ty != REG_SZ {
-            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not REG_SZ -> no user locale\n");
+        let mut system_locale = [0u8; 10];
+        let Some(system_locale_len) = utf16le_ascii_z(system_ascii, &mut system_locale) else {
             return;
-        }
+        };
         // The target key must ALREADY exist in the prototype hive (hivedef.inf creates it empty);
         // creating it ourselves would be inventing structure rather than performing setup's step.
-        if self.resolve_key(USER_INTERNATIONAL).is_none() {
+        if self
+            .mutable_registry_key_by_path(USER_INTERNATIONAL)
+            .is_none()
+        {
             print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
             return;
         }
@@ -1901,18 +2073,40 @@ impl ExecNtHandler {
             USER_INTERNATIONAL,
             "Locale",
             REG_SZ,
-            &language_id,
+            &user_locale[..user_locale_len],
         ) {
             print_str(
                 b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
             );
             return;
         }
+        if self.mutable_registry_key_by_path(NLS_LANGUAGE).is_none() {
+            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
+            return;
+        }
+        if !self.set_mutable_registry_value_by_path(
+            NLS_LANGUAGE,
+            "Default",
+            REG_SZ,
+            &system_locale[..system_locale_len],
+        ) {
+            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default mutable write failed\n");
+            return;
+        }
+        if !self.set_mutable_registry_value_by_path(
+            NLS_LANGUAGE,
+            "InstallLanguage",
+            REG_SZ,
+            &system_locale[..system_locale_len],
+        ) {
+            print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\InstallLanguage mutable write failed\n");
+            return;
+        }
         self.mutable_hives_dirty = true;
-        DEFAULT_USER_LOCALE_BYTES.store(language_id.len() as u64, Ordering::Relaxed);
+        DEFAULT_USER_LOCALE_BYTES.store(user_locale_len as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
-        for &byte in language_id.iter().step_by(2) {
+        for &byte in &locale_ascii {
             debug_put_char(if (0x20..0x7f).contains(&byte) {
                 byte
             } else {
@@ -1921,7 +2115,13 @@ impl ExecNtHandler {
         }
         print_str(b" (REG type ");
         print_u64(REG_SZ as u64);
-        print_str(b", from HKLM\\SYSTEM\\...\\Nls\\Language\\Default)\n");
+        print_str(b", from ");
+        print_str(locale_source);
+        print_str(b") | HKLM\\...\\Nls\\Language Default=");
+        for &byte in system_ascii {
+            debug_put_char(byte);
+        }
+        print_str(b"\n");
     }
 
     fn is_dynamic_user_volatile_env_canon(canon: &str) -> bool {
@@ -2224,6 +2424,72 @@ impl ExecNtHandler {
         path.split('\\').filter(|c| !c.is_empty()).collect()
     }
 
+    /// True if `comps` is exactly `Registry\Machine` (the predefined `HKEY_LOCAL_MACHINE` root).
+    fn is_machine_root_comps(comps: &[&str]) -> bool {
+        comps.len() == 2
+            && comps[0].eq_ignore_ascii_case("Registry")
+            && comps[1].eq_ignore_ascii_case("Machine")
+    }
+
+    fn is_machine_namespace_root_component(component: &str) -> bool {
+        component.eq_ignore_ascii_case("System")
+            || component.eq_ignore_ascii_case("Software")
+            || component.eq_ignore_ascii_case("Security")
+            || component.eq_ignore_ascii_case("Sam")
+            || component.eq_ignore_ascii_case("Hardware")
+            || component.eq_ignore_ascii_case("BCD00000000")
+    }
+
+    /// Resolve the FULL NT path of a `\Registry\Machine` open target. The name may be absolute
+    /// (`\Registry\Machine\...`), relative to the machine root sentinel / an already-open HKLM key,
+    /// or a machine-hive-root relative name such as `System\CurrentControlSet\...`.
+    fn machine_namespace_target(
+        &self,
+        root_target: Option<KeyRef>,
+        name: &str,
+    ) -> Option<alloc::string::String> {
+        let comps = Self::key_components(name);
+        let base = match root_target {
+            None => {
+                if Self::is_machine_root_comps(&comps) {
+                    return Some(alloc::string::String::from(name));
+                }
+                if comps.len() > 2
+                    && comps[0].eq_ignore_ascii_case("Registry")
+                    && comps[1].eq_ignore_ascii_case("Machine")
+                {
+                    return Some(alloc::string::String::from(name));
+                }
+                if comps
+                    .first()
+                    .is_some_and(|component| Self::is_machine_namespace_root_component(component))
+                {
+                    let mut full = alloc::string::String::from(r"\Registry\Machine");
+                    if !name.is_empty() {
+                        full.push('\\');
+                        full.push_str(name);
+                    }
+                    return Some(full);
+                }
+                return None;
+            }
+            Some(MACHINE_ROOT_KEY) => alloc::string::String::from(r"\Registry\Machine"),
+            Some(target) => {
+                let path = self.registry_target_path(target)?;
+                if path != r"\registry\machine" && !path.starts_with(r"\registry\machine\") {
+                    return None;
+                }
+                path
+            }
+        };
+        let mut full = base;
+        if !name.is_empty() {
+            full.push('\\');
+            full.push_str(name);
+        }
+        Some(full)
+    }
+
     /// True if `comps` is exactly `Registry\User` (the predefined `HKEY_USERS` root).
     fn is_user_root_comps(comps: &[&str]) -> bool {
         comps.len() == 2
@@ -2400,9 +2666,9 @@ impl ExecNtHandler {
         Some(0xC000_0034)
     }
 
-    /// Hosted user processes after logon should resolve the mounted machine hives through the same
-    /// overlay-first path services/LSA use. Earlier boot clients stay on their exact-name arms because
-    /// broad pre-SAS HKLM success changes user32/winmm initialization order and regresses paint.
+    /// `NtOpenKey` for the `\Registry\Machine` (`HKEY_LOCAL_MACHINE`) namespace. This is the same
+    /// overlay/mutable/base authority used by value queries and relative child opens; a miss inside
+    /// the namespace is a real registry miss, not a synthetic success.
     ///
     /// # Safety
     /// Reads the caller's OBJECT_ATTRIBUTES through the bounds-checked cross-AS reader and mints a
@@ -2414,51 +2680,9 @@ impl ExecNtHandler {
         oa: u64,
         args: &[u64],
     ) -> Option<u32> {
-        if self.pi < 5 {
-            return None;
-        }
         let name = self.effective_objattr_name(path, oa);
-        if root_target.is_none() {
-            let comps = Self::key_components(&name);
-            if comps.len() == 2
-                && comps[0].eq_ignore_ascii_case("Registry")
-                && comps[1].eq_ignore_ascii_case("Machine")
-            {
-                return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
-            }
-        }
-
-        let full = if root_target == Some(MACHINE_ROOT_KEY) {
-            let mut full = alloc::string::String::from(r"\Registry\Machine");
-            if !name.is_empty() {
-                full.push('\\');
-                full.push_str(&name);
-            }
-            Some(full)
-        } else if let Some(parent_path) =
-            root_target.and_then(|target| self.registry_target_path(target))
-        {
-            if parent_path != r"\registry\machine"
-                && !parent_path.starts_with(r"\registry\machine\")
-            {
-                return None;
-            }
-            let mut full = parent_path;
-            if !name.is_empty() {
-                full.push('\\');
-                full.push_str(&name);
-            }
-            Some(full)
-        } else if root_target.is_none() {
-            Some(name)
-        } else {
-            None
-        }?;
-
+        let full = self.machine_namespace_target(root_target, &name)?;
         let canon = self.overlay_canon(&full);
-        if canon != r"\registry\machine" && !canon.starts_with(r"\registry\machine\") {
-            return None;
-        }
         if canon == r"\registry\machine" {
             return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
         }
@@ -14228,23 +14452,11 @@ impl ExecNtHandler {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
                 let root_dir = u64::from_le_bytes(rd);
-                // Hosted ReactOS processes often pass RegOpenKeyExW key-name strings from untouched
-                // DLL `.rdata` pages. The process may never dereference those literals itself, so a
-                // mirror-only read can observe an empty OBJECT_ATTRIBUTES name. Use the same
-                // cross-address-space reader as NtQueryValueKey for hosted roles so HKLM/HKU opens
-                // are resolved by the registry authority rather than image-specific recovery arms.
-                let pe_backed_registry_strings = self.current_process_uses_pe_backed_registry_strings();
-                let name16 = if pe_backed_registry_strings {
-                    self.read_objattr_name_pe(oa)
-                } else {
-                    smss_read_objattr_name(oa)
-                };
-                let mut path = alloc::string::String::new();
-                for &w in &name16 {
-                    if let Some(c) = char::from_u32(w as u32) {
-                        path.push(c);
-                    }
-                }
+                // Decode registry names with the common live-memory/PE-backed reader. ReactOS
+                // advapi often passes static DLL `.rdata` strings that the process has not faulted
+                // in, while userenv builds dynamic stack/heap names that must not be replaced by
+                // image bytes.
+                let mut path = self.read_registry_objattr_name(oa);
                 let root_target = if root_dir == 0 {
                     None
                 } else {
@@ -14359,22 +14571,6 @@ impl ExecNtHandler {
                                 args[0],
                             );
                         }
-                    }
-                    // winlogon InitializeSAS → SetDefaultLanguage(NULL) opens
-                    // `System\CurrentControlSet\Control\Nls\Language` (relative to the HKLM handle, so
-                    // root_dir arrives 0 like the keyboard-layout key) and reads its `Default` value (the
-                    // system default LCID string). Backing it makes SetDefaultLanguage succeed →
-                    // InitializeSAS succeeds (was: NOT_FOUND → SetDefaultLanguage
-                    // FALSE → InitializeSAS FALSE → winlogon ExitProcess(2)). EXACT-name scoped so no other
-                    // pi==2 HKLM subkey outcome changes (the desktop paint's client reads stay identical).
-                    if is_nls_language_key(&eff_name) {
-                        let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
-                        if let Some(status) =
-                            self.open_registry_full_path(&full, args[1] as u32, args[0])
-                        {
-                            return status;
-                        }
-                        return 0xC000_0034;
                     }
                     // PE-name recovery only. Readable ProfileList opens are handled by the generic
                     // mutable-hive route above; this branch exists for winlogon registry names that
@@ -15899,8 +16095,8 @@ impl ExecNtHandler {
                     // Hosted clients reading a value out of a REAL MOUNTED HIVE (not an overlay or
                     // predefined-root handle): their out-params are advapi/userenv heap or stack the
                     // plain mirror can't reach, so the copyout below must go cross-AS. Early live cases:
-                    //   • SetDefaultLanguage(NULL) → the `Default` value of the SYSTEM-hive key
-                    //     `...\Control\Nls\Language` (opened via is_nls_language_key). Was:
+                    //   • SetDefaultLanguage(NULL) -> the `Default` value of the SYSTEM-hive key
+                    //     `...\Control\Nls\Language` (opened through the machine namespace). Was:
                     //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
                     //     InitializeSAS FALSE → ExitProcess(2).
                     //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key

@@ -95,6 +95,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
 - `[x]` G4: Add a stable framebuffer proof for explorer shell chrome, distinct from desktop
   background and cursor artifacts.
 
+### H. Registry Namespace And Setup-State Cleanup
+
+- `[x]` H1: Replace remaining exact-name winlogon HKLM registry arms with a real
+  `\Registry\Machine` namespace resolver shared by predefined-root, absolute, and key-relative
+  opens.
+- `[x]` H2: Keep LiveCD/setup locale provisioning tied to real setup inputs: prefer
+  `reactos\unattend.inf` `LocaleID` when present, otherwise use the staged SYSTEM hive's
+  `Nls\Language\Default` value.
+- `[x]` H3: Re-run one serialized boot after H1/H2 and require the post-SAS path to advance through
+  `SetDefaultLanguage(NULL)` without reintroducing synthetic registry success.
+
 ## Review Log
 
 ### 2026-08-02
@@ -2017,3 +2028,22 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   frontier is the post-SAS message loop. In that boot, `exec_winlogon_sas_window` and
   `exec_win32k_desktop_painted` pass, but post-SAS `GetMessage` remains `0`, so msgina dialog
   creation/profile activation/userinit/explorer are downstream again.
+- H1/H2 started. The clean TEB-emulation boot proof
+  `.tmp/boot-clean-teb-emulation-20260810-134455.log` reaches desktop background paint and the
+  winlogon SAS window, then `InitializeSAS` fails immediately after
+  `NtUserSetLogonNotifyWindow(0x127c)`. The final native sequence has one `NtOpenKey` and then
+  `NtTerminateProcess`, with no `NtQueryValueKey` or `NtSetDefaultLocale`, so the blocker is the
+  registry open that should feed `SetDefaultLanguage(NULL)`. Review adjustment: remove the old
+  exact NLS-key matcher and route HKLM opens through a real machine namespace parser instead.
+- H2 correction. A diagnostic boot with the in-progress locale setup code printed
+  `[locale-setup] reactos\unattend.inf LocaleID absent -> no setup locale`, so relying only on
+  `unattend.inf` regressed the previously working `.DEFAULT` locale seed. The setup provisioner must
+  use real data only, but it needs both legitimate sources: `unattend.inf` when present and the
+  staged SYSTEM hive's `Nls\Language\Default` otherwise.
+- H1-H3 complete. Fresh serialized boot
+  `.tmp/boot-setup-locale-clean-20260810-135954.log` provisions
+  `HKU\.DEFAULT\Control Panel\International\Locale <- 00000409` from
+  `reactos\unattend.inf`, writes `HKLM\...\Nls\Language` `Default=0409`, and reaches the existing
+  desktop proof without the previous `WL: Failed to initialize SAS` abort. The run finishes at the
+  current shell frontier (`246/295`, `exec_win32k_desktop_painted` passes); post-SAS
+  `GetMessage`/msgina/profile/userinit/explorer gates remain the next blockers.
