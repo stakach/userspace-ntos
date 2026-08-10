@@ -322,10 +322,9 @@ const IRP_MJ_FILE_SYSTEM_CONTROL: u64 = major::IRP_MJ_FILE_SYSTEM_CONTROL as u64
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
-/// `IRP_MJ_CLOSE` / `IRP_MJ_CLEANUP` — the requests that END an open (and therefore the ONLY
-/// requests that may destroy its FILE_OBJECT). See [`FILE_OBJECTS`].
+/// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
+/// FILE_OBJECT must remain available for close. See [`FILE_OBJECTS`].
 const IRP_MJ_CLOSE: u64 = 0x02;
-const IRP_MJ_CLEANUP: u64 = 0x12;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -7734,8 +7733,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if uses_file_object && crate::FSD_FILE_OBJECT_PER_OPEN && owns_fo && fsctx != 0 && fsctx != 1 {
         fo_registered = fo_register(fsctx, fo);
     }
-    // CLEANUP / CLOSE end the open — this is where a FILE_OBJECT legitimately dies.
-    if uses_file_object && (major == IRP_MJ_CLEANUP || major == IRP_MJ_CLOSE) {
+    // CLOSE is where the FILE_OBJECT memory legitimately dies. CLEANUP may clear its FsContext, but
+    // the same FILE_OBJECT must remain available for the following CLOSE IRP.
+    if uses_file_object && major == IRP_MJ_CLOSE {
         fo_release(file_id);
         fo_registered = false;
     }

@@ -42,11 +42,22 @@ pub struct FileCompletionBinding {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileReferenceRelease {
+    pub cleanup_required: bool,
+    pub close_required: bool,
+    pub device_id: u64,
+    pub port_id: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FileCompletionEntry {
     file_id: u64,
+    device_id: u64,
     references: u32,
+    handle_references: u32,
     synchronous: bool,
     signaled: bool,
+    cleanup_sent: bool,
     notification_modes: u32,
     binding: Option<FileCompletionBinding>,
 }
@@ -64,9 +75,12 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Self {
             entries: [FileCompletionEntry {
                 file_id: 0,
+                device_id: 0,
                 references: 0,
+                handle_references: 0,
                 synchronous: false,
                 signaled: false,
+                cleanup_sent: false,
                 notification_modes: 0,
                 binding: None,
             }; FILES],
@@ -79,16 +93,28 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         }
     }
 
-    pub fn insert_file(&mut self, file_id: u64, synchronous: bool) -> Result<(), u32> {
-        if file_id == 0 {
+    pub fn insert_file(
+        &mut self,
+        file_id: u64,
+        device_id: u64,
+        synchronous: bool,
+    ) -> Result<(), u32> {
+        if file_id == 0 || device_id == 0 {
             return Err(STATUS_INVALID_HANDLE);
         }
         if let Some(entry) = self.entry_mut(file_id) {
-            if entry.synchronous != synchronous {
+            if entry.device_id != device_id
+                || entry.synchronous != synchronous
+                || entry.cleanup_sent
+            {
                 return Err(STATUS_INVALID_PARAMETER);
             }
             entry.references = entry
                 .references
+                .checked_add(1)
+                .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            entry.handle_references = entry
+                .handle_references
                 .checked_add(1)
                 .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
             return Ok(());
@@ -100,12 +126,31 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         *entry = FileCompletionEntry {
             file_id,
+            device_id,
             references: 1,
+            handle_references: 1,
             synchronous,
             signaled: true,
+            cleanup_sent: false,
             notification_modes: 0,
             binding: None,
         };
+        Ok(())
+    }
+
+    pub fn retain_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.cleanup_sent {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        entry.references = entry
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        entry.handle_references = entry
+            .handle_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         Ok(())
     }
 
@@ -118,17 +163,27 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         Ok(())
     }
 
-    /// Drop one handle reference. The returned port id is the binding reference the executive must
-    /// release when the last handle to the file object closes.
-    pub fn release_file(&mut self, file_id: u64) -> Result<Option<u32>, u32> {
+    /// Drop one non-handle file-object reference, usually held by a pending I/O operation.
+    pub fn release_file(&mut self, file_id: u64) -> Result<FileReferenceRelease, u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         entry.references -= 1;
-        if entry.references != 0 {
-            return Ok(None);
+        Ok(Self::finish_release(entry, false))
+    }
+
+    /// Drop one user-visible file handle reference. Cleanup is required when the last handle closes;
+    /// close is required when this also drops the final file-object reference.
+    pub fn release_handle(&mut self, file_id: u64) -> Result<FileReferenceRelease, u32> {
+        let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.handle_references == 0 {
+            return Err(STATUS_INVALID_HANDLE);
         }
-        let port = entry.binding.map(|binding| binding.port_id);
-        *entry = FileCompletionEntry::default();
-        Ok(port)
+        entry.handle_references -= 1;
+        entry.references -= 1;
+        let cleanup_required = entry.handle_references == 0 && !entry.cleanup_sent;
+        if cleanup_required {
+            entry.cleanup_sent = true;
+        }
+        Ok(Self::finish_release(entry, cleanup_required))
     }
 
     pub fn associate(&mut self, file_id: u64, binding: FileCompletionBinding) -> Result<(), u32> {
@@ -232,6 +287,27 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
         self.entries
             .iter_mut()
             .find(|entry| entry.references != 0 && entry.file_id == file_id)
+    }
+
+    fn finish_release(
+        entry: &mut FileCompletionEntry,
+        cleanup_required: bool,
+    ) -> FileReferenceRelease {
+        let close_required = entry.references == 0;
+        let release = FileReferenceRelease {
+            cleanup_required,
+            close_required,
+            device_id: entry.device_id,
+            port_id: if close_required {
+                entry.binding.map(|binding| binding.port_id)
+            } else {
+                None
+            },
+        };
+        if close_required {
+            *entry = FileCompletionEntry::default();
+        }
+        release
     }
 }
 
@@ -865,8 +941,8 @@ mod tests {
     #[test]
     fn file_completion_binding_is_shared_until_the_last_handle_closes() {
         let mut files = FileCompletionTable::<2>::new();
-        files.insert_file(10, false).unwrap();
-        files.retain_file(10).unwrap();
+        files.insert_file(10, 77, false).unwrap();
+        files.retain_handle(10).unwrap();
         files
             .associate(
                 10,
@@ -883,16 +959,32 @@ mod tests {
                 key_context: 0x1234,
             })
         );
-        assert_eq!(files.release_file(10), Ok(None));
+        assert_eq!(
+            files.release_handle(10),
+            Ok(FileReferenceRelease {
+                cleanup_required: false,
+                close_required: false,
+                device_id: 77,
+                port_id: None,
+            })
+        );
         assert_eq!(files.binding(10).unwrap().key_context, 0x1234);
-        assert_eq!(files.release_file(10), Ok(Some(3)));
+        assert_eq!(
+            files.release_handle(10),
+            Ok(FileReferenceRelease {
+                cleanup_required: true,
+                close_required: true,
+                device_id: 77,
+                port_id: Some(3),
+            })
+        );
         assert_eq!(files.binding(10), None);
     }
 
     #[test]
     fn pending_operation_keeps_binding_alive_after_last_handle_closes() {
         let mut files = FileCompletionTable::<1>::new();
-        files.insert_file(10, false).unwrap();
+        files.insert_file(10, 77, false).unwrap();
         files
             .associate(
                 10,
@@ -903,17 +995,33 @@ mod tests {
             )
             .unwrap();
         files.retain_file(10).unwrap();
-        assert_eq!(files.release_file(10), Ok(None));
+        assert_eq!(
+            files.release_handle(10),
+            Ok(FileReferenceRelease {
+                cleanup_required: true,
+                close_required: false,
+                device_id: 77,
+                port_id: None,
+            })
+        );
         assert_eq!(files.is_synchronous(10), Ok(false));
         assert_eq!(files.binding(10).unwrap().port_id, 3);
-        assert_eq!(files.release_file(10), Ok(Some(3)));
+        assert_eq!(
+            files.release_file(10),
+            Ok(FileReferenceRelease {
+                cleanup_required: false,
+                close_required: true,
+                device_id: 77,
+                port_id: Some(3),
+            })
+        );
         assert_eq!(files.binding(10), None);
     }
 
     #[test]
     fn file_object_signal_state_tracks_pending_io() {
         let mut files = FileCompletionTable::<1>::new();
-        files.insert_file(10, false).unwrap();
+        files.insert_file(10, 77, false).unwrap();
         assert_eq!(files.is_signaled(10), Ok(true));
 
         assert_eq!(files.set_signaled(10, false), Ok(()));
@@ -927,8 +1035,8 @@ mod tests {
     #[test]
     fn file_completion_notification_modes_are_sticky_and_reject_sync_files() {
         let mut files = FileCompletionTable::<2>::new();
-        files.insert_file(10, false).unwrap();
-        files.insert_file(20, true).unwrap();
+        files.insert_file(10, 77, false).unwrap();
+        files.insert_file(20, 77, true).unwrap();
 
         assert_eq!(files.notification_modes(10), Ok(0));
         assert_eq!(
@@ -957,7 +1065,7 @@ mod tests {
     #[test]
     fn file_completion_policy_controls_handle_signal_and_port_packets() {
         let mut files = FileCompletionTable::<1>::new();
-        files.insert_file(10, false).unwrap();
+        files.insert_file(10, 77, false).unwrap();
         files
             .set_notification_modes(
                 10,
@@ -992,12 +1100,12 @@ mod tests {
     #[test]
     fn file_completion_binding_rejects_sync_rebind_and_capacity_overflow() {
         let mut files = FileCompletionTable::<2>::new();
-        files.insert_file(10, true).unwrap();
+        files.insert_file(10, 77, true).unwrap();
         assert_eq!(
             files.associate(10, FileCompletionBinding::default()),
             Err(STATUS_INVALID_PARAMETER)
         );
-        files.insert_file(20, false).unwrap();
+        files.insert_file(20, 77, false).unwrap();
         assert_eq!(
             files.associate(
                 20,
@@ -1014,7 +1122,7 @@ mod tests {
         );
         assert_eq!(files.can_associate(20), Err(STATUS_INVALID_PARAMETER));
         assert_eq!(
-            files.insert_file(30, false),
+            files.insert_file(30, 77, false),
             Err(STATUS_INSUFFICIENT_RESOURCES)
         );
         assert_eq!(files.retain_file(99), Err(STATUS_INVALID_HANDLE));

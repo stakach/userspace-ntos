@@ -116,7 +116,10 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   next genuine red edge without reintroducing service-pipe or executable identity fallbacks.
 - `[~]` I4: Fix the real service-control RPC/context-handle path now exposed by dynamic service
   startup, using NPFS/RPC/loader semantics rather than service-name, executable, or launch-order
-  fallbacks.
+  fallbacks. Current completed slice: routed file handles now distinguish user-handle references
+  from pending I/O references, `NtClose` sends real `IRP_MJ_CLEANUP`/`IRP_MJ_CLOSE` to the owning
+  hosted device, and the hosted-driver shim keeps the same FILE_OBJECT alive from cleanup through
+  close.
 
 ### J. SEC_IMAGE And Memory Manager Fidelity
 
@@ -128,6 +131,17 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   or historical bootstrap assumptions.
 
 ## Review Log
+
+### 2026-08-10
+
+- I4 continued. The latest EventLog context-handle miss exposed a missing generic NT file-object
+  lifecycle rather than an RPC handle gap: process handle close dropped executive pipe bookkeeping
+  without dispatching cleanup/close IRPs to hosted NPFS, and the hosted-driver shim released the
+  per-open FILE_OBJECT too early on cleanup. `nt-io-completion` now tracks handle refs separately
+  from in-flight I/O refs and reports cleanup/close obligations; `NtClose` on routed files dispatches
+  `IRP_MJ_CLEANUP` when the last user handle closes and `IRP_MJ_CLOSE` when the final file-object
+  reference drops. Review adjustment: boot validation still needs to prove this moves the
+  EventLog/RPC context-handle frontier and restores the desktop path.
 
 ### 2026-08-02
 
@@ -2436,3 +2450,20 @@ state, ports, and GUI/user callbacks through real kernel-owned contracts.
   {fb1f958e-c047-4b4f-ba6c-97645a18f1a1}` while explorer still has zero syscalls. Review
   adjustment: continue I4 in RPC context-handle association and server-side endpoint state; do not
   add service-name, executable-order, stack-window, or paint fallbacks.
+- I4 hosted FILE_OBJECT lifecycle cleanup complete. The EventLog/RPC context-handle miss above
+  exposed a generic I/O lifetime gap, not a UUID-specific RPC policy problem: routed file handles were
+  being dropped from completion bookkeeping without delivering the NT file-object lifecycle IRPs to
+  hosted NPFS. The file-completion table now tracks user-handle references separately from pending I/O
+  references, records the owning device for each routed FILE_OBJECT, dispatches `IRP_MJ_CLEANUP` when
+  the last user handle closes, and dispatches `IRP_MJ_CLOSE` only when the final file-object reference
+  is released. The hosted-driver shim keeps the same FILE_OBJECT allocation alive between cleanup and
+  close so ReactOS NPFS can clear CCB state during cleanup and finish object teardown during close.
+  Validation: `cargo fmt --all`, `cargo test -p nt-io-completion -- --nocapture`, executive
+  `cargo check`, `git diff --check`, and serialized desktop boot
+  `.tmp/boot-file-lifecycle-20260811-011725.log`. Evidence: the old `no context handle found`/fault
+  packet edge does not recur, `exec_win32k_desktop_painted` passes, EventLog/LSA/SAM service paths
+  continue through the real NPFS/RPC data plane, and the harness reaches `[microtest done]`. Review
+  adjustment: I4 remains open at the next real desktop blocker: Winlogon reaches the logon path, but
+  `ProfileList` opens stay at zero, `NtLoadKey`/profile copy do not run, and `userinit.exe`/explorer do
+  not launch. Continue in registry/profile/logon routing with no profile, executable-order, or paint
+  fallbacks.

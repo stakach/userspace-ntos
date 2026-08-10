@@ -52,6 +52,16 @@ mechanisms: make winlogon's profile directory and `ProfileList` reads route thro
 SOFTWARE hive and writable overlay, then drive `LoadUserProfile`/`NtLoadKey` far enough for
 `userinit.exe` to launch naturally.
 
+Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
+completion table separates user-handle references from pending I/O references; `NtClose` dispatches
+`IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and
+the hosted-driver shim preserves the same FILE_OBJECT between cleanup and close. This targets the
+real EventLog/RPC context-handle frontier by fixing NPFS instance cleanup rather than synthesizing
+RPC context state. Serialized boot `.tmp/boot-file-lifecycle-20260811-011725.log` proves the old
+EventLog context-handle fault does not recur and the base desktop readback still passes; the active
+red edge has moved to Winlogon profile/shell activation, where `ProfileList` opens remain zero and
+`userinit.exe`/`explorer.exe` are not launched.
+
 The current kernel fix is generic: root `FSCTL_PIPE_WAIT` has a bounded name waiter with real
 timeout/deadline handling and exact name completion, `NtOpenFile` clears failed output handles, and
 hosted-thread quiesce now tracks the actual parked thread badges. Dispatcher waits, pipe reads,

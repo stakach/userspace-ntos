@@ -5983,7 +5983,7 @@ impl ExecNtHandler {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe")?;
         self.file_completion
-            .insert_file(file_id, synchronous)
+            .insert_file(file_id, device_id, synchronous)
             .ok()?;
         let handle = match self.insert_process_handle(
             pid,
@@ -7360,14 +7360,52 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn release_file_reference(&mut self, file_id: u64) {
-        if let Ok(port_id) = self.file_completion.release_file(file_id) {
-            if self.file_completion.is_signaled(file_id).is_err() {
-                crate::pipe_fid_name_forget(file_id);
-            }
-            if let Some(port_id) = port_id {
-                let _ = self.io_completion_ports.release(port_id);
-            }
+        if let Ok(release) = self.file_completion.release_file(file_id) {
+            self.complete_file_reference_release(file_id, release);
         }
+    }
+
+    fn release_file_handle_reference(&mut self, file_id: u64, device_id: u64) {
+        if let Ok(mut release) = self.file_completion.release_handle(file_id) {
+            if release.device_id == 0 {
+                release.device_id = device_id;
+            }
+            self.complete_file_reference_release(file_id, release);
+        }
+    }
+
+    fn complete_file_reference_release(
+        &mut self,
+        file_id: u64,
+        release: nt_io_completion::FileReferenceRelease,
+    ) {
+        if release.cleanup_required {
+            self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLEANUP);
+        }
+        if release.close_required {
+            self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLOSE);
+            crate::pipe_fid_name_forget(file_id);
+        }
+        if let Some(port_id) = release.port_id {
+            let _ = self.io_completion_ports.release(port_id);
+        }
+    }
+
+    fn dispatch_file_lifecycle_irp(&mut self, file_id: u64, device_id: u64, major: u8) {
+        if file_id == 0 || device_id == 0 {
+            return;
+        }
+        let mut empty: [u8; 0] = [];
+        let _ = unsafe {
+            driver_launch::dispatch_irp_to_device_result(
+                device_id,
+                major as u64,
+                0,
+                file_id,
+                &[],
+                &mut empty,
+            )
+        };
     }
 
     fn cancel_target_for_handle(&self, handle: u64) -> Result<(Option<u64>, bool), u32> {
@@ -10912,9 +10950,12 @@ impl ExecNtHandler {
             nt_process::HandleObject::IoCompletion(id) => {
                 let _ = self.io_completion_ports.release(id);
             }
-            nt_process::HandleObject::File(file_id)
-            | nt_process::HandleObject::RoutedFile { file_id, .. } => {
-                self.release_file_reference(file_id);
+            nt_process::HandleObject::File(file_id) => {
+                let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe").unwrap_or(0);
+                self.release_file_handle_reference(file_id, device_id);
+            }
+            nt_process::HandleObject::RoutedFile { file_id, device_id } => {
+                self.release_file_handle_reference(file_id, device_id);
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
@@ -11017,7 +11058,7 @@ impl ExecNtHandler {
             nt_process::HandleObject::IoCompletion(id) => self.io_completion_ports.retain(id),
             nt_process::HandleObject::File(file_id)
             | nt_process::HandleObject::RoutedFile { file_id, .. } => {
-                self.file_completion.retain_file(file_id)
+                self.file_completion.retain_handle(file_id)
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 self.directory_opens.retain(object_id)

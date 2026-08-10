@@ -16675,9 +16675,14 @@ impl ExecFileCompletion {
         Self { table }
     }
 
-    fn insert_file(&mut self, file_id: u64, synchronous: bool) -> Result<(), u32> {
+    fn insert_file(&mut self, file_id: u64, device_id: u64, synchronous: bool) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).insert_file(file_id, synchronous) }
+        unsafe { (&mut *self.table).insert_file(file_id, device_id, synchronous) }
+    }
+
+    fn retain_handle(&mut self, file_id: u64) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain_handle(file_id) }
     }
 
     fn retain_file(&mut self, file_id: u64) -> Result<(), u32> {
@@ -16685,9 +16690,14 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).retain_file(file_id) }
     }
 
-    fn release_file(&mut self, file_id: u64) -> Result<Option<u32>, u32> {
+    fn release_file(&mut self, file_id: u64) -> Result<nt_io_completion::FileReferenceRelease, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_file(file_id) }
+    }
+
+    fn release_handle(&mut self, file_id: u64) -> Result<nt_io_completion::FileReferenceRelease, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_handle(file_id) }
     }
 
     fn associate(
