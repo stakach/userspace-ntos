@@ -56,6 +56,10 @@ static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
+static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static NT_CANCEL_IO_FILE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
@@ -157,6 +161,217 @@ fn trace_named_pipe_io(
         print_hex(byte as u32);
         print_str(b" ");
     }
+    print_str(b"\n");
+}
+
+fn scm_worker_slot_for(nt: &ExecNtHandler) -> Option<usize> {
+    match nt.hosted_thread_role_for_badge(nt.current_badge) {
+        Some(HostedThreadRole::ScmWorkerSlot { slot }) if slot < TP_WORKER_SLOT_COUNT => {
+            Some(slot)
+        }
+        _ => None,
+    }
+}
+
+fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
+    print_str(b" handle=0x");
+    print_hex(handle as u32);
+    let Some(pid) = nt.pm_pid_for_pi(nt.pi) else {
+        print_str(b" access=no-pid obj=no-pid");
+        return;
+    };
+    if handle > u32::MAX as u64 {
+        print_str(b" access=invalid obj=invalid-handle");
+        return;
+    }
+    let process_handle = handle as nt_process::Handle;
+    match nt.pm.handle_access(pid, process_handle) {
+        Some(access) => {
+            print_str(b" access=0x");
+            print_hex(access);
+        }
+        None => print_str(b" access=missing"),
+    }
+    print_str(b" obj=");
+    match nt.pm.lookup_handle(pid, process_handle) {
+        Some(nt_process::HandleObject::RoutedFile { file_id, device_id }) => {
+            print_str(b"routed-file fid=0x");
+            print_hex(file_id as u32);
+            print_str(b" dev=0x");
+            print_hex(device_id as u32);
+        }
+        Some(nt_process::HandleObject::File(file_id)) => {
+            print_str(b"file fid=0x");
+            print_hex(file_id as u32);
+        }
+        Some(nt_process::HandleObject::OverlayFile(file_id)) => {
+            print_str(b"overlay-file fid=0x");
+            print_hex(file_id as u32);
+        }
+        Some(nt_process::HandleObject::Opaque(tag)) => {
+            print_str(b"opaque tag=0x");
+            print_hex_u64(tag);
+        }
+        Some(nt_process::HandleObject::DiskFile { .. }) => print_str(b"disk-file"),
+        Some(nt_process::HandleObject::Directory { .. }) => print_str(b"directory"),
+        Some(nt_process::HandleObject::BootStatusFile) => print_str(b"boot-status"),
+        Some(nt_process::HandleObject::IoCompletion(_)) => print_str(b"io-completion"),
+        Some(nt_process::HandleObject::RegistryKey(_)) => print_str(b"registry-key"),
+        Some(nt_process::HandleObject::Process(_)) => print_str(b"process"),
+        Some(nt_process::HandleObject::Thread(_)) => print_str(b"thread"),
+        Some(nt_process::HandleObject::Section(_)) => print_str(b"section"),
+        Some(nt_process::HandleObject::Token(_)) => print_str(b"token"),
+        Some(nt_process::HandleObject::TokenObject(_)) => print_str(b"token-object"),
+        Some(nt_process::HandleObject::DebugObject(_)) => print_str(b"debug-object"),
+        None => print_str(b"missing"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_scm_worker_read_io(
+    nt: &ExecNtHandler,
+    slot: usize,
+    seq: u64,
+    handle: u64,
+    event: u64,
+    iosb: u64,
+    iosb_ok: bool,
+    buffer: u64,
+    len: usize,
+    byte_offset: u64,
+    apc_routine: u64,
+    apc_context: u64,
+    completion_event: Result<Option<usize>, u32>,
+    disk_file: Result<Option<(u32, u32)>, u32>,
+    overlay_file: Option<u64>,
+    route_status: u32,
+    route_fid: u64,
+    routed: bool,
+    pending_read_fid: u64,
+    status: u32,
+    information: u64,
+) {
+    if seq >= 16 {
+        return;
+    }
+    print_str(b"[scm-worker-read-io] slot=");
+    print_u64(slot as u64);
+    print_str(b" #");
+    print_u64(seq);
+    print_str(b" pi=");
+    print_u64(nt.pi as u64);
+    print_str(b" badge=");
+    print_u64(nt.current_badge);
+    print_str(b" tid=");
+    print_u64(nt.current_tid);
+    trace_handle_object_for(nt, handle);
+    print_str(b" event=0x");
+    print_hex(event as u32);
+    print_str(b" iosb=0x");
+    print_hex_u64(iosb);
+    print_str(b" iosb_ok=");
+    print_u64(iosb_ok as u64);
+    print_str(b" buffer=0x");
+    print_hex_u64(buffer);
+    print_str(b" len=");
+    print_u64(len as u64);
+    print_str(b" byte_offset=0x");
+    print_hex_u64(byte_offset);
+    print_str(b" apc=0x");
+    print_hex_u64(apc_routine);
+    print_str(b" apc_ctx=0x");
+    print_hex_u64(apc_context);
+    print_str(b" event_status=0x");
+    match completion_event {
+        Ok(Some(index)) => {
+            print_hex(0);
+            print_str(b" event_idx=");
+            print_u64(index as u64);
+        }
+        Ok(None) => {
+            print_hex(0);
+            print_str(b" event_idx=none");
+        }
+        Err(event_status) => {
+            print_hex(event_status);
+            print_str(b" event_idx=err");
+        }
+    }
+    print_str(b" disk_status=0x");
+    match disk_file {
+        Ok(Some((_cluster, size))) => {
+            print_hex(0);
+            print_str(b" disk_size=");
+            print_u64(size as u64);
+        }
+        Ok(None) => {
+            print_hex(0);
+            print_str(b" disk_size=none");
+        }
+        Err(disk_status) => {
+            print_hex(disk_status);
+            print_str(b" disk_size=err");
+        }
+    }
+    print_str(b" overlay=0x");
+    print_hex(overlay_file.unwrap_or(0) as u32);
+    print_str(b" route_status=0x");
+    print_hex(route_status);
+    print_str(b" route_fid=0x");
+    print_hex(route_fid as u32);
+    print_str(b" routed=");
+    print_u64(routed as u64);
+    print_str(b" pending_fid=0x");
+    print_hex(pending_read_fid as u32);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(information);
+    print_str(b"\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_scm_worker_flush_io(
+    nt: &ExecNtHandler,
+    slot: usize,
+    seq: u64,
+    handle: u64,
+    iosb: u64,
+    iosb_ok: bool,
+    file_id: u64,
+    route_status: u32,
+    routed: bool,
+    status: u32,
+    information: u64,
+) {
+    if seq >= 16 {
+        return;
+    }
+    print_str(b"[scm-worker-flush-io] slot=");
+    print_u64(slot as u64);
+    print_str(b" #");
+    print_u64(seq);
+    print_str(b" pi=");
+    print_u64(nt.pi as u64);
+    print_str(b" badge=");
+    print_u64(nt.current_badge);
+    print_str(b" tid=");
+    print_u64(nt.current_tid);
+    trace_handle_object_for(nt, handle);
+    print_str(b" iosb=0x");
+    print_hex_u64(iosb);
+    print_str(b" iosb_ok=");
+    print_u64(iosb_ok as u64);
+    print_str(b" route_status=0x");
+    print_hex(route_status);
+    print_str(b" file_id=0x");
+    print_hex(file_id as u32);
+    print_str(b" routed=");
+    print_u64(routed as u64);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" info=");
+    print_u64(information);
     print_str(b"\n");
 }
 
@@ -21376,6 +21591,8 @@ impl ExecNtHandler {
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
                 let mut completion_file_id = 0u64;
                 let mut async_file_retained = false;
+                let mut npfs_route_status = 0xFFFF_FFFEu32;
+                let mut npfs_route_fid = 0u64;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !matches!(disk_file, Ok(Some(_)))
@@ -21474,9 +21691,14 @@ impl ExecNtHandler {
                     }
                 } else {
                     match self.npfs_read_file_route_for(fh) {
-                        Err(handle_status) => handle_status,
+                        Err(handle_status) => {
+                            npfs_route_status = handle_status;
+                            handle_status
+                        }
                         Ok(route) => {
+                            npfs_route_status = nt_fs::STATUS_SUCCESS;
                             let file_id = route.file_id;
+                            npfs_route_fid = file_id;
                             completion_file_id = file_id;
                             let synchronous =
                                 self.file_completion.is_synchronous(file_id).unwrap_or(true);
@@ -21657,6 +21879,32 @@ impl ExecNtHandler {
                     apc_context,
                     &output[..(information as usize).min(output.len())],
                 );
+                if let Some(slot) = scm_worker_slot_for(self) {
+                    let seq = SCM_WORKER_READ_IO_TRACE_N[slot].fetch_add(1, Ordering::Relaxed);
+                    trace_scm_worker_read_io(
+                        self,
+                        slot,
+                        seq,
+                        fh,
+                        event,
+                        iosb,
+                        iosb_ok,
+                        buffer,
+                        len,
+                        byte_offset,
+                        apc_routine,
+                        apc_context,
+                        completion_event,
+                        disk_file,
+                        overlay_file,
+                        npfs_route_status,
+                        npfs_route_fid,
+                        routed,
+                        pending_read_fid,
+                        status,
+                        information,
+                    );
+                }
                 if NT_READ_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[nt-read-file] pi=");
                     print_u64(self.pi as u64);
@@ -21920,6 +22168,7 @@ impl ExecNtHandler {
                 let mut information = 0u64;
                 let mut file_id = 0u64;
                 let mut routed = false;
+                let mut npfs_route_status = 0xFFFF_FFFEu32;
                 let status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if self.boot_status_handle_access(handle).is_ok() {
@@ -21934,8 +22183,12 @@ impl ExecNtHandler {
                     nt_fs::STATUS_SUCCESS
                 } else {
                     match self.npfs_flush_file_route_for(handle) {
-                        Err(handle_status) => handle_status,
+                        Err(handle_status) => {
+                            npfs_route_status = handle_status;
+                            handle_status
+                        }
                         Ok(route) => {
+                            npfs_route_status = nt_fs::STATUS_SUCCESS;
                             file_id = route.file_id;
                             let mut output = [];
                             match self.npfs_route_raw_for(
@@ -21961,6 +22214,22 @@ impl ExecNtHandler {
                 }
                 if routed && status == 0x0000_0103 {
                     NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(slot) = scm_worker_slot_for(self) {
+                    let seq = SCM_WORKER_FLUSH_IO_TRACE_N[slot].fetch_add(1, Ordering::Relaxed);
+                    trace_scm_worker_flush_io(
+                        self,
+                        slot,
+                        seq,
+                        handle,
+                        iosb,
+                        iosb_ok,
+                        file_id,
+                        npfs_route_status,
+                        routed,
+                        status,
+                        information,
+                    );
                 }
                 if NT_FLUSH_BUFFERS_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
                     print_str(b"[nt-flush-file] pi="); print_u64(self.pi as u64);
