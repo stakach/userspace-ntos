@@ -1045,6 +1045,10 @@ pub const SSN_NT_PULSE_EVENT: u64 = 144;
 pub const SSN_NT_QUERY_EVENT: u64 = 155;
 pub const SSN_NT_RESET_EVENT: u64 = 210;
 pub const SSN_NT_SET_EVENT: u64 = 228;
+pub const SSN_NT_CANCEL_TIMER: u64 = 25;
+pub const SSN_NT_CREATE_TIMER: u64 = 56;
+pub const SSN_NT_OPEN_TIMER: u64 = 137;
+pub const SSN_NT_SET_TIMER: u64 = 253;
 pub const SSN_NT_CREATE_MUTANT: u64 = 45;
 pub const SSN_NT_OPEN_MUTANT: u64 = 126;
 pub const SSN_NT_RELEASE_MUTANT: u64 = 196;
@@ -1057,6 +1061,7 @@ pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
 pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
 pub const SSN_NT_CONNECT_PORT: u64 = 33;
 pub const SSN_NT_SECURE_CONNECT_PORT: u64 = 218;
+pub const SSN_NT_LISTEN_PORT: u64 = 100;
 /// NtRequestWaitReplyPort — the LPC message data plane (CSR API calls: kernel32's CsrClientCallServer
 /// → \Windows\ApiPort). Serviced by the executive's DIRECT cross-badge message plane.
 pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
@@ -2396,6 +2401,12 @@ static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable<IO_COM
 static IO_COMPLETION_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Native waitable timers share the delay HPET one-shot. The authoritative timer records live in
+/// `ExecNtHandler`; this atomic lets the common rearm path include their current minimum deadline.
+static USER_TIMER_NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static USER_TIMER_FIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static USER_TIMER_APC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Keyed-event waiters (`NtWaitForKeyedEvent`) use the same reply-cap parking model as object-event
 /// waits, but are keyed by an arbitrary user pointer instead of an object-namespace event index.
@@ -12177,6 +12188,10 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
     let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
+    let user_timer_deadline = match USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        deadline => Some(deadline),
+    };
     // The deadman joins the same `min()` as every real waiter — it is a deadline like any other, so
     // the arm/disarm path (and `exec_delay_timer_disarms`' invariants) are untouched by it.
     let deadman_deadline = watchdog_deadline();
@@ -12187,6 +12202,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .chain(keyed_deadline)
         .chain(io_completion_deadline)
         .chain(pipe_name_deadline)
+        .chain(user_timer_deadline)
         .chain(deadman_deadline)
         .min();
     if let Some(deadline) = deadline {
@@ -12206,6 +12222,8 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
             4
         } else if pipe_name_deadline == Some(deadline) {
             6
+        } else if user_timer_deadline == Some(deadline) {
+            7
         } else {
             5 // the deadman
         };
@@ -12357,6 +12375,17 @@ unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
+unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler) -> u64 {
+    let fired = handler.user_timer_fire_due(monotonic_time_100ns());
+    if fired != 0 {
+        let woken = wait_wake_dispatcher_set(handler);
+        USER_TIMER_FIRED_COUNT.fetch_add(fired, Ordering::Relaxed);
+        fired + woken
+    } else {
+        0
+    }
+}
+
 fn thread_wait_state_reset() {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).reset();
@@ -12449,6 +12478,7 @@ unsafe fn delay_timer_interrupt(
         + keyed_wait_wake_due(handler)
         + io_completion_wake_due(handler)
         + pipe_name_wait_wake_due(handler)
+        + user_timer_wake_due(handler)
         + watchdog_tick;
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
@@ -12492,10 +12522,12 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>
     let completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
     let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
+    let user_timer_deadline = USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed);
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || queue.len() != 0
         || completion_deadline.is_some()
         || pipe_name_deadline.is_some()
+        || user_timer_deadline != u64::MAX
     {
         return;
     }
@@ -16018,6 +16050,8 @@ const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
 /// for win32k and cross-process compatibility.
 const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
 const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const TIMER_HANDLE_TAG: u64 = 0x5449_4D52_0000_0000;
+const TIMER_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
 const SEMAPHORE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const MUTANT_HANDLE_TAG: u64 = 0x4D55_544E_0000_0000;
@@ -16033,6 +16067,7 @@ const DIRECTORY_CREATE_SUBDIRECTORY_ACCESS: u32 = 0x0008;
 const SYMBOLIC_LINK_QUERY_ACCESS: u32 = 0x0001;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
+const TIMER_MODIFY_STATE: u32 = 0x0002;
 const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
 const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -16043,6 +16078,7 @@ const OBJ_KIND_EVENT: u8 = 2;
 const OBJ_KIND_SEMAPHORE: u8 = 3;
 const OBJ_KIND_MUTANT: u8 = 4;
 const OBJ_KIND_LPC_PORT: u8 = 5;
+const OBJ_KIND_TIMER: u8 = 6;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
@@ -16261,6 +16297,16 @@ enum HostedThreadSpawnRequest {
     TpWorker { pi: usize, slot: usize },
 }
 
+#[derive(Clone, Copy)]
+struct UserTimerRecord {
+    object_index: u64,
+    due_100ns: u64,
+    period_100ns: u64,
+    active: bool,
+    apc_routine: u64,
+    apc_context: u64,
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -16316,6 +16362,11 @@ struct ExecNtHandler {
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
+    /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
+    /// `events`; this table holds due-time, period, and optional APC metadata.
+    user_timers: alloc::vec::Vec<UserTimerRecord>,
+    user_timers_dirty: bool,
+    user_timer_rearm_requested: bool,
     /// Counting semaphore state keyed by the same stable namespace indices.
     semaphores: nt_kernel_exec::SemaphoreStore,
     /// Mutant state keyed by the same stable namespace indices.
@@ -16377,6 +16428,12 @@ struct ExecNtHandler {
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
     lpc_rendezvous_conn: u64,
     lpc_rendezvous_out: u64,
+    /// Generic LPC server receive that found no pending broker message. The loop parks this caller as
+    /// a typed LPC receiver instead of sending a spurious status or falling into unserviced handling.
+    lpc_receive_park_port: u64,
+    lpc_receive_park_msg: u64,
+    lpc_receive_park_ctx: u64,
+    lpc_receive_park_listen_only: bool,
     /// A synchronous SMSS request on its established `\\SmApiPort` client connection. The loop
     /// delivers it to the parked real SmpApiLoop and resumes this caller only after the worker's
     /// reply is available.
@@ -17601,6 +17658,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtResetEvent, SSN_NT_RESET_EVENT as u32),
             (NativeService::NtSetEvent, SSN_NT_SET_EVENT as u32),
             (NativeService::NtOpenEvent, SSN_NT_OPEN_EVENT as u32),
+            (NativeService::NtCreateTimer, SSN_NT_CREATE_TIMER as u32),
+            (NativeService::NtOpenTimer, SSN_NT_OPEN_TIMER as u32),
+            (NativeService::NtCancelTimer, SSN_NT_CANCEL_TIMER as u32),
+            (NativeService::NtSetTimer, SSN_NT_SET_TIMER as u32),
             (
                 NativeService::NtCreateSemaphore,
                 SSN_NT_CREATE_SEMAPHORE as u32,
@@ -17634,6 +17695,11 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtRequestWaitReplyPort,
                 SSN_NT_REQUEST_WAIT_REPLY_PORT as u32,
+            ),
+            (NativeService::NtListenPort, SSN_NT_LISTEN_PORT as u32),
+            (
+                NativeService::NtReplyWaitReceivePort,
+                SSN_NT_REPLY_WAIT_RECEIVE_PORT as u32,
             ),
             (NativeService::NtOpenProcess, SSN_NT_OPEN_PROCESS as u32),
             (NativeService::NtOpenThread, SSN_NT_OPEN_THREAD as u32),

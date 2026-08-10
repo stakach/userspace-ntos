@@ -6954,6 +6954,10 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_name_wait_iosb_va: u64 = 0;
             let mut park_pipe_name_wait_event_obj_idx: u64 = u64::MAX;
             let mut park_pipe_name_wait_deadline_100ns: u64 = u64::MAX;
+            let mut park_lpc_receive_port: u64 = 0;
+            let mut park_lpc_receive_msg: u64 = 0;
+            let mut park_lpc_receive_ctx: u64 = 0;
+            let mut park_lpc_receive_listen_only = false;
             let mut gui_message_wait_park_request = false;
             let mut gui_message_wait_queue_event_body: u64 = 0;
             let mut gui_message_wait_msg_ptr: u64 = 0;
@@ -7025,6 +7029,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
                 nt_handler.lpc_connections_dirty = false;
+                nt_handler.user_timers_dirty = false;
+                nt_handler.user_timer_rearm_requested = false;
                 nt_handler.hive_mounts_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
@@ -7064,6 +7070,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_name_wait_redrive = 0;
                 nt_handler.pipe_connect_redrive_server_fid = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
+                nt_handler.lpc_receive_park_port = 0;
+                nt_handler.lpc_receive_park_msg = 0;
+                nt_handler.lpc_receive_park_ctx = 0;
+                nt_handler.lpc_receive_park_listen_only = false;
                 nt_handler.sm_request_port = 0;
                 nt_handler.sm_request_message = 0;
                 nt_handler.sm_reply_message = 0;
@@ -7484,6 +7494,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.lpc_connections_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                if nt_handler.user_timers_dirty {
+                    nt_handler.user_timers_dirty = false;
+                    pin_durable_heap_mark(&mut heap_mark);
+                }
                 if take_object_namespace_growth_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -7644,6 +7658,15 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
+                }
+                if nt_handler.user_timer_rearm_requested {
+                    delay_timer_rearm(delay_queue);
+                }
+                if nt_handler.lpc_receive_park_port != 0 {
+                    park_lpc_receive_port = nt_handler.lpc_receive_park_port;
+                    park_lpc_receive_msg = nt_handler.lpc_receive_park_msg;
+                    park_lpc_receive_ctx = nt_handler.lpc_receive_park_ctx;
+                    park_lpc_receive_listen_only = nt_handler.lpc_receive_park_listen_only;
                 }
                 // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
                 // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
@@ -13301,6 +13324,50 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 print_str(b"[gui-msg-wait] park unavailable -> GetMessage failure\n");
                 result = u64::MAX;
+            }
+            if park_lpc_receive_port != 0 && reply_main != 0 {
+                if drop_current_syscall_reply() {
+                    print_str(b"[lpc-recv] pi=");
+                    print_u64(pi as u64);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" port=0x");
+                    print_hex_u64(park_lpc_receive_port);
+                    print_str(b" msg=0x");
+                    print_hex_u64(park_lpc_receive_msg);
+                    if park_lpc_receive_ctx != 0 {
+                        print_str(b" ctx=0x");
+                        print_hex_u64(park_lpc_receive_ctx);
+                    }
+                    print_str(if park_lpc_receive_listen_only {
+                        b" listen=1"
+                    } else {
+                        b" listen=0"
+                    });
+                    print_str(b" -> PARK LPC receiver\n");
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    trace_indefinite_wait_park(
+                        &nt_handler,
+                        badge,
+                        live_top_badges(&nt_handler),
+                        crash_parked,
+                        wait_parked,
+                    );
+                    mark_wait_parked!(pi, resume_ip);
+                    let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                print_str(b"[lpc-recv] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                result = 0xC000_009A;
             }
             if park_io_completion_port >= 0 && reply_main != 0 {
                 if park_io_completion_deadline.is_some() && !delay_timer_init() {

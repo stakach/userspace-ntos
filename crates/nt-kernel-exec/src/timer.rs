@@ -13,6 +13,28 @@ pub trait Clock {
     fn system_time_100ns(&self) -> i64;
 }
 
+/// Expand Win32 generic access bits into the timer object's native access mask.
+pub fn map_timer_access(mut access: u32) -> u32 {
+    const TIMER_QUERY_STATE: u32 = 0x0001;
+    const TIMER_MODIFY_STATE: u32 = 0x0002;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+
+    if access & 0x8000_0000 != 0 {
+        access |= 0x0002_0000 | TIMER_QUERY_STATE;
+    }
+    if access & 0x4000_0000 != 0 {
+        access |= 0x0002_0000 | TIMER_MODIFY_STATE;
+    }
+    if access & 0x2000_0000 != 0 {
+        access |= 0x0002_0000 | SYNCHRONIZE;
+    }
+    if access & (0x1000_0000 | 0x0200_0000) != 0 {
+        access |= TIMER_ALL_ACCESS;
+    }
+    access & !(0xF000_0000 | 0x0200_0000)
+}
+
 /// A deterministic fake clock for tests (spec §10.3).
 #[derive(Debug, Default)]
 pub struct FakeClock {
@@ -261,5 +283,13 @@ mod tests {
         assert!(!tq.cancel(0x700)); // no longer active
         clk.advance_100ns(2_000);
         assert!(tq.run_due(&clk).is_empty()); // cancelled → no fire
+    }
+
+    #[test]
+    fn timer_generic_access_maps_to_native_rights() {
+        assert_eq!(map_timer_access(0x8000_0000), 0x0002_0001);
+        assert_eq!(map_timer_access(0x4000_0000), 0x0002_0002);
+        assert_eq!(map_timer_access(0x2000_0000), 0x0012_0000);
+        assert_eq!(map_timer_access(0x1000_0000), 0x001F_0003);
     }
 }

@@ -189,6 +189,33 @@ fn driver_load_variants_keep_native_argument_contracts() {
 }
 
 #[test]
+fn timer_and_lpc_receive_services_keep_native_contracts() {
+    let cases = [
+        (NativeService::NtCancelTimer, "NtCancelTimer", 25, 2),
+        (NativeService::NtCreateTimer, "NtCreateTimer", 56, 4),
+        (NativeService::NtListenPort, "NtListenPort", 100, 2),
+        (NativeService::NtOpenTimer, "NtOpenTimer", 137, 3),
+        (
+            NativeService::NtReplyWaitReceivePort,
+            "NtReplyWaitReceivePort",
+            203,
+            4,
+        ),
+        (NativeService::NtSetTimer, "NtSetTimer", 253, 7),
+    ];
+    let table = NativeServiceTable::test_profile();
+    for (service, name, ssn, argc) in cases {
+        assert_eq!(service.name(), name);
+        assert_eq!(service.arg_count(), (argc, argc));
+        assert_eq!(nt_syscall_abi::ssn_of(name), Some(ssn));
+        assert!(
+            table.number_of(service).is_some(),
+            "{name} missing from test table"
+        );
+    }
+}
+
+#[test]
 fn query_directory_file_keeps_native_eleven_argument_contract() {
     assert_eq!(
         NativeService::NtQueryDirectoryFile.name(),

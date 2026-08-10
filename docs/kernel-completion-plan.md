@@ -52,6 +52,18 @@ mechanisms: make winlogon's profile directory and `ProfileList` reads route thro
 SOFTWARE hive and writable overlay, then drive `LoadUserProfile`/`NtLoadKey` far enough for
 `userinit.exe` to launch naturally.
 
+Active syscall-coverage slice: ReactOS now reaches real NT waitable timers and generic LPC
+server-receive/listen calls before the profile/shell path can run naturally. `NtCreateTimer`,
+`NtOpenTimer`, `NtSetTimer`, and `NtCancelTimer` are registered in the native table and backed by
+typed process handles, dispatcher-signaled timer objects, HPET deadline rearming, periodic requeue,
+and exact access mapping. `NtListenPort` and `NtReplyWaitReceivePort` are also registered and route
+through the LPC broker instead of falling into the unserviced syscall path; connection requests carry
+a real `PORT_MESSAGE` header with broker connection identity and data messages copy the broker's
+bytes into the server's receive buffer. The serialized desktop retry must now prove whether this is
+enough to get back to base desktop paint; if it parks, the next fix should be a generic wakeable LPC
+receive waiter or the next logon/profile syscall shown by the boot log, not a profile, service-name,
+UUID, launch-order, or paint fallback.
+
 Current I/O lifecycle slice: routed FILE_OBJECTs now use NT-style close ownership. The
 completion table separates user-handle references from pending I/O references; `NtClose` dispatches
 `IRP_MJ_CLEANUP` at the last user handle and `IRP_MJ_CLOSE` at the final file-object reference, and
@@ -2954,3 +2966,19 @@ executable-order fallbacks.
   connection, mounted SOFTWARE `ProfileList`, `NtLoadKey`, profile copy) before expecting natural
   userinit/explorer paint. No service-name, UUID, launch-order, RPC-byte, or paint fallback has been
   introduced.
+
+- I4 native timer and LPC receive registration slice. The native syscall table now includes
+  `NtCreateTimer`/`NtOpenTimer`/`NtSetTimer`/`NtCancelTimer` plus
+  `NtListenPort`/`NtReplyWaitReceivePort` at the ReactOS SSNs and argument counts. Timers are real
+  dispatcher-signaled objects with typed handle access, object-query identity, absolute/relative due
+  time conversion, HPET rearming, cancellation, immediate signal, and periodic requeue; APC routines
+  are traced but still wait for the generic user-APC integration path. Generic LPC server receive
+  calls now capture optional replies, accept immediate broker connection/data messages, write real
+  `PORT_MESSAGE` receive buffers, and park typed LPC receives instead of returning an unserviced
+  syscall. Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec -- --nocapture`,
+  `cargo test -p nt-syscall -- --nocapture`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: the next serialized desktop run should classify whether
+  the remaining blocker is wakeable LPC receive delivery, user timer APC delivery, or the next real
+  logon/profile syscall. Do not add profile, service-name, UUID, launch-order, RPC-byte, or paint
+  fallback behavior.

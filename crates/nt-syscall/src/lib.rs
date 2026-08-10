@@ -163,6 +163,10 @@ pub enum NativeService {
     // NtOpenEventPair — obsolete event-pair objects. Exported so legacy shell/debug imports resolve;
     // the executive currently returns an object-open failure because no event-pair type is modelled.
     NtOpenEventPair,
+    NtCreateTimer,
+    NtOpenTimer,
+    NtCancelTimer,
+    NtSetTimer,
     NtCreateSemaphore,
     NtOpenSemaphore,
     NtQuerySemaphore,
@@ -182,6 +186,8 @@ pub enum NativeService {
     // API message exchange (kernel32's CsrClientCallServer → \Windows\ApiPort) via DIRECT cross-
     // badge delivery against the cached connection — it does NOT round-trip to the isolated broker.
     NtRequestWaitReplyPort,
+    NtListenPort,
+    NtReplyWaitReceivePort,
     NtMakeTemporaryObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
     // no per-thread/process attribute sets, no per-object security).
@@ -331,6 +337,10 @@ impl NativeService {
             NtSetEvent => "NtSetEvent",
             NtOpenEvent => "NtOpenEvent",
             NtOpenEventPair => "NtOpenEventPair",
+            NtCreateTimer => "NtCreateTimer",
+            NtOpenTimer => "NtOpenTimer",
+            NtCancelTimer => "NtCancelTimer",
+            NtSetTimer => "NtSetTimer",
             NtCreateSemaphore => "NtCreateSemaphore",
             NtOpenSemaphore => "NtOpenSemaphore",
             NtQuerySemaphore => "NtQuerySemaphore",
@@ -343,6 +353,8 @@ impl NativeService {
             NtAcceptConnectPort => "NtAcceptConnectPort",
             NtCompleteConnectPort => "NtCompleteConnectPort",
             NtRequestWaitReplyPort => "NtRequestWaitReplyPort",
+            NtListenPort => "NtListenPort",
+            NtReplyWaitReceivePort => "NtReplyWaitReceivePort",
             NtMakeTemporaryObject => "NtMakeTemporaryObject",
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
@@ -537,6 +549,12 @@ impl NativeService {
         NativeService::NtCancelIoFile,
         NativeService::NtContinue,
         NativeService::NtRaiseException,
+        NativeService::NtCreateTimer,
+        NativeService::NtOpenTimer,
+        NativeService::NtCancelTimer,
+        NativeService::NtSetTimer,
+        NativeService::NtListenPort,
+        NativeService::NtReplyWaitReceivePort,
     ];
 }
 

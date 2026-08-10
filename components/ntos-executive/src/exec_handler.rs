@@ -1891,6 +1891,9 @@ impl ExecNtHandler {
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
+        write_field!(user_timers, alloc::vec::Vec::with_capacity(32));
+        write_field!(user_timers_dirty, false);
+        write_field!(user_timer_rearm_requested, false);
         write_field!(
             semaphores,
             nt_kernel_exec::SemaphoreStore::with_capacity(192)
@@ -1958,6 +1961,10 @@ impl ExecNtHandler {
         write_field!(anon_event_seq, 0);
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
+        write_field!(lpc_receive_park_port, 0);
+        write_field!(lpc_receive_park_msg, 0);
+        write_field!(lpc_receive_park_ctx, 0);
+        write_field!(lpc_receive_park_listen_only, false);
         write_field!(sm_request_port, 0);
         write_field!(sm_request_message, 0);
         write_field!(sm_reply_message, 0);
@@ -6405,6 +6412,59 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub(crate) fn mint_timer_handle(&mut self, timer_index: usize, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let tag = TIMER_HANDLE_TAG | timer_index as u64;
+        let handle = self
+            .insert_process_handle(
+                pid,
+                nt_process::HandleObject::Opaque(tag),
+                nt_kernel_exec::map_timer_access(access),
+            )
+            .ok()?;
+        Some(handle as u64)
+    }
+
+    pub(crate) fn timer_index_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            return match self.obj_ns.get(index) {
+                Some(entry) if entry.kind != OBJ_KIND_TIMER => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                _ => Err(STATUS_INVALID_HANDLE),
+            };
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Opaque(tag))
+                if tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG =>
+            {
+                tag
+            }
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let index = (tag & 0xFFFF_FFFF) as usize;
+        self.obj_ns
+            .get(index)
+            .filter(|entry| entry.kind == OBJ_KIND_TIMER && self.events.contains(index as u64))
+            .map(|_| index)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub(crate) fn signal_event_index(&mut self, index: usize) -> u32 {
         let Some(previous) = self.events.set_existing(index as u64) else {
             return 0xC000_0008; // STATUS_INVALID_HANDLE
@@ -7036,6 +7096,13 @@ impl ExecNtHandler {
             Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
             Err(status) => return Err(status),
         }
+        match self.timer_index_for_handle(handle, required_access) {
+            Ok(index) => return Ok(WaitObject::dispatcher(index)),
+            Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
+            Err(STATUS_INVALID_HANDLE) => saw_invalid_handle = true,
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
+            Err(status) => return Err(status),
+        }
         match self.semaphore_index_for_handle(handle, required_access) {
             Ok(index) => return Ok(WaitObject::dispatcher(index)),
             Err(STATUS_ACCESS_DENIED) => return Err(STATUS_ACCESS_DENIED),
@@ -7152,9 +7219,13 @@ impl ExecNtHandler {
         thread: u64,
     ) -> Option<nt_kernel_exec::DispatcherObject> {
         match self.obj_ns.get(index).map(|entry| entry.kind) {
-            Some(2) => Some(nt_kernel_exec::DispatcherObject::Event(index as u64)),
-            Some(3) => Some(nt_kernel_exec::DispatcherObject::Semaphore(index as u64)),
-            Some(4) => Some(nt_kernel_exec::DispatcherObject::Mutant {
+            Some(OBJ_KIND_EVENT) | Some(OBJ_KIND_TIMER) => {
+                Some(nt_kernel_exec::DispatcherObject::Event(index as u64))
+            }
+            Some(OBJ_KIND_SEMAPHORE) => {
+                Some(nt_kernel_exec::DispatcherObject::Semaphore(index as u64))
+            }
+            Some(OBJ_KIND_MUTANT) => Some(nt_kernel_exec::DispatcherObject::Mutant {
                 identity: index as u64,
                 thread,
             }),
@@ -9414,6 +9485,7 @@ impl ExecNtHandler {
             Some(2) => b"Event",
             Some(3) => b"Semaphore",
             Some(4) => b"Mutant",
+            Some(OBJ_KIND_TIMER) => b"Timer",
             _ => match object {
                 nt_process::HandleObject::Process(_) => b"Process",
                 nt_process::HandleObject::Thread(_) => b"Thread",
@@ -9444,6 +9516,11 @@ impl ExecNtHandler {
                     if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG =>
                 {
                     b"Mutant"
+                }
+                nt_process::HandleObject::Opaque(tag)
+                    if tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG =>
+                {
+                    b"Timer"
                 }
                 nt_process::HandleObject::Opaque(tag)
                     if tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG =>
@@ -9479,6 +9556,7 @@ impl ExecNtHandler {
         let index = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG
             || tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG
             || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
+            || tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG
             || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG
             || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == SYMBOLIC_LINK_HANDLE_TAG
         {
@@ -13016,6 +13094,14 @@ impl ExecNtHandler {
         }
     }
 
+    fn rollback_new_timer(&mut self, index: usize) {
+        if index + 1 == self.obj_ns.len() {
+            self.obj_ns.pop();
+            self.events.remove_existing(index as u64);
+            self.user_timer_remove(index as u64);
+        }
+    }
+
     fn rollback_new_semaphore(&mut self, index: usize) {
         if index + 1 == self.obj_ns.len() {
             self.obj_ns.pop();
@@ -13646,6 +13732,118 @@ impl ExecNtHandler {
         0
     }
 
+    unsafe fn lpc_capture_port_message(&self, message: u64) -> Result<alloc::vec::Vec<u8>, u32> {
+        if message == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+        let mut header = [0u8; 4];
+        if !self.xas_read(message, &mut header) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let total = u16::from_le_bytes([header[2], header[3]]) as usize;
+        if !(0x28..=512).contains(&total) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut bytes = alloc::vec![0u8; total];
+        if !self.xas_read(message, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(bytes)
+    }
+
+    unsafe fn lpc_write_received_message(
+        &self,
+        receive_message: u64,
+        received: &nt_lpc_client::ReceiveResult,
+    ) -> Result<(), u32> {
+        const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
+        if receive_message == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let bytes = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
+            let data_len = received.connection_info.len().min(512 - PORT_MESSAGE_HEADER_LEN);
+            let total = PORT_MESSAGE_HEADER_LEN + data_len;
+            let mut message = alloc::vec![0u8; total];
+            message[0..2].copy_from_slice(&(data_len as u16).to_le_bytes());
+            message[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+            message[4..6].copy_from_slice(&received.msg_type.to_le_bytes());
+            message[0x18..0x1c].copy_from_slice(&(received.connection_id as u32).to_le_bytes());
+            message[PORT_MESSAGE_HEADER_LEN..].copy_from_slice(&received.connection_info[..data_len]);
+            message
+        } else {
+            received.connection_info.clone()
+        };
+        if bytes.is_empty()
+            || !self.probe_user_output(receive_message, bytes.len())
+            || !self.xas_try_write_buf(receive_message, &bytes)
+        {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(())
+    }
+
+    unsafe fn lpc_receive_or_park(
+        &mut self,
+        port_handle: u64,
+        port_context: u64,
+        reply_message: u64,
+        receive_message: u64,
+        listen_only: bool,
+    ) -> u32 {
+        let reply = match self.lpc_capture_port_message(reply_message) {
+            Ok(reply) => reply,
+            Err(status) => return status,
+        };
+        let Some(lpc) = lpc_client() else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        match lpc.reply_wait_receive_with_reply(port_handle, &reply) {
+            Ok(received) => {
+                if listen_only && received.msg_type != nt_lpc_client::LPC_CONNECTION_REQUEST {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if let Err(status) = self.lpc_write_received_message(receive_message, &received) {
+                    return status;
+                }
+                if port_context != 0 {
+                    let context = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
+                        0
+                    } else {
+                        received.port_context
+                    };
+                    if !self.xas_write_u64(port_context, context) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                0
+            }
+            Err(status) if status.raw() as u32 == STATUS_PENDING => {
+                self.lpc_receive_park_port = port_handle;
+                self.lpc_receive_park_msg = receive_message;
+                self.lpc_receive_park_ctx = port_context;
+                self.lpc_receive_park_listen_only = listen_only;
+                0x102
+            }
+            Err(status) => status.raw() as u32,
+        }
+    }
+
+    unsafe fn lpc_connection_id_from_port_message(&self, message: u64) -> Result<u64, u32> {
+        if message == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut bytes = [0u8; 4];
+        if !self.xas_read(message + 0x18, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let id = u32::from_le_bytes(bytes) as u64;
+        if id == 0 {
+            Err(STATUS_INVALID_PARAMETER)
+        } else {
+            Ok(id)
+        }
+    }
+
     /// Service a Win32 process' kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
     /// csrss owns \Windows\ApiPort and pending connects are completed by the real
@@ -14054,6 +14252,42 @@ impl ExecNtHandler {
         Some(index)
     }
 
+    pub(crate) fn obj_create_anon_timer(&mut self, auto_reset: bool) -> Option<usize> {
+        let n = self.anon_event_seq;
+        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
+        let name = [
+            b't',
+            (n & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            ((n >> 16) & 0xff) as u8,
+        ];
+        let index = ObjEntry::push_kind(
+            &mut self.obj_ns,
+            &name,
+            OBJ_PARENT_ANONYMOUS,
+            OBJ_KIND_TIMER,
+            &[],
+        )?;
+        if !self.events.try_initialize(
+            index as u64,
+            if auto_reset {
+                EventKind::Synchronization
+            } else {
+                EventKind::Notification
+            },
+            false,
+        ) {
+            self.obj_ns.pop();
+            return None;
+        }
+        if self.user_timer_ensure(index as u64).is_err() {
+            self.obj_ns.pop();
+            self.events.remove_existing(index as u64);
+            return None;
+        }
+        Some(index)
+    }
+
     /// Create a dispatcher-only event identity for internal kernel objects such as
     /// `DEBUG_OBJECT.EventsPresent`. It is waitable through the same dispatcher path as user-visible
     /// events, but it is not an object-manager namespace entry and cannot be opened by name.
@@ -14076,6 +14310,138 @@ impl ExecNtHandler {
                 initial_state,
             )
             .then_some(index)
+    }
+
+    fn user_timer_pos(&self, object_index: u64) -> Option<usize> {
+        self.user_timers
+            .iter()
+            .position(|timer| timer.object_index == object_index)
+    }
+
+    fn user_timer_ensure(&mut self, object_index: u64) -> Result<usize, u32> {
+        if let Some(pos) = self.user_timer_pos(object_index) {
+            return Ok(pos);
+        }
+        if self.user_timers.len() == self.user_timers.capacity() {
+            self.user_timers
+                .try_reserve(self.user_timers.capacity().max(16))
+                .map_err(|_| 0xC000_009A_u32)?;
+            self.user_timers_dirty = true;
+        }
+        self.user_timers.push(UserTimerRecord {
+            object_index,
+            due_100ns: u64::MAX,
+            period_100ns: 0,
+            active: false,
+            apc_routine: 0,
+            apc_context: 0,
+        });
+        Ok(self.user_timers.len() - 1)
+    }
+
+    fn user_timer_remove(&mut self, object_index: u64) {
+        if let Some(pos) = self.user_timer_pos(object_index) {
+            self.user_timers.remove(pos);
+            self.user_timer_refresh_next_deadline();
+            self.user_timer_rearm_requested = true;
+        }
+    }
+
+    fn user_timer_refresh_next_deadline(&self) {
+        let deadline = self
+            .user_timers
+            .iter()
+            .filter(|timer| timer.active)
+            .map(|timer| timer.due_100ns)
+            .min()
+            .unwrap_or(u64::MAX);
+        USER_TIMER_NEXT_DEADLINE.store(deadline, Ordering::Relaxed);
+    }
+
+    fn user_timer_previous_state(&self, object_index: u64) -> bool {
+        self.events
+            .query_existing(object_index)
+            .map(|(_, signaled)| signaled)
+            .unwrap_or(false)
+    }
+
+    fn user_timer_cancel(&mut self, object_index: u64) -> bool {
+        let was_active = self
+            .user_timer_pos(object_index)
+            .map(|pos| {
+                let was_active = self.user_timers[pos].active;
+                self.user_timers[pos].active = false;
+                self.user_timers[pos].due_100ns = u64::MAX;
+                was_active
+            })
+            .unwrap_or(false);
+        self.user_timer_refresh_next_deadline();
+        self.user_timer_rearm_requested = true;
+        was_active
+    }
+
+    fn user_timer_set(
+        &mut self,
+        object_index: u64,
+        due_100ns: u64,
+        period_ms: u32,
+        apc_routine: u64,
+        apc_context: u64,
+    ) -> Result<bool, u32> {
+        let pos = self.user_timer_ensure(object_index)?;
+        let was_active = self.user_timers[pos].active;
+        let period_100ns = period_ms as u64 * 10_000;
+        self.user_timers[pos] = UserTimerRecord {
+            object_index,
+            due_100ns,
+            period_100ns,
+            active: due_100ns != u64::MAX,
+            apc_routine,
+            apc_context,
+        };
+        self.user_timer_refresh_next_deadline();
+        self.user_timer_rearm_requested = true;
+        Ok(was_active)
+    }
+
+    pub(crate) fn user_timer_fire_due(&mut self, now_100ns: u64) -> u64 {
+        let mut fired = 0u64;
+        let len = self.user_timers.len();
+        for pos in 0..len {
+            if !self.user_timers[pos].active || self.user_timers[pos].due_100ns > now_100ns {
+                continue;
+            }
+            let object_index = self.user_timers[pos].object_index;
+            let period = self.user_timers[pos].period_100ns;
+            let apc_routine = self.user_timers[pos].apc_routine;
+            let apc_context = self.user_timers[pos].apc_context;
+            if period == 0 {
+                self.user_timers[pos].active = false;
+                self.user_timers[pos].due_100ns = u64::MAX;
+            } else {
+                self.user_timers[pos].due_100ns = now_100ns.saturating_add(period);
+            }
+            if self.events.set_existing(object_index).is_some() {
+                fired += 1;
+            }
+            if apc_routine != 0 {
+                let trace = USER_TIMER_APC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace < 16 {
+                    print_str(b"[timer] due object=");
+                    print_u64(object_index);
+                    print_str(b" apc=0x");
+                    print_hex_u64(apc_routine);
+                    print_str(b" context=0x");
+                    print_hex_u64(apc_context);
+                    print_str(b" -> dispatcher signaled; APC delivery pending user-APC integration\n");
+                }
+            }
+        }
+        if fired != 0 {
+            self.user_timer_refresh_next_deadline();
+            self.user_timer_rearm_requested = true;
+        }
+        fired
     }
 
     pub(crate) fn obj_create_anon_semaphore(
@@ -18304,6 +18670,12 @@ impl ExecNtHandler {
                 print_str(b"[lpc-msg] NtRequestWaitReplyPort on an unregistered LPC connection -> failing\n");
                 0xC000_0008 // STATUS_INVALID_HANDLE
             },
+            NativeService::NtListenPort => unsafe {
+                self.lpc_receive_or_park(args[0], 0, 0, args[1], true)
+            },
+            NativeService::NtReplyWaitReceivePort => unsafe {
+                self.lpc_receive_or_park(args[0], args[1], args[2], args[3], false)
+            },
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
             // \SmApiPort). Route to the LPC broker; on the interim AutoAccept path the connect completes
@@ -18443,16 +18815,26 @@ impl ExecNtHandler {
                     }
                     return if server_handle != 0 { 0 } else { 0xC000_0001 };
                 }
-                let h = self.mint_handle();
-                self.queue_write(args[0], h);
-                0
+                let conn_id = match self.lpc_connection_id_from_port_message(args[2]) {
+                    Ok(conn_id) => conn_id,
+                    Err(status) => return status,
+                };
+                let accept = args[3] != 0;
+                let port_context = args[1];
+                match lpc_client().and_then(|c| c.accept_connect(conn_id, accept, port_context).ok()) {
+                    Some(server_handle) => {
+                        self.queue_write(args[0], server_handle);
+                        0
+                    }
+                    None => STATUS_UNSUCCESSFUL,
+                }
             },
             NativeService::NtCompleteConnectPort => unsafe {
                 // ★ LSA RENDEZVOUS: the real server finished its accept — complete through the broker
                 // and hand the LOOP the client comm-port handle to publish into winlogon's *PortHandle.
                 let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
                 if self.current_process_is_lsass() && lsa_conn != 0 {
-                    match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
+                    return match lpc_client().and_then(|c| c.complete_connect(lsa_conn).ok()) {
                         Some((client_handle, _)) => {
                             LSA_CLIENT_HANDLE.store(client_handle, Ordering::Relaxed);
                             LSA_COMPLETE_PENDING.store(1, Ordering::Relaxed);
@@ -18462,9 +18844,11 @@ impl ExecNtHandler {
                             LSA_COMPLETE_PENDING.store(2, Ordering::Relaxed);
                             0xC000_0001
                         }
-                    }
-                } else {
-                    0
+                    };
+                }
+                match lpc_client().and_then(|c| c.complete_connect(args[0]).ok()) {
+                    Some((_client_handle, _connection_id)) => 0,
+                    None => STATUS_UNSUCCESSFUL,
                 }
             },
             // NtCreateEvent(*EventHandle[R10], ACCESS, *OA, EVENT_TYPE, InitialState). winsrv's
@@ -18794,6 +19178,239 @@ impl ExecNtHandler {
                     return 0;
                 }
                 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+            },
+            NativeService::NtCreateTimer => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                let timer_type = args[3];
+                if timer_type > 1 {
+                    return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                }
+                if out == 0 {
+                    return 0xC000_0005;
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002;
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                let auto_reset = timer_type == 1;
+
+                let create_anonymous = |this: &mut Self| -> Result<u32, u32> {
+                    let Some(index) = this.obj_create_anon_timer(auto_reset) else {
+                        return Err(0xC000_009A);
+                    };
+                    let Some(handle) = this.mint_timer_handle(index, args[1] as u32) else {
+                        this.rollback_new_timer(index);
+                        return Err(0xC000_009A);
+                    };
+                    if !this.xas_write_u64(out, handle) {
+                        this.close_current_handle(handle);
+                        this.rollback_new_timer(index);
+                        return Err(0xC000_0005);
+                    }
+                    Ok(0)
+                };
+
+                if oa == 0 {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => {
+                        return create_anonymous(self).unwrap_or_else(|status| status);
+                    }
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let existing = self.obj_resolve(path, root_idx);
+                if existing.is_some_and(|i| self.obj_ns[i].kind != OBJ_KIND_TIMER) {
+                    return 0xC000_0024;
+                }
+                let existed = existing.is_some();
+                let Some(index) = self.obj_create(path, root_idx, OBJ_KIND_TIMER, &[]) else {
+                    return 0xC000_009A;
+                };
+                if !existed {
+                    self.events.initialize(
+                        index as u64,
+                        if auto_reset {
+                            EventKind::Synchronization
+                        } else {
+                            EventKind::Notification
+                        },
+                        false,
+                    );
+                    if self.user_timer_ensure(index as u64).is_err() {
+                        self.rollback_new_timer(index);
+                        return 0xC000_009A;
+                    }
+                }
+                let Some(handle) = self.mint_timer_handle(index, args[1] as u32) else {
+                    if !existed {
+                        self.rollback_new_timer(index);
+                    }
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    if !existed {
+                        self.rollback_new_timer(index);
+                    }
+                    return 0xC000_0005;
+                }
+                if existed { 0x4000_0000 } else { 0 }
+            },
+            NativeService::NtOpenTimer => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                if out == 0 {
+                    return 0xC000_0005;
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002;
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                if oa == 0 {
+                    return 0xC000_000D;
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let Some(index) = self.obj_resolve(path, root_idx) else {
+                    return 0xC000_0034;
+                };
+                if self.obj_ns[index].kind != OBJ_KIND_TIMER {
+                    return 0xC000_0024;
+                }
+                let Some(handle) = self.mint_timer_handle(index, args[1] as u32) else {
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtCancelTimer => unsafe {
+                let current_state = args[1];
+                if current_state != 0 && !self.probe_event_output(current_state, 1) {
+                    return 0xC000_0005;
+                }
+                let index = match self.timer_index_for_handle(args[0], TIMER_MODIFY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let state = self.user_timer_previous_state(index as u64);
+                self.user_timer_cancel(index as u64);
+                if current_state != 0 && !self.xas_try_write_buf(current_state, &[u8::from(state)]) {
+                    return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtSetTimer => unsafe {
+                let due_time_ptr = args[1];
+                let apc_routine = args[2];
+                let apc_context = args[3];
+                let wake_timer = args[4] != 0;
+                let period = args[5] as u32 as i32;
+                let previous_state = args[6];
+                if period < 0 {
+                    return 0xC000_00F4; // STATUS_INVALID_PARAMETER_6
+                }
+                if due_time_ptr == 0 || !self.probe_user_input(due_time_ptr, 8) {
+                    return 0xC000_0005;
+                }
+                if previous_state != 0 && !self.probe_event_output(previous_state, 1) {
+                    return 0xC000_0005;
+                }
+                let index = match self.timer_index_for_handle(args[0], TIMER_MODIFY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let mut due_bytes = [0u8; 8];
+                if !self.xas_read(due_time_ptr, &mut due_bytes) {
+                    return 0xC000_0005;
+                }
+                let due_time = i64::from_le_bytes(due_bytes);
+                let previous = self.user_timer_previous_state(index as u64);
+                let _was_active = self.user_timer_cancel(index as u64);
+                let _ = self.events.reset_existing(index as u64);
+                match nt_delay_execution::due_time(
+                    due_time,
+                    monotonic_time_100ns(),
+                    nt_system_time_100ns(),
+                ) {
+                    nt_delay_execution::Due::Immediate => {
+                        let _ = self.events.set_existing(index as u64);
+                        let period_ms = period as u32;
+                        if period_ms != 0 {
+                            let deadline = monotonic_time_100ns()
+                                .saturating_add(period_ms as u64 * 10_000);
+                            if self
+                                .user_timer_set(
+                                    index as u64,
+                                    deadline,
+                                    period_ms,
+                                    apc_routine,
+                                    apc_context,
+                                )
+                                .is_err()
+                            {
+                                return 0xC000_009A;
+                            }
+                        }
+                        wait_wake_dispatcher_set(self);
+                    }
+                    nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                        if self
+                            .user_timer_set(
+                                index as u64,
+                                deadline,
+                                period as u32,
+                                apc_routine,
+                                apc_context,
+                            )
+                            .is_err()
+                        {
+                            return 0xC000_009A;
+                        }
+                        if !delay_timer_init() {
+                            self.user_timer_cancel(index as u64);
+                            return 0xC000_009A;
+                        }
+                    }
+                }
+                if previous_state != 0
+                    && !self.xas_try_write_buf(previous_state, &[u8::from(previous)])
+                {
+                    return 0xC000_0005;
+                }
+                if wake_timer {
+                    0x4000_0025 // STATUS_TIMER_RESUME_IGNORED
+                } else {
+                    0
+                }
             },
             NativeService::NtCreateSemaphore => unsafe {
                 let out = args[0];

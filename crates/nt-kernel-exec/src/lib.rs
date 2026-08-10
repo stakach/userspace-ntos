@@ -53,7 +53,7 @@ pub use mutant::{map_mutant_access, MutantError, MutantStore};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use semaphore::{map_semaphore_access, SemaphoreError, SemaphoreStore};
 pub use spin::{SpinError, SpinLockTable};
-pub use timer::{Clock, FakeClock, TimerQueue};
+pub use timer::{map_timer_access, Clock, FakeClock, TimerQueue};
 pub use work_item::WorkQueue;
 
 /// Invokes driver callbacks (DPC / timer-DPC / work-item routines) — function
