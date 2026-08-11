@@ -17395,80 +17395,102 @@ pub(crate) unsafe fn service_sec_image(
                         // Its first fault: the `int3` if it read BeingDebugged = 1, else its exit
                         // syscall. Either way it must have RUN — the marker proves the thread
                         // executed in the target's address space with a correct TEB/PEB.
-                        let (_fb, f1_mi, f1_m0, _f1m1, _f1m2, _f1m3) =
-                            recv_full_r12(brk_ep, reply_a);
-                        if marker(0x00) == 0x11
-                            && marker(0x08) == SMSS_PEB_VA
-                            && marker(0x18) == selftests::DBGK_BREAKIN_PARAM
-                        {
-                            br_ok |= 0x0010;
-                        }
-                        // ── 0x0020 — ★ IT HIT THE BREAKPOINT, and the debugger sees it.
-                        // The byte it read is the write-through; the `int3` (DebugException,
-                        // label 4) is forwarded through the live fault-loop entry and its reporter
-                        // parked, then retrieved BY SSN as DbgBreakpointStateChange carrying the
-                        // BREAK-IN THREAD's CLIENT_ID.
-                        let is_breakpoint = (f1_mi >> 12) == 4 && marker(0x10) == 1;
-                        let forwarded = is_breakpoint
-                            && nt_handler.dbgk_forward_exception(
-                                BRK_TEST_PI,
-                                breakin_tid,
-                                dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f1_m0),
-                                true,
-                            );
-                        let parked = forwarded
-                            && nt_handler.dbgk_block_reporter(
-                                BRK_TEST_PI,
-                                breakin_tid,
-                                0,
-                                dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
-                                reply_a,
-                                f1_m0,
-                                0,
-                                0,
-                                0,
-                            );
-                        let waited = parked
-                            && sysc!(
-                                SSN_NT_WAIT_FOR_DEBUG_EVENT,
-                                &[dbg_handle, 0, A_TIMEOUT, A_STATE]
-                            ) == 0
-                            && img_spawn::smss_copyin(A_STATE, &mut sc);
-                        let reported = waited
-                            && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE
-                            && u64::from_le_bytes(sc[0x08..0x10].try_into().unwrap())
-                                == target as u64
-                            && u64::from_le_bytes(sc[0x10..0x18].try_into().unwrap())
-                                == breakin_tid
-                            && sc_u32!(0x18) == dbgk::STATUS_BREAKPOINT;
-                        if reported {
-                            br_ok |= 0x0020;
-                        }
-                        // ── 0x0040 — ★ CONTINUE RESUMES IT PAST THE int3 AND IT EXITS CLEANLY.
-                        let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
-                        let mut cid = [0u8; 16];
-                        cid[0..8].copy_from_slice(&(target as u64).to_le_bytes());
-                        cid[8..16].copy_from_slice(&breakin_tid.to_le_bytes());
-                        let continued = reported
-                            && img_spawn::smss_copyout(A_CLIENT_ID, &cid)
-                            && sysc!(
-                                SSN_NT_DEBUG_CONTINUE,
-                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
-                            ) == 0
-                            && DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed) == resumed_before + 1;
-                        if continued {
-                            // Its exit path: marker 0x12 (it really resumed past the breakpoint)
-                            // then the `RtlExitUserThread` stand-in syscall arrives here.
-                            let (_eb, e_mi, e_m0, _em1, _em2, _em3) =
-                                recv_full_r12(brk_ep, reply_b);
-                            if (e_mi >> 12) == 2
-                                && e_m0 == selftests::DBGK_BREAKIN_EXIT_SSN
-                                && marker(0x00) == 0x12
-                            {
-                                br_ok |= 0x0040;
+                        //
+                        // Hosted TCB admission may emit a startup/scheduler notification before the
+                        // thread reaches its entry trampoline. That notification is not the
+                        // break-in thread's debuggee event, and treating it as such leaves the
+                        // marker at zero. Select the first message after the marker page proves
+                        // the break-in code has run; the private endpoint means any later selected
+                        // message still belongs to this throwaway thread.
+                        let mut f1 = None;
+                        let mut f1_guard = 0;
+                        while f1_guard < 4 {
+                            f1_guard += 1;
+                            let (_fb, mi_r, m0_r, m1_r, _m2_r, _m3_r) =
+                                recv_full_r12(brk_ep, reply_a);
+                            let ran = marker(0x00);
+                            if ran == 0x11 || ran == 0x12 {
+                                dbgk_brk_trace(b"f1", mi_r, m0_r, m1_r, ran);
+                                f1 = Some((mi_r, m0_r));
+                                break;
                             }
-                        } else if parked {
-                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            dbgk_brk_trace(b"f1-foreign", mi_r, m0_r, m1_r, ran);
+                        }
+                        if let Some((f1_mi, f1_m0)) = f1 {
+                            if marker(0x00) == 0x11
+                                && marker(0x08) == SMSS_PEB_VA
+                                && marker(0x18) == selftests::DBGK_BREAKIN_PARAM
+                            {
+                                br_ok |= 0x0010;
+                            }
+                            // ── 0x0020 — ★ IT HIT THE BREAKPOINT, and the debugger sees it.
+                            // The byte it read is the write-through; the `int3` (DebugException,
+                            // label 4) is forwarded through the live fault-loop entry and its reporter
+                            // parked, then retrieved BY SSN as DbgBreakpointStateChange carrying the
+                            // BREAK-IN THREAD's CLIENT_ID.
+                            let is_breakpoint = (f1_mi >> 12) == 4 && marker(0x10) == 1;
+                            let forwarded = is_breakpoint
+                                && nt_handler.dbgk_forward_exception(
+                                    BRK_TEST_PI,
+                                    breakin_tid,
+                                    dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f1_m0),
+                                    true,
+                                );
+                            let parked = forwarded
+                                && nt_handler.dbgk_block_reporter(
+                                    BRK_TEST_PI,
+                                    breakin_tid,
+                                    0,
+                                    dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                                    reply_a,
+                                    f1_m0,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            let waited = parked
+                                && sysc!(
+                                    SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                    &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                                ) == 0
+                                && img_spawn::smss_copyin(A_STATE, &mut sc);
+                            let reported = waited
+                                && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE
+                                && u64::from_le_bytes(sc[0x08..0x10].try_into().unwrap())
+                                    == target as u64
+                                && u64::from_le_bytes(sc[0x10..0x18].try_into().unwrap())
+                                    == breakin_tid
+                                && sc_u32!(0x18) == dbgk::STATUS_BREAKPOINT;
+                            if reported {
+                                br_ok |= 0x0020;
+                            }
+                            // ── 0x0040 — ★ CONTINUE RESUMES IT PAST THE int3 AND IT EXITS CLEANLY.
+                            let resumed_before = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                            let mut cid = [0u8; 16];
+                            cid[0..8].copy_from_slice(&(target as u64).to_le_bytes());
+                            cid[8..16].copy_from_slice(&breakin_tid.to_le_bytes());
+                            let continued = reported
+                                && img_spawn::smss_copyout(A_CLIENT_ID, &cid)
+                                && sysc!(
+                                    SSN_NT_DEBUG_CONTINUE,
+                                    &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                                ) == 0
+                                && DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed)
+                                    == resumed_before + 1;
+                            if continued {
+                                // Its exit path: marker 0x12 (it really resumed past the breakpoint)
+                                // then the `RtlExitUserThread` stand-in syscall arrives here.
+                                let (_eb, e_mi, e_m0, _em1, _em2, _em3) =
+                                    recv_full_r12(brk_ep, reply_b);
+                                if (e_mi >> 12) == 2
+                                    && e_m0 == selftests::DBGK_BREAKIN_EXIT_SSN
+                                    && marker(0x00) == 0x12
+                                {
+                                    br_ok |= 0x0040;
+                                }
+                            } else if parked {
+                                let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            }
                         }
                     }
 
@@ -20976,5 +20998,22 @@ unsafe fn dbgk_blk_trace(tag: &[u8], msginfo: u64, m0: u64, m1: u64, marker: u64
     print_hex(m1 as u32);
     print_str(b" marker=");
     print_u64(marker);
+    print_str(b"\n");
+}
+
+/// One-line progress trace for the DbgUiRemoteBreakin self-test. The marker is the remote target's
+/// private proof page: zero means the selected event was admission noise, `0x11` means the break-in
+/// thread reached its entry point, and `0x12` means it resumed past the breakpoint.
+unsafe fn dbgk_brk_trace(tag: &[u8], msginfo: u64, m0: u64, m1: u64, marker: u64) {
+    print_str(b"[dbgk-brk] ");
+    print_str(tag);
+    print_str(b" label=");
+    print_u64(msginfo >> 12);
+    print_str(b" m0=0x");
+    print_hex(m0 as u32);
+    print_str(b" m1=0x");
+    print_hex(m1 as u32);
+    print_str(b" marker=0x");
+    print_hex(marker as u32);
     print_str(b"\n");
 }
