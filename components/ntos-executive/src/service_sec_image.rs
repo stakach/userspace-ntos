@@ -6460,7 +6460,7 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     }
                 }
-                if mapped_into_process && shareable && pi >= 1 {
+                if mapped_into_process && shareable {
                     if !shared_image_mapping_put(pi as u64, bpage, cc) {
                         let _ = page_unmap_r(cc);
                         let _ = cnode_delete_recycle_r(cc);

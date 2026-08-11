@@ -95,7 +95,11 @@ headroom below the gate. The next reduction is mechanism-level sharing, not a ga
 read-faulted DLL image pages whose current protection maps non-writable now use the shared image
 cache, so clean read-only and write-copy data pages share the same frame across processes just like
 executable text. First writes still flow through the existing image COW promotion path, preserving
-loader/runtime fixups. The obsolete executable-only helper was removed. Local validation is green:
+loader/runtime fixups. The first proof retry exposed a real `smss` write-copy case: `pi == 0`
+shared image mappings must be retained too, otherwise the later COW promotion cannot unmap the
+clean view before installing the private writable page. The obsolete executable-only helper was
+removed and shared-image map-cap tracking now applies to every hosted image process. Local
+validation is green:
 `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
 x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof should confirm Explorer
 desktop/icon paint still reaches the quiesce frontier while `shared-frames`/`shared-hits` rise and
