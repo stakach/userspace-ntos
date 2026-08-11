@@ -48,7 +48,7 @@ use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
-use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory, s_wcslen};
+use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_wcslen};
 
 use crate::*;
 
@@ -257,6 +257,11 @@ pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted c
 pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
 pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
 pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
+pub const SH_ACTIVE_IRP: u64 = 0x6C0; // out: component VA of the IRP currently inside MajorFunction
+pub const SH_ACTIVE_IOSL: u64 = 0x6C8; // out: component VA of Tail.Overlay.CurrentStackLocation
+pub const SH_ACTIVE_DATA: u64 = 0x6D0; // out: component VA of request SystemBuffer/UserBuffer
+pub const SH_ACTIVE_DATA_CAP: u64 = 0x6D8; // out: bytes allocated for SH_ACTIVE_DATA
+pub const SH_ACTIVE_FILE_OBJECT: u64 = 0x6E0; // out: component VA of the IRP FILE_OBJECT, if any
 pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
 pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
@@ -278,6 +283,7 @@ const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
+const _: () = assert!(SH_ACTIVE_FILE_OBJECT + 8 <= SH_RESOURCE_IO_PORT_CAP);
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -1766,6 +1772,196 @@ unsafe fn pipe_ccb_view_in_pool(fid: u64, exec_pool_va: u64) -> Option<PipeCcbVi
 
 unsafe fn pipe_ccb_view(fid: u64) -> Option<PipeCcbView> {
     pipe_ccb_view_in_pool(fid, FSD_POOL_VADDR)
+}
+
+fn component_pool_end() -> u64 {
+    FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
+}
+
+fn component_pool_to_exec_va(exec_pool_va: u64, component_va: u64, bytes: u64) -> Option<u64> {
+    if component_va < FSD_POOL_VADDR + POOL_DATA_OFF
+        || component_va >= component_pool_end()
+        || bytes > component_pool_end().saturating_sub(component_va)
+    {
+        return None;
+    }
+    exec_pool_va.checked_add(component_va - FSD_POOL_VADDR)
+}
+
+fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
+    if exec_va < exec_pool_va {
+        return None;
+    }
+    let off = exec_va - exec_pool_va;
+    if off >= FSD_POOL_FRAMES * 0x1000 {
+        return None;
+    }
+    Some(FSD_POOL_VADDR + off)
+}
+
+unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
+    let sh = inst.exec_shared_va;
+    let irp_c = read_volatile((sh + SH_ACTIVE_IRP) as *const u64);
+    let iosl_c = read_volatile((sh + SH_ACTIVE_IOSL) as *const u64);
+    let data_c = read_volatile((sh + SH_ACTIVE_DATA) as *const u64);
+    let data_cap = read_volatile((sh + SH_ACTIVE_DATA_CAP) as *const u64);
+    let fo_c = read_volatile((sh + SH_ACTIVE_FILE_OBJECT) as *const u64);
+    if irp_c == 0 && iosl_c == 0 {
+        return;
+    }
+    print_str(b"[deadman] active-driver-irp irp=");
+    print_hex64(irp_c);
+    print_str(b" iosl=");
+    print_hex64(iosl_c);
+    print_str(b" data=");
+    print_hex64(data_c);
+    print_str(b" data-cap=");
+    print_u64(data_cap);
+    print_str(b" fo=");
+    print_hex64(fo_c);
+    if let Some(irp) = component_pool_to_exec_va(inst.exec_pool_va, irp_c, WDM_X64_IRP_SIZE as u64)
+    {
+        let system_buffer = read_unaligned((irp + 0x18) as *const u64);
+        let status = read_unaligned((irp + 0x30) as *const u32);
+        let info = read_unaligned((irp + 0x38) as *const u64);
+        let current_location = read_unaligned((irp + 0x42) as *const u8);
+        let stack_count = read_unaligned((irp + 0x43) as *const u8);
+        let user_buffer = read_unaligned((irp + 0x70) as *const u64);
+        let current_stack = read_unaligned((irp + 0xb8) as *const u64);
+        print_str(b" irp.sys=");
+        print_hex64(system_buffer);
+        print_str(b" irp.user=");
+        print_hex64(user_buffer);
+        print_str(b" irp.curstack=");
+        print_hex64(current_stack);
+        print_str(b" irp.loc=");
+        print_u64(current_location as u64);
+        print_str(b"/");
+        print_u64(stack_count as u64);
+        print_str(b" ios=");
+        print_hex(status);
+        print_str(b"/");
+        print_u64(info);
+    }
+    if let Some(iosl) =
+        component_pool_to_exec_va(inst.exec_pool_va, iosl_c, WDM_X64_IO_STACK_LOCATION_SIZE as u64)
+    {
+        let mj = read_unaligned(iosl as *const u8);
+        let mn = read_unaligned((iosl + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8);
+        let length = read_unaligned((iosl + 0x08) as *const u32);
+        let io_control = read_unaligned((iosl + 0x18) as *const u32);
+        let type3 = read_unaligned((iosl + 0x20) as *const u64);
+        let device = read_unaligned((iosl + 0x28) as *const u64);
+        let file_object = read_unaligned((iosl + 0x30) as *const u64);
+        print_str(b" stack.mj=");
+        print_u64(mj as u64);
+        print_str(b".");
+        print_u64(mn as u64);
+        print_str(b" len=");
+        print_u64(length as u64);
+        print_str(b" ctl=0x");
+        print_hex(io_control);
+        print_str(b" type3=");
+        print_hex64(type3);
+        print_str(b" dev=");
+        print_hex64(device);
+        print_str(b" stack.fo=");
+        print_hex64(file_object);
+        if let Some(fo) =
+            component_pool_to_exec_va(inst.exec_pool_va, file_object, WDM_X64_FILE_OBJECT_SIZE as u64)
+        {
+            let fsctx = read_unaligned((fo + 0x18) as *const u64);
+            let fsctx2 = read_unaligned((fo + 0x20) as *const u64);
+            print_str(b" fsctx=");
+            print_hex64(fsctx);
+            print_str(b" fsctx2=");
+            print_hex64(fsctx2);
+        }
+    }
+    print_str(b"\n");
+}
+
+unsafe fn print_pipe_queue_heads_for_deadman(fid: u64, inst: &DriverInstance, active_out: u64) {
+    if fid == 0 || fid == 1 {
+        return;
+    }
+    let component_ccb = fid & !1;
+    if component_ccb < FSD_POOL_VADDR + POOL_DATA_OFF
+        || component_ccb + 0xC0 > component_pool_end()
+        || component_ccb & 7 != 0
+    {
+        return;
+    }
+    let Some(ccb) = component_pool_to_exec_va(inst.exec_pool_va, component_ccb, 0xC0) else {
+        return;
+    };
+    if read_volatile(ccb as *const u16) != NPFS_NTC_CCB {
+        return;
+    }
+    for end in 0..2u64 {
+        let dq = ccb + NP_CCB_DATA_QUEUE + end * NP_DATA_QUEUE_SIZE;
+        let Some(component_dq) = exec_pool_to_component_va(inst.exec_pool_va, dq) else {
+            continue;
+        };
+        let head_c = read_volatile(dq as *const u64);
+        let state = read_volatile((dq + 0x10) as *const u32);
+        let bytes = read_volatile((dq + 0x14) as *const u32);
+        let entries = read_volatile((dq + 0x18) as *const u32);
+        let quota = read_volatile((dq + 0x1c) as *const u32);
+        let byte_offset = read_volatile((dq + 0x20) as *const u32);
+        print_str(b"[deadman] active-driver-q");
+        print_u64(end);
+        print_str(b" dq=");
+        print_hex64(component_dq);
+        print_str(b" state=");
+        print_u64(state as u64);
+        print_str(b" bytes=");
+        print_u64(bytes as u64);
+        print_str(b" entries=");
+        print_u64(entries as u64);
+        print_str(b" quota=");
+        print_u64(quota as u64);
+        print_str(b" offset=");
+        print_u64(byte_offset as u64);
+        print_str(b" head=");
+        print_hex64(head_c);
+        if head_c != component_dq && head_c & 7 == 0 {
+            if let Some(head) = component_pool_to_exec_va(inst.exec_pool_va, head_c, 0x38) {
+                let ty = read_volatile((head + 0x10) as *const u32);
+                let irp = read_volatile((head + 0x18) as *const u64);
+                let quota_in_entry = read_volatile((head + 0x20) as *const u32);
+                let client_ctx = read_volatile((head + 0x28) as *const u64);
+                let data_size = read_volatile((head + 0x30) as *const u32);
+                let remaining = data_size.saturating_sub(byte_offset);
+                let expected_copy = (remaining as u64).min(active_out);
+                let src_c = head_c + 0x38 + byte_offset as u64;
+                print_str(b" entry.type=");
+                print_u64(ty as u64);
+                print_str(b" entry.irp=");
+                print_hex64(irp);
+                print_str(b" entry.quota=");
+                print_u64(quota_in_entry as u64);
+                print_str(b" entry.ctx=");
+                print_hex64(client_ctx);
+                print_str(b" entry.size=");
+                print_u64(data_size as u64);
+                print_str(b" expected=");
+                print_u64(remaining as u64);
+                print_str(b"/");
+                print_u64(expected_copy);
+                print_str(b" src=");
+                print_hex64(src_c);
+                if let Some(src) = component_pool_to_exec_va(inst.exec_pool_va, src_c, 1) {
+                    print_str(b" bytes=");
+                    let preview = expected_copy.min(8);
+                    for i in 0..preview {
+                        print_hex_byte(read_volatile((src + i) as *const u8));
+                    }
+                }
+            }
+        }
+        print_str(b"\n");
+    }
 }
 
 fn print_pipe_ccb_view(tag: &[u8], view: PipeCcbView) {
@@ -4527,7 +4723,7 @@ const WDM_X64_IRP_CANCEL_ROUTINE_OFFSET: u64 = 0x68;
 const WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET: u64 = 0x90;
 const WDM_X64_IO_STACK_MINOR_OFFSET: u64 = 0x01;
 const WDM_X64_IO_STACK_CONTROL_OFFSET: u64 = 0x03;
-const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x20;
+const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x28;
 const WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET: u64 = 0x38;
 const WDM_X64_IO_STACK_CONTEXT_OFFSET: u64 = 0x40;
 const WDM_X64_SL_INVOKE_ON_SUCCESS: u8 = 0x40;
@@ -7497,9 +7693,9 @@ fn register_fsd_trampolines() {
     reg.bind("__C_specific_handler", s_c_specific_handler as usize as u64);
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as usize as u64);
-    reg.bind("memmove", s_memcpy as usize as u64);
+    reg.bind("memmove", s_memmove as usize as u64);
     reg.bind("RtlCopyMemory", s_memcpy as usize as u64);
-    reg.bind("RtlMoveMemory", s_memcpy as usize as u64);
+    reg.bind("RtlMoveMemory", s_memmove as usize as u64);
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
     reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
@@ -8298,6 +8494,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, irp);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, current_iosl);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, data);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64, data_capacity);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, fo);
 
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
     // own consistency bugcheck (`NpBugCheck` → `KeBugCheckEx`) we unwind back here and fail THIS
@@ -8314,6 +8515,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     jb[1] = 0;
     jb[2] = 0;
     let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr());
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, 0);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, 0);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, 0);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
     if trace_active_write {
         print_str(b"[fsd-active-write] after-call seq=");
         print_u64(active_seq);
@@ -11952,6 +12158,18 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_hex64(regs[nt_user_callback::USER_CONTEXT_RCX]);
             print_str(b" rdx=");
             print_hex64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+            print_str(b" rsi=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RSI]);
+            print_str(b" rdi=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_RDI]);
+            print_str(b" r8=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_R8]);
+            print_str(b" r9=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_R9]);
+            print_str(b" r10=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_R10]);
+            print_str(b" r15=");
+            print_hex64(regs[nt_user_callback::USER_CONTEXT_R15]);
             print_str(b"\n");
 
             let mut state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
@@ -12007,6 +12225,12 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_str(b"\n");
         }
         unsafe {
+            print_active_irp_graph_for_deadman(&inst);
+            print_pipe_queue_heads_for_deadman(
+                file_id,
+                &inst,
+                FSD_ACTIVE_DISPATCH_OUT.load(Ordering::Relaxed),
+            );
             if let Some(view) = pipe_ccb_view_in_pool(file_id, inst.exec_pool_va) {
                 print_pipe_ccb_view(b"[deadman] active-driver-ccb", view);
                 print_str(b"\n");
@@ -12054,6 +12278,11 @@ unsafe fn dispatch_irp_for_instance(
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_IRP) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_IOSL) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_DATA) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+    write_volatile((sh + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
 
     // Wake the component (plain Send) + drive its fault loop until it re-parks, THROUGH THE SHARED
     // HARNESS PUMP. The per-IRP loop only walls on the low-address guard (image_frames=0 → no

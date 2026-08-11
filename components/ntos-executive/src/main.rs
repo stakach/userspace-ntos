@@ -2680,6 +2680,7 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" entered-at-ms=");
         print_u64(W32_PREV_T.load(Ordering::Relaxed) / 10_000);
         print_str(b"\n");
+        win32k_subsystem::trace_win32k_request_context();
         win32k_glue::win32k_dispatch_backtrace();
     }
     for slot in 0..WAITER_N {
@@ -11585,10 +11586,12 @@ unsafe fn reply_recv_full(
 /// any component `Call` serviced while this client's syscall was in flight (an IRP/win32k dispatch
 /// completion or one of its demand-page faults) silently re-pointed it at the COMPONENT — the
 /// clobber that hung the first Phase-1 boot and that `COMPONENT_CALL_CLOBBERED_REPLY_TO` existed to
-/// dodge. It is now two syscalls: `reply_on` on the object the kernel BOUND to this caller
-/// (`decode_reply` → `replies[idx].bound_tcb`, which nothing else can re-point), then
-/// `recv_full_r12` re-registering the same object for the next caller. Equivalent because the
-/// executive is the sole replier, and correct by construction rather than by guard.
+/// dodge. It is now a bound-reply `SYS_NB_SEND_RECV`: the send half targets the object the kernel
+/// BOUND to this caller (`decode_reply` -> `replies[idx].bound_tcb`, which nothing else can
+/// re-point), and the recv half
+/// re-registers it for the next caller. That preserves the essential ReplyRecv property: the
+/// executive has already armed its receive before the replied user thread can run arbitrary
+/// user-mode code.
 unsafe fn reply_recv_badge(
     recv_ep: u64,
     reply_len: u64,
@@ -11622,8 +11625,7 @@ unsafe fn reply_recv_badge(
         );
         return (badge, msginfo, mr0, mr1, mr2, mr3);
     }
-    client_reply_on(reply_cptr, reply_len, r0, r1, r2, r3);
-    recv_full_r12(recv_ep, reply_cptr)
+    client_reply_recv_badge(recv_ep, reply_cptr, reply_len, r0, r1, r2, r3)
 }
 
 /// `seL4_Recv(ep)` that ALSO registers a reply capability via the MCS `replyRegister` (r12): the
@@ -11655,6 +11657,49 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
     // ★ THE DEADMAN LIVES HERE, not at the service-loop top — this is the ONE place the executive
     // ever blocks, so a check here covers the nested component-pump receives a dispatch makes as
     // well as the loop's own. Cost on the hot path is one relaxed increment.
+    if EXEC_DEADMAN_WATCHDOG {
+        if badge == DELAY_TIMER_BADGE {
+            watchdog_on_tick();
+        } else {
+            WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    (badge, msginfo, mr0, mr1, mr2, mr3)
+}
+
+/// Reply through a caller-bound Reply cap and receive the next executive event in one kernel entry.
+/// This is the bound-reply replacement for legacy `ReplyRecv`: r13 names the Reply cap consumed by
+/// the send half, and r12 offers the same Reply cap to the receive half for the next client `Call`.
+unsafe fn client_reply_recv_badge(
+    recv_ep: u64,
+    reply_cptr: u64,
+    reply_len: u64,
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+) -> (u64, u64, u64, u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_NB_SEND_RECV as u64,
+        inout("rdi") recv_ep => badge,
+        inout("rsi") reply_len => msginfo,
+        inout("r10") r0 => mr0,
+        inout("r8") r1 => mr1,
+        inout("r9") r2 => mr2,
+        inout("r15") r3 => mr3,
+        in("r12") reply_cptr,
+        in("r13") reply_cptr,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if EXEC_DEADMAN_WATCHDOG {
         if badge == DELAY_TIMER_BADGE {
             watchdog_on_tick();

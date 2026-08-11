@@ -1030,6 +1030,7 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
                 crate::delay_timer_nested_ack();
             }
             if let Some(polled) = pump_try_recv_after_timer(ch) {
+                crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
                 return polled;
             }
             let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
@@ -1094,6 +1095,7 @@ unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -
             crate::delay_timer_nested_ack();
         }
         if let Some(polled) = pump_try_recv_after_timer(ch) {
+            crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             return polled;
         }
         let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);

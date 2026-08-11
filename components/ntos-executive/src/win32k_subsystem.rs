@@ -411,13 +411,26 @@ const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
 const W32PROCESS_PEPROCESS_OFF: u64 = 0x00;
 const W32PROCESS_FLAGS_OFF: u64 = 0x0C;
 const W32PROCESS_W32PID_OFF: u64 = 0x40;
+const W32PF_CREATEDWINORDC: u32 = 0x0400_0000;
 const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
 const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
 /// WND->head.pti offset (ntuser.h: THRDESKHEAD at +0).
 const WND_HEAD_PTI_OFF: u64 = 0x10;
+const WND_EXSTYLE_OFF: u64 = 0x30;
+const WND_STYLE_OFF: u64 = 0x34;
+const WND_SPWND_NEXT_OFF: u64 = 0x48;
+const WND_SPWND_PREV_OFF: u64 = 0x50;
+const WND_SPWND_PARENT_OFF: u64 = 0x58;
+const WND_SPWND_CHILD_OFF: u64 = 0x60;
+const WND_PCLS_OFF: u64 = 0x98;
+const CLS_PDCE_OFF: u64 = 0x18;
+const CLS_STYLE_OFF: u64 = 0x54;
+const SSN_NT_USER_CALL_ONE_PARAM: u64 = 0x1002;
 const SSN_NT_USER_SET_WINDOW_LONG: u64 = 0x105b;
 const SSN_NT_USER_SET_WINDOW_LONG_PTR: u64 = 0x1298;
+const SSN_NT_USER_GET_DC: u64 = 0x100a;
 const GWLP_WNDPROC_INDEX_U32: u64 = 0xffff_fffc;
+const ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT: u64 = 0x28;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EXPLORER_SETWNDPROC_REPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -426,6 +439,8 @@ static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
 /// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
 /// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
 const THREADINFO_RPDESK_OFF: u64 = 0x78;
+const THREADINFO_MESSAGE_QUEUE_OFF: u64 = 0x60;
+const THREADINFO_KEYBOARD_LAYOUT_OFF: u64 = 0x68;
 /// THREADINFO->pDeskInfo offset (win32.h, immediately after rpdesk). The DESKTOPINFO of the thread's
 /// assigned desktop — `IntSetThreadDesktop` copies it from `rpdesk->pDeskInfo` (desktop.c:3430).
 ///
@@ -452,6 +467,10 @@ const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
 const THREADINFO_PEVENT_QUEUE_SERVER_OFF: u64 = 0x140;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
+/// KL.hkl and CLIENTINFO.{hKL,CodePage}; used only by wall diagnostics.
+const KL_HKL_OFF: u64 = 0x28;
+const CLIENTINFO_HKL_OFF: u64 = 0x90;
+const CLIENTINFO_CODEPAGE_OFF: u64 = 0x98;
 /// USER_MESSAGE_QUEUE offsets used by ReactOS `MsqInitializeMessageQueue`.
 const USER_MESSAGE_QUEUE_PTI_MOUSE_OFF: u64 = 0x28;
 const USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF: u64 = 0x30;
@@ -4595,6 +4614,199 @@ unsafe fn read_u64_field_if_present(base: u64, offset: u64) -> u64 {
         0
     } else {
         read_volatile((base + offset) as *const u64)
+    }
+}
+
+unsafe fn resolve_window_handle(hwnd: u64) -> u64 {
+    let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
+    if ahelist == 0 || (hwnd & 0xffff) < 0x20 {
+        return 0;
+    }
+    let handles = read_volatile(ahelist as *const u64);
+    let count = read_volatile((ahelist + 0x10) as *const u32) as u64;
+    let index = ((hwnd & 0xffff) - 0x20) >> 1;
+    if handles == 0 || index >= count {
+        return 0;
+    }
+    let entry = handles + index * 0x18;
+    if read_volatile((entry + 0x10) as *const u8) != 1 {
+        return 0;
+    }
+    read_volatile(entry as *const u64)
+}
+
+unsafe fn trace_getdc_window_context(hwnd: u64) {
+    let pwnd = resolve_window_handle(hwnd);
+    print_str(b"[w32req-getdc] hwnd=0x");
+    print_hex(hwnd as u32);
+    print_str(b" pwnd=0x");
+    print_win32k_hex64(pwnd);
+    if pwnd == 0 {
+        print_str(b"\n");
+        return;
+    }
+    let pti = read_volatile((pwnd + WND_HEAD_PTI_OFF) as *const u64);
+    let parent = read_volatile((pwnd + WND_SPWND_PARENT_OFF) as *const u64);
+    let child = read_volatile((pwnd + WND_SPWND_CHILD_OFF) as *const u64);
+    let next = read_volatile((pwnd + WND_SPWND_NEXT_OFF) as *const u64);
+    let prev = read_volatile((pwnd + WND_SPWND_PREV_OFF) as *const u64);
+    let style = read_volatile((pwnd + WND_STYLE_OFF) as *const u32);
+    let exstyle = read_volatile((pwnd + WND_EXSTYLE_OFF) as *const u32);
+    let pcls = read_volatile((pwnd + WND_PCLS_OFF) as *const u64);
+    let class_style = if pcls == 0 {
+        0
+    } else {
+        read_volatile((pcls + CLS_STYLE_OFF) as *const u32)
+    };
+    let class_dce = read_u64_field_if_present(pcls, CLS_PDCE_OFF);
+    print_str(b" pti=0x");
+    print_win32k_hex64(pti);
+    print_str(b" parent=0x");
+    print_win32k_hex64(parent);
+    print_str(b" child=0x");
+    print_win32k_hex64(child);
+    print_str(b" next=0x");
+    print_win32k_hex64(next);
+    print_str(b" prev=0x");
+    print_win32k_hex64(prev);
+    print_str(b" style=0x");
+    print_hex(style);
+    print_str(b" ex=0x");
+    print_hex(exstyle);
+    print_str(b" pcls=0x");
+    print_win32k_hex64(pcls);
+    print_str(b" cls-style=0x");
+    print_hex(class_style);
+    print_str(b" cls-dce=0x");
+    print_win32k_hex64(class_dce);
+    print_str(b"\n");
+}
+
+unsafe fn trace_oneparam_thread_context(param: u64, routine: u64) {
+    let pti = current_w32thread();
+    print_str(b"[w32req-oneparam] routine=0x");
+    print_hex(routine as u32);
+    print_str(b" param=0x");
+    print_win32k_hex64(param);
+    print_str(b" pti=0x");
+    print_win32k_hex64(pti);
+    if pti == 0 {
+        print_str(b"\n");
+        return;
+    }
+
+    let ppi = read_u64_field_if_present(pti, THREADINFO_PPI_OFF);
+    let mq = read_u64_field_if_present(pti, THREADINFO_MESSAGE_QUEUE_OFF);
+    let kl = read_u64_field_if_present(pti, THREADINFO_KEYBOARD_LAYOUT_OFF);
+    let pcti = read_u64_field_if_present(pti, 0x70);
+    let rpdesk = read_u64_field_if_present(pti, THREADINFO_RPDESK_OFF);
+    let pdeskinfo = read_u64_field_if_present(pti, THREADINFO_PDESKINFO_OFF);
+    let pci = read_u64_field_if_present(pti, THREADINFO_PCLIENTINFO_OFF);
+    let hkl = read_u64_field_if_present(kl, KL_HKL_OFF);
+    let pci_hkl = read_u64_field_if_present(pci, CLIENTINFO_HKL_OFF);
+    let pci_codepage = if pci == 0 {
+        0
+    } else {
+        read_volatile((pci + CLIENTINFO_CODEPAGE_OFF) as *const u16) as u64
+    };
+
+    print_str(b" ppi=0x");
+    print_win32k_hex64(ppi);
+    print_str(b" mq=0x");
+    print_win32k_hex64(mq);
+    print_str(b" kl=0x");
+    print_win32k_hex64(kl);
+    print_str(b" hkl=0x");
+    print_win32k_hex64(hkl);
+    print_str(b" pcti=0x");
+    print_win32k_hex64(pcti);
+    print_str(b" rpdesk=0x");
+    print_win32k_hex64(rpdesk);
+    print_str(b" pdeskinfo=0x");
+    print_win32k_hex64(pdeskinfo);
+    print_str(b" pci=0x");
+    print_win32k_hex64(pci);
+    print_str(b" pci-hkl=0x");
+    print_win32k_hex64(pci_hkl);
+    print_str(b" cp=");
+    print_u64(pci_codepage);
+    if routine == ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT && param == 0 {
+        print_str(b" current-thread-hkl");
+    }
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn trace_win32k_request_context() {
+    let sh = WIN32K_SHARED_VADDR;
+    let ssn = read_volatile((sh + SH_REQ_SSN) as *const u64);
+    let a0 = read_volatile((sh + SH_REQ_A0) as *const u64);
+    let a1 = read_volatile((sh + SH_REQ_A1) as *const u64);
+    let a2 = read_volatile((sh + SH_REQ_A2) as *const u64);
+    let a3 = read_volatile((sh + SH_REQ_A3) as *const u64);
+    let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    let nested = read_volatile((sh + SH_REQ_NESTED_CALLBACK) as *const u64);
+    let caller_sp = read_volatile((sh + SH_REQ_CALLER_SP) as *const u64);
+    let nargs = read_volatile((sh + SH_REQ_NARGS) as *const u64);
+    let ppi = current_w32process();
+    let ppi_flags = read_u64_field_if_present(ppi, W32PROCESS_FLAGS_OFF) as u32;
+    let handler = if ssn >= WIN32K_SERVICE_BASE {
+        let base = read_volatile((sh + SH_SSDT_BASE) as *const u64);
+        let count = read_volatile((sh + SH_SSDT_COUNT) as *const u32) as u64;
+        let idx = ssn - WIN32K_SERVICE_BASE;
+        if base != 0 && (count == 0 || idx < count) {
+            read_volatile((base + idx * 8) as *const u64)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let provider_argc = registered_win32k_provider_argc(ssn).unwrap_or(u64::MAX);
+    print_str(b"[w32req] ssn=0x");
+    print_hex(ssn as u32);
+    print_str(b" pi=");
+    print_u64(pi);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" nested=");
+    print_u64(nested);
+    print_str(b" a0=0x");
+    print_win32k_hex64(a0);
+    print_str(b" a1=0x");
+    print_win32k_hex64(a1);
+    print_str(b" a2=0x");
+    print_win32k_hex64(a2);
+    print_str(b" a3=0x");
+    print_win32k_hex64(a3);
+    print_str(b" caller-sp=0x");
+    print_win32k_hex64(caller_sp);
+    print_str(b" nargs=");
+    print_u64(nargs);
+    print_str(b" provider-argc=");
+    if provider_argc == u64::MAX {
+        print_str(b"?");
+    } else {
+        print_u64(provider_argc);
+    }
+    print_str(b" handler-rva=0x");
+    if handler >= WIN32K_CODE_VA {
+        print_hex(handler.wrapping_sub(WIN32K_CODE_VA) as u32);
+    } else {
+        print_hex(0);
+    }
+    print_str(b" ppi-flags=0x");
+    print_hex(ppi_flags);
+    print_str(if ppi_flags & W32PF_CREATEDWINORDC != 0 {
+        b" created-dc=1"
+    } else {
+        b" created-dc=0"
+    });
+    print_str(b"\n");
+    if ssn == SSN_NT_USER_GET_DC {
+        trace_getdc_window_context(a0);
+    } else if ssn == SSN_NT_USER_CALL_ONE_PARAM {
+        trace_oneparam_thread_context(a0, a1);
     }
 }
 

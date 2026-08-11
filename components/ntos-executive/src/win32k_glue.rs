@@ -5395,6 +5395,67 @@ pub(crate) const TCB_DBG_FAULT_EP_STATE: usize = 20;
 pub(crate) const TCB_DBG_FAULT_EP_HEAD: usize = 21;
 pub(crate) const TCB_DBG_FAULT_EP_TAIL: usize = 22;
 
+fn print_tcb_debug_opt(value: u64) {
+    if value == TCB_DEBUG_NONE {
+        print_str(b"none");
+    } else {
+        print_u64(value);
+    }
+}
+
+pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
+    let tcb = WIN32K_TCB.load(Ordering::Relaxed);
+    let reply = REPLY_W32_SLOT.load(Ordering::Relaxed);
+    if tcb == 0 {
+        return;
+    }
+    let mut state = [0u64; TCB_DEBUG_STATE_WORDS];
+    tcb_read_debug_state(tcb, reply, &mut state);
+    print_str(b"[w32disp] tcb state=");
+    print_u64(state[TCB_DBG_STATE]);
+    print_str(b" sched=");
+    print_u64(state[TCB_DBG_SCHEDULABLE]);
+    print_str(b" enq=");
+    print_u64(state[TCB_DBG_ENQUEUED]);
+    print_str(b" prio=");
+    print_u64(state[TCB_DBG_PRIORITY]);
+    print_str(b" sc=");
+    print_tcb_debug_opt(state[TCB_DBG_SC]);
+    print_str(b" active_sc=");
+    print_tcb_debug_opt(state[TCB_DBG_ACTIVE_SC]);
+    print_str(b" pend_reply=");
+    print_tcb_debug_opt(state[TCB_DBG_PENDING_REPLY]);
+    print_str(b" reply_to=");
+    print_tcb_debug_opt(state[TCB_DBG_REPLY_TO]);
+    print_str(b" ntfn=");
+    print_tcb_debug_opt(state[TCB_DBG_BOUND_NOTIFICATION]);
+    print_str(b" call=");
+    print_u64(state[TCB_DBG_BLOCKED_IS_CALL]);
+    print_str(b" grant=");
+    print_u64(state[TCB_DBG_BLOCKED_CAN_GRANT]);
+    print_str(b" donated=");
+    print_tcb_debug_opt(state[TCB_DBG_DONATED_SC]);
+    print_str(b" fault=");
+    print_u64(state[TCB_DBG_PENDING_FAULT]);
+    print_str(b" hosted=");
+    print_u64(state[TCB_DBG_HOSTED_SYSCALLS]);
+    print_str(b" reply_bound=");
+    print_tcb_debug_opt(state[TCB_DBG_REPLY_BOUND_TCB]);
+    print_str(b" current=");
+    print_tcb_debug_opt(state[TCB_DBG_CURRENT_TCB]);
+    print_str(b" target=");
+    print_tcb_debug_opt(state[TCB_DBG_TARGET_TCB]);
+    print_str(b" cspace=");
+    print_tcb_debug_opt(state[TCB_DBG_CSPACE_INDEX]);
+    print_str(b" fault-ep=");
+    print_u64(state[TCB_DBG_FAULT_EP_STATE]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_FAULT_EP_HEAD]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_FAULT_EP_TAIL]);
+    print_str(b"\n");
+}
+
 /// rust-micro extension: `TCB::ReadDebugState(reply_cap)` returns compact scheduler/IPC state for
 /// a target TCB and, when `reply_cap != 0`, the TCB currently bound to that reply object.
 pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u64; 24]) {
@@ -5452,6 +5513,7 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
     }
     let mut registers = [0u64; 20];
     tcb_read_regs20(tcb, &mut registers);
+    let rip = registers[nt_user_callback::USER_CONTEXT_RIP];
     let rsp = registers[nt_user_callback::USER_CONTEXT_RSP];
     let sbase = win32k_subsystem::WIN32K_STACK_VADDR;
     let stack_top = sbase + sf * 0x1000;
@@ -5463,7 +5525,14 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
     let code_va = win32k_subsystem::WIN32K_CODE_VA;
     let lo = code_va;
     let hi = code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
-    print_str(b"[w32disp] backtrace rsp=0x");
+    print_str(b"[w32disp] backtrace rip=0x");
+    print_hex((rip >> 32) as u32);
+    print_hex(rip as u32);
+    if rip >= lo && rip < hi {
+        print_str(b" rva=0x");
+        print_hex(rip.wrapping_sub(code_va) as u32);
+    }
+    print_str(b" rsp=0x");
     print_hex((rsp >> 32) as u32);
     print_hex(rsp as u32);
     print_str(b" rax=0x");
@@ -5475,7 +5544,26 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
     print_str(b" rdx=0x");
     print_hex((registers[6] >> 32) as u32);
     print_hex(registers[6] as u32);
+    print_str(b" rsi=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_RSI] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_RSI] as u32);
+    print_str(b" rdi=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_RDI] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_RDI] as u32);
+    print_str(b" r10=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_R10] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_R10] as u32);
+    print_str(b" r8=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_R8] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_R8] as u32);
+    print_str(b" r9=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_R9] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_R9] as u32);
+    print_str(b" r15=0x");
+    print_hex((registers[nt_user_callback::USER_CONTEXT_R15] >> 32) as u32);
+    print_hex(registers[nt_user_callback::USER_CONTEXT_R15] as u32);
     print_str(b"\n");
+    trace_win32k_tcb_debug_state();
     win32k_subsystem::trace_win32k_wall_context();
     // RAW stack window from fault rsp: each qword annotated with its win32k RVA if it lands in the
     // image (a return address). Keep the scan bounded; this path only runs after the component has
@@ -5492,6 +5580,16 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
                 print_hex(off as u32);
                 print_str(b"] rva=0x");
                 print_hex(v.wrapping_sub(code_va) as u32);
+                print_str(b"\n");
+                printed += 1;
+            } else if v >= crate::IMAGE_BASE
+                && v < crate::IMAGE_BASE
+                    + crate::IMAGE_FRAMES_COUNT.load(Ordering::Relaxed) * 0x1000
+            {
+                print_str(b"  [rsp+0x");
+                print_hex(off as u32);
+                print_str(b"] exec-rva=0x");
+                print_hex(v.wrapping_sub(crate::IMAGE_BASE) as u32);
                 print_str(b"\n");
                 printed += 1;
             }

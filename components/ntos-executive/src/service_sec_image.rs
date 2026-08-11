@@ -55,10 +55,7 @@ static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_RECT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
-static CLIENT_REPLY_HANDOFF_YIELDS: AtomicU64 = AtomicU64::new(0);
-static CLIENT_REPLY_HANDOFF_TRACE: AtomicU64 = AtomicU64::new(0);
-static CLIENT_PARK_HANDOFF_YIELDS: AtomicU64 = AtomicU64::new(0);
-static CLIENT_PARK_HANDOFF_TRACE: AtomicU64 = AtomicU64::new(0);
+static NTUSER_CALL_ONE_PARAM_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -84,38 +81,6 @@ static mut SERVICE_DLL_PE_STORE_WORK: [Option<nt_pe_loader::PeFile<'static>>; DL
 static SERVICE_DLL_PE_NONE: Option<nt_pe_loader::PeFile<'static>> = None;
 static mut SERVICE_DLL_PE_REFS_WORK: [&'static Option<nt_pe_loader::PeFile<'static>>;
     DLL_REG_COUNT] = [&SERVICE_DLL_PE_NONE; DLL_REG_COUNT];
-
-#[inline]
-fn client_reply_handoff_yield() {
-    let n = CLIENT_REPLY_HANDOFF_YIELDS.fetch_add(1, Ordering::Relaxed);
-    let trace = CLIENT_REPLY_HANDOFF_TRACE.load(Ordering::Relaxed);
-    if trace < 4
-        && CLIENT_REPLY_HANDOFF_TRACE
-            .compare_exchange(trace, trace + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        print_str(b"[client-reply-handoff] yield count=");
-        print_u64(n + 1);
-        print_str(b"\n");
-    }
-    yield_now();
-}
-
-#[inline]
-fn client_park_handoff_yield() {
-    let n = CLIENT_PARK_HANDOFF_YIELDS.fetch_add(1, Ordering::Relaxed);
-    let trace = CLIENT_PARK_HANDOFF_TRACE.load(Ordering::Relaxed);
-    if trace < 4
-        && CLIENT_PARK_HANDOFF_TRACE
-            .compare_exchange(trace, trace + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        print_str(b"[client-park-handoff] yield count=");
-        print_u64(n + 1);
-        print_str(b"\n");
-    }
-    yield_now();
-}
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -8855,6 +8820,30 @@ pub(crate) unsafe fn service_sec_image(
                 let a2 = get_recv_mr(7); // R8 = arg3
                 let a3 = get_recv_mr(8); // R9 = arg4
                 let sp = get_recv_mr(16); // real syscall-entry RSP for win32k stack args
+                if m0 == 0x1002 {
+                    let n = NTUSER_CALL_ONE_PARAM_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 192 {
+                        print_str(b"[ntuser-oneparam] #");
+                        print_u64(n);
+                        print_str(b" pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" tid=");
+                        print_u64(current_tid as u64);
+                        print_str(b" param=0x");
+                        print_hex_u64(a0);
+                        print_str(b" routine=0x");
+                        print_hex(a1 as u32);
+                        print_str(b" a2=0x");
+                        print_hex_u64(a2);
+                        print_str(b" a3=0x");
+                        print_hex_u64(a3);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b"\n");
+                    }
+                }
                                           // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
                                           // winsrv created these events via NtCreateEvent into its own image globals. Forward
                                           // exactly what the caller supplied; no executive-side substitution is permitted.
@@ -13487,7 +13476,6 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13532,7 +13520,6 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13575,7 +13562,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13613,7 +13599,6 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(delay_queue.len() as u64);
                         print_str(b" -> receive continues\n");
                     }
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -13654,7 +13639,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -13728,7 +13712,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13779,7 +13762,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13831,7 +13813,6 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13879,7 +13860,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13925,7 +13905,6 @@ pub(crate) unsafe fn service_sec_image(
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
                     mark_wait_parked!(pi, resume_ip);
-                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13969,7 +13948,6 @@ pub(crate) unsafe fn service_sec_image(
                 reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
             } else if park_caller {
                 // The caller's binding was STOLEN into a park slot — do not reply, just recv.
-                client_park_handoff_yield();
                 recv_full_r12(fault_ep, reply_main)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
@@ -13982,11 +13960,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (result, m1, m3)
                 };
-                client_reply_on(reply_main, len, r0, r1, 0, r3);
-                if !redirected_user_control {
-                    client_reply_handoff_yield();
-                }
-                recv_full_r12(fault_ep, reply_main)
+                client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, 0, r3)
             };
             badge = nb;
             mi = nmi;

@@ -3349,3 +3349,25 @@ before unrelated executive traffic monopolises the receive loop.
   identify which NTUSER/GDI service `0x1002` represents in the registered win32k table, then fix the
   real lock/callback/wait boundary it exposes rather than adding service-specific launch or pipe
   fallbacks.
+
+- Component pump reply/receive boundary review. The next dirty retry moved past the earlier
+  `0x1002` win32k wall and reached the base desktop paint again, but the run exposed two separate
+  issues: the hosted-driver lifecycle proof failed because an explicit Reply-cap `SysCall` plus a
+  later `Recv` left a scheduling window around bound HPET notifications, and the later desktop path
+  stalled inside hosted NPFS on the final read of a queued 44-byte DCERPC request fragment
+  (`q0=WriteEntries/44/1/24/20`, requested read length 20). ReactOS `NpReadDataQueue` should satisfy
+  that final read, and identical queue shapes had completed earlier in the same boot. Current cleanup
+  restores the component pump to atomic `SysNBSendRecv` reply+receive, keeps the kernel reply-handoff
+  marker limited to active-SC returns, clears the marker after use, fixes the hosted
+  `IO_STACK_LOCATION.DeviceObject` forwarding offset to `0x28`, binds `memmove`/`RtlMoveMemory` to
+  the real move primitive, and publishes active hosted IRP/IO_STACK/queue-head diagnostics through
+  the per-instance shared page. Serialized validation
+  `.tmp/run-desktop-composite-recv-20260811.log` proves the transport cleanup: kernel specs pass,
+  `exec_pump_screens_bound_notification` passes, genuine base desktop paint is back
+  (`desktop-bg 768/768`), the profile source is materialised with a valid `Default User` hive, and
+  the old NPFS read hang now completes (`seq=134`, `status=0`, `info=50`). Review adjustment: the
+  current blocker has moved to the nested paint-side `NtUserCallOneParam` routine `0x28`
+  (`ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT`) with the current winlogon `THREADINFO.KeyboardLayout`,
+  `KL.hkl`, and `CLIENTINFO.hKL` all null while the win32k context still holds three locks. Next work
+  should initialise and attach the real default keyboard-layout state through the ReactOS win32k/user32
+  path, not add a synthetic return from `NtUserCallOneParam`.
