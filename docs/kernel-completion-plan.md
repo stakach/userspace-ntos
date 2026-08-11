@@ -3837,11 +3837,22 @@ before unrelated executive traffic monopolises the receive loop.
   `spoolsv.exe` at dynamic `pi=16`/`badge=38` without a `dynamic admission failed`/`Full` wall,
   reaches `spoolsv.exe` win32k dispatch, and opens `\net\NtControlPipe6`. Screenshot
   `.tmp/run-desktop-dynamic-pi24-20260811.png` confirms the shell/taskbar is still visible after the
-  capacity change, while `.tmp/run-desktop-ui-language-20260811.png` remains the stronger desktop
-  icon proof. Local validation is green: `cargo fmt --all`,
-  `cargo test -p nt-exe-image -- --nocapture`, `cargo test -p nt-fs -- --nocapture`,
-  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`, `git diff --check`, and the serialized desktop retry above. The next red
-  edge is repeated service RPC listener failure (`RpcServerListen() failed (Status 6b1)`) during
-  later services such as `wkssvc`/`srvsvc`, not shell-paint scaffolding, executable ordering,
-  profile staging, or dynamic hosted-image identity policy.
+  capacity change, while `.tmp/run-desktop-ui-language-20260811.png` remains the stronger clean guest
+  desktop-icon proof. The later `.tmp/run-desktop-dynamic-pi24-late-20260811.png` capture is not a
+  clean guest proof because the host terminal obscures QEMU, so do not use it as a framebuffer gate.
+  Local validation is green: `cargo fmt --all`, `cargo test -p nt-exe-image -- --nocapture`,
+  `cargo test -p nt-fs -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and the
+  serialized desktop retry above.
+
+  Follow-up RPC classification: the repeated service log line
+  `RpcServerListen() failed (Status 6b1)` is `RPC_S_ALREADY_LISTENING` from ReactOS user-mode
+  `rpcrt4`'s process-wide listener state. In the p24 trace it appears after `wkssvc`/`browser`/
+  `srvsvc` register more endpoints inside the shared `svchost.exe`; the executive still arms the
+  corresponding named-pipe listen events (`NtWaitForMultipleObjects(4/5/6 events, WaitAny)`) and
+  continues handling peer writes, IOCP wakeups, CSR calls, and service control-pipe traffic around
+  those messages. Treating the string itself as the kernel blocker is therefore too coarse: the next
+  accepted proof should either reproduce clean desktop icons under the p24 capacity budget or expose a
+  later generic kernel-visible wait/completion stall after the shared service RPC endpoints are armed.
+  Do not patch ReactOS service sources or add service-name/RPC-status fallbacks; stay at the NT
+  object, wait, NPFS/IOCP, LPC, and process-runtime boundaries.
