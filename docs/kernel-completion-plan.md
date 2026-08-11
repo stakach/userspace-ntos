@@ -46,11 +46,11 @@ Active slice (2026-08-11): the OS now reaches real IDD_LOGON paint, real RETURN 
 `userinit.exe`, and explorer GUI process connection. It still does not reach final explorer shell
 chrome pixels. The latest visible wall is after `NtUserProcessConnect`: explorer issues native and
 win32k syscalls, cursor objects are created, and the system remains alive through periodic census,
-but `explorer-frontier` repeatedly reports deferred quiesce while winlogon continues profile/wait
-traffic (`profile-frontier` around SSN 198 and related native calls). Next work should identify the
-real profile, environment, registry, wait, or shell COM syscall that keeps explorer from reaching its
-first painted shell windows. Do not add userinit, explorer launch, profile, callback, or shell-paint
-fallbacks.
+but the shell-startup frontier repeatedly reports deferred quiesce while winlogon continues
+profile/wait traffic (`profile-frontier` around SSN 198 and related native calls). Next work should
+identify the real profile, environment, registry, wait, or shell COM syscall that keeps explorer from
+reaching its first painted shell windows. Do not add userinit, explorer launch, profile, callback, or
+shell-paint fallbacks.
 
 Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
@@ -3517,3 +3517,11 @@ before unrelated executive traffic monopolises the receive loop.
   GDI batch text record, RETURN is delivered to the real edit control, `userinit.exe` probes
   `explorer.exe`, and explorer reaches real `NtUserProcessConnect`. Remaining work moves to the
   profile/userinit/explorer shell-chrome frontier, not USER heap aliasing.
+
+- Interactive shell frontier cleanup in progress. The progress-stall quiesce deferral no longer
+  reads the explorer-only proof histogram or hard-codes `pi=6`; it now uses the registered
+  `InteractiveShell` process role plus the generic `W32_CONNECTED_MASK` and a role-derived
+  `NtUserCreateWindowEx` attempt bit. The old explorer counters remain proof instrumentation, not
+  kernel control policy. Next validation should confirm the trace changes to `[shell-frontier]` and
+  then continue the real shell-chrome investigation at the first long `NtGdiOpenDCW`/window-create
+  boundary if pixels are still absent.

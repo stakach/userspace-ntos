@@ -8,7 +8,7 @@ const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 4 * 1024 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
-static EXPLORER_FRONTIER_QUIESCE_DEFERS: AtomicU64 = AtomicU64::new(0);
+static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +43,7 @@ static CREATE_DIBITMAP_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_METRICS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static TEXT_EXTENT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CHAR_WIDTH_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static OPEN_DCW_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static LOAD_KEYBOARD_LAYOUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static SET_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -1585,43 +1586,41 @@ fn hosted_leaf_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option
     nt_handler.hosted_process_leaf(pi)
 }
 
-unsafe fn defer_explorer_startup_quiesce(nt_handler: &ExecNtHandler) -> bool {
-    const MAX_DEFERS: u64 = 4;
-
-    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 1
-        || EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed) != 0
-    {
-        return false;
+fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
+    let connected = W32_CONNECTED_MASK.load(Ordering::Relaxed);
+    let create_window_attempted =
+        INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK.load(Ordering::Relaxed);
+    for pi in 0..MAX_PI.min(64) {
+        if nt_handler.hosted_process_role(pi)
+            != Some(nt_exe_image::HostedProcessRole::InteractiveShell)
+        {
+            continue;
+        }
+        if nt_handler.pm_pid_for_pi(pi).is_none() {
+            continue;
+        }
+        let bit = 1u64 << pi;
+        if connected & bit == 0 || create_window_attempted & bit != 0 {
+            continue;
+        }
+        return Some(pi);
     }
+    None
+}
 
-    let process_connects = EXPLORER_SSN_HIST[ssn_bucket(win32k_subsystem::SSN_NT_USER_INITIALIZE)]
-        .load(Ordering::Relaxed);
-    let create_window_calls = EXPLORER_SSN_HIST[ssn_bucket(0x1077)].load(Ordering::Relaxed);
-    if process_connects == 0 || create_window_calls != 0 {
-        return false;
-    }
-
-    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(6).unwrap_or(0);
-    if tcb <= 1 {
-        return false;
-    }
-
-    let n = EXPLORER_FRONTIER_QUIESCE_DEFERS.fetch_add(1, Ordering::Relaxed);
-    if n >= MAX_DEFERS {
-        return false;
-    }
-
-    let resume = tcb_resume(tcb);
-    print_str(b"[explorer-frontier] deferred quiesce after NtUserProcessConnect; kick=");
-    print_u64(n + 1);
-    print_str(b"/");
-    print_u64(MAX_DEFERS);
-    print_str(b" tcb=0x");
-    print_hex(tcb as u32);
-    print_str(b" resume=0x");
-    print_hex(resume as u32);
+fn trace_interactive_shell_startup_stall(nt_handler: &ExecNtHandler) {
+    let Some(pi) = interactive_shell_frontier_pi(nt_handler) else {
+        return;
+    };
+    print_str(
+        b"[shell-frontier] no progress after NtUserProcessConnect before first NtUserCreateWindowEx; pi=",
+    );
+    print_u64(pi as u64);
+    print_str(b" connected-mask=0x");
+    print_hex_u64(W32_CONNECTED_MASK.load(Ordering::Relaxed));
+    print_str(b" create-window-mask=0x");
+    print_hex_u64(INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK.load(Ordering::Relaxed));
     print_str(b"\n");
-    resume == 0
 }
 
 struct HostedExeSpawn<'a> {
@@ -4234,7 +4233,7 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_epoch = ep;
                 last_progress_t = now;
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
-                if defer_explorer_startup_quiesce(&nt_handler) {
+                if defer_interactive_shell_startup_quiesce(&nt_handler) {
                     last_progress_t = now;
                 } else if defer_quiesce_for_active_user_callbacks(b"progress-stall") {
                     last_progress_t = now;
@@ -11199,6 +11198,10 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 } else if m0 == 0x1077 {
+                    if shell_gui_client && pi < 64 {
+                        INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK
+                            .fetch_or(1u64 << pi, Ordering::Relaxed);
+                    }
                     // `NtUserCreateWindowEx` takes LARGE_STRING ClassName/ClsVersion/WindowName.
                     if sp == 0 {
                         create_window_probe_failed = true;
