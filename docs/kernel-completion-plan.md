@@ -49,6 +49,18 @@ resource/lifetime stability under the later service wave: at the last census roo
 was down to `17453 KiB` with no allocation failures, so continue reducing retained caps/views/driver
 state through real teardown and reclaim rather than adding process or shell-specific exits.
 
+Current resource-lifetime slice (2026-08-12): the shared DLL executable-page cache no longer has a
+silent overflow path. Its capacity is raised from 4096 to 16384 pages, failed duplicate/full inserts
+are counted, and every periodic pool census prints `shared-frames`, `shared-hits`, `shared-full`,
+and `shared-dup` beside `image-mapcaps`. A newly filled shared RX frame is now usable only if the
+cache records ownership; otherwise the pager unmaps/deletes the scratch frame and surfaces a real
+`image-map-resource` wall instead of retaining an untracked cap. SEC_IMAGE forward prefetch also
+collapses from 32 pages to the touched page as soon as root CSlot, client-frame, or untyped headroom
+enters the low-water zone. Local validation is green: `cargo fmt --all`,
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Next serialized desktop proof should confirm the shell still reaches desktop
+icons while the new census shows nonzero shared-cache reuse and zero `shared-full`/`shared-dup`.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.

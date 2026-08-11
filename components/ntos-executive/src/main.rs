@@ -6921,11 +6921,13 @@ fn root_slot_available_count() -> u64 {
 // it — real Windows image sharing (fewer frames, one fill). Keyed by page VA (base+rva). Frames
 // persist for the run (no process teardown yet). Accessed via raw pointers to avoid the
 // static_mut_refs lint; single-threaded executive, so no races.
-const DLL_CACHE_CAP: usize = 4096;
+const DLL_CACHE_CAP: usize = 16384;
 static mut DLL_CACHE_VA: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
 static mut DLL_CACHE_FR: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
 static mut DLL_CACHE_N: usize = 0;
 static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_FULL: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
 /// The shared frame cap for page VA `va`, or 0 if not yet cached.
 unsafe fn dll_cache_get(va: u64) -> u64 {
     let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
@@ -6939,14 +6941,25 @@ unsafe fn dll_cache_get(va: u64) -> u64 {
     0
 }
 /// Record the shared frame `fr` for page VA `va` (once, on first fill).
-unsafe fn dll_cache_put(va: u64, fr: u64) {
+unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
+    let vas_ro = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(vas_ro.add(i)) == va {
+            DLL_CACHE_DUPLICATE_INSERTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
     if n < DLL_CACHE_CAP {
         let vas = core::ptr::addr_of_mut!(DLL_CACHE_VA) as *mut u64;
         let frs = core::ptr::addr_of_mut!(DLL_CACHE_FR) as *mut u64;
         core::ptr::write(vas.add(n), va);
         core::ptr::write(frs.add(n), fr);
         core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), n + 1);
+        true
+    } else {
+        DLL_CACHE_FULL.fetch_add(1, Ordering::Relaxed);
+        false
     }
 }
 
@@ -7763,6 +7776,16 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(SHARED_IMAGE_MAPPING_HW.load(Ordering::Relaxed));
     print_str(b" image-mapcap-fails=");
     print_u64(SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed));
+    print_str(b" shared-frames=");
+    print_u64(unsafe { core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64 });
+    print_str(b"/");
+    print_u64(DLL_CACHE_CAP as u64);
+    print_str(b" shared-hits=");
+    print_u64(DLL_SHARED_HITS.load(Ordering::Relaxed));
+    print_str(b" shared-full=");
+    print_u64(DLL_CACHE_FULL.load(Ordering::Relaxed));
+    print_str(b" shared-dup=");
+    print_u64(DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed));
     print_str(b" freelist=");
     print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");

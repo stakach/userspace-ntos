@@ -6,6 +6,8 @@ use crate::*;
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 4 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM: u64 = 64 * 1024;
+const SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM: u64 = 16 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
@@ -657,8 +659,13 @@ fn sec_image_forward_run() -> u64 {
     let slots_cap =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
-    let slot_pressure = slots_cap != 0 && slots_used * 5 >= slots_cap * 4;
-    let frame_pressure = CSRSS_FRAME_HW.load(Ordering::Relaxed) * 10 >= CSRSS_FRAME_CAP as u64 * 7;
+    let slot_free = root_slot_available_count();
+    let slot_pressure = slots_cap != 0 && slot_free <= SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM;
+    let slot_critical =
+        slots_cap != 0 && slot_free <= SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM;
+    let frame_hw = CSRSS_FRAME_HW.load(Ordering::Relaxed);
+    let frame_pressure = frame_hw * 5 >= CSRSS_FRAME_CAP as u64 * 3;
+    let frame_critical = frame_hw * 10 >= CSRSS_FRAME_CAP as u64 * 9;
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let untyped_free = untyped_total.saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed));
     let untyped_low = untyped_total != 0
@@ -673,20 +680,20 @@ fn sec_image_forward_run() -> u64 {
             print_u64(slots_used);
             print_str(b"/");
             print_u64(slots_cap);
+            print_str(b" slot-free=");
+            print_u64(slot_free);
             print_str(b" frame-reg=");
-            print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+            print_u64(frame_hw);
             print_str(b"/");
             print_u64(CSRSS_FRAME_CAP as u64);
             print_str(b" ut-free=");
             print_u64(untyped_free >> 10);
             print_str(b"KiB");
+            print_str(b" critical=");
+            print_u64((slot_critical || frame_critical || untyped_critical) as u64);
             print_str(b"\n");
         }
-        if untyped_critical {
-            1
-        } else {
-            4
-        }
+        1
     } else {
         32
     }
@@ -6370,7 +6377,31 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     let _filled_rights = fill_image_page(tpe, rva, scratch);
                     if shareable {
-                        dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
+                        // This frame becomes the shared copy for all processes. If the ownership
+                        // table cannot record it, do not leave a scratch-mapped frame without a
+                        // reclaim path; surface the resource wall to the caller instead.
+                        if !dll_cache_put(bpage, f) {
+                            let full = DLL_CACHE_FULL.load(Ordering::Relaxed);
+                            let duplicate = DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed);
+                            if full + duplicate <= 16 {
+                                print_str(b"[image-shared] cache insert failed pi=");
+                                print_u64(pi as u64);
+                                print_str(b" page=0x");
+                                print_hex((bpage >> 32) as u32);
+                                print_hex(bpage as u32);
+                                print_str(b" cap=");
+                                print_u64(DLL_CACHE_CAP as u64);
+                                print_str(b" full=");
+                                print_u64(full);
+                                print_str(b" dup=");
+                                print_u64(duplicate);
+                                print_str(b"\n");
+                            }
+                            let _ = page_unmap_r(f);
+                            let _ = cnode_delete_recycle_r(f);
+                            allocation_failed = true;
+                            break;
+                        }
                     } else {
                         // Per-process page (main image, or DLL headers/rdata/data/IAT): keep its
                         // scratch alias as the source frame for copyin/copyout and possible COW
