@@ -204,6 +204,19 @@ frontier is therefore no longer winlogon/userinit/explorer launch; it is obtaini
 desktop/chrome proof from the later service/process wave and identifying any real blocked waiter if
 the watchdog stops forward progress.
 
+Quiet-GP/explorer callback retry (2026-08-11): the generic rust-micro `#GP` diagnostic now logs the
+register dump only when user-fault delivery fails; normal delivered user `#GP`s stay quiet. The
+serialized desktop retry `.tmp/run-desktop-quiet-gp-recorded-peb-20260811.log` reaches explorer,
+multiple dynamic service processes, rundll32, and nested explorer api0 callbacks without the previous
+delivered-`#GP` log flood. The next real wall is inside explorer shell view creation: ReactOS asserts
+`SUCCEEDED(MapFolderColumnToListColumn(0))`, then win32k reports `Class ... not found` and
+`co_UserCreateWindowEx failed` while creating the assertion/message UI. A secondary problem was also
+found in our diagnostics: `dump_client_callback_crash_state` tried to read the crashed client's stack
+from executive/rootserver context after explorer termination, causing a rootserver page fault with no
+handler. That diagnostic now keeps the register dump and active callback metadata but skips arbitrary
+client stack/TEB reads unless an executive-owned mirror exists. The next mechanism target is the
+class/atom path used by explorer's shell view/message UI, not process launch or synthetic shell paint.
+
 Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
 the sentinel and the harness reporting `SUCCESS -- the ReactOS stack booted and the win32k desktop

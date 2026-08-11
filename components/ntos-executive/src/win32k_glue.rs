@@ -2285,12 +2285,9 @@ unsafe fn print_crash_hex64(value: u64) {
 }
 
 /// Crash-site diagnostic for a GUI client that faulted around the user-callback path. It prints the
-/// faulting GPRs and, when a TEB alias is known, the exact client-side state `user32`'s
-/// `ValidateHwnd`/`DesktopPtrToUser` read to produce a `PWND`: the `CLIENTINFO.CallbackWnd` triple
-/// the callback bridge maintains (TEB+0x840 hWnd / +0x848 pWnd / +0x850 pActCtx) and
-/// `CLIENTINFO.pDeskInfo` / `.ulClientDelta` (TEB+0x820 / +0x828). This deliberately also works
-/// after the callback frame has been popped, because a bad `NtCallbackReturn` resume can fault in
-/// the caller immediately after the active stack becomes empty.
+/// faulting GPRs and callback metadata that lives in executive-owned memory. Do not chase arbitrary
+/// client stack or TEB pointers from here: this runs in the executive/rootserver context and cannot
+/// service hosted-client page faults.
 pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64) {
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
     let active_frame = active.top_for_pi(client_pi as u32);
@@ -2335,30 +2332,17 @@ pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64
         print_str(b" r15=0x");
         print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_R15]);
         print_str(b"\n");
-        print_str(b"[cb-crash] stack:");
-        let mut slot = 0u64;
-        while slot < 16 {
-            let value = crate::img_spawn::smss_stack_read(
-                regs[nt_user_callback::USER_CONTEXT_RSP] + slot * 8,
-            );
-            print_str(b" +0x");
-            print_hex((slot * 8) as u32);
-            print_str(b":0x");
-            print_crash_hex64(value);
-            slot += 1;
-        }
+        print_str(b"[cb-crash] stack omitted: client rsp=0x");
+        print_crash_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
         print_str(b"\n");
     }
-    let teb = active_frame
-        .map(|frame| frame.client_teb())
-        .filter(|&teb| teb != 0)
-        .unwrap_or(if client_pi == 2 {
-            WINLOGON_MAIN_TEB_MIRROR_VA
-        } else {
-            0
-        });
+    let teb = if client_pi == 2 {
+        WINLOGON_MAIN_TEB_MIRROR_VA
+    } else {
+        0
+    };
     if teb == 0 {
-        print_str(b"[cb-crash] CLIENTINFO unavailable\n");
+        print_str(b"[cb-crash] CLIENTINFO skipped: no executive-owned TEB mirror\n");
     } else {
         let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
         print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
