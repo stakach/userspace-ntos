@@ -3815,20 +3815,28 @@ before unrelated executive traffic monopolises the receive loop.
   The next frontier is therefore generic hosted-process runtime capacity/churn, not `Program Files`,
   profile staging, userinit launch, explorer launch, or synthetic paint.
 
-  Dynamic hosted-process capacity slice completed locally: the latest accepted visible desktop proof
-  remains `.tmp/run-desktop-ui-language-20260811.png`, which shows genuine Explorer shell chrome,
-  desktop icons, the Start button, and the taskbar clock. The later fixed-drive-overlay log reaches
-  the same real service/process wave in serial trace: explorer issues thousands of native/win32k
-  calls, service control-pipe waits and opens succeed through `NtControlPipe1..5`, EventLog publishes
+  Dynamic hosted-process capacity slice completed locally: the fixed-drive-overlay log reaches the
+  same real service/process wave in serial trace: explorer issues thousands of native/win32k calls,
+  service control-pipe waits and opens succeed through `NtControlPipe1..5`, EventLog publishes
   `\pipe\EventLog`, and dynamic service churn reaches at least `pi=14`. That made the old
   `MAX_PI=16` table ceiling the next artificial wall. The repair keeps process admission dynamic:
-  `nt-exe-image` now exposes the badge-derived dynamic `pi` limit, the executive's `MAX_PI` follows
-  that mechanism limit, and catalog admission clamps future callers to the transport ceiling so
-  exhaustion reports as `Full` instead of a path error. Local validation is green:
-  `cargo fmt --all`, `cargo test -p nt-exe-image -- --nocapture`,
-  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
-  and `git diff --check`. Remaining validation is a serialized desktop retry; if dynamic admission
-  still reaches `Full`, the next repair is map-backed/reclaimable process runtime state rather than
-  executable-specific launch policy. Otherwise the next red edge is repeated service RPC listener
-  failure (`RpcServerListen() failed (Status 6b1)`) during later services such as `srvsvc`/`wuauserv`,
-  not shell-paint scaffolding, executable ordering, or profile staging.
+  `nt-exe-image` now exposes the badge-derived dynamic `pi` transport limit (`42`), catalog
+  admission clamps future callers to that limit so exhaustion reports as `Full` instead of a path
+  error, and the executive's boot-image-fitting table budget is raised to `24` (`17` dynamic
+  process instances). The full `42`-slot table crossed the current BOOTBOOT initrd limit by about
+  416 KiB, and the intermediate `32`-slot table still crossed it by 144896 bytes in
+  `.tmp/run-desktop-dynamic-pi-budget-20260811.log`, so moving beyond the `24` budget should be a
+  real map-backed/reclaimable process-runtime conversion rather than another fixed-table bump.
+
+  Serialized desktop retry `.tmp/run-desktop-dynamic-pi24-20260811.log` now fits the BOOTBOOT initrd
+  (`size=16697344`), runs the real `WlxActivateUserShell` path, spawns `userinit.exe`, spawns
+  `explorer.exe`, redirects real Explorer win32k/USER callbacks, and admits `spoolsv.exe` at
+  dynamic `pi=16` without a `dynamic admission failed`/`Full` wall. Screenshot
+  `.tmp/run-desktop-dynamic-pi24-20260811.png` shows genuine Explorer shell chrome beyond the plain
+  background: taskbar, Start button, and clock. Local validation is green: `cargo fmt --all`,
+  `cargo test -p nt-exe-image -- --nocapture`, `cargo test -p nt-fs -- --nocapture`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and the serialized desktop retry above. The next red
+  edge is repeated service RPC listener failure (`RpcServerListen() failed (Status 6b1)`) during
+  later services such as `wkssvc`/`srvsvc`, not shell-paint scaffolding, executable ordering,
+  profile staging, or dynamic hosted-image identity policy.

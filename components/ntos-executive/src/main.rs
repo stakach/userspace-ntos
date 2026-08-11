@@ -1310,7 +1310,7 @@ pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WI
 /// still guards `pi < MAX_PI` so exhaustion is explicit instead of corrupting neighbouring mechanism
 /// state. Moving past this boot-image-fitting table budget needs map-backed/reclaimable process
 /// runtime state, not more hardcoded image identities.
-pub const HOSTED_PROCESS_RUNTIME_PI_LIMIT: usize = 32;
+pub const HOSTED_PROCESS_RUNTIME_PI_LIMIT: usize = 24;
 pub const MAX_PI: usize = HOSTED_PROCESS_RUNTIME_PI_LIMIT;
 const _: () = assert!(MAX_PI <= nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT);
 /// Ordered image-open/section/spawn records are handle-lifetime records, not process slots. A
