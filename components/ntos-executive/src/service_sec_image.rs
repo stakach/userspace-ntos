@@ -6928,12 +6928,10 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             // ═══ `\Windows\ApiPort` dynamic CSR API workers — client request side ═══════════════
-            // The private static CSR rendezvous remains the preferred synchronous path. If it is not
-            // parked but a dynamically-created CSRSS API worker is parked on the real ApiPort, route
-            // this request to that worker and block the caller until the worker loops back through
-            // NtReplyWaitReceivePort with the executed CSR message.
+            // ReactOS grows `CsrApiRequestThread`s to avoid starving the CSR API port. When one of
+            // those real dynamic workers is parked on `\Windows\ApiPort`, deliver the next request to
+            // it before using the bootstrap private worker path in the syscall handler below.
             if m0 == SSN_NT_REQUEST_WAIT_REPLY_PORT
-                && CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) == 0
                 && nt_handler.lpc_connection_is(get_recv_mr(9), pi, b"\\windows\\apiport")
                 && csr_dynamic_worker_available()
             {

@@ -3439,12 +3439,29 @@ before unrelated executive traffic monopolises the receive loop.
   EventLog/SCM pipe traffic progresses through FSD dispatch `#167`, publishes a real
   `\??\pipe\EventLog` instance, and issues the first bind write on the client end.
 
-  Current red edge: explorer is still not launched (`explorer total=0`). One EventLog worker
-  `NtRequestWaitReplyPort(\Windows\ApiPort)` now reaches the direct static CSR delivery point
-  (`[csr-api] delivered ApiNumber=0x00010001 bytes=88`) but the real CSR worker rendezvous returns
-  false after absorbing a timer notification, so the EventLog worker is parked as an unserviced SSN 208.
-  The run later quiesces with winlogon in advapi32/ntdll service-control/profile notification code.
-  Next work should keep the CSR worker rendezvous generic: identify the post-delivery label/state that
-  follows the absorbed timer and either service that real worker syscall or route this request through a
-  parked dynamic CSR worker when the static worker is busy. Do not add service-name, process-launch, or
-  shell-paint policy.
+  Current red edge: explorer is still not launched (`explorer total=0`). Retry
+  `.tmp/run-desktop-csr-rdv-badgefix-20260811.log` proves the stale timer-label failure is gone:
+  `DELAY_TIMER_BADGE` notifications are absorbed even when seL4 leaves label `31` in the stale message
+  info. The next real wall is later and more structural: EventLog's main thread is inside
+  `NtUserRegisterClassExWOW` while another EventLog worker delivers `BasepCreateThread`
+  (`ApiNumber=0x00010001`) to the private static CSR API rendezvous, after which no worker IPC reaches
+  the executive and the deadman reports the active win32k 0x10b4 dispatch. ReactOS' CSRSRV creates
+  dynamic `CsrApiRequestThread`s to avoid starving the API port, but the executive was still giving the
+  private bootstrap worker priority whenever it was parked. Current fix keeps this at the generic LPC
+  boundary: if a real dynamic CSRSS API worker is parked on `\Windows\ApiPort`, CSR API requests are
+  delivered there before the bootstrap worker path is considered. Next validation must prove that the
+  EventLog `ApiNumber=0x00010001` wall moves forward to service start/userinit activation. Do not add
+  service-name, process-launch, or shell-paint policy.
+
+  Validation update: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and serialized desktop retry `.tmp/run-desktop-csr-dyn-priority-20260811.log` all completed. The
+  old EventLog CSR wall is gone: after dynamic worker badge 17 parks on `NtReplyWaitReceivePort`,
+  later CSR API traffic repeatedly logs `[csr-api-dyn] delivered ...` and `[csr-api-dyn] reply
+  completed ...` with no deadman trips. The final framebuffer proof also moved from a magenta bottom
+  line to real non-background content (`104517` non-background pixels, bounds `0,260..1023,767`,
+  `unique-non-bg>=32`), while explorer is still not launched. The next red edge is now winlogon's
+  profile/user-shell activation: `ProfileList` opens remain zero, `NtLoadKey` is not reached,
+  `Default User\ntuser.dat` is staged but not copied/loaded, and `WlxActivateUserShell` never reads
+  the `Userinit` value or opens `userinit.exe`.

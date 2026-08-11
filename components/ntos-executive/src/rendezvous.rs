@@ -14,7 +14,10 @@ unsafe fn rendezvous_recv_full_r12(
 ) -> (u64, u64, u64, u64, u64, u64) {
     loop {
         let received = crate::recv_full_r12(ep, reply);
-        if received.0 == DELAY_TIMER_BADGE && (received.1 >> 12) == 0 {
+        // Bound timer notifications interrupt any executive receive and may leave stale msginfo/MRs.
+        // The badge is the ownership signal; rendezvous loops must not treat the label as worker IPC.
+        if received.0 == DELAY_TIMER_BADGE {
+            let label = received.1 >> 12;
             DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
             if !crate::drain_nested_pump_timer_delivery() {
                 crate::delay_timer_nested_ack();
@@ -22,7 +25,12 @@ unsafe fn rendezvous_recv_full_r12(
             let tick = RENDEZVOUS_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             if tick < 8 {
                 print_str(tag);
-                print_str(b" absorbed timer notification while driving real server worker\n");
+                print_str(b" absorbed timer notification while driving real server worker");
+                if label != 0 {
+                    print_str(b" label=");
+                    print_u64(label);
+                }
+                print_str(b"\n");
             }
             continue;
         }
@@ -1620,7 +1628,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     let mut fill_idx = 0;
     let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
         rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
-    for _ in 0..8000 {
+    for iter in 0..8000 {
         if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
             let ssn = m0;
             let rsp = m1;
@@ -1653,17 +1661,41 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         &mut fill_idx,
                     )
                 {
-                    print_str(b"[csr-api] unresolved worker fault\n");
+                    print_str(b"[csr-api] unresolved worker fault iter=");
+                    print_u64(iter);
+                    print_str(b" ip=0x");
+                    print_hex_u64(m0);
+                    print_str(b" addr=0x");
+                    print_hex_u64(m1);
+                    print_str(b"\n");
                     return false;
                 }
                 client_reply_on(reply, 0, 0, 0, 0, 0);
             }
             3 => {
-                let Some(pe) = ntdll_pe else { return false };
+                let Some(pe) = ntdll_pe else {
+                    print_str(b"[csr-api] worker exception without ntdll image iter=");
+                    print_u64(iter);
+                    print_str(b" fip=0x");
+                    print_hex_u64(m0);
+                    print_str(b" code=");
+                    print_u64(m3);
+                    print_str(b"\n");
+                    return false;
+                };
                 if m0 < nt_base
                     || m0 >= nt_end
                     || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
                 {
+                    print_str(b"[csr-api] non-debug worker exception iter=");
+                    print_u64(iter);
+                    print_str(b" fip=0x");
+                    print_hex_u64(m0);
+                    print_str(b" rsp=0x");
+                    print_hex_u64(m1);
+                    print_str(b" code=");
+                    print_u64(m3);
+                    print_str(b"\n");
                     return false;
                 }
                 client_reply_on(reply, 3, m0 + 3, m1, m2, 0);
@@ -2006,12 +2038,20 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                         };
                         let reply_len = if reply_source != 0 {
                             let Some(header_word) = csr_stack_read(reply_source) else {
+                                print_str(b"[csr-api] worker reply header unreadable source=0x");
+                                print_hex_u64(reply_source);
+                                print_str(b"\n");
                                 return false;
                             };
                             let total = ((header_word >> 16) as u16) as usize;
                             if !(0x28..=CSR_API_MSG_MAX).contains(&total)
                                 || !csr_stack_copyin(reply_source, &mut reply_bytes[..total])
                             {
+                                print_str(b"[csr-api] worker reply frame invalid source=0x");
+                                print_hex_u64(reply_source);
+                                print_str(b" total=");
+                                print_u64(total as u64);
+                                print_str(b"\n");
                                 return false;
                             }
                             reply_bytes[4..6]
@@ -2040,6 +2080,11 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                             return false;
                         };
                         if !nt_handler.xas_try_write_buf(reply_va, &reply_bytes[..reply_len]) {
+                            print_str(b"[csr-api] client reply copyout failed va=0x");
+                            print_hex_u64(reply_va);
+                            print_str(b" len=");
+                            print_u64(reply_len as u64);
+                            print_str(b"\n");
                             return false;
                         }
                         CSR_MSGS.fetch_add(1, Ordering::Relaxed);
@@ -2056,6 +2101,16 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                     _ => {
                         print_str(b"[csr-api] unexpected worker SSN=");
                         print_u64(ssn);
+                        print_str(b" iter=");
+                        print_u64(iter);
+                        print_str(b" ip=0x");
+                        print_hex_u64(resume_ip);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
+                        print_str(b" arg1=0x");
+                        print_hex_u64(get_recv_mr(9));
+                        print_str(b" arg2=0x");
+                        print_hex_u64(rdx);
                         print_str(b"\n");
                         return false;
                     }
@@ -2065,7 +2120,24 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
                 set_reply_mr(17, flags);
                 client_reply_on(reply, 18, result, 0, 0, rdx);
             }
-            _ => return false,
+            label => {
+                print_str(b"[csr-api] unexpected worker label=");
+                print_u64(label);
+                print_str(b" iter=");
+                print_u64(iter);
+                print_str(b" mi=0x");
+                print_hex_u64(mi);
+                print_str(b" m0=0x");
+                print_hex_u64(m0);
+                print_str(b" m1=0x");
+                print_hex_u64(m1);
+                print_str(b" m2=0x");
+                print_hex_u64(m2);
+                print_str(b" m3=0x");
+                print_hex_u64(m3);
+                print_str(b"\n");
+                return false;
+            }
         }
         let (_badge, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
         mi = nmi;
@@ -2074,6 +2146,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
         m2 = nm2;
         m3 = nm3;
     }
+    print_str(b"[csr-api] worker rendezvous guard exhausted\n");
     false
 }
 
