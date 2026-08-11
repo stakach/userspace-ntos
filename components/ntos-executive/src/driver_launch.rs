@@ -445,11 +445,27 @@ const EMPTY_COMPLETED_WRITE: CompletedWrite = CompletedWrite {
     _pad: 0,
     info: 0,
 };
+const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
+    irp: 0,
+    iosl: 0,
+    file_object: 0,
+    data: 0,
+    fid: 0,
+    major: 0,
+    read_completion: false,
+    owns_fo: false,
+    _pad: [0; 5],
+};
+const EMPTY_PENDING_IRP_NODE: PendingIrpNode = PendingIrpNode {
+    next: 0,
+    entry: EMPTY_PENDING_IRP,
+};
 
 const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
 const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_COMPLETED_WRITE_CAP: usize = 128;
 const FSD_COMPLETED_READ_CAP: usize = 30;
+const FSD_PENDING_IRP_CAP: usize = 256;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
 const FSD_COMPLETED_WRITES_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8);
 const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
@@ -457,9 +473,14 @@ const FSD_COMPLETED_READS_OFF: u64 = align_up_u64(
         + core::mem::size_of::<CompletedWrite>() as u64 * FSD_COMPLETED_WRITE_CAP as u64,
     8,
 );
-const _: () = assert!(
+const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(
     FSD_COMPLETED_READS_OFF
-        + core::mem::size_of::<CompletedRead>() as u64 * FSD_COMPLETED_READ_CAP as u64
+        + core::mem::size_of::<CompletedRead>() as u64 * FSD_COMPLETED_READ_CAP as u64,
+    8,
+);
+const _: () = assert!(
+    FSD_PENDING_IRPS_OFF
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64
         <= FSD_DATA_FRAMES * 0x1000
 );
 
@@ -497,14 +518,32 @@ unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRea
 }
 
 #[inline]
+unsafe fn pending_irp_slot(data_base: u64, index: usize) -> *mut PendingIrpNode {
+    (data_base
+        + FSD_PENDING_IRPS_OFF
+        + (index as u64) * core::mem::size_of::<PendingIrpNode>() as u64)
+        as *mut PendingIrpNode
+}
+
+#[inline]
 unsafe fn pending_irp_node_valid(node: u64) -> bool {
     let pool_start = FSD_POOL_VADDR + POOL_DATA_OFF;
     let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
-    node >= pool_start
+    let in_pool = node >= pool_start
         && node & 7 == 0
         && node
             .checked_add(core::mem::size_of::<PendingIrpNode>() as u64)
-            .is_some_and(|end| end <= pool_end)
+            .is_some_and(|end| end <= pool_end);
+    let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
+    let table_end = table_start
+        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    let in_table = node >= table_start
+        && node & 7 == 0
+        && node
+            .checked_add(core::mem::size_of::<PendingIrpNode>() as u64)
+            .is_some_and(|end| end <= table_end)
+        && (node - table_start) % core::mem::size_of::<PendingIrpNode>() as u64 == 0;
+    in_pool || in_table
 }
 
 unsafe fn pending_irp_exists(irp: u64) -> bool {
@@ -537,7 +576,14 @@ unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
         let entry = read_volatile((node + 8) as *const PendingIrp);
         if entry.irp == irp {
             write_volatile(prev, next);
-            pool_free(node);
+            let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
+            let table_end = table_start
+                + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+            if node >= table_start && node < table_end {
+                write_volatile(node as *mut PendingIrpNode, EMPTY_PENDING_IRP_NODE);
+            } else {
+                pool_free(node);
+            }
             return Some(entry);
         }
         prev = node as *mut u64;
@@ -548,9 +594,19 @@ unsafe fn take_pending_irp(irp: u64) -> Option<PendingIrp> {
 }
 
 unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
-    let node = pool_alloc(core::mem::size_of::<PendingIrpNode>() as u64);
+    let mut node = 0u64;
+    for index in 0..FSD_PENDING_IRP_CAP {
+        let slot = pending_irp_slot(FSD_DATA_VADDR, index);
+        if read_volatile(slot).entry.irp == 0 {
+            node = slot as u64;
+            break;
+        }
+    }
     if node == 0 {
-        return false;
+        node = pool_alloc(core::mem::size_of::<PendingIrpNode>() as u64);
+        if node == 0 {
+            return false;
+        }
     }
     let head = pending_irp_head(FSD_DATA_VADDR);
     let old = read_volatile(head);
@@ -1845,6 +1901,7 @@ unsafe fn trace_pipe_transceive_result(
     let interesting = status == STATUS_PENDING
         || status == STATUS_BUFFER_OVERFLOW
         || status == 0xC000_00AE
+        || status & 0xC000_0000 == 0xC000_0000
         || info != 0
         || pdu.is_some()
         || before.is_some_and(|view| view.has_queued_state())

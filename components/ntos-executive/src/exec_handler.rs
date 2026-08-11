@@ -39,6 +39,8 @@ const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
 const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
 const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
+const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
+    r"\registry\machine\system\controlset001\control\servicegrouporder";
 
 fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
     let timeout = if request.timeout_specified {
@@ -2756,7 +2758,7 @@ impl ExecNtHandler {
         let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
         self.mutable_key_handles.push(Some(key));
         if grows_buffer {
-            self.mark_mutable_hives_dirty();
+            self.mark_mutable_hives_dirty_preserving_services_order();
         }
         Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
     }
@@ -3962,7 +3964,7 @@ impl ExecNtHandler {
                 .mutable_hives
                 .set_key_security_descriptor(key, descriptor)
             {
-                self.mark_mutable_hives_dirty();
+                self.mark_mutable_hives_dirty_preserving_services_order();
                 return Ok(());
             }
             return Err(0xC000_0008);
@@ -4115,7 +4117,9 @@ impl ExecNtHandler {
             .mutable_hives
             .set_value(key, name, value_type, data.to_vec());
         if updated {
-            self.mark_mutable_hives_dirty();
+            self.mark_mutable_hives_dirty_for_services_order_change(
+                Self::registry_services_order_value_write_may_reorder(full_path),
+            );
         }
         updated
     }
@@ -4528,6 +4532,23 @@ impl ExecNtHandler {
     fn mark_mutable_hives_dirty(&mut self) {
         self.mutable_hives_dirty = true;
         self.invalidate_registry_services_order_cache();
+        bump_progress();
+    }
+
+    fn mark_mutable_hives_dirty_preserving_services_order(&mut self) {
+        self.mutable_hives_dirty = true;
+        bump_progress();
+    }
+
+    fn mark_mutable_hives_dirty_for_services_order_change(
+        &mut self,
+        services_order_may_change: bool,
+    ) {
+        self.mutable_hives_dirty = true;
+        if services_order_may_change {
+            self.invalidate_registry_services_order_cache();
+        }
+        bump_progress();
     }
 
     fn invalidate_registry_services_order_cache(&mut self) {
@@ -4625,6 +4646,35 @@ impl ExecNtHandler {
 
     fn is_system_services_registry_path(path: &str) -> bool {
         nt_hive_core::canon_path(path) == REGISTRY_SERVICES_CANON
+    }
+
+    fn registry_services_descendant_depth_from_canon(canon: &str) -> Option<usize> {
+        if canon == REGISTRY_SERVICES_CANON {
+            return Some(0);
+        }
+        let rest = canon.strip_prefix(REGISTRY_SERVICES_CANON)?;
+        let rest = rest.strip_prefix('\\')?;
+        if rest.is_empty() {
+            return None;
+        }
+        Some(rest.split('\\').filter(|part| !part.is_empty()).count())
+    }
+
+    fn registry_services_order_key_membership_may_change(path: &str) -> bool {
+        let canon = nt_hive_core::canon_path(path);
+        matches!(
+            Self::registry_services_descendant_depth_from_canon(&canon),
+            Some(1)
+        )
+    }
+
+    fn registry_services_order_value_write_may_reorder(path: &str) -> bool {
+        let canon = nt_hive_core::canon_path(path);
+        canon == REGISTRY_SERVICE_GROUP_ORDER_CANON
+            || matches!(
+                Self::registry_services_descendant_depth_from_canon(&canon),
+                Some(1)
+            )
     }
 
     fn registry_ordered_service_subkey_by_index(
@@ -16958,7 +17008,9 @@ impl ExecNtHandler {
                             return 0xC000_0008;
                         }
                     }
-                    self.mark_mutable_hives_dirty();
+                    self.mark_mutable_hives_dirty_for_services_order_change(
+                        Self::registry_services_order_key_membership_may_change(canon),
+                    );
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
                     // boot paths.
@@ -17163,6 +17215,8 @@ impl ExecNtHandler {
                                 .unwrap_or("")
                         })
                     });
+                let services_order_may_change = key_path_for_counters
+                    .is_some_and(Self::registry_services_order_value_write_may_reorder);
                 let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none() {
                     self.mutable_registry_key(key)
                 } else {
@@ -17269,7 +17323,9 @@ impl ExecNtHandler {
                             false
                         };
                         if shared_installed {
-                            self.mark_mutable_hives_dirty();
+                            self.mark_mutable_hives_dirty_for_services_order_change(
+                                services_order_may_change,
+                            );
                             return 0;
                         }
                     }
@@ -17292,7 +17348,9 @@ impl ExecNtHandler {
                     ) {
                         return 0xC000_0008;
                     }
-                    self.mark_mutable_hives_dirty();
+                    self.mark_mutable_hives_dirty_for_services_order_change(
+                        services_order_may_change,
+                    );
                     return 0;
                 }
                 let Some(staged) = data_view else {
@@ -17405,6 +17463,9 @@ impl ExecNtHandler {
                 }
                 let key_path = self.registry_target_path(key);
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
+                    let services_order_may_change = key_path
+                        .as_deref()
+                        .is_some_and(Self::registry_services_order_key_membership_may_change);
                     match self.mutable_hives.delete_key(mutable_key) {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
@@ -17412,7 +17473,9 @@ impl ExecNtHandler {
                                     self.overlay_dirty = true;
                                 }
                             }
-                            self.mark_mutable_hives_dirty();
+                            self.mark_mutable_hives_dirty_for_services_order_change(
+                                services_order_may_change,
+                            );
                             return 0;
                         }
                         Err(nt_hive_core::DeleteKeyError::CannotDelete) => {
@@ -17440,10 +17503,16 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
+                    let services_order_may_change = self
+                        .registry_target_path(key)
+                        .as_deref()
+                        .is_some_and(Self::registry_services_order_value_write_may_reorder);
                     if !self.mutable_hives.delete_value(mutable_key, &name) {
                         return 0xC000_0008;
                     }
-                    self.mark_mutable_hives_dirty();
+                    self.mark_mutable_hives_dirty_for_services_order_change(
+                        services_order_may_change,
+                    );
                     return 0;
                 }
                 if overlay_key_idx(key).is_some() {

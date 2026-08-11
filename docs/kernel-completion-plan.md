@@ -3293,3 +3293,59 @@ before unrelated executive traffic monopolises the receive loop.
   generic SCM runtime/listener path, with `exec_svc_rpc_listener_multiplex` still red and userinit /
   explorer naturally absent. Next work should inspect the services syscall/thread sequence after
   `CheckSetup()` and fix the real SCM RPC listener or wait/reply mechanism it exposes.
+
+- Progress accounting during mutable registry work. The next inspection of
+  `.tmp/boot-wait-timeout-xas-desktop-20260811.log` showed `services.exe` had not yet reached
+  `ScmStartRpcServer()` when the global progress-stall gate fired: it was still in the first-boot
+  `ScmCreateLastKnownGoodControlSet()` path, copying values from `SYSTEM\ControlSet001` into a new
+  control set through real `NtEnumerateValueKey` / `NtSetValueKey` traffic. That is genuine
+  Configuration Manager progress, not SCM-listener idleness. The progress epoch now bumps from the
+  generic mutable-hive dirty path, so any real mounted-hive create/delete/set/mount mutation keeps the
+  run alive while the registry is changing. This intentionally stays path-agnostic: repeated writes of
+  already-matching values still return before marking the hive dirty, while distinct CM mutations are
+  counted as forward progress. Next serialized desktop retry should prove whether services finishes
+  the control-set copy and reaches `ScmStartRpcServer()` / the `\pipe\ntsvcs` listener frontier.
+
+- Services-order cache invalidation and NPFS transceive retention. The Services enumeration cache now
+  invalidates only when service key membership, first-level service ordering values, or
+  `Control\ServiceGroupOrder` can change; nested service metadata writes keep the mounted hive dirty
+  and bump progress without throwing away the ordered Services view. Serialized retry
+  `.tmp/boot-services-order-precise-desktop-20260811.log` proves the previous SCM wall moved: the run
+  reaches `[microtest done]` at `237/295`, passes `exec_svc_rpc_listener_multiplex`, creates and
+  signals `\BaseNamedObjects\SvcctrlStartEvent_A3752DX`, accepts winlogon traffic on `\pipe\ntsvcs`,
+  spawns `eventlog.exe`, and then `svchost.exe` for `DcomLaunch`. Review adjustment: explorer is
+  still naturally absent because service startup stalls earlier. The concrete failure is generic NPFS
+  transaction handling: `FSCTL_PIPE_TRANSCEIVE` (`0x0011c017`) on the DcomLaunch control pipe returns
+  `STATUS_INSUFFICIENT_RESOURCES`, ReactOS logs `TransactNamedPipe(DcomLaunch, 80) failed`, removes
+  that service image, and then Services cannot open `\??\pipe\EventLog`. The bridge now keeps pending
+  hosted-FSD IRP list nodes in the per-instance DATA table instead of allocating each node from the
+  small hosted FSD pool, preserving the real NPFS transceive IRP while avoiding the pool exhaustion
+  that broke this service-control round trip. Next serialized desktop retry should prove whether
+  DcomLaunch/EventLog advances and whether winlogon reaches profile/userinit after auto-start
+  services make forward progress.
+
+- Hosted DEVICE_OBJECT stack-size projection for NPFS child IRPs. Serialized retry
+  `.tmp/boot-npfs-transceive-table-desktop-20260811.log` proved the pending-IRP DATA table was not
+  the whole transceive failure: `eventlog.exe` and the later `DcomLaunch` service process were
+  dynamically admitted, but their first SCM control `TransactNamedPipe` still returned
+  `STATUS_INSUFFICIENT_RESOURCES` from inside hosted NPFS. The failing ReactOS path is
+  `NpTransceive()`: once the request write cannot be fully consumed by an already-waiting read, NPFS
+  allocates a secondary write IRP with `IoAllocateIrp(DeviceObject->StackSize, TRUE)`. Our hosted
+  `DEVICE_OBJECT` writer had left `StackSize` at zero, so that real child-IRP allocation failed even
+  though the component pool still had space. The shared WDM layout now writes `DEVICE_OBJECT.StackSize`
+  at offset `0x4c`, base hosted devices are created with stack size 1, attach/detach can still adjust
+  stack depth dynamically, and the transceive trace now includes hard failures so future pipe FSCTL
+  logs include queue state. Validation so far: `cargo test -p nt-io-manager wdm_x64`,
+  `cargo fmt --all`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Serialized desktop retry
+  `.tmp/boot-device-stacksize-desktop-20260811.log` proves the fix: the EventLog SCM control
+  `FSCTL_PIPE_TRANSCEIVE` now returns `STATUS_PENDING`, leaves the transceive read queued, and the
+  service-side follow-up read receives the 50-byte control packet (`status=0`, `info=50`) instead of
+  `STATUS_INSUFFICIENT_RESOURCES`. EventLog then creates an additional `\ntsvcs` client connection
+  and SCM claims a dynamic per-connection worker for it. Review adjustment: the current blocker has
+  moved out of NPFS transceive allocation and into a later win32k/user-mode interaction. The retry
+  deadlocks with the last entered win32k syscall at `0x1002`, current GUI context `pi=2`/winlogon,
+  and `locks=3`/non-null refs while EventLog and SCM worker threads are parked. Next work should
+  identify which NTUSER/GDI service `0x1002` represents in the registered win32k table, then fix the
+  real lock/callback/wait boundary it exposes rather than adding service-specific launch or pipe
+  fallbacks.

@@ -2098,6 +2098,7 @@ mod tests {
                 next_device: 0x2222,
                 device_extension: 0x3333,
                 device_type: 0x44,
+                stack_size: 3,
             },
         )
         .unwrap();
@@ -2107,6 +2108,7 @@ mod tests {
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
         assert_eq!(le_u64(&dev, 0x40), 0x3333);
         assert_eq!(le_u32(&dev, 0x48), 0x44);
+        assert_eq!(dev[0x4c], 3);
         assert!(dev.iter().skip(WDM_X64_DEVICE_OBJECT_SIZE).all(|b| *b == 0));
 
         let mut file = [0xCC; WDM_X64_FILE_OBJECT_SIZE];
@@ -2160,6 +2162,7 @@ mod tests {
         assert_eq!(le_u64(&device, 0x08), 0x1000);
         assert_eq!(le_u64(&device, 0x10), 0);
         assert_eq!(le_u32(&device, 0x48), 0x23);
+        assert_eq!(device[0x4c], 1);
 
         assert_eq!(le_u16(&file, 0x00), WDM_X64_IO_TYPE_FILE as u16);
         assert_eq!(le_u64(&file, 0x08), 0x2000);

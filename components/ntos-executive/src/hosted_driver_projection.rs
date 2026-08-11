@@ -70,6 +70,7 @@ pub(crate) unsafe fn create_hosted_device_projection(
             next_device,
             device_extension,
             device_type,
+            stack_size: 1,
         },
     )
     .is_err()

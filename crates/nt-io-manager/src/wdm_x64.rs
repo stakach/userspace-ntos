@@ -40,6 +40,7 @@ pub struct WdmDeviceObjectInit {
     pub next_device: u64,
     pub device_extension: u64,
     pub device_type: u32,
+    pub stack_size: u8,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -148,6 +149,7 @@ pub fn write_wdm_device_object(
     put_u64(bytes, 0x10, init.next_device);
     put_u64(bytes, 0x40, init.device_extension);
     put_u32(bytes, 0x48, init.device_type);
+    put_u8(bytes, 0x4c, init.stack_size);
     Ok(())
 }
 
@@ -189,6 +191,7 @@ pub fn write_wdm_open_device_projection(
             next_device: 0,
             device_extension: 0,
             device_type: init.device_type,
+            stack_size: 1,
         },
     )?;
     write_wdm_file_object(
