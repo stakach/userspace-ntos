@@ -363,9 +363,10 @@ pub fn classify_wait(status: NtStatus, last_chance: bool) -> WaitOutcome {
 
 // --- RTL_SRWLOCK ------------------------------------------------------------------------------
 
-/// `RTL_SRWLOCK` — a single pointer-width word. Bit 0 is the `Locked` bit; the upper bits form the
-/// waiter/shared-count. The uncontended fast paths (acquire/release, exclusive + shared) are
-/// implemented here; the contended path shares the [`WaitSeam`] keyed-event model.
+/// `RTL_SRWLOCK` — a single pointer-width word using the NT bit layout:
+/// `OWNED` (bit 0), `CONTENDED` (bit 1), `SHARED` (bit 2), and a shared-holder count shifted by
+/// four bits. The uncontended fast paths are implemented here; the DLL export uses the same word
+/// transitions and parks contended callers on the kernel keyed-event wait plane.
 #[repr(C)]
 #[derive(Debug)]
 pub struct SrwLock {
@@ -373,9 +374,13 @@ pub struct SrwLock {
     pub value: usize,
 }
 
-/// Bit 0 of the SRW word: exclusively locked.
-const SRW_LOCK_BIT: usize = 0x1;
-/// The shared-count lives above the low control bit.
+/// Bit 0 of the SRW word: the lock is owned, either exclusively or shared.
+const SRW_OWNED: usize = 0x1;
+/// Bit 1 of the SRW word: contention was observed.
+const SRW_CONTENDED: usize = 0x2;
+/// Bit 2 of the SRW word: ownership is shared.
+const SRW_SHARED: usize = 0x4;
+/// The shared-count lives above the low control bits.
 const SRW_SHARED_SHIFT: u32 = 4;
 const SRW_SHARED_UNIT: usize = 1 << SRW_SHARED_SHIFT;
 
@@ -387,8 +392,8 @@ impl SrwLock {
 
     /// `RtlTryAcquireSRWLockExclusive`: succeed only if fully free.
     pub fn try_acquire_exclusive(&mut self) -> bool {
-        if self.value == 0 {
-            self.value = SRW_LOCK_BIT;
+        if self.value == 0 || self.value == SRW_CONTENDED {
+            self.value = SRW_OWNED | (self.value & SRW_CONTENDED);
             true
         } else {
             false
@@ -398,8 +403,8 @@ impl SrwLock {
     /// `RtlReleaseSRWLockExclusive`: clear the lock bit. Returns `false` on a contract violation
     /// (not exclusively held).
     pub fn release_exclusive(&mut self) -> bool {
-        if self.value & SRW_LOCK_BIT != 0 {
-            self.value &= !SRW_LOCK_BIT;
+        if self.value & SRW_OWNED != 0 && self.value & SRW_SHARED == 0 {
+            self.value = 0;
             true
         } else {
             false
@@ -408,19 +413,27 @@ impl SrwLock {
 
     /// `RtlTryAcquireSRWLockShared`: succeed if not exclusively held; bumps the shared count.
     pub fn try_acquire_shared(&mut self) -> bool {
-        if self.value & SRW_LOCK_BIT != 0 {
+        if self.value & SRW_OWNED != 0 && self.value & SRW_SHARED == 0 {
             return false;
         }
-        self.value += SRW_SHARED_UNIT;
+        if self.value & SRW_CONTENDED != 0 {
+            return false;
+        }
+        self.value = self.value.wrapping_add(SRW_SHARED_UNIT) | SRW_OWNED | SRW_SHARED;
         true
     }
 
     /// `RtlReleaseSRWLockShared`: decrement the shared count. Returns `false` if no shared holder.
     pub fn release_shared(&mut self) -> bool {
-        if self.value < SRW_SHARED_UNIT || self.value & SRW_LOCK_BIT != 0 {
+        if self.value & SRW_SHARED == 0 || self.shared_count() == 0 {
             return false;
         }
-        self.value -= SRW_SHARED_UNIT;
+        let next_count = self.shared_count() - 1;
+        self.value = if next_count == 0 {
+            0
+        } else {
+            (next_count << SRW_SHARED_SHIFT) | SRW_OWNED | SRW_SHARED
+        };
         true
     }
 
@@ -622,6 +635,7 @@ mod tests {
     fn srw_exclusive_excludes() {
         let mut l = SrwLock::new();
         assert!(l.try_acquire_exclusive());
+        assert_eq!(l.value, SRW_OWNED);
         assert!(!l.try_acquire_exclusive()); // exclusive is exclusive
         assert!(!l.try_acquire_shared()); // shared blocked while exclusive
         assert!(l.release_exclusive());
@@ -632,8 +646,10 @@ mod tests {
     fn srw_shared_stacks() {
         let mut l = SrwLock::new();
         assert!(l.try_acquire_shared());
+        assert_eq!(l.value, SRW_OWNED | SRW_SHARED | SRW_SHARED_UNIT);
         assert!(l.try_acquire_shared());
         assert_eq!(l.shared_count(), 2);
+        assert_eq!(l.value, SRW_OWNED | SRW_SHARED | (2 * SRW_SHARED_UNIT));
         assert!(!l.try_acquire_exclusive()); // exclusive blocked while shared held
         assert!(l.release_shared());
         assert!(l.release_shared());

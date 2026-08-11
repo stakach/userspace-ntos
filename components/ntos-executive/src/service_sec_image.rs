@@ -49,10 +49,13 @@ static MESSAGE_CALL_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static SET_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEFER_WINDOW_POS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static GET_ATOM_NAME_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static SESSION_ATOM_NAME_SERVE_TRACE: AtomicU64 = AtomicU64::new(0);
+static SESSION_BUILTIN_CLASS_SERVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static SESSION_CURSOR_SERVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_RECT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2912,6 +2915,32 @@ unsafe fn copy_back_get_atom_name(
     )
 }
 
+unsafe fn stage_session_atom_name(
+    nt_handler: &mut ExecNtHandler,
+    atom: u16,
+    capture: CapturedGetAtomName,
+) -> Option<u64> {
+    let mut units = [0u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP];
+    let len = nt_handler.lookup_class_atom_name(atom, &mut units)?;
+    let byte_len = len.checked_mul(2)?;
+    let total_len = byte_len.checked_add(2)?;
+    let max = (capture.maximum as usize).min(RC_ARG_BUF_CAP as usize);
+    if total_len > max {
+        nt_handler.record_class_atom_name_serve(false);
+        return None;
+    }
+    for (index, unit) in units[..len].iter().enumerate() {
+        core::ptr::write_unaligned(
+            (capture.buffer_out + index as u64 * 2) as *mut u16,
+            *unit,
+        );
+    }
+    core::ptr::write_unaligned((capture.buffer_out + byte_len as u64) as *mut u16, 0);
+    core::ptr::write_unaligned(capture.desc_out as *mut u16, byte_len as u16);
+    nt_handler.record_class_atom_name_serve(true);
+    Some(len as u64)
+}
+
 unsafe fn stage_unicode_string_output_for_win32k(
     pi: u64,
     descriptor: u64,
@@ -3263,6 +3292,41 @@ unsafe fn capture_cursor_identity_key(
         CapturedCursorString::Text(len) => CursorResource::name(&resource_name[..len])?,
     };
     CursorLookupKey::new(&module[..module_len], resource, icon_kind)
+}
+
+unsafe fn capture_find_existing_cursor_key(
+    pi: u64,
+    module_descriptor: u64,
+    resource_descriptor: u64,
+    parameter: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<nt_kernel_exec::user_cursor::CursorLookupKey> {
+    if parameter == 0 {
+        return None;
+    }
+    let mut params = [0u8; 12];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        parameter,
+        &mut params,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    ) {
+        return None;
+    }
+    let icon_kind = (u32::from_le_bytes(params[0..4].try_into().ok()?) != 0) as u32;
+    capture_cursor_identity_key(
+        pi,
+        module_descriptor,
+        resource_descriptor,
+        icon_kind,
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
 }
 
 unsafe fn stage_cursor_lookup_args(
@@ -11475,7 +11539,15 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 let cursor_identity_key = if m0 == 0x103d {
-                    None
+                    capture_find_existing_cursor_key(
+                        pi as u64,
+                        a0,
+                        a1,
+                        a2,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    )
                 } else if m0 == 0x10a8 {
                     capture_cursor_set_data_key(
                         pi as u64,
@@ -11810,6 +11882,63 @@ pub(crate) unsafe fn service_sec_image(
                     dispatch_peb_mirror,
                     scratch_base,
                 );
+                let session_cursor_hit = if m0 == 0x103d {
+                    cursor_identity_key
+                        .as_ref()
+                        .and_then(|key| nt_handler.lookup_global_cursor_identity(key))
+                } else {
+                    None
+                };
+                if let Some(handle) = session_cursor_hit {
+                    let n = SESSION_CURSOR_SERVE_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        print_str(b"[win32k-session] ");
+                        print_str(win32k_client_label(&nt_handler, pi));
+                        print_str(b" NtUserFindExistingCursorIcon -> 0x");
+                        print_hex(handle);
+                        print_str(b"\n");
+                    }
+                }
+                let session_builtin_class_atom = if m0 == 0x10b4 && builtin_class_attempt {
+                    builtin_class_key
+                        .as_ref()
+                        .and_then(|key| nt_handler.lookup_builtin_class_atom(key))
+                } else {
+                    None
+                };
+                if let Some(atom) = session_builtin_class_atom {
+                    let n = SESSION_BUILTIN_CLASS_SERVE_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        print_str(b"[win32k-session] ");
+                        print_str(win32k_client_label(&nt_handler, pi));
+                        print_str(b" NtUserRegisterClassExWOW builtin atom=0x");
+                        print_hex(atom as u32);
+                        if let Some(key) = builtin_class_key.as_ref() {
+                            print_str(b" fnid=0x");
+                            print_hex(key.fn_id());
+                        }
+                        print_str(b"\n");
+                    }
+                }
+                let session_atom_name_chars = if m0 == 0x10ad {
+                    get_atom_name_capture.and_then(|capture| {
+                        stage_session_atom_name(&mut nt_handler, a0 as u16, capture)
+                    })
+                } else {
+                    None
+                };
+                if let Some(chars) = session_atom_name_chars {
+                    let n = SESSION_ATOM_NAME_SERVE_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        print_str(b"[win32k-session] ");
+                        print_str(win32k_client_label(&nt_handler, pi));
+                        print_str(b" NtUserGetAtomName atom=0x");
+                        print_hex(a0 as u32);
+                        print_str(b" chars=");
+                        print_u64(chars);
+                        print_str(b"\n");
+                    }
+                }
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park
                     || gui_message_wait_park_request
                 {
@@ -11818,6 +11947,12 @@ pub(crate) unsafe fn service_sec_image(
                     // so dispatching the blocking GetMessage would park the single-threaded host
                     // inside win32k. The !handled block below owns the wait-park.
                     (0, false)
+                } else if let Some(handle) = session_cursor_hit {
+                    (handle as u64, true)
+                } else if let Some(atom) = session_builtin_class_atom {
+                    (atom as u64, true)
+                } else if let Some(chars) = session_atom_name_chars {
+                    (chars, true)
                 } else if find_cursor_icon_probe_failed {
                     let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                     if failures < 8 {
@@ -19027,6 +19162,19 @@ unsafe fn csr_dynamic_wake(cap: u64, status: u64, ip: u64, sp: u64, flags: u64) 
 unsafe fn csr_dynamic_worker_available() -> bool {
     let table = csr_dynamic_workers_mut();
     table.iter().copied().any(CsrDynamicApiWorker::is_parked)
+}
+
+pub(crate) fn csr_dynamic_client_pi_for_worker_badge(worker_badge: u64) -> Option<usize> {
+    let table = unsafe { &*core::ptr::addr_of!(CSR_DYNAMIC_API_WORKERS) };
+    table
+        .iter()
+        .copied()
+        .find(|worker| {
+            worker.badge == worker_badge
+                && worker.in_flight_kind == CSR_DYNAMIC_KIND_REQUEST
+                && worker.client_pi != CSR_DYNAMIC_CONTEXT_UNSET
+        })
+        .map(|worker| worker.client_pi as usize)
 }
 
 unsafe fn csr_dynamic_worker_park(

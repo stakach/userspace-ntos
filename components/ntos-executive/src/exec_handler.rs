@@ -81,6 +81,7 @@ static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static CSR_DUPLICATE_CLIENT_SOURCE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
@@ -4815,6 +4816,13 @@ impl ExecNtHandler {
         self.win32k_session.observe_cursor_identity(key, handle);
     }
 
+    pub(crate) fn lookup_global_cursor_identity(
+        &mut self,
+        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
+    ) -> Option<u32> {
+        self.win32k_session.lookup_cursor(key)
+    }
+
     pub(crate) fn promote_global_cursor(&mut self, handle: u32) {
         self.win32k_session.promote_cursor(handle);
     }
@@ -4831,6 +4839,13 @@ impl ExecNtHandler {
         self.win32k_session.observe_builtin_class(key, atom);
     }
 
+    pub(crate) fn lookup_builtin_class_atom(
+        &mut self,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
+    ) -> Option<u16> {
+        self.win32k_session.lookup_builtin_class(key)
+    }
+
     pub(crate) fn record_userinit_builtin_class_hit(&mut self, fn_id: u32, atom: u16) {
         self.win32k_session
             .record_userinit_builtin_class_hit(fn_id, atom);
@@ -4842,6 +4857,18 @@ impl ExecNtHandler {
 
     pub(crate) fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
         self.win32k_session.observe_class_atom_name(atom, units)
+    }
+
+    pub(crate) fn lookup_class_atom_name(
+        &mut self,
+        atom: u16,
+        out: &mut [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+    ) -> Option<usize> {
+        self.win32k_session.lookup_class_atom_name(atom, out)
+    }
+
+    pub(crate) fn record_class_atom_name_serve(&mut self, success: bool) {
+        self.win32k_session.record_class_atom_name_serve(success);
     }
 
     pub(crate) fn record_userinit_scrollbar_query(&mut self) {
@@ -9692,6 +9719,18 @@ impl ExecNtHandler {
         }
     }
 
+    fn csr_dynamic_client_source_pid_for_handle(
+        &self,
+        handle: nt_process::Handle,
+    ) -> Option<nt_process::ProcessId> {
+        let client_pi = csr_dynamic_client_pi_for_worker_badge(self.current_badge)?;
+        let client_pid = self.pm_pid_for_pi(client_pi)?;
+        self.pm
+            .lookup_handle(client_pid, handle)
+            .is_some()
+            .then_some(client_pid)
+    }
+
     fn is_process_security_handle(&self, caller: nt_process::ProcessId, handle: u64) -> bool {
         if handle == u64::MAX {
             return true;
@@ -11607,6 +11646,42 @@ impl ExecNtHandler {
             }
         }
         Ok(handle)
+    }
+
+    fn duplicate_process_handle_with_request_source(
+        &mut self,
+        source_pid: Option<nt_process::ProcessId>,
+        source_handle: nt_process::Handle,
+        target_pid: nt_process::ProcessId,
+        desired_access: Option<u32>,
+    ) -> Result<(nt_process::Handle, nt_process::ProcessId, bool), u32> {
+        let mut invalid_status = STATUS_INVALID_HANDLE;
+        if let Some(pid) = source_pid {
+            match self.duplicate_process_handle_with_access(
+                pid,
+                source_handle,
+                target_pid,
+                desired_access,
+            ) {
+                Ok(handle) => return Ok((handle, pid, false)),
+                Err(status) if status != STATUS_INVALID_HANDLE => return Err(status),
+                Err(status) => invalid_status = status,
+            }
+        }
+
+        let Some(client_pid) = self.csr_dynamic_client_source_pid_for_handle(source_handle) else {
+            return Err(invalid_status);
+        };
+        if Some(client_pid) == source_pid {
+            return Err(invalid_status);
+        }
+        self.duplicate_process_handle_with_access(
+            client_pid,
+            source_handle,
+            target_pid,
+            desired_access,
+        )
+        .map(|handle| (handle, client_pid, true))
     }
 
     /// Transfer one existing token reference into a new caller-local handle. Every failure path
@@ -16287,22 +16362,24 @@ impl ExecNtHandler {
                 }
             },
             // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
-            // DesiredAccess, HandleAttributes, Options). Resolve both process handles in the
-            // caller's table, then duplicate the typed object into the target EPROCESS table. This
-            // preserves shared identities such as msgina's worker-completion event instead of
-            // copying an unowned scalar handle value.
+            // DesiredAccess, HandleAttributes, Options). Resolve process handles in the caller's
+            // table and duplicate the typed object into the target EPROCESS table. When a real CSR
+            // API worker is executing a delivered client request, ReactOS BaseSrv can name the
+            // client's handle table as the source process; recover that table from the in-flight LPC
+            // message context instead of fabricating a scalar handle result.
             NativeService::NtDuplicateObject => {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
                 const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
                 const DUPLICATE_SAME_ACCESS: u32 = 0x2;
 
-                let Some(source_pid) = self.resolve_process_handle(args[0]) else {
-                    return STATUS_INVALID_HANDLE;
-                };
+                let source_handle = args[1] as nt_process::Handle;
+                let source_pid = self.resolve_process_handle(args[0]);
                 let options = args[6] as u32;
                 let mut target_pid_for_peak = None;
+                let mut close_source_pid = source_pid;
                 let mut native_duplicate = false;
+                let mut recovered_source_from_csr_client = false;
                 let result = if args[2] == 0 {
                     if args[3] == 0 && options & DUPLICATE_CLOSE_SOURCE != 0 {
                         Ok(None)
@@ -16317,40 +16394,44 @@ impl ExecNtHandler {
                     let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
                         .then_some(args[4] as u32);
                     let user_same_process_duplicate =
-                        source_pid == target_pid && options & DUPLICATE_SAME_ACCESS != 0;
+                        source_pid == Some(target_pid) && options & DUPLICATE_SAME_ACCESS != 0;
                     if user_same_process_duplicate {
                         if let Some(handle) = unsafe {
                             crate::win32k_subsystem::duplicate_user_object_handle(args[1])
                         } {
                             Ok(Some(handle))
                         } else {
-                            match self.duplicate_process_handle_with_access(
+                            match self.duplicate_process_handle_with_request_source(
                                 source_pid,
-                                args[1] as nt_process::Handle,
+                                source_handle,
                                 target_pid,
                                 desired_access,
                             ) {
-                                Ok(handle) => {
+                                Ok((handle, owner_pid, recovered)) => {
+                                    close_source_pid = Some(owner_pid);
                                     native_duplicate = true;
+                                    recovered_source_from_csr_client = recovered;
                                     Ok(Some(handle as u64))
                                 }
                                 Err(status) => Err(status),
                             }
                         }
                     } else {
-                        match self.duplicate_process_handle_with_access(
+                        match self.duplicate_process_handle_with_request_source(
                             source_pid,
-                            args[1] as nt_process::Handle,
+                            source_handle,
                             target_pid,
                             desired_access,
                         ) {
-                            Ok(handle) => {
+                            Ok((handle, owner_pid, recovered)) => {
+                                close_source_pid = Some(owner_pid);
                                 native_duplicate = true;
+                                recovered_source_from_csr_client = recovered;
                                 Ok(Some(handle as u64))
                             }
                             Err(status)
                                 if status == STATUS_INVALID_HANDLE
-                                    && source_pid == target_pid
+                                    && source_pid == Some(target_pid)
                                     && options & DUPLICATE_SAME_ACCESS != 0 =>
                             {
                                 unsafe {
@@ -16365,7 +16446,12 @@ impl ExecNtHandler {
                 };
 
                 if options & DUPLICATE_CLOSE_SOURCE != 0 {
-                    let closed_native = self.close_process_handle(source_pid, args[1]);
+                    if close_source_pid.is_none() {
+                        close_source_pid = self.csr_dynamic_client_source_pid_for_handle(source_handle);
+                    }
+                    let closed_native = close_source_pid
+                        .map(|pid| self.close_process_handle(pid, args[1]))
+                        .unwrap_or(false);
                     if closed_native
                         || unsafe {
                             crate::win32k_subsystem::close_user_object_handle(args[1])
@@ -16395,6 +16481,22 @@ impl ExecNtHandler {
                             print_hex(status);
                             print_str(b"\n");
                         }
+                    }
+                }
+                if recovered_source_from_csr_client {
+                    let trace = CSR_DUPLICATE_CLIENT_SOURCE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                    if trace < 32 {
+                        print_str(b"[csr-duplicate] worker_badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" source_handle=0x");
+                        print_hex_u64(args[1]);
+                        print_str(b" source_process=0x");
+                        print_hex_u64(args[0]);
+                        print_str(b" recovered_client_pid=");
+                        print_u64(close_source_pid.unwrap_or(0) as u64);
+                        print_str(b" target_pid=");
+                        print_u64(target_pid_for_peak.unwrap_or(0) as u64);
+                        print_str(b"\n");
                     }
                 }
                 match result {

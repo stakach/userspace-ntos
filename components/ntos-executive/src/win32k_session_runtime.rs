@@ -1,17 +1,48 @@
 const WIN32K_STOCK_OBJECT_COUNT: u32 = 22;
+const SESSION_CURSOR_RECORD_CAP: usize = 64;
+const SESSION_BUILTIN_CLASS_RECORD_CAP: usize = 32;
+const SESSION_ATOM_NAME_RECORD_CAP: usize = 128;
+
+#[derive(Clone, Copy)]
+struct SessionCursorRecord {
+    key: nt_kernel_exec::user_cursor::CursorLookupKey,
+    handle: u32,
+    promoted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SessionBuiltinClassRecord {
+    key: nt_kernel_exec::user_class::BuiltinClassKey,
+    atom: u16,
+}
+
+#[derive(Clone, Copy)]
+struct SessionAtomNameRecord {
+    atom: u16,
+    len: u16,
+    units: [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+}
 
 struct Win32kSessionRuntimeState {
     stock_object_observed_mask: u32,
     stock_objects_observed: u64,
+    cursor_records: [Option<SessionCursorRecord>; SESSION_CURSOR_RECORD_CAP],
+    cursor_record_next: usize,
+    promoted_cursor_handles: [u32; SESSION_CURSOR_RECORD_CAP],
+    promoted_cursor_handle_next: usize,
     cursor_identities_observed: u64,
     cursor_promotions: u64,
     userinit_cursor_hits: u64,
     userinit_cursor_handle: u64,
+    builtin_class_records: [Option<SessionBuiltinClassRecord>; SESSION_BUILTIN_CLASS_RECORD_CAP],
+    builtin_class_record_next: usize,
     builtin_classes_observed: u64,
     userinit_builtin_class_hits: u64,
     userinit_builtin_class_misses: u64,
     userinit_builtin_class_mask: u64,
     userinit_dialog_class_atom: u64,
+    class_atom_name_records: [Option<SessionAtomNameRecord>; SESSION_ATOM_NAME_RECORD_CAP],
+    class_atom_name_record_next: usize,
     class_atom_names_observed: u64,
     class_atom_name_serves: u64,
     class_atom_name_failures: u64,
@@ -29,15 +60,23 @@ impl Win32kSessionRuntimeState {
         Self {
             stock_object_observed_mask: 0,
             stock_objects_observed: 0,
+            cursor_records: [None; SESSION_CURSOR_RECORD_CAP],
+            cursor_record_next: 0,
+            promoted_cursor_handles: [0; SESSION_CURSOR_RECORD_CAP],
+            promoted_cursor_handle_next: 0,
             cursor_identities_observed: 0,
             cursor_promotions: 0,
             userinit_cursor_hits: 0,
             userinit_cursor_handle: 0,
+            builtin_class_records: [None; SESSION_BUILTIN_CLASS_RECORD_CAP],
+            builtin_class_record_next: 0,
             builtin_classes_observed: 0,
             userinit_builtin_class_hits: 0,
             userinit_builtin_class_misses: 0,
             userinit_builtin_class_mask: 0,
             userinit_dialog_class_atom: 0,
+            class_atom_name_records: [None; SESSION_ATOM_NAME_RECORD_CAP],
+            class_atom_name_record_next: 0,
             class_atom_names_observed: 0,
             class_atom_name_serves: 0,
             class_atom_name_failures: 0,
@@ -55,15 +94,23 @@ impl Win32kSessionRuntimeState {
     fn clear(&mut self) {
         self.stock_object_observed_mask = 0;
         self.stock_objects_observed = 0;
+        self.cursor_records = [None; SESSION_CURSOR_RECORD_CAP];
+        self.cursor_record_next = 0;
+        self.promoted_cursor_handles = [0; SESSION_CURSOR_RECORD_CAP];
+        self.promoted_cursor_handle_next = 0;
         self.cursor_identities_observed = 0;
         self.cursor_promotions = 0;
         self.userinit_cursor_hits = 0;
         self.userinit_cursor_handle = 0;
+        self.builtin_class_records = [None; SESSION_BUILTIN_CLASS_RECORD_CAP];
+        self.builtin_class_record_next = 0;
         self.builtin_classes_observed = 0;
         self.userinit_builtin_class_hits = 0;
         self.userinit_builtin_class_misses = 0;
         self.userinit_builtin_class_mask = 0;
         self.userinit_dialog_class_atom = 0;
+        self.class_atom_name_records = [None; SESSION_ATOM_NAME_RECORD_CAP];
+        self.class_atom_name_record_next = 0;
         self.class_atom_names_observed = 0;
         self.class_atom_name_serves = 0;
         self.class_atom_name_failures = 0;
@@ -91,18 +138,64 @@ impl Win32kSessionRuntimeState {
 
     fn observe_cursor_identity(
         &mut self,
-        _key: &nt_kernel_exec::user_cursor::CursorLookupKey,
+        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
         handle: u32,
     ) {
-        if handle != 0 {
-            self.cursor_identities_observed = self.cursor_identities_observed.saturating_add(1);
+        if handle == 0 {
+            return;
         }
+        self.cursor_identities_observed = self.cursor_identities_observed.saturating_add(1);
+        let promoted = self.promoted_cursor_handles.contains(&handle);
+        for record in self.cursor_records.iter_mut().flatten() {
+            if record.key.same_identity(key) {
+                if !record.promoted || record.handle == handle {
+                    record.handle = handle;
+                    record.promoted |= promoted;
+                }
+                return;
+            }
+        }
+        let slot = self
+            .cursor_records
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                let slot = self.cursor_record_next % SESSION_CURSOR_RECORD_CAP;
+                self.cursor_record_next = self.cursor_record_next.wrapping_add(1);
+                slot
+            });
+        self.cursor_records[slot] = Some(SessionCursorRecord {
+            key: *key,
+            handle,
+            promoted,
+        });
     }
 
     fn promote_cursor(&mut self, handle: u32) {
-        if handle != 0 {
-            self.cursor_promotions = self.cursor_promotions.saturating_add(1);
+        if handle == 0 {
+            return;
         }
+        self.cursor_promotions = self.cursor_promotions.saturating_add(1);
+        let mut found = false;
+        for record in self.cursor_records.iter_mut().flatten() {
+            if record.handle == handle {
+                record.promoted = true;
+                found = true;
+            }
+        }
+        if !found && !self.promoted_cursor_handles.contains(&handle) {
+            let slot = self.promoted_cursor_handle_next % SESSION_CURSOR_RECORD_CAP;
+            self.promoted_cursor_handles[slot] = handle;
+            self.promoted_cursor_handle_next = self.promoted_cursor_handle_next.wrapping_add(1);
+        }
+    }
+
+    fn lookup_cursor(&self, key: &nt_kernel_exec::user_cursor::CursorLookupKey) -> Option<u32> {
+        self.cursor_records
+            .iter()
+            .flatten()
+            .find(|record| record.promoted && record.handle != 0 && record.key.same_identity(key))
+            .map(|record| record.handle)
     }
 
     fn record_userinit_cursor_hit(&mut self, handle: u32) {
@@ -112,12 +205,41 @@ impl Win32kSessionRuntimeState {
 
     fn observe_builtin_class(
         &mut self,
-        _key: &nt_kernel_exec::user_class::BuiltinClassKey,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
         atom: u16,
     ) {
-        if atom != 0 {
-            self.builtin_classes_observed = self.builtin_classes_observed.saturating_add(1);
+        if atom == 0 {
+            return;
         }
+        self.builtin_classes_observed = self.builtin_classes_observed.saturating_add(1);
+        for record in self.builtin_class_records.iter_mut().flatten() {
+            if record.key.same_identity(key) {
+                record.atom = atom;
+                return;
+            }
+        }
+        let slot = self
+            .builtin_class_records
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                let slot = self.builtin_class_record_next % SESSION_BUILTIN_CLASS_RECORD_CAP;
+                self.builtin_class_record_next =
+                    self.builtin_class_record_next.wrapping_add(1);
+                slot
+        });
+        self.builtin_class_records[slot] = Some(SessionBuiltinClassRecord { key: *key, atom });
+    }
+
+    fn lookup_builtin_class(
+        &self,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
+    ) -> Option<u16> {
+        self.builtin_class_records
+            .iter()
+            .flatten()
+            .find(|record| record.atom != 0 && record.key.same_identity(key))
+            .map(|record| record.atom)
     }
 
     fn record_userinit_builtin_class_hit(&mut self, fn_id: u32, atom: u16) {
@@ -140,8 +262,60 @@ impl Win32kSessionRuntimeState {
             && units.len() <= nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP;
         if observed {
             self.class_atom_names_observed = self.class_atom_names_observed.saturating_add(1);
+            let mut stored = SessionAtomNameRecord {
+                atom,
+                len: units.len() as u16,
+                units: [0; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+            };
+            stored.units[..units.len()].copy_from_slice(units);
+            for record in self.class_atom_name_records.iter_mut().flatten() {
+                if record.atom == atom {
+                    *record = stored;
+                    return true;
+                }
+            }
+            let slot = self
+                .class_atom_name_records
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or_else(|| {
+                    let slot = self.class_atom_name_record_next % SESSION_ATOM_NAME_RECORD_CAP;
+                    self.class_atom_name_record_next =
+                        self.class_atom_name_record_next.wrapping_add(1);
+                    slot
+                });
+            self.class_atom_name_records[slot] = Some(stored);
         }
         observed
+    }
+
+    fn lookup_class_atom_name(
+        &self,
+        atom: u16,
+        out: &mut [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+    ) -> Option<usize> {
+        if atom == 0 {
+            return None;
+        }
+        if let Some(record) = self
+            .class_atom_name_records
+            .iter()
+            .flatten()
+            .find(|record| record.atom == atom)
+        {
+            let len = record.len as usize;
+            out[..len].copy_from_slice(&record.units[..len]);
+            return Some(len);
+        }
+        nt_kernel_exec::user_class::integer_atom_name(atom, out)
+    }
+
+    fn record_class_atom_name_serve(&mut self, success: bool) {
+        if success {
+            self.class_atom_name_serves = self.class_atom_name_serves.saturating_add(1);
+        } else {
+            self.class_atom_name_failures = self.class_atom_name_failures.saturating_add(1);
+        }
     }
 
     fn record_userinit_scrollbar_query(&mut self) {
@@ -227,6 +401,14 @@ impl Win32kSessionRuntime {
         unsafe { (&mut *self.state).observe_cursor_identity(key, handle) };
     }
 
+    pub(crate) fn lookup_cursor(
+        &mut self,
+        key: &nt_kernel_exec::user_cursor::CursorLookupKey,
+    ) -> Option<u32> {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).lookup_cursor(key) }
+    }
+
     pub(crate) fn promote_cursor(&mut self, handle: u32) {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).promote_cursor(handle) };
@@ -246,6 +428,14 @@ impl Win32kSessionRuntime {
         unsafe { (&mut *self.state).observe_builtin_class(key, atom) };
     }
 
+    pub(crate) fn lookup_builtin_class(
+        &mut self,
+        key: &nt_kernel_exec::user_class::BuiltinClassKey,
+    ) -> Option<u16> {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).lookup_builtin_class(key) }
+    }
+
     pub(crate) fn record_userinit_builtin_class_hit(&mut self, fn_id: u32, atom: u16) {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).record_userinit_builtin_class_hit(fn_id, atom) };
@@ -259,6 +449,20 @@ impl Win32kSessionRuntime {
     pub(crate) fn observe_class_atom_name(&mut self, atom: u16, units: &[u16]) -> bool {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).observe_class_atom_name(atom, units) }
+    }
+
+    pub(crate) fn lookup_class_atom_name(
+        &mut self,
+        atom: u16,
+        out: &mut [u16; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
+    ) -> Option<usize> {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).lookup_class_atom_name(atom, out) }
+    }
+
+    pub(crate) fn record_class_atom_name_serve(&mut self, success: bool) {
+        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
+        unsafe { (&mut *self.state).record_class_atom_name_serve(success) };
     }
 
     pub(crate) fn record_userinit_scrollbar_query(&mut self) {

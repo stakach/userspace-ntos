@@ -53,6 +53,20 @@ honest wall is after cursor/icon GDI bootstrap, immediately after successful
 thread, stack, caller, and IAT dump for any `InteractiveShell` process stuck at that frontier.
 Do not add userinit, explorer launch, profile, callback, or shell-paint fallbacks.
 
+Current retry note (2026-08-11, SRW/keyed-event slice): dynamic CSR duplicate-source recovery
+removed the previous `Failed to duplicate process handle` wall, and the serialized desktop retry
+`.tmp/run-desktop-ntdll-srw-keyed-20260811.log` reached EventLog process launch plus real RPC/NPFS
+traffic. EventLog now creates and publishes the real `\??\pipe\EventLog` endpoint, and SCM consumes a
+following `\ntsvcs` request (`op=7`) without pool exhaustion or duplicate-handle failure. The ntdll
+SRW exports also now use the NT SRW word layout and park contended
+`RtlAcquireSRWLock{Exclusive,Shared}` callers on `NtWaitForKeyedEvent`, with release waking waiters
+through `NtReleaseKeyedEvent`; this was validated by `cargo test -p nt-ntdll sync -- --nocapture`,
+`scripts/build_ntdll_dll.sh`, executive check/build, and
+`./rust-micro/scripts/build_kernel.sh extern-rootserver`. The desktop retry did not show keyed-event
+traffic, so the remaining wall is later: generic EventLog/SCM RPC, dispatcher wait, or IOCP handoff
+after the EventLog pipe is available. Do not add EventLog ordering, executable-launch, or shell-paint
+policy.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in

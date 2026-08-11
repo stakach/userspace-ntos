@@ -2314,12 +2314,16 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
     STATUS_SUCCESS
 }
 
-const SRW_LOCK_BIT: usize = 0x1;
-const SRW_SHARED_UNIT: usize = 1 << 4;
+const SRW_OWNED: usize = 0x1;
+const SRW_CONTENDED: usize = 0x2;
+const SRW_SHARED: usize = 0x4;
+const SRW_SHARED_SHIFT: usize = 4;
 const RTL_CONDITION_VARIABLE_LOCKMODE_SHARED: u32 = 0x1;
 const RTL_RUN_ONCE_CHECK_ONLY: u32 = 0x1;
 const RTL_RUN_ONCE_ASYNC: u32 = 0x2;
 const RTL_RUN_ONCE_INIT_FAILED: u32 = 0x4;
+const STATUS_TIMEOUT: NtStatus = 0x0000_0102;
+const STATUS_RESOURCE_NOT_OWNED: NtStatus = 0xC000_0264;
 
 #[inline]
 unsafe fn atomic_word(ptr: *mut c_void) -> Option<&'static AtomicUsize> {
@@ -2336,6 +2340,47 @@ fn spin_pause(iteration: usize) {
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
     }
     core::hint::spin_loop();
+}
+
+#[inline]
+fn srw_shared_count(value: usize) -> usize {
+    value >> SRW_SHARED_SHIFT
+}
+
+unsafe fn srw_mark_contended(srw_lock: *mut c_void) {
+    if let Some(word) = unsafe { atomic_word(srw_lock) } {
+        word.fetch_or(SRW_CONTENDED, Ordering::AcqRel);
+    }
+}
+
+unsafe fn srw_wait_for_release(srw_lock: *mut c_void) {
+    let status = unsafe { nt_wait_for_keyed_event_raw(srw_lock, core::ptr::null()) };
+    if !nt_success(status) {
+        unsafe { rtl_raise_status(status) };
+        return;
+    }
+}
+
+unsafe fn srw_wake_contended_waiters(srw_lock: *mut c_void) {
+    let timeout: i64 = 0;
+    loop {
+        let status = unsafe { nt_release_keyed_event_raw(srw_lock, &timeout) };
+        if status == STATUS_SUCCESS {
+            continue;
+        }
+        if status == STATUS_TIMEOUT {
+            break;
+        }
+        unsafe { rtl_raise_status(status) };
+        return;
+    }
+
+    // Pair with a waiter that set SRW_CONTENDED and is about to enter NtWaitForKeyedEvent.
+    let status = unsafe { nt_release_keyed_event_raw(srw_lock, core::ptr::null()) };
+    if !nt_success(status) {
+        unsafe { rtl_raise_status(status) };
+        return;
+    }
 }
 
 /// `RtlInitializeSRWLock(PRTL_SRWLOCK)`.
@@ -2358,10 +2403,21 @@ pub unsafe extern "system" fn rtl_try_acquire_srw_lock_exclusive(srw_lock: *mut 
     let Some(word) = (unsafe { atomic_word(srw_lock) }) else {
         return 0;
     };
-    u8::from(
-        word.compare_exchange(0, SRW_LOCK_BIT, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok(),
-    )
+    let mut current = word.load(Ordering::Acquire);
+    loop {
+        if current != 0 && current != SRW_CONTENDED {
+            return 0;
+        }
+        match word.compare_exchange_weak(
+            current,
+            SRW_OWNED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return 1,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// `RtlTryAcquireSRWLockShared(PRTL_SRWLOCK) -> BOOLEAN`.
@@ -2375,12 +2431,19 @@ pub unsafe extern "system" fn rtl_try_acquire_srw_lock_shared(srw_lock: *mut c_v
     };
     let mut current = word.load(Ordering::Acquire);
     loop {
-        if current & SRW_LOCK_BIT != 0 {
+        let owned = current & SRW_OWNED != 0;
+        let shared = current & SRW_SHARED != 0;
+        if owned && !shared {
             return 0;
         }
+        if owned && current & SRW_CONTENDED != 0 {
+            return 0;
+        }
+        let next_count = if shared { srw_shared_count(current) } else { 0 }.wrapping_add(1);
+        let next = (next_count << SRW_SHARED_SHIFT) | SRW_OWNED | SRW_SHARED;
         match word.compare_exchange_weak(
             current,
-            current.wrapping_add(SRW_SHARED_UNIT),
+            next,
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
@@ -2399,10 +2462,12 @@ pub unsafe extern "system" fn rtl_acquire_srw_lock_exclusive(srw_lock: *mut c_vo
     if srw_lock.is_null() {
         return;
     }
-    let mut spins = 0usize;
     while unsafe { rtl_try_acquire_srw_lock_exclusive(srw_lock) } == 0 {
-        spin_pause(spins);
-        spins = spins.wrapping_add(1);
+        unsafe { srw_mark_contended(srw_lock) };
+        if unsafe { rtl_try_acquire_srw_lock_exclusive(srw_lock) } != 0 {
+            return;
+        }
+        unsafe { srw_wait_for_release(srw_lock) };
     }
 }
 
@@ -2415,10 +2480,12 @@ pub unsafe extern "system" fn rtl_acquire_srw_lock_shared(srw_lock: *mut c_void)
     if srw_lock.is_null() {
         return;
     }
-    let mut spins = 0usize;
     while unsafe { rtl_try_acquire_srw_lock_shared(srw_lock) } == 0 {
-        spin_pause(spins);
-        spins = spins.wrapping_add(1);
+        unsafe { srw_mark_contended(srw_lock) };
+        if unsafe { rtl_try_acquire_srw_lock_shared(srw_lock) } != 0 {
+            return;
+        }
+        unsafe { srw_wait_for_release(srw_lock) };
     }
 }
 
@@ -2428,8 +2495,25 @@ pub unsafe extern "system" fn rtl_acquire_srw_lock_shared(srw_lock: *mut c_void)
 /// `srw_lock` is a valid `RTL_SRWLOCK` held exclusively by the caller.
 #[export_name = "RtlReleaseSRWLockExclusive"]
 pub unsafe extern "system" fn rtl_release_srw_lock_exclusive(srw_lock: *mut c_void) {
-    if let Some(word) = unsafe { atomic_word(srw_lock) } {
-        let _ = word.compare_exchange(SRW_LOCK_BIT, 0, Ordering::Release, Ordering::Relaxed);
+    let Some(word) = (unsafe { atomic_word(srw_lock) }) else {
+        return;
+    };
+    let mut current = word.load(Ordering::Acquire);
+    loop {
+        if current & SRW_OWNED == 0 || current & SRW_SHARED != 0 {
+            unsafe { rtl_raise_status(STATUS_RESOURCE_NOT_OWNED) };
+            return;
+        }
+        let contended = current & SRW_CONTENDED != 0;
+        match word.compare_exchange_weak(current, 0, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => {
+                if contended {
+                    unsafe { srw_wake_contended_waiters(srw_lock) };
+                }
+                return;
+            }
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -2444,16 +2528,32 @@ pub unsafe extern "system" fn rtl_release_srw_lock_shared(srw_lock: *mut c_void)
     };
     let mut current = word.load(Ordering::Acquire);
     loop {
-        if current < SRW_SHARED_UNIT || current & SRW_LOCK_BIT != 0 {
+        if current & SRW_SHARED == 0 || srw_shared_count(current) == 0 {
+            unsafe { rtl_raise_status(STATUS_RESOURCE_NOT_OWNED) };
             return;
         }
+        let contended = current & SRW_CONTENDED != 0;
+        let next_count = srw_shared_count(current) - 1;
+        let next = if next_count == 0 {
+            0
+        } else {
+            (next_count << SRW_SHARED_SHIFT)
+                | SRW_OWNED
+                | SRW_SHARED
+                | (current & SRW_CONTENDED)
+        };
         match word.compare_exchange_weak(
             current,
-            current - SRW_SHARED_UNIT,
+            next,
             Ordering::Release,
             Ordering::Relaxed,
         ) {
-            Ok(_) => return,
+            Ok(_) => {
+                if contended && next_count == 0 {
+                    unsafe { srw_wake_contended_waiters(srw_lock) };
+                }
+                return;
+            }
             Err(actual) => current = actual,
         }
     }
