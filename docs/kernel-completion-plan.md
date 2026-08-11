@@ -31,26 +31,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest serialized gate validation (2026-08-12): `.tmp/run-desktop-retired-callback-injection-20260812.log`
+Latest serialized gate validation (2026-08-12): `.tmp/run-desktop-dbgk-f1-select-20260812.log`
 rebuilds ntdll, the executive, rust-micro, and the disk image, reaches the quiesce gate, and exits
-through the microtest sentinel at `287/295`. This is the closeout proof for the retired callback
-injection harness: the log has no `[w32-slip]`, `[cb-inject]`, or post-gate `no fault handler`
-markers, while `exec_user_callback_dead_client_unwind` passes with `injection=retired` and
-`exec_win32k_transport_call_nested` passes with `nested-scenario=retired`. The repeated
-`[wl-quiesce]` frame is now an idle post-desktop observation: winlogon is parked in user32
-`NtUserMessageCall`, the run has already painted Explorer chrome, and no synthetic worker-injection
-probe follows it. Real userinit/explorer flow is green (`userinit.exe` at `pi=5`, `explorer.exe` at
-`pi=6`), IDD_LOGON paint and credential delivery are green, profile/user hive loading is green, and
-the Explorer framebuffer proof reports all `786432` pixels non-background with at least 32 distinct
-non-background colors. Remaining red gates are now generic kernel-system targets:
-`exec_dbgk_target_blocks_until_continue`, `exec_dbgk_remote_breakin_thread_runs`,
+through the microtest sentinel at `289/295`. This closes the retired callback-injection and
+client-reply accounting slice: the log has no `[w32-slip]`, `[cb-inject]`, post-gate
+`no fault handler`, or `[client-reply] UNBOUND` markers. The Dbgk target-block selftest now selects
+the first real debuggee VMFault on `DBGK_CLIENT_FIXUP` after an initial startup/foreign event, so
+`exec_dbgk_target_blocks_until_continue` and `exec_client_reply_bound` both pass without adding a
+fallback reply path. The repeated `[wl-quiesce]` frame remains an idle post-desktop observation:
+winlogon is parked in user32 `NtUserMessageCall`, the run has already painted Explorer chrome, and
+no synthetic worker-injection probe follows it. Real userinit/explorer flow is green
+(`userinit.exe` at `pi=5`, `explorer.exe` at `pi=6`), IDD_LOGON paint and credential delivery are
+green, profile/user hive loading is green, and the Explorer framebuffer proof reports all `786432`
+pixels non-background with at least 32 distinct non-background colors. Remaining red gates are now
+generic kernel-system targets: `exec_dbgk_remote_breakin_thread_runs`,
 `exec_dbgk_remote_breakin_reports_breakpoint`, `exec_alpc_section_view_cross_vspace`,
-`exec_client_reply_bound`, `exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and
-`exec_vm_pool_headroom`. Review adjustment: keep treating shell launch, profile staging, WM_PAINT,
-callback dispatch, and Explorer chrome as working real mechanisms. The next useful implementation
-slice should start with the generic reply/lifetime accounting path (`exec_client_reply_bound`) and
-resource retention (`exec_vm_pool_headroom`), then tighten LSA auth/logon gate semantics from the
-already-live data plane rather than adding LSA or shell policy.
+`exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and `exec_vm_pool_headroom`. Review
+adjustment: keep treating shell launch, profile staging, WM_PAINT, callback dispatch, Explorer
+chrome, Dbgk target blocking, and client reply binding as working real mechanisms. The next useful
+implementation slice should either complete the Dbgk remote-breakin execution path, fix generic
+ALPC cross-vspace section view transfer, or reduce retained VM/CSlot/root-untyped resources through
+real teardown and reclaim.
 
 Latest desktop/icon validation (2026-08-12): serialized graphics retry
 `.tmp/run-desktop-late-freeze-20260812.log` rebuilt ntdll, the executive, rust-micro, and the disk

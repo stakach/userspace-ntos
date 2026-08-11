@@ -16422,15 +16422,32 @@ pub(crate) unsafe fn service_sec_image(
                     // introduce. `loop { … break }` gives the early exits.
                     loop {
                         // ═══ FAULT 1 — VMFault (`#PF`), the flavour every page fault takes ═══
-                        let (_fb, f1_mi, f1_m0, f1_m1, _f1m2, _f1m3) =
-                            recv_full_r12(client_ep, reply_a);
-                        dbgk_blk_trace(b"f1", f1_mi, f1_m0, f1_m1, marker_t());
-                        if attached
-                            && client_pml4 != 0
-                            && (f1_mi >> 12) == 6
-                            && f1_m1 == selftests::DBGK_CLIENT_FIXUP
-                            && marker_t() == 1
-                        {
+                        // The throwaway TCB can deliver an initial scheduler/startup fault before
+                        // the target code reaches its marker write. That event is not the debuggee
+                        // report this proof is about and, as a plain startup notification, does not
+                        // leave `reply_a` bound to a blocked caller. Select the VMFault on FIXUP
+                        // before parking the reporter so the later continue never replies to an
+                        // unbound synthetic event.
+                        let mut f1 = None;
+                        let mut f1_guard = 0;
+                        while f1_guard < 4 {
+                            f1_guard += 1;
+                            let (_fb, mi_r, m0_r, m1_r, _f1m2, _f1m3) =
+                                recv_full_r12(client_ep, reply_a);
+                            if (mi_r >> 12) == 6
+                                && m1_r == selftests::DBGK_CLIENT_FIXUP
+                                && marker_t() == 1
+                            {
+                                f1 = Some((mi_r, m0_r, m1_r));
+                                dbgk_blk_trace(b"f1", mi_r, m0_r, m1_r, marker_t());
+                                break;
+                            }
+                            dbgk_blk_trace(b"f1-foreign", mi_r, m0_r, m1_r, marker_t());
+                        }
+                        let Some((_f1_mi, f1_m0, f1_m1)) = f1 else {
+                            break;
+                        };
+                        if attached && client_pml4 != 0 {
                             bk_ok |= 0x0001;
                         }
                         // 0x0002 — ★ THE BLOCK. Forward the fault through the entry the live loop
