@@ -1303,19 +1303,16 @@ pub const LSASS_BADGE: u64 = 8;
 /// (lsasrv/samsrv/msv1_0 + deps) can page in without overflowing into a neighbour's scratch.
 pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDOW;
 pub const USERINIT_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 5 * DEMAND_SCRATCH_WINDOW;
-/// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
-/// per-process arrays are sized for. The current hosted processes
-/// (smss/csrss/winlogon/services/lsass/userinit/explorer = pi 0..6) are live; the extra headroom is
-/// for later post-login processes (the
-/// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
-/// (mechanism mirrors, PFILLED, the service_sec_image `procs`/`dll_pd_created`/`dll_pt_bits` locals)
-/// is sized to this so a later hosted process never silently overflows a per-process slot. The
-/// pi-indexed WRITE sites guard `pi < MAX_PI` and panic LOUDLY (never a silent
-/// spin) if a spawn ever exceeds this — bump `MAX_PI` (a scalar cost) or move to a per-pid map. The
-/// per-pi VA-LAYOUT still uses distinct fixed windows per process (SCRATCH_BASE / *_MIRROR_VA above),
-/// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
-/// makes the SLOT arrays ready and the overflow LOUD in the meantime.
-pub const MAX_PI: usize = 16;
+/// Current hosted-process runtime table budget. Static boot processes occupy `pi=0..6`; dynamic
+/// hosted processes are admitted densely from `DYNAMIC_PROCESS_FIRST_PI` up to this executive budget,
+/// which must remain below the badge transport limit exposed by `nt-exe-image`. The table is generic
+/// over process instances, not executable names or launch order, and every pi-indexed write site
+/// still guards `pi < MAX_PI` so exhaustion is explicit instead of corrupting neighbouring mechanism
+/// state. Moving past this boot-image-fitting table budget needs map-backed/reclaimable process
+/// runtime state, not more hardcoded image identities.
+pub const HOSTED_PROCESS_RUNTIME_PI_LIMIT: usize = 32;
+pub const MAX_PI: usize = HOSTED_PROCESS_RUNTIME_PI_LIMIT;
+const _: () = assert!(MAX_PI <= nt_exe_image::DYNAMIC_PROCESS_PI_LIMIT);
 /// Ordered image-open/section/spawn records are handle-lifetime records, not process slots. A
 /// published process record is retained after its file/section handles close so later
 /// `NtCreateProcessEx`/publication accounting remains ordered, while dynamic service starts can

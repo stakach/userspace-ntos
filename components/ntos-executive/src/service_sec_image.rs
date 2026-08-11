@@ -4687,14 +4687,13 @@ pub(crate) unsafe fn service_sec_image(
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
             PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
         }
-        // LOUD overflow guard: `pi` indexes the fixed-size per-process arrays (procs / pfilled /
-        // dll_pd_created / dll_pt_bits, all sized to MAX_PI). A future 6th/7th hosted process
-        // adds a badge→pi arm above; if one ever exceeds MAX_PI this panics with a clear message
-        // (the panic handler prints file:line) instead of silently corrupting an adjacent array /
-        // spinning. Bump MAX_PI (a scalar .bss cost) to admit more processes.
+        // LOUD overflow guard: `pi` indexes fixed-size per-process arrays (procs / pfilled /
+        // dll_pd_created / dll_pt_bits, all sized to MAX_PI). Dynamic hosted processes are admitted
+        // through the catalog/runtime tables; if one ever exceeds the current executive ceiling this
+        // panics with a clear file:line instead of corrupting an adjacent array.
         assert!(
             pi < MAX_PI,
-            "hosted process pi exceeds MAX_PI — bump MAX_PI"
+            "hosted process pi exceeds MAX_PI - raise the runtime ceiling"
         );
         // Resolve this fault badge to its real EPROCESS via the handler-owned ProcessManager lookup.
         // Read-only (no alloc under the reset), it proves the live badge-multiplex is backed by real

@@ -18,11 +18,15 @@ pub const USERINIT_TOP_BADGE: u64 = 27;
 pub const EXPLORER_TOP_BADGE: u64 = 28;
 pub const DYNAMIC_PROCESS_FIRST_PI: usize = 7;
 pub const DYNAMIC_TOP_BADGE_BASE: u64 = 29;
+pub const DYNAMIC_TOP_BADGE_LIMIT: u64 = 64;
+pub const DYNAMIC_PROCESS_PI_LIMIT: usize =
+    DYNAMIC_PROCESS_FIRST_PI + (DYNAMIC_TOP_BADGE_LIMIT - DYNAMIC_TOP_BADGE_BASE) as usize;
 
-pub fn dynamic_top_badge_for_pi(pi: usize) -> Option<u64> {
-    let offset = pi.checked_sub(DYNAMIC_PROCESS_FIRST_PI)? as u64;
-    let badge = DYNAMIC_TOP_BADGE_BASE.checked_add(offset)?;
-    (badge < 64).then_some(badge)
+pub const fn dynamic_top_badge_for_pi(pi: usize) -> Option<u64> {
+    if pi < DYNAMIC_PROCESS_FIRST_PI || pi >= DYNAMIC_PROCESS_PI_LIMIT {
+        return None;
+    }
+    Some(DYNAMIC_TOP_BADGE_BASE + (pi - DYNAMIC_PROCESS_FIRST_PI) as u64)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,6 +532,7 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         image_root: HostedImageRoot,
         max_pi: usize,
     ) -> Result<usize, HostedImageRegistrationError> {
+        let max_pi = core::cmp::min(max_pi, DYNAMIC_PROCESS_PI_LIMIT);
         let pi = self
             .next_free_pi(DYNAMIC_PROCESS_FIRST_PI, max_pi)
             .ok_or(HostedImageRegistrationError::Full)?;
@@ -1647,6 +1652,88 @@ mod tests {
         assert_eq!(
             catalog.get_by_pi(second).unwrap().top_badge,
             DYNAMIC_TOP_BADGE_BASE + 1
+        );
+    }
+
+    #[test]
+    fn owned_catalog_admits_repeated_service_churn_to_badge_limit() {
+        const TEST_MAX_PI: usize = DYNAMIC_PROCESS_PI_LIMIT;
+        const TEST_DYNAMIC_SLOTS: usize = DYNAMIC_PROCESS_PI_LIMIT - DYNAMIC_PROCESS_FIRST_PI;
+
+        let mut catalog = OwnedHostedImageCatalog::<TEST_DYNAMIC_SLOTS>::new();
+        for offset in 0..TEST_DYNAMIC_SLOTS {
+            let pi = catalog
+                .admit_dynamic_executable(
+                    b"svchost.exe",
+                    HostedProcessRole::NonInteractiveService,
+                    b"\\SystemRoot\\System32\\svchost.exe",
+                    b"\\SystemRoot\\System32\\svchost.exe -k netsvcs",
+                    HostedImageRoot::System32,
+                    TEST_MAX_PI,
+                )
+                .unwrap();
+
+            assert_eq!(pi, DYNAMIC_PROCESS_FIRST_PI + offset);
+            assert_eq!(
+                catalog.get_by_pi(pi).unwrap().top_badge,
+                DYNAMIC_TOP_BADGE_BASE + offset as u64
+            );
+        }
+
+        assert_eq!(
+            catalog.get_by_leaf(b"svchost.exe").unwrap().pi,
+            DYNAMIC_PROCESS_FIRST_PI
+        );
+        assert_eq!(
+            catalog.get_latest_by_leaf(b"svchost.exe").unwrap().pi,
+            TEST_MAX_PI - 1
+        );
+        assert_eq!(
+            catalog.admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe -k netsvcs",
+                HostedImageRoot::System32,
+                TEST_MAX_PI,
+            ),
+            Err(HostedImageRegistrationError::Full)
+        );
+        assert_eq!(
+            dynamic_top_badge_for_pi(DYNAMIC_PROCESS_PI_LIMIT - 1),
+            Some(DYNAMIC_TOP_BADGE_LIMIT - 1)
+        );
+        assert_eq!(dynamic_top_badge_for_pi(DYNAMIC_PROCESS_PI_LIMIT), None);
+    }
+
+    #[test]
+    fn owned_catalog_clamps_admission_to_badge_transport_limit() {
+        const TEST_DYNAMIC_SLOTS: usize = DYNAMIC_PROCESS_PI_LIMIT - DYNAMIC_PROCESS_FIRST_PI;
+
+        let mut catalog = OwnedHostedImageCatalog::<TEST_DYNAMIC_SLOTS>::new();
+        for _ in 0..TEST_DYNAMIC_SLOTS {
+            catalog
+                .admit_dynamic_executable(
+                    b"svchost.exe",
+                    HostedProcessRole::NonInteractiveService,
+                    b"\\SystemRoot\\System32\\svchost.exe",
+                    b"\\SystemRoot\\System32\\svchost.exe -k netsvcs",
+                    HostedImageRoot::System32,
+                    usize::MAX,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            catalog.admit_dynamic_executable(
+                b"svchost.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\svchost.exe",
+                b"\\SystemRoot\\System32\\svchost.exe -k netsvcs",
+                HostedImageRoot::System32,
+                usize::MAX,
+            ),
+            Err(HostedImageRegistrationError::Full)
         );
     }
 

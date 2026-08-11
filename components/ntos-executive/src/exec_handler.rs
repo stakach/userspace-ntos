@@ -1478,6 +1478,8 @@ unsafe fn admit_dynamic_hosted_exe(
             print_str(leaf);
             print_str(b" err=");
             print_u64(err as u64);
+            print_str(b" max_pi=");
+            print_u64(MAX_PI as u64);
             print_str(b"\n");
             return None;
         }
