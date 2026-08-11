@@ -3420,3 +3420,31 @@ before unrelated executive traffic monopolises the receive loop.
   IOCP packet delivery to parked SCM/LSASS workers, or the concrete wait object that gates winlogon's
   profile/userinit transition. Do not add EventLog, service-order, executable-launch, or shell-paint
   policy.
+
+- CSR API data-plane cleanup in progress. Both the static `CsrApiRequestThread` rendezvous and the
+  dynamic CSRSS API worker route now deliver request bytes directly into the parked real worker's
+  `ReceiveMsg` instead of asking the LPC broker to echo the same message back through the control
+  plane. Replies are copied from the real worker-mutated CSR message to the parked client reply
+  buffer. The `PortContext` out value remains zero because the ReactOS CSR server API loop does not
+  consume it after `NtReplyWaitReceivePort`. The LPC message router also no longer queries the broker
+  from the data plane when a cache entry is missing; a missing cache entry is treated as missing
+  connection publication to be fixed at connect/accept time.
+
+  Validation for this slice: `cargo fmt --all`, `git diff --check`,
+  `components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and
+  serialized desktop retry `.tmp/run-desktop-csr-direct-static-20260811.log`. Result: kernel specs
+  pass, genuine base desktop paint is restored (`desktop-bg 768/768`), and static CSR API delivery no
+  longer blocks after `[csr-api] routing ...`; repeated real `CsrApiRequestThread` roundtrips complete,
+  including service-process `ApiNumber=0x00010001` traffic and CSR-driven worker thread creation.
+  EventLog/SCM pipe traffic progresses through FSD dispatch `#167`, publishes a real
+  `\??\pipe\EventLog` instance, and issues the first bind write on the client end.
+
+  Current red edge: explorer is still not launched (`explorer total=0`). One EventLog worker
+  `NtRequestWaitReplyPort(\Windows\ApiPort)` now reaches the direct static CSR delivery point
+  (`[csr-api] delivered ApiNumber=0x00010001 bytes=88`) but the real CSR worker rendezvous returns
+  false after absorbing a timer notification, so the EventLog worker is parked as an unserviced SSN 208.
+  The run later quiesces with winlogon in advapi32/ntdll service-control/profile notification code.
+  Next work should keep the CSR worker rendezvous generic: identify the post-delivery label/state that
+  follows the absorbed timer and either service that real worker syscall or route this request through a
+  parked dynamic CSR worker when the static worker is busy. Do not add service-name, process-launch, or
+  shell-paint policy.

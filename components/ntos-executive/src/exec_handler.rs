@@ -13986,37 +13986,10 @@ impl ExecNtHandler {
         if self.lpc_connection_cache_is(handle, connector_pi, name) {
             return true;
         }
-        if let Some(query) =
-            unsafe { lpc_client().and_then(|client| client.query_handle(handle).ok()) }
-        {
-            let endpoint_ok = query.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT;
-            let state_ok = query.state == nt_lpc_abi::connection_state::CONNECTED;
-            let name_ok = Self::lpc_name_equals_ascii(&query.name, name);
-            if endpoint_ok && state_ok && name_ok {
-                return self.cache_lpc_connection_for_pi(
-                    query.connection_id,
-                    handle,
-                    connector_pi,
-                    &query.name,
-                );
-            }
-            if Self::ascii_name_equals(name, b"\\lsaauthenticationport")
-                && LPC_CACHE_MISS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8
-            {
-                print_str(b"[lpc-cache] broker rejected \\LsaAuthenticationPort handle=0x");
-                print_hex_u64(handle);
-                print_str(b" pi=");
-                print_u64(connector_pi as u64);
-                print_str(b" endpoint=");
-                print_u64(query.endpoint as u64);
-                print_str(b" state=");
-                print_u64(query.state as u64);
-                print_str(b" name=");
-                print_sanitized_utf16_ascii(&query.name, 64);
-                print_str(b"\n");
-            }
-            return false;
-        }
+        // The LPC broker owns name lookup and connect/accept control flow, but it is not on the
+        // message data plane. A missing cache entry is a real missing connection publication; do not
+        // query the broker from NtRequestWaitReplyPort/NtReplyWaitReceivePort routing, because the
+        // broker may itself be waiting behind the message path we are trying to dispatch.
         self.trace_lpc_connection_miss(handle, connector_pi, name);
         false
     }

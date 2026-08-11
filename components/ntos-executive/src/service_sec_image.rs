@@ -154,6 +154,7 @@ const CURSORF_ACON: u32 = 0x0008;
 const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
 const GUI_MESSAGE_WAITER_N: usize = 16;
+static CSR_API_TAIL_TRACE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct GuiMessageWaiter {
@@ -8072,6 +8073,24 @@ pub(crate) unsafe fn service_sec_image(
                     let csr_request_port = nt_handler.csr_request_port;
                     let csr_request_message = nt_handler.csr_request_message;
                     let csr_reply_message = nt_handler.csr_reply_message;
+                    let trace = CSR_API_TAIL_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if trace < 64 {
+                        print_str(b"[csr-api] tail drive pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" tid=");
+                        print_u64(current_tid);
+                        print_str(b" parked=");
+                        print_u64(CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed));
+                        print_str(b" port=0x");
+                        print_hex_u64(csr_request_port);
+                        print_str(b" req=0x");
+                        print_hex_u64(csr_request_message);
+                        print_str(b" out=0x");
+                        print_hex_u64(csr_reply_message);
+                        print_str(b"\n");
+                    }
                     let completed = loaded_hosted_pe_by_pi(&*hosted_loaded_images, csrss_pi)
                         .is_some_and(|pe| {
                             csr_api_request_rendezvous(
@@ -18026,7 +18045,7 @@ unsafe fn spawn_requested_local_thread(
             print_str(b" tid=");
             print_u64(tid);
             print_str(b"\n");
-            let suspended = nt_handler.is_pool_thread_suspended(wl_pi, slot);
+            let suspended = hosted_thread_suspended(nt_handler, tid);
             let spawned = spawn_wl_listener_thread(
                 slot,
                 pml4,
@@ -18782,7 +18801,6 @@ struct CsrDynamicApiWorker {
     tid: u64,
     reply_cap: u64,
     recvmsg: u64,
-    port: u64,
     ctx_out: u64,
     ip: u64,
     sp: u64,
@@ -18807,7 +18825,6 @@ impl CsrDynamicApiWorker {
             tid: 0,
             reply_cap: 0,
             recvmsg: 0,
-            port: 0,
             ctx_out: 0,
             ip: 0,
             sp: 0,
@@ -18909,7 +18926,6 @@ unsafe fn csr_dynamic_worker_park(
     pi: usize,
     tid: u64,
     recvmsg: u64,
-    port: u64,
     ctx_out: u64,
     ip: u64,
     sp: u64,
@@ -18948,7 +18964,6 @@ unsafe fn csr_dynamic_worker_park(
         tid,
         reply_cap: cap,
         recvmsg,
-        port,
         ctx_out,
         ip,
         sp,
@@ -18967,7 +18982,7 @@ enum CsrDynamicRoute {
 #[allow(clippy::too_many_arguments)]
 unsafe fn csr_dynamic_deliver_request(
     nt_handler: &mut ExecNtHandler,
-    client_port: u64,
+    _client_port: u64,
     request_va: u64,
     reply_va: u64,
     client_badge: u64,
@@ -19006,29 +19021,9 @@ unsafe fn csr_dynamic_deliver_request(
     let Some(client_cap) = steal_main_reply() else {
         return CsrDynamicRoute::NotRouted;
     };
-    let broker_sent = lpc_client()
-        .and_then(|client| {
-            client
-                .request_wait_reply(client_port, &request[..request_len])
-                .ok()
-        })
-        .is_some();
-    let received = if broker_sent {
-        lpc_client().and_then(|client| client.reply_wait_receive(worker.port).ok())
-    } else {
-        None
-    };
-    let Some(received) = received else {
-        csr_dynamic_wake(client_cap, 0xC000_0001, client_ip, client_sp, client_flags);
-        return CsrDynamicRoute::Consumed;
-    };
-    if received.connection_info.len() != request_len {
-        csr_dynamic_wake(client_cap, 0xC000_0001, client_ip, client_sp, client_flags);
-        return CsrDynamicRoute::Consumed;
-    }
     let delivered =
         csr_dynamic_with_peer(nt_handler, worker.badge, worker.pi as usize, |handler| {
-            let mut ok = handler.xas_try_write_buf(worker.recvmsg, &received.connection_info);
+            let mut ok = handler.xas_try_write_buf(worker.recvmsg, &request[..request_len]);
             if ok {
                 ok = handler.xas_try_write_buf(
                     worker.recvmsg + 4,
@@ -19042,7 +19037,7 @@ unsafe fn csr_dynamic_deliver_request(
                 ok = handler.xas_write_u64(worker.recvmsg + 16, client_tid);
             }
             if ok && worker.ctx_out != 0 {
-                ok = handler.xas_write_u64(worker.ctx_out, received.port_context);
+                ok = handler.xas_write_u64(worker.ctx_out, 0);
             }
             ok
         });
@@ -19170,7 +19165,7 @@ unsafe fn csr_dynamic_reply_wait_receive(
             table[index].clear_client();
         }
     }
-    if !csr_dynamic_worker_park(badge, pi, tid, recvmsg, port, ctx_out, ip, sp, flags) {
+    if !csr_dynamic_worker_park(badge, pi, tid, recvmsg, ctx_out, ip, sp, flags) {
         return false;
     }
     print_str(b"[csr-api-dyn] worker badge=");
