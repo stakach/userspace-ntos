@@ -15,6 +15,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 use core::mem::size_of;
 
 use bytemuck::Pod;
@@ -96,10 +97,12 @@ impl<B: Backend> LpcClient<B> {
             max_message,
             max_pool,
             name_offset: hdr as u32,
-            name_len_bytes: byte_len(name),
+            name_len_bytes: byte_len(name)?,
         };
-        let buf = pack(&req, name);
-        let r = self.backend.call(opcode::LPC_OP_CREATE_PORT, &buf, &mut []);
+        let buf = pack_units::<LPC_CONTROL_BUF_LEN, _>(&req, name)?;
+        let r = self
+            .backend
+            .call(opcode::LPC_OP_CREATE_PORT, buf.as_slice(), &mut []);
         NtStatus(r.status).to_result()?;
         Ok(r.detail0)
     }
@@ -112,21 +115,25 @@ impl<B: Backend> LpcClient<B> {
         conn_info: &[u8],
     ) -> Result<ConnectResult, NtStatus> {
         let hdr = size_of::<LpcConnectPortRequest>();
+        let name_len = byte_len(name)?;
+        let conn_info_len =
+            u32::try_from(conn_info.len()).map_err(|_| NtStatus::BUFFER_TOO_SMALL)?;
         let req = LpcConnectPortRequest {
             abi_size: hdr as u16,
             flags: 0,
             subsystem_type,
             name_offset: hdr as u32,
-            name_len_bytes: byte_len(name),
-            conninfo_offset: (hdr + name.len() * 2) as u32,
-            conninfo_len_bytes: conn_info.len() as u32,
+            name_len_bytes: name_len,
+            conninfo_offset: u32_len(
+                hdr.checked_add(name_len as usize)
+                    .ok_or(NtStatus::BUFFER_TOO_SMALL)?,
+            )?,
+            conninfo_len_bytes: conn_info_len,
         };
-        let mut buf = bytemuck::bytes_of(&req).to_vec();
-        push_units(&mut buf, name);
-        buf.extend_from_slice(conn_info);
+        let buf = pack_units_and_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, name, conn_info)?;
         let r = self
             .backend
-            .call(opcode::LPC_OP_CONNECT_PORT, &buf, &mut []);
+            .call(opcode::LPC_OP_CONNECT_PORT, buf.as_slice(), &mut []);
         NtStatus(r.status).to_result()?;
         Ok(ConnectResult {
             handle: r.detail0,
@@ -149,10 +156,11 @@ impl<B: Backend> LpcClient<B> {
             connection_id,
             port_context,
         };
-        let buf = bytemuck::bytes_of(&req).to_vec();
-        let r = self
-            .backend
-            .call(opcode::LPC_OP_ACCEPT_CONNECT, &buf, &mut []);
+        let r = self.backend.call(
+            opcode::LPC_OP_ACCEPT_CONNECT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
         NtStatus(r.status).to_result()?;
         Ok(r.detail0)
     }
@@ -165,10 +173,11 @@ impl<B: Backend> LpcClient<B> {
             _reserved2: 0,
             connection_id,
         };
-        let buf = bytemuck::bytes_of(&req).to_vec();
-        let r = self
-            .backend
-            .call(opcode::LPC_OP_COMPLETE_CONNECT, &buf, &mut []);
+        let r = self.backend.call(
+            opcode::LPC_OP_COMPLETE_CONNECT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
         NtStatus(r.status).to_result()?;
         Ok((r.detail0, r.detail1))
     }
@@ -181,11 +190,12 @@ impl<B: Backend> LpcClient<B> {
             _reserved2: 0,
             port_handle,
         };
-        let buf = bytemuck::bytes_of(&req).to_vec();
         let mut out = [0u8; size_of::<LpcQueryHandleResponse>()];
-        let r = self
-            .backend
-            .call(opcode::LPC_OP_QUERY_HANDLE, &buf, &mut out);
+        let r = self.backend.call(
+            opcode::LPC_OP_QUERY_HANDLE,
+            bytemuck::bytes_of(&req),
+            &mut out,
+        );
         NtStatus(r.status).to_result()?;
         if r.information as usize != size_of::<LpcQueryHandleResponse>() {
             return Err(NtStatus::BUFFER_TOO_SMALL);
@@ -220,6 +230,7 @@ impl<B: Backend> LpcClient<B> {
         reply_msg: &[u8],
     ) -> Result<ReceiveResult, NtStatus> {
         let header = size_of::<LpcReceiveRequest>();
+        let reply_msg_len = u32_len(reply_msg.len())?;
         let req = LpcReceiveRequest {
             abi_size: size_of::<LpcReceiveRequest>() as u16,
             _reserved: 0,
@@ -230,14 +241,13 @@ impl<B: Backend> LpcClient<B> {
             } else {
                 header as u32
             },
-            reply_msg_len_bytes: reply_msg.len() as u32,
+            reply_msg_len_bytes: reply_msg_len,
         };
-        let mut buf = bytemuck::bytes_of(&req).to_vec();
-        buf.extend_from_slice(reply_msg);
+        let buf = pack_bytes::<LPC_CONTROL_BUF_LEN, _>(&req, reply_msg)?;
         let mut out = [0u8; 512];
         let r = self
             .backend
-            .call(opcode::LPC_OP_REPLY_WAIT_RECEIVE, &buf, &mut out);
+            .call(opcode::LPC_OP_REPLY_WAIT_RECEIVE, buf.as_slice(), &mut out);
         if r.status == NtStatus::PENDING.raw() {
             return Err(NtStatus::PENDING);
         }
@@ -276,18 +286,18 @@ impl<B: Backend> LpcClient<B> {
         message: &[u8],
     ) -> Result<Vec<u8>, NtStatus> {
         let header = size_of::<LpcMessageRequest>();
+        let message_len = u32_len(message.len())?;
         let req = LpcMessageRequest {
             abi_size: header as u16,
             _reserved: 0,
             _reserved2: 0,
             port_handle,
             msg_offset: header as u32,
-            msg_len_bytes: message.len() as u32,
+            msg_len_bytes: message_len,
         };
-        let mut buf = bytemuck::bytes_of(&req).to_vec();
-        buf.extend_from_slice(message);
+        let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&req, message)?;
         let mut out = [0u8; 512];
-        let r = self.backend.call(opcode, &buf, &mut out);
+        let r = self.backend.call(opcode, buf.as_slice(), &mut out);
         if opcode == opcode::LPC_OP_REQUEST_WAIT_REPLY && r.status == NtStatus::PENDING.raw() {
             return Ok(Vec::new());
         }
@@ -301,18 +311,218 @@ pub const LPC_CONNECTION_REQUEST: u16 = msg_type::LPC_CONNECTION_REQUEST;
 
 // --- encode helpers --------------------------------------------------------
 
-fn byte_len(units: &[u16]) -> u32 {
-    (units.len() * 2) as u32
+const LPC_CONTROL_BUF_LEN: usize = 1024;
+const LPC_MESSAGE_BUF_LEN: usize = 1024;
+
+struct StackBuf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
 }
 
-fn pack<T: Pod>(req: &T, units: &[u16]) -> Vec<u8> {
-    let mut buf = bytemuck::bytes_of(req).to_vec();
-    push_units(&mut buf, units);
-    buf
+impl<const N: usize> StackBuf<N> {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
 }
 
-fn push_units(buf: &mut Vec<u8>, units: &[u16]) {
+fn byte_len(units: &[u16]) -> Result<u32, NtStatus> {
+    let bytes = units
+        .len()
+        .checked_mul(2)
+        .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+    u32_len(bytes)
+}
+
+fn u32_len(len: usize) -> Result<u32, NtStatus> {
+    u32::try_from(len).map_err(|_| NtStatus::BUFFER_TOO_SMALL)
+}
+
+fn pack_units<const N: usize, T: Pod>(req: &T, units: &[u16]) -> Result<StackBuf<N>, NtStatus> {
+    let mut buf = StackBuf {
+        bytes: [0; N],
+        len: bytemuck::bytes_of(req)
+            .len()
+            .checked_add(
+                units
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(NtStatus::BUFFER_TOO_SMALL)?,
+            )
+            .ok_or(NtStatus::BUFFER_TOO_SMALL)?,
+    };
+    if buf.len > N {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
+    }
+    let header = bytemuck::bytes_of(req);
+    buf.bytes[..header.len()].copy_from_slice(header);
+    let mut pos = header.len();
     for &u in units {
-        buf.extend_from_slice(&u.to_le_bytes());
+        let le = u.to_le_bytes();
+        buf.bytes[pos] = le[0];
+        buf.bytes[pos + 1] = le[1];
+        pos += 2;
+    }
+    Ok(buf)
+}
+
+fn pack_units_and_bytes<const N: usize, T: Pod>(
+    req: &T,
+    units: &[u16],
+    tail: &[u8],
+) -> Result<StackBuf<N>, NtStatus> {
+    let unit_bytes = units
+        .len()
+        .checked_mul(2)
+        .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+    let total = bytemuck::bytes_of(req)
+        .len()
+        .checked_add(unit_bytes)
+        .and_then(|n| n.checked_add(tail.len()))
+        .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+    if total > N {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
+    }
+
+    let mut buf = StackBuf {
+        bytes: [0; N],
+        len: total,
+    };
+    let header = bytemuck::bytes_of(req);
+    buf.bytes[..header.len()].copy_from_slice(header);
+    let mut pos = header.len();
+    for &u in units {
+        let le = u.to_le_bytes();
+        buf.bytes[pos] = le[0];
+        buf.bytes[pos + 1] = le[1];
+        pos += 2;
+    }
+    buf.bytes[pos..pos + tail.len()].copy_from_slice(tail);
+    Ok(buf)
+}
+
+fn pack_bytes<const N: usize, T: Pod>(req: &T, tail: &[u8]) -> Result<StackBuf<N>, NtStatus> {
+    let total = bytemuck::bytes_of(req)
+        .len()
+        .checked_add(tail.len())
+        .ok_or(NtStatus::BUFFER_TOO_SMALL)?;
+    if total > N {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
+    }
+    let mut buf = StackBuf {
+        bytes: [0; N],
+        len: total,
+    };
+    let header = bytemuck::bytes_of(req);
+    buf.bytes[..header.len()].copy_from_slice(header);
+    buf.bytes[header.len()..total].copy_from_slice(tail);
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::vec::Vec;
+    use nt_lpc_abi::{LpcConnectPortRequest, LpcCreatePortRequest};
+    use std::vec;
+
+    #[derive(Default)]
+    struct CaptureBackend {
+        calls: Vec<(u16, Vec<u8>)>,
+        reply: LpcReply,
+    }
+
+    impl Backend for CaptureBackend {
+        fn call(&mut self, opcode: u16, in_buf: &[u8], _out_buf: &mut [u8]) -> LpcReply {
+            self.calls.push((opcode, in_buf.to_vec()));
+            self.reply
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn create_port_encodes_header_and_name_without_heap_payload_builder() {
+        let backend = CaptureBackend {
+            calls: Vec::new(),
+            reply: LpcReply {
+                status: NtStatus::SUCCESS.raw(),
+                detail0: 0x4c50_0000_0001,
+                ..Default::default()
+            },
+        };
+        let mut client = LpcClient::new(backend);
+        let name = wide(r"\ErrorLogPort");
+
+        assert_eq!(client.create_port(&name, 0, 512, 0), Ok(0x4c50_0000_0001));
+
+        let (opcode, payload) = &client.backend_mut().calls[0];
+        assert_eq!(*opcode, opcode::LPC_OP_CREATE_PORT);
+        let req = bytemuck::from_bytes::<LpcCreatePortRequest>(
+            &payload[..size_of::<LpcCreatePortRequest>()],
+        );
+        assert_eq!(req.abi_size as usize, size_of::<LpcCreatePortRequest>());
+        assert_eq!(req.max_message, 512);
+        assert_eq!(req.name_offset as usize, size_of::<LpcCreatePortRequest>());
+        assert_eq!(req.name_len_bytes as usize, name.len() * 2);
+
+        let mut encoded = Vec::new();
+        for unit in &name {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(&payload[req.name_offset as usize..], encoded.as_slice());
+    }
+
+    #[test]
+    fn connect_port_rejects_payloads_that_do_not_fit_control_frame() {
+        let backend = CaptureBackend::default();
+        let mut client = LpcClient::new(backend);
+        let too_long = vec![0u16; LPC_CONTROL_BUF_LEN];
+
+        assert_eq!(
+            client.connect_port(&too_long, 0, &[]),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert!(client.backend_mut().calls.is_empty());
+    }
+
+    #[test]
+    fn connect_port_encodes_name_and_connection_info() {
+        let backend = CaptureBackend {
+            calls: Vec::new(),
+            reply: LpcReply {
+                status: NtStatus::PENDING.raw(),
+                detail1: 42,
+                ..Default::default()
+            },
+        };
+        let mut client = LpcClient::new(backend);
+        let name = wide(r"\Windows\ApiPort");
+        let conn_info = [1u8, 2, 3, 4, 5];
+
+        let result = client.connect_port(&name, 3, &conn_info).unwrap();
+        assert!(result.pending);
+        assert_eq!(result.connection_id, 42);
+
+        let (opcode, payload) = &client.backend_mut().calls[0];
+        assert_eq!(*opcode, opcode::LPC_OP_CONNECT_PORT);
+        let req = bytemuck::from_bytes::<LpcConnectPortRequest>(
+            &payload[..size_of::<LpcConnectPortRequest>()],
+        );
+        assert_eq!(req.subsystem_type, 3);
+        assert_eq!(req.name_offset as usize, size_of::<LpcConnectPortRequest>());
+        assert_eq!(req.name_len_bytes as usize, name.len() * 2);
+        assert_eq!(
+            req.conninfo_offset as usize,
+            size_of::<LpcConnectPortRequest>() + name.len() * 2
+        );
+        assert_eq!(req.conninfo_len_bytes as usize, conn_info.len());
+        assert_eq!(
+            &payload[req.conninfo_offset as usize..],
+            conn_info.as_slice()
+        );
     }
 }

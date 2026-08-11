@@ -146,6 +146,18 @@ Next serialized desktop proof should show `NtCreatePort(\ErrorLogPort)` reaching
 `begin`/`done`, then either EventLog/SCM progress toward explorer shell chrome or the next real
 mechanism gap.
 
+Current desktop proof (2026-08-11): serialized retry
+`.tmp/run-desktop-service-priority-20260811.log` proves the scheduling-boundary repair. EventLog's
+`NtCreatePort(\ErrorLogPort)` now reaches the isolated LPC broker (`begin #97 req=98
+name=\ErrorLogPort`), completes successfully, and returns a real handle. The run proceeds through
+real `WlxActivateUserShell`, spawns `userinit.exe` and `explorer.exe`, maps explorer's GDI shared
+table, and records explorer native/win32k syscall traffic (`ssn-hist explorer total=401`, `win32k=55`
+at the 96s census). QEMU was externally terminated before a final shell chrome framebuffer gate, so
+the next frontier is later explorer shell startup/chrome rendering, not EventLog LPC scheduling. The
+same run shows heap pressure near that frontier (`heap=7091024/8388608`), so outbound LPC client
+encoding now uses bounded stack buffers instead of transient heap `Vec`s for request construction;
+host coverage is `cargo test -p nt-lpc-client -- --nocapture`, plus the executive target check.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
