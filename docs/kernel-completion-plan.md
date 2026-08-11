@@ -3465,3 +3465,27 @@ before unrelated executive traffic monopolises the receive loop.
   profile/user-shell activation: `ProfileList` opens remain zero, `NtLoadKey` is not reached,
   `Default User\ntuser.dat` is staged but not copied/loaded, and `WlxActivateUserShell` never reads
   the `Userinit` value or opens `userinit.exe`.
+
+- Callback-return shared-frame republish. A local visible retry reproduced a later winlogon/user32
+  paint-side transport bug: after a nested LPK/text callback and `WM_CTLCOLOR*` callback returned,
+  `NtCallbackReturn` flushed the caller's deferred GDI batch before resuming the parked win32k
+  continuation. That flush legitimately re-entered win32k and reused `SH_USER_CALLBACK`, clobbering
+  the reply header/output that the original `KeUserModeCallback` continuation was about to consume.
+  The executive now keeps the active callback frame live through the flush, then re-copies and
+  republishes the exact callback reply immediately before sending the resume label; the diagnostic
+  message/window fields are read only after the returned client payload has been copied back.
+  Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and serialized visible retry `.tmp/run-desktop-callback-reply-republish-20260811.log`. Result:
+  `[microtest done]` at `252/295`, no `unregistered component request` wall, no win32k retirement,
+  `real-redirects=123`/`real-returns=123`, `continuation-pushes=947`/`continuation-unwinds=947`,
+  `PASS exec_user_callback_real_api0_nested_roundtrip`, and `PASS exec_gdi_user_batch_flushed`.
+
+  Review adjustment: the active blocker is no longer the shared callback reply page. The run reaches
+  the logon/profile accounting boundary but still has no successful logon token, profile load, or
+  shell activation: `ProfileList` opens are zero, `NtCreateToken` calls are zero, `NtLoadKey` calls
+  are zero, profile directories/copy are zero, `WlxActivateUserShell` has not read `Userinit`, and
+  `userinit.exe`/`explorer.exe` are not spawned. Next work should inspect the real winlogon logon,
+  LSA/MSV1_0/SAM validation, and token result that gate `LoadUserProfile`, without adding profile,
+  executable-launch, or shell-paint fallbacks.

@@ -1377,6 +1377,31 @@ unsafe fn callback_payload_result_u64(
     u64::from_le_bytes(bytes)
 }
 
+unsafe fn copy_callback_result_to_shared(
+    client_pi: u32,
+    client_scratch_base: u64,
+    result_pointer: u64,
+    result_length: u64,
+) -> bool {
+    if result_length == 0 {
+        return true;
+    }
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *mut nt_user_callback::CallbackFrame;
+    let output = core::slice::from_raw_parts_mut(
+        core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
+        result_length as usize,
+    );
+    crate::img_spawn::client_copyin_mapped(
+        client_pi as u64,
+        result_pointer,
+        output,
+        &[],
+        0,
+        client_scratch_base,
+    )
+}
+
 unsafe fn callback_payload_write_u64(
     frame: *mut nt_user_callback::CallbackFrame,
     offset: usize,
@@ -1388,6 +1413,38 @@ unsafe fn callback_payload_write_u64(
             *byte,
         );
     }
+}
+
+unsafe fn publish_callback_reply(
+    request: nt_user_callback::CallbackHeader,
+    client_pi: u32,
+    client_scratch_base: u64,
+    result_pointer: u64,
+    result_length: u64,
+    callback_status: u64,
+) -> bool {
+    if !copy_callback_result_to_shared(
+        client_pi,
+        client_scratch_base,
+        result_pointer,
+        result_length,
+    ) {
+        return false;
+    }
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *mut nt_user_callback::CallbackFrame;
+    if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        && request.payload_reference_offset != nt_user_callback::NO_PAYLOAD_REFERENCE
+    {
+        callback_payload_write_u64(frame, WINDOWPROC_LPARAM_OFFSET as usize, 0);
+    }
+    let mut reply = request;
+    reply.state = nt_user_callback::CallbackState::Reply as u32;
+    reply.output_length = result_length as u32;
+    reply.status = callback_status as i32;
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
+    let reply = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    nt_user_callback::validate_reply(&request, &reply).is_ok()
 }
 
 fn user_callback_validation_error_name(error: nt_user_callback::ValidationError) -> &'static [u8] {
@@ -3096,19 +3153,6 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     let request = *active_frame.request();
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
-    let request_window_message = if request.api_index
-        == nt_user_callback::USER32_CALLBACK_WINDOWPROC
-        && request.input_length as usize >= 0x40
-    {
-        callback_payload_u32(frame, 0x18)
-    } else {
-        u32::MAX
-    };
-    let request_window = if request_window_message != u32::MAX {
-        callback_payload_u64(frame, 0x10)
-    } else {
-        0
-    };
     // (The frame's client identity is the caller's by construction — `top_for` selected it.)
     if !active_frame.is_redirected() {
         return None;
@@ -3132,10 +3176,30 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     if result_length != 0 {
-        let output = core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
-            result_length as usize,
-        );
+        if !copy_callback_result_to_shared(
+            client_pi,
+            active_frame.client_scratch_base(),
+            result_pointer,
+            result_length,
+        ) {
+            abort_controlled_user_callbacks();
+            return None;
+        }
+    }
+    let request_window_message = if request.api_index
+        == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        && result_length as usize >= 0x40
+    {
+        callback_payload_u32(frame, 0x18)
+    } else {
+        u32::MAX
+    };
+    let request_window = if request_window_message != u32::MAX {
+        callback_payload_u64(frame, 0x10)
+    } else {
+        0
+    };
+    if result_length != 0 {
         if (client_is_winlogon || client_is_explorer) && request_window_message == 0x0081 {
             let expected = nt_user_callback::UserCallbackStackLayout::below(
                 active_frame.saved_user_context()[nt_user_callback::USER_CONTEXT_RSP],
@@ -3186,17 +3250,6 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_str(b" expected-result=0x");
             print_hex(u64::from_le_bytes(expected_result) as u32);
             print_str(b"\n");
-        }
-        if !crate::img_spawn::client_copyin_mapped(
-            client_pi as u64,
-            result_pointer,
-            output,
-            &[],
-            0,
-            active_frame.client_scratch_base(),
-        ) {
-            abort_controlled_user_callbacks();
-            return None;
         }
         if request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC {
             let result0 = callback_payload_result_u64(frame, result_length as u32);
@@ -3253,26 +3306,25 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         print_hex(callback_status as u32);
         print_str(b"\n");
     }
-    if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
-        && request.payload_reference_offset != nt_user_callback::NO_PAYLOAD_REFERENCE
-    {
-        callback_payload_write_u64(frame, WINDOWPROC_LPARAM_OFFSET as usize, 0);
-    }
-    let mut reply = request;
-    reply.state = nt_user_callback::CallbackState::Reply as u32;
-    reply.output_length = result_length as u32;
-    reply.status = callback_status as i32;
-    core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
-    let reply = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
-    if nt_user_callback::validate_reply(&request, &reply).is_err() {
-        abort_controlled_user_callbacks();
-        return None;
-    }
     // ReactOS flushes the caller's deferred GDI batch after `KiCallUserMode` returns from a
     // `KeUserModeCallback`, before the suspended win32k continuation runs again. Normal win32k
     // syscalls already do this at syscall entry; callbacks need the same kernel-owned boundary so
     // user32/GDI work performed inside WndProc cannot keep stale records across chained callbacks.
     flush_returned_user_callback_gdi_batch(request, active_frame);
+    // The flush can itself enter win32k, and win32k reuses the same shared callback page for every
+    // nested dispatch. Re-publish the reply after the flush so the parked `KeUserModeCallback`
+    // continuation consumes the result for THIS callback, not the last nested dispatch's header.
+    if !publish_callback_reply(
+        request,
+        client_pi,
+        active_frame.client_scratch_base(),
+        result_pointer,
+        result_length,
+        callback_status,
+    ) {
+        abort_controlled_user_callbacks();
+        return None;
+    }
     if !unwind_controlled_callback(request) {
         print_str(b"[user-callback] continuation correlation rejected SSN 22\n");
         abort_controlled_user_callbacks();
