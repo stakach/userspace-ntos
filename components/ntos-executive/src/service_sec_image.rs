@@ -1815,45 +1815,30 @@ unsafe fn seed_gui_thread_client_info(
     pi: usize,
     teb_alias: u64,
     pml4: u64,
-) -> Option<(u64, u64, u64)> {
-    let server_deskinfo = core::ptr::read_volatile(
-        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_DESKINFO) as *const u64,
-    );
-    let pti = core::ptr::read_volatile(
-        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_PTI) as *const u64,
-    );
-    if server_deskinfo == 0 || pti == 0 {
+) -> Option<(u64, u64, u64, u64)> {
+    let mapped_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
+    let (client_deskinfo, pti, desktop_delta, client_pcti) =
+        win32k_subsystem::published_desktop_client_info()?;
+    if desktop_delta != mapped_delta {
         return None;
     }
-
-    let user_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
-    let client_deskinfo = if server_deskinfo >= win32k_subsystem::WIN32K_HEAP_VADDR
-        && server_deskinfo
-            < win32k_subsystem::WIN32K_HEAP_VADDR + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
-    {
-        server_deskinfo.checked_sub(user_delta)?
-    } else if server_deskinfo >= win32k_subsystem::WIN32K_POOL_VADDR
-        && server_deskinfo
-            < win32k_subsystem::WIN32K_POOL_VADDR + win32k_subsystem::WIN32K_POOL_FRAMES * 0x1000
-    {
-        let pool_delta = win32k_glue::map_win32k_pool_into_client(pml4, pi)?;
-        server_deskinfo.checked_sub(pool_delta)?
-    } else {
-        return None;
-    };
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
-    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
+    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, desktop_delta);
+    core::ptr::write_volatile((teb_alias + 0x860) as *mut u64, client_pcti);
     if let Some((_kl, hkl, codepage)) =
         win32k_subsystem::current_thread_keyboard_layout_client_info()
     {
         core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, hkl);
         core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, codepage);
     }
-    Some((client_deskinfo, pti, user_delta))
+    Some((client_deskinfo, pti, desktop_delta, client_pcti))
 }
 
-unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<(u64, u64, u64)> {
+unsafe fn seed_winlogon_thread_client_info(
+    teb_alias: u64,
+    pml4: u64,
+) -> Option<(u64, u64, u64, u64)> {
     seed_gui_thread_client_info(2, teb_alias, pml4)
 }
 
@@ -5252,7 +5237,7 @@ pub(crate) unsafe fn service_sec_image(
                             .unwrap_or(0),
                         _ => nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0),
                     };
-                    if let Some((client_deskinfo, pti, _)) =
+                    if let Some((client_deskinfo, pti, _, _)) =
                         seed_winlogon_thread_client_info(teb_alias, pml4)
                     {
                         // The faulting instruction already has RAX=NULL. Re-run the helper call at
@@ -13042,7 +13027,10 @@ pub(crate) unsafe fn service_sec_image(
                 //   - Win32ThreadInfo (TEB+0x78) = pti (server VA), matching Wnd->head.pti.
                 //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO translated through its owning
                 //     arena's client mapping.
-                //   - CLIENTINFO.ulClientDelta (TEB+0x828) = USER heap server->client delta.
+                //   - CLIENTINFO.ulClientDelta (TEB+0x828) = ReactOS' desktop-heap server->client
+                //     delta from PROCESSINFO.HeapMappings.
+                //   - CLIENTINFO.pClientThreadInfo (TEB+0x860) = pcti translated through that same
+                //     desktop-heap mapping.
                 // This used to be winlogon-only for the SAS path; explorer's real shell/ATL path uses
                 // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
                 // GUI main thread must be restated after win32k can clear the fields.
@@ -13054,7 +13042,7 @@ pub(crate) unsafe fn service_sec_image(
                     tp_worker_identity,
                     is_wl_worker,
                 ) {
-                    if let Some((client_deskinfo, pti, delta)) =
+                    if let Some((client_deskinfo, pti, delta, client_pcti)) =
                         seed_gui_thread_client_info(pi, teb_alias, pml4)
                     {
                         if winlogon_gui_client {
@@ -13068,6 +13056,9 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b" ulClientDelta=0x");
                                 print_hex((delta >> 32) as u32);
                                 print_hex(delta as u32);
+                                print_str(b" pClientThreadInfo=0x");
+                                print_hex((client_pcti >> 32) as u32);
+                                print_hex(client_pcti as u32);
                                 print_str(b"\n");
                             }
                         } else {
@@ -13086,6 +13077,9 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b" ulClientDelta=0x");
                                 print_hex((delta >> 32) as u32);
                                 print_hex(delta as u32);
+                                print_str(b" pClientThreadInfo=0x");
+                                print_hex((client_pcti >> 32) as u32);
+                                print_hex(client_pcti as u32);
                                 print_str(b"\n");
                             }
                         }

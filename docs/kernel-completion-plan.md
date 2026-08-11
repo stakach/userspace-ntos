@@ -31,6 +31,27 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
+Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
+ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
+external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.
+Process `MmMapViewOfSection` now returns the logical client alias for heap-backed USER/desktop
+sections while the session/system maps keep server VAs; `PROCESSINFO.HeapMappings.Next` is populated
+for the active desktop heap; and `CLIENTINFO.{pDeskInfo,ulClientDelta,pClientThreadInfo}` is seeded
+from the same mapping. Proof lines: `winlogon CLIENTINFO seeded ... pClientThreadInfo=...`,
+`dialog-pump ... paints=12 queue-drained=1`, `cred-inject ... RENDERED the injected user name`,
+`winlogon IDD_LOGON framebuffer rect=302 260 721 507 ... non-desktop=103493`, and `WlxActivateUserShell
+Userinit = "%SystemRoot%\system32\userinit.exe"`.
+
+Active slice (2026-08-11): the OS now reaches real IDD_LOGON paint, real RETURN delivery,
+`userinit.exe`, and explorer GUI process connection. It still does not reach final explorer shell
+chrome pixels. The latest visible wall is after `NtUserProcessConnect`: explorer issues native and
+win32k syscalls, cursor objects are created, and the system remains alive through periodic census,
+but `explorer-frontier` repeatedly reports deferred quiesce while winlogon continues profile/wait
+traffic (`profile-frontier` around SSN 198 and related native calls). Next work should identify the
+real profile, environment, registry, wait, or shell COM syscall that keeps explorer from reaching its
+first painted shell windows. Do not add userinit, explorer launch, profile, callback, or shell-paint
+fallbacks.
+
 Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
 the sentinel and the harness reporting `SUCCESS -- the ReactOS stack booted and the win32k desktop
@@ -3489,3 +3510,10 @@ before unrelated executive traffic monopolises the receive loop.
   `userinit.exe`/`explorer.exe` are not spawned. Next work should inspect the real winlogon logon,
   LSA/MSV1_0/SAM validation, and token result that gate `LoadUserProfile`, without adding profile,
   executable-launch, or shell-paint fallbacks.
+
+- USER/desktop heap mapping repair completed. `.tmp/run-desktop-desktopheap-mapping-20260811.log`
+  proves the old `user32+0x5792c` raw-server `PWND` fault is gone: winlogon's modal pump drains,
+  the credential dialog framebuffer is non-background, the injected username renders through a real
+  GDI batch text record, RETURN is delivered to the real edit control, `userinit.exe` probes
+  `explorer.exe`, and explorer reaches real `NtUserProcessConnect`. Remaining work moves to the
+  profile/userinit/explorer shell-chrome frontier, not USER heap aliasing.

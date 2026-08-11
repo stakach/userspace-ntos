@@ -176,8 +176,8 @@ const _: () = assert!(GDI_SHARED_TABLE_VA >= CSRSS_W32_POOL_VA + WIN32K_POOL_FRA
 // USERCONNECT is { ULONG ulVersion; ULONG ulCurrentVersion; DWORD dwDispatchCount; SHAREDINFO
 // siClient; } with siClient (8-byte aligned) at +0x10, and SHAREDINFO = { PSERVERINFO psi; PVOID
 // aheList; PVOID pDispInfo; ULONG_PTR ulSharedDelta; ... }. NtUserProcessConnect fills these with
-// SERVER pointers (shifted by W32Process->HeapMappings delta = 0 in this single-AS host); the
-// executive rewrites them to CSRSS_W32_SHARED_VA-relative client pointers before copy-out.
+// logical client pointers derived from W32Process->HeapMappings; the executive verifies and restates
+// those CSRSS_W32_SHARED_VA-relative pointers before copy-out.
 pub const UC_SI_PSI: u64 = 0x10; // SHAREDINFO.psi
 pub const UC_SI_AHELIST: u64 = 0x18; // SHAREDINFO.aheList
 pub const UC_SI_PDISPINFO: u64 = 0x20; // SHAREDINFO.pDispInfo
@@ -226,8 +226,8 @@ const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + WIN32K_STACK_TAIL_ARGS as u64 
 // TEB.Win32ClientInfo so user32's `ValidateHwnd`/`DesktopPtrToUser`/`IntCallMessageProc` resolve a
 // real window PWND out of win32k's (unified USER+desktop) heap into the client's RO-mapped view:
 //   - SH_SAS_DESKINFO: the bound DESKTOP's DESKTOPINFO server VA. The executive translates it through
-//     whichever shared arena owns the pointer, while CLIENTINFO.ulClientDelta remains the USER-heap
-//     delta used by DesktopPtrToUser for heap-resident PWND/CLS pointers.
+//     the DESKTOP's W32PROCESS heap mapping, and CLIENTINFO.ulClientDelta is the desktop-heap delta
+//     ReactOS' DesktopHeapGetUserDelta/DesktopHeapAddressToUser publish for that desktop.
 //   - SH_SAS_PTI: the dispatch THREADINFO server VA (== the window's `head.pti`); the client's
 //     TEB.Win32ThreadInfo must equal it so IntCallMessageProc's `Wnd->head.pti == GetW32ThreadInfo()`
 //     same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY → the proc never runs).
@@ -408,9 +408,18 @@ const PROCESSINFO_HDESK_STARTUP_OFF: u64 = 0x110;
 const PROCESSINFO_PRPWINSTA_OFF: u64 = 0x220;
 const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
 const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
+/// PROCESSINFO->HeapMappings (`win32.h`). The first embedded entry is the global USER heap; its
+/// `Next` chain holds per-desktop heap mappings for DesktopHeapGetUserDelta/DesktopHeapAddressToUser.
+const PROCESSINFO_HEAP_MAPPINGS_OFF: u64 = 0x340;
 const W32PROCESS_PEPROCESS_OFF: u64 = 0x00;
 const W32PROCESS_FLAGS_OFF: u64 = 0x0C;
 const W32PROCESS_W32PID_OFF: u64 = 0x40;
+const W32HEAP_MAPPING_NEXT_OFF: u64 = 0x00;
+const W32HEAP_MAPPING_KERNEL_OFF: u64 = 0x08;
+const W32HEAP_MAPPING_USER_OFF: u64 = 0x10;
+const W32HEAP_MAPPING_LIMIT_OFF: u64 = 0x18;
+const W32HEAP_MAPPING_COUNT_OFF: u64 = 0x20;
+const W32HEAP_MAPPING_SIZE: u64 = 0x28;
 const W32PF_CREATEDWINORDC: u32 = 0x0400_0000;
 const W32PF_READSCREENACCESSGRANTED: u32 = 0x0000_0010;
 const WINSTA_ALL_ACCESS: u32 = 0x000f_037f;
@@ -456,6 +465,11 @@ const THREADINFO_PDESKINFO_OFF: u64 = 0x80;
 /// THREADINFO->pClientInfo offset (win32.h, after pDeskInfo). `IntSetThreadDesktop` also updates the
 /// client-side `pci->pDeskInfo` (desktop.c:3434) from this.
 const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
+const THREADINFO_PCTI_OFF: u64 = 0x70;
+const CLIENTTHREADINFO_SIZE: u64 = 0x20;
+const CLIENTINFO_PDESKINFO_OFF: u64 = 0x20;
+const CLIENTINFO_ULCLIENTDELTA_OFF: u64 = 0x28;
+const CLIENTINFO_PCLIENTTHREADINFO_OFF: u64 = 0x60;
 /// THREADINFO->hdesk offset (`win32.h`: after `exitCode`, before `cPaintsReady`). Keep it consistent
 /// with `rpdesk`/`pDeskInfo` when preparing a real first `NtUserSetThreadDesktop` call.
 const THREADINFO_HDESK_OFF: u64 = 0xD8;
@@ -3618,6 +3632,160 @@ unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
     Some((heap, size))
 }
 
+pub(crate) fn win32k_user_heap_delta() -> u64 {
+    WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA
+}
+
+pub(crate) fn win32k_heap_server_to_client(addr: u64) -> Option<u64> {
+    let heap_lo = WIN32K_HEAP_VADDR;
+    let heap_hi = heap_lo + WIN32K_HEAP_FRAMES * 0x1000;
+    if addr >= heap_lo && addr < heap_hi {
+        addr.checked_sub(win32k_user_heap_delta())
+    } else {
+        None
+    }
+}
+
+fn win32k_heap_client_to_server(addr: u64) -> Option<u64> {
+    let client_lo = CSRSS_W32_SHARED_VA;
+    let client_hi = client_lo + WIN32K_HEAP_FRAMES * 0x1000;
+    if addr >= client_lo && addr < client_hi {
+        addr.checked_add(win32k_user_heap_delta())
+    } else {
+        None
+    }
+}
+
+unsafe fn desktop_heap_client_mapping(desk_body: u64) -> Option<(u64, u64, u64)> {
+    if desk_body == 0 {
+        return None;
+    }
+    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    let (kernel_base, limit) = hosted_heap_bounds(pheap)?;
+    let user_base = win32k_heap_server_to_client(kernel_base)?;
+    Some((kernel_base, user_base, limit))
+}
+
+fn desktop_heap_client_address(
+    server_addr: u64,
+    kernel_base: u64,
+    user_base: u64,
+    limit: u64,
+) -> Option<u64> {
+    if server_addr >= kernel_base && server_addr < kernel_base + limit {
+        Some(server_addr - kernel_base + user_base)
+    } else {
+        None
+    }
+}
+
+unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Option<(u64, u64, u64)> {
+    if ppi == 0 {
+        return None;
+    }
+    let (kernel_base, user_base, limit) = desktop_heap_client_mapping(desk_body)?;
+    let head = ppi + PROCESSINFO_HEAP_MAPPINGS_OFF;
+    let mut prev_next = head + W32HEAP_MAPPING_NEXT_OFF;
+    let mut mapping = read_volatile(prev_next as *const u64);
+    let mut scanned = 0usize;
+    while mapping != 0 && scanned < 64 {
+        let kernel = read_volatile((mapping + W32HEAP_MAPPING_KERNEL_OFF) as *const u64);
+        if kernel == kernel_base {
+            write_volatile((mapping + W32HEAP_MAPPING_USER_OFF) as *mut u64, user_base);
+            write_volatile((mapping + W32HEAP_MAPPING_LIMIT_OFF) as *mut u64, limit);
+            if read_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *const u32) == 0 {
+                write_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *mut u32, 1);
+            }
+            return Some((kernel_base, user_base, limit));
+        }
+        prev_next = mapping + W32HEAP_MAPPING_NEXT_OFF;
+        mapping = read_volatile(prev_next as *const u64);
+        scanned += 1;
+    }
+    if scanned >= 64 {
+        return None;
+    }
+
+    let mapping = heap_alloc(W32HEAP_MAPPING_SIZE, true);
+    if mapping == 0 {
+        return None;
+    }
+    write_volatile((mapping + W32HEAP_MAPPING_NEXT_OFF) as *mut u64, 0);
+    write_volatile(
+        (mapping + W32HEAP_MAPPING_KERNEL_OFF) as *mut u64,
+        kernel_base,
+    );
+    write_volatile((mapping + W32HEAP_MAPPING_USER_OFF) as *mut u64, user_base);
+    write_volatile((mapping + W32HEAP_MAPPING_LIMIT_OFF) as *mut u64, limit);
+    write_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *mut u32, 1);
+    write_volatile(prev_next as *mut u64, mapping);
+    Some((kernel_base, user_base, limit))
+}
+
+unsafe fn ensure_thread_desktop_pcti(pti: u64, desk_body: u64) -> u64 {
+    if pti == 0 || desk_body == 0 {
+        return 0;
+    }
+    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    let Some((kernel_base, limit)) = hosted_heap_bounds(pheap) else {
+        return 0;
+    };
+    let pcti = read_volatile((pti + THREADINFO_PCTI_OFF) as *const u64);
+    if pcti >= kernel_base && pcti < kernel_base + limit {
+        return pcti;
+    }
+    let pcti = s_rtl_allocate_heap(pheap, HEAP_ZERO_MEMORY, CLIENTTHREADINFO_SIZE);
+    if pcti != 0 {
+        write_volatile((pti + THREADINFO_PCTI_OFF) as *mut u64, pcti);
+    }
+    pcti
+}
+
+unsafe fn write_thread_client_desktop_info(
+    pti: u64,
+    desk_body: u64,
+    pdeskinfo: u64,
+) -> Option<(u64, u64, u64)> {
+    let mut ppi = read_u64_field_if_present(pti, THREADINFO_PPI_OFF);
+    if ppi == 0 {
+        ppi = current_w32process();
+    }
+    let (kernel_base, user_base, limit) = ensure_process_desktop_heap_mapping(ppi, desk_body)?;
+    let delta = kernel_base - user_base;
+    let client_deskinfo = desktop_heap_client_address(pdeskinfo, kernel_base, user_base, limit)?;
+    let pcti = ensure_thread_desktop_pcti(pti, desk_body);
+    let client_pcti = desktop_heap_client_address(pcti, kernel_base, user_base, limit).unwrap_or(0);
+    let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+    if pci != 0 {
+        write_volatile(
+            (pci + CLIENTINFO_PDESKINFO_OFF) as *mut u64,
+            client_deskinfo,
+        );
+        write_volatile(
+            (pci + CLIENTINFO_ULCLIENTDELTA_OFF) as *mut u64,
+            delta,
+        );
+        write_volatile(
+            (pci + CLIENTINFO_PCLIENTTHREADINFO_OFF) as *mut u64,
+            client_pcti,
+        );
+    }
+    Some((client_deskinfo, delta, client_pcti))
+}
+
+pub(crate) unsafe fn published_desktop_client_info() -> Option<(u64, u64, u64, u64)> {
+    let server_deskinfo =
+        read_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *const u64);
+    let pti = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *const u64);
+    if server_deskinfo == 0 || pti == 0 {
+        return None;
+    }
+    let desk_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+    let (client_deskinfo, delta, client_pcti) =
+        write_thread_client_desktop_info(pti, desk_body, server_deskinfo)?;
+    Some((client_deskinfo, pti, delta, client_pcti))
+}
+
 unsafe fn default_keyboard_layout_from_ring() -> u64 {
     let first = read_volatile((WIN32K_CODE_VA + GSPKL_BASE_LAYOUT_RVA) as *const u64);
     if first == 0 {
@@ -3922,7 +4090,8 @@ unsafe fn unmap_section_view_addr(addr: u64) -> i32 {
     if addr == 0 {
         return STATUS_INVALID_PARAMETER_I32;
     }
-    let section = find_section_for_view_addr(addr);
+    let backing_addr = win32k_heap_client_to_server(addr).unwrap_or(addr);
+    let section = find_section_for_view_addr(backing_addr);
     if section == 0 {
         print_str(b"[win32k-host] MmUnmapView: unmapped/foreign base=0x");
         print_hex((addr >> 32) as u32);
@@ -3930,7 +4099,7 @@ unsafe fn unmap_section_view_addr(addr: u64) -> i32 {
         print_str(b"\n");
         return STATUS_INVALID_PARAMETER_I32;
     }
-    if unmap_section(section as *mut u8, addr, |base| heap_free(base)) {
+    if unmap_section(section as *mut u8, backing_addr, |base| heap_free(base)) {
         0
     } else {
         STATUS_INVALID_PARAMETER_I32
@@ -4023,9 +4192,10 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
 
 /// `NTSTATUS MmMapViewOfSection(PVOID Section, PEPROCESS Process, PVOID *BaseAddress, ULONG_PTR
 /// ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT,
-/// ULONG AllocationType, ULONG Win32Protect)` — `MapGlobalUserHeap` projects the global USER-heap
-/// section into each connecting process. Return the SAME backing the session-space map used (single
-/// address space → kernel + user views coincide, delta 0), writing `*BaseAddress` + `*ViewSize`.
+/// ULONG AllocationType, ULONG Win32Protect)` — `MapGlobalUserHeap` and `IntMapDesktopView` project
+/// USER/desktop heap sections into GUI client processes. The backing remains the coherent win32k heap
+/// region, but the returned view base is the logical client alias inside `CSRSS_W32_SHARED_VA` so
+/// ReactOS' W32PROCESS heap mappings publish the same server→client delta that user32 will use.
 extern "win64" fn s_mm_map_view_of_section(
     section: u64,
     _process: u64,
@@ -4045,8 +4215,9 @@ extern "win64" fn s_mm_map_view_of_section(
         if base == 0 {
             return STATUS_NO_MEMORY;
         }
+        let view_base = win32k_heap_server_to_client(base).unwrap_or(base);
         if !base_out.is_null() {
-            write_volatile(base_out, base);
+            write_volatile(base_out, view_base);
         }
         if !size_io.is_null() {
             write_volatile(size_io, size);
@@ -5990,10 +6161,7 @@ unsafe fn publish_thread_desktop_binding(pti: u64, hdesk: u64, desk_body: u64, p
     if hdesk != 0 {
         write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, hdesk);
     }
-    let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-    if pci != 0 {
-        write_volatile((pci + 0x20) as *mut u64, pdeskinfo);
-    }
+    let _ = write_thread_client_desktop_info(pti, desk_body, pdeskinfo);
     write_volatile(
         (WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64,
         pdeskinfo,
@@ -9674,7 +9842,7 @@ unsafe fn create_winsta_and_desktop() {
         print_hex(spwnd as u32);
         print_str(b")\n");
 
-        // ★ BIND THE DISPATCH THREAD TO THE DESKTOP — the REAL `IntSetThreadDesktop` connection.
+        // ★ BIND THE DISPATCH THREAD TO THE DESKTOP — the `IntSetThreadDesktop` state contract.
         //
         // The switch above sets the GLOBAL `gpdeskInputDesktop`, but does NOT connect the CURRENT
         // thread's win32k `THREADINFO` (`pti`) to the desktop. In real Windows that connection is done
@@ -9682,14 +9850,11 @@ unsafe fn create_winsta_and_desktop() {
         // (desktop.c:3428/3430), whose core is exactly:
         //     pti->rpdesk    = pdesk;                    // desktop.c:3428
         //     pti->pDeskInfo = pti->rpdesk->pDeskInfo;   // desktop.c:3430
-        //     pci->pDeskInfo = pti->pDeskInfo - ulClientDelta;   // desktop.c:3434 (delta 0 in-host)
+        //     pci->pDeskInfo = pti->pDeskInfo - ulClientDelta;   // desktop.c:3434
         // Our host merges winlogon's interactive thread onto the single shared dispatch W32THREAD
-        // (`SLOT_W32THREAD`), and winlogon's own NtUserSetThreadDesktop can't drive the real
-        // IntSetThreadDesktop body end-to-end (it needs the desktop-heap view / pcti alloc our host
-        // doesn't map). So we perform the SAME two field assignments here, directly on the dispatch
-        // W32THREAD, using the REAL created DESKTOP body + its real `pDeskInfo` (DESKTOP+0x08). This is
-        // the thread↔desktop connection win32k's checked `NtUserGetClassInfo` helper asserts on:
-        // `mov rcx,[pti+0x80]` (pti->pDeskInfo) — NULL before this, a real DESKTOPINFO after.
+        // (`SLOT_W32THREAD`). This bootstrap path can run before winlogon's own SetThreadDesktop has a
+        // chance to restate the same fields, so keep THREADINFO, PROCESSINFO.HeapMappings, and
+        // CLIENTINFO coherent with ReactOS' real desktop-heap mapping model.
         let pti = current_w32thread();
         let desk_pdeskinfo = read_volatile((desk_body + 0x08) as *const u64); // DESKTOP.pDeskInfo
         let pti_link = pti + THREADINFO_PTI_LINK_OFF;
@@ -9706,19 +9871,24 @@ unsafe fn create_winsta_and_desktop() {
                                                                                       // Latch for per-dispatch re-assertion (see BOUND_DESK_* + dispatch_loop top).
         BOUND_DESK_BODY = desk_body;
         BOUND_DESK_PDESKINFO = desk_pdeskinfo;
-        // Mirror the client side (pci->pDeskInfo), ulClientDelta == 0 in our single-AS host.
-        let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-        if pci != 0 {
-            // CLIENTINFO.pDeskInfo @ +0x20 (ntuser.h: CI_flags@0, cSpins@8, dwExpWinVer@0x10,
-            // dwCompatFlags@0x14, dwCompatFlags2@0x18, dwTIFlags@0x1C, pDeskInfo@0x20).
-            write_volatile((pci + 0x20) as *mut u64, desk_pdeskinfo);
-        }
+        let client_info = write_thread_client_desktop_info(pti, desk_body, desk_pdeskinfo);
         print_str(b"[win32k-host] IntSetThreadDesktop(Default): pti->rpdesk=0x");
         print_hex((desk_body >> 32) as u32);
         print_hex(desk_body as u32);
         print_str(b" pti->pDeskInfo=0x");
         print_hex((desk_pdeskinfo >> 32) as u32);
         print_hex(desk_pdeskinfo as u32);
+        if let Some((client_deskinfo, delta, client_pcti)) = client_info {
+            print_str(b" client-pDeskInfo=0x");
+            print_hex((client_deskinfo >> 32) as u32);
+            print_hex(client_deskinfo as u32);
+            print_str(b" ulClientDelta=0x");
+            print_hex((delta >> 32) as u32);
+            print_hex(delta as u32);
+            print_str(b" client-pcti=0x");
+            print_hex((client_pcti >> 32) as u32);
+            print_hex(client_pcti as u32);
+        }
         print_str(b"\n");
     } else {
         print_str(b"[win32k-host] WARN: no desktop/winsta body - gpdeskInputDesktop unset\n");
