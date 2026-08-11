@@ -3856,3 +3856,19 @@ before unrelated executive traffic monopolises the receive loop.
   later generic kernel-visible wait/completion stall after the shared service RPC endpoints are armed.
   Do not patch ReactOS service sources or add service-name/RPC-status fallbacks; stay at the NT
   object, wait, NPFS/IOCP, LPC, and process-runtime boundaries.
+
+  Fresh p24 desktop-icon proof (2026-08-12): serialized retry
+  `.tmp/run-desktop-p24-icons-20260812.log` upgrades the capacity proof from taskbar-only to real
+  Explorer shell chrome under the 24-slot process budget. Screenshot
+  `.tmp/run-desktop-p24-icons-20260812.png` is a clean foreground QEMU capture with desktop icons
+  (`My Computer`, `Internet Browser`, `Command Prompt`, `Read Me`), Start, taskbar, and clock
+  visible. The same run proves the dynamic path in the log: `WlxActivateUserShell` reads the real
+  `Userinit` value, `userinit.exe` is admitted at `pi=5`, `explorer.exe` at `pi=6`, Explorer reaches
+  thousands of native/win32k calls plus `api0` USER callbacks, `spoolsv.exe` is admitted at `pi=16`
+  and opens `\net\NtControlPipe6`, later shared-service work demand-loads `wuauserv`, and
+  `sc_autostartcomplete` is signaled. The final gates now pass the userinit/explorer shell checks
+  including `exec_explorer_shell_chrome_painted`; the remaining red gates in this run are
+  `exec_delay_timer_disarms` and `exec_vm_pool_headroom` (`290/295` total). Review adjustment: the
+  active frontier is post-desktop generic timer/resource cleanup under service pressure, with final
+  pool state around `ut-free=8239KiB`, `slot-free=1284`, and executive heap `7675240/8388608`, not
+  profile loading, dynamic process identity, userinit/explorer launch, or shell paint.
