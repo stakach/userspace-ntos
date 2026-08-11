@@ -616,6 +616,61 @@ fn trace_wait_object(
     print_str(b"\n");
 }
 
+fn trace_tp_worker_event_transition(
+    handler: &ExecNtHandler,
+    op: &[u8],
+    handle: u64,
+    index: usize,
+    previous: Option<bool>,
+    status: u32,
+    woken: u64,
+) {
+    let Some((tp_pi, tp_slot)) = tp_worker_identity_from_badge(handler.current_badge) else {
+        return;
+    };
+    if tp_pi >= MAX_PI || tp_slot >= TP_WORKER_SLOT_COUNT {
+        return;
+    }
+    let trace_index = tp_pi * TP_WORKER_SLOT_COUNT + tp_slot;
+    let n = TP_WORKER_SLOT_EVENT_TRACE[trace_index].fetch_add(1, Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    print_str(b"[tp-worker-event] pi=");
+    print_u64(tp_pi as u64);
+    print_str(b" slot=");
+    print_u64(tp_slot as u64);
+    print_str(b" #");
+    print_u64(n);
+    print_str(b" badge=");
+    print_u64(handler.current_badge);
+    print_str(b" ");
+    print_str(op);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b" obj=");
+    print_u64(index as u64);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" prev=");
+    match previous {
+        Some(value) => print_u64(value as u64),
+        None => print_str(b"-"),
+    }
+    print_str(b" woken=");
+    print_u64(woken);
+    if let Some((kind, signaled)) = handler.events.query_existing(index as u64) {
+        print_str(b" event=");
+        print_str(match kind {
+            EventKind::Notification => b"notification",
+            EventKind::Synchronization => b"synchronization",
+        });
+        print_str(b" signaled=");
+        print_u64(signaled as u64);
+    }
+    print_str(b"\n");
+}
+
 fn trace_named_event_object(
     handler: &ExecNtHandler,
     op: &[u8],
@@ -19782,6 +19837,15 @@ impl ExecNtHandler {
                             print_str(if auto_reset { b" sync" } else { b" notification" });
                             print_str(if init_state { b" initial=1\n" } else { b" initial=0\n" });
                         }
+                        trace_tp_worker_event_transition(
+                            self,
+                            b"create",
+                            event_handle,
+                            index,
+                            Some(init_state),
+                            0,
+                            0,
+                        );
                         return 0;
                     }
                     let (root_dir, name16) = match self.read_event_object_attributes(oa) {
@@ -19849,6 +19913,15 @@ impl ExecNtHandler {
                                 status,
                                 event_handle,
                                 existed,
+                            );
+                            trace_tp_worker_event_transition(
+                                self,
+                                b"create",
+                                event_handle,
+                                i,
+                                Some(init_state),
+                                status,
+                                0,
                             );
                             status // STATUS_OBJECT_NAME_EXISTS : SUCCESS
                         }
@@ -19975,6 +20048,15 @@ impl ExecNtHandler {
                                 return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                             }
                         }
+                        trace_tp_worker_event_transition(
+                            self,
+                            b"reset",
+                            args[0],
+                            index,
+                            Some(previous),
+                            0,
+                            0,
+                        );
                         0
                     }
                     Err(status) => status,
@@ -20019,9 +20101,19 @@ impl ExecNtHandler {
                         }
                         // SAFETY: native dispatch is serialized; the signal and waiter selection
                         // are one executive transition.
+                        let mut woken = 0;
                         if !previous {
-                            unsafe { wait_wake_dispatcher_set(self) };
+                            woken = unsafe { wait_wake_dispatcher_set(self) };
                         }
+                        trace_tp_worker_event_transition(
+                            self,
+                            b"set",
+                            args[0],
+                            index,
+                            Some(previous),
+                            0,
+                            woken,
+                        );
                         0
                     }
                     Err(status) => status,

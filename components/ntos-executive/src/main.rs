@@ -2760,15 +2760,22 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     if handler == 0 || period == 0 {
         return;
     }
-    let step = nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
     let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+    let target = if deadline == u64::MAX {
+        let step = nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
+        now.saturating_add(step)
+    } else {
+        nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period)
+            .max(now.saturating_add(1))
+    };
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
     config &= !HPET_TN_INT_ENB;
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     core::ptr::write_volatile(
         (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
-        now.saturating_add(step),
+        target,
     );
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     core::ptr::write_volatile(
@@ -2785,6 +2792,7 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
 /// level-triggered HPET line from starving the component's real reply.
 pub(crate) unsafe fn delay_timer_nested_ack() {
     if WATCHDOG_ARMED.load(Ordering::Relaxed) != 0 {
+        watchdog_on_tick();
         watchdog_nested_rearm();
         return;
     }
@@ -6184,6 +6192,12 @@ pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// per-slot window so late `\pipe\ntsvcs` accepts remain observable without changing behavior.
 pub(crate) static SCM_WORKER_SLOT_SSN_TRACE: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
+/// Generic per-process/per-slot TP worker trace. Dynamic services and drivers can create workers
+/// after global caps are exhausted; this keeps each hosted worker slot independently observable.
+pub(crate) static TP_WORKER_SLOT_SSN_TRACE: [AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; MAX_PI * TP_WORKER_SLOT_COUNT];
+pub(crate) static TP_WORKER_SLOT_EVENT_TRACE: [AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT] =
+    [const { AtomicU64::new(0) }; MAX_PI * TP_WORKER_SLOT_COUNT];
 /// LSA-RPC DIAG: per-SSN trace counter for lsass' `\pipe\lsarpc` rpcrt4 SERVER thread
 /// (`RPCRT4_server_thread`, badge [`LSASS_LISTENER3_BADGE`]). Bounded; reveals exactly what the
 /// server thread does after `rpcrt4_protseq_np_wait_for_new_connection` returns from an accept
@@ -6344,6 +6358,7 @@ pub(crate) fn census_slot(badge: u64) -> usize {
 /// woke NOTHING (a rearm that keeps firing on an already-past deadline is a livelock, not work).
 pub(crate) static TIMER_TICKS_SEEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_SPURIOUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
 /// 1 = delay queue, 2 = event waiter, 3 = keyed waiter, 4 = io-completion waiter.
 pub(crate) static TIMER_PAST_DEADLINE_SOURCE: AtomicU64 = AtomicU64::new(0);
@@ -12251,6 +12266,22 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
     while let Some(waiter) =
         unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
     {
+        let trace = IO_COMPLETION_TIMEOUT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 32 {
+            print_str(b"[io-completion] TIMEOUT pi=");
+            print_u64(waiter.process_index as u64);
+            print_str(b" badge=");
+            print_u64(waiter.badge);
+            print_str(b" tid=");
+            print_u64(waiter.thread_id);
+            print_str(b" port=");
+            print_u64(waiter.port_id as u64);
+            print_str(b" deadline=");
+            print_u64(waiter.deadline_100ns);
+            print_str(b" now=");
+            print_u64(now);
+            print_str(b"\n");
+        }
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);
@@ -12423,6 +12454,14 @@ unsafe fn delay_timer_interrupt(
             print_u64(monotonic_time_100ns());
             print_str(b" delayq=");
             print_u64(queue.len() as u64);
+            let completion_waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
+            print_str(b" iocp-deadline=");
+            match completion_waiters.next_deadline() {
+                Some(deadline) => print_u64(deadline),
+                None => print_str(b"none"),
+            }
+            print_str(b" iocp-waiters=");
+            print_u64(completion_waiters.len() as u64);
             print_str(b"\n");
         }
     }

@@ -826,6 +826,7 @@ fn dispatch_depth_leave() {
 const REQUEST_TAG_LEN: u64 = 1;
 static PUMP_TIMER_FAIR_POLLS: AtomicU64 = AtomicU64::new(0);
 static PUMP_TIMER_FAIR_HITS: AtomicU64 = AtomicU64::new(0);
+static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
@@ -875,6 +876,9 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
         if !crate::drain_nested_pump_timer_delivery() {
             crate::delay_timer_nested_ack();
         }
+        if pump_deadman_tripped() {
+            return Some(PumpMessage::deadman_wall());
+        }
         return None;
     }
     let label = mi >> 12;
@@ -920,6 +924,30 @@ impl PumpMessage {
     fn label(self) -> u64 {
         self.mi >> 12
     }
+
+    #[inline]
+    const fn deadman_wall() -> Self {
+        Self {
+            mi: 0,
+            m0: 0,
+            m1: 0,
+            m2: 0,
+            m3: 0,
+            m4: 0,
+        }
+    }
+}
+
+#[inline]
+fn pump_deadman_tripped() -> bool {
+    if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let n = PUMP_DEADMAN_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        crate::print_str(b"[pump] deadman tripped during nested receive -> unwind to gate\n");
+    }
+    true
 }
 
 macro_rules! pump_reply_recv_into {
@@ -1029,6 +1057,9 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
             if !crate::drain_nested_pump_timer_delivery() {
                 crate::delay_timer_nested_ack();
             }
+            if pump_deadman_tripped() {
+                return PumpMessage::deadman_wall();
+            }
             if let Some(polled) = pump_try_recv_after_timer(ch) {
                 crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
                 return polled;
@@ -1093,6 +1124,9 @@ unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -
         crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
         if !crate::drain_nested_pump_timer_delivery() {
             crate::delay_timer_nested_ack();
+        }
+        if pump_deadman_tripped() {
+            return PumpMessage::deadman_wall();
         }
         if let Some(polled) = pump_try_recv_after_timer(ch) {
             crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);

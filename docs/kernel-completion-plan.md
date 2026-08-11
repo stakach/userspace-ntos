@@ -86,6 +86,23 @@ and `git diff --check`. The next serialized desktop proof should show `pipe-wait
 for a pipe with a published listening server instance and should determine whether SCM/EventLog
 progress reaches userinit/explorer or exposes the next real dispatcher/IOCP/RPC handoff gap.
 
+Nested-deadman / worker-visibility slice (2026-08-11): serialized retry
+`.tmp/run-desktop-pipe-availability-20260811.log` proved the new server-availability route in a real
+boot (`pipe-wait ... armed=1 available=1` on `\net\NtControlPipe1`), but it still hit the later
+EventLog/SCM frontier and the external timeout killed QEMU before the harness gate could print final
+status. The final serial output shows EventLog has published `\EventLog`, SCM has read a second real
+`\ntsvcs` `RSetServiceStatus` request, EventLog workers are split across runnable and parked states,
+and finite IOCP waiters are contributing HPET rearm source 4. The old global `[tp-worker-ssn]` cap
+is exhausted at exactly this frontier, and a deadman trip from nested component/rendezvous receives
+could set state without reliably unwinding to the main gate. The current repair keeps this generic:
+thread-pool native syscall tracing is now bounded per `(pi, slot)`, TP-worker event create/set/reset
+transitions log their dispatcher state and wake count, finite IOCP timeout wakeups log the exact
+waiter, spurious timer logs include IOCP waiter/deadline state, nested timer acks run the watchdog
+predicate and preserve the logical watchdog deadline, and component/rendezvous nested receives
+unwind once the watchdog trips so the main loop can run the normal gate. The next serialized desktop
+proof should either progress past the EventLog/SCM wall or produce a gate/deadman report naming the
+exact dynamic worker, event, and IOCP waiter responsible.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in

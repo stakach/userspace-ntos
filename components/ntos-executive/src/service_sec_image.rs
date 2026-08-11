@@ -4331,6 +4331,19 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
         }
+        if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+            dump_interactive_shell_frontier_quiesce(
+                &nt_handler,
+                &*hosted_loaded_images,
+                &reg,
+                ntdll,
+                procs,
+                pfilled,
+            );
+            print_str(b"[deadman] nested receive tripped watchdog -> run gate\n");
+            stop = m1;
+            break;
+        }
         // TAIL WATCH — sample every hosted process' TEB tail on EVERY service-loop event, so the
         // good→bad transition is attributed to the event that preceded it rather than to whichever
         // observer happened to look next.
@@ -6476,6 +6489,29 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" ssn=");
                     print_u64(ssn);
                     print_str(b"\n");
+                }
+            }
+            if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+                if tp_pi < MAX_PI && tp_slot < TP_WORKER_SLOT_COUNT {
+                    let trace_index = tp_pi * TP_WORKER_SLOT_COUNT + tp_slot;
+                    let dn = TP_WORKER_SLOT_SSN_TRACE[trace_index].fetch_add(1, Ordering::Relaxed);
+                    if dn < 96 {
+                        print_str(b"[tp-worker-slot-ssn] pi=");
+                        print_u64(tp_pi as u64);
+                        print_str(b" slot=");
+                        print_u64(tp_slot as u64);
+                        print_str(b" #");
+                        print_u64(dn);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" ssn=");
+                        print_u64(ssn);
+                        print_str(b" arg1=0x");
+                        print_hex(arg1 as u32);
+                        print_str(b" arg2=0x");
+                        print_hex(arg2 as u32);
+                        print_str(b"\n");
+                    }
                 }
             }
             // lsass' generic ntdll thread-pool worker is where rpcrt4 runs `RPCRT4_worker_thread`

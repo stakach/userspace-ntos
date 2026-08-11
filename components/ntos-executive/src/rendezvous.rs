@@ -22,6 +22,11 @@ unsafe fn rendezvous_recv_full_r12(
             if !crate::drain_nested_pump_timer_delivery() {
                 crate::delay_timer_nested_ack();
             }
+            if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+                print_str(tag);
+                print_str(b" deadman tripped while driving real server worker -> unwind\n");
+                return received;
+            }
             let tick = RENDEZVOUS_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             if tick < 8 {
                 print_str(tag);
