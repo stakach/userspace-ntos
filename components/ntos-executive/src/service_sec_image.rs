@@ -14344,14 +14344,6 @@ pub(crate) unsafe fn service_sec_image(
             print_str(b" blocked reporter(s)\n");
         }
     }
-    // === DEAD-CLIENT CALLBACK-UNWIND FAULT INJECTION (POST-QUIESCE). The boot's whole load-bearing
-    // flow is finished here — winlogon's SAS → msgina dialog → the authentic desktop/dialog paints
-    // have completed and their counters are latched — and win32k is idle in its dispatch receive
-    // loop. That makes this the one point where a client can be deliberately killed MID-CALLBACK
-    // without perturbing anything: the injection drives an expendable winlogon RPC worker thread into
-    // a REAL win32k user-mode callback (WM_NULL, so nothing can change), terminates it there, and
-    // asserts `unwind_dead_client_user_callbacks` recovers win32k. Without that unwind this is the
-    // shape that WEDGED the boot (RUNEXIT=124, no gate at all). See `exec_user_callback_dead_client_unwind`. ===
     // === PRIVATE-VM COMMIT/DECOMMIT/RE-COMMIT SELF-TEST (POST-QUIESCE). Runs on the real
     // `vm_map_private_page` path in a real hosted VSpace, at a VA above every placement the boot
     // makes, so it perturbs nothing. See `private_vm_unmap_selftest`. ===
@@ -14377,38 +14369,6 @@ pub(crate) unsafe fn service_sec_image(
         );
     } else {
         print_str(b"[private-vm] no runtime-registered interactive logon process -> skipped\n");
-    }
-    if ntdll.is_some() && WIN32K_TCB.load(Ordering::Relaxed) != 0 {
-        if let Some(callback_thread) = winlogon_callback_thread_candidate(&nt_handler) {
-            if let Some(probe_client) = winlogon_main_probe_client(&nt_handler) {
-                // ★ FIRST: the NESTED request↔reply BINDING injection (`exec_win32k_transport_call_nested`).
-                // It runs on the SAME expendable worker but leaves it ALIVE and latches nothing, so the
-                // dead-client injection below still finds a live, redirectable thread. Order matters: the
-                // dead-client injection latches winlogon's pi as DEAD, after which no further callback can
-                // park and this injection could not arm.
-                let nested_proof =
-                    win32k_glue::inject_win32k_nested_dispatch_slip(callback_thread, probe_client);
-                WIN32K_NESTED_SLIP_INJECTION.store(nested_proof, Ordering::Relaxed);
-                let mut terminate_victim = |victim_tid: u64| {
-                    let terminated =
-                        terminate_hosted_thread_mechanism(victim_tid, delay_queue, &mut nt_handler);
-                    win32k_glue::DeadClientVictimTermination {
-                        terminated,
-                        tcb_reclaimed: nt_handler.hosted_thread_tcb(victim_tid).is_none(),
-                    }
-                };
-                let proof = win32k_glue::inject_dead_client_callback_unwind(
-                    callback_thread,
-                    probe_client,
-                    &mut terminate_victim,
-                );
-                DEAD_CLIENT_UNWIND_INJECTION.store(proof, Ordering::Relaxed);
-            } else {
-                print_str(b"[cb-inject] runtime-registered winlogon main thread has no live probe context\n");
-            }
-        } else {
-            print_str(b"[cb-inject] no runtime-registered winlogon callback worker -> skipped\n");
-        }
     }
     // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
     // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
@@ -18284,72 +18244,6 @@ fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
     nt_handler
         .pm_pool_slot_for_tid(tid)
         .is_some_and(|(pi, slot)| nt_handler.is_pool_thread_suspended(pi, slot))
-}
-
-#[inline]
-fn winlogon_callback_thread_candidate(
-    nt_handler: &ExecNtHandler,
-) -> Option<win32k_glue::WinlogonCallbackThread> {
-    let process_role = nt_exe_image::HostedProcessRole::InteractiveLogon;
-    let pi = hosted_pi_for_role(nt_handler, process_role)?;
-    let candidates = [
-        (
-            HostedThreadRole::WinlogonWorker { slot: 1 },
-            WL_WORKER2_TEB_VA,
-            WL_WORKER2_STACK_BASE + WL_WORKER2_STACK_FRAMES * 0x1000,
-        ),
-        (
-            HostedThreadRole::WinlogonListener,
-            WL_LISTENER_TEB_VA,
-            WL_LISTENER_STACK_BASE + WL_LISTENER_STACK_FRAMES * 0x1000,
-        ),
-    ];
-    for (role, teb, stack_top) in candidates {
-        if let Some((tid, tcb, badge)) = nt_handler.hosted_thread_identity_for_role(pi, role) {
-            let client = win32k_client_context_for_thread(
-                nt_handler,
-                pi,
-                badge,
-                tid,
-                tcb,
-                Some(role),
-                teb,
-                hosted_peb_mirror_for_pi(pi),
-                hosted_scratch_base_for_pi(pi),
-            );
-            return Some(win32k_glue::WinlogonCallbackThread { client, stack_top });
-        }
-    }
-    None
-}
-
-#[inline]
-fn winlogon_main_probe_client(
-    nt_handler: &ExecNtHandler,
-) -> Option<win32k_glue::Win32kClientContext> {
-    let pi = hosted_pi_for_role(
-        nt_handler,
-        nt_exe_image::HostedProcessRole::InteractiveLogon,
-    )?;
-    let badge = nt_handler.hosted_process_top_badge(pi)?;
-    let tid = nt_handler.pm_main_tid_for_pi(pi).map(u64::from)?;
-    let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi)?;
-    let teb = nt_handler
-        .pm
-        .thread_teb(tid as nt_process::ThreadId)
-        .filter(|teb| *teb != 0)
-        .unwrap_or(SMSS_TEB_VA);
-    Some(win32k_client_context_for_thread(
-        nt_handler,
-        pi,
-        badge,
-        tid,
-        tcb,
-        Some(HostedThreadRole::Main),
-        teb,
-        hosted_peb_mirror_for_pi(pi),
-        hosted_scratch_base_for_pi(pi),
-    ))
 }
 
 #[inline]

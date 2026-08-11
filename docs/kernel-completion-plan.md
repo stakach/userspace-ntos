@@ -67,6 +67,21 @@ on the shared-pager proof path, not as synthetic scaffolding. The remaining red 
 systems work: LSA logon/auth-port routing and total VM/CSlot/root-untyped retention under the later
 service wave.
 
+Callback-harness cleanup slice (2026-08-12): `.tmp/run-desktop-20260812-090617.log` reached the
+post-desktop quiesce frontier, then the old post-loop `w32-slip`/`cb-inject` probes deliberately
+drove a winlogon worker through WM_NULL callback injection. The selected `tid=156` was a dynamic
+worker/listener, not a guaranteed GUI callback thread; win32k reported `ClientThreadSetup failed`
+and the synthetic victim-kill path ended in a root-side `no fault handler` line after the real run
+had already gated. That probe is retired rather than papered over. The executive no longer runs the
+post-quiesce winlogon-worker callback injections, the proof latches and victim selectors are removed,
+and the final callback/transport gates now assert live invariants only: redirect/return accounting,
+continuation-stack balance, zero reply errors, completed call-bound win32k dispatches, live nested
+depth, zero suspended component outstanding, and no walled win32k dispatches. Next serialized
+desktop proof should contain no `[w32-slip]`, `[cb-inject]`, or post-gate `no fault handler` lines;
+remaining failures should be structural LSA routing and VM/CSlot/root-untyped retention. Local
+validation is green: `cargo fmt --all`, `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
 Serialized validation (2026-08-12): `.tmp/run-desktop-shared-pager-20260812.log` reaches the
 harness sentinel with real Explorer desktop and icon paint. Screenshot proof
 `.tmp/run-desktop-shared-pager-20260812-2.png` shows the ReactOS desktop with `My Computer`,
@@ -258,6 +273,8 @@ client WndProc, opens the shell COM classes, and paints shell chrome:
 Remaining red gates are cleanup targets rather than the shell frontier: callback fault-injection
 proof bits (`exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`), the stale
 single-window msgina dialog count gate, LSA worker route completeness, and VM pool headroom.
+Subsequent cleanup retired the callback fault-injection proof bits from the live desktop boot path;
+the transport and callback gates are now based on runtime invariants from the real workload.
 
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled

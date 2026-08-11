@@ -631,15 +631,15 @@ unwind, cancel) funnel through the single `resume_suspended_user_callback_compon
 that ONE function converted all three. `SUSPENDED_COMPONENT_OUTSTANDING` (incremented on suspend,
 decremented on resume) is asserted **0** at quiesce.
 
-**The new spec: `exec_win32k_transport_call_nested`.** It reuses the SAME real scenario
-(`inject_win32k_nested_dispatch_slip` — post-quiesce, expendable winlogon RPC worker, `WM_NULL`) and
-asserts: `PUMP_REPLY_ERRORS == 0`, call-bound completions == `HARNESS_SYSCALL_DISPATCHES` (2557/2557),
-requests >= 4, nesting high-water >= 2, suspended-outstanding == 0, not walled, and all six
-`NESTED_SLIP_*` bits. `NESTED_SLIP_REJECTED` is replaced by **`NESTED_SLIP_R_HELD`**: the reply object
-stayed outstanding across the client redirect (sampled before and after), which is the property that
-used to require a token stack. `NESTED_SLIP_MATCHED` additionally requires
-`dispatch_depth() >= 1` at the instant the nested dispatch is issued — the DIRECT measurement that
-the nested level really was nested, since the boot-wide high-water (5) is reached long before.
+**The current spec: `exec_win32k_transport_call_nested`.** The post-quiesce
+`inject_win32k_nested_dispatch_slip` scenario was retired on 2026-08-12. It had become stale after
+worker/listener identities became dynamic because it could select an ordinary non-GUI winlogon
+worker and force a harness-only `ClientThreadSetup` path. The transport property is now asserted
+from the live workload itself: `PUMP_REPLY_ERRORS == 0`, call-bound completions equal
+`HARNESS_SYSCALL_DISPATCHES`, requests >= 4, nesting high-water >= 2, suspended-outstanding == 0,
+and win32k is not walled/retired. Live Explorer/user32 callback traffic reaches deeper nesting than
+the retired WM_NULL scenario and keeps the proof tied to real shell work rather than a synthetic
+post-gate worker injection.
 
 **Bypass vs negative control.** There is no bypass switch and there cannot be one:
 `W32_DISPATCH_TOKEN_BINDING` was flippable because the binding was OUR code, whereas "a stale
@@ -1064,11 +1064,9 @@ otherwise keep widening.
 ### Specs that only tested the workarounds (replaced, not dropped)
 34. `exec_component_dispatch_in_phase` (`main.rs:10819`) → **`exec_irp_transport_call_bound`**;
     `exec_win32k_dispatch_in_phase_nested` (`main.rs:12326`) + `NESTED_SLIP_REJECTED`
-    (`win32k_glue.rs:1291`) → **`exec_win32k_transport_call_nested`**. The injector
-    `inject_win32k_nested_dispatch_slip` (`win32k_glue.rs:1335`) is **kept** — the *scenario* (real
-    parked callback, real client redirect, real nested dispatch) is still exactly the right test; only
-    the "publish a stale `done`" step becomes unrepresentable and is replaced by the
-    reply-binding assertions of §5/Phase 2.
+    (`win32k_glue.rs:1291`) → **`exec_win32k_transport_call_nested`**. The interim
+    `inject_win32k_nested_dispatch_slip` scenario was later retired once live Explorer/user32
+    callback traffic provided the same nested-depth proof without a post-gate worker injection.
 
 **Net:** two correlation planes, one 32-deep stack, two bypass switches, two fault injectors, one
 duplicated transport fork and one bespoke init loop are removed; **one** primitive

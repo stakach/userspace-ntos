@@ -495,23 +495,15 @@ success.
      so any further callback fails closed, which is what makes the unwind pump converge. Wired at
      every crash-park site and at critical termination.
 
-     **GATE-PROTECTED (batch 49): `exec_user_callback_dead_client_unwind`.** On a healthy boot no
-     client dies, so `dead-client-unwinds` was `0` and this recovery was evidenced only by two
-     historical crash boots. `win32k_glue::inject_dead_client_callback_unwind` now MANUFACTURES the
-     condition for real, POST-QUIESCE (after the whole load-bearing SAS → msgina → paint flow has
-     finished and its counters are latched, so it cannot perturb them): it drives an expendable
-     winlogon RPC worker thread through a real `NtUserMessageCall(hwnd, WM_NULL, …, FNID_SENDMESSAGE)`
-     → `co_IntDoSendMessage → co_IntCallWindowProc → KeUserModeCallback`, so the component genuinely
-     suspends and the worker is genuinely redirected into `KiUserCallbackDispatcher`; then it
-     TERMINATES that thread (TCB suspended + cap revoked) at callback depth 1 and asserts the
-     recovery. Six proof bits, all required: component parked / frame redirected at depth >= 1 /
-     victim really dead / frame unwound / both stacks drained / **a FRESH win32k dispatch completes**.
-     `WM_NULL` is chosen precisely because it changes nothing, and the victim is never winlogon's main
-     thread. Measured live: `dead-client-unwinds=1 dead-client-unwind-redirects=1`,
-     `continuation-pushes == continuation-unwinds (1644/1644)`, `193/99` ZERO FAILs.
-     Disabling the unwind (experiment, `/tmp/boot_faultinj_nofix.log`) leaves
-     `active-depth=1 continuation-depth=2` and the fresh dispatch is REJECTED (`0xC000000D`) —
-     win32k stranded — so the spec fails (`191/99`, 2 FAILs). It cannot pass without the fix.
+     **Historical batch-49 gate, retired 2026-08-12.** This recovery used to be gate-protected by a
+     post-quiesce `WM_NULL` fault-injection scenario that deliberately terminated an expendable
+     winlogon worker at callback depth. That was useful while worker identity was static, but it
+     became stale once worker/listener admission became fully dynamic: the selector could pick a
+     non-GUI worker and force ReactOS through `ClientThreadSetup` solely for the harness. The live
+     desktop boot no longer manufactures this client death. The production mechanism above remains
+     wired at real crash-park and termination sites, and the gate now checks the runtime ledger:
+     `real-returns + dead-client-unwind-redirects == real-redirects`,
+     `dead-client-unwind-redirects <= dead-client-unwinds`, and continuation pushes/unwinds balance.
 
      **Ledger note.** A dead-client unwind is deliberately NOT a `real-return` (it is a failure
      completion), so `exec_user_callback_real_api0_nested_roundtrip` now asserts the exact identity

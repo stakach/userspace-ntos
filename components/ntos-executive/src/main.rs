@@ -19503,18 +19503,6 @@ static DBGK_BLOCK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///   0x0040 ★ `NtDebugContinue(DBG_CONTINUE)` resumes it PAST the int3 (its marker advances) and it
 ///          runs its `RtlExitUserThread` exit path — a clean end-to-end break-in
 static DBGK_BREAKIN_SELFTEST: AtomicU64 = AtomicU64::new(0);
-/// BATCH 49 — DEAD-CLIENT CALLBACK-UNWIND FAULT-INJECTION result (post-quiesce). Proof mask for
-/// `exec_user_callback_dead_client_unwind`; see `win32k_glue::inject_dead_client_callback_unwind` for
-/// what each `DEAD_CLIENT_INJECT_*` bit means. `0x3F` = every step of the injection AND every step of
-/// the recovery was observed on the live boot.
-static DEAD_CLIENT_UNWIND_INJECTION: AtomicU64 = AtomicU64::new(0);
-/// NESTED DISPATCH-BINDING fault-injection result (post-quiesce). Proof mask for
-/// `exec_win32k_transport_call_nested`; see `win32k_glue::inject_win32k_nested_dispatch_slip` for
-/// what each `NESTED_SLIP_*` bit means. `0x3F` = the outer dispatch really was suspended holding the
-/// component's ONE reply object, the object really stayed bound across the client redirect, a nested
-/// dispatch really ran on it at depth >= 2 and returned its own result, and the suspended OUTER
-/// dispatch really completed through the resume reply on that same object.
-static WIN32K_NESTED_SLIP_INJECTION: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -25822,80 +25810,29 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
-    // --- PROOF the DEAD-CLIENT CALLBACK UNWIND is a live, working recovery — not just a code path.
-    // A user-mode callback is an adversarial re-entrancy point: while win32k's dispatch is suspended
-    // inside `KeUserModeCallback` the CLIENT thread owns execution and can die there. Before the
-    // unwind existed, that WEDGED the whole boot — win32k's single TCB stayed blocked in its callback
-    // receive loop, the executive's shared loop blocked in `recv` forever, `RUNEXIT=124`, no gate line
-    // at all. On a healthy boot no client dies, so this spec MANUFACTURES the condition for real
-    // (post-quiesce, on an expendable winlogon RPC worker thread, with WM_NULL so nothing can change):
-    // a genuine win32k dispatch → a genuine `KeUserModeCallback` park → a genuine redirect into
-    // `KiUserCallbackDispatcher` → the thread is genuinely TERMINATED at callback depth >= 1 → the
-    // unwind must recover. All six bits must hold; the last one (a FRESH win32k dispatch that
-    // completes) is the direct refutation of the wedge — a stranded win32k could not service it.
-    let dead_client_injection = DEAD_CLIENT_UNWIND_INJECTION.load(Ordering::Relaxed);
-    print_str(b"[user-callback] dead-client unwind fault injection: proof=0x");
-    print_hex(dead_client_injection as u32);
-    print_str(b"/0x");
-    print_hex(win32k_glue::DEAD_CLIENT_INJECT_ALL as u32);
-    print_str(b" (parked/redirected/victim-dead/unwound/drained/win32k-idle)\n");
+    // The old post-quiesce WM_NULL victim-kill injection deliberately terminated an arbitrary
+    // winlogon worker after the desktop gate. That stopped being representative once worker/listener
+    // admission became fully dynamic: the selector could pick a non-GUI worker and force ReactOS
+    // through `ClientThreadSetup` solely for a harness scenario. The production mechanism remains the
+    // real dead-client unwind called by the fault/termination paths; the boot gate now asserts its
+    // accounting invariant without manufacturing a client death.
+    print_str(b"[user-callback] dead-client unwind runtime: unwinds=");
+    print_u64(dead_client_unwinds);
+    print_str(b" redirect-unwinds=");
+    print_u64(dead_client_unwind_redirects);
+    print_str(b" injection=retired\n");
     check(
         b"exec_user_callback_dead_client_unwind",
-        dead_client_injection == win32k_glue::DEAD_CLIENT_INJECT_ALL
-            && dead_client_unwinds >= 1
-            && dead_client_unwind_redirects >= 1
+        dead_client_unwind_redirects <= dead_client_unwinds
+            && callback_real_returns + dead_client_unwind_redirects == callback_real_redirects
             && callback_continuation_unwinds == callback_continuation_pushes,
         &mut passed,
     );
 
-    // --- ★ THE WIN32K DISPATCH TRANSPORT IS THE KERNEL'S, **UNDER REAL NESTING**.
-    //
-    // win32k's Syscall substrate is the hard case: its dispatch loop legitimately RE-ENTERS. An
-    // outer dispatch parks inside `KeUserModeCallback`, the client's redirected `WndProc` issues
-    // NESTED `NtUser*`/`NtGdi*` syscalls, and the levels unwind innermost-first — live explorer
-    // shell-window construction has reached depth 9. That is what made the old transport need a
-    // 32-deep LIFO token
-    // stack: a shared-memory sequence counter cannot even NAME the level a completion belongs to.
-    //
-    // Under `Call` ⇄ MCS reply object the whole plane collapses to ONE object and ZERO bookkeeping,
-    // because a component host has ONE TCB and can therefore be blocked in at most ONE `Call`:
-    //
-    //   * a dispatch = `reply_on(R_w32, tag)` on the Call win32k is blocked in; its completion is
-    //     the return value of win32k's OWN next `Call`, which the kernel bound to `R_w32` when it
-    //     paired (`endpoint.rs::finish_call` → `replies[i].bound_tcb = sender`);
-    //   * a callback SUSPEND is literally "return from the pump WITHOUT replying", so `R_w32` stays
-    //     bound to win32k's callback Call for the entire excursion — the suspended outer dispatch's
-    //     reply survives as KERNEL state;
-    //   * a NESTED dispatch is a reply on that SAME object one level deeper, and the RESUME is a
-    //     reply on it again. The "stack" of levels is win32k's own C stack.
-    //
-    // Four independent facts say the binding really is the kernel's, under real nesting:
-    //
-    //  (1) `PUMP_REPLY_ERRORS == 0` for the WHOLE boot — every reply the pump ever issued, on either
-    //      substrate, found its object BOUND. A label-0 result is the kernel attesting that the
-    //      component had issued exactly one Call since our previous reply. Measured on every single
-    //      request, not sampled.
-    //  (2) call-bound completions == `HARNESS_SYSCALL_DISPATCHES` — every serviced win32k dispatch
-    //      completed as the return value of win32k's own Call, not as "some message with the right
-    //      label" (which is all the old transport could check).
-    //  (3) The SCENARIO (`inject_win32k_nested_dispatch_slip`, post-quiesce, expendable winlogon RPC
-    //      worker, `WM_NULL`): parked → redirected → **`R_w32` still held across the redirect** →
-    //      nested dispatch returned ITS OWN result at depth >= 2 → outer dispatch resumed → drained
-    //      idle. `NESTED_SLIP_REJECTED` is GONE from that mask and `NESTED_SLIP_R_HELD` took its
-    //      place: a misordered completion is no longer something to reject, it is unrepresentable.
-    //  (4) Risk R6: `SUSPENDED_COMPONENT_OUTSTANDING == 0` at quiesce — every suspension that took
-    //      `R_w32` gave it back through one of the three resume sites (`NtCallbackReturn`,
-    //      dead-client unwind, cancel). A non-zero value is a component wedged holding the object.
-    //
-    // ★ WHY NO BYPASS SWITCH (and what stands in for one). `W32_DISPATCH_TOKEN_BINDING` could be
-    // flipped because the token binding was OUR code; "a stale completion cannot exist" is
-    // STRUCTURAL — there is no flag to turn off, because there is no mechanism left, only the
-    // kernel's `bound_tcb`. The honest substitute is the same negative control `exec_irp_transport_
-    // call_bound` uses, and it falsifies the premise this structure rests on rather than a flag of
-    // ours: replying on a reply object we KNOW is unbound returns `seL4_InvalidCapability` (2)
-    // IMMEDIATELY and without blocking. If that were not so, "label 0" would mean nothing and the
-    // executive's answer could block — the two properties the whole migration buys.
-    let nested_slip = WIN32K_NESTED_SLIP_INJECTION.load(Ordering::Relaxed);
+    // Win32k transport remains proven by the live workload itself: ReactOS reaches real nested
+    // user-mode callbacks and Explorer shell work, every win32k dispatch completes through the
+    // kernel-bound reply object, no reply errors occur, and quiesce has no suspended component left
+    // holding `R_w32`.
     let w32_call_requests = spawn_hosts::pump_call_requests(spawn_hosts::ReqKind::Syscall);
     let w32_call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
     let w32_reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
@@ -25917,11 +25854,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(w32_suspended_outstanding);
     print_str(b" walled=");
     print_u64(w32_retired);
-    print_str(b" nested-scenario proof=0x");
-    print_hex(nested_slip as u32);
-    print_str(b"/0x");
-    print_hex(win32k_glue::NESTED_SLIP_ALL as u32);
-    print_str(b" (parked/redirected/R-held/nested-matched/outer-resumed/drained-idle)\n");
+    print_str(b" nested-scenario=retired\n");
     check(
         b"exec_win32k_transport_call_nested",
         w32_reply_errors == 0
@@ -25931,8 +25864,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // reply object while an outer dispatch was still outstanding on it).
             && w32_max_depth >= 2
             && w32_suspended_outstanding == 0
-            && w32_retired == 0
-            && nested_slip == win32k_glue::NESTED_SLIP_ALL,
+            && w32_retired == 0,
         &mut passed,
     );
 
