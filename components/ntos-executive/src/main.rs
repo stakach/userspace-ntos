@@ -6097,6 +6097,8 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     print_u64(seen);
     print_str(b" woke-nothing=");
     print_u64(spurious);
+    print_str(b" early-stale=");
+    print_u64(TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed));
     print_str(b" past-deadline-rearms=");
     print_u64(past);
     print_str(b" T0_CONFIG=0x");
@@ -6121,6 +6123,7 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
             && seen >= 1
             && seen <= 4096
             && spurious <= 64
+            && TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed) <= seen
     };
     check(b"exec_delay_timer_disarms", shape, passed);
 }
@@ -6354,6 +6357,7 @@ pub(crate) fn census_slot(badge: u64) -> usize {
 /// woke NOTHING (a rearm that keeps firing on an already-past deadline is a livelock, not work).
 pub(crate) static TIMER_TICKS_SEEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_SPURIOUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TIMER_TICKS_EARLY_STALE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
 /// 1 = delay queue, 2 = event waiter, 3 = keyed waiter, 4 = io-completion waiter.
@@ -6614,6 +6618,8 @@ pub(crate) fn print_progress_census() {
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
     print_str(b" spurious=");
     print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
+    print_str(b" early-stale=");
+    print_u64(TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed));
     print_str(b" past-deadline-rearms=");
     print_u64(TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed));
     print_str(b" last-past-source=");
@@ -12378,6 +12384,17 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler) -> u64 {
     }
 }
 
+fn delay_timer_delivery_is_stale(config: u64, counter: u64, comparator: u64) -> bool {
+    (config & HPET_TN_INT_ENB) == 0 || counter < comparator
+}
+
+unsafe fn delay_timer_ack_irq() {
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if handler != 0 {
+        let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+    }
+}
+
 fn thread_wait_state_reset() {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).reset();
@@ -12461,6 +12478,33 @@ unsafe fn delay_timer_interrupt(
     handler: &mut ExecNtHandler,
 ) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let counter = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    let cmp = core::ptr::read_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *const u64);
+    let cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    if delay_timer_delivery_is_stale(cfg, counter, cmp) {
+        TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+        let n = TIMER_TICKS_EARLY_STALE.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[timer-stale] #");
+            print_u64(n);
+            print_str(b" counter=0x");
+            print_hex_u64(counter);
+            print_str(b" cmp=0x");
+            print_hex_u64(cmp);
+            print_str(b" cfg=0x");
+            print_hex_u64(cfg);
+            print_str(b" armed=");
+            print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
+            print_str(b" src=");
+            print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
+            print_str(b" deadline=");
+            print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
+            print_str(b"\n");
+        }
+        core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+        delay_timer_ack_irq();
+        return;
+    }
     // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
     // it must not be counted as a spurious wake — `exec_delay_timer_disarms`' `spurious <= 64`
     // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
@@ -12512,10 +12556,7 @@ unsafe fn delay_timer_interrupt(
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    if handler != 0 {
-        let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
-    }
+    delay_timer_ack_irq();
 }
 
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {

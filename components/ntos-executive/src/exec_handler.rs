@@ -5699,6 +5699,23 @@ impl ExecNtHandler {
         (count, overflow)
     }
 
+    pub(crate) unsafe fn suspend_hosted_threads_for_quiesce(&mut self) -> (usize, usize) {
+        let mut suspended = 0usize;
+        let mut failures = 0usize;
+        let table = unsafe { &*self.thread_runtime.table };
+        for runtime in table.entries.iter().copied() {
+            if !runtime.is_live() || runtime.tcb <= 1 {
+                continue;
+            }
+            if unsafe { tcb_suspend_r(runtime.tcb) } == 0 {
+                suspended += 1;
+            } else {
+                failures += 1;
+            }
+        }
+        (suspended, failures)
+    }
+
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
         self.thread_runtime
             .get_by_badge(self.current_badge)

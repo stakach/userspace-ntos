@@ -17556,6 +17556,16 @@ pub(crate) unsafe fn service_sec_image(
         // the 3 live hosted processes are untouched (byte-identical boot).
         ALPC_XVIEW_OK.store(alpc_cross_vspace_selftest(), Ordering::Relaxed);
     }
+    // Freeze hosted threads only after all post-quiesce active probes have run. The probes above
+    // intentionally drive win32k callbacks, teardown, driver cancellation, and ALPC mappings; doing
+    // a blanket TCB suspend before them corrupts the environment they are meant to prove.
+    let (quiesce_suspended, quiesce_suspend_failures) =
+        unsafe { nt_handler.suspend_hosted_threads_for_quiesce() };
+    print_str(b"[quiesce-freeze] hosted-tcbs-suspended=");
+    print_u64(quiesce_suspended as u64);
+    print_str(b" failures=");
+    print_u64(quiesce_suspend_failures as u64);
+    print_str(b"\n");
     if csrss_process_handle != 0 {
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
         print_hex(csrss_process_handle as u32);
@@ -17942,7 +17952,6 @@ unsafe fn dump_hosted_main_thread_quiesce(
     print_str(b"\n");
 
     let (stack_base, stack_size, stack_mirror, _, _, _) = mirror_ctx_for(badge, pi);
-    let scratch_base = procs[pi].scratch_base;
     let read_wl = |va: u64| -> Option<u64> {
         unsafe {
             let end = va.checked_add(8)?;
@@ -17952,15 +17961,7 @@ unsafe fn dump_hosted_main_thread_quiesce(
                 ));
             }
             let mut bytes = [0u8; 8];
-            img_spawn::client_copyin_process_mapped(
-                pi as u64,
-                va,
-                &mut bytes,
-                &pfilled[pi],
-                procs[pi].faults as usize,
-                scratch_base,
-                false,
-            )
+            quiesce_copyin_process_bytes(pi, va, &mut bytes, procs, pfilled)
             .then(|| u64::from_le_bytes(bytes))
         }
     };
@@ -17995,7 +17996,16 @@ unsafe fn dump_hosted_main_thread_quiesce(
         print_quiesce_addr(value, pi, loaded_images, reg, ntdll);
         shown += 1;
         if iat_shown < 4
-            && print_quiesce_iat_call_site(label, nt_handler, value, pi, loaded_images, reg, ntdll)
+            && print_quiesce_iat_call_site(
+                label,
+                value,
+                pi,
+                loaded_images,
+                reg,
+                ntdll,
+                procs,
+                pfilled,
+            )
         {
             iat_shown += 1;
         }
@@ -18010,20 +18020,43 @@ unsafe fn dump_hosted_main_thread_quiesce(
 }
 
 #[inline]
+unsafe fn quiesce_copyin_process_bytes(
+    pi: usize,
+    va: u64,
+    dst: &mut [u8],
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) -> bool {
+    if pi >= MAX_PI {
+        return false;
+    }
+    img_spawn::client_copyin_process_mapped(
+        pi as u64,
+        va,
+        dst,
+        &pfilled[pi],
+        procs[pi].faults as usize,
+        procs[pi].scratch_base,
+        false,
+    )
+}
+
+#[inline]
 unsafe fn print_quiesce_iat_call_site(
     label: &[u8],
-    nt_handler: &ExecNtHandler,
     return_address: u64,
     pi: usize,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
 ) -> bool {
     let Some(insn_address) = return_address.checked_sub(6) else {
         return false;
     };
     let mut insn = [0u8; 6];
-    if !nt_handler.xas_read(insn_address, &mut insn) {
+    if !quiesce_copyin_process_bytes(pi, insn_address, &mut insn, procs, pfilled) {
         return false;
     }
     if insn[0] != 0xff || insn[1] != 0x15 {
@@ -18039,7 +18072,8 @@ unsafe fn print_quiesce_iat_call_site(
         return false;
     };
     let mut target_bytes = [0u8; 8];
-    let target = if nt_handler.xas_read(slot_address, &mut target_bytes) {
+    let target = if quiesce_copyin_process_bytes(pi, slot_address, &mut target_bytes, procs, pfilled)
+    {
         Some(u64::from_le_bytes(target_bytes))
     } else {
         None

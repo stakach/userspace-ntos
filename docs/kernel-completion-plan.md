@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 ## Objective
 
@@ -30,6 +30,24 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ## Workstreams
 
 ### Current Desktop Frontier
+
+Latest desktop/icon validation (2026-08-12): serialized graphics retry
+`.tmp/run-desktop-late-freeze-20260812.log` rebuilt ntdll, the executive, rust-micro, and the disk
+image, then reached a live ReactOS desktop without shell-launch or paint fallbacks. Screenshot proof
+`.tmp/run-desktop-late-freeze-20260812.png` shows the real Explorer desktop with `My Computer`,
+`Internet Browser`, `Command Prompt`, `Read Me`, the Start button, and taskbar clock. The serial log
+has no `FAIL`, `panic`, `RUNEXIT`, or `no fault handler` before the manual interrupt, and Explorer
+continues making real native/win32k progress: at the 156s census `explorer total=10416 native=7422
+win32k=2994`, with real `NtUserGetIconInfo`, `NtGdiCreateDIBSection`, and `NtGdiExtTextOutW` calls.
+`nt-ntdll` import snapping reports `missing=0` across large ReactOS import sets. This run did not
+emit a final quiesce/harness gate because the desktop kept processing work; treat it as a strong
+live desktop proof, not a post-quiesce closeout. Current implementation cleanup keeps this
+mechanism-owned: stale HPET deliveries are detected and acked without redriving waiters, quiesce
+client-memory inspection uses process-mapped copyin instead of root-context user reads, and the
+blanket hosted-TCB freeze now runs only after active post-quiesce probes. Next target is long-run
+resource/lifetime stability under the later service wave: at the last census root untyped headroom
+was down to `17453 KiB` with no allocation failures, so continue reducing retained caps/views/driver
+state through real teardown and reclaim rather than adding process or shell-specific exits.
 
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
