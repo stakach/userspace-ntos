@@ -3730,7 +3730,7 @@ before unrelated executive traffic monopolises the receive loop.
   `./run.sh --desktop` boot to confirm the EventLog/SCM DCE/RPC context-handle path moves forward
   and that retained pipe cancels no longer report `STATUS_INVALID_PARAMETER`.
 
-  Follow-up repair in progress: the next desktop/background-only retry moved past EventLog/SCM into
+  Follow-up repair completed: the next desktop/background-only retry moved past EventLog/SCM into
   real `userinit.exe`, `explorer.exe`, and `rundll32.exe` GUI traffic, then retired win32k inside
   `rundll32.exe` `NtUserCreateWindowEx`. The fault was in ReactOS win32k
   `IntFixWindowCoordinates`: `PsGetCurrentProcess()->Peb` existed, but the selected `EPROCESS`
@@ -3738,6 +3738,37 @@ before unrelated executive traffic monopolises the receive loop.
   boundary dynamic: hosted process parameter/environment pages are now registered as per-client
   frames, and win32k derives the real PEB VA from the dispatch caller's TEB when selecting the
   PID/TID-keyed `EPROCESS`. Bootstrap/no-client contexts still get a self-consistent synthetic PEB,
-  but hosted GUI dispatches use the caller's attached PEB and `RTL_USER_PROCESS_PARAMETERS`. Next
-  validation: format/check, then one serialized desktop proof that the `rundll32`
-  `NtUserCreateWindowEx` wall disappears and explorer shell chrome keeps rendering.
+  but hosted GUI dispatches use the caller's attached PEB and `RTL_USER_PROCESS_PARAMETERS`. Validated
+  by the later serialized desktop proof: the `rundll32` `NtUserCreateWindowEx` wall did not recur and
+  explorer shell chrome kept rendering.
+
+  Follow-up repair completed: the recorded-PEB desktop retry moved further than the user's
+  background-only gate snapshot: `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, GDI mapping,
+  real callbacks, and WM_PAINT all run. The red edge was ReactOS shell32's `CDefView.cpp:1178`
+  assertion after `ListView_GetHeader()`/`Header_GetItemCount()`: the trace showed `LVM_GETHEADER`
+  (`0x101f`) followed by `HDM_GETITEMCOUNT` (`0x1200`) being redirected through win32k as api0
+  callbacks, and comctl32's list-view WndProc logged `unknown msg 1200`. ReactOS user32 normally keeps
+  same-thread common-control sends in-process when `Wnd->head.pti == GetW32ThreadInfo()`. The
+  executive was seeding later GUI clients' TEB `Win32ThreadInfo` from the last shared scratch
+  `SH_SAS_PTI`, including during parked api7 `ClientThreadSetup` before the new thread's win32k
+  callout had returned; this let explorer inherit a previous process/thread's `THREADINFO`.
+
+  The cleanup removed the shared desktop/PTI client seed ABI (`SH_SAS_DESKINFO`/`SH_SAS_PTI`),
+  projects CLIENTINFO from an explicit W32THREAD parked on the exact hosted TID, refreshes GUI
+  CLIENTINFO again after a parked callback continuation completes, and makes non-winlogon callback
+  TEB aliasing role-based via `HostedProcessRole::uses_win32_client_gdi()` instead of
+  explorer-specific. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and the
+  serialized `./run.sh --desktop` proof in `.tmp/run-desktop-per-thread-clientinfo-20260811.log` with
+  screenshot `.tmp/run-desktop-per-thread-clientinfo-20260811.png`. Result: real explorer shell chrome
+  is visible (desktop icons and Start/taskbar), explorer reaches repeated real WM_PAINT/api0 callback
+  traffic and then parks on an empty shell `GetMessage` queue, and the previous
+  `unknown msg 1200`/`CDefView.cpp:1178` assertion does not recur.
+
+  Review adjustment: desktop shell paint is no longer the active blocker. Later in the same run,
+  service/helper work proceeds into `rundll32.exe`, `kbswitch.exe`, `wlansvc.exe`, and `iexplore.exe`.
+  The next honest gaps are dynamic filesystem/profile/installer paths such as
+  `\??\C:\Program Files` returning `STATUS_NOT_IMPLEMENTED`, missing temporary-file support under the
+  Administrator profile, and a later helper process parked on an unhandled syscall at IP `0x96`.
+  Those should be implemented as generic NT object-manager/filesystem/syscall behavior, not as
+  hosted-image or shell-paint special cases.

@@ -221,22 +221,9 @@ pub const WIN32K_STACK_TAIL_ARGS: usize = (WIN32K_MAX_SERVICE_ARGS - 4) as usize
 const _: () = assert!(SH_REQ_A4 > SH_FONT_SIZE);
 const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + WIN32K_STACK_TAIL_ARGS as u64 * 8);
 
-// ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING (SAS DispatchMessageW client-side resolution). win32k
-// publishes, per dispatch, the two server-VA facts the executive needs to seed the GUI client's
-// TEB.Win32ClientInfo so user32's `ValidateHwnd`/`DesktopPtrToUser`/`IntCallMessageProc` resolve a
-// real window PWND out of win32k's (unified USER+desktop) heap into the client's RO-mapped view:
-//   - SH_SAS_DESKINFO: the bound DESKTOP's DESKTOPINFO server VA. The executive translates it through
-//     the DESKTOP's W32PROCESS heap mapping, and CLIENTINFO.ulClientDelta is the desktop-heap delta
-//     ReactOS' DesktopHeapGetUserDelta/DesktopHeapAddressToUser publish for that desktop.
-//   - SH_SAS_PTI: the dispatch THREADINFO server VA (== the window's `head.pti`); the client's
-//     TEB.Win32ThreadInfo must equal it so IntCallMessageProc's `Wnd->head.pti == GetW32ThreadInfo()`
-//     same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY → the proc never runs).
-// Both are 0 until the desktop is bound (BOUND_DESK_* latched). Written above SH_REQ_NARGS.
-pub const SH_SAS_DESKINFO: u64 = 0x100; // out: bound DESKTOPINFO server VA (u64)
-pub const SH_SAS_PTI: u64 = 0x108; // out: dispatch THREADINFO server VA (== window head.pti) (u64)
-                                   // The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
-                                   // USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
-                                   // can resolve a HWND → its PWND (handles[(hwnd&0xffff − 0x20)>>1].ptr) to persist WND.dwUserData.
+// The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
+// USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
+// can resolve a HWND → its PWND (handles[(hwnd&0xffff − 0x20)>>1].ptr) to persist WND.dwUserData.
 pub const SH_SAS_AHELIST: u64 = 0x110; // in: gSharedInfo.aheList (USER_HANDLE_TABLE) server VA (u64)
                                        // The SAS window's Session pointer (CreateWindowEx lpCreateParams), published by win32k's WM_CREATE
                                        // callback bridge; the executive reads winlogon's `Session->LogonState` (Session+0x118) through it to
@@ -275,7 +262,7 @@ pub const SH_GDI_LOAD_STATUS: u64 = 0x1D8; // out: executive load NTSTATUS
 pub const SH_GDI_LOAD_LEAF: u64 = 0x1E0; // in: lower-case ASCII driver leaf bytes
 pub const SH_GDI_LOAD_LEAF_CAP: usize = 24;
 pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
-const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
+const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
@@ -3773,14 +3760,24 @@ unsafe fn write_thread_client_desktop_info(
     Some((client_deskinfo, delta, client_pcti))
 }
 
-pub(crate) unsafe fn published_desktop_client_info() -> Option<(u64, u64, u64, u64)> {
-    let server_deskinfo =
-        read_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *const u64);
-    let pti = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *const u64);
-    if server_deskinfo == 0 || pti == 0 {
+pub(crate) unsafe fn desktop_client_info_for_w32thread(pti: u64) -> Option<(u64, u64, u64, u64)> {
+    if pti == 0 {
         return None;
     }
     let desk_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+    if desk_body == 0 {
+        return None;
+    }
+    let server_deskinfo = ensure_desktop_runtime_fields(desk_body)?;
+    if server_deskinfo == 0 {
+        return None;
+    }
+    if read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64) != server_deskinfo {
+        write_volatile(
+            (pti + THREADINFO_PDESKINFO_OFF) as *mut u64,
+            server_deskinfo,
+        );
+    }
     let (client_deskinfo, delta, client_pcti) =
         write_thread_client_desktop_info(pti, desk_body, server_deskinfo)?;
     Some((client_deskinfo, pti, delta, client_pcti))
@@ -3890,8 +3887,9 @@ unsafe fn bind_default_keyboard_layout_to_thread(pti: u64) -> Option<(u64, u64, 
     Some((kl, hkl, codepage))
 }
 
-pub(crate) unsafe fn current_thread_keyboard_layout_client_info() -> Option<(u64, u64, u16)> {
-    let pti = current_w32thread();
+pub(crate) unsafe fn keyboard_layout_client_info_for_w32thread(
+    pti: u64,
+) -> Option<(u64, u64, u16)> {
     bind_default_keyboard_layout_to_thread(pti)
 }
 
@@ -6217,11 +6215,6 @@ unsafe fn publish_thread_desktop_binding(pti: u64, hdesk: u64, desk_body: u64, p
         write_volatile((pti + THREADINFO_HDESK_OFF) as *mut u64, hdesk);
     }
     let _ = write_thread_client_desktop_info(pti, desk_body, pdeskinfo);
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64,
-        pdeskinfo,
-    );
-    write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, pti);
 }
 
 unsafe fn seed_default_startup_desktop_for_process(ppi: u64, pti: u64) -> bool {

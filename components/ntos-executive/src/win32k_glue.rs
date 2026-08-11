@@ -980,26 +980,24 @@ fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
 
 fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let pi = callback_client_owner_pi(client)?;
-    if client.tid == 0 {
+    if client.tid == 0
+        || !client
+            .process_role
+            .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
+    {
         return None;
     }
-    if callback_client_is_explorer(client) {
-        match client.role {
-            Some(HostedThreadRole::Main)
-                if client.top_badge != 0 && client.badge == client.top_badge =>
-            {
-                let alias = crate::env_scratch_base_for_pi(pi);
-                (alias != 0).then_some(alias)
-            }
-            Some(HostedThreadRole::TpWorker { slot })
-                if tp_worker_identity_from_badge(client.badge) == Some((pi, slot)) =>
-            {
-                Some(tp_worker_teb_mirror_va(pi, slot))
-            }
-            _ => None,
+    match client.role {
+        Some(HostedThreadRole::Main) if client.top_badge != 0 && client.badge == client.top_badge => {
+            let alias = crate::env_scratch_base_for_pi(pi);
+            (alias != 0).then_some(alias)
         }
-    } else {
-        None
+        Some(HostedThreadRole::TpWorker { slot })
+            if tp_worker_identity_from_badge(client.badge) == Some((pi, slot)) =>
+        {
+            Some(tp_worker_teb_mirror_va(pi, slot))
+        }
+        _ => None,
     }
 }
 
@@ -1066,13 +1064,9 @@ fn client_callback_supported_for_api(
     if api_index == nt_user_callback::USER32_CALLBACK_CLIENTTHREADSTARTUP {
         return true;
     }
-    matches!(
-        client.process_role,
-        Some(
-            nt_exe_image::HostedProcessRole::InteractiveLogon
-                | nt_exe_image::HostedProcessRole::InteractiveShell
-        )
-    )
+    client
+        .process_role
+        .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi)
 }
 
 unsafe fn bind_client_callback_window(

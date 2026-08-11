@@ -7,7 +7,7 @@ const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 4 * 1024 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
-static GUI_CLIENTINFO_SEED_LOGGED: AtomicU64 = AtomicU64::new(0);
+static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -357,6 +357,7 @@ unsafe fn take_deferred_user_callback_return_for_top() -> Option<DeferredCallbac
 }
 
 unsafe fn process_completed_user_callback_outer_dispatch(
+    nt_handler: &ExecNtHandler,
     completion_pi: usize,
     completion_pml4: u64,
     completion_badge: u64,
@@ -379,6 +380,36 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             W32_CONNECTED_MASK.fetch_or(1u64 << completion_pi, Ordering::Relaxed);
         } else {
             return false;
+        }
+    }
+    let completion_process_role = nt_handler.hosted_process_role(completion_pi);
+    if completion_process_role.is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi) {
+        let is_wl_worker = matches!(
+            completion_badge,
+            WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE
+        );
+        if let Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti)) =
+            refresh_hosted_gui_thread_client_info(
+                nt_handler,
+                completion_pi,
+                completion_badge,
+                completion_tid,
+                tp_worker_identity_from_badge(completion_badge),
+                is_wl_worker,
+                completion_pml4,
+            )
+        {
+            log_refreshed_gui_thread_client_info(
+                completion_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon),
+                completion_pi,
+                completion_tid,
+                teb_alias,
+                client_deskinfo,
+                pti,
+                delta,
+                client_pcti,
+                old_pti,
+            );
         }
     }
     if completion_pi == 2 {
@@ -444,6 +475,7 @@ unsafe fn drain_deferred_user_callback_returns(
                     };
                     effects_ok = if completion_pi == current_pi {
                         process_completed_user_callback_outer_dispatch(
+                            nt_handler,
                             completion_pi,
                             completion_pml4,
                             deferred.badge,
@@ -455,6 +487,7 @@ unsafe fn drain_deferred_user_callback_returns(
                         )
                     } else {
                         process_completed_user_callback_outer_dispatch(
+                            nt_handler,
                             completion_pi,
                             completion_pml4,
                             deferred.badge,
@@ -1834,31 +1867,26 @@ unsafe fn seed_gui_thread_client_info(
     pi: usize,
     teb_alias: u64,
     pml4: u64,
-) -> Option<(u64, u64, u64, u64)> {
+    pti: u64,
+) -> Option<(u64, u64, u64, u64, u64)> {
     let mapped_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
     let (client_deskinfo, pti, desktop_delta, client_pcti) =
-        win32k_subsystem::published_desktop_client_info()?;
+        win32k_subsystem::desktop_client_info_for_w32thread(pti)?;
     if desktop_delta != mapped_delta {
         return None;
     }
+    let old_pti = core::ptr::read_volatile((teb_alias + 0x78) as *const u64);
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
     core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, desktop_delta);
     core::ptr::write_volatile((teb_alias + 0x860) as *mut u64, client_pcti);
     if let Some((_kl, hkl, codepage)) =
-        win32k_subsystem::current_thread_keyboard_layout_client_info()
+        win32k_subsystem::keyboard_layout_client_info_for_w32thread(pti)
     {
         core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, hkl);
         core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, codepage);
     }
-    Some((client_deskinfo, pti, desktop_delta, client_pcti))
-}
-
-unsafe fn seed_winlogon_thread_client_info(
-    teb_alias: u64,
-    pml4: u64,
-) -> Option<(u64, u64, u64, u64)> {
-    seed_gui_thread_client_info(2, teb_alias, pml4)
+    Some((client_deskinfo, pti, desktop_delta, client_pcti, old_pti))
 }
 
 fn winlogon_thread_teb_alias_for(
@@ -1914,6 +1942,100 @@ fn hosted_gui_thread_teb_alias_for(
     }
     let teb_alias = hosted_env_scratch_base_for_pi(pi);
     (teb_alias != 0).then_some(teb_alias)
+}
+
+unsafe fn hosted_gui_thread_w32thread(nt_handler: &ExecNtHandler, current_tid: u64) -> Option<u64> {
+    if current_tid == 0 || current_tid > nt_process::ThreadId::MAX as u64 {
+        return None;
+    }
+    nt_handler
+        .pm
+        .thread_win32(current_tid as nt_process::ThreadId)
+}
+
+unsafe fn refresh_hosted_gui_thread_client_info(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    badge: u64,
+    current_tid: u64,
+    tp_worker_identity: Option<(usize, usize)>,
+    is_wl_worker: bool,
+    pml4: u64,
+) -> Option<(u64, u64, u64, u64, u64, u64)> {
+    let teb_alias = hosted_gui_thread_teb_alias_for(
+        nt_handler,
+        pi,
+        badge,
+        current_tid,
+        tp_worker_identity,
+        is_wl_worker,
+    )?;
+    let pti = hosted_gui_thread_w32thread(nt_handler, current_tid)?;
+    let (client_deskinfo, pti, delta, client_pcti, old_pti) =
+        seed_gui_thread_client_info(pi, teb_alias, pml4, pti)?;
+    Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti))
+}
+
+fn log_refreshed_gui_thread_client_info(
+    winlogon_gui_client: bool,
+    pi: usize,
+    tid: u64,
+    teb_alias: u64,
+    client_deskinfo: u64,
+    pti: u64,
+    delta: u64,
+    client_pcti: u64,
+    old_pti: u64,
+) {
+    if winlogon_gui_client {
+        if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+            print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
+            print_hex((client_deskinfo >> 32) as u32);
+            print_hex(client_deskinfo as u32);
+            print_str(b" pti=0x");
+            print_hex((pti >> 32) as u32);
+            print_hex(pti as u32);
+            print_str(b" ulClientDelta=0x");
+            print_hex((delta >> 32) as u32);
+            print_hex(delta as u32);
+            print_str(b" pClientThreadInfo=0x");
+            print_hex((client_pcti >> 32) as u32);
+            print_hex(client_pcti as u32);
+            print_str(b"\n");
+        }
+        return;
+    }
+
+    if old_pti == pti {
+        return;
+    }
+
+    let n = GUI_CLIENTINFO_SEED_TRACE.fetch_add(1, Ordering::Relaxed);
+    if n < 64 {
+        print_str(b"[gui-clientinfo] pi=");
+        print_u64(pi as u64);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" teb=0x");
+        print_hex((teb_alias >> 32) as u32);
+        print_hex(teb_alias as u32);
+        print_str(b" CLIENTINFO seeded for client-side ValidateHwnd: old-pti=0x");
+        print_hex((old_pti >> 32) as u32);
+        print_hex(old_pti as u32);
+        print_str(b" pDeskInfo=0x");
+        print_hex((client_deskinfo >> 32) as u32);
+        print_hex(client_deskinfo as u32);
+        print_str(b" pti=0x");
+        print_hex((pti >> 32) as u32);
+        print_hex(pti as u32);
+        print_str(b" ulClientDelta=0x");
+        print_hex((delta >> 32) as u32);
+        print_hex(delta as u32);
+        print_str(b" pClientThreadInfo=0x");
+        print_hex((client_pcti >> 32) as u32);
+        print_hex(client_pcti as u32);
+        print_str(b"\n");
+    }
 }
 
 unsafe fn complete_ntuser_process_connect_copyout(
@@ -5297,23 +5419,6 @@ pub(crate) unsafe fn service_sec_image(
                 // exact fault in the TEB that owns it (main or one of winlogon's worker TEBs), then
                 // retry the instruction. This must precede the generic worker-wall park below.
                 if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
-                    let teb_alias = if let Some((2, tp_slot)) = tp_worker_identity {
-                        tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000
-                    } else if is_wl_worker {
-                        match badge {
-                            WINLOGON_WORKER2_BADGE => {
-                                WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000
-                            }
-                            WINLOGON_WORKER3_BADGE => {
-                                WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
-                            }
-                            _ => {
-                                WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000
-                            }
-                        }
-                    } else {
-                        0x0000_0100_107C_0000
-                    };
                     let tcb = match badge {
                         _ if tp_worker_identity.is_some() => {
                             let (tp_pi, tp_slot) = tp_worker_identity.unwrap();
@@ -5336,8 +5441,17 @@ pub(crate) unsafe fn service_sec_image(
                             .unwrap_or(0),
                         _ => nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0),
                     };
-                    if let Some((client_deskinfo, pti, _, _)) =
-                        seed_winlogon_thread_client_info(teb_alias, pml4)
+                    let repair_tid = nt_handler.hosted_thread_tid_for_badge(badge).unwrap_or(0);
+                    if let Some((_teb_alias, client_deskinfo, pti, _, _, _old_pti)) =
+                        refresh_hosted_gui_thread_client_info(
+                            &nt_handler,
+                            pi,
+                            badge,
+                            repair_tid,
+                            tp_worker_identity,
+                            is_wl_worker,
+                            pml4,
+                        )
                     {
                         // The faulting instruction already has RAX=NULL. Re-run the helper call at
                         // 0x801a0004 so it reloads the repaired TEB fields before dereferencing.
@@ -6769,6 +6883,7 @@ pub(crate) unsafe fn service_sec_image(
                             );
                             if let Some(dispatch) = completion.outer_dispatch {
                                 if !process_completed_user_callback_outer_dispatch(
+                                    &nt_handler,
                                     pi,
                                     pml4,
                                     badge,
@@ -13202,10 +13317,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has bound the Default desktop it
-                // publishes (per dispatch, via the coherent shared page) the DESKTOPINFO server VA
-                // (SH_SAS_DESKINFO) + the dispatch THREADINFO server VA (SH_SAS_PTI == every window's
-                // head.pti). Seed the interactive GUI client's TEB.Win32ClientInfo so user32's
+                // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has created the caller's
+                // W32THREAD and bound it to a desktop, seed that exact GUI thread's
+                // TEB.Win32ClientInfo so user32's
                 // client-side ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve real heap-
                 // resident PWNDs in the process' RO-mapped heap view without a syscall:
                 //   - Win32ThreadInfo (TEB+0x78) = pti (server VA), matching Wnd->head.pti.
@@ -13218,56 +13332,28 @@ pub(crate) unsafe fn service_sec_image(
                 // This used to be winlogon-only for the SAS path; explorer's real shell/ATL path uses
                 // the same ReactOS client-side `IsWindow` and subclass validation, so every hosted
                 // GUI main thread must be restated after win32k can clear the fields.
-                if let Some(teb_alias) = hosted_gui_thread_teb_alias_for(
-                    &nt_handler,
-                    pi,
-                    badge,
-                    current_tid,
-                    tp_worker_identity,
-                    is_wl_worker,
-                ) {
-                    if let Some((client_deskinfo, pti, delta, client_pcti)) =
-                        seed_gui_thread_client_info(pi, teb_alias, pml4)
-                    {
-                        if winlogon_gui_client {
-                            if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
-                                print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
-                                print_hex((client_deskinfo >> 32) as u32);
-                                print_hex(client_deskinfo as u32);
-                                print_str(b" pti=0x");
-                                print_hex((pti >> 32) as u32);
-                                print_hex(pti as u32);
-                                print_str(b" ulClientDelta=0x");
-                                print_hex((delta >> 32) as u32);
-                                print_hex(delta as u32);
-                                print_str(b" pClientThreadInfo=0x");
-                                print_hex((client_pcti >> 32) as u32);
-                                print_hex(client_pcti as u32);
-                                print_str(b"\n");
-                            }
-                        } else {
-                            let bit = 1u64 << pi;
-                            if GUI_CLIENTINFO_SEED_LOGGED.fetch_or(bit, Ordering::Relaxed) & bit
-                                == 0
-                            {
-                                print_str(b"[gui-clientinfo] pi=");
-                                print_u64(pi as u64);
-                                print_str(b" CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
-                                print_hex((client_deskinfo >> 32) as u32);
-                                print_hex(client_deskinfo as u32);
-                                print_str(b" pti=0x");
-                                print_hex((pti >> 32) as u32);
-                                print_hex(pti as u32);
-                                print_str(b" ulClientDelta=0x");
-                                print_hex((delta >> 32) as u32);
-                                print_hex(delta as u32);
-                                print_str(b" pClientThreadInfo=0x");
-                                print_hex((client_pcti >> 32) as u32);
-                                print_hex(client_pcti as u32);
-                                print_str(b"\n");
-                            }
-                        }
-                    }
+                if let Some((teb_alias, client_deskinfo, pti, delta, client_pcti, old_pti)) =
+                    refresh_hosted_gui_thread_client_info(
+                        &nt_handler,
+                        pi,
+                        badge,
+                        current_tid,
+                        tp_worker_identity,
+                        is_wl_worker,
+                        pml4,
+                    )
+                {
+                    log_refreshed_gui_thread_client_info(
+                        winlogon_gui_client,
+                        pi,
+                        current_tid,
+                        teb_alias,
+                        client_deskinfo,
+                        pti,
+                        delta,
+                        client_pcti,
+                        old_pti,
+                    );
                 }
                 // ★ CLIENT-GDI HANDLE-TABLE MAPPING. GUI clients whose PEB+0xf8 was seeded before
                 // gdi32's GdiProcessSetup must also have the live win32k GDI table projected into
@@ -18280,15 +18366,6 @@ unsafe fn spawn_requested_local_thread(
                 fault_ep,
                 false,
             );
-            let teb_alias = match slot {
-                0 => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
-                1 => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
-                2 => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
-                _ => 0,
-            };
-            if seed_winlogon_thread_client_info(teb_alias, pml4).is_none() {
-                print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
-            }
             if slot == 0 {
                 let mapped_low = initial_teb
                     .stack_limit
