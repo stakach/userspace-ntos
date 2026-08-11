@@ -2924,20 +2924,10 @@ static WINLOGON_HANDLE_FAULT_DIAG_N: AtomicU64 = AtomicU64::new(0);
 /// `RtlEnterCriticalSection` — the `RTL_CRITICAL_SECTION` the caller handed us, so the wall is
 /// MEASURED rather than attributed.
 pub(crate) static WL_CPUEXC_DIAG_N: AtomicU64 = AtomicU64::new(0);
-/// (B) SPIN WATCHDOG for the win32k dispatch. A hosted GUI client (notably csrss's user32
-/// RegisterSystemClasses loop) can call the SAME win32k SSN over and over when win32k WALLs the
-/// call (returns STATUS_UNSUCCESSFUL / asserts) — a NON-terminating loop that issues syscalls (so it
-/// is NOT crash-parked and NOT wait-parked) and would spin the shared service loop until the TCG
-/// timeout, so the boot never reaches the gate. The watchdog records the last (badge, SSN) win32k
-/// dispatch + a consecutive-repeat count; when one client repeats the SAME SSN past a generous
-/// threshold (well beyond any legitimate class/cursor-init loop) it is a live-lock → the client is
-/// parked (like a crash) so the loop can make progress / quiesce.
-/// Per-client TOTAL win32k dispatch counters (indexed by pi). Some win32k live-locks return
-/// STATUS_SUCCESS on every call yet never satisfy the client's loop condition (csrss's user32
-/// RegisterSystemClasses re-registering the same cursor/class forever because win32k's assert-skips
-/// leave the class table inconsistent), so a consecutive-WALL watchdog can't catch them. A TOTAL
-/// budget does: a client's real win32k init is bounded (a few hundred calls); past a generous ceiling
-/// it is a live-lock → park the client so the loop quiesces + the gate runs. Sized to MAX_PI.
+/// Per-client win32k dispatch counters (indexed by pi), used only for census/gate evidence.
+/// Explorer and other real GUI clients can legitimately cross the old fixed bootstrap budgets while
+/// still loading code, filling pages, taking user callbacks, and painting. Liveness is therefore
+/// owned by the wall-clock progress-stall watchdog (`PROGRESS_EPOCH`), not by this counter.
 pub(crate) static W32_TOTAL_DISPATCH: [AtomicU64; MAX_PI] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; MAX_PI]

@@ -8856,55 +8856,12 @@ pub(crate) unsafe fn service_sec_image(
                 // that made winlogon the 2nd client. The reply is caller-agnostic: REPLY_MAIN is
                 // bound to THIS caller at its recv, so it resumes exactly services (no reply-spin).
                 W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-                // ★ (B) SPIN WATCHDOG. A GUI client can live-lock a run of win32k calls that never
-                // terminates — either all WALLing (csrss's user32 RegisterSystemClasses hammering
-                // NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4 when win32k
-                // asserts) OR each returning STATUS_SUCCESS yet never satisfying the loop condition (the
-                // assert-skips leave win32k's class table inconsistent so the same cursor/class is
-                // re-registered forever). It keeps issuing syscalls so it is neither crash- nor
-                // wait-parked → without this it spins the shared loop to the TCG timeout and the boot
-                // never reaches the gate. A TOTAL per-client win32k-dispatch budget catches BOTH cases:
-                // a client's real win32k init is bounded (a few hundred calls), so past a generous
-                // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
-                // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
+                // Count every win32k dispatch for census/gate evidence. This is deliberately not a
+                // liveness policy: real GUI clients can make thousands of win32k calls while still
+                // loading code, faulting pages, running user callbacks, and painting. True stalls are
+                // handled by the wall-clock progress watchdog at the loop top.
                 {
-                    // Real cursor/icon/OBM callbacks run bounded resource-load bursts before SAS;
-                    // dispatching the first real SAS then starts welcome-dialog construction, whose child
-                    // creation and layout legitimately cross the historical 500-call ceiling before
-                    // IDD_LOGON can be correlated. Grant only a bounded bridge after both the dequeued
-                    // SAS and a real post-SAS dialog creation; reserve the larger burst for the exact
-                    // correlated credential dialog.
-                    const W32_TOTAL_LIMIT: u64 = 500;
-                    const W32_RESOURCE_CALLBACK_LIMIT: u64 = 1536;
-                    const W32_POST_SAS_DIALOG_LIMIT: u64 = 2048;
-                    const W32_IDD_LOGON_LIMIT: u64 = 4096;
-                    // An interactive shell's first real window startup legitimately crosses the
-                    // generic 500-dispatch budget once user32/ATL run callbacks instead of synthetic
-                    // create paths. Keep it bounded, but do not tie the guard to explorer.exe.
-                    const W32_SHELL_STARTUP_LIMIT: u64 = 2048;
-                    // Typing credentials into the painted dialog is a second bounded burst: every
-                    // character runs the real edit control's caret/invalidate/repaint cycle on top
-                    // of the dialog's own pump. Grant the headroom only once keystrokes are in.
-                    const W32_CREDENTIAL_LIMIT: u64 = 12288;
-                    let limit = if winlogon_gui_client && winlogon_credential_started() {
-                        W32_CREDENTIAL_LIMIT
-                    } else if winlogon_gui_client
-                        && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
-                    {
-                        W32_IDD_LOGON_LIMIT
-                    } else if winlogon_gui_client
-                        && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
-                        && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) != 0
-                    {
-                        W32_POST_SAS_DIALOG_LIMIT
-                    } else if winlogon_gui_client && win32k_glue::real_resource_callback_started() {
-                        W32_RESOURCE_CALLBACK_LIMIT
-                    } else if shell_gui_client {
-                        W32_SHELL_STARTUP_LIMIT
-                    } else {
-                        W32_TOTAL_LIMIT
-                    };
-                    let total = W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed) + 1;
+                    W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed);
                     // FORWARD-PROGRESS CENSUS: the win32k SHADOW table lands in the same per-process
                     // histogram as the native table (high half). Without this the census could see
                     // only the native syscalls, and every "the UI work grew" claim about a win32k
@@ -8922,18 +8879,6 @@ pub(crate) unsafe fn service_sec_image(
                         // pump, so the main loop's badge census cannot see any of the time spent
                         // here. It also ticks the periodic dump, so a non-quiescing boot reports.
                         w32_census_enter(m0);
-                    }
-                    if total >= limit {
-                        print_str(b"[w32-spin] pi=");
-                        print_u64(pi as u64);
-                        print_str(b" badge=");
-                        print_u64(badge);
-                        print_str(b" last SSN=0x");
-                        print_hex(m0 as u32);
-                        print_str(b" exceeded ");
-                        print_u64(total);
-                        print_str(b" total win32k dispatches (live-lock) -> PARK\n");
-                        park_and_log!(pi, b"win32k-spin", m0, m0);
                     }
                 }
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by

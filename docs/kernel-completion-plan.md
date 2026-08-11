@@ -158,6 +158,19 @@ same run shows heap pressure near that frontier (`heap=7091024/8388608`), so out
 encoding now uses bounded stack buffers instead of transient heap `Vec`s for request construction;
 host coverage is `cargo test -p nt-lpc-client -- --nocapture`, plus the executive target check.
 
+Latest desktop proof (2026-08-11): `.tmp/run-desktop-after-lpc-stack-20260811.log` rebuilt ntdll,
+the executive, rust-micro, and the disk image, then booted the graphics desktop until the harness
+sentinel. The fixed per-process win32k dispatch budget is removed; it was stale liveness policy, and
+real explorer shell startup legitimately crosses the old cap while still faulting pages, running user
+callbacks, creating windows, and painting. Liveness now belongs to the wall-clock progress watchdog
+and census counters, not a GUI syscall-count park. The proof crosses real `WlxActivateUserShell`,
+spawns `userinit.exe` and `explorer.exe`, maps GDI, redirects explorer user callbacks, installs the
+client WndProc, opens the shell COM classes, and paints shell chrome:
+`exec_explorer_shell_chrome_painted` passes with `[explorer-fb] final non-bg pixels=786432/786432`.
+Remaining red gates are cleanup targets rather than the shell frontier: callback fault-injection
+proof bits (`exec_user_callback_dead_client_unwind`, `exec_win32k_transport_call_nested`), the stale
+single-window msgina dialog count gate, LSA worker route completeness, and VM pool headroom.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
@@ -3645,6 +3658,14 @@ before unrelated executive traffic monopolises the receive loop.
   `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, and
   `cargo test --manifest-path crates/nt-io-completion/Cargo.toml` pass for this checkpoint. The old
   explorer counters remain proof instrumentation, not kernel control policy.
+
+- Win32k dispatch liveness cleanup completed. `.tmp/run-desktop-after-lpc-stack-20260811.log`
+  proves the EventLog/LPC frontier, real `WlxActivateUserShell`, userinit launch, explorer launch,
+  explorer GDI mapping, client WndProc installation, shell COM class service, and real shell chrome
+  paint. The stale fixed total win32k dispatch budget is removed as a control path; it incorrectly
+  parked explorer while shell startup was still doing legitimate window/callback/GDI work.
+  `W32_TOTAL_DISPATCH` remains census evidence only, and real liveness stays with the generic
+  wall-clock `PROGRESS_EPOCH` stall watchdog.
 
 - NPFS retained-IRP cancellation in progress. The old thread-teardown path no longer detaches
   reply-cap-blocked pipe waiters while preserving the driver completion owner. `PipeWaiter` and
