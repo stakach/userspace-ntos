@@ -101,8 +101,8 @@ use nt_syscall::{
 };
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectAttributes, ObjectId, UnicodeString};
 use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
-use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
-use surt_sel4::{drain_blocking, CPtr, Sel4Env, Sel4Notify};
+use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig, WaitDecision};
+use surt_sel4::{CPtr, Sel4Env, Sel4Notify};
 
 #[derive(Clone, Copy)]
 pub(crate) enum SyscallUserMemory {
@@ -2590,9 +2590,9 @@ pub(crate) static PUMP_TIMER_NESTED_ACKS: AtomicU64 = AtomicU64::new(0);
 // The mechanism that CAN interrupt a blocking `Recv` already exists: the executive's root TCB has
 // the HPET one-shot notification BOUND to it (`delay_timer_init`), which is how `NtDelayExecution`
 // wakes a parked waiter while the loop sits in `recv`. So the watchdog is a coarse deadline that
-// joins the delay queue's own `min()` in `delay_timer_rearm`, and the check runs inside
-// `recv_full_r12` — i.e. at EVERY blocking receive the executive makes, including the nested ones a
-// component pump takes during a dispatch.
+// joins the delay queue's own `min()` in `delay_timer_rearm`, and the check runs inside the
+// executive blocking receive helpers — hosted-thread receives, nested component/rendezvous pumps,
+// and executive-side SURT client waits.
 //
 // ★ IT RESPECTS `exec_delay_timer_disarms`. The trigger-type bit is never used as an arm control
 // (only `delay_timer_rearm`'s existing `Tn_INT_ENB` path arms/disarms), the period is 20 s so the
@@ -11271,11 +11271,15 @@ struct RingChannel<'a> {
     sq: Producer<SurtSqe>,
     cq: Consumer<SurtCqe>,
     signal: Sel4Notify<'a, KernelEnv>,
-    wait: Sel4Notify<'a, KernelEnv>,
+    wait_cptr: CPtr,
     req_vaddr: u64,
     rep_vaddr: u64,
     next_id: u64,
 }
+static SURT_CLIENT_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+static SURT_CLIENT_TIMER_DRAINS: AtomicU64 = AtomicU64::new(0);
+static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
+
 impl RingChannel<'_> {
     /// One synchronous request/reply: stage `in_buf` in the request frame, push the
     /// SQE, wait for the matching completion, copy the reply payload out. Returns
@@ -11302,20 +11306,30 @@ impl RingChannel<'_> {
         }
         let _ = self.sq.notify_consumer(&self.signal);
         let mut out = (0i32, 0u32, 0u64, 0u64, 0u64);
-        let _ = drain_blocking(&mut self.cq, &self.wait, |cqe: &SurtCqe| {
-            if cqe.request_id == id {
-                out = (
-                    cqe.status,
-                    cqe.flags,
-                    cqe.information,
-                    cqe.detail0,
-                    cqe.detail1,
-                );
-                false
-            } else {
-                true
+        loop {
+            match self.cq.try_pop() {
+                Ok(Some(cqe)) => {
+                    if cqe.request_id == id {
+                        out = (
+                            cqe.status,
+                            cqe.flags,
+                            cqe.information,
+                            cqe.detail0,
+                            cqe.detail1,
+                        );
+                        break;
+                    }
+                }
+                Ok(None) => match self.cq.prepare_wait() {
+                    Ok(WaitDecision::Ready) => {}
+                    Ok(WaitDecision::Block) => unsafe {
+                        self.wait_completion_timer_aware();
+                    },
+                    Err(_) => break,
+                },
+                Err(_) => break,
             }
-        });
+        }
         let n = (out.2 as usize).min(out_buf.len());
         // SAFETY: reply frame holds `n` result bytes.
         unsafe {
@@ -11325,6 +11339,37 @@ impl RingChannel<'_> {
             }
         }
         out
+    }
+
+    unsafe fn wait_completion_timer_aware(&self) {
+        let (_rax, badge, _info, _payload) = ep_recv(self.wait_cptr);
+        if EXEC_DEADMAN_WATCHDOG {
+            if badge == DELAY_TIMER_BADGE {
+                watchdog_on_tick();
+            } else {
+                WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if badge == DELAY_TIMER_BADGE {
+            let n = SURT_CLIENT_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+            DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+            if drain_nested_pump_timer_delivery() {
+                let drains = SURT_CLIENT_TIMER_DRAINS.fetch_add(1, Ordering::Relaxed);
+                if drains < 8 {
+                    print_str(b"[surt-client] timer-aware wait drained delay tick\n");
+                }
+            } else {
+                delay_timer_nested_ack();
+            }
+            if n < 8 {
+                print_str(b"[surt-client] HPET tick landed while waiting for completion\n");
+            }
+        } else {
+            let n = SURT_CLIENT_WAIT_WAKES.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                print_str(b"[surt-client] completion notification woke client wait\n");
+            }
+        }
     }
 }
 
@@ -11693,9 +11738,9 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    // ★ THE DEADMAN LIVES HERE, not at the service-loop top — this is the ONE place the executive
-    // ever blocks, so a check here covers the nested component-pump receives a dispatch makes as
-    // well as the loop's own. Cost on the hot path is one relaxed increment.
+    // ★ THE DEADMAN LIVES HERE for hosted-thread endpoint receives, not at the service-loop top, so
+    // it also covers nested rendezvous receives. Executive-side SURT client waits mirror this same
+    // HPET-badge handling in `RingChannel::wait_completion_timer_aware`.
     if EXEC_DEADMAN_WATCHDOG {
         if badge == DELAY_TIMER_BADGE {
             watchdog_on_tick();
@@ -19861,7 +19906,7 @@ unsafe fn stand_up_service(
         sq,
         cq,
         signal: Sel4Notify::new(&ENV, n_sub),
-        wait: Sel4Notify::new(&ENV, n_comp),
+        wait_cptr: n_comp,
         req_vaddr: req_v,
         rep_vaddr: rep_v,
         next_id: 1,

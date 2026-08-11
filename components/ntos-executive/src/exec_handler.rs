@@ -91,6 +91,7 @@ static PIPE_RETAINED_CANCEL_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_MISS_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static LPC_PORT_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
 static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
@@ -18958,10 +18959,46 @@ impl ExecNtHandler {
                     print_str(b"[lpc-port] broker unavailable for NtCreatePort -> failing\n");
                     return STATUS_UNSUCCESSFUL;
                 };
+                let trace = LPC_PORT_CREATE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 32 {
+                    let mut nb = [0u8; 96];
+                    let nlen = Self::fold_name(&name16, &mut nb);
+                    print_str(b"[lpc-port] create begin pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" badge=");
+                    print_u64(self.current_badge);
+                    print_str(b" name=");
+                    print_str(&nb[..nlen]);
+                    print_str(b" maxconn=");
+                    print_u64(args[2]);
+                    print_str(b" maxmsg=");
+                    print_u64(args[3]);
+                    print_str(b"\n");
+                }
                 let handle = match client.create_port(&name16, args[2] as u32, args[3] as u32, 0) {
-                    Ok(handle) if handle != 0 => handle,
-                    Ok(_) => return STATUS_UNSUCCESSFUL,
-                    Err(status) => return status.raw() as u32,
+                    Ok(handle) if handle != 0 => {
+                        if trace < 32 {
+                            print_str(b"[lpc-port] create success handle=0x");
+                            print_hex((handle >> 32) as u32);
+                            print_hex(handle as u32);
+                            print_str(b"\n");
+                        }
+                        handle
+                    }
+                    Ok(_) => {
+                        if trace < 32 {
+                            print_str(b"[lpc-port] create returned null handle\n");
+                        }
+                        return STATUS_UNSUCCESSFUL;
+                    }
+                    Err(status) => {
+                        if trace < 32 {
+                            print_str(b"[lpc-port] create failed status=0x");
+                            print_hex(status.raw() as u32);
+                            print_str(b"\n");
+                        }
+                        return status.raw() as u32;
+                    }
                 };
                 match self.register_lpc_port_object(&name16, root_idx, handle) {
                     Ok(_) => {}

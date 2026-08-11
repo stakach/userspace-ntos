@@ -103,6 +103,20 @@ unwind once the watchdog trips so the main loop can run the normal gate. The nex
 proof should either progress past the EventLog/SCM wall or produce a gate/deadman report naming the
 exact dynamic worker, event, and IOCP waiter responsible.
 
+SURT client timer-awareness slice (2026-08-11): desktop retry
+`.tmp/run-desktop-nested-deadman-20260811.log` reached the same EventLog/SCM frontier, but the new
+per-slot trace narrowed the silent tail: EventLog worker slot 1 entered `NtCreatePort` (`ssn=48`)
+after several finite IOCP timeouts and then no later timer/deadman output appeared. Review exposed
+one remaining executive wait that was outside the common HPET/deadman path: `RingChannel::raw`
+waited on SURT completion notifications through the generic `surt_sel4::drain_blocking` helper,
+whose `KernelEnv::wait` used plain `ep_recv` and discarded bound HPET badges. The repair keeps SURT
+coalescing intact but makes executive-side SURT client waits timer-aware: empty completion rings
+still use `prepare_wait`, but a wait wake now recognizes `DELAY_TIMER_BADGE`, drains the same
+delay/event/keyed/IOCP/pipe-name/user-timer/deadman handler used by the service loop, and then
+rechecks the completion ring. `NtCreatePort` also has bounded entry/exit tracing so the next
+serialized run can prove whether EventLog's LPC port create returns or exposes the next generic LPC
+broker/object-manager boundary. No EventLog, SCM, userinit, explorer, or paint policy was added.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
