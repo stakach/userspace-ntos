@@ -467,8 +467,14 @@ const THREADINFO_HEVENT_QUEUE_CLIENT_OFF: u64 = 0x138;
 const THREADINFO_PEVENT_QUEUE_SERVER_OFF: u64 = 0x140;
 /// THREADINFO->PtiLink offset, membership in DESKTOP.PtiList.
 const THREADINFO_PTI_LINK_OFF: u64 = 0x148;
-/// KL.hkl and CLIENTINFO.{hKL,CodePage}; used only by wall diagnostics.
+/// KL layout and CLIENTINFO.{hKL,CodePage}. ReactOS' `tagKL` starts with `HEAD` (16 bytes on x64),
+/// then the pklNext/pklPrev ring, flags, hkl, spkf, font sigs/base charset, and CodePage.
+const KL_PKL_PREV_OFF: u64 = 0x18;
+const KL_FLAGS_OFF: u64 = 0x20;
 const KL_HKL_OFF: u64 = 0x28;
+const KL_CODEPAGE_OFF: u64 = 0x40;
+const KL_UNLOAD: u32 = 0x2000_0000;
+const WIN32K_KL_WALK_LIMIT: usize = 64;
 const CLIENTINFO_HKL_OFF: u64 = 0x90;
 const CLIENTINFO_CODEPAGE_OFF: u64 = 0x98;
 /// USER_MESSAGE_QUEUE offsets used by ReactOS `MsqInitializeMessageQueue`.
@@ -476,6 +482,10 @@ const USER_MESSAGE_QUEUE_PTI_MOUSE_OFF: u64 = 0x28;
 const USER_MESSAGE_QUEUE_PTI_KEYBOARD_OFF: u64 = 0x30;
 const USER_MESSAGE_QUEUE_HARDWARE_MESSAGES_OFF: u64 = 0x38;
 const USER_MESSAGE_QUEUE_CTHREADS_OFF: u64 = 0xB0;
+const SSN_NT_USER_LOAD_KEYBOARD_LAYOUT_EX: u64 = 0x125c;
+static WIN32K_DEFAULT_KEYBOARD_LAYOUT: AtomicU64 = AtomicU64::new(0);
+static WIN32K_KEYBOARD_LAYOUT_OBSERVES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_KEYBOARD_LAYOUT_BINDINGS: AtomicU64 = AtomicU64::new(0);
 
 /// win32k `.data` global `gpdeskInputDesktop` (desktop.c:52) RVA. `IntGetActiveDesktop()` returns it
 /// (desktop.c:1287); `co_IntShowDesktop` (winsta.c:340) derefs `Desktop->pDeskInfo->spwnd` and faults
@@ -488,6 +498,13 @@ const USER_MESSAGE_QUEUE_CTHREADS_OFF: u64 = 0xB0;
 /// handle-validation / winsta-locking / InputWindowStation guards; we only READ it here to report the
 /// switch's effect.
 pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
+
+/// win32k `.data` global `gspklBaseLayout` (`kbdlayout.c:22`) RVA. Derived from this build's
+/// disassembly:
+///   * VMA 0x9ff20 is `W32kGetDefaultKeyLayout`: it reads 0x21bf40, tests `KL.dwKL_Flags` (+0x20)
+///     for `KL_UNLOAD`, then follows `pklPrev` (+0x18) until it returns to the same global.
+///   * win32k.sys ImageBase is 0x10000, so VMA 0x21bf40 maps to RVA 0x20bf40.
+pub const GSPKL_BASE_LAYOUT_RVA: u64 = 0x20bf40;
 
 /// win32k `.data` global `NrGuiAppsRunning` (guicheck.c:17) RVA — the lazy-graphics-init gate counter.
 /// `co_AddGuiApp` triggers `co_IntInitializeDesktopGraphics` only on the 0→1 transition. We READ it to
@@ -3599,6 +3616,115 @@ unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((heap, size))
+}
+
+unsafe fn default_keyboard_layout_from_ring() -> u64 {
+    let first = read_volatile((WIN32K_CODE_VA + GSPKL_BASE_LAYOUT_RVA) as *const u64);
+    if first == 0 {
+        return 0;
+    }
+
+    let mut kl = first;
+    for _ in 0..WIN32K_KL_WALK_LIMIT {
+        let flags = read_volatile((kl + KL_FLAGS_OFF) as *const u32);
+        if flags & KL_UNLOAD == 0 {
+            return kl;
+        }
+
+        let prev = read_volatile((kl + KL_PKL_PREV_OFF) as *const u64);
+        if prev == 0 {
+            return 0;
+        }
+        kl = prev;
+        if kl == first {
+            return 0;
+        }
+    }
+    0
+}
+
+unsafe fn refresh_default_keyboard_layout() -> u64 {
+    let kl = default_keyboard_layout_from_ring();
+    let current = WIN32K_DEFAULT_KEYBOARD_LAYOUT.load(Ordering::Relaxed);
+    if kl == 0 || kl == current {
+        return kl;
+    }
+
+    WIN32K_DEFAULT_KEYBOARD_LAYOUT.store(kl, Ordering::Relaxed);
+    let n = WIN32K_KEYBOARD_LAYOUT_OBSERVES.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        let hkl = read_volatile((kl + KL_HKL_OFF) as *const u64);
+        let codepage = read_volatile((kl + KL_CODEPAGE_OFF) as *const u16);
+        print_str(b"[win32k-kbd] default KL observed from gspklBaseLayout hkl=0x");
+        print_hex((hkl >> 32) as u32);
+        print_hex(hkl as u32);
+        print_str(b" kl=0x");
+        print_hex((kl >> 32) as u32);
+        print_hex(kl as u32);
+        print_str(b" codepage=");
+        print_u64(codepage as u64);
+        print_str(b"\n");
+    }
+    kl
+}
+
+unsafe fn keyboard_layout_client_values(kl: u64) -> Option<(u64, u16)> {
+    if kl == 0 {
+        return None;
+    }
+    let hkl = read_volatile((kl + KL_HKL_OFF) as *const u64);
+    if hkl == 0 {
+        return None;
+    }
+    let codepage = read_volatile((kl + KL_CODEPAGE_OFF) as *const u16);
+    Some((hkl, codepage))
+}
+
+unsafe fn bind_default_keyboard_layout_to_thread(pti: u64) -> Option<(u64, u64, u16)> {
+    if pti == 0 {
+        return None;
+    }
+
+    let mut kl = read_volatile((pti + THREADINFO_KEYBOARD_LAYOUT_OFF) as *const u64);
+    let bound_new = if kl == 0 {
+        kl = refresh_default_keyboard_layout();
+        if kl == 0 {
+            return None;
+        }
+        write_volatile((pti + THREADINFO_KEYBOARD_LAYOUT_OFF) as *mut u64, kl);
+        true
+    } else {
+        false
+    };
+
+    let (hkl, codepage) = keyboard_layout_client_values(kl)?;
+    let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+    if pci != 0 {
+        write_volatile((pci + CLIENTINFO_HKL_OFF) as *mut u64, hkl);
+        write_volatile((pci + CLIENTINFO_CODEPAGE_OFF) as *mut u16, codepage);
+    }
+
+    if bound_new {
+        let n = WIN32K_KEYBOARD_LAYOUT_BINDINGS.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-kbd] bound default KL to pti=0x");
+            print_hex((pti >> 32) as u32);
+            print_hex(pti as u32);
+            print_str(b" hkl=0x");
+            print_hex((hkl >> 32) as u32);
+            print_hex(hkl as u32);
+            print_str(b" kl=0x");
+            print_hex((kl >> 32) as u32);
+            print_hex(kl as u32);
+            print_str(b"\n");
+        }
+    }
+    Some((kl, hkl, codepage))
+}
+
+pub(crate) unsafe fn current_thread_keyboard_layout_client_info() -> Option<(u64, u64, u16)> {
+    let pti = current_w32thread();
+    bind_default_keyboard_layout_to_thread(pti)
 }
 
 /// A GENERAL_LOOKASIDE's default Allocate `PVOID(POOL_TYPE, SIZE_T, ULONG Tag)` — bump the heap
@@ -8312,6 +8438,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
+    if ssn == SSN_NT_USER_LOAD_KEYBOARD_LAYOUT_EX && result != 0 {
+        let _ = refresh_default_keyboard_layout();
+        let _ = bind_default_keyboard_layout_to_thread(t);
+    }
     // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). InitializeGreCSRSS and
     // InitFontSupport have completed, so this is the earliest valid point to create the system font,
     // interactive object graph and PDEV. The PDEV must exist before user32's real
@@ -9071,6 +9201,7 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
             write_volatile((w32thread + 0x88) as *mut u64, ci);
         }
     }
+    let _ = bind_default_keyboard_layout_to_thread(w32thread);
     // MessageQueue (THREADINFO+0x60): the paint/window-position path references the window's thread
     // and reads `pti->MessageQueue->QF_flags` (USER_MESSAGE_QUEUE+0xAC) — a NULL queue null-derefs in
     // painting.c (RVA 0xb6a55). Real win32k creates this in CreateThreadInfo -> MsqCreateMessageQueue

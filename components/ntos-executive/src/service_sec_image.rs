@@ -1843,6 +1843,11 @@ unsafe fn seed_gui_thread_client_info(
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
     core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
+    if let Some((_kl, hkl, codepage)) = win32k_subsystem::current_thread_keyboard_layout_client_info()
+    {
+        core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, hkl);
+        core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, codepage);
+    }
     Some((client_deskinfo, pti, user_delta))
 }
 

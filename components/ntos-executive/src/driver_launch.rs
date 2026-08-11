@@ -12210,6 +12210,8 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CURRENT_TCB]);
             print_str(b" target=");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_TARGET_TCB]);
+            print_str(b" comp-handoff=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_COMPOSITE_REPLY_HANDOFF]);
             print_str(b" cspace=");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CSPACE_INDEX]);
             print_str(b" fault-cap-kind=");

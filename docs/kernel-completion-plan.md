@@ -3371,3 +3371,28 @@ before unrelated executive traffic monopolises the receive loop.
   `KL.hkl`, and `CLIENTINFO.hKL` all null while the win32k context still holds three locks. Next work
   should initialise and attach the real default keyboard-layout state through the ReactOS win32k/user32
   path, not add a synthetic return from `NtUserCallOneParam`.
+
+- I4 real keyboard-layout state and deferred composite-reply handoff. The win32k side now derives the
+  default layout from ReactOS' own `gspklBaseLayout` ring after `NtUserLoadKeyboardLayoutEx`, binds
+  that `tagKL` to newly-created/current `THREADINFO` records, and publishes the real `hKL`/codepage
+  through both `CLIENTINFO` and the hosted TEB alias. This removes the previous paint-side
+  `ONEPARAM_ROUTINE_GETKEYBOARDLAYOUT` null state without adding a synthetic `NtUserCallOneParam`
+  result. `rust-micro` also now preserves a composite reply wake across a receive half that is
+  satisfied by a later bound notification; the microkernel spec
+  `NBSendRecv deferred reply wake survives later bound-notification receive` covers that delayed wake
+  case. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./rust-micro/scripts/build_kernel.sh extern-rootserver`, and serialized visible retry
+  `.tmp/run-desktop-composite-deferred3-20260811.log`. Result: kernel specs pass, real base desktop
+  paint remains green (`desktop-bg 768/768`, pixel `0x003a6ea5`), the profile source materialises with
+  the Default User hive, and EventLog/SCM NPFS writes progress through `seq=155`.
+
+  Review adjustment: the current blocker is still generic hosted-component scheduling after base paint,
+  not keyboard layout, profile scaffolding, executable ordering, or NPFS byte policy. In the latest log
+  the next FSD write dispatch `#159` is accepted by the executive, but no `[fsd-active-write]
+  before-call seq=159` appears. The hosted FSD TCB is runnable, schedulable, enqueued, priority 100, and
+  parked at `driver_launch::call_on`, while the executive remains current under timer/deadman pressure
+  and the composite handoff marker is already clear. Next work should inspect the generic syscall-tail
+  scheduling/component-pump boundary so an answered component `Call` is allowed to run before the
+  executive loops on bound notifications; do not reintroduce service, process, IRQ, paint, keyboard, or
+  pipe fallbacks.

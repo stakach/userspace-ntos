@@ -5394,6 +5394,7 @@ pub(crate) const TCB_DBG_FAULT_CAP_DETAIL: usize = 19;
 pub(crate) const TCB_DBG_FAULT_EP_STATE: usize = 20;
 pub(crate) const TCB_DBG_FAULT_EP_HEAD: usize = 21;
 pub(crate) const TCB_DBG_FAULT_EP_TAIL: usize = 22;
+pub(crate) const TCB_DBG_COMPOSITE_REPLY_HANDOFF: usize = 23;
 
 fn print_tcb_debug_opt(value: u64) {
     if value == TCB_DEBUG_NONE {
@@ -5445,6 +5446,8 @@ pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
     print_tcb_debug_opt(state[TCB_DBG_CURRENT_TCB]);
     print_str(b" target=");
     print_tcb_debug_opt(state[TCB_DBG_TARGET_TCB]);
+    print_str(b" comp-handoff=");
+    print_tcb_debug_opt(state[TCB_DBG_COMPOSITE_REPLY_HANDOFF]);
     print_str(b" cspace=");
     print_tcb_debug_opt(state[TCB_DBG_CSPACE_INDEX]);
     print_str(b" fault-ep=");
