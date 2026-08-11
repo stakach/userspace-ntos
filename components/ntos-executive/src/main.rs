@@ -12919,14 +12919,7 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 }
 
 unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
-    let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
-    let _ = table.detach_blocked_thread_with_reply_caps(tid, release_reply_pool_cap);
-    let listens = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
-    let _ = listens.cancel_thread_with_file_ids(tid, |file_id| {
-        if file_id != 0 {
-            handler.release_file_reference(file_id);
-        }
-    });
+    let _ = handler.cancel_pipe_io_for_thread_teardown(tid);
     let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
     let name_wait_reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_NAME_CANCEL_REPLY_CAPS_WORK);
     let name_wait_count = name_waiters.cancel_thread_collect_reply_caps(tid, name_wait_reply_caps);
@@ -16392,9 +16385,11 @@ struct ExecNtHandler {
     /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
     /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
     /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
-    /// writes. `pipe_park_fid` = the reading end's npfs `FsContext` (0 = no park request). The rest is
-    /// the completion context the re-drive needs (user buffer/IOSB VAs + capacity + transceive flag).
+    /// writes. `pipe_park_device_id` is the owning NT device id and `pipe_park_fid` = the reading
+    /// end's npfs `FsContext` (0 = no park request). The rest is the completion context the re-drive
+    /// needs (user buffer/IOSB VAs + capacity + transceive flag).
     /// Reset each dispatch (group-A signal, like `io_signal_event`).
+    pipe_park_device_id: u64,
     pipe_park_fid: u64,
     pipe_park_buffer_va: u64,
     pipe_park_buffer_len: u32,
@@ -16696,6 +16691,11 @@ impl ExecFileCompletion {
     fn is_synchronous(&self, file_id: u64) -> Result<bool, u32> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).is_synchronous(file_id) }
+    }
+
+    fn device_id(&self, file_id: u64) -> Result<u64, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).device_id(file_id) }
     }
 
     fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
@@ -23206,7 +23206,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 4, /* WRITE */
                                 0, cli_fid, &wake, &mut cnone,
                             );
-                            let stash = driver_launch::take_completed_read(srv_fid);
+                            let named_pipe_device =
+                                driver_launch::device_id_by_name("\\Device\\NamedPipe")
+                                    .unwrap_or(0);
+                            let stash = driver_launch::take_completed_read_for_device(
+                                named_pipe_device,
+                                srv_fid,
+                            );
                             let pending_delivered = match &stash {
                                 Some((st, info, bytes)) => {
                                     *st == 0
@@ -23351,7 +23357,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 4, /* WRITE */
                                 0, srv_fid, &response, &mut cnone,
                             );
-                            let hdr_stash = driver_launch::take_completed_read(cli_fid);
+                            let hdr_stash = driver_launch::take_completed_read_for_device(
+                                named_pipe_device,
+                                cli_fid,
+                            );
                             let hdr_ok = match &hdr_stash {
                                 Some((st, info, bytes)) => {
                                     *st == 0x8000_0005

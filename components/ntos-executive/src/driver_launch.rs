@@ -320,6 +320,7 @@ pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
+pub const FSD_DISPATCH_CANCEL_PENDING_FILE: u64 = u64::MAX - 0x774;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const STATUS_PENDING: u32 = 0x0000_0103;
@@ -394,6 +395,7 @@ static mut IO_COMPLETE_CALLS: u64 = 0;
 static mut POOL_CALLS: u64 = 0;
 static mut POOL_LONG_WALKS: u32 = 0;
 static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
+static FSD_CANCEL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn pending_irp_returns_read_bytes(major: u64, fsctl: u64) -> bool {
@@ -626,6 +628,101 @@ unsafe fn insert_pending_irp(entry: PendingIrp) -> bool {
     true
 }
 
+#[derive(Clone, Copy)]
+struct PendingIrpCancelTarget {
+    irp: u64,
+    cancel_routine: u64,
+}
+
+unsafe fn find_pending_irp_cancel_target(fid: u64) -> Option<PendingIrpCancelTarget> {
+    if fid == 0 {
+        return None;
+    }
+    let mut node = read_volatile(pending_irp_head(FSD_DATA_VADDR));
+    let mut steps = 0u64;
+    while node != 0 && steps < POOL_FREE_LIST_MAX {
+        if !pending_irp_node_valid(node) {
+            return None;
+        }
+        let entry = read_volatile((node + 8) as *const PendingIrp);
+        if entry.fid == fid && entry.irp != 0 {
+            let cancel_routine = read_unaligned(
+                (entry.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64,
+            );
+            if cancel_routine != 0 {
+                return Some(PendingIrpCancelTarget {
+                    irp: entry.irp,
+                    cancel_routine,
+                });
+            }
+        }
+        node = read_volatile(node as *const u64);
+        steps += 1;
+    }
+    None
+}
+
+unsafe fn discard_completed_file_records(fid: u64) -> u64 {
+    if fid == 0 {
+        return 0;
+    }
+    let mut discarded = 0u64;
+    for index in 0..FSD_COMPLETED_READ_CAP {
+        let ptr = completed_read_slot(FSD_DATA_VADDR, index);
+        if read_volatile(ptr).fid == fid {
+            write_volatile(ptr, EMPTY_COMPLETED_READ);
+            discarded += 1;
+        }
+    }
+    for index in 0..FSD_COMPLETED_WRITE_CAP {
+        let ptr = completed_write_slot(FSD_DATA_VADDR, index);
+        if read_volatile(ptr).fid == fid {
+            write_volatile(ptr, EMPTY_COMPLETED_WRITE);
+            discarded += 1;
+        }
+    }
+    discarded
+}
+
+unsafe fn cancel_pending_irps_for_file(fid: u64, device_object: u64) -> u64 {
+    let mut cancelled = 0u64;
+    loop {
+        let Some(target) = find_pending_irp_cancel_target(fid) else {
+            break;
+        };
+        write_unaligned((target.irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
+        write_unaligned((target.irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, 0);
+        write_unaligned(
+            (target.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64,
+            0,
+        );
+        let cancel: extern "win64" fn(u64, u64) =
+            core::mem::transmute(target.cancel_routine as *const ());
+        cancel(device_object, target.irp);
+        let discarded = discard_completed_file_records(fid);
+        let trace = FSD_CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < 32 {
+            print_str(b"[fsd-cancel] fid=0x");
+            print_hex(fid as u32);
+            print_str(b" irp=0x");
+            print_hex((target.irp >> 32) as u32);
+            print_hex(target.irp as u32);
+            print_str(b" routine=0x");
+            print_hex((target.cancel_routine >> 32) as u32);
+            print_hex(target.cancel_routine as u32);
+            print_str(b" discarded=");
+            print_u64(discarded);
+            print_str(b"\n");
+        }
+        cancelled += 1;
+        if cancelled >= FSD_PENDING_IRP_CAP as u64 {
+            break;
+        }
+    }
+    let _ = discard_completed_file_records(fid);
+    cancelled
+}
+
 unsafe fn insert_completed_write(fid: u64, status: u32, info: u64) -> bool {
     if fid == 0 {
         return false;
@@ -682,33 +779,26 @@ unsafe fn insert_completed_read(
     false
 }
 
-/// Take (consume) a stashed completed-pending-read for `fid`, if any. Returns `(status, info, bytes)`.
-pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
-    let mut best_instance = usize::MAX;
-    let mut best_slot = usize::MAX;
-    let mut best_seq = u64::MAX;
-    if let Some(instances) = driver_instances() {
-        for (instance, inst) in instances.iter().enumerate() {
-            if !inst.used {
-                continue;
-            }
-            let Some(win) = ExecVaWindow::try_for_instance(instance) else {
-                continue;
-            };
-            for slot_index in 0..FSD_COMPLETED_READ_CAP {
-                let slot = read_volatile(completed_read_slot(win.data_va, slot_index));
-                if slot.fid == fid && slot.fid != 0 && slot.seq < best_seq {
-                    best_instance = instance;
-                    best_slot = slot_index;
-                    best_seq = slot.seq;
-                }
-            }
-        }
-    }
-    if best_instance == usize::MAX {
+unsafe fn take_completed_read_from_instance(
+    instance: usize,
+    fid: u64,
+) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
+    if fid == 0 {
         return None;
     }
-    let win = ExecVaWindow::try_for_instance(best_instance)?;
+    let win = ExecVaWindow::try_for_instance(instance)?;
+    let mut best_slot = usize::MAX;
+    let mut best_seq = u64::MAX;
+    for slot_index in 0..FSD_COMPLETED_READ_CAP {
+        let slot = read_volatile(completed_read_slot(win.data_va, slot_index));
+        if slot.fid == fid && slot.seq < best_seq {
+            best_slot = slot_index;
+            best_seq = slot.seq;
+        }
+    }
+    if best_slot == usize::MAX {
+        return None;
+    }
     let ptr = completed_read_slot(win.data_va, best_slot);
     let slot = read_volatile(ptr);
     write_volatile(ptr, EMPTY_COMPLETED_READ);
@@ -718,36 +808,45 @@ pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::v
     Some((slot.status, slot.info, bytes))
 }
 
-pub(crate) unsafe fn take_completed_write(fid: u64) -> Option<(u32, u64)> {
-    let mut best_instance = usize::MAX;
-    let mut best_slot = usize::MAX;
-    let mut best_seq = u64::MAX;
-    if let Some(instances) = driver_instances() {
-        for (instance, inst) in instances.iter().enumerate() {
-            if !inst.used {
-                continue;
-            }
-            let Some(win) = ExecVaWindow::try_for_instance(instance) else {
-                continue;
-            };
-            for slot_index in 0..FSD_COMPLETED_WRITE_CAP {
-                let slot = read_volatile(completed_write_slot(win.data_va, slot_index));
-                if slot.fid == fid && slot.fid != 0 && slot.seq < best_seq {
-                    best_instance = instance;
-                    best_slot = slot_index;
-                    best_seq = slot.seq;
-                }
-            }
-        }
-    }
-    if best_instance == usize::MAX {
+/// Take (consume) a stashed completed-pending-read for `fid` from `device_id`'s hosted component.
+/// Returns `(status, info, bytes)`.
+pub(crate) unsafe fn take_completed_read_for_device(
+    device_id: u64,
+    fid: u64,
+) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
+    let (instance, _) = instance_by_device_id(device_id)?;
+    take_completed_read_from_instance(instance, fid)
+}
+
+unsafe fn take_completed_write_from_instance(instance: usize, fid: u64) -> Option<(u32, u64)> {
+    if fid == 0 {
         return None;
     }
-    let win = ExecVaWindow::try_for_instance(best_instance)?;
+    let win = ExecVaWindow::try_for_instance(instance)?;
+    let mut best_slot = usize::MAX;
+    let mut best_seq = u64::MAX;
+    for slot_index in 0..FSD_COMPLETED_WRITE_CAP {
+        let slot = read_volatile(completed_write_slot(win.data_va, slot_index));
+        if slot.fid == fid && slot.seq < best_seq {
+            best_slot = slot_index;
+            best_seq = slot.seq;
+        }
+    }
+    if best_slot == usize::MAX {
+        return None;
+    }
     let ptr = completed_write_slot(win.data_va, best_slot);
     let slot = read_volatile(ptr);
     write_volatile(ptr, EMPTY_COMPLETED_WRITE);
     Some((slot.status, slot.info))
+}
+
+pub(crate) unsafe fn take_completed_write_for_device(
+    device_id: u64,
+    fid: u64,
+) -> Option<(u32, u64)> {
+    let (instance, _) = instance_by_device_id(device_id)?;
+    take_completed_write_from_instance(instance, fid)
 }
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
@@ -4725,6 +4824,8 @@ const WDM_X64_IRP_CURRENT_LOCATION_OFFSET: u64 = 0x43;
 const WDM_X64_IRP_STACK_COUNT_OFFSET: u64 = 0x42;
 const WDM_X64_IRP_IO_STATUS_STATUS_OFFSET: u64 = 0x30;
 const WDM_X64_IRP_PENDING_RETURNED_OFFSET: u64 = 0x41;
+const WDM_X64_IRP_CANCEL_OFFSET: u64 = 0x44;
+const WDM_X64_IRP_CANCEL_IRQL_OFFSET: u64 = 0x45;
 const WDM_X64_IRP_CANCEL_ROUTINE_OFFSET: u64 = 0x68;
 const WDM_X64_IRP_DRIVER_CONTEXT3_OFFSET: u64 = 0x90;
 const WDM_X64_IO_STACK_MINOR_OFFSET: u64 = 0x01;
@@ -8149,6 +8250,12 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
             deliveries.saturating_add(1),
         );
         return (0, (claimed != 0) as u64);
+    }
+    if major == FSD_DISPATCH_CANCEL_PENDING_FILE {
+        let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+        let cancelled = cancel_pending_irps_for_file(file_id, devobj);
+        return (0, cancelled);
     }
     if major == FSD_DISPATCH_ADD_DEVICE {
         let add_device = read_volatile((FSD_SHARED_VADDR + SH_ADD_DEVICE) as *const u64);
@@ -12496,6 +12603,26 @@ pub(crate) unsafe fn dispatch_irp_to_device_result(
 ) -> Result<(i32, u64), u32> {
     require_hosted_device_ready_for_dispatch(device_id)?;
     dispatch_external_irp_to_device_record_result(device_id, major, fsctl, file_id, in_data, out)
+}
+
+pub(crate) unsafe fn cancel_pending_file_irps(
+    device_id: u64,
+    file_id: u64,
+) -> Result<u64, u32> {
+    let mut out = [];
+    let (status, cancelled) = dispatch_irp_to_device_result(
+        device_id,
+        FSD_DISPATCH_CANCEL_PENDING_FILE,
+        0,
+        file_id,
+        &[],
+        &mut out,
+    )?;
+    if status == 0 {
+        Ok(cancelled)
+    } else {
+        Err(status as u32)
+    }
 }
 
 fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {

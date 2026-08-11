@@ -86,6 +86,7 @@ static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
 static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static NT_CANCEL_IO_FILE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PIPE_RETAINED_CANCEL_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static HOSTED_EXE_OPEN_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_CACHE_MISS_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -2189,6 +2190,7 @@ impl ExecNtHandler {
         write_field!(io_completion_deadline_100ns, u64::MAX);
         write_field!(io_completion_wake, None);
         write_field!(io_signal_event, -1);
+        write_field!(pipe_park_device_id, 0);
         write_field!(pipe_park_fid, 0);
         write_field!(pipe_park_buffer_va, 0);
         write_field!(pipe_park_buffer_len, 0);
@@ -7889,7 +7891,51 @@ impl ExecNtHandler {
         true
     }
 
+    unsafe fn cancel_retained_file_irps(&mut self, device_id: u64, file_id: u64) -> u64 {
+        let resolved_device_id = if device_id != 0 {
+            device_id
+        } else {
+            self.file_completion.device_id(file_id).unwrap_or(0)
+        };
+        if resolved_device_id == 0 || file_id == 0 {
+            return 0;
+        }
+        match driver_launch::cancel_pending_file_irps(resolved_device_id, file_id) {
+            Ok(cancelled) => {
+                let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 64 || cancelled != 0 {
+                    print_str(b"[pipe-cancel-retained] #");
+                    print_u64(trace);
+                    print_str(b" dev=");
+                    print_u64(resolved_device_id);
+                    print_str(b" fid=0x");
+                    print_hex(file_id as u32);
+                    print_str(b" irps=");
+                    print_u64(cancelled);
+                    print_str(b"\n");
+                }
+                cancelled
+            }
+            Err(status) => {
+                let trace = PIPE_RETAINED_CANCEL_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 64 {
+                    print_str(b"[pipe-cancel-retained] #");
+                    print_u64(trace);
+                    print_str(b" dev=");
+                    print_u64(resolved_device_id);
+                    print_str(b" fid=0x");
+                    print_hex(file_id as u32);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+                0
+            }
+        }
+    }
+
     unsafe fn complete_cancelled_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
+        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id);
         if waiter.iosb_va != 0 {
             let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
         }
@@ -7916,6 +7962,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn complete_cancelled_pipe_listen(&mut self, listen: nt_io_manager::AsyncListen) {
+        let _ = self.cancel_retained_file_irps(listen.device_id, listen.server_file_id);
         if listen.iosb_va != 0 {
             let _ = self.write_current_iosb(listen.iosb_va, STATUS_CANCELLED, 0);
         }
@@ -7931,6 +7978,17 @@ impl ExecNtHandler {
             let _ = self.signal_event_index(listen.event_obj_idx as usize);
         }
         self.release_file_reference(listen.server_file_id);
+    }
+
+    unsafe fn abandon_terminating_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
+        if waiter.reply_cap == 0 {
+            self.complete_cancelled_pipe_waiter(waiter);
+            return;
+        }
+        let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id);
+        release_reply_pool_cap(waiter.reply_cap);
+        thread_wait_state_clear_badge_ready(self, waiter.badge);
+        self.release_file_reference(waiter.file_id);
     }
 
     unsafe fn complete_cancelled_pipe_name_waiter(
@@ -7966,6 +8024,15 @@ impl ExecNtHandler {
             file_id,
             |listen| self.complete_cancelled_pipe_listen(listen),
         );
+        cancelled
+    }
+
+    pub(crate) unsafe fn cancel_pipe_io_for_thread_teardown(&mut self, tid: u64) -> usize {
+        let mut cancelled = 0usize;
+        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_WAITERS))
+            .cancel_thread_with(tid, |waiter| self.abandon_terminating_pipe_waiter(waiter));
+        cancelled += (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS))
+            .cancel_thread_with(tid, |listen| self.complete_cancelled_pipe_listen(listen));
         cancelled
     }
 
@@ -17838,6 +17905,7 @@ impl ExecNtHandler {
                 let raw_output_len = args[9] as u32 as usize;
                 let file_route = self.npfs_file_route_for(args[0]);
                 let fid = file_route.map(|route| route.file_id).unwrap_or(0);
+                let route_device_id = file_route.map(|route| route.device_id).unwrap_or(0);
                 let is_pipe_wait = (fsctl as u32) == FSCTL_PIPE_WAIT;
                 let is_pipe_transceive = (fsctl as u32) == FSCTL_PIPE_TRANSCEIVE;
                 let mut transceive_file_retained = false;
@@ -18028,6 +18096,7 @@ impl ExecNtHandler {
                 {
                     let synchronous = self.file_completion.is_synchronous(fid).unwrap_or(true);
                     if synchronous {
+                        self.pipe_park_device_id = route_device_id;
                         self.pipe_park_fid = fid;
                         self.pipe_park_buffer_va = args[8];
                         self.pipe_park_buffer_len = args[9] as u32;
@@ -18039,6 +18108,7 @@ impl ExecNtHandler {
                         self.pipe_park_transceive = true;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
+                            device_id: route_device_id,
                             file_id: fid,
                             pi: self.pi as u32,
                             tid: self.current_tid,
@@ -18089,6 +18159,7 @@ impl ExecNtHandler {
                     if retain_status.is_ok()
                         && table
                             .arm(nt_io_manager::AsyncListen {
+                                device_id: route_device_id,
                                 server_file_id: fid,
                                 event_obj_idx,
                                 pi: self.pi as u32,
@@ -23237,6 +23308,7 @@ impl ExecNtHandler {
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut completion_file_id = 0u64;
+                let mut pending_write_device_id = 0u64;
                 let mut pending_write_fid = 0u64;
                 let mut async_file_retained = false;
                 let mut status = if !iosb_ok {
@@ -23361,6 +23433,8 @@ impl ExecNtHandler {
                                                         routed = true;
                                                         information = completed;
                                                         if driver_status as u32 == 0x0000_0103 {
+                                                            pending_write_device_id =
+                                                                route.device_id;
                                                             pending_write_fid = file_id;
                                                         }
                                                         driver_status as u32
@@ -23387,6 +23461,7 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
+                        self.pipe_park_device_id = pending_write_device_id;
                         self.pipe_park_fid = pending_write_fid;
                         self.pipe_park_buffer_va = 0;
                         self.pipe_park_buffer_len = 0;
@@ -23399,6 +23474,7 @@ impl ExecNtHandler {
                         self.pipe_park_is_write = true;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
+                            device_id: pending_write_device_id,
                             file_id: pending_write_fid,
                             pi: self.pi as u32,
                             tid: self.current_tid,
@@ -23599,6 +23675,7 @@ impl ExecNtHandler {
                 let mut output = alloc::vec![0u8; output_capacity];
                 let mut information = 0u64;
                 let mut routed = false;
+                let mut pending_read_device_id = 0u64;
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
                 let mut completion_file_id = 0u64;
                 let mut async_file_retained = false;
@@ -23816,6 +23893,8 @@ impl ExecNtHandler {
                                                             }
                                                         }
                                                         if driver_status as u32 == 0x0000_0103 {
+                                                            pending_read_device_id =
+                                                                route.device_id;
                                                             pending_read_fid = file_id;
                                                         }
                                                         driver_status as u32
@@ -23842,6 +23921,7 @@ impl ExecNtHandler {
                     let event_obj_idx =
                         completion_event_index.map_or(u64::MAX, |index| index as u64);
                     if synchronous {
+                        self.pipe_park_device_id = pending_read_device_id;
                         self.pipe_park_fid = pending_read_fid;
                         self.pipe_park_buffer_va = buffer;
                         self.pipe_park_buffer_len = len as u32;
@@ -23853,6 +23933,7 @@ impl ExecNtHandler {
                         self.pipe_park_transceive = false;
                     } else {
                         let waiter = nt_io_manager::PipeWaiter {
+                            device_id: pending_read_device_id,
                             file_id: pending_read_fid,
                             pi: self.pi as u32,
                             tid: self.current_tid,

@@ -44,13 +44,23 @@ Userinit = "%SystemRoot%\system32\userinit.exe"`.
 
 Active slice (2026-08-11): the OS now reaches real IDD_LOGON paint, real RETURN delivery,
 `userinit.exe`, and explorer GUI process connection. It still does not reach final explorer shell
-chrome pixels. The latest visible wall is after `NtUserProcessConnect`: explorer issues native and
-win32k syscalls, cursor objects are created, and the system remains alive through periodic census,
-but the shell-startup frontier repeatedly reports deferred quiesce while winlogon continues
-profile/wait traffic (`profile-frontier` around SSN 198 and related native calls). Next work should
-identify the real profile, environment, registry, wait, or shell COM syscall that keeps explorer from
-reaching its first painted shell windows. Do not add userinit, explorer launch, profile, callback, or
-shell-paint fallbacks.
+chrome pixels. `.tmp/run-desktop-shell-frontier-cleanup-20260811.log` proves the old
+watchdog-side shell TCB resume is gone: `WlxActivateUserShell` reads the real `Userinit` value,
+spawns `userinit.exe`, then `explorer.exe`, and explorer completes `NtUserProcessConnect`. The
+honest wall is after cursor/icon GDI bootstrap, immediately after successful
+`NtGdiCreateCompatibleDC`/`NtGdiCreateCompatibleBitmap`, before the first
+`NtUserCreateWindowEx`. The kernel now emits a generic `[shell-quiesce]` main-thread register,
+thread, stack, caller, and IAT dump for any `InteractiveShell` process stuck at that frontier.
+Do not add userinit, explorer launch, profile, callback, or shell-paint fallbacks.
+
+Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
+`WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
+threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
+progress is mechanism-level: pipe waiters and async listens now carry their owning device id,
+completion stashes are consumed per hosted driver instance, and thread/NtCancelIoFile cleanup routes
+through the hosted driver's cancel routine instead of preserving stale pipe IRPs. Next serialized
+desktop validation should prove whether the DCE/RPC context-handle faults (`0x1c00001a`) disappear
+and whether the run returns to userinit/explorer shell activation.
 
 Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
@@ -3518,10 +3528,27 @@ before unrelated executive traffic monopolises the receive loop.
   `explorer.exe`, and explorer reaches real `NtUserProcessConnect`. Remaining work moves to the
   profile/userinit/explorer shell-chrome frontier, not USER heap aliasing.
 
-- Interactive shell frontier cleanup in progress. The progress-stall quiesce deferral no longer
-  reads the explorer-only proof histogram or hard-codes `pi=6`; it now uses the registered
-  `InteractiveShell` process role plus the generic `W32_CONNECTED_MASK` and a role-derived
-  `NtUserCreateWindowEx` attempt bit. The old explorer counters remain proof instrumentation, not
-  kernel control policy. Next validation should confirm the trace changes to `[shell-frontier]` and
-  then continue the real shell-chrome investigation at the first long `NtGdiOpenDCW`/window-create
-  boundary if pixels are still absent.
+- Interactive shell frontier cleanup in progress. The progress-stall watchdog no longer resumes a
+  hardcoded explorer TCB, either by `pi=6` or by the registered shell role. It only reports a
+  diagnostic `[shell-frontier]` line when an `InteractiveShell` process has completed
+  `NtUserProcessConnect` but has not attempted `NtUserCreateWindowEx`; quiesce then runs honestly.
+  The win32k startup dispatch budget is role-based for interactive shell GUI clients, and the
+  `NtGdiOpenDCW` marshal path now emits bounded generic argument traces. The quiesce dump path is
+  shared by winlogon and the interactive shell, with tag-driven output (`[wl-quiesce]` /
+  `[shell-quiesce]`) instead of a second explorer-specific implementation. `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `cargo test --manifest-path crates/nt-io-manager/Cargo.toml`, and
+  `cargo test --manifest-path crates/nt-io-completion/Cargo.toml` pass for this checkpoint. The old
+  explorer counters remain proof instrumentation, not kernel control policy.
+
+- NPFS retained-IRP cancellation in progress. The old thread-teardown path no longer detaches
+  reply-cap-blocked pipe waiters while preserving the driver completion owner. `PipeWaiter` and
+  `AsyncListen` records are device-qualified, the no-finalizer table cancellation APIs have been
+  removed, redrive consumes completed read/write stashes from the owning hosted driver instance, and
+  `NtCancelIoFile`/thread teardown now dispatch a bounded internal cancel request to the owning
+  component so npfs.sys runs its real cancel routine and `IoCompleteRequest` path. Host validation:
+  `cargo test -p nt-io-manager cancel_thread -- --nocapture`,
+  `cargo test -p nt-io-completion file -- --nocapture`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Remaining validation: rebuild the executive/rootserver and run one serialized `./run.sh --desktop`
+  to confirm the EventLog/SCM DCE/RPC context-handle fault moves forward.

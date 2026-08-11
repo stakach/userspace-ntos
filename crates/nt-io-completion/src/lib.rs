@@ -226,6 +226,12 @@ impl<const FILES: usize> FileCompletionTable<FILES> {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub fn device_id(&self, file_id: u64) -> Result<u64, u32> {
+        self.entry(file_id)
+            .map(|entry| entry.device_id)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub fn set_signaled(&mut self, file_id: u64, signaled: bool) -> Result<(), u32> {
         let entry = self.entry_mut(file_id).ok_or(STATUS_INVALID_HANDLE)?;
         entry.signaled = signaled;

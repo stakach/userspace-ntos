@@ -684,15 +684,17 @@ fn valid_completion_mode(mode: u32) -> bool {
 // `complete` for it).
 
 /// One parked pipe read awaiting peer data. All fields are the executive-side
-/// context needed to complete the read when data arrives: the npfs `file_id`
-/// (the reading end's `FsContext`) to re-issue the read against, the owning
+/// context needed to complete the read when data arrives: the owning device id,
+/// the npfs `file_id` (the reading end's `FsContext`) to re-issue the read against, the owning
 /// process index + thread id (whose VSpace/stack-mirror the bytes land in), the
 /// user `buffer`/`iosb` VAs, the buffer length, the seL4 reply cap held for the
 /// blocked thread, and its native-syscall resume context (RCX/RSP/RFLAGS). The
-/// pure table treats them as opaque `u64`s — only `file_id` participates in the
+/// pure table treats them as opaque values — only `file_id` participates in the
 /// table's own logic (as the slot key); the rest are carried verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PipeWaiter {
+    /// NT I/O manager device id that owns `file_id`.
+    pub device_id: u64,
     /// npfs `FsContext` of the READING end this waiter is blocked on (the slot key).
     pub file_id: u64,
     /// Owning process index (which VSpace / stack-mirror to write the bytes into).
@@ -841,17 +843,22 @@ impl<const N: usize> PipeWaiterTable<N> {
         self.slots.get_mut(slot).and_then(|s| s.take())
     }
 
-    /// Cancel + free any waiter owned by `tid` (thread teardown). Returns the
-    /// count freed.
-    pub fn cancel_thread(&mut self, tid: u64) -> usize {
-        let mut n = 0;
+    /// Cancel + free any waiter owned by `tid`, invoking `complete` with every removed waiter. This
+    /// is the thread-teardown form: the caller owns completing or abandoning the retained I/O in the
+    /// real driver before releasing the table slot.
+    pub fn cancel_thread_with<F>(&mut self, tid: u64, mut complete: F) -> usize
+    where
+        F: FnMut(PipeWaiter),
+    {
+        let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.map(|w| w.tid) == Some(tid) {
-                *slot = None;
-                n += 1;
+            if slot.is_some_and(|waiter| waiter.tid == tid) {
+                let waiter = slot.take().unwrap();
+                complete(waiter);
+                count += 1;
             }
         }
-        n
+        count
     }
 
     /// Cancel + free any waiter owned by `tid` for `file_id`, invoking `complete` with every removed
@@ -870,55 +877,6 @@ impl<const N: usize> PipeWaiterTable<N> {
             }
         }
         count
-    }
-
-    /// Cancel only reply-cap-blocked operations. Asynchronous requests have already returned to
-    /// user mode and must remain owned until the driver produces their final completion.
-    pub fn cancel_blocked_thread(&mut self, tid: u64) -> usize {
-        let mut count = 0;
-        for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|waiter| waiter.tid == tid && waiter.reply_cap != 0) {
-                *slot = None;
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Detach reply-cap-blocked operations from a terminating thread while preserving the driver
-    /// completion owner. The finalizer will discard user copyout and release the file reference.
-    ///
-    /// The callback receives every stolen reply cap that was detached so the executive can return it to
-    /// the reply pool without relying on a fixed-size scratch array.
-    pub fn detach_blocked_thread_with_reply_caps<F>(&mut self, tid: u64, mut release: F) -> usize
-    where
-        F: FnMut(u64),
-    {
-        let mut count = 0;
-        for waiter in self.slots.iter_mut().flatten() {
-            if waiter.tid == tid && waiter.reply_cap != 0 {
-                release(waiter.reply_cap);
-                waiter.tid = 0;
-                waiter.buffer_va = 0;
-                waiter.buffer_len = 0;
-                waiter.iosb_va = 0;
-                waiter.apc_context = 0;
-                waiter.completion_port_suppressed = false;
-                waiter.event_obj_idx = u64::MAX;
-                waiter.reply_cap = 0;
-                waiter.resume_ip = 0;
-                waiter.resume_sp = 0;
-                waiter.resume_flags = 0;
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Detach blocked operations without observing the reply caps. Tests and legacy callers use this
-    /// when the cap-lifecycle side is irrelevant.
-    pub fn detach_blocked_thread(&mut self, tid: u64) -> usize {
-        self.detach_blocked_thread_with_reply_caps(tid, |_| {})
     }
 
     /// Is there already a parked read on `file_id`? (Guards double-parking the
@@ -1055,6 +1013,8 @@ impl PipeFidNameTable {
 /// SUCCESS (in the server's VSpace) and signals `event_obj_idx` (waking the server's wait-array).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AsyncListen {
+    /// NT I/O manager device id that owns `server_file_id`.
+    pub device_id: u64,
     /// npfs `FsContext` of the SERVER end that posted FSCTL_PIPE_LISTEN (the slot key).
     pub server_file_id: u64,
     /// The obj_ns EVENT index (resolved in the SERVER's handle table at listen time) to SIGNAL on
@@ -1297,55 +1257,17 @@ impl<const N: usize> AsyncListenTable<N> {
             .any(|slot| slot.is_some_and(|listen| listen.tid == tid))
     }
 
-    /// Cancel all pending listens issued by `tid`, returning the number removed.
-    pub fn cancel_thread(&mut self, tid: u64) -> usize {
-        let mut count = 0;
-        for slot in &mut self.slots {
-            if slot.is_some_and(|listen| listen.tid == tid) {
-                *slot = None;
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Cancel all pending listens issued by `tid`, copying each removed server file id into `out`.
-    ///
-    /// The executive retains the listen's `FILE_OBJECT` while the IRP is pending; callers use the
-    /// returned ids to release those references after cancellation. Returns the number of removed
-    /// listens. If `out` is shorter than the number removed, excess ids are dropped from the copy but
-    /// still counted.
-    pub fn cancel_thread_collect_file_ids(&mut self, tid: u64, out: &mut [u64]) -> usize {
-        let mut count = 0;
-        for slot in &mut self.slots {
-            if let Some(listen) = *slot {
-                if listen.tid == tid {
-                    if count < out.len() {
-                        out[count] = listen.server_file_id;
-                    }
-                    *slot = None;
-                    count += 1;
-                }
-            }
-        }
-        count
-    }
-
-    /// Cancel all pending listens issued by `tid`, invoking `release` for every removed server file
-    /// id. This is the unbounded form the executive uses so a growable table cannot leak retained
-    /// FILE_OBJECT references when a thread exits with more listens than a fixed scratch array held.
-    pub fn cancel_thread_with_file_ids<F>(&mut self, tid: u64, mut release: F) -> usize
+    /// Cancel all pending listens issued by `tid`, invoking `complete` with every removed record.
+    pub fn cancel_thread_with<F>(&mut self, tid: u64, mut complete: F) -> usize
     where
-        F: FnMut(u64),
+        F: FnMut(AsyncListen),
     {
         let mut count = 0;
         for slot in &mut self.slots {
-            if let Some(listen) = *slot {
-                if listen.tid == tid {
-                    release(listen.server_file_id);
-                    *slot = None;
-                    count += 1;
-                }
+            if slot.is_some_and(|listen| listen.tid == tid) {
+                let listen = slot.take().unwrap();
+                complete(listen);
+                count += 1;
             }
         }
         count
@@ -1498,6 +1420,7 @@ mod tests {
 
     fn wtr(file_id: u64, pi: u32, tid: u64) -> PipeWaiter {
         PipeWaiter {
+            device_id: 0xD00D,
             file_id,
             pi,
             tid,
@@ -1547,26 +1470,7 @@ mod tests {
         assert_eq!(pending.reply_cap, 0);
         assert_eq!(pending.apc_context, 0xDEAD);
         assert_eq!(pending.event_obj_idx, 9);
-        assert_eq!(t.cancel_blocked_thread(7), 0);
         assert!(t.parked_on(0xAA));
-    }
-
-    #[test]
-    fn terminating_blocked_thread_detaches_without_dropping_completion_owner() {
-        let mut t = PipeWaiterTable::<1>::new();
-        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
-        let mut released = std::vec::Vec::new();
-        assert_eq!(
-            t.detach_blocked_thread_with_reply_caps(7, |cap| released.push(cap)),
-            1
-        );
-        assert_eq!(released, std::vec![0x40 + 0xAA]);
-        let waiter = t.get(slot).unwrap();
-        assert_eq!(waiter.file_id, 0xAA);
-        assert_eq!(waiter.tid, 0);
-        assert_eq!(waiter.reply_cap, 0);
-        assert_eq!(waiter.buffer_va, 0);
-        assert_eq!(waiter.iosb_va, 0);
     }
 
     #[test]
@@ -1650,8 +1554,34 @@ mod tests {
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap(); // same tid, 2nd end
         t.park(wtr(0xCC, 2, 4)).unwrap(); // different thread
-        assert_eq!(t.cancel_thread(7), 2);
+        let mut cancelled = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_with(7, |waiter| cancelled.push(waiter.file_id)),
+            2
+        );
+        assert_eq!(cancelled, std::vec![0xAA, 0xBB]);
         assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xCC));
+    }
+
+    #[test]
+    fn pipe_waiter_cancel_thread_callback_releases_every_waiter() {
+        let mut t = PipeWaiterTable::<8>::new();
+        t.park(wtr(0xAA, 3, 7)).unwrap();
+        t.park(wtr(0xBB, 3, 7)).unwrap();
+        t.park(wtr(0xCC, 2, 4)).unwrap();
+
+        let mut cancelled = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_with(7, |waiter| {
+                cancelled.push((waiter.device_id, waiter.file_id, waiter.tid))
+            }),
+            2
+        );
+        assert_eq!(cancelled, std::vec![(0xD00D, 0xAA, 7), (0xD00D, 0xBB, 7)]);
+        assert_eq!(t.len(), 1);
+        assert!(!t.parked_on(0xAA));
+        assert!(!t.parked_on(0xBB));
         assert!(t.parked_on(0xCC));
     }
 
@@ -2175,6 +2105,7 @@ mod tests {
 
     fn al(server_file_id: u64, event_obj_idx: u64) -> AsyncListen {
         AsyncListen {
+            device_id: 0xD00D,
             server_file_id,
             event_obj_idx,
             pi: 3,
@@ -2268,24 +2199,12 @@ mod tests {
         other.tid = 88;
         t.arm(other).unwrap();
 
-        assert_eq!(t.cancel_thread(77), 1);
-        assert!(!t.has_thread(77));
-        assert!(t.has_thread(88));
-        assert!(t.armed(0xB));
-    }
-
-    #[test]
-    fn async_listen_cancel_thread_collects_retained_file_ids() {
-        let mut t = AsyncListenTable::<8>::new();
-        t.arm(al(0xA, 1)).unwrap();
-        t.arm(al(0xC, 3)).unwrap();
-        let mut other = al(0xB, 2);
-        other.tid = 88;
-        t.arm(other).unwrap();
-
-        let mut ids = [0u64; 8];
-        assert_eq!(t.cancel_thread_collect_file_ids(77, &mut ids), 2);
-        assert_eq!(&ids[..2], &[0xA, 0xC]);
+        let mut cancelled = std::vec::Vec::new();
+        assert_eq!(
+            t.cancel_thread_with(77, |listen| cancelled.push(listen.server_file_id)),
+            1
+        );
+        assert_eq!(cancelled, std::vec![0xA]);
         assert!(!t.has_thread(77));
         assert!(t.has_thread(88));
         assert!(t.armed(0xB));
@@ -2317,18 +2236,27 @@ mod tests {
     }
 
     #[test]
-    fn async_listen_cancel_thread_callback_releases_every_file_id() {
+    fn async_listen_cancel_thread_callback_releases_every_record() {
         let mut t = AsyncListenTable::<2>::new();
         t.arm(al(0xA, 1)).unwrap();
         t.arm(al(0xB, 2)).unwrap();
         t.arm(al(0xC, 3)).unwrap();
 
-        let mut released = std::vec::Vec::new();
+        let mut cancelled = std::vec::Vec::new();
         assert_eq!(
-            t.cancel_thread_with_file_ids(77, |file_id| released.push(file_id)),
+            t.cancel_thread_with(77, |listen| {
+                cancelled.push((
+                    listen.device_id,
+                    listen.server_file_id,
+                    listen.event_obj_idx,
+                ))
+            }),
             3
         );
-        assert_eq!(released, std::vec![0xA, 0xB, 0xC]);
+        assert_eq!(
+            cancelled,
+            std::vec![(0xD00D, 0xA, 1), (0xD00D, 0xB, 2), (0xD00D, 0xC, 3)]
+        );
         assert!(t.is_empty());
     }
 
@@ -2586,13 +2514,13 @@ mod tests {
 
     #[test]
     fn pipe_waiter_cancel_thread_clears_parked_on_and_reopens_slot() {
-        // cancel_thread must clear the parked_on() key AND free the slot for immediate re-park (a
-        // thread torn down mid-read; its reading end can later be re-opened by another thread).
+        // cancel_thread_with must clear the parked_on() key AND free the slot for immediate re-park
+        // after the caller has finalized the real pending IRP.
         let mut t = PipeWaiterTable::<2>::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap();
         assert!(t.parked_on(0xAA));
-        assert_eq!(t.cancel_thread(7), 2);
+        assert_eq!(t.cancel_thread_with(7, |_| {}), 2);
         assert!(!t.parked_on(0xAA), "cancel clears the parked_on key");
         assert!(!t.parked_on(0xBB));
         assert!(t.is_empty());
@@ -2643,10 +2571,10 @@ mod tests {
 
     #[test]
     fn pipe_waiter_cancel_thread_no_match_is_noop() {
-        // cancel_thread for a tid with no parked waiters frees nothing and disturbs nobody.
+        // cancel_thread_with for a tid with no parked waiters frees nothing and disturbs nobody.
         let mut t = PipeWaiterTable::<4>::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
-        assert_eq!(t.cancel_thread(999), 0);
+        assert_eq!(t.cancel_thread_with(999, |_| {}), 0);
         assert_eq!(t.len(), 1);
         assert!(t.parked_on(0xAA));
     }

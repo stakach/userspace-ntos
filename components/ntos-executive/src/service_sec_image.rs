@@ -1608,7 +1608,14 @@ fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
     None
 }
 
-fn trace_interactive_shell_startup_stall(nt_handler: &ExecNtHandler) {
+unsafe fn dump_interactive_shell_frontier_quiesce(
+    nt_handler: &ExecNtHandler,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) {
     let Some(pi) = interactive_shell_frontier_pi(nt_handler) else {
         return;
     };
@@ -1621,6 +1628,16 @@ fn trace_interactive_shell_startup_stall(nt_handler: &ExecNtHandler) {
     print_str(b" create-window-mask=0x");
     print_hex_u64(INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK.load(Ordering::Relaxed));
     print_str(b"\n");
+    dump_hosted_main_thread_quiesce(
+        b"shell-quiesce",
+        pi,
+        nt_handler,
+        loaded_images,
+        reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
 }
 
 struct HostedExeSpawn<'a> {
@@ -4233,11 +4250,17 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_epoch = ep;
                 last_progress_t = now;
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
-                if defer_interactive_shell_startup_quiesce(&nt_handler) {
-                    last_progress_t = now;
-                } else if defer_quiesce_for_active_user_callbacks(b"progress-stall") {
+                if defer_quiesce_for_active_user_callbacks(b"progress-stall") {
                     last_progress_t = now;
                 } else {
+                    dump_interactive_shell_frontier_quiesce(
+                        &nt_handler,
+                        &*hosted_loaded_images,
+                        &reg,
+                        ntdll,
+                        procs,
+                        pfilled,
+                    );
                     print_str(b"[quiesce] no forward progress for ~45s wall-clock (no new load/fill/event/paint) -> run gate\n");
                     stop = m1;
                     break;
@@ -7008,6 +7031,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_deadline: Option<u64> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
+            let mut park_pipe_device_id: u64 = 0;
             let mut park_pipe_fid: u64 = 0;
             let mut park_pipe_buffer_va: u64 = 0;
             let mut park_pipe_buffer_len: u32 = 0;
@@ -7118,6 +7142,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_deadline_100ns = u64::MAX;
                 nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
+                nt_handler.pipe_park_device_id = 0;
                 nt_handler.pipe_park_fid = 0;
                 nt_handler.pipe_park_buffer_va = 0;
                 nt_handler.pipe_park_buffer_len = 0;
@@ -7749,6 +7774,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_dbgk_reporter = true;
                 }
                 if nt_handler.pipe_park_fid != 0 {
+                    park_pipe_device_id = nt_handler.pipe_park_device_id;
                     park_pipe_fid = nt_handler.pipe_park_fid;
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
@@ -8752,11 +8778,10 @@ pub(crate) unsafe fn service_sec_image(
                     const W32_RESOURCE_CALLBACK_LIMIT: u64 = 1536;
                     const W32_POST_SAS_DIALOG_LIMIT: u64 = 2048;
                     const W32_IDD_LOGON_LIMIT: u64 = 4096;
-                    // Explorer's first real shell window startup legitimately crosses the generic
-                    // 500-dispatch budget now that userinit launches the real process and user32/ATL
-                    // run callbacks instead of the old synthetic create path. Keep it bounded, but
-                    // do not kill the shell midway through its WM_NCCREATE/WM_CREATE burst.
-                    const W32_EXPLORER_STARTUP_LIMIT: u64 = 2048;
+                    // An interactive shell's first real window startup legitimately crosses the
+                    // generic 500-dispatch budget once user32/ATL run callbacks instead of synthetic
+                    // create paths. Keep it bounded, but do not tie the guard to explorer.exe.
+                    const W32_SHELL_STARTUP_LIMIT: u64 = 2048;
                     // Typing credentials into the painted dialog is a second bounded burst: every
                     // character runs the real edit control's caret/invalidate/repaint cycle on top
                     // of the dialog's own pump. Grant the headroom only once keystrokes are in.
@@ -8774,8 +8799,8 @@ pub(crate) unsafe fn service_sec_image(
                         W32_POST_SAS_DIALOG_LIMIT
                     } else if winlogon_gui_client && win32k_glue::real_resource_callback_started() {
                         W32_RESOURCE_CALLBACK_LIMIT
-                    } else if explorer_gui_client && EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0 {
-                        W32_EXPLORER_STARTUP_LIMIT
+                    } else if shell_gui_client {
+                        W32_SHELL_STARTUP_LIMIT
                     } else {
                         W32_TOTAL_LIMIT
                     };
@@ -11157,6 +11182,10 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     );
+                    let mut open_dcw_tail_read = false;
+                    let mut open_dcw_b_display = u64::MAX;
+                    let mut open_dcw_hspool = u64::MAX;
+                    let mut open_dcw_dhpdev_out = u64::MAX;
                     if sp != 0 {
                         let b_display = client_read_u64_mapped(
                             pi as u64,
@@ -11182,6 +11211,10 @@ pub(crate) unsafe fn service_sec_image(
                         if let (Some(b_display), Some(hspool), Some(dhpdev_out)) =
                             (b_display, hspool, dhpdev_out)
                         {
+                            open_dcw_tail_read = true;
+                            open_dcw_b_display = b_display;
+                            open_dcw_hspool = hspool;
+                            open_dcw_dhpdev_out = dhpdev_out;
                             if dhpdev_out != 0 {
                                 let slot = RC_ARG_CAPTURE_NEXT.fetch_add(1, Ordering::Relaxed)
                                     % RC_ARG_CAPTURE_SLOTS;
@@ -11196,6 +11229,38 @@ pub(crate) unsafe fn service_sec_image(
                                 open_dcw_dhpdev_copyout = (dhpdev_out, staged_out);
                             }
                         }
+                    }
+                    let n = OPEN_DCW_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        print_str(b"[w32marshal] NtGdiOpenDCW pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" dev=0x");
+                        print_hex_u64(a0);
+                        print_str(b"->0x");
+                        print_hex_u64(d_a0);
+                        print_str(b" devmode=0x");
+                        print_hex_u64(a1);
+                        print_str(b"->0x");
+                        print_hex_u64(d_a1);
+                        print_str(b" logaddr=0x");
+                        print_hex_u64(a2);
+                        print_str(b"->0x");
+                        print_hex_u64(d_a2);
+                        print_str(b" type=");
+                        print_u64(a3);
+                        print_str(b" tail-read=");
+                        print_u64(open_dcw_tail_read as u64);
+                        print_str(b" display=0x");
+                        print_hex_u64(open_dcw_b_display);
+                        print_str(b" hspool=0x");
+                        print_hex_u64(open_dcw_hspool);
+                        print_str(b" dhpdev-out=0x");
+                        print_hex_u64(open_dcw_dhpdev_out);
+                        print_str(b" staged=");
+                        print_u64((open_dcw_stack_arg_count == open_dcw_stack_args.len()) as u64);
+                        print_str(b"\n");
                     }
                 } else if m0 == 0x1077 {
                     if shell_gui_client && pi < 64 {
@@ -13804,6 +13869,7 @@ pub(crate) unsafe fn service_sec_image(
             // retaining an owned IRP would leave both completion and ThreadIsIoPending inconsistent.
             if park_pipe_fid != 0 && reply_main != 0 {
                 if pipe_wait_park(
+                    park_pipe_device_id,
                     park_pipe_fid,
                     pi as u32,
                     nt_handler.current_tid,
@@ -13994,6 +14060,14 @@ pub(crate) unsafe fn service_sec_image(
         park_and_log!(pi, b"other-fault", m1, m1);
     }
     dump_interactive_logon_quiesce(
+        &nt_handler,
+        &*hosted_loaded_images,
+        &reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
+    dump_interactive_shell_frontier_quiesce(
         &nt_handler,
         &*hosted_loaded_images,
         &reg,
@@ -17559,10 +17633,42 @@ unsafe fn dump_interactive_logon_quiesce(
         print_str(b"[wl-quiesce] no runtime-registered interactive logon process\n");
         return;
     };
+    dump_hosted_main_thread_quiesce(
+        b"wl-quiesce",
+        pi,
+        nt_handler,
+        loaded_images,
+        reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
+}
+
+#[inline]
+fn print_quiesce_tag(label: &[u8], suffix: &[u8]) {
+    print_str(b"[");
+    print_str(label);
+    print_str(suffix);
+    print_str(b"]");
+}
+
+#[inline(never)]
+unsafe fn dump_hosted_main_thread_quiesce(
+    label: &[u8],
+    pi: usize,
+    nt_handler: &ExecNtHandler,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) {
     let Some((tid, tcb, badge)) =
         nt_handler.hosted_thread_identity_for_role(pi, HostedThreadRole::Main)
     else {
-        print_str(b"[wl-quiesce] interactive logon process has no live main-thread TCB pi=");
+        print_quiesce_tag(label, b"");
+        print_str(b" process has no live main-thread TCB pi=");
         print_u64(pi as u64);
         print_str(b"\n");
         return;
@@ -17578,7 +17684,8 @@ unsafe fn dump_interactive_logon_quiesce(
     let r8 = regs[nt_user_callback::USER_CONTEXT_R8];
     let r9 = regs[nt_user_callback::USER_CONTEXT_R9];
 
-    print_str(b"[wl-quiesce] pi=");
+    print_quiesce_tag(label, b"");
+    print_str(b" pi=");
     print_u64(pi as u64);
     print_str(b" tid=");
     print_u64(tid);
@@ -17624,7 +17731,8 @@ unsafe fn dump_interactive_logon_quiesce(
 
     let mut threads = [HostedThreadQuiesceRecord::empty(); 32];
     let (count, overflow) = nt_handler.hosted_thread_quiesce_records_for_pi(pi, &mut threads);
-    print_str(b"[wl-quiesce-threads] overflow=");
+    print_quiesce_tag(label, b"-threads");
+    print_str(b" overflow=");
     print_u64(overflow as u64);
     print_str(b" threads=");
     for thread in threads[..count].iter().copied() {
@@ -17656,7 +17764,8 @@ unsafe fn dump_interactive_logon_quiesce(
         }
     };
 
-    print_str(b"[wl-quiesce-stack] rsp=0x");
+    print_quiesce_tag(label, b"-stack");
+    print_str(b" rsp=0x");
     print_hex_u64(rsp);
     print_str(b" top:");
     for slot in 0..8u64 {
@@ -17668,7 +17777,8 @@ unsafe fn dump_interactive_logon_quiesce(
             None => print_str(b"?"),
         }
     }
-    print_str(b"\n[wl-quiesce-callers]");
+    print_str(b"\n");
+    print_quiesce_tag(label, b"-callers");
     let mut shown = 0usize;
     let mut iat_shown = 0usize;
     for slot in 0..160u64 {
@@ -17684,7 +17794,7 @@ unsafe fn dump_interactive_logon_quiesce(
         print_quiesce_addr(value, pi, loaded_images, reg, ntdll);
         shown += 1;
         if iat_shown < 4
-            && print_quiesce_iat_call_site(nt_handler, value, pi, loaded_images, reg, ntdll)
+            && print_quiesce_iat_call_site(label, nt_handler, value, pi, loaded_images, reg, ntdll)
         {
             iat_shown += 1;
         }
@@ -17700,6 +17810,7 @@ unsafe fn dump_interactive_logon_quiesce(
 
 #[inline]
 unsafe fn print_quiesce_iat_call_site(
+    label: &[u8],
     nt_handler: &ExecNtHandler,
     return_address: u64,
     pi: usize,
@@ -17733,7 +17844,9 @@ unsafe fn print_quiesce_iat_call_site(
         None
     };
 
-    print_str(b"\n[wl-quiesce-iat] ret=");
+    print_str(b"\n");
+    print_quiesce_tag(label, b"-iat");
+    print_str(b" ret=");
     print_quiesce_addr(return_address, pi, loaded_images, reg, ntdll);
     print_str(b" slot=0x");
     print_hex_u64(slot_address);
@@ -19792,6 +19905,7 @@ unsafe fn lsa_deliver_reply(nt_handler: &mut ExecNtHandler, replymsg: u64) -> bo
 /// false if the reply pool is unavailable or the growable waiter table cannot allocate the record. The
 /// stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
 unsafe fn pipe_wait_park(
+    device_id: u64,
     file_id: u64,
     pi: u32,
     tid: u64,
@@ -19818,6 +19932,7 @@ unsafe fn pipe_wait_park(
     };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
     let parked = table.park(nt_io_manager::PipeWaiter {
+        device_id,
         file_id,
         pi,
         tid,
@@ -19995,11 +20110,13 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // read here manufactures another data-queue entry and can make the next SCM
         // `TransactNamedPipe` fail with the legitimate `STATUS_PIPE_BUSY` precondition.
         let (status, completed) = if w.is_write {
-            match driver_launch::take_completed_write(w.file_id) {
+            match driver_launch::take_completed_write_for_device(w.device_id, w.file_id) {
                 Some(completion) => completion,
                 None => continue,
             }
-        } else if let Some((st, info, bytes)) = driver_launch::take_completed_read(w.file_id) {
+        } else if let Some((st, info, bytes)) =
+            driver_launch::take_completed_read_for_device(w.device_id, w.file_id)
+        {
             let n = (bytes.len()).min(output.len());
             output[..n].copy_from_slice(&bytes[..n]);
             (st, info)
