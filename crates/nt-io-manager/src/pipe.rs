@@ -1008,6 +1008,117 @@ impl PipeFidNameTable {
     }
 }
 
+/// Availability of server pipe instances by exact server FILE_OBJECT and name.
+///
+/// The fid-name table answers "does this pipe name exist in the namespace?". This table answers the
+/// stronger `FSCTL_PIPE_WAIT` question: "is there a server instance a client can connect to right
+/// now?". A fresh `NtCreateNamedPipeFile` starts in `Listening` state, so it is available before
+/// user mode posts an explicit `FSCTL_PIPE_LISTEN`. A successful client create consumes exactly the
+/// accepted server fid, leaving other same-name instances available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PipeServerAvailability {
+    pub server_file_id: u64,
+    pub name_hash: u64,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipeServerAvailabilityTable {
+    entries: Vec<PipeServerAvailability>,
+}
+
+impl Default for PipeServerAvailabilityTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipeServerAvailabilityTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn mark_available(&mut self, server_file_id: u64, name_hash: u64) -> Result<(), ()> {
+        if server_file_id == 0 || name_hash == 0 {
+            return Err(());
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.server_file_id == server_file_id)
+        {
+            entry.name_hash = name_hash;
+            entry.available = true;
+            return Ok(());
+        }
+        if self.entries.len() == self.entries.capacity() {
+            let reserve = if self.entries.capacity() == 0 { 32 } else { 1 };
+            self.entries.try_reserve(reserve).map_err(|_| ())?;
+        }
+        self.entries.push(PipeServerAvailability {
+            server_file_id,
+            name_hash,
+            available: true,
+        });
+        Ok(())
+    }
+
+    pub fn consume(&mut self, server_file_id: u64) -> bool {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.server_file_id == server_file_id)
+        {
+            let was_available = entry.available;
+            entry.available = false;
+            was_available
+        } else {
+            false
+        }
+    }
+
+    pub fn remove(&mut self, server_file_id: u64) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.server_file_id == server_file_id)
+        {
+            self.entries.swap_remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn available_name(&self, name_hash: u64) -> bool {
+        name_hash != 0
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.available && entry.name_hash == name_hash)
+    }
+
+    pub fn is_available(&self, server_file_id: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.server_file_id == server_file_id && entry.available)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn available_len(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.available).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// A pending async server-side `FSCTL_PIPE_LISTEN` awaiting a client connect. Keyed by the SERVER
 /// end's npfs `file_id`. On the peer connect/write the executive completes it: fills `iosb_va` with
 /// SUCCESS (in the server's VSpace) and signals `event_obj_idx` (waking the server's wait-array).
@@ -2407,6 +2518,60 @@ mod tests {
         assert_eq!(table.name_hash(0x123), None);
         assert_eq!(table.len(), 39);
         assert!(!table.forget(0x123));
+    }
+
+    #[test]
+    fn pipe_server_availability_tracks_create_connect_and_cleanup() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let eventlog_hash = pipe_name_hash(&eventlog);
+        let mut table = PipeServerAvailabilityTable::new();
+
+        assert!(table.mark_available(0, eventlog_hash).is_err());
+        assert!(table.mark_available(0x101, 0).is_err());
+        assert!(!table.available_name(eventlog_hash));
+
+        table.mark_available(0x101, eventlog_hash).unwrap();
+        assert!(table.available_name(eventlog_hash));
+        assert!(table.is_available(0x101));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.available_len(), 1);
+
+        assert!(table.consume(0x101));
+        assert!(
+            !table.consume(0x101),
+            "consuming an already connected instance is idempotent"
+        );
+        assert!(!table.available_name(eventlog_hash));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.available_len(), 0);
+
+        table.mark_available(0x101, eventlog_hash).unwrap();
+        assert!(table.available_name(eventlog_hash));
+        assert!(table.remove(0x101));
+        assert!(table.is_empty());
+        assert!(!table.available_name(eventlog_hash));
+    }
+
+    #[test]
+    fn pipe_server_availability_consumes_exact_same_name_instance() {
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let ntsvcs_hash = pipe_name_hash(&ntsvcs);
+        let mut table = PipeServerAvailabilityTable::new();
+
+        table.mark_available(0x201, ntsvcs_hash).unwrap();
+        table.mark_available(0x203, ntsvcs_hash).unwrap();
+        assert_eq!(table.available_len(), 2);
+        assert!(table.available_name(ntsvcs_hash));
+
+        assert!(table.consume(0x201));
+        assert!(!table.is_available(0x201));
+        assert!(table.is_available(0x203));
+        assert!(table.available_name(ntsvcs_hash));
+        assert_eq!(table.available_len(), 1);
+
+        assert!(table.consume(0x203));
+        assert!(!table.available_name(ntsvcs_hash));
+        assert_eq!(table.available_len(), 0);
     }
 
     #[test]

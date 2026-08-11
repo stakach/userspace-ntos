@@ -7854,10 +7854,12 @@ impl ExecNtHandler {
         release: nt_io_completion::FileReferenceRelease,
     ) {
         if release.cleanup_required {
+            crate::pipe_server_available_forget(file_id);
             self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLEANUP);
         }
         if release.close_required {
             self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLOSE);
+            crate::pipe_server_available_forget(file_id);
             crate::pipe_fid_name_forget(file_id);
         }
         if let Some(port_id) = release.port_id {
@@ -15708,7 +15710,9 @@ impl ExecNtHandler {
                         if let Some(handle) = opened_handle {
                             self.queue_write(file_handle_out, handle);
                             if status == 0 {
-                                self.pipe_connect_redrive_server_fid = (fid & !1) | 1;
+                                let server_fid = (fid & !1) | 1;
+                                crate::pipe_server_available_consume(server_fid);
+                                self.pipe_connect_redrive_server_fid = server_fid;
                             }
                         } else {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
@@ -17905,13 +17909,19 @@ impl ExecNtHandler {
                     Ok((0, fid)) if fid != 0 => {
                         // Remember this server fid -> pipe leaf name-hash for FSCTL_PIPE_WAIT
                         // readiness probes. Client connects complete listens by exact server fid.
-                        match crate::pipe_fid_name_remember(
-                            fid,
-                            nt_io_manager::pipe_name_hash(&leaf),
-                        ) {
+                        let name_hash = nt_io_manager::pipe_name_hash(&leaf);
+                        match crate::pipe_fid_name_remember(fid, name_hash) {
                             Ok(()) => {
-                                routed_file_id = fid;
-                                nt_fs::STATUS_SUCCESS
+                                match crate::pipe_server_available_remember(fid, name_hash) {
+                                    Ok(()) => {
+                                        routed_file_id = fid;
+                                        nt_fs::STATUS_SUCCESS
+                                    }
+                                    Err(availability_status) => {
+                                        crate::pipe_fid_name_forget(fid);
+                                        availability_status
+                                    }
+                                }
                             }
                             Err(name_status) => name_status,
                         }
@@ -17943,6 +17953,7 @@ impl ExecNtHandler {
                     != 0;
                 let Some(h) = self.mint_file_handle(routed_file_id, args[1] as u32, synchronous)
                 else {
+                    crate::pipe_server_available_forget(routed_file_id);
                     crate::pipe_fid_name_forget(routed_file_id);
                     if self.pi >= 2 {
                         self.queue_write(file_handle_out, 0);
@@ -18015,6 +18026,7 @@ impl ExecNtHandler {
                 let mut pipe_wait_trace_name: Option<alloc::vec::Vec<u16>> = None;
                 let mut pipe_wait_trace_hash = 0u64;
                 let mut pipe_wait_trace_armed = false;
+                let mut pipe_wait_trace_available = false;
                 let mut pipe_wait_trace_known = false;
                 let mut routed_endpoint_fsctl = false;
                 if is_pipe_wait && self.is_npfs_root_handle(args[0]) {
@@ -18045,9 +18057,11 @@ impl ExecNtHandler {
                                     let listens = &*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS);
                                     pipe_wait_trace_armed =
                                         listens.armed_name(pipe_wait_name_hash);
+                                    pipe_wait_trace_available =
+                                        crate::pipe_server_name_available(pipe_wait_name_hash);
                                     pipe_wait_trace_known =
                                         crate::pipe_name_hash_known(pipe_wait_name_hash);
-                                    if pipe_wait_trace_armed {
+                                    if pipe_wait_trace_armed || pipe_wait_trace_available {
                                         status = nt_fs::STATUS_SUCCESS as u64;
                                     } else if !pipe_wait_trace_known {
                                         status = nt_fs::STATUS_OBJECT_NAME_NOT_FOUND as u64;
@@ -18099,6 +18113,8 @@ impl ExecNtHandler {
                         print_hex_u64(pipe_wait_trace_hash);
                         print_str(b" armed=");
                         print_u64(pipe_wait_trace_armed as u64);
+                        print_str(b" available=");
+                        print_u64(pipe_wait_trace_available as u64);
                         print_str(b" known=");
                         print_u64(pipe_wait_trace_known as u64);
                         print_str(b" in_len=");
@@ -18277,6 +18293,13 @@ impl ExecNtHandler {
                             .is_some()
                     {
                         crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if crate::pipe_server_available_remember(fid, listen_name_hash).is_err() {
+                            print_str(b"[pipe-listen] availability record failed server fid=0x");
+                            print_hex(fid as u32);
+                            print_str(b" pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b"\n");
+                        }
                         print_str(b"[pipe-listen] ARMED server fid=0x");
                         print_hex(fid as u32);
                         print_str(b" event_obj=0x");
@@ -18296,6 +18319,11 @@ impl ExecNtHandler {
                             .unwrap_or(nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
                             as u64;
                     }
+                } else if is_pipe_listen
+                    && (status as u32) == nt_io_manager::STATUS_PIPE_CONNECTED.raw() as u32
+                    && fid != 0
+                {
+                    crate::pipe_server_available_consume(fid);
                 }
                 if iosb != 0
                     && self.pipe_park_fid == 0
@@ -23172,7 +23200,9 @@ impl ExecNtHandler {
                                         info = nt_fs::FILE_OPENED as u64;
                                         // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
                                         // Complete the exact server-end listen IRP for the same CCB.
-                                        self.pipe_connect_redrive_server_fid = (file_id & !1) | 1;
+                                        let server_fid = (file_id & !1) | 1;
+                                        crate::pipe_server_available_consume(server_fid);
+                                        self.pipe_connect_redrive_server_fid = server_fid;
                                     } else {
                                         crate::pipe_fid_name_forget(file_id);
                                         status = 0xC000_009A;

@@ -2500,6 +2500,10 @@ static PIPE_NAME_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `NtCreateFile`/`NtOpenFile` time. Async LISTEN completion and WAIT probing must be name-scoped;
 /// missing metadata is an error/non-match, never a wildcard.
 static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable = nt_io_manager::PipeFidNameTable::new();
+/// Exact server-instance availability for root `FSCTL_PIPE_WAIT`. A pipe name can be known while all
+/// instances are already connected; readiness must therefore be tracked separately from fid metadata.
+static mut PIPE_SERVER_AVAILABILITY: nt_io_manager::PipeServerAvailabilityTable =
+    nt_io_manager::PipeServerAvailabilityTable::new();
 
 /// Record (or update) `fid -> name_hash`. Replaces an existing entry for `fid`.
 pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) -> Result<(), u32> {
@@ -2514,8 +2518,28 @@ pub(crate) fn pipe_fid_name_forget(fid: u64) -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_FID_NAMES)).forget(fid) }
 }
 
+pub(crate) fn pipe_server_available_remember(server_fid: u64, name_hash: u64) -> Result<(), u32> {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY))
+            .mark_available(server_fid, name_hash)
+            .map_err(|_| nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
+pub(crate) fn pipe_server_available_consume(server_fid: u64) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).consume(server_fid) }
+}
+
+pub(crate) fn pipe_server_available_forget(server_fid: u64) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).remove(server_fid) }
+}
+
 pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(PIPE_FID_NAMES)).contains_name_hash(name_hash) }
+}
+
+pub(crate) fn pipe_server_name_available(name_hash: u64) -> bool {
+    unsafe { (&*core::ptr::addr_of!(PIPE_SERVER_AVAILABILITY)).available_name(name_hash) }
 }
 
 /// The name-hash recorded for `fid` (0 = unknown).

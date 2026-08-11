@@ -67,6 +67,25 @@ traffic, so the remaining wall is later: generic EventLog/SCM RPC, dispatcher wa
 after the EventLog pipe is available. Do not add EventLog ordering, executable-launch, or shell-paint
 policy.
 
+Current pipe availability slice (2026-08-11): the latest serialized `./run.sh --desktop` retry
+`.tmp/run-desktop-current-20260811.log` timed out after the base desktop paint and EventLog pipe
+publication. The final evidence showed EventLog created `\EventLog`, SCM was still inside real
+`\ntsvcs` `RSetServiceStatus` traffic, and one EventLog worker remained runnable while the other RPC
+threads were parked; there was no later successful `\??\pipe\EventLog` client retry. The generic
+mechanism gap found in that frontier was root `FSCTL_PIPE_WAIT` readiness: the executive only treated
+an armed overlapped `FSCTL_PIPE_LISTEN` as available, but NPFS creates a fresh server CCB in
+`Listening` state at `NtCreateNamedPipeFile`, before user mode posts another listen IRP. The current
+implementation keeps pipe name metadata and server-instance availability separate: server
+`NtCreateNamedPipeFile` and pending `FSCTL_PIPE_LISTEN` mark an exact server fid/name as available,
+client `NtCreateFile`/`NtOpenFile` consumes the accepted server fid, file cleanup/close removes stale
+availability, and root `FSCTL_PIPE_WAIT` now succeeds when either an async listen is armed or a fresh
+server instance is available. This is generic NPFS readiness, not an EventLog/SCM special case. Local
+validation is green: `cargo fmt --all`, `cargo test -p nt-io-manager pipe -- --nocapture`,
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. The next serialized desktop proof should show `pipe-wait ... available=1`
+for a pipe with a published listening server instance and should determine whether SCM/EventLog
+progress reaches userinit/explorer or exposes the next real dispatcher/IOCP/RPC handoff gap.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
