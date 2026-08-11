@@ -6226,11 +6226,17 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     break;
                 }
-                // SHAREABLE = a registered DLL image page whose current fault installs a non-writable
-                // mapping. That includes executable text and clean read-only/write-copy data: the
-                // first write promotes through the image COW path below, so read faults can share the
-                // same cached frame instead of allocating identical per-process copies.
-                let shareable = base != PE_LOAD_BASE && !image_map_writable;
+                let image_map_executable = matches!(
+                    image_fault_plan.map_protection & 0xff,
+                    nt_address_space::PAGE_EXECUTE
+                        | nt_address_space::PAGE_EXECUTE_READ
+                        | nt_address_space::PAGE_EXECUTE_READWRITE
+                        | nt_address_space::PAGE_EXECUTE_WRITECOPY
+                );
+                // SHAREABLE = a registered DLL image page whose current fault installs an executable,
+                // non-writable mapping. Non-executable clean image data still needs a stronger
+                // protect/COW proof before it can use the shared cache without regressing CSRSS.
+                let shareable = base != PE_LOAD_BASE && image_map_executable && !image_map_writable;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 if is_fault_page && image_fault_plan.copy_on_write {
                     let read_fault_protection =
