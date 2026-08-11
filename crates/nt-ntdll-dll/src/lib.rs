@@ -1,11 +1,11 @@
 //! # `nt-ntdll-dll` — the PE32+ DLL wrapper (Step 4.0)
 //!
 //! This crate exists ONLY to EMIT our Rust ntdll as a loadable `ntdll.dll`. It is a thin `cdylib`
-//! around the host-tested [`nt_ntdll`] rlib — all the real logic (the 188 `Nt*` trap stubs, the
+//! around the host-tested [`nt_ntdll`] rlib — all the real logic (the generated `Nt*` trap stubs, the
 //! `Rtl*`/`Csr*`/`Dbg*`/`Ki*` surface, the loader engine) lives there and stays under `cargo test`.
 //!
 //! Its job here is three things the rlib can't do on its own:
-//! 1. **Force-retain the exports.** The 188 naked `Nt*` trap stubs (defined in
+//! 1. **Force-retain the exports.** The generated naked `Nt*` trap stubs (defined in
 //!    [`nt_ntdll::trap_stubs`], exported under their real Windows names via `#[export_name]`) are
 //!    unreferenced by anything else, so linker dead-code elimination would drop them. We anchor them
 //!    with [`nt_ntdll::trap_stubs::TRAP_STUB_ADDRS`] (a `#[used]` fn-ptr array in the rlib) —
@@ -1257,7 +1257,7 @@ unsafe impl GlobalAlloc for ProcessHeapAllocator {
 #[global_allocator]
 static ALLOCATOR: ProcessHeapAllocator = ProcessHeapAllocator;
 
-/// Anchor the 188 `Nt*` trap stubs so the linker retains them into the DLL export directory.
+/// Anchor the generated `Nt*` trap stubs so the linker retains them into the DLL export directory.
 ///
 /// `TRAP_STUB_ADDRS` is `#[used]` in the rlib, but a `#[used]` static in a *dependency* rlib is only
 /// kept if the dependency itself is pulled in. Taking its address here from the cdylib's root object

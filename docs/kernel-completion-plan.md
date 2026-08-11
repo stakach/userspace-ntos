@@ -3772,3 +3772,17 @@ before unrelated executive traffic monopolises the receive loop.
   Administrator profile, and a later helper process parked on an unhandled syscall at IP `0x96`.
   Those should be implemented as generic NT object-manager/filesystem/syscall behavior, not as
   hosted-image or shell-paint special cases.
+
+  Native UI-language repair implemented/host-validated: syscall `0x96` is
+  `NtQueryDefaultUILanguage` in the shared ReactOS-derived ABI table. `kbswitch.exe` reaches it
+  through kernel32's `GetUserDefaultUILanguage()`, so the fix belongs in the native service
+  catalogue/table and the executive's locale plane, not in helper-process launch code. This slice
+  registers `NtQueryDefaultUILanguage`, `NtQueryInstallUILanguage`, and `NtSetDefaultUILanguage`,
+  exports the missing `Nt/ZwSetDefaultUILanguage` ntdll stubs, seeds the install/current UI LANGID
+  from the same NLS setup value used for the registry locale bootstrap, and writes 16-bit LANGID
+  out-parameters with ordinary user pointer validation. Validation is green: `cargo fmt --all`,
+  `cargo test -p nt-syscall -- --nocapture`, `cargo test -p nt-syscall-abi -- --nocapture`,
+  `cargo test -p nt-ntdll trap -- --nocapture`, `./scripts/build_ntdll_dll.sh`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `git diff --check`. Remaining validation is a serialized desktop retry to confirm
+  `kbswitch.exe` moves past SSN `0x96` and exposes the next real service/filesystem gap.

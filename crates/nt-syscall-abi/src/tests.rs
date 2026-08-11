@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 218;
-const REQUIRED_ZW_COUNT: usize = 218;
+const REQUIRED_NT_COUNT: usize = 219;
+const REQUIRED_ZW_COUNT: usize = 219;
 
 #[test]
 fn required_counts() {
@@ -182,6 +182,9 @@ fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtUnloadKey"), 1);
     assert_eq!(argc_of("NtUnloadKey2"), 2);
     assert_eq!(argc_of("NtUnloadKeyEx"), 2);
+    assert_eq!(argc_of("NtQueryDefaultUILanguage"), 1);
+    assert_eq!(argc_of("NtQueryInstallUILanguage"), 1);
+    assert_eq!(argc_of("NtSetDefaultUILanguage"), 1);
     // Zw* inherits its underlying Nt*'s arity.
     assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));
     assert_eq!(argc_of("ZwLoadKeyEx"), argc_of("NtLoadKeyEx"));

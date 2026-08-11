@@ -1,6 +1,6 @@
 //! # Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports
 //!
-//! Step 4.0 emitted the 188 `Nt*` trap stubs + `LdrpInitialize`. smss.exe *also* imports ~61
+//! Step 4.0 emitted the generated `Nt*` trap stubs + `LdrpInitialize`. smss.exe *also* imports ~61
 //! non-`Nt*` symbols from ntdll (Rtl/Ldr/Dbg/CRT). This module completes the export table so smss's
 //! FULL ntdll import set resolves against our DLL — the last piece before the Step 4.A live boot.
 //!
@@ -25201,6 +25201,11 @@ zw_alias!(
     "ZwSetDefaultLocale",
     nt_set_default_locale
 );
+zw_alias!(
+    zw_set_default_ui_language,
+    "ZwSetDefaultUILanguage",
+    nt_set_default_ui_language
+);
 zw_alias!(zw_set_event, "ZwSetEvent", nt_set_event);
 zw_alias!(
     zw_set_information_debug_object,
@@ -30162,6 +30167,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_set_debug_filter_state as *const () as usize,
         zw_set_default_hard_error_port as *const () as usize,
         zw_set_default_locale as *const () as usize,
+        zw_set_default_ui_language as *const () as usize,
         zw_set_event as *const () as usize,
         zw_set_information_debug_object as *const () as usize,
         zw_set_information_file as *const () as usize,

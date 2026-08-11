@@ -454,13 +454,17 @@ fn group_c_first_cut_services_register() {
 #[test]
 fn group_c_ladder_migrations_register() {
     // Remaining group-C ladder cases migrated onto the table (name-scoped file fakes, section
-    // queries, locale demand-fill, and the csrss spawn). They register at their real Win7 SSNs and
-    // expose their canonical exact contracts even while handlers still read some tail args from SP.
+    // queries, locale/UI-language demand-fill, and the csrss spawn). They register at their real
+    // Win7 SSNs and expose their canonical exact contracts even while handlers still read some tail
+    // args from SP.
     let pairs = [
         (NativeService::NtQueryAttributesFile, 145u32),
         (NativeService::NtOpenFile, 122),
         (NativeService::NtQuerySection, 175),
         (NativeService::NtQueryDefaultLocale, 149),
+        (NativeService::NtQueryDefaultUILanguage, 150),
+        (NativeService::NtQueryInstallUILanguage, 164),
+        (NativeService::NtSetDefaultUILanguage, 225),
         (NativeService::NtCreateSection, 52),
         (NativeService::NtMapViewOfSection, 113),
         (NativeService::NtCreateProcess, 49),

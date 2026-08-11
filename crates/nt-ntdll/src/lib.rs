@@ -29,7 +29,7 @@
 //!   `RtlpWaitForCriticalSection` boot deadlock: correct by construction).
 //!
 //! **Step 2c** (this) completes the export surface:
-//! - [`trap_stubs`] — the full **188** `Nt*` trap-stub bodies, macro-generated (`mov r10,rcx;
+//! - [`trap_stubs`] — the full `Nt*` trap-stub body set, macro-generated (`mov r10,rcx;
 //!   mov eax,<ssn>; syscall; ret`), target-only asm with host-tested generation coverage.
 //! - [`marshal`] — arity-driven **argument marshalling** for the non-trap backends (seL4/SURT must
 //!   gather the >4-arg stack tail into an IPC message; host-tested, incl. the widest 14-arg service).

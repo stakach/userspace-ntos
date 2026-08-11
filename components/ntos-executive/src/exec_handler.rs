@@ -113,6 +113,9 @@ const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
 const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
+static NT_INSTALL_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0x0409);
+static NT_DEFAULT_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0x0409);
+static NT_PENDING_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0);
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
@@ -2675,6 +2678,11 @@ impl ExecNtHandler {
             b"HKLM\\SYSTEM\\...\\Nls\\Language\\Default"
         };
         let system_ascii = &locale_ascii[4..8];
+        if let Some(langid) = parse_hex_u32(system_ascii) {
+            NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+            NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
+            NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
+        }
         let mut user_locale = [0u8; 18];
         let Some(user_locale_len) = utf16le_ascii_z(&locale_ascii, &mut user_locale) else {
             return;
@@ -21574,6 +21582,24 @@ impl ExecNtHandler {
             // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
             // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
             | NativeService::NtSetDefaultLocale => 0,
+            NativeService::NtSetDefaultUILanguage => {
+                if args[0] > u16::MAX as u64 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let langid = args[0] as u32;
+                if langid != 0 {
+                    NT_PENDING_UI_LANGUAGE.store(langid, Ordering::Relaxed);
+                    0
+                } else {
+                    let pending = NT_PENDING_UI_LANGUAGE.swap(0, Ordering::Relaxed);
+                    if pending == 0 {
+                        0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+                    } else {
+                        NT_DEFAULT_UI_LANGUAGE.store(pending, Ordering::Relaxed);
+                        0
+                    }
+                }
+            }
             NativeService::NtSetInformationObject => unsafe {
                 self.nt_set_information_object_with_user_memory(
                     args,
@@ -24717,6 +24743,29 @@ impl ExecNtHandler {
                     return if out == 0 { 0xC000_0005 } else { 0x8000_0002 };
                 }
                 if self.xas_write_u32(out, 0x409) { 0 } else { 0xC000_0005 }
+            },
+            NativeService::NtQueryDefaultUILanguage
+            | NativeService::NtQueryInstallUILanguage => unsafe {
+                let out = args[0]; // R10 = *LanguageId
+                if out == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if out & 1 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_user_output(out, core::mem::size_of::<u16>()) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let value = if ctx.service == NativeService::NtQueryInstallUILanguage {
+                    NT_INSTALL_UI_LANGUAGE.load(Ordering::Relaxed)
+                } else {
+                    NT_DEFAULT_UI_LANGUAGE.load(Ordering::Relaxed)
+                } as u16;
+                if self.xas_try_write_buf(out, &value.to_le_bytes()) {
+                    0
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                }
             },
             // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
             // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).

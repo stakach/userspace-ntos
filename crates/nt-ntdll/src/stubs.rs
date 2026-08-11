@@ -104,7 +104,7 @@ impl StubTable {
 //
 // These prove the name -> SSN -> transport path end-to-end for services spanning the range. Each is
 // a thin, typed wrapper that resolves its SSN through the shared ABI table and issues the transport
-// call — exactly the shape the full 188-stub body port (Step 2b) will fill out. On the host the
+// call — exactly the shape the full stub body port (Step 2b) will fill out. On the host the
 // transport returns STATUS_NOT_IMPLEMENTED (no trap available); on the x86_64 target it issues the
 // real trap. The wiring — SSN resolution + backend selection + arg marshalling — is what's proven.
 

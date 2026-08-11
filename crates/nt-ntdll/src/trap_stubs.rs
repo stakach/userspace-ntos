@@ -327,6 +327,11 @@ generate_trap_stubs! {
     (nt_set_debug_filter_state, "NtSetDebugFilterState", 222),
     (nt_set_default_hard_error_port, "NtSetDefaultHardErrorPort", 223),
     (nt_set_default_locale, "NtSetDefaultLocale", 224),
+    (
+        nt_set_default_ui_language,
+        "NtSetDefaultUILanguage",
+        225
+    ),
     (nt_set_event, "NtSetEvent", 228),
     (nt_set_information_debug_object, "NtSetInformationDebugObject", 232),
     (nt_set_information_file, "NtSetInformationFile", 233),

@@ -958,9 +958,15 @@ pub const SSN_NT_FS_CONTROL_FILE: u64 = 88;
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
 pub const SSN_NT_QUERY_DEFAULT_LOCALE: u64 = 149;
+/// ntdll's NtQueryDefaultUILanguage SSN (kbswitch/user32 locale bootstrap asks kernel for LANGID).
+pub const SSN_NT_QUERY_DEFAULT_UI_LANGUAGE: u64 = 150;
+/// ntdll's NtQueryInstallUILanguage SSN (kernel32/kernelbase locale helpers ask install LANGID).
+pub const SSN_NT_QUERY_INSTALL_UI_LANGUAGE: u64 = 164;
 /// ntdll's NtSetDefaultLocale SSN. winlogon's InitializeSAS → SetDefaultLanguage(NULL) sets the
 /// system default UI locale after reading Nls\Language\Default. No-op SUCCESS (see exec_handler).
 pub const SSN_NT_SET_DEFAULT_LOCALE: u64 = 224;
+/// ntdll's NtSetDefaultUILanguage SSN (stores current user UI LANGID in the locale plane).
+pub const SSN_NT_SET_DEFAULT_UI_LANGUAGE: u64 = 225;
 /// ntdll's NtQueryDebugFilterState SSN. DbgPrintEx(component,...) suppresses its message unless
 /// this returns (NTSTATUS)TRUE=1 (rtl/debug.c:66). Returning 1 unmasks the SXS/LDR component
 /// traces so we can see *which* internal loader step fails (otherwise only DPRINT1/-1 shows).
@@ -17990,6 +17996,18 @@ fn build_nt_table() -> NativeServiceTable {
             (
                 NativeService::NtSetDefaultLocale,
                 SSN_NT_SET_DEFAULT_LOCALE as u32,
+            ),
+            (
+                NativeService::NtQueryDefaultUILanguage,
+                SSN_NT_QUERY_DEFAULT_UI_LANGUAGE as u32,
+            ),
+            (
+                NativeService::NtQueryInstallUILanguage,
+                SSN_NT_QUERY_INSTALL_UI_LANGUAGE as u32,
+            ),
+            (
+                NativeService::NtSetDefaultUILanguage,
+                SSN_NT_SET_DEFAULT_UI_LANGUAGE as u32,
             ),
             // Workstream A batch 8 (group C): section creation (csrss.exe SEC_IMAGE + DLL + anon).
             (NativeService::NtCreateSection, SSN_NT_CREATE_SECTION as u32),

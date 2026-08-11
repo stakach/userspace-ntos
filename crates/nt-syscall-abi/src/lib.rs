@@ -277,6 +277,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtSetDebugFilterState", 222),
     n("NtSetDefaultHardErrorPort", 223),
     n("NtSetDefaultLocale", 224),
+    n("NtSetDefaultUILanguage", 225),
     n("NtSetEvent", 228),
     n("NtSetInformationDebugObject", 232),
     n("NtSetInformationFile", 233),
@@ -581,6 +582,7 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
         223,
     ),
     z("ZwSetDefaultLocale", "NtSetDefaultLocale", 224),
+    z("ZwSetDefaultUILanguage", "NtSetDefaultUILanguage", 225),
     z("ZwSetEvent", "NtSetEvent", 228),
     z(
         "ZwSetInformationDebugObject",
@@ -839,6 +841,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtSetDebugFilterState", 3),
     ("NtSetDefaultHardErrorPort", 1),
     ("NtSetDefaultLocale", 2),
+    ("NtSetDefaultUILanguage", 1),
     ("NtSetEvent", 2),
     ("NtSetInformationDebugObject", 5),
     ("NtSetInformationFile", 5),
