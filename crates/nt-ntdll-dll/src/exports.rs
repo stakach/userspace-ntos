@@ -29,9 +29,7 @@ use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
-use nt_ntdll_layout::{
-    ListEntry, Peb, RtlRelativeNameU, RtlpCurDirRef, Teb, UnicodeString,
-};
+use nt_ntdll_layout::{ListEntry, Peb, RtlRelativeNameU, RtlpCurDirRef, Teb, UnicodeString};
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
@@ -192,9 +190,9 @@ static mut RTL_ACTIVATION_CONTEXT_LOCK: LoaderCriticalSection = LoaderCriticalSe
 #[cfg(target_arch = "x86_64")]
 const RTL_ACTIVATION_CONTEXT_CAP: usize = 256;
 #[cfg(target_arch = "x86_64")]
-static mut RTL_ACTIVATION_CONTEXT_REGISTRY:
-    nt_ntdll::rtl::activation::ActivationContextRegistry<RTL_ACTIVATION_CONTEXT_CAP> =
-    nt_ntdll::rtl::activation::ActivationContextRegistry::new();
+static mut RTL_ACTIVATION_CONTEXT_REGISTRY: nt_ntdll::rtl::activation::ActivationContextRegistry<
+    RTL_ACTIVATION_CONTEXT_CAP,
+> = nt_ntdll::rtl::activation::ActivationContextRegistry::new();
 
 const _: [(); 40] = [(); core::mem::size_of::<LoaderCriticalSection>()];
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
@@ -1361,24 +1359,13 @@ unsafe fn boot_nt_query_volume_information_file(
     length: u32,
     information_class: u32,
 ) -> NtStatus {
-    type NtQueryVolumeInformationFile = unsafe extern "system" fn(
-        u64,
-        *mut [u64; 2],
-        *mut c_void,
-        u32,
-        u32,
-    ) -> NtStatus;
+    type NtQueryVolumeInformationFile =
+        unsafe extern "system" fn(u64, *mut [u64; 2], *mut c_void, u32, u32) -> NtStatus;
     // SAFETY: forwards the exact x64 NtQueryVolumeInformationFile ABI to the generated trap stub.
     unsafe {
         core::mem::transmute::<unsafe extern "C" fn(), NtQueryVolumeInformationFile>(
             nt_ntdll::trap_stubs::nt_query_volume_information_file,
-        )(
-            file_handle,
-            iosb,
-            information,
-            length,
-            information_class,
-        )
+        )(file_handle, iosb, information, length, information_class)
     }
 }
 
@@ -1498,15 +1485,8 @@ unsafe fn boot_nt_duplicate_current_process_handle(
     source_handle: u64,
     target_handle: *mut u64,
 ) -> NtStatus {
-    type NtDuplicateObject = unsafe extern "system" fn(
-        u64,
-        u64,
-        u64,
-        *mut u64,
-        u32,
-        u32,
-        u32,
-    ) -> NtStatus;
+    type NtDuplicateObject =
+        unsafe extern "system" fn(u64, u64, u64, *mut u64, u32, u32, u32) -> NtStatus;
     const CURRENT_PROCESS: u64 = u64::MAX;
     const DUPLICATE_SAME_ACCESS: u32 = 0x2;
     unsafe {
@@ -2001,10 +1981,7 @@ unsafe fn critical_section_wait(cs: *mut c_void) -> NtStatus {
                 unsafe extern "C" fn(),
                 unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
             >(nt_ntdll::trap_stubs::nt_wait_for_keyed_event)(
-                0,
-                cs as u64,
-                0,
-                core::ptr::null(),
+                0, cs as u64, 0, core::ptr::null()
             )
         }
     } else {
@@ -2012,7 +1989,9 @@ unsafe fn critical_section_wait(cs: *mut c_void) -> NtStatus {
             core::mem::transmute::<
                 unsafe extern "C" fn(),
                 unsafe extern "system" fn(u64, u8, *const i64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(handle, 0, core::ptr::null())
+            >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(
+                handle, 0, core::ptr::null()
+            )
         }
     }
 }
@@ -2026,10 +2005,7 @@ unsafe fn critical_section_wake_one(cs: *mut c_void) -> NtStatus {
                 unsafe extern "C" fn(),
                 unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
             >(nt_ntdll::trap_stubs::nt_release_keyed_event)(
-                0,
-                cs as u64,
-                0,
-                core::ptr::null(),
+                0, cs as u64, 0, core::ptr::null()
             )
         }
     } else {
@@ -2212,7 +2188,9 @@ pub unsafe extern "system" fn rtlp_not_owner_critical_section(_cs: *mut c_void) 
 /// # Safety
 /// Touches no memory.
 #[export_name = "RtlCheckForOrphanedCriticalSections"]
-pub unsafe extern "system" fn rtl_check_for_orphaned_critical_sections(_thread_handle: *mut c_void) {
+pub unsafe extern "system" fn rtl_check_for_orphaned_critical_sections(
+    _thread_handle: *mut c_void,
+) {
 }
 
 /// `RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
@@ -5052,7 +5030,8 @@ pub unsafe extern "system" fn rtl_assert(
     const ASSERT_FORMAT: &[u8] =
         b"\n*** Assertion failed: %s%s\n***   Source File: %s, line %lu\n\n\0";
     const CONTEXT_FORMAT: &[u8] = b"Execute '.cxr %p' to dump context\n\0";
-    const PROMPT: &[u8] = b"Break repeatedly, break Once, Ignore, terminate Process or terminate Thread (boipt)? \0";
+    const PROMPT: &[u8] =
+        b"Break repeatedly, break Once, Ignore, terminate Process or terminate Thread (boipt)? \0";
     const EMPTY: &[u8] = b"\0";
     const FLG_DISABLE_DEBUG_PROMPTS: u32 = 0x0800_0000;
     const STATUS_ASSERTION_FAILURE: NtStatus = 0xc000_0420;
@@ -5063,10 +5042,9 @@ pub unsafe extern "system" fn rtl_assert(
     let mut context = AssertContext([0; 0x4d0]);
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void),
-        >(rtl_capture_context)(context.0.as_mut_ptr().cast());
+        core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(*mut c_void)>(
+            rtl_capture_context,
+        )(context.0.as_mut_ptr().cast());
     }
 
     loop {
@@ -5095,8 +5073,13 @@ pub unsafe extern "system" fn rtl_assert(
         }
 
         let mut response = [0u8; 2];
-        let response_length =
-            unsafe { dbg_prompt(PROMPT.as_ptr(), response.as_mut_ptr(), response.len() as u32) };
+        let response_length = unsafe {
+            dbg_prompt(
+                PROMPT.as_ptr(),
+                response.as_mut_ptr(),
+                response.len() as u32,
+            )
+        };
         let action = nt_ntdll::dbg::assert_action(
             (response_length != 0 && response[0] != 0).then_some(response[0]),
         );
@@ -5124,7 +5107,7 @@ pub unsafe extern "system" fn rtl_assert(
                         unsafe extern "C" fn(),
                         unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
                     >(nt_ntdll::trap_stubs::nt_terminate_process)(
-                        -1, STATUS_UNSUCCESSFUL,
+                        -1, STATUS_UNSUCCESSFUL
                     );
                 }
             }
@@ -5135,7 +5118,7 @@ pub unsafe extern "system" fn rtl_assert(
                         unsafe extern "C" fn(),
                         unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
                     >(nt_ntdll::trap_stubs::nt_terminate_thread)(
-                        -2, STATUS_UNSUCCESSFUL,
+                        -2, STATUS_UNSUCCESSFUL
                     );
                 }
             }
@@ -5366,14 +5349,7 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
     };
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe {
-            verify_image_file_handle(
-                image_file_handle,
-                callback,
-                parameter,
-                characteristics,
-            )
-        }
+        unsafe { verify_image_file_handle(image_file_handle, callback, parameter, characteristics) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -6159,12 +6135,7 @@ pub unsafe extern "C" fn sprintf(buf: *mut u8, format: *const u8, args: ...) -> 
 
 /// `_snprintf`: returns `-1` only when rendering exceeds `count`; exact fit is unterminated.
 #[export_name = "_snprintf"]
-pub unsafe extern "C" fn snprintf(
-    buf: *mut u8,
-    count: usize,
-    format: *const u8,
-    args: ...,
-) -> i32 {
+pub unsafe extern "C" fn snprintf(buf: *mut u8, count: usize, format: *const u8, args: ...) -> i32 {
     unsafe { format_narrow_va(buf, count, format, args) }
 }
 
@@ -6175,11 +6146,7 @@ pub unsafe extern "C" fn swprintf(buf: *mut u16, format: *const u16, args: ...) 
 }
 
 #[export_name = "vsprintf"]
-pub unsafe extern "C" fn vsprintf(
-    buf: *mut u8,
-    format: *const u8,
-    args: VaList<'_>,
-) -> i32 {
+pub unsafe extern "C" fn vsprintf(buf: *mut u8, format: *const u8, args: VaList<'_>) -> i32 {
     unsafe { format_narrow_va(buf, i32::MAX as usize, format, args) }
 }
 
@@ -6397,7 +6364,8 @@ pub unsafe extern "system" fn rtl_create_heap(
         let captured = if params.is_null() {
             None
         } else {
-            let candidate = unsafe { core::ptr::read_unaligned(params as *const RtlHeapParameters) };
+            let candidate =
+                unsafe { core::ptr::read_unaligned(params as *const RtlHeapParameters) };
             (candidate.length as usize == core::mem::size_of::<RtlHeapParameters>())
                 .then_some(candidate)
         };
@@ -6748,15 +6716,11 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_ex(
             (6, 1, 1)
         }
     };
-    let (spin_count, flags) = match nt_ntdll::sync::critical_section_init_flags(
-        spin_count,
-        flags,
-        os_major,
-        os_minor,
-    ) {
-        Ok(config) => config,
-        Err(status) => return status,
-    };
+    let (spin_count, flags) =
+        match nt_ntdll::sync::critical_section_init_flags(spin_count, flags, os_major, os_minor) {
+            Ok(config) => config,
+            Err(status) => return status,
+        };
     // SAFETY: cs valid per the contract.
     unsafe {
         core::ptr::write_bytes(cs as *mut u8, 0, 40);
@@ -7196,7 +7160,7 @@ pub unsafe extern "C" fn snwprintf(
     buf: *mut u16,
     count: usize,
     format: *const u16,
-    args: ...,
+    args: ...
 ) -> i32 {
     unsafe { format_wide_va(buf, count, format, args) }
 }
@@ -7547,10 +7511,7 @@ unsafe fn acquire_notification_lock() -> Result<NotificationLockGuard, NtStatus>
 #[cfg(target_arch = "x86_64")]
 unsafe fn retire_notification_entry(entry: u64) {
     unsafe {
-        core::ptr::write_unaligned(
-            (entry + 32) as *mut u64,
-            LDR_DLL_NOTIFICATION_RETIRED_HEAD,
-        );
+        core::ptr::write_unaligned((entry + 32) as *mut u64, LDR_DLL_NOTIFICATION_RETIRED_HEAD);
         LDR_DLL_NOTIFICATION_RETIRED_HEAD = entry;
     }
 }
@@ -7623,7 +7584,8 @@ unsafe fn ldr_send_dll_notifications_for_entry(entry: u64, reason: u32) {
             };
         }
     }
-    let retired = unsafe { (*core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE)).finish_dispatch() };
+    let retired =
+        unsafe { (*core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE)).finish_dispatch() };
     let retired_head = if retired != 0 {
         unsafe {
             let head = LDR_DLL_NOTIFICATION_RETIRED_HEAD;
@@ -9406,11 +9368,9 @@ pub unsafe extern "system" fn ldr_lock_loader_lock(
     if !cookie.is_null() {
         unsafe { *cookie = 0 };
     }
-    if let Err(status) = nt_ntdll::loader::lock::validate_lock_request(
-        flags,
-        !state.is_null(),
-        !cookie.is_null(),
-    ) {
+    if let Err(status) =
+        nt_ntdll::loader::lock::validate_lock_request(flags, !state.is_null(), !cookie.is_null())
+    {
         return unsafe { loader_lock_error(flags, status) };
     }
 
@@ -9429,7 +9389,8 @@ pub unsafe extern "system" fn ldr_lock_loader_lock(
     let acquisition = LDR_LOADER_LOCK_ACQUISITION_COUNT
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
-    let value = nt_ntdll::loader::lock::make_cookie(unsafe { resource_current_thread() }, acquisition);
+    let value =
+        nt_ntdll::loader::lock::make_cookie(unsafe { resource_current_thread() }, acquisition);
     if !state.is_null() {
         unsafe { *state = nt_ntdll::loader::lock::DISPOSITION_LOCK_ACQUIRED };
     }
@@ -9444,11 +9405,9 @@ pub unsafe extern "system" fn ldr_lock_loader_lock(
 /// `cookie` from `LdrLockLoaderLock`.
 #[export_name = "LdrUnlockLoaderLock"]
 pub unsafe extern "system" fn ldr_unlock_loader_lock(flags: u32, cookie: usize) -> NtStatus {
-    if let Err(status) = nt_ntdll::loader::lock::validate_unlock(
-        flags,
-        cookie,
-        unsafe { resource_current_thread() },
-    ) {
+    if let Err(status) =
+        nt_ntdll::loader::lock::validate_unlock(flags, cookie, unsafe { resource_current_thread() })
+    {
         return unsafe { loader_lock_error(flags, status) };
     }
     if cookie == 0 {
@@ -9548,10 +9507,7 @@ pub unsafe extern "system" fn ldr_add_ref_dll(flags: u32, dll_handle: *mut c_voi
             Err(status) => return status,
         };
         unsafe {
-            crate::on_target::ldr_add_ref_dll(
-                dll_handle as u64,
-                flags & LDR_ADDREF_DLL_PIN != 0,
-            )
+            crate::on_target::ldr_add_ref_dll(dll_handle as u64, flags & LDR_ADDREF_DLL_PIN != 0)
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -9776,10 +9732,9 @@ pub unsafe extern "system" fn ldr_get_dll_handle_ex(
     if !dll_handle.is_null() {
         unsafe { core::ptr::write_unaligned(dll_handle, core::ptr::null_mut()) };
     }
-    let Some(action) = nt_ntdll::loader::lifecycle::get_dll_handle_action(
-        flags,
-        !dll_handle.is_null(),
-    ) else {
+    let Some(action) =
+        nt_ntdll::loader::lifecycle::get_dll_handle_action(flags, !dll_handle.is_null())
+    else {
         return STATUS_INVALID_PARAMETER;
     };
     if dll_name.is_null() {
@@ -9886,10 +9841,7 @@ pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
             let ldr = current_peb_ldr();
             if ldr != 0 {
                 core::ptr::write_unaligned((ldr + 0x48) as *mut u8, 1);
-                core::ptr::write_unaligned(
-                    (ldr + 0x50) as *mut u64,
-                    resource_current_thread(),
-                );
+                core::ptr::write_unaligned((ldr + 0x50) as *mut u64, resource_current_thread());
             }
         }
         let _loader_lock = match unsafe { acquire_loader_lock() } {
@@ -12112,13 +12064,7 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u(
 ) -> u8 {
     // SAFETY: forwards the same descriptor/pointer contract.
     u8::from(nt_success(unsafe {
-        rtl_dos_path_name_to_nt_path_name_u_impl(
-            dos_name,
-            nt_name,
-            part_name,
-            relative_name,
-            true,
-        )
+        rtl_dos_path_name_to_nt_path_name_u_impl(dos_name, nt_name, part_name, relative_name, true)
     }))
 }
 
@@ -12150,7 +12096,8 @@ pub unsafe extern "system" fn rtl_release_relative_name(relative_name: *mut c_vo
         return;
     }
     let relative = relative_name as *mut RtlRelativeNameU;
-    let reference = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*relative).cur_dir_ref)) };
+    let reference =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*relative).cur_dir_ref)) };
     if reference == 0 {
         return;
     }
@@ -12160,7 +12107,8 @@ pub unsafe extern "system" fn rtl_release_relative_name(relative_name: *mut c_vo
     if count.fetch_sub(1, Ordering::AcqRel) == 1 {
         #[cfg(target_arch = "x86_64")]
         {
-            let handle = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*reference).handle)) };
+            let handle =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*reference).handle)) };
             let _ = unsafe { boot_nt_close(handle) };
             unsafe { crate::process_heap_free(reference.cast()) };
         }
@@ -12204,18 +12152,15 @@ pub unsafe extern "system" fn rtl_dos_search_path_ustr(
     if flags & !7 != 0
         || path.is_null()
         || file_name.is_null()
-        || (!static_string.is_null()
-            && !dynamic_string.is_null()
-            && full_file_name_out.is_null())
+        || (!static_string.is_null() && !dynamic_string.is_null() && full_file_name_out.is_null())
     {
         return STATUS_INVALID_PARAMETER;
     }
 
     let path_units = unsafe { us_slice(path) };
     let file_units = unsafe { us_slice(file_name) };
-    let extension_units = (!default_extension.is_null()).then(|| unsafe {
-        us_slice(default_extension)
-    });
+    let extension_units =
+        (!default_extension.is_null()).then(|| unsafe { us_slice(default_extension) });
     let candidates = match nt_ntdll::rtl::path::dos_search_path_candidates(
         flags,
         path_units,
@@ -12258,9 +12203,7 @@ pub unsafe extern "system" fn rtl_dos_search_path_ustr(
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn copy_validated_unicode_string(
-    string: PCUnicodeString,
-) -> Result<Vec<u16>, NtStatus> {
+unsafe fn copy_validated_unicode_string(string: PCUnicodeString) -> Result<Vec<u16>, NtStatus> {
     if string.is_null() {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -12274,7 +12217,8 @@ unsafe fn copy_validated_unicode_string(
     }
     let units = descriptor.length as usize / 2;
     let mut copy = Vec::new();
-    copy.try_reserve_exact(units).map_err(|_| STATUS_NO_MEMORY)?;
+    copy.try_reserve_exact(units)
+        .map_err(|_| STATUS_NO_MEMORY)?;
     if units != 0 {
         copy.extend_from_slice(unsafe {
             core::slice::from_raw_parts(descriptor.buffer as *const u16, units)
@@ -12301,8 +12245,7 @@ unsafe fn isolation_dot_local_path(original: &[u16]) -> Result<Option<Vec<u16>>,
     if parameters == 0 {
         return Ok(None);
     }
-    let flags =
-        unsafe { core::ptr::read_unaligned((parameters as usize + 0x08) as *const u32) };
+    let flags = unsafe { core::ptr::read_unaligned((parameters as usize + 0x08) as *const u32) };
     if flags & RTL_USER_PROCESS_PARAMETERS_PRIVATE_DLL_PATH == 0 {
         return Ok(None);
     }
@@ -12351,10 +12294,7 @@ unsafe fn isolation_actctx_path(
     existence_only: bool,
 ) -> Result<Option<Vec<u16>>, NtStatus> {
     if !path_is_relative
-        && !nt_ntdll::rtl::activation_redirection::absolute_path_is_system32(
-            original,
-            system_root,
-        )
+        && !nt_ntdll::rtl::activation_redirection::absolute_path_is_system32(original, system_root)
     {
         return Ok(None);
     }
@@ -12391,17 +12331,16 @@ unsafe fn isolation_actctx_path(
             unsafe { activation_context_release(context) };
             return Ok(Some(Vec::new()));
         }
-        let redirection =
-            match nt_ntdll::rtl::activation_section::decode_dll_redirection(
-                &object.dll_redirect_section,
-                found,
-            ) {
-                Ok(redirection) => redirection,
-                Err(_) => {
-                    unsafe { activation_context_release(context) };
-                    continue;
-                }
-            };
+        let redirection = match nt_ntdll::rtl::activation_section::decode_dll_redirection(
+            &object.dll_redirect_section,
+            found,
+        ) {
+            Ok(redirection) => redirection,
+            Err(_) => {
+                unsafe { activation_context_release(context) };
+                continue;
+            }
+        };
         if !nt_ntdll::rtl::activation_redirection::redirection_applies_to_path(
             redirection.flags,
             path_is_relative,
@@ -12426,8 +12365,7 @@ unsafe fn isolation_actctx_path(
                 system_root,
                 lookup_name,
             )?;
-            if redirection.flags
-                & nt_ntdll::rtl::activation_section::DLL_REDIRECTION_PATH_EXPAND
+            if redirection.flags & nt_ntdll::rtl::activation_section::DLL_REDIRECTION_PATH_EXPAND
                 != 0
             {
                 path = crate::on_target::expand_env_units(&path).ok_or(STATUS_UNSUCCESSFUL)?;
@@ -12512,10 +12450,7 @@ unsafe fn write_isolation_redirection_output(
                 let mut descriptor = UnicodeString::default();
                 descriptor.maximum_length = required as u16;
                 descriptor.buffer = buffer as u64;
-                core::ptr::write_unaligned(
-                    dynamic_string,
-                    descriptor,
-                );
+                core::ptr::write_unaligned(dynamic_string, descriptor);
             }
             dynamic_string
         }
@@ -12813,11 +12748,13 @@ unsafe fn rtl_format_message_common(
         Ok(message) => message,
         Err(_) => return STATUS_INVALID_PARAMETER,
     };
-    let mut arguments = unsafe {
-        FormatMessageArguments::new(arguments, arguments_are_an_array != 0)
-    };
+    let mut arguments =
+        unsafe { FormatMessageArguments::new(arguments, arguments_are_an_array != 0) };
     let output = unsafe {
-        core::slice::from_raw_parts_mut(buffer, (buffer_size as usize) / core::mem::size_of::<u16>())
+        core::slice::from_raw_parts_mut(
+            buffer,
+            (buffer_size as usize) / core::mem::size_of::<u16>(),
+        )
     };
     match nt_ntdll::rtl::message::format_message(
         &message,
@@ -13028,9 +12965,8 @@ unsafe fn activation_context_release(handle: *mut c_void) {
         if !registry.contains(value) {
             return;
         }
-        let object = unsafe {
-            &*(value as *const nt_ntdll::rtl::activation::ActivationContextObject)
-        };
+        let object =
+            unsafe { &*(value as *const nt_ntdll::rtl::activation::ActivationContextObject) };
         if object.release_ref() {
             destroy = registry.remove(value);
         }
@@ -13325,7 +13261,8 @@ unsafe fn copy_utf16_z_bounded(value: *const u16, limit: usize) -> Result<Vec<u1
         return Err(STATUS_NAME_TOO_LONG);
     }
     let mut copy = Vec::new();
-    copy.try_reserve_exact(length).map_err(|_| STATUS_NO_MEMORY)?;
+    copy.try_reserve_exact(length)
+        .map_err(|_| STATUS_NO_MEMORY)?;
     for index in 0..length {
         copy.push(unsafe { core::ptr::read_unaligned(value.add(index)) });
     }
@@ -13338,15 +13275,13 @@ unsafe fn copy_ldr_full_name(base: usize) -> Result<Vec<u16>, NtStatus> {
     if entry == 0 {
         return Err(STATUS_DLL_NOT_FOUND);
     }
-    let length = unsafe {
-        core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME) as *const u16) as usize
-    };
+    let length =
+        unsafe { core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME) as *const u16) as usize };
     let maximum = unsafe {
         core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 2) as *const u16) as usize
     };
-    let buffer = unsafe {
-        core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 8) as *const *const u16)
-    };
+    let buffer =
+        unsafe { core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 8) as *const *const u16) };
     if length & 1 != 0 || length > maximum || (length != 0 && buffer.is_null()) {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -13444,9 +13379,7 @@ unsafe fn copy_actctx_resource_name(
 
 #[cfg(target_arch = "x86_64")]
 fn copy_activation_manifest_bytes(bytes: &[u8]) -> Result<Vec<u8>, NtStatus> {
-    if bytes.is_empty()
-        || bytes.len() > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
-    {
+    if bytes.is_empty() || bytes.len() > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES {
         return Err(nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
     }
     let mut manifest = Vec::new();
@@ -13497,9 +13430,7 @@ unsafe fn read_file_handle_bounded(
     let result = (|| {
         let mut contents = Vec::new();
         loop {
-            let remaining = maximum
-                .saturating_add(1)
-                .saturating_sub(contents.len());
+            let remaining = maximum.saturating_add(1).saturating_sub(contents.len());
             let requested = remaining.min(0x4000);
             if requested == 0 {
                 return Err(too_large_status);
@@ -13572,7 +13503,8 @@ unsafe fn read_activation_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtSt
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn read_associated_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtStatus> {
-    let handle = unsafe { open_activation_file(nt_path) }.map_err(|_| STATUS_RESOURCE_NAME_NOT_FOUND)?;
+    let handle =
+        unsafe { open_activation_file(nt_path) }.map_err(|_| STATUS_RESOURCE_NAME_NOT_FOUND)?;
     let result = unsafe {
         read_file_handle_bounded(
             handle,
@@ -13665,8 +13597,7 @@ impl TargetActivationManifestCatalog {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const STATUS_NO_MORE_FILES: NtStatus = 0x8000_0006;
 
-        let Some(pattern) =
-            nt_ntdll::rtl::activation_dependency::winsxs_manifest_pattern(request)?
+        let Some(pattern) = nt_ntdll::rtl::activation_dependency::winsxs_manifest_pattern(request)?
         else {
             return Ok(None);
         };
@@ -13675,15 +13606,14 @@ impl TargetActivationManifestCatalog {
         }
         let manifests_leaf: Vec<u16> = "winsxs\\manifests".encode_utf16().collect();
         let manifests_directory = append_activation_path(&self.system_root, &manifests_leaf)?;
-        let resolved_directory =
-            match nt_ntdll::rtl::activation::resolve_manifest_source(
-                &manifests_directory,
-                None,
-                &[],
-            ) {
-                Some(path) => path,
-                None => return Ok(None),
-            };
+        let resolved_directory = match nt_ntdll::rtl::activation::resolve_manifest_source(
+            &manifests_directory,
+            None,
+            &[],
+        ) {
+            Some(path) => path,
+            None => return Ok(None),
+        };
         let pattern_bytes = pattern
             .len()
             .checked_mul(2)
@@ -13733,9 +13663,7 @@ impl TargetActivationManifestCatalog {
                     return Ok(());
                 }
                 if information > buffer.0.len() {
-                    return Err(
-                        nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
-                    );
+                    return Err(nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                 }
                 let mut offset = 0usize;
                 loop {
@@ -13749,9 +13677,9 @@ impl TargetActivationManifestCatalog {
                     let attributes = u32::from_le_bytes(record[56..60].try_into().unwrap());
                     let name_bytes =
                         u32::from_le_bytes(record[60..64].try_into().unwrap()) as usize;
-                    let name_end = 94usize.checked_add(name_bytes).ok_or(
-                        nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
-                    )?;
+                    let name_end = 94usize
+                        .checked_add(name_bytes)
+                        .ok_or(nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
                     if name_bytes & 1 != 0 || name_end > record.len() {
                         return Err(
                             nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
@@ -13834,11 +13762,9 @@ impl TargetActivationManifestCatalog {
                     .try_reserve_exact(".dll".len())
                     .map_err(|_| STATUS_NO_MEMORY)?;
                 dll_path.extend(".dll".bytes().map(u16::from));
-                if let Some(resolved) = nt_ntdll::rtl::activation::resolve_manifest_source(
-                    &dll_path,
-                    None,
-                    &[],
-                ) {
+                if let Some(resolved) =
+                    nt_ntdll::rtl::activation::resolve_manifest_source(&dll_path, None, &[])
+                {
                     let embedded = unsafe {
                         read_activation_file(
                             &resolved.nt_path,
@@ -13869,11 +13795,9 @@ impl TargetActivationManifestCatalog {
                     .try_reserve_exact(".manifest".len())
                     .map_err(|_| STATUS_NO_MEMORY)?;
                 manifest_path.extend(".manifest".bytes().map(u16::from));
-                let Some(resolved) = nt_ntdll::rtl::activation::resolve_manifest_source(
-                    &manifest_path,
-                    None,
-                    &[],
-                ) else {
+                let Some(resolved) =
+                    nt_ntdll::rtl::activation::resolve_manifest_source(&manifest_path, None, &[])
+                else {
                     continue;
                 };
                 match unsafe { read_activation_manifest_file(&resolved.nt_path) } {
@@ -13904,10 +13828,8 @@ impl nt_ntdll::rtl::activation_dependency::ActivationManifestCatalog
     fn resolve(
         &mut self,
         request: &nt_ntdll::rtl::activation_dependency::AssemblyRequest,
-    ) -> Result<
-        Option<nt_ntdll::rtl::activation_dependency::ActivationManifestSource>,
-        NtStatus,
-    > {
+    ) -> Result<Option<nt_ntdll::rtl::activation_dependency::ActivationManifestSource>, NtStatus>
+    {
         // SAFETY: the catalog runs inside ntdll with process-owned buffers and native syscall stubs.
         unsafe {
             match self.resolve_winsxs(request)? {
@@ -13993,11 +13915,9 @@ pub unsafe extern "system" fn rtl_activate_activation_context_ex(
     if cookie.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    if let Err(status) = nt_ntdll::rtl::activation::validate_activate_ex(
-        flags,
-        !teb.is_null(),
-        act_ctx as usize,
-    ) {
+    if let Err(status) =
+        nt_ntdll::rtl::activation::validate_activate_ex(flags, !teb.is_null(), act_ctx as usize)
+    {
         return status;
     }
     #[cfg(target_arch = "x86_64")]
@@ -14006,9 +13926,8 @@ pub unsafe extern "system" fn rtl_activate_activation_context_ex(
             Ok(stack) => stack,
             Err(status) => return status,
         };
-        let frame = crate::process_heap_alloc(
-            nt_ntdll::rtl::activation::ActivationContextStackFrame::SIZE,
-        );
+        let frame =
+            crate::process_heap_alloc(nt_ntdll::rtl::activation::ActivationContextStackFrame::SIZE);
         if frame.is_null() {
             return STATUS_NO_MEMORY;
         }
@@ -14246,16 +14165,17 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             Ok(mode) => mode,
             Err(status) => return status,
         };
-        let assembly_directory =
-            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID != 0
-            {
-                match copy_utf16_z_bounded(descriptor.assembly_directory as *const u16, 32 * 1024) {
-                    Ok(directory) => directory,
-                    Err(status) => return status,
-                }
-            } else {
-                Vec::new()
-            };
+        let assembly_directory = if descriptor.flags
+            & nt_ntdll::rtl::activation::ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID
+            != 0
+        {
+            match copy_utf16_z_bounded(descriptor.assembly_directory as *const u16, 32 * 1024) {
+                Ok(directory) => directory,
+                Err(status) => return status,
+            }
+        } else {
+            Vec::new()
+        };
         let (mut manifest, source, mut manifest_path, associated_manifest) = match source_mode {
             nt_ntdll::rtl::activation::ActivationContextSourceMode::LoadedModuleResource => {
                 let (resource_name, numeric_resource) =
@@ -14268,14 +14188,11 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Err(status) => return status,
                 };
                 let cwd = peb_current_directory();
-                let resolved = match nt_ntdll::rtl::activation::resolve_manifest_source(
-                    &source,
-                    None,
-                    &cwd,
-                ) {
-                    Some(resolved) => resolved,
-                    None => return STATUS_NO_SUCH_FILE,
-                };
+                let resolved =
+                    match nt_ntdll::rtl::activation::resolve_manifest_source(&source, None, &cwd) {
+                        Some(resolved) => resolved,
+                        None => return STATUS_NO_SUCH_FILE,
+                    };
                 let sidecar = match nt_ntdll::rtl::activation::associated_manifest_source(
                     &resolved,
                     numeric_resource,
@@ -14289,11 +14206,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                         name.as_ptr() as usize
                     }
                 };
-                let resource_path = [
-                    24usize,
-                    resource_value,
-                    descriptor.language_id as usize,
-                ];
+                let resource_path = [24usize, resource_value, descriptor.language_id as usize];
                 let primary = (|| -> Result<Vec<u8>, NtStatus> {
                     let mut data_entry = core::ptr::null_mut();
                     let status = ldr_find_resource_u(
@@ -14318,8 +14231,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     }
                     if manifest_address.is_null()
                         || manifest_size == 0
-                        || manifest_size as usize
-                            > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
+                        || manifest_size as usize > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
                     {
                         return Err(
                             nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
@@ -14345,18 +14257,14 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                             Ok(manifest) => manifest,
                             Err(status) => return status,
                         };
-                        (
-                            manifest,
-                            resolved.dos_path,
-                            sidecar.dos_path,
-                            None,
-                        )
+                        (manifest, resolved.dos_path, sidecar.dos_path, None)
                     }
                     Err(status) => return status,
                 }
             }
             nt_ntdll::rtl::activation::ActivationContextSourceMode::ManifestFile => {
-                let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
+                let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024)
+                {
                     Ok(source) => source,
                     Err(status) => return status,
                 };
@@ -14373,15 +14281,11 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(manifest) => manifest,
                     Err(status) => return status,
                 };
-                (
-                    manifest,
-                    resolved.dos_path.clone(),
-                    resolved.dos_path,
-                    None,
-                )
+                (manifest, resolved.dos_path.clone(), resolved.dos_path, None)
             }
             nt_ntdll::rtl::activation::ActivationContextSourceMode::PeFileResource => {
-                let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
+                let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024)
+                {
                     Ok(source) => source,
                     Err(status) => return status,
                 };
@@ -14441,12 +14345,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                             Ok(manifest) => manifest,
                             Err(status) => return status,
                         };
-                        (
-                            manifest,
-                            resolved.dos_path,
-                            sidecar.dos_path,
-                            None,
-                        )
+                        (manifest, resolved.dos_path, sidecar.dos_path, None)
                     }
                 }
             }
@@ -14468,37 +14367,36 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 return status;
             }
         }
-        let application_directory =
-            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
-            {
-                match copy_utf16_z_bounded(descriptor.application_name as *const u16, 32 * 1024) {
-                    Ok(application) => application,
-                    Err(status) => return status,
-                }
-            } else {
-                let application_module = if descriptor.flags
-                    & nt_ntdll::rtl::activation::ACTCTX_FLAG_HMODULE_VALID
-                    != 0
-                {
+        let application_directory = if descriptor.flags
+            & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID
+            != 0
+        {
+            match copy_utf16_z_bounded(descriptor.application_name as *const u16, 32 * 1024) {
+                Ok(application) => application,
+                Err(status) => return status,
+            }
+        } else {
+            let application_module =
+                if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_HMODULE_VALID != 0 {
                     descriptor.module
                 } else {
                     let peb = current_peb();
                     if peb == 0 {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    core::ptr::read_unaligned(
-                        core::ptr::addr_of!((*(peb as *const nt_ntdll_layout::Peb)).image_base_address),
-                    ) as usize
+                    core::ptr::read_unaligned(core::ptr::addr_of!(
+                        (*(peb as *const nt_ntdll_layout::Peb)).image_base_address
+                    )) as usize
                 };
-                let application_path = match copy_ldr_full_name(application_module) {
-                    Ok(path) => path,
-                    Err(status) => return status,
-                };
-                match parent_directory_with_separator(&application_path) {
-                    Ok(directory) => directory,
-                    Err(status) => return status,
-                }
+            let application_path = match copy_ldr_full_name(application_module) {
+                Ok(path) => path,
+                Err(status) => return status,
             };
+            match parent_directory_with_separator(&application_path) {
+                Ok(directory) => directory,
+                Err(status) => return status,
+            }
+        };
         let root_manifest_directory = match parent_directory_with_separator(&manifest_path) {
             Ok(directory) => directory,
             Err(status) => return status,
@@ -14508,14 +14406,13 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             application_directory: application_directory.clone(),
             root_manifest_directory,
         };
-        let root_source =
-            nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
-                source,
-                manifest_path,
-                assembly_directory,
-                manifest,
-                shared: false,
-            };
+        let root_source = nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
+            source,
+            manifest_path,
+            assembly_directory,
+            manifest,
+            shared: false,
+        };
         let native_architecture: Vec<u16> = "amd64".encode_utf16().collect();
         let mut resolved =
             match nt_ntdll::rtl::activation_dependency::resolve_activation_dependencies(
@@ -14548,29 +14445,21 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             return STATUS_NO_MEMORY;
         }
         for assembly in &resolved.assemblies {
-            dll_assemblies.push(
-                nt_ntdll::rtl::activation_section::DllRedirectAssembly {
-                    redirects: &assembly.details.root.dll_redirects,
-                },
-            );
-            window_assemblies.push(
-                nt_ntdll::rtl::activation_section::WindowClassAssembly {
-                    version: assembly.details.root.assembly_identity.version,
-                    files: &assembly.details.root.dll_redirects,
-                    classes: &assembly.details.window_classes,
-                },
-            );
-            interface_assemblies.push(
-                nt_ntdll::rtl::activation_section::ComInterfaceAssembly {
-                    files: &assembly.details.root.dll_redirects,
-                    interfaces: &assembly.details.com_interfaces,
-                },
-            );
-            clr_assemblies.push(
-                nt_ntdll::rtl::activation_section::ClrSurrogateAssembly {
-                    surrogates: &assembly.details.clr_surrogates,
-                },
-            );
+            dll_assemblies.push(nt_ntdll::rtl::activation_section::DllRedirectAssembly {
+                redirects: &assembly.details.root.dll_redirects,
+            });
+            window_assemblies.push(nt_ntdll::rtl::activation_section::WindowClassAssembly {
+                version: assembly.details.root.assembly_identity.version,
+                files: &assembly.details.root.dll_redirects,
+                classes: &assembly.details.window_classes,
+            });
+            interface_assemblies.push(nt_ntdll::rtl::activation_section::ComInterfaceAssembly {
+                files: &assembly.details.root.dll_redirects,
+                interfaces: &assembly.details.com_interfaces,
+            });
+            clr_assemblies.push(nt_ntdll::rtl::activation_section::ClrSurrogateAssembly {
+                surrogates: &assembly.details.clr_surrogates,
+            });
         }
         let dll_redirect_section =
             match nt_ntdll::rtl::activation_section::build_dll_redirection_section_for_assemblies(
@@ -15123,11 +15012,9 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
             {
                 return STATUS_DLL_NOT_FOUND;
             }
-            selected =
-                core::ptr::read_unaligned((entry + 0x88) as *const *mut c_void);
+            selected = core::ptr::read_unaligned((entry + 0x88) as *const *mut c_void);
         } else if selected.is_null()
-            && info_class
-                != nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS
+            && info_class != nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS
         {
             selected = process_activation_context_no_addref();
         }
@@ -15208,10 +15095,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                         nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
                     } else {
                         let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
-                        match nt_ntdll::rtl::activation_query::pack_detailed_into(
-                            &query,
-                            output,
-                        ) {
+                        match nt_ntdll::rtl::activation_query::pack_detailed_into(&query, output) {
                             Ok(_) => {
                                 rebase_activation_query_pointers(
                                     info.cast(),
@@ -15230,20 +15114,19 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                 return STATUS_INVALID_PARAMETER;
             }
             let roster_index = core::ptr::read_unaligned(sub_instance as *const u32);
-            let assembly_index =
-                match nt_ntdll::rtl::activation_query::validate_roster_index(
-                    roster_index,
-                    assembly_count,
-                ) {
-                    Ok(index) => index,
-                    Err(status) => {
-                        activation_context_release(selected);
-                        return status;
-                    }
-                };
+            let assembly_index = match nt_ntdll::rtl::activation_query::validate_roster_index(
+                roster_index,
+                assembly_count,
+            ) {
+                Ok(index) => index,
+                Err(status) => {
+                    activation_context_release(selected);
+                    return status;
+                }
+            };
             let assembly = &object.assemblies[assembly_index];
-            let manifest_path = (!assembly.manifest_path.is_empty())
-                .then_some(assembly.manifest_path.as_slice());
+            let manifest_path =
+                (!assembly.manifest_path.is_empty()).then_some(assembly.manifest_path.as_slice());
             let assembly_directory = (!assembly.assembly_directory.is_empty())
                 .then_some(assembly.assembly_directory.as_slice());
             let file_count = match u32::try_from(assembly.dll_redirects.len()) {
@@ -15275,8 +15158,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                     } else {
                         let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
                         match nt_ntdll::rtl::activation_query::pack_assembly_detailed_into(
-                            &query,
-                            output,
+                            &query, output,
                         ) {
                             Ok(_) => {
                                 rebase_activation_query_pointers(
@@ -15326,8 +15208,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                     } else {
                         let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
                         match nt_ntdll::rtl::activation_query::pack_file_detailed_into(
-                            &query,
-                            output,
+                            &query, output,
                         ) {
                             Ok(_) => {
                                 rebase_activation_query_pointers(
@@ -15364,22 +15245,27 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
             }
         } else {
             let mut elements = Vec::new();
-            if elements.try_reserve_exact(object.compatibility.len()).is_err() {
+            if elements
+                .try_reserve_exact(object.compatibility.len())
+                .is_err()
+            {
                 activation_context_release(selected);
                 return STATUS_NO_MEMORY;
             }
             for element in &object.compatibility {
-                elements.push(nt_ntdll::rtl::activation_query::CompatibilityContextElement {
-                    id: nt_ntdll::rtl::activation_query::CompatibilityGuid {
-                        data1: element.id.data1,
-                        data2: element.id.data2,
-                        data3: element.id.data3,
-                        data4: element.id.data4,
+                elements.push(
+                    nt_ntdll::rtl::activation_query::CompatibilityContextElement {
+                        id: nt_ntdll::rtl::activation_query::CompatibilityGuid {
+                            data1: element.id.data1,
+                            data2: element.id.data2,
+                            data3: element.id.data3,
+                            data4: element.id.data4,
+                        },
+                        element_type: element.kind,
+                        padding: 0,
+                        max_version_tested: element.max_version_tested,
                     },
-                    element_type: element.kind,
-                    padding: 0,
-                    max_version_tested: element.max_version_tested,
-                });
+                );
             }
             match nt_ntdll::rtl::activation_query::compatibility_required_size(&elements) {
                 Err(status) => status,
@@ -15392,8 +15278,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                     } else {
                         let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
                         match nt_ntdll::rtl::activation_query::pack_compatibility_into(
-                            &elements,
-                            output,
+                            &elements, output,
                         ) {
                             Ok(_) => STATUS_SUCCESS,
                             Err(status) => status,
@@ -15429,9 +15314,8 @@ pub unsafe extern "system" fn rtl_allocate_activation_context_stack(
         if !core::ptr::read_unaligned(stack).is_null() {
             return STATUS_SUCCESS;
         }
-        let memory = crate::process_heap_alloc(
-            nt_ntdll::rtl::activation::ActivationContextStack::SIZE,
-        );
+        let memory =
+            crate::process_heap_alloc(nt_ntdll::rtl::activation::ActivationContextStack::SIZE);
         if memory.is_null() {
             return STATUS_NO_MEMORY;
         }
@@ -15670,10 +15554,11 @@ pub unsafe extern "system" fn rtl_is_thread_within_loader_callout() -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
         let owner = LDR_TOP_LEVEL_CALLOUT_TEB.load(Ordering::Acquire);
-        return u8::from(nt_ntdll::loader::lifecycle::is_thread_within_loader_callout(
-            owner,
-            unsafe { current_teb() as u64 },
-        ));
+        return u8::from(
+            nt_ntdll::loader::lifecycle::is_thread_within_loader_callout(owner, unsafe {
+                current_teb() as u64
+            }),
+        );
     }
     #[cfg(not(target_arch = "x86_64"))]
     0
@@ -17774,9 +17659,7 @@ unsafe fn resource_release_semaphore(handle: u64, count: u32) {
             unsafe extern "C" fn(),
             unsafe extern "system" fn(u64, i32, *mut i32) -> NtStatus,
         >(nt_ntdll::trap_stubs::nt_release_semaphore)(
-            handle,
-            count as i32,
-            core::ptr::null_mut(),
+            handle, count as i32, core::ptr::null_mut()
         )
     };
 }
@@ -17947,9 +17830,7 @@ pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void,
                 return 0;
             }
             nt_ntdll::rtl::resource::Acquire::Blocked => {
-                let semaphore = unsafe {
-                    *(resource.byte_add(RES_SHARED_SEMAPHORE) as *const u64)
-                };
+                let semaphore = unsafe { *(resource.byte_add(RES_SHARED_SEMAPHORE) as *const u64) };
                 let _ = unsafe { rtl_leave_critical_section(resource) };
                 #[cfg(target_arch = "x86_64")]
                 if !nt_success(unsafe { resource_wait_for_semaphore(semaphore) }) {
@@ -17990,9 +17871,8 @@ pub unsafe extern "system" fn rtl_acquire_resource_exclusive(
                 return 0;
             }
             nt_ntdll::rtl::resource::Acquire::Blocked => {
-                let semaphore = unsafe {
-                    *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *const u64)
-                };
+                let semaphore =
+                    unsafe { *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *const u64) };
                 let _ = unsafe { rtl_leave_critical_section(resource) };
                 #[cfg(target_arch = "x86_64")]
                 if !nt_success(unsafe { resource_wait_for_semaphore(semaphore) }) {
@@ -18149,7 +18029,15 @@ unsafe fn rtl_create_timer_impl(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (timer_queue, timer, callback, parameter, due_time, period, flags);
+        let _ = (
+            timer_queue,
+            timer,
+            callback,
+            parameter,
+            due_time,
+            period,
+            flags,
+        );
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -18161,10 +18049,7 @@ unsafe fn rtl_delete_timer_queue_ex_impl(
     #[cfg(target_arch = "x86_64")]
     {
         return unsafe {
-            crate::on_target::rtl_delete_timer_queue(
-                timer_queue as u64,
-                completion_event as u64,
-            )
+            crate::on_target::rtl_delete_timer_queue(timer_queue as u64, completion_event as u64)
         };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -18379,7 +18264,14 @@ pub unsafe extern "system" fn rtl_register_wait(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (new_wait_object, object, callback, context, milliseconds, flags);
+        let _ = (
+            new_wait_object,
+            object,
+            callback,
+            context,
+            milliseconds,
+            flags,
+        );
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -18733,9 +18625,7 @@ unsafe fn debug_buffer_commit(
     }
     unsafe {
         (*buffer).offset_free = plan.new_offset_free;
-        (*buffer)
-            .view_base_client
-            .byte_add(plan.result_offset)
+        (*buffer).view_base_client.byte_add(plan.result_offset)
     }
 }
 
@@ -18878,9 +18768,7 @@ unsafe fn rtl_query_remote_process_modules(
     process_id: u32,
     buffer: *mut nt_ntdll::rtl::debug_buffer::DebugInformation,
 ) -> NtStatus {
-    use nt_ntdll::rtl::debug_buffer::{
-        query_remote_process_modules, RemoteModuleSnapshotError,
-    };
+    use nt_ntdll::rtl::debug_buffer::{query_remote_process_modules, RemoteModuleSnapshotError};
 
     let process_handle = match unsafe { debug_open_process(process_id) } {
         Ok(handle) => handle,
@@ -18963,8 +18851,7 @@ unsafe fn rtl_query_process_heap_information_impl(
             if include_entries
                 && (specific_heap.is_null() || specific_heap.cast::<u8>() == handles[index])
             {
-                let Some(total) =
-                    number_of_entries.checked_add(summary.number_of_entries as usize)
+                let Some(total) = number_of_entries.checked_add(summary.number_of_entries as usize)
                 else {
                     return STATUS_NO_MEMORY;
                 };
@@ -19164,9 +19051,7 @@ pub unsafe extern "system" fn rtl_destroy_query_debug_buffer(buffer: *mut c_void
 /// # Safety
 /// `buffer` must come from `RtlCreateQueryDebugBuffer`.
 #[export_name = "RtlQueryProcessHeapInformation"]
-pub unsafe extern "system" fn rtl_query_process_heap_information(
-    buffer: *mut c_void,
-) -> NtStatus {
+pub unsafe extern "system" fn rtl_query_process_heap_information(buffer: *mut c_void) -> NtStatus {
     if buffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -19239,11 +19124,7 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
         if flags & nt_ntdll::rtl::debug_buffer::QUERY_MODULES != 0 {
             let mut required = 0u32;
             let status = unsafe {
-                ldr_query_process_module_information(
-                    core::ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
+                ldr_query_process_module_information(core::ptr::null_mut(), 0, &mut required)
             };
             if status != STATUS_INFO_LENGTH_MISMATCH && !nt_success(status) {
                 return status;
@@ -19317,10 +19198,7 @@ pub unsafe extern "system" fn rtl_get_unload_event_trace_ex(
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "system" fn rtl_trace_standard_hash(
-    count: u32,
-    trace: *mut *mut c_void,
-) -> u32 {
+unsafe extern "system" fn rtl_trace_standard_hash(count: u32, trace: *mut *mut c_void) -> u32 {
     if count == 0 {
         return 0;
     }
@@ -19360,9 +19238,7 @@ unsafe fn trace_database_acquire(
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn trace_database_release(
-    database: *mut nt_ntdll::rtl::trace_database::TraceDatabase,
-) {
+unsafe fn trace_database_release(database: *mut nt_ntdll::rtl::trace_database::TraceDatabase) {
     unsafe {
         (*database).owner = core::ptr::null_mut();
         let lock = core::ptr::addr_of_mut!((*database).lock).cast::<c_void>();
@@ -19378,16 +19254,15 @@ unsafe fn trace_hash_and_bucket(
     record_probe: bool,
 ) -> Option<(u32, usize)> {
     let hash = unsafe { ((*database).hash_function?)(count, trace) };
-    let bucket =
-        nt_ntdll::rtl::trace_database::bucket_index(hash, unsafe { (*database).number_of_buckets })?;
+    let bucket = nt_ntdll::rtl::trace_database::bucket_index(hash, unsafe {
+        (*database).number_of_buckets
+    })?;
     if record_probe {
-        let counter = nt_ntdll::rtl::trace_database::hash_counter_index(
-            bucket,
-            unsafe { (*database).number_of_buckets },
-        )?;
+        let counter = nt_ntdll::rtl::trace_database::hash_counter_index(bucket, unsafe {
+            (*database).number_of_buckets
+        })?;
         unsafe {
-            (*database).hash_counter[counter] =
-                (*database).hash_counter[counter].saturating_add(1);
+            (*database).hash_counter[counter] = (*database).hash_counter[counter].saturating_add(1);
         }
     }
     Some((hash, bucket))
@@ -19590,9 +19465,9 @@ unsafe fn trace_database_validate_locked(
             {
                 return false;
             }
-            let Some((_, expected_bucket)) = (unsafe {
-                trace_hash_and_bucket(database, (*block).size, (*block).trace, false)
-            }) else {
+            let Some((_, expected_bucket)) =
+                (unsafe { trace_hash_and_bucket(database, (*block).size, (*block).trace, false) })
+            else {
                 return false;
             };
             if expected_bucket != bucket {
@@ -19627,8 +19502,7 @@ pub unsafe extern "system" fn rtl_trace_database_create(
             TRACE_IN_USER_MODE, TRACE_SEGMENT_MAGIC,
         };
 
-        let Some(allocation_size) =
-            nt_ntdll::rtl::trace_database::initial_allocation_size(buckets)
+        let Some(allocation_size) = nt_ntdll::rtl::trace_database::initial_allocation_size(buckets)
         else {
             return core::ptr::null_mut();
         };
@@ -19640,7 +19514,11 @@ pub unsafe extern "system" fn rtl_trace_database_create(
         unsafe { core::ptr::write_bytes(raw, 0, allocation_size) };
         let database = raw.cast::<TraceDatabase>();
         let segment = unsafe { database.add(1).cast::<TraceSegment>() };
-        let bucket_table = unsafe { segment.add(1).cast::<*mut nt_ntdll::rtl::trace_database::TraceBlock>() };
+        let bucket_table = unsafe {
+            segment
+                .add(1)
+                .cast::<*mut nt_ntdll::rtl::trace_database::TraceBlock>()
+        };
         let function = if hash_function.is_null() {
             rtl_trace_standard_hash
         } else {
@@ -19726,8 +19604,7 @@ pub unsafe extern "system" fn rtl_trace_database_add(
         }
         let result = (|| {
             let (_, bucket) = unsafe { trace_hash_and_bucket(database, count, trace, true) }?;
-            let existing =
-                unsafe { trace_find_in_bucket(database, bucket, count, trace) };
+            let existing = unsafe { trace_find_in_bucket(database, bucket, count, trace) };
             if !existing.is_null() {
                 unsafe {
                     (*existing).count = (*existing).count.saturating_add(1);
@@ -19736,8 +19613,7 @@ pub unsafe extern "system" fn rtl_trace_database_add(
                 return Some(existing);
             }
 
-            let request =
-                nt_ntdll::rtl::trace_database::trace_block_allocation_size(count)?;
+            let request = nt_ntdll::rtl::trace_database::trace_block_allocation_size(count)?;
             let mut segment = unsafe { (*database).segment_list };
             let remaining = unsafe {
                 ((*segment).segment_end as usize).checked_sub((*segment).segment_free as usize)
@@ -19801,8 +19677,7 @@ pub unsafe extern "system" fn rtl_trace_database_add(
                     core::ptr::copy_nonoverlapping(trace, trace_copy, count as usize);
                 }
                 *(*database).buckets.add(bucket) = block;
-                (*database).number_of_traces =
-                    (*database).number_of_traces.saturating_add(1);
+                (*database).number_of_traces = (*database).number_of_traces.saturating_add(1);
             }
             Some(block)
         })();
@@ -19910,14 +19785,12 @@ pub unsafe extern "system" fn rtl_trace_database_enumerate(
                     return None;
                 }
                 unsafe {
-                    (*enumerate).block =
-                        *(*database).buckets.add((*enumerate).index as usize);
+                    (*enumerate).block = *(*database).buckets.add((*enumerate).index as usize);
                 }
             }
             let current = unsafe { (*enumerate).block };
-            if !unsafe {
-                trace_block_is_in_bucket(database, (*enumerate).index as usize, current)
-            } {
+            if !unsafe { trace_block_is_in_bucket(database, (*enumerate).index as usize, current) }
+            {
                 return None;
             }
             unsafe { (*enumerate).block = (*current).next };
@@ -19981,9 +19854,7 @@ pub unsafe extern "system" fn rtl_trace_database_destroy(database: *mut c_void) 
             } else {
                 segment as u64
             };
-            if !nt_success(unsafe {
-                crate::on_target::nt_release_virtual_memory(allocation)
-            }) {
+            if !nt_success(unsafe { crate::on_target::nt_release_virtual_memory(allocation) }) {
                 success = false;
             }
             segment = next;
@@ -20003,9 +19874,7 @@ pub unsafe extern "system" fn rtl_trace_database_lock(database: *mut c_void) {
     #[cfg(target_arch = "x86_64")]
     {
         let _ = unsafe {
-            trace_database_acquire(
-                database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>(),
-            )
+            trace_database_acquire(database.cast::<nt_ntdll::rtl::trace_database::TraceDatabase>())
         };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -23625,23 +23494,26 @@ pub unsafe extern "system" fn rtl_compute_import_table_hash(
             Ok(image) => image,
             Err(status) => return status,
         };
-        let digest = match nt_ntdll::rtl::import_table_hash::compute_import_table_hash(
-            &image, revision,
-        ) {
-            Ok(digest) => digest,
-            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::UnknownRevision) => {
-                return STATUS_UNKNOWN_REVISION;
-            }
-            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceDataNotFound) => {
-                return STATUS_RESOURCE_DATA_NOT_FOUND;
-            }
-            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceNameNotFound) => {
-                return STATUS_RESOURCE_NAME_NOT_FOUND;
-            }
-            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::NoMemory) => {
-                return STATUS_NO_MEMORY;
-            }
-        };
+        let digest =
+            match nt_ntdll::rtl::import_table_hash::compute_import_table_hash(&image, revision) {
+                Ok(digest) => digest,
+                Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::UnknownRevision) => {
+                    return STATUS_UNKNOWN_REVISION;
+                }
+                Err(
+                    nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceDataNotFound,
+                ) => {
+                    return STATUS_RESOURCE_DATA_NOT_FOUND;
+                }
+                Err(
+                    nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceNameNotFound,
+                ) => {
+                    return STATUS_RESOURCE_NAME_NOT_FOUND;
+                }
+                Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::NoMemory) => {
+                    return STATUS_NO_MEMORY;
+                }
+            };
         // SAFETY: the caller supplies a writable 16-byte hash buffer.
         unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), hash, digest.len()) };
         STATUS_SUCCESS
@@ -23876,8 +23748,9 @@ pub unsafe extern "system" fn rtl_destroy_heap(heap: *mut c_void) -> *mut c_void
                 }
                 core::ptr::null_mut()
             }
-            nt_ntdll::heap::HeapRemoval::ProcessHeap
-            | nt_ntdll::heap::HeapRemoval::NotFound => heap,
+            nt_ntdll::heap::HeapRemoval::ProcessHeap | nt_ntdll::heap::HeapRemoval::NotFound => {
+                heap
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -24299,9 +24172,8 @@ pub unsafe extern "system" fn etw_event_activity_id_control(
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let teb = &mut *(current_teb() as *mut Teb);
-        let current = core::ptr::read_unaligned(
-            teb.activity_id.as_ptr().cast::<nt_ntdll::etw::Guid>(),
-        );
+        let current =
+            core::ptr::read_unaligned(teb.activity_id.as_ptr().cast::<nt_ntdll::etw::Guid>());
         let mut state = nt_ntdll::etw::ActivityState { current };
         let mut value = core::ptr::read_unaligned(activity_id);
         let generated = if matches!(
@@ -24313,8 +24185,7 @@ pub unsafe extern "system" fn etw_event_activity_id_control(
         } else {
             nt_ntdll::etw::Guid::default()
         };
-        let status =
-            nt_ntdll::etw::control_activity_id(&mut state, control, &mut value, generated);
+        let status = nt_ntdll::etw::control_activity_id(&mut state, control, &mut value, generated);
         if status == nt_ntdll::etw::ERROR_SUCCESS {
             core::ptr::write_unaligned(activity_id, value);
             core::ptr::write_unaligned(
@@ -24365,8 +24236,7 @@ pub unsafe extern "system" fn etw_event_register(
 #[export_name = "EtwEventUnregister"]
 pub unsafe extern "system" fn etw_event_unregister(registration_handle: u64) -> u32 {
     let _guard = etw_provider_guard();
-    unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }
-        .unregister(registration_handle)
+    unsafe { &mut *core::ptr::addr_of_mut!(ETW_PROVIDER_REGISTRY) }.unregister(registration_handle)
 }
 
 #[export_name = "EtwEventEnabled"]
@@ -25135,11 +25005,7 @@ zw_alias!(
     nt_query_volume_information_file
 );
 zw_alias!(zw_queue_apc_thread, "ZwQueueApcThread", nt_queue_apc_thread);
-zw_alias!(
-    zw_raise_exception,
-    "ZwRaiseException",
-    nt_raise_exception
-);
+zw_alias!(zw_raise_exception, "ZwRaiseException", nt_raise_exception);
 zw_alias!(zw_raise_hard_error, "ZwRaiseHardError", nt_raise_hard_error);
 zw_alias!(zw_read_file, "ZwReadFile", nt_read_file);
 zw_alias!(
@@ -25407,9 +25273,8 @@ pub unsafe extern "system" fn rtl_append_string_to_string(
         return STATUS_INVALID_PARAMETER;
     }
     // Read descriptor fields before moving bytes: source and destination buffers may overlap.
-    let (source_buffer, source_len) = unsafe {
-        ((*source).buffer as *const u8, (*source).length as usize)
-    };
+    let (source_buffer, source_len) =
+        unsafe { ((*source).buffer as *const u8, (*source).length as usize) };
     if source_len == 0 {
         return STATUS_SUCCESS;
     }
@@ -27598,11 +27463,8 @@ pub unsafe extern "system" fn rtl_is_text_unicode(
     } else {
         Some(unsafe { core::ptr::read_unaligned(result) } as u32)
     };
-    let detected = rtl::text_unicode::is_text_unicode(
-        bytes,
-        requested,
-        nls_is_ansi_dbcs(),
-        |unit| {
+    let detected =
+        rtl::text_unicode::is_text_unicode(bytes, requested, nls_is_ansi_dbcs(), |unit| {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 let lead_info = NLS_ANSI_LEAD_BYTE_INFO;
@@ -27615,8 +27477,7 @@ pub unsafe extern "system" fn rtl_is_text_unicode(
                 let _ = unit;
                 false
             }
-        },
-    );
+        });
     if !result.is_null() {
         // SAFETY: result writable.
         unsafe { core::ptr::write_unaligned(result, detected.flags as i32) };
@@ -27958,7 +27819,7 @@ pub unsafe extern "C" fn dbg_print_ex(
     component: u32,
     level: u32,
     format: *const u8,
-    args: ...,
+    args: ...
 ) -> NtStatus {
     if !dbg_print_filter_allows(component, level) {
         return STATUS_SUCCESS;
@@ -27971,10 +27832,7 @@ pub unsafe extern "C" fn dbg_print_ex(
 /// # Safety
 /// Called with the C DbgPrint ABI; every argument must match its format conversion.
 #[export_name = "DbgPrintReturnControlC"]
-pub unsafe extern "C" fn dbg_print_return_control_c(
-    format: *const u8,
-    args: ...,
-) -> NtStatus {
+pub unsafe extern "C" fn dbg_print_return_control_c(format: *const u8, args: ...) -> NtStatus {
     unsafe { dbg_emit_variadic(format, args) }
 }
 
@@ -28319,11 +28177,9 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
         return STATUS_INVALID_PARAMETER;
     }
     let state = unsafe {
-        &*(wait_state_change
-            as *const [u8; nt_ntdll::dbg::DBGUI_WAIT_STATE_CHANGE_SIZE])
+        &*(wait_state_change as *const [u8; nt_ntdll::dbg::DBGUI_WAIT_STATE_CHANGE_SIZE])
     };
-    let event =
-        unsafe { &mut *(debug_event as *mut [u8; nt_ntdll::dbg::DEBUG_EVENT_SIZE]) };
+    let event = unsafe { &mut *(debug_event as *mut [u8; nt_ntdll::dbg::DEBUG_EVENT_SIZE]) };
     match nt_ntdll::dbg::convert_state_change(state, event, |thread| {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -28332,13 +28188,7 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
             let mut information = [0u8; THREAD_BASIC_INFORMATION_SIZE];
             let status = core::mem::transmute::<
                 unsafe extern "C" fn(),
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    *mut c_void,
-                    u32,
-                    *mut u32,
-                ) -> NtStatus,
+                unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> NtStatus,
             >(nt_ntdll::trap_stubs::nt_query_information_thread)(
                 thread as *mut c_void,
                 THREAD_BASIC_INFORMATION,
@@ -28346,9 +28196,8 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
                 THREAD_BASIC_INFORMATION_SIZE as u32,
                 core::ptr::null_mut(),
             );
-            nt_success(status).then(|| {
-                core::ptr::read_unaligned(information.as_ptr().add(8).cast::<u64>())
-            })
+            nt_success(status)
+                .then(|| core::ptr::read_unaligned(information.as_ptr().add(8).cast::<u64>()))
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -28378,8 +28227,7 @@ pub unsafe extern "system" fn dbg_ui_debug_active_process(process: *mut c_void) 
             unsafe extern "C" fn(),
             unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
         >(nt_ntdll::trap_stubs::nt_debug_active_process)(
-            process,
-            dbg_ui_get_thread_debug_object(),
+            process, dbg_ui_get_thread_debug_object()
         );
         if !nt_success(status) {
             return status;
@@ -28407,8 +28255,7 @@ pub unsafe extern "system" fn dbg_ui_stop_debugging(process: *mut c_void) -> NtS
             unsafe extern "C" fn(),
             unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
         >(nt_ntdll::trap_stubs::nt_remove_process_debug)(
-            process,
-            dbg_ui_get_thread_debug_object(),
+            process, dbg_ui_get_thread_debug_object()
         )
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -29009,10 +28856,9 @@ pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
     {
         let port = unsafe { crate::on_target::csr_api_port() };
         unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_register_thread_terminate_port)(port)
+            core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
+                nt_ntdll::trap_stubs::nt_register_thread_terminate_port,
+            )(port)
         }
     }
     #[cfg(not(target_arch = "x86_64"))]

@@ -55,6 +55,10 @@ static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static USER_RECT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CLIENT_REPLY_HANDOFF_YIELDS: AtomicU64 = AtomicU64::new(0);
+static CLIENT_REPLY_HANDOFF_TRACE: AtomicU64 = AtomicU64::new(0);
+static CLIENT_PARK_HANDOFF_YIELDS: AtomicU64 = AtomicU64::new(0);
+static CLIENT_PARK_HANDOFF_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
@@ -80,6 +84,38 @@ static mut SERVICE_DLL_PE_STORE_WORK: [Option<nt_pe_loader::PeFile<'static>>; DL
 static SERVICE_DLL_PE_NONE: Option<nt_pe_loader::PeFile<'static>> = None;
 static mut SERVICE_DLL_PE_REFS_WORK: [&'static Option<nt_pe_loader::PeFile<'static>>;
     DLL_REG_COUNT] = [&SERVICE_DLL_PE_NONE; DLL_REG_COUNT];
+
+#[inline]
+fn client_reply_handoff_yield() {
+    let n = CLIENT_REPLY_HANDOFF_YIELDS.fetch_add(1, Ordering::Relaxed);
+    let trace = CLIENT_REPLY_HANDOFF_TRACE.load(Ordering::Relaxed);
+    if trace < 4
+        && CLIENT_REPLY_HANDOFF_TRACE
+            .compare_exchange(trace, trace + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        print_str(b"[client-reply-handoff] yield count=");
+        print_u64(n + 1);
+        print_str(b"\n");
+    }
+    yield_now();
+}
+
+#[inline]
+fn client_park_handoff_yield() {
+    let n = CLIENT_PARK_HANDOFF_YIELDS.fetch_add(1, Ordering::Relaxed);
+    let trace = CLIENT_PARK_HANDOFF_TRACE.load(Ordering::Relaxed);
+    if trace < 4
+        && CLIENT_PARK_HANDOFF_TRACE
+            .compare_exchange(trace, trace + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        print_str(b"[client-park-handoff] yield count=");
+        print_u64(n + 1);
+        print_str(b"\n");
+    }
+    yield_now();
+}
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -1827,14 +1863,12 @@ unsafe fn seed_gui_thread_client_info(
     let user_delta = win32k_glue::map_win32k_user_heap_into_client(pml4, pi)?;
     let client_deskinfo = if server_deskinfo >= win32k_subsystem::WIN32K_HEAP_VADDR
         && server_deskinfo
-            < win32k_subsystem::WIN32K_HEAP_VADDR
-                + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
+            < win32k_subsystem::WIN32K_HEAP_VADDR + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
     {
         server_deskinfo.checked_sub(user_delta)?
     } else if server_deskinfo >= win32k_subsystem::WIN32K_POOL_VADDR
         && server_deskinfo
-            < win32k_subsystem::WIN32K_POOL_VADDR
-                + win32k_subsystem::WIN32K_POOL_FRAMES * 0x1000
+            < win32k_subsystem::WIN32K_POOL_VADDR + win32k_subsystem::WIN32K_POOL_FRAMES * 0x1000
     {
         let pool_delta = win32k_glue::map_win32k_pool_into_client(pml4, pi)?;
         server_deskinfo.checked_sub(pool_delta)?
@@ -6039,9 +6073,7 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         ) {
                             Ok(()) => {
-                                for filled_page in
-                                    filled_pages.iter_mut().take(faults as usize)
-                                {
+                                for filled_page in filled_pages.iter_mut().take(faults as usize) {
                                     if *filled_page == bpage {
                                         *filled_page = 0;
                                     }
@@ -6348,13 +6380,15 @@ pub(crate) unsafe fn service_sec_image(
             // exits before reading the bind (the self-inspection syscalls + which handle it reads/exits on).
             if is_scm_worker {
                 let dn = SCM_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
-                let slot_trace = hosted_thread_role
-                    .and_then(|role| match role {
-                        HostedThreadRole::ScmWorkerSlot { slot } if slot < TP_WORKER_SLOT_COUNT => {
-                            Some((slot, SCM_WORKER_SLOT_SSN_TRACE[slot].fetch_add(1, Ordering::Relaxed)))
-                        }
-                        _ => None,
-                    });
+                let slot_trace = hosted_thread_role.and_then(|role| match role {
+                    HostedThreadRole::ScmWorkerSlot { slot } if slot < TP_WORKER_SLOT_COUNT => {
+                        Some((
+                            slot,
+                            SCM_WORKER_SLOT_SSN_TRACE[slot].fetch_add(1, Ordering::Relaxed),
+                        ))
+                    }
+                    _ => None,
+                });
                 if dn < 32 {
                     print_str(b"[scm-worker-ssn] #");
                     print_u64(dn);
@@ -6811,9 +6845,8 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = lsa_deliver_reply(&mut nt_handler, replymsg);
                 }
                 if lsa_server_park(badge, pi, recvmsg, ctx_out, resume_ip, sp, flags) {
-                    let delivered_waiting_client =
-                        lsa_try_deliver_pending_connect(&mut nt_handler)
-                            || lsa_try_deliver_pending_request(&mut nt_handler);
+                    let delivered_waiting_client = lsa_try_deliver_pending_connect(&mut nt_handler)
+                        || lsa_try_deliver_pending_request(&mut nt_handler);
                     if delivered_waiting_client {
                         bump_progress();
                     } else if LSA_SERVER_PARKS.load(Ordering::Relaxed) <= 4 {
@@ -7381,8 +7414,7 @@ pub(crate) unsafe fn service_sec_image(
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                recv_full_r12(fault_ep, new_reply);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -7399,15 +7431,17 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(write_error);
                         print_str(b"\n");
                         if reply_dropped {
-                            let _ =
-                                terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            let _ = terminate_hosted_thread_mechanism(
+                                tid,
+                                delay_queue,
+                                &mut nt_handler,
+                            );
                             procs[pi].faults = faults;
                             procs[pi].first = first;
                             procs[pi].ntfaults = ntfaults;
                             pfilled[pi] = *filled_pages;
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) =
-                                recv_full_r12(fault_ep, new_reply);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
                             mi = nmi;
                             m0 = nm0;
@@ -12381,9 +12415,7 @@ pub(crate) unsafe fn service_sec_image(
                         if !tmwi_ok {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                             if failures < 8 {
-                                print_str(
-                                    b"[win32k-svc] NtGdiGetTextMetricsW copy-out failed pi=",
-                                );
+                                print_str(b"[win32k-svc] NtGdiGetTextMetricsW copy-out failed pi=");
                                 print_u64(pi as u64);
                                 print_str(b" out=0x");
                                 print_hex_u64(client_tmwi);
@@ -12407,9 +12439,7 @@ pub(crate) unsafe fn service_sec_image(
                         if !size_ok {
                             let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
                             if failures < 8 {
-                                print_str(
-                                    b"[win32k-svc] NtGdiGetTextExtent copy-out failed pi=",
-                                );
+                                print_str(b"[win32k-svc] NtGdiGetTextExtent copy-out failed pi=");
                                 print_u64(pi as u64);
                                 print_str(b" size=0x");
                                 print_hex_u64(client_size);
@@ -12677,8 +12707,7 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
                 if dialog_modal_dispatch && !callback_suspended {
-                    let staged_msg =
-                        msg_syscall && d_a0 == win32k_subsystem::WIN32K_ARG_VADDR;
+                    let staged_msg = msg_syscall && d_a0 == win32k_subsystem::WIN32K_ARG_VADDR;
                     let msg_ptr = if staged_msg {
                         win32k_subsystem::WIN32K_ARG_VADDR
                     } else {
@@ -13453,6 +13482,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13497,6 +13527,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13539,6 +13570,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    client_park_handoff_yield();
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -13576,6 +13608,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(delay_queue.len() as u64);
                         print_str(b" -> receive continues\n");
                     }
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -13616,6 +13649,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -13689,6 +13723,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13739,6 +13774,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13790,6 +13826,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13837,6 +13874,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13882,6 +13920,7 @@ pub(crate) unsafe fn service_sec_image(
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
                     mark_wait_parked!(pi, resume_ip);
+                    client_park_handoff_yield();
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -13925,6 +13964,7 @@ pub(crate) unsafe fn service_sec_image(
                 reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
             } else if park_caller {
                 // The caller's binding was STOLEN into a park slot — do not reply, just recv.
+                client_park_handoff_yield();
                 recv_full_r12(fault_ep, reply_main)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
@@ -13938,6 +13978,9 @@ pub(crate) unsafe fn service_sec_image(
                     (result, m1, m3)
                 };
                 client_reply_on(reply_main, len, r0, r1, 0, r3);
+                if !redirected_user_control {
+                    client_reply_handoff_yield();
+                }
                 recv_full_r12(fault_ep, reply_main)
             };
             badge = nb;
@@ -13951,6 +13994,14 @@ pub(crate) unsafe fn service_sec_image(
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
     }
+    dump_interactive_logon_quiesce(
+        &nt_handler,
+        &*hosted_loaded_images,
+        &reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
     // ★ THE ESCAPE HATCH (unconditional, bounded). The service loop is done: release every reporter
     // still blocked on a debug event, so a debugger that attached, took an event and never continued
     // (or died holding one) can NEVER leave a target parked with its reply capability stranded. With
@@ -17455,42 +17506,18 @@ unsafe fn spawn_requested_multiplexed_thread(
     print_str(b"\n");
 
     let spawned = match spec.spawner {
-        HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
-            pml4,
-            start,
-            initial_teb,
-            cid_proc,
-            tid,
-            fault_ep,
-            resume,
-        ),
-        HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
-            pml4,
-            start,
-            initial_teb,
-            cid_proc,
-            tid,
-            fault_ep,
-            resume,
-        ),
-        HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
-            pml4,
-            start,
-            initial_teb,
-            cid_proc,
-            tid,
-            fault_ep,
-            resume,
-        ),
-        HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
-            pml4,
-            start,
-            initial_teb,
-            cid_proc,
-            tid,
-            fault_ep,
-            resume,
-        ),
+        HostedMultiplexedThreadSpawner::ServicesListener => {
+            spawn_svc_listener_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
+        }
+        HostedMultiplexedThreadSpawner::LsassListener => {
+            spawn_lsass_listener_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
+        }
+        HostedMultiplexedThreadSpawner::LsassListener2 => {
+            spawn_lsass_listener2_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
+        }
+        HostedMultiplexedThreadSpawner::LsassListener3 => {
+            spawn_lsass_listener3_thread(pml4, start, initial_teb, cid_proc, tid, fault_ep, resume)
+        }
     };
 
     if nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role) {
@@ -17515,6 +17542,275 @@ unsafe fn requested_thread_start(caller_sp: u64) -> (u64, nt_thread_start::Amd64
             context_va,
         ),
     )
+}
+
+#[inline(never)]
+unsafe fn dump_interactive_logon_quiesce(
+    nt_handler: &ExecNtHandler,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) {
+    let Some(pi) = hosted_pi_for_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveLogon,
+    ) else {
+        print_str(b"[wl-quiesce] no runtime-registered interactive logon process\n");
+        return;
+    };
+    let Some((tid, tcb, badge)) =
+        nt_handler.hosted_thread_identity_for_role(pi, HostedThreadRole::Main)
+    else {
+        print_str(b"[wl-quiesce] interactive logon process has no live main-thread TCB pi=");
+        print_u64(pi as u64);
+        print_str(b"\n");
+        return;
+    };
+
+    let mut regs = [0u64; 20];
+    crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+    let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
+    let rsp = regs[nt_user_callback::USER_CONTEXT_RSP];
+    let rax = regs[nt_user_callback::USER_CONTEXT_RAX];
+    let rcx = regs[nt_user_callback::USER_CONTEXT_RCX];
+    let rdx = regs[nt_user_callback::USER_CONTEXT_RDX];
+    let r8 = regs[nt_user_callback::USER_CONTEXT_R8];
+    let r9 = regs[nt_user_callback::USER_CONTEXT_R9];
+
+    print_str(b"[wl-quiesce] pi=");
+    print_u64(pi as u64);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" state=");
+    if tid <= nt_process::ThreadId::MAX as u64 {
+        match nt_handler
+            .pm
+            .thread(tid as nt_process::ThreadId)
+            .map(|thread| thread.state)
+        {
+            Some(nt_process::ThreadState::Initialized) => print_str(b"Initialized"),
+            Some(nt_process::ThreadState::Ready) => print_str(b"Ready"),
+            Some(nt_process::ThreadState::Running) => print_str(b"Running"),
+            Some(nt_process::ThreadState::Waiting) => print_str(b"Waiting"),
+            Some(nt_process::ThreadState::Suspended) => print_str(b"Suspended"),
+            Some(nt_process::ThreadState::Terminated) => print_str(b"Terminated"),
+            None => print_str(b"?"),
+        }
+    } else {
+        print_str(b"?");
+    }
+    print_str(b" parked=");
+    print_u64(thread_wait_state_badge_parked(badge) as u64);
+    print_str(b" rip=");
+    print_quiesce_addr(rip, pi, loaded_images, reg, ntdll);
+    print_str(b" rsp=0x");
+    print_hex_u64(rsp);
+    print_str(b" rax=0x");
+    print_hex_u64(rax);
+    print_str(b" rcx=0x");
+    print_hex_u64(rcx);
+    print_str(b" rdx=0x");
+    print_hex_u64(rdx);
+    print_str(b" r8=0x");
+    print_hex_u64(r8);
+    print_str(b" r9=0x");
+    print_hex_u64(r9);
+    print_str(b"\n");
+
+    let mut threads = [HostedThreadQuiesceRecord::empty(); 32];
+    let (count, overflow) = nt_handler.hosted_thread_quiesce_records_for_pi(pi, &mut threads);
+    print_str(b"[wl-quiesce-threads] overflow=");
+    print_u64(overflow as u64);
+    print_str(b" threads=");
+    for thread in threads[..count].iter().copied() {
+        print_wait_snapshot_thread(thread);
+    }
+    print_str(b"\n");
+
+    let (stack_base, stack_size, stack_mirror, _, _, _) = mirror_ctx_for(badge, pi);
+    let scratch_base = procs[pi].scratch_base;
+    let read_wl = |va: u64| -> Option<u64> {
+        unsafe {
+            let end = va.checked_add(8)?;
+            if va >= stack_base && end <= stack_base + stack_size {
+                return Some(core::ptr::read_volatile(
+                    (stack_mirror + (va - stack_base)) as *const u64,
+                ));
+            }
+            let mut bytes = [0u8; 8];
+            img_spawn::client_copyin_process_mapped(
+                pi as u64,
+                va,
+                &mut bytes,
+                &pfilled[pi],
+                procs[pi].faults as usize,
+                scratch_base,
+                false,
+            )
+            .then(|| u64::from_le_bytes(bytes))
+        }
+    };
+
+    print_str(b"[wl-quiesce-stack] rsp=0x");
+    print_hex_u64(rsp);
+    print_str(b" top:");
+    for slot in 0..8u64 {
+        print_str(b" +");
+        print_u64(slot * 8);
+        print_str(b"=");
+        match read_wl(rsp + slot * 8) {
+            Some(value) => print_hex_u64(value),
+            None => print_str(b"?"),
+        }
+    }
+    print_str(b"\n[wl-quiesce-callers]");
+    let mut shown = 0usize;
+    let mut iat_shown = 0usize;
+    for slot in 0..160u64 {
+        let Some(value) = read_wl(rsp + slot * 8) else {
+            continue;
+        };
+        if !quiesce_addr_is_known(value, pi, loaded_images, reg, ntdll) {
+            continue;
+        }
+        print_str(b" +");
+        print_u64(slot * 8);
+        print_str(b"=");
+        print_quiesce_addr(value, pi, loaded_images, reg, ntdll);
+        shown += 1;
+        if iat_shown < 4
+            && print_quiesce_iat_call_site(nt_handler, value, pi, loaded_images, reg, ntdll)
+        {
+            iat_shown += 1;
+        }
+        if shown >= 24 {
+            break;
+        }
+    }
+    if shown == 0 {
+        print_str(b" <none>");
+    }
+    print_str(b"\n");
+}
+
+#[inline]
+unsafe fn print_quiesce_iat_call_site(
+    nt_handler: &ExecNtHandler,
+    return_address: u64,
+    pi: usize,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+) -> bool {
+    let Some(insn_address) = return_address.checked_sub(6) else {
+        return false;
+    };
+    let mut insn = [0u8; 6];
+    if !nt_handler.xas_read(insn_address, &mut insn) {
+        return false;
+    }
+    if insn[0] != 0xff || insn[1] != 0x15 {
+        return false;
+    }
+    let disp = i32::from_le_bytes([insn[2], insn[3], insn[4], insn[5]]) as i64;
+    let slot_address = if disp >= 0 {
+        return_address.checked_add(disp as u64)
+    } else {
+        return_address.checked_sub(disp.unsigned_abs())
+    };
+    let Some(slot_address) = slot_address else {
+        return false;
+    };
+    let mut target_bytes = [0u8; 8];
+    let target = if nt_handler.xas_read(slot_address, &mut target_bytes) {
+        Some(u64::from_le_bytes(target_bytes))
+    } else {
+        None
+    };
+
+    print_str(b"\n[wl-quiesce-iat] ret=");
+    print_quiesce_addr(return_address, pi, loaded_images, reg, ntdll);
+    print_str(b" slot=0x");
+    print_hex_u64(slot_address);
+    print_str(b" target=");
+    match target {
+        Some(address) => print_quiesce_addr(address, pi, loaded_images, reg, ntdll),
+        None => print_str(b"?"),
+    }
+    true
+}
+
+#[inline]
+unsafe fn quiesce_addr_is_known(
+    address: u64,
+    pi: usize,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+) -> bool {
+    if let Some(pe) = loaded_images.pe_by_pi(pi) {
+        if address >= PE_LOAD_BASE && address < PE_LOAD_BASE + image_extent(pe) {
+            return true;
+        }
+    }
+    if let Some((base, pe)) = ntdll {
+        if address >= base && address < base + image_extent(pe) {
+            return true;
+        }
+    }
+    reg.dll_for_page(pi, address).is_some()
+}
+
+#[inline]
+unsafe fn print_quiesce_addr(
+    address: u64,
+    pi: usize,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+) {
+    print_str(b"0x");
+    print_hex_u64(address);
+    print_str(b"(");
+    if let Some(pe) = loaded_images.pe_by_pi(pi) {
+        if address >= PE_LOAD_BASE && address < PE_LOAD_BASE + image_extent(pe) {
+            match loaded_images.get_by_pi(pi) {
+                Some(image) => print_str(image.leaf()),
+                None => print_str(b"exe"),
+            }
+            print_str(b"+0x");
+            print_hex((address - PE_LOAD_BASE) as u32);
+            print_str(b")");
+            return;
+        }
+    }
+    if let Some((base, pe)) = ntdll {
+        if address >= base && address < base + image_extent(pe) {
+            print_str(b"ntdll+0x");
+            print_hex((address - base) as u32);
+            print_str(b")");
+            return;
+        }
+    }
+    if let Some((i, rva)) = reg.dll_for_page(pi, address) {
+        let name = reg.name(i);
+        if name.is_empty() {
+            print_str(b"dll");
+        } else {
+            print_str(name);
+        }
+        print_str(b"+0x");
+        print_hex(rva);
+        print_str(b")");
+        return;
+    }
+    print_str(b"unknown)");
 }
 
 #[inline]
@@ -18431,6 +18727,19 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
             waiter.io_status_block_out + 8,
             &packet.information.to_le_bytes(),
         );
+    crate::exec_handler::trace_io_completion_packet(
+        waiter.process_index as usize,
+        if copied {
+            b"deliver"
+        } else {
+            b"deliver-copy-failed"
+        },
+        waiter.port_id,
+        nt_handler.io_completion_ports.depth(waiter.port_id).ok(),
+        0,
+        waiter.badge,
+        packet,
+    );
 
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
@@ -18732,25 +19041,26 @@ unsafe fn csr_dynamic_deliver_request(
         csr_dynamic_wake(client_cap, 0xC000_0001, client_ip, client_sp, client_flags);
         return CsrDynamicRoute::Consumed;
     }
-    let delivered = csr_dynamic_with_peer(nt_handler, worker.badge, worker.pi as usize, |handler| {
-        let mut ok = handler.xas_try_write_buf(worker.recvmsg, &received.connection_info);
-        if ok {
-            ok = handler.xas_try_write_buf(
-                worker.recvmsg + 4,
-                &nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes(),
-            );
-        }
-        if ok {
-            ok = handler.xas_write_u64(worker.recvmsg + 8, client_pid);
-        }
-        if ok {
-            ok = handler.xas_write_u64(worker.recvmsg + 16, client_tid);
-        }
-        if ok && worker.ctx_out != 0 {
-            ok = handler.xas_write_u64(worker.ctx_out, received.port_context);
-        }
-        ok
-    });
+    let delivered =
+        csr_dynamic_with_peer(nt_handler, worker.badge, worker.pi as usize, |handler| {
+            let mut ok = handler.xas_try_write_buf(worker.recvmsg, &received.connection_info);
+            if ok {
+                ok = handler.xas_try_write_buf(
+                    worker.recvmsg + 4,
+                    &nt_lpc_abi::msg_type::LPC_DATAGRAM.to_le_bytes(),
+                );
+            }
+            if ok {
+                ok = handler.xas_write_u64(worker.recvmsg + 8, client_pid);
+            }
+            if ok {
+                ok = handler.xas_write_u64(worker.recvmsg + 16, client_tid);
+            }
+            if ok && worker.ctx_out != 0 {
+                ok = handler.xas_write_u64(worker.ctx_out, received.port_context);
+            }
+            ok
+        });
     if !delivered {
         csr_dynamic_wake(client_cap, 0xC000_0001, client_ip, client_sp, client_flags);
         return CsrDynamicRoute::Consumed;
@@ -18816,9 +19126,10 @@ unsafe fn csr_dynamic_finish_request_reply(
     } else {
         reply[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REPLY.to_le_bytes());
         let client_pi = worker.client_pi as usize;
-        let copy_ok = csr_dynamic_with_peer(nt_handler, worker.client_badge, client_pi, |handler| {
-            handler.xas_try_write_buf(worker.client_reply, &reply[..reply_len])
-        });
+        let copy_ok =
+            csr_dynamic_with_peer(nt_handler, worker.client_badge, client_pi, |handler| {
+                handler.xas_try_write_buf(worker.client_reply, &reply[..reply_len])
+            });
         if !copy_ok {
             status = 0xC000_0005;
         }
@@ -19194,8 +19505,8 @@ unsafe fn lsa_try_deliver_pending_connect(nt_handler: &mut ExecNtHandler) -> boo
     let Some(cli_pi) = lsa_recorded_pi(&LSA_CLI_PI) else {
         return false;
     };
-    let length = (LSA_CLI_CONNINFO_LEN.load(Ordering::Relaxed) as usize)
-        .min(LSA_CONNECTION_INFO_SIZE);
+    let length =
+        (LSA_CLI_CONNINFO_LEN.load(Ordering::Relaxed) as usize).min(LSA_CONNECTION_INFO_SIZE);
     let payload = core::slice::from_raw_parts(
         core::ptr::addr_of!(LSA_CLI_CONNECT_INFO) as *const u8,
         length,
@@ -19778,7 +20089,9 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
             }
         }
-        if !w.is_write && copy_len >= 16 && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
+        if !w.is_write
+            && copy_len >= 16
+            && PIPE_REDRIVE_RPC_TRACE_COUNT.load(Ordering::Relaxed) < 96
         {
             let pdu = driver_launch::dcerpc_pdu_view_from_slice(&output[..copy_len]);
             if pdu.is_some() && PIPE_REDRIVE_RPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 96 {

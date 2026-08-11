@@ -878,8 +878,7 @@ pub(crate) unsafe fn sm_rendezvous(
                 break;
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
-            let (_b, nmi, nm0, nm1, nm2, nm3) =
-                rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
+            let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -1124,8 +1123,7 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
-            let (_b, nmi, nm0, nm1, nm2, nm3) =
-                rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
+            let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[sm-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -1473,8 +1471,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
             }
             _ => return false,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) =
-            rendezvous_recv_full_r12(ep, reply, b"[sm-api]");
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[sm-api]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -2058,8 +2055,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
             }
             _ => return false,
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) =
-            rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-api]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -2239,8 +2235,7 @@ pub(crate) unsafe fn csr_sb_startup(
                 return false;
             }
         }
-        let (_badge, nmi, nm0, nm1, nm2, nm3) =
-            rendezvous_recv_full_r12(ep, reply, b"[csr-sb]");
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-sb]");
         mi = nmi;
         m0 = nm0;
         m1 = nm1;
@@ -3845,8 +3840,7 @@ pub(crate) unsafe fn csr_rendezvous(
                 break;
             }
             client_reply_on(reply, 0, 0, 0, 0, 0);
-            let (_b, nmi, nm0, nm1, nm2, nm3) =
-                rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
+            let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -4063,8 +4057,7 @@ pub(crate) unsafe fn csr_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             client_reply_on(reply, 18, result, 0, 0, rdx);
-            let (_b, nmi, nm0, nm1, nm2, nm3) =
-                rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
+            let (_b, nmi, nm0, nm1, nm2, nm3) = rendezvous_recv_full_r12(ep, reply, b"[csr-rdv]");
             mi = nmi;
             m0 = nm0;
             m1 = nm1;

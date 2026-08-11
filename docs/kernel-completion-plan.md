@@ -433,6 +433,28 @@ subsequent native/registry progress; the next fix should be generic hosted-threa
 forward progress or real mapped registry copyout, not a profile, userinit, explorer, or paint
 fallback.
 
+Active cleanup slice: the same retry's final winlogon quiesce dump shows the main winlogon thread
+runnable and still sitting at the post-`syscall` return point for `NtQueryValueKey`, while the
+executive continues servicing other endpoint traffic until the 45s no-progress gate fires. The
+current fix adds a generic client-reply handoff yield after ordinary native syscall replies, before
+the executive re-enters its receive loop, so a just-unblocked hosted thread can run the way a real
+kernel scheduler would allow. This intentionally excludes parked waits and user callback/APC
+redirect replies, and it does not add profile, userinit, explorer, registry-value, or paint
+fallbacks. Serialized validation must prove whether winlogon advances past the `Winlogon\Notify`
+registry sequence into SAS/profile/userinit, or expose the next real missing kernel mechanism.
+
+Serialized validation `.tmp/boot-park-handoff-desktop-20260811.log` shows that the native-reply
+handoff plus generic post-park handoff moved the visible `--desktop` run materially forward without
+adding image, profile, userinit, explorer, or paint scaffolding. The boot reaches real base desktop
+paint, services and LSASS both run after paint, LSA RPC handoff reaches a new client, `services.exe`
+executes `CheckSetup()`, and the profile/config image sources materialise. The shell still does not
+launch: winlogon stops after the `Winlogon\Notify` registry sequence (`ScCertProp`, then `Schedule`
+`DllName`) with its main thread runnable/enqueued at the post-`NtQueryValueKey` return point while
+services/LSASS IO-completion and registry traffic continue. Review adjustment: the active target is
+now the real Reply-cap/MCS scheduling-context handoff in the microkernel composite reply+receive
+path, so lower-priority hosted clients that just regained their donated context actually resume
+before unrelated executive traffic monopolises the receive loop.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

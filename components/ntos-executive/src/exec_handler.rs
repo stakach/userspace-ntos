@@ -67,8 +67,11 @@ static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_CONTINUE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static EXPLORER_IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
-static EXPLORER_WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_POST_LSA_NATIVE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_POST_LSA_REGISTRY_READBACK_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_YIELD_EXECUTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -197,9 +200,7 @@ fn trace_named_pipe_io(
 
 fn scm_worker_slot_for(nt: &ExecNtHandler) -> Option<usize> {
     match nt.hosted_thread_role_for_badge(nt.current_badge) {
-        Some(HostedThreadRole::ScmWorkerSlot { slot }) if slot < TP_WORKER_SLOT_COUNT => {
-            Some(slot)
-        }
+        Some(HostedThreadRole::ScmWorkerSlot { slot }) if slot < TP_WORKER_SLOT_COUNT => Some(slot),
         _ => None,
     }
 }
@@ -451,7 +452,7 @@ fn trace_pipe_open(
     print_str(b"\"\n");
 }
 
-fn trace_explorer_io_completion(
+pub(crate) fn trace_io_completion(
     pi: usize,
     op: &[u8],
     handle: u64,
@@ -463,14 +464,15 @@ fn trace_explorer_io_completion(
     apc: u64,
     iosb: u64,
 ) {
-    if pi != 6 {
+    let n = IO_COMPLETION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 384 {
         return;
     }
-    let n = EXPLORER_IO_COMPLETION_TRACE_N.fetch_add(1, Ordering::Relaxed);
-    if n >= 192 {
-        return;
-    }
-    print_str(b"[explorer-iocp] ");
+    print_str(b"[iocp] #");
+    print_u64(n);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" ");
     print_str(op);
     print_str(b" handle=0x");
     print_hex_u64(handle);
@@ -497,7 +499,48 @@ fn trace_explorer_io_completion(
     print_str(b"\n");
 }
 
-fn trace_explorer_wait_object(
+pub(crate) fn trace_io_completion_packet(
+    pi: usize,
+    op: &[u8],
+    port_id: u32,
+    depth: Option<u32>,
+    caller_badge: u64,
+    waiter_badge: u64,
+    packet: nt_io_completion::CompletionPacket,
+) {
+    let n = IO_COMPLETION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 384 {
+        return;
+    }
+    print_str(b"[iocp] #");
+    print_u64(n);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" badge=");
+    print_u64(caller_badge);
+    print_str(b" ");
+    print_str(op);
+    print_str(b" port=");
+    print_u64(port_id as u64);
+    print_str(b" depth=");
+    match depth {
+        Some(depth) => print_u64(depth as u64),
+        None => print_str(b"-"),
+    }
+    print_str(b" waiter=");
+    print_u64(waiter_badge);
+    print_str(b" key=0x");
+    print_hex_u64(packet.key_context);
+    print_str(b" apc=0x");
+    print_hex_u64(packet.apc_context);
+    print_str(b" st=0x");
+    print_hex(packet.status);
+    print_str(b" info=");
+    print_u64(packet.information);
+    print_str(b"\n");
+}
+
+fn trace_wait_object(
     handler: &ExecNtHandler,
     phase: &[u8],
     handle: u64,
@@ -505,14 +548,22 @@ fn trace_explorer_wait_object(
     timeout_ptr: u64,
     status: u32,
 ) {
-    if handler.pi != 6 {
+    let trace_winlogon = handler.pi == 2
+        && handler.current_badge == 4
+        && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+        && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
+    if handler.pi != 6 && !trace_winlogon {
         return;
     }
-    let n = EXPLORER_WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    let n = WAIT_OBJECT_TRACE_N.fetch_add(1, Ordering::Relaxed);
     if n >= 192 {
         return;
     }
-    print_str(b"[explorer-wait-object] ");
+    print_str(b"[wait-object] pi=");
+    print_u64(handler.pi as u64);
+    print_str(b" badge=");
+    print_u64(handler.current_badge);
+    print_str(b" ");
     print_str(phase);
     print_str(b" handle=0x");
     print_hex_u64(handle);
@@ -550,6 +601,131 @@ fn trace_explorer_wait_object(
             print_u64(maximum as u64);
         } else if handler.mutants.contains(index as u64) {
             print_str(b" mutant=1");
+        }
+    }
+    print_str(b"\n");
+}
+
+fn trace_winlogon_post_lsa_native_enter(
+    handler: &ExecNtHandler,
+    ctx: &NativeCallContext,
+    args: &[u64],
+) -> Option<u64> {
+    if handler.pi != 2
+        || handler.current_badge != 4
+        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) == 0
+        || WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+    {
+        return None;
+    }
+    let n = WINLOGON_POST_LSA_NATIVE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 160 {
+        return None;
+    }
+    print_str(b"[wl-post-lsa] #");
+    print_u64(n);
+    print_str(b" enter ssn=");
+    print_u64(ctx.syscall_number as u64);
+    print_str(b" ");
+    print_str(ctx.service.name().as_bytes());
+    print_str(b" rip=0x");
+    print_hex_u64(ctx.user_ip);
+    print_str(b" sp=0x");
+    print_hex_u64(ctx.user_sp);
+    for i in 0..4 {
+        print_str(b" a");
+        print_u64(i as u64);
+        print_str(b"=0x");
+        print_hex_u64(args.get(i).copied().unwrap_or(0));
+    }
+    print_str(b"\n");
+    Some(n)
+}
+
+fn trace_winlogon_post_lsa_native_exit(
+    handler: &ExecNtHandler,
+    ctx: &NativeCallContext,
+    trace_index: u64,
+    status: u32,
+) {
+    print_str(b"[wl-post-lsa] #");
+    print_u64(trace_index);
+    print_str(b" exit ");
+    print_str(ctx.service.name().as_bytes());
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" wait_park=");
+    print_u64(handler.wait_park_event as u64);
+    print_str(b" keyed_wait=0x");
+    print_hex_u64(handler.keyed_wait_key);
+    print_str(b" delay=");
+    print_u64(handler.delay_requested as u64);
+    print_str(b" io_port=");
+    print_u64(handler.io_completion_park_port as u64);
+    print_str(b" lpc_recv=");
+    print_u64(handler.lpc_receive_park_port);
+    print_str(b"\n");
+}
+
+fn trace_winlogon_post_lsa_registry(
+    handler: &ExecNtHandler,
+    op: &[u8],
+    key_path: Option<&str>,
+    name: &str,
+    status: u32,
+    ty: Option<u32>,
+    data: Option<&[u8]>,
+) {
+    if handler.pi != 2
+        || handler.current_badge != 4
+        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) == 0
+        || WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+    {
+        return;
+    }
+    let n = WINLOGON_POST_LSA_REGISTRY_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 128 {
+        return;
+    }
+    print_str(b"[wl-reg] #");
+    print_u64(n);
+    print_str(b" ");
+    print_str(op);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" key=\"");
+    if let Some(path) = key_path {
+        print_sanitized_ascii(path.as_bytes(), 120);
+    }
+    print_str(b"\" name=\"");
+    print_sanitized_ascii(name.as_bytes(), 64);
+    print_str(b"\"");
+    if let Some(ty) = ty {
+        print_str(b" type=");
+        print_u64(ty as u64);
+    }
+    if let Some(data) = data {
+        print_str(b" bytes=");
+        print_u64(data.len() as u64);
+        if matches!(ty, Some(1 | 2 | 7)) {
+            print_str(b" utf16=\"");
+            let mut units = 0usize;
+            for pair in data.chunks_exact(2) {
+                if units >= 96 {
+                    break;
+                }
+                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                if unit == 0 {
+                    break;
+                }
+                debug_put_char(if (0x20..0x7f).contains(&unit) {
+                    unit as u8
+                } else {
+                    b'.'
+                });
+                units += 1;
+            }
+            print_str(b"\"");
         }
     }
     print_str(b"\n");
@@ -7349,6 +7525,7 @@ impl ExecNtHandler {
         object_id: u32,
         packet: nt_io_completion::CompletionPacket,
     ) -> u32 {
+        let trace_depth_before = self.io_completion_ports.depth(object_id).ok();
         if let Some(waiter) =
             unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id) }
         {
@@ -7357,6 +7534,15 @@ impl ExecNtHandler {
                 .remove(object_id, nt_io_completion::RemoveMode::Poll)
             {
                 Ok(nt_io_completion::RemoveResult::Packet(queued)) => {
+                    trace_io_completion_packet(
+                        self.pi,
+                        b"wake-oldest-queued",
+                        object_id,
+                        trace_depth_before,
+                        self.current_badge,
+                        waiter.badge,
+                        queued,
+                    );
                     if let Err(status) = self.io_completion_ports.enqueue(object_id, packet) {
                         let _ = unsafe {
                             (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
@@ -7365,7 +7551,18 @@ impl ExecNtHandler {
                     }
                     queued
                 }
-                Ok(nt_io_completion::RemoveResult::Empty(_)) => packet,
+                Ok(nt_io_completion::RemoveResult::Empty(_)) => {
+                    trace_io_completion_packet(
+                        self.pi,
+                        b"wake-direct",
+                        object_id,
+                        trace_depth_before,
+                        self.current_badge,
+                        waiter.badge,
+                        packet,
+                    );
+                    packet
+                }
                 Err(status) => {
                     let _ = unsafe {
                         (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
@@ -7373,9 +7570,29 @@ impl ExecNtHandler {
                     return status;
                 }
             };
+            if self.io_completion_wake.is_some() {
+                trace_io_completion_packet(
+                    self.pi,
+                    b"wake-overwrite",
+                    object_id,
+                    self.io_completion_ports.depth(object_id).ok(),
+                    self.current_badge,
+                    waiter.badge,
+                    wake_packet,
+                );
+            }
             self.io_completion_wake = Some((waiter, wake_packet));
             return nt_io_completion::STATUS_SUCCESS;
         }
+        trace_io_completion_packet(
+            self.pi,
+            b"enqueue",
+            object_id,
+            trace_depth_before,
+            self.current_badge,
+            0,
+            packet,
+        );
         self.io_completion_ports
             .enqueue(object_id, packet)
             .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
@@ -11045,7 +11262,8 @@ impl ExecNtHandler {
                 let _ = self.io_completion_ports.release(id);
             }
             nt_process::HandleObject::File(file_id) => {
-                let device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe").unwrap_or(0);
+                let device_id =
+                    driver_launch::device_id_by_name("\\Device\\NamedPipe").unwrap_or(0);
                 self.release_file_handle_reference(file_id, device_id);
             }
             nt_process::HandleObject::RoutedFile { file_id, device_id } => {
@@ -11961,11 +12179,7 @@ impl ExecNtHandler {
         true
     }
 
-    unsafe fn current_image_protection_for_page(
-        &self,
-        ctx: ExecLoopCtx,
-        page: u64,
-    ) -> Option<u32> {
+    unsafe fn current_image_protection_for_page(&self, ctx: ExecLoopCtx, page: u64) -> Option<u32> {
         if page >= PE_LOAD_BASE && page < ctx.img_end {
             return Some(image_page_protection(&*ctx.pe, PE_LOAD_BASE, page));
         }
@@ -12697,6 +12911,122 @@ impl ExecNtHandler {
         0
     }
 
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn trace_winlogon_post_lsa_query_value_readback(
+        &self,
+        key_path: Option<&str>,
+        value_name: &str,
+        status: u32,
+        info_class: u64,
+        output_va: u64,
+        output_length: usize,
+        result_length_va: u64,
+        ty: u32,
+        data: &[u8],
+        use_xas_write: bool,
+    ) {
+        if self.pi != 2
+            || self.current_badge != 4
+            || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) == 0
+            || WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+            || value_name != "dllname"
+        {
+            return;
+        }
+        let n = WINLOGON_POST_LSA_REGISTRY_READBACK_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if n >= 32 {
+            return;
+        }
+        let Some(layout) = key_value_info_layout(info_class, "", data.len()) else {
+            return;
+        };
+
+        let mut result_bytes = [0u8; 4];
+        let result_ok = result_length_va != 0 && self.xas_read(result_length_va, &mut result_bytes);
+        let result_length = if result_ok {
+            u32::from_le_bytes(result_bytes)
+        } else {
+            0
+        };
+
+        let mut output = [0u8; 96];
+        let read_len = output_length.min(layout.total_len).min(output.len());
+        let output_ok =
+            output_va != 0 && read_len != 0 && self.xas_read(output_va, &mut output[..read_len]);
+
+        print_str(b"[wl-reg-rb] #");
+        print_u64(n);
+        print_str(b" status=0x");
+        print_hex(status);
+        print_str(b" class=");
+        print_u64(info_class);
+        print_str(b" out=0x");
+        print_hex_u64(output_va);
+        print_str(b" out-len=");
+        print_u64(output_length as u64);
+        print_str(b" result-ok=");
+        print_u64(result_ok as u64);
+        print_str(b" result-len=");
+        print_u64(result_length as u64);
+        print_str(b" xas=");
+        print_u64(use_xas_write as u64);
+        print_str(b" key=\"");
+        if let Some(path) = key_path {
+            print_sanitized_ascii(path.as_bytes(), 96);
+        }
+        print_str(b"\"");
+        print_str(b" read-ok=");
+        print_u64(output_ok as u64);
+        if output_ok && read_len >= 0x0c {
+            let dest_type = read_le_u32_at(&output, 0x04);
+            let dest_len = read_le_u32_at(&output, 0x08) as usize;
+            let avail = read_len.saturating_sub(layout.data_offset);
+            let preview_len = dest_len.min(avail).min(48);
+            let preview = &output[layout.data_offset..layout.data_offset + preview_len];
+            let matches_prefix = preview_len <= data.len() && preview == &data[..preview_len];
+            let mut nul_at = u64::MAX;
+            for (i, pair) in preview.chunks_exact(2).enumerate() {
+                if u16::from_le_bytes([pair[0], pair[1]]) == 0 {
+                    nul_at = i as u64;
+                    break;
+                }
+            }
+            print_str(b" dest-type=");
+            print_u64(dest_type as u64);
+            print_str(b" dest-len=");
+            print_u64(dest_len as u64);
+            print_str(b" match=");
+            print_u64(matches_prefix as u64);
+            print_str(b" nul-at=");
+            if nul_at == u64::MAX {
+                print_str(b"none");
+            } else {
+                print_u64(nul_at);
+            }
+            if matches!(ty, 1 | 2 | 7) {
+                print_str(b" utf16=\"");
+                let mut units = 0usize;
+                for pair in preview.chunks_exact(2) {
+                    if units >= 48 {
+                        break;
+                    }
+                    let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                    if unit == 0 {
+                        break;
+                    }
+                    debug_put_char(if (0x20..0x7f).contains(&unit) {
+                        unit as u8
+                    } else {
+                        b'.'
+                    });
+                    units += 1;
+                }
+                print_str(b"\"");
+            }
+        }
+        print_str(b"\n");
+    }
+
     fn registry_value_copy_provenance_for_copyout(
         &self,
         info_class: u64,
@@ -13364,7 +13694,10 @@ impl ExecNtHandler {
     /// notification; the event object remains the untagged handle. Legacy opaque wait handles are
     /// accepted for the hosted immediate-wait model, but a real typed event must satisfy the same
     /// access check ReactOS uses before `KeClearEvent`.
-    pub(crate) fn prepare_io_event_for_request(&mut self, handle: u64) -> Result<Option<usize>, u32> {
+    pub(crate) fn prepare_io_event_for_request(
+        &mut self,
+        handle: u64,
+    ) -> Result<Option<usize>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         let Some(event_handle) = nt_io_completion::normalize_io_event_handle(handle) else {
             return Ok(None);
@@ -13479,11 +13812,18 @@ impl ExecNtHandler {
         true
     }
 
-    pub(crate) fn lpc_connection_is(&mut self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
+    pub(crate) fn lpc_connection_is(
+        &mut self,
+        handle: u64,
+        connector_pi: usize,
+        name: &[u8],
+    ) -> bool {
         if self.lpc_connection_cache_is(handle, connector_pi, name) {
             return true;
         }
-        if let Some(query) = unsafe { lpc_client().and_then(|client| client.query_handle(handle).ok()) } {
+        if let Some(query) =
+            unsafe { lpc_client().and_then(|client| client.query_handle(handle).ok()) }
+        {
             let endpoint_ok = query.endpoint == nt_lpc_abi::handle_endpoint::CLIENT_COMM_PORT;
             let state_ok = query.state == nt_lpc_abi::connection_state::CONNECTED;
             let name_ok = Self::lpc_name_equals_ascii(&query.name, name);
@@ -13580,7 +13920,9 @@ impl ExecNtHandler {
             && name
                 .iter()
                 .zip(expected.iter())
-                .all(|(&actual, &expected)| actual.to_ascii_lowercase() == expected.to_ascii_lowercase())
+                .all(|(&actual, &expected)| {
+                    actual.to_ascii_lowercase() == expected.to_ascii_lowercase()
+                })
     }
 
     pub(crate) unsafe fn connect_srm_command_port(
@@ -13683,8 +14025,7 @@ impl ExecNtHandler {
         self.queue_write(port_handle_out, client_handle);
         self.cache_lpc_connection(connect.connection_id, client_handle, name16);
 
-        let lsa_command_name: alloc::vec::Vec<u16> =
-            "\\SeLsaCommandPort".encode_utf16().collect();
+        let lsa_command_name: alloc::vec::Vec<u16> = "\\SeLsaCommandPort".encode_utf16().collect();
         if self.lpc_port_handle_for_name16(&lsa_command_name).is_none() {
             print_str(
                 b"[srm-rdv] \\SeLsaCommandPort is not registered for kernel reverse connect\n",
@@ -13698,7 +14039,9 @@ impl ExecNtHandler {
                 print_str(b"\n");
             }
             Ok(reverse) => {
-                print_str(b"[srm-rdv] expected pending \\SeLsaCommandPort reverse connect, got handle=0x");
+                print_str(
+                    b"[srm-rdv] expected pending \\SeLsaCommandPort reverse connect, got handle=0x",
+                );
                 print_hex((reverse.handle >> 32) as u32);
                 print_hex(reverse.handle as u32);
                 print_str(b" pending=");
@@ -13707,7 +14050,9 @@ impl ExecNtHandler {
                 return STATUS_UNSUCCESSFUL;
             }
             Err(status) => {
-                print_str(b"[srm-rdv] broker rejected \\SeLsaCommandPort reverse connect status=0x");
+                print_str(
+                    b"[srm-rdv] broker rejected \\SeLsaCommandPort reverse connect status=0x",
+                );
                 print_hex(status.raw() as u32);
                 print_str(b"\n");
                 return status.raw() as u32;
@@ -13822,14 +14167,18 @@ impl ExecNtHandler {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         let bytes = if received.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST {
-            let data_len = received.connection_info.len().min(512 - PORT_MESSAGE_HEADER_LEN);
+            let data_len = received
+                .connection_info
+                .len()
+                .min(512 - PORT_MESSAGE_HEADER_LEN);
             let total = PORT_MESSAGE_HEADER_LEN + data_len;
             let mut message = alloc::vec![0u8; total];
             message[0..2].copy_from_slice(&(data_len as u16).to_le_bytes());
             message[2..4].copy_from_slice(&(total as u16).to_le_bytes());
             message[4..6].copy_from_slice(&received.msg_type.to_le_bytes());
             message[0x18..0x1c].copy_from_slice(&(received.connection_id as u32).to_le_bytes());
-            message[PORT_MESSAGE_HEADER_LEN..].copy_from_slice(&received.connection_info[..data_len]);
+            message[PORT_MESSAGE_HEADER_LEN..]
+                .copy_from_slice(&received.connection_info[..data_len]);
             message
         } else {
             received.connection_info.clone()
@@ -14494,7 +14843,9 @@ impl ExecNtHandler {
                     print_hex_u64(apc_routine);
                     print_str(b" context=0x");
                     print_hex_u64(apc_context);
-                    print_str(b" -> dispatcher signaled; APC delivery pending user-APC integration\n");
+                    print_str(
+                        b" -> dispatcher signaled; APC delivery pending user-APC integration\n",
+                    );
                 }
             }
         }
@@ -14705,7 +15056,6 @@ impl ExecNtHandler {
     ) -> Option<nt_exe_image::HostedProcessImageRef<'a>> {
         catalog.probe_image(folded, is_sxs)
     }
-
 }
 impl NativeSyscallHandler for ExecNtHandler {
     /// The dispatcher's entry point. It is a thin wrapper so that ONE thing is guaranteed to run
@@ -14721,7 +15071,11 @@ impl NativeSyscallHandler for ExecNtHandler {
         args: &[u64],
         out: &mut alloc::vec::Vec<u8>,
     ) -> u32 {
+        let winlogon_trace = trace_winlogon_post_lsa_native_enter(self, ctx, args);
         let status = self.handle_service(ctx, args, out);
+        if let Some(trace_index) = winlogon_trace {
+            trace_winlogon_post_lsa_native_exit(self, ctx, trace_index, status);
+        }
         self.sync_debug_object_signals();
         status
     }
@@ -17058,7 +17412,17 @@ impl ExecNtHandler {
                 let idx = args[1] as u32 as usize;
                 let info_class = args[2] as u32;
                 let output_length = args[4] as u32 as usize;
+                let key_path = self.registry_target_path(key);
                 let Some(name) = self.registry_subkey_by_index(key, idx) else {
+                    trace_winlogon_post_lsa_registry(
+                        self,
+                        b"enum-key",
+                        key_path.as_deref(),
+                        "",
+                        0x8000_001A,
+                        None,
+                        None,
+                    );
                     return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
                 };
                 let class_name = self.registry_subkey_class(key, &name);
@@ -17100,9 +17464,27 @@ impl ExecNtHandler {
                     smss_copyout(args[5], &total_bytes); // *ResultLength (stack local)
                 }
                 if output_length < info.len() {
+                    trace_winlogon_post_lsa_registry(
+                        self,
+                        b"enum-key",
+                        key_path.as_deref(),
+                        &name,
+                        0x8000_0005,
+                        None,
+                        None,
+                    );
                     return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
                 }
                 self.xas_write_buf(args[3], &info); // KeyInformation (heap buffer)
+                trace_winlogon_post_lsa_registry(
+                    self,
+                    b"enum-key",
+                    key_path.as_deref(),
+                    &name,
+                    0,
+                    None,
+                    None,
+                );
                 0 // STATUS_SUCCESS
             },
             // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
@@ -17696,7 +18078,7 @@ impl ExecNtHandler {
                 let query_status = if self.should_expose_sam_setup_phase(key_path.as_deref(), &name_lc)
                 {
                     let data = 1u32.to_le_bytes();
-                    self.query_value_key_copyout_status(
+                    let status = self.query_value_key_copyout_status(
                         info_class,
                         args[3],
                         output_length,
@@ -17705,7 +18087,29 @@ impl ExecNtHandler {
                         4,
                         &data,
                         use_xas_write,
-                    )
+                    );
+                    self.trace_winlogon_post_lsa_query_value_readback(
+                        key_path.as_deref(),
+                        &name_lc,
+                        status,
+                        info_class,
+                        args[3],
+                        output_length,
+                        args[5],
+                        4,
+                        &data,
+                        use_xas_write,
+                    );
+                    trace_winlogon_post_lsa_registry(
+                        self,
+                        b"query-value",
+                        key_path.as_deref(),
+                        &name_lc,
+                        status,
+                        Some(4),
+                        Some(&data),
+                    );
+                    status
                 } else {
                     self.registry_value_with(key, &name_lc, |ty, data| {
                         let mut value_use_xas_write = use_xas_write;
@@ -17771,6 +18175,18 @@ impl ExecNtHandler {
                             data,
                             value_use_xas_write,
                         );
+                        self.trace_winlogon_post_lsa_query_value_readback(
+                            key_path.as_deref(),
+                            &name_lc,
+                            status,
+                            info_class,
+                            args[3],
+                            output_length,
+                            args[5],
+                            ty,
+                            data,
+                            value_use_xas_write,
+                        );
                         // A value COPIED OUT of the 4th mount, in full, to a hosted process.
                         // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
                         // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
@@ -17785,6 +18201,15 @@ impl ExecNtHandler {
                                 WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        trace_winlogon_post_lsa_registry(
+                            self,
+                            b"query-value",
+                            key_path.as_deref(),
+                            &name_lc,
+                            status,
+                            Some(ty),
+                            Some(data),
+                        );
                         status
                     })
                     .unwrap_or_else(|| {
@@ -17796,6 +18221,15 @@ impl ExecNtHandler {
                         if self.current_process_is_winlogon() && post_profile_phase() {
                             self.trace_post_profile_registry(b"query-value", key, &name_lc);
                         }
+                        trace_winlogon_post_lsa_registry(
+                            self,
+                            b"query-value",
+                            key_path.as_deref(),
+                            &name_lc,
+                            0xC000_0034,
+                            None,
+                            None,
+                        );
                         0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                     })
                 };
@@ -20847,7 +21281,7 @@ impl ExecNtHandler {
                             }
                         }
                         if self.wait_object_ready(object) {
-                            trace_explorer_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
+                            trace_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
                             print_str(b"[wait] pi=");
                             print_u64(self.pi as u64);
                             print_str(b" NtWaitForSingleObject(");
@@ -20866,7 +21300,7 @@ impl ExecNtHandler {
                                 nt_system_time_100ns(),
                             ) {
                                 nt_delay_execution::Due::Immediate => {
-                                    trace_explorer_wait_object(
+                                    trace_wait_object(
                                         self,
                                         b"timeout-immediate",
                                         handle,
@@ -20883,7 +21317,7 @@ impl ExecNtHandler {
                         }
                         // Unsignaled wait object → ask the loop to park this caller on it.
                         self.wait_park_event = object.raw() as i64;
-                        trace_explorer_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
+                        trace_wait_object(self, b"park", handle, object, timeout_ptr, 0x102);
                         print_str(b"[wait] pi=");
                         print_u64(self.pi as u64);
                         print_str(b" NtWaitForSingleObject(");
@@ -21870,7 +22304,7 @@ impl ExecNtHandler {
                 } else {
                     STATUS_OBJECT_NAME_EXISTS
                 };
-                trace_explorer_io_completion(
+                trace_io_completion(
                     self.pi,
                     b"create",
                     handle,
@@ -21923,7 +22357,7 @@ impl ExecNtHandler {
                 let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
                     Ok(id) => id,
                     Err(status) => {
-                        trace_explorer_io_completion(
+                        trace_io_completion(
                             self.pi,
                             b"set-resolve-failed",
                             args[0],
@@ -21945,7 +22379,7 @@ impl ExecNtHandler {
                     information: args[4],
                 };
                 let status = self.post_io_completion_packet(object_id, packet);
-                trace_explorer_io_completion(
+                trace_io_completion(
                     self.pi,
                     b"set",
                     args[0],
@@ -21965,7 +22399,7 @@ impl ExecNtHandler {
                 let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
                     Ok(id) => id,
                     Err(status) => {
-                        trace_explorer_io_completion(
+                        trace_io_completion(
                             self.pi,
                             b"remove-resolve-failed",
                             args[0],
@@ -21984,7 +22418,7 @@ impl ExecNtHandler {
                     || !self.probe_user_output(args[2], 8)
                     || !self.probe_user_output(args[3], 16)
                 {
-                    trace_explorer_io_completion(
+                    trace_io_completion(
                         self.pi,
                         b"remove-probe-failed",
                         args[0],
@@ -22003,7 +22437,7 @@ impl ExecNtHandler {
                 } else {
                     let mut timeout = [0u8; 8];
                     if !self.xas_read(args[4], &mut timeout) {
-                        trace_explorer_io_completion(
+                        trace_io_completion(
                             self.pi,
                             b"remove-timeout-probe-failed",
                             args[0],
@@ -22035,7 +22469,7 @@ impl ExecNtHandler {
                                 &packet.information.to_le_bytes(),
                             );
                         if copied {
-                            trace_explorer_io_completion(
+                            trace_io_completion(
                                 self.pi,
                                 b"remove-packet",
                                 args[0],
@@ -22049,7 +22483,7 @@ impl ExecNtHandler {
                             );
                             nt_io_completion::STATUS_SUCCESS
                         } else {
-                            trace_explorer_io_completion(
+                            trace_io_completion(
                                 self.pi,
                                 b"remove-packet-copy-failed",
                                 args[0],
@@ -22066,7 +22500,7 @@ impl ExecNtHandler {
                     }
                     Ok(nt_io_completion::RemoveResult::Empty(status)) => {
                         if status != nt_io_completion::STATUS_PENDING {
-                            trace_explorer_io_completion(
+                            trace_io_completion(
                                 self.pi,
                                 b"remove-empty",
                                 args[0],
@@ -22088,7 +22522,7 @@ impl ExecNtHandler {
                                 nt_system_time_100ns(),
                             ) {
                                 nt_delay_execution::Due::Immediate => {
-                                    trace_explorer_io_completion(
+                                    trace_io_completion(
                                         self.pi,
                                         b"remove-timeout-immediate",
                                         args[0],
@@ -22114,7 +22548,7 @@ impl ExecNtHandler {
                             print_str(b"[nt-remove-io-completion] pi="); print_u64(self.pi as u64);
                             print_str(b" empty blocking wait -> reply-cap park armed\n");
                         }
-                        trace_explorer_io_completion(
+                        trace_io_completion(
                             self.pi,
                             b"remove-pending",
                             args[0],
@@ -22129,7 +22563,7 @@ impl ExecNtHandler {
                         nt_io_completion::STATUS_PENDING
                     }
                     Err(status) => {
-                        trace_explorer_io_completion(
+                        trace_io_completion(
                             self.pi,
                             b"remove-error",
                             args[0],

@@ -1196,7 +1196,13 @@ pub(crate) unsafe fn trace_dcerpc_read_reassembly_from_slice(
     );
 }
 
-unsafe fn trace_dcerpc_read_reassembly(file_id: u64, status: u32, info: u64, payload: u64, len: u64) {
+unsafe fn trace_dcerpc_read_reassembly(
+    file_id: u64,
+    status: u32,
+    info: u64,
+    payload: u64,
+    len: u64,
+) {
     if file_id == 0 || payload == 0 || info == 0 || len == 0 {
         return;
     }
@@ -1338,9 +1344,10 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                 table[index].response_count != 0
             })
             .unwrap_or(false);
-        let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(context.uuid))
-        else {
-            if pdu.ptype == 0 && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP {
+        let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(context.uuid)) else {
+            if pdu.ptype == 0
+                && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+            {
                 DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
                 dcerpc_print_context_flow(b"drop", fid, pdu, *context, None, false);
             }
@@ -1360,11 +1367,14 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                 entry.request_count = entry.request_count.saturating_add(1);
                 if seen_response {
                     let first_use = entry.request_count == 1;
-                    if first_use && DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_USE_TRACE_CAP {
+                    if first_use
+                        && DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_USE_TRACE_CAP
+                    {
                         DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT += 1;
                         dcerpc_print_context_flow(b"use", fid, pdu, *context, Some(*entry), true);
                     }
-                } else if DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP {
+                } else if DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
+                {
                     DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
                     dcerpc_print_context_flow(b"miss", fid, pdu, *context, Some(*entry), false);
                 }
@@ -1378,8 +1388,7 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                 entry.last_response_fid = fid;
                 entry.response_count = entry.response_count.saturating_add(1);
                 if first_response
-                    && DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT
-                        < DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP
+                    && DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT < DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP
                 {
                     DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT += 1;
                     dcerpc_print_context_flow(b"create", fid, pdu, *context, Some(*entry), true);
@@ -1390,7 +1399,14 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
                     && DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT < DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP
                 {
                     DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT += 1;
-                    dcerpc_print_context_flow(b"fault-miss", fid, pdu, *context, Some(*entry), false);
+                    dcerpc_print_context_flow(
+                        b"fault-miss",
+                        fid,
+                        pdu,
+                        *context,
+                        Some(*entry),
+                        false,
+                    );
                 }
             }
             _ => {}
@@ -1513,12 +1529,7 @@ unsafe fn dcerpc_context_handles(
         if let Some(context) = dcerpc_context_handle_at(payload, wire_len, offset as u16) {
             dcerpc_push_context_handle(&mut handles, context);
         }
-        if handles
-            .last()
-            .copied()
-            .flatten()
-            .is_some()
-        {
+        if handles.last().copied().flatten().is_some() {
             break;
         }
         offset += 4;
@@ -5548,8 +5559,7 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
         let active_seq = FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed);
-        if active_seq >= 128
-            && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
+        if active_seq >= 128 && FSD_ACTIVE_COMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
         {
             print_str(b"[fsd-complete-active] seq=");
             print_u64(active_seq);
@@ -5559,7 +5569,9 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 && irp + WDM_X64_IRP_SIZE as u64 <= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
             {
                 print_str(b" status=");
-                print_hex(read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32));
+                print_hex(read_unaligned(
+                    (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32,
+                ));
                 print_str(b" info=");
                 print_u64(read_unaligned((irp + 0x38) as *const u64));
             }
@@ -8251,7 +8263,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         print_str(b" ret=");
         print_hex(ret as u32);
         print_str(b" irp-status=");
-        print_hex(read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32));
+        print_hex(read_unaligned(
+            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32,
+        ));
         print_str(b" info=");
         print_u64(read_unaligned((irp + 0x38) as *const u64));
         unsafe {
@@ -11919,6 +11933,20 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_REPLY_BOUND_TCB]);
             print_str(b" current=");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CURRENT_TCB]);
+            print_str(b" target=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_TARGET_TCB]);
+            print_str(b" cspace=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CSPACE_INDEX]);
+            print_str(b" fault-cap-kind=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_FAULT_CAP_KIND]);
+            print_str(b" fault-cap-detail=");
+            print_hex64(state[crate::win32k_glue::TCB_DBG_FAULT_CAP_DETAIL]);
+            print_str(b" fault-ep=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_FAULT_EP_STATE]);
+            print_str(b"/");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_FAULT_EP_HEAD]);
+            print_str(b"/");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_FAULT_EP_TAIL]);
             print_str(b"\n");
         }
         unsafe {

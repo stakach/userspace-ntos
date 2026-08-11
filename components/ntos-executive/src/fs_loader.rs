@@ -774,16 +774,15 @@ fn push_path_suffix(out: &mut [u8], n: &mut usize, suffix: &[u8]) -> Option<()> 
     Some(())
 }
 
-fn drive_path_to_volume_relative_into(
-    path_after_drive: &[u8],
-    out: &mut [u8],
-) -> Option<usize> {
+fn drive_path_to_volume_relative_into(path_after_drive: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut n = 0usize;
     let mut relative = path_after_drive;
     while relative.starts_with(b"\\") || relative.starts_with(b"/") {
         relative = &relative[1..];
     }
-    if relative == b"windows" || relative.starts_with(b"windows\\") || relative.starts_with(b"windows/")
+    if relative == b"windows"
+        || relative.starts_with(b"windows\\")
+        || relative.starts_with(b"windows/")
     {
         push_path_component(out, &mut n, b"reactos")?;
         push_path_suffix(out, &mut n, &relative[b"windows".len()..])?;
@@ -851,8 +850,7 @@ unsafe fn open_dll_read_result(
     sys32_relative: &[u8],
 ) -> Result<(u64, u32), DemandLoadError> {
     let mut relative = [0u8; 192];
-    if let Some(relative_len) =
-        folded_dll_path_to_volume_relative_into(folded_name, &mut relative)
+    if let Some(relative_len) = folded_dll_path_to_volume_relative_into(folded_name, &mut relative)
     {
         return open_volume_relative_read_result(fs, &relative[..relative_len]);
     }

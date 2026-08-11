@@ -68,12 +68,8 @@ pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
         nt_pe_loader::ImageProtection::WriteCopy => nt_address_space::PAGE_WRITECOPY,
         nt_pe_loader::ImageProtection::Execute => nt_address_space::PAGE_EXECUTE,
         nt_pe_loader::ImageProtection::ExecuteRead => nt_address_space::PAGE_EXECUTE_READ,
-        nt_pe_loader::ImageProtection::ExecuteReadWrite => {
-            nt_address_space::PAGE_EXECUTE_READWRITE
-        }
-        nt_pe_loader::ImageProtection::ExecuteWriteCopy => {
-            nt_address_space::PAGE_EXECUTE_WRITECOPY
-        }
+        nt_pe_loader::ImageProtection::ExecuteReadWrite => nt_address_space::PAGE_EXECUTE_READWRITE,
+        nt_pe_loader::ImageProtection::ExecuteWriteCopy => nt_address_space::PAGE_EXECUTE_WRITECOPY,
     }
 }
 
@@ -539,14 +535,14 @@ pub(crate) unsafe fn spawn_sec_image(
     // creation boundary before spawn registers image and environment views.
     process_committed_mapping_reset(pi as usize);
     let main_image_size = image_extent(pe);
-    let mut dropped_image_frames = csrss_frame_drop_process_range(pi, PE_LOAD_BASE, main_image_size);
+    let mut dropped_image_frames =
+        csrss_frame_drop_process_range(pi, PE_LOAD_BASE, main_image_size);
     if let Some((ntdll_base, ntdll_pe)) = ntdll {
-        dropped_image_frames = dropped_image_frames
-            .saturating_add(csrss_frame_drop_process_range(
-                pi,
-                ntdll_base,
-                image_extent(ntdll_pe),
-            ));
+        dropped_image_frames = dropped_image_frames.saturating_add(csrss_frame_drop_process_range(
+            pi,
+            ntdll_base,
+            image_extent(ntdll_pe),
+        ));
     }
     if dropped_image_frames != 0 {
         print_str(b"[frame-reg] dropped stale SEC_IMAGE frames pi=");

@@ -547,8 +547,7 @@ unsafe fn call_tls_initializers(base: u64, reason: u32) {
 ///
 /// # Safety
 /// On-target; every table entry is a mapped DLL image whose imports have been snapped. `table` is a
-/// valid `*mut ModuleTable` uniquely owned by the single-threaded loader (used mutably to RE-SNAP a
-/// module's imports immediately before its DllMain — see [`attach_dfs`]).
+/// valid `*mut ModuleTable` uniquely owned by the single-threaded loader.
 #[cfg(target_arch = "x86_64")]
 unsafe fn run_process_attach(table: *mut ModuleTable, startup_reserved: u64) -> u32 {
     let _callout = unsafe { crate::exports::enter_loader_callout() };
@@ -719,24 +718,6 @@ unsafe fn attach_dfs(
                     return status;
                 }
             };
-        // ★ RE-SNAP this module's imports RIGHT BEFORE its DllMain runs. The executive demand-fills a
-        // hosted DLL's per-process pages (headers/.rdata/.idata/IAT) lazily and from the ON-DISK PE
-        // (raw, un-snapped thunks); a page we snapped earlier (during the static import walk) can be
-        // re-faulted later in the loader and RE-FILLED from the PE, silently reverting our IAT writes
-        // (observed: comdlg32's kernel32 IAT slot held our resolved 0x803c14f0 immediately after the
-        // snap, then read back the raw 0x3ad64 by DllMain time). Re-snapping here — on the same thread,
-        // immediately before the `jmp *IAT[..]`, so the pages are freshly resident — makes the IAT the
-        // DllMain sees authoritative. `snap_module` is idempotent (re-resolves + re-writes each thunk),
-        // de-dupes loads via the table, and is cheap for an already-mapped graph.
-        let ntdll_base = (*table).find(b"ntdll");
-        if ntdll_base != 0 {
-            let mut sink = SnapResult::default();
-            snap_module(base, ntdll_base, table, &mut sink, 0);
-            if sink.status != 0 {
-                (*table).mods[module_index].attaching = false;
-                return sink.status;
-            }
-        }
         {
             let mut mb = [0u8; 64];
             let mut mn = 0usize;
@@ -899,7 +880,11 @@ unsafe fn report_recovered_thread_attach_base(index: usize, base: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn report_thread_attach_committed(teb: u64, completed: usize, executable_tls_attached: bool) {
+unsafe fn report_thread_attach_committed(
+    teb: u64,
+    completed: usize,
+    executable_tls_attached: bool,
+) {
     let n = THREAD_ATTACH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
     if n >= 32 {
         return;
@@ -2601,6 +2586,9 @@ unsafe fn snap_module(
         }
         unsafe { (&mut *table).set_imports_failed(image_base) };
         return; // corrupt graph: a simple path cannot exceed the table's unique-module capacity
+    }
+    if unsafe { (&*table).imports_ready(image_base) } {
+        return;
     }
     unsafe { (&mut *table).begin_imports(image_base) };
     let mut imports_ready = ModuleImportsReadyGuard {
@@ -5678,8 +5666,8 @@ pub(crate) unsafe fn reset_process_runtime_state_for_new_process() {
         RTL_ASYNC_LOCK = RtlAsyncCriticalSection::new();
         RTL_TIMER_QUEUES = [const { RtlTimerQueueSlot::new() }; RTL_TIMER_QUEUE_CAPACITY];
         RTL_TIMER_HANDLES = [const { RtlTimerHandleSlot::new() }; RTL_TIMER_HANDLE_CAPACITY];
-        RTL_REGISTERED_WAITS = [const { RtlRegisteredWaitSlot::new() };
-            RTL_REGISTERED_WAIT_CAPACITY];
+        RTL_REGISTERED_WAITS =
+            [const { RtlRegisteredWaitSlot::new() }; RTL_REGISTERED_WAIT_CAPACITY];
         WORK_POOL_COUNTERS = nt_rtl_work_item::PoolCounters::new();
         WORK_POOL_FLEET = nt_rtl_work_item::WorkerFleet::new();
     }
@@ -6225,8 +6213,7 @@ unsafe fn drive_pool_worker_start(
     parameter: *mut c_void,
     latch: &nt_rtl_work_item::WorkerStartLatch,
 ) -> u32 {
-    let mut start =
-        nt_rtl_work_item::WorkerStart::new(worker_routine as usize as u64, parameter);
+    let mut start = nt_rtl_work_item::WorkerStart::new(worker_routine as usize as u64, parameter);
     loop {
         let Some(action) = start.next_action() else {
             return STATUS_UNSUCCESSFUL_U32;
@@ -6352,9 +6339,7 @@ fn completion_worker_tid_slot(id: nt_rtl_work_item::WorkerId) -> Option<&'static
     RTL_COMPLETION_WORKER_TIDS.get(usize::from(id.slot()))
 }
 
-unsafe fn start_reserved_completion_worker(
-    reservation: nt_rtl_work_item::StartReservation,
-) -> u32 {
+unsafe fn start_reserved_completion_worker(reservation: nt_rtl_work_item::StartReservation) -> u32 {
     let parameter = CompletionWorkerStartParameter::new(reservation.id);
     unsafe {
         drive_pool_worker_start(
@@ -6410,9 +6395,7 @@ pub(crate) unsafe fn start_completion_worker_for(
 }
 
 pub(crate) unsafe fn start_completion_worker() -> u32 {
-    unsafe {
-        start_completion_worker_for(nt_rtl_work_item::WorkItemFlags::EXECUTE_DEFAULT)
-    }
+    unsafe { start_completion_worker_for(nt_rtl_work_item::WorkItemFlags::EXECUTE_DEFAULT) }
 }
 
 unsafe fn commit_completion_worker_persistent_floor_if_needed(

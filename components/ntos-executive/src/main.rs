@@ -10174,12 +10174,7 @@ unsafe fn vm_promote_mapped_cow_page(
         if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
             let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
             if retained_alias != 0 && old_alias_cap != 0 {
-                let _ = page_map_r(
-                    old_alias_cap,
-                    retained_alias,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
+                let _ = page_map_r(old_alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             let _ = csrss_frame_put_at_cap_source_owned(
                 pi as u64,
@@ -10236,28 +10231,14 @@ unsafe fn vm_promote_mapped_cow_page(
     };
 
     if let Err(status) = vm_ensure_private_pt(pi, page, pml4) {
-        restore_old_mapped_mapping(
-            pi,
-            page,
-            old_mapping,
-            retained_alias,
-            old_protection,
-            pml4,
-        );
+        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(status);
     }
 
     let map_error = page_map_r(new_frame, page, vm_page_rights(new_protection), pml4);
     if map_error != 0 {
-        restore_old_mapped_mapping(
-            pi,
-            page,
-            old_mapping,
-            retained_alias,
-            old_protection,
-            pml4,
-        );
+        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
         vm_frame_release(new_frame, 0);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -10270,28 +10251,14 @@ unsafe fn vm_promote_mapped_cow_page(
                 let _ = cnode_delete_recycle_r(alias_cap);
             }
             let _ = page_unmap_r(new_frame);
-            restore_old_mapped_mapping(
-                pi,
-                page,
-                old_mapping,
-                retained_alias,
-                old_protection,
-                pml4,
-            );
+            restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         if page_map_r(alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
             let _ = cnode_delete_recycle_r(alias_cap);
             let _ = page_unmap_r(new_frame);
-            restore_old_mapped_mapping(
-                pi,
-                page,
-                old_mapping,
-                retained_alias,
-                old_protection,
-                pml4,
-            );
+            restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
             vm_frame_release(new_frame, 0);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -10313,14 +10280,7 @@ unsafe fn vm_promote_mapped_cow_page(
         }
         let _ = page_unmap_r(new_frame);
         vm_frame_release(new_frame, 0);
-        restore_old_mapped_mapping(
-            pi,
-            page,
-            old_mapping,
-            retained_alias,
-            old_protection,
-            pml4,
-        );
+        restore_old_mapped_mapping(pi, page, old_mapping, retained_alias, old_protection, pml4);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
 
@@ -12186,7 +12146,6 @@ unsafe fn delay_wake_due(
             print_str(b" status=STATUS_SUCCESS\n");
         }
     }
-    delay_timer_rearm(queue);
     woken
 }
 
@@ -16611,12 +16570,18 @@ impl ExecFileCompletion {
         unsafe { (&mut *self.table).retain_file(file_id) }
     }
 
-    fn release_file(&mut self, file_id: u64) -> Result<nt_io_completion::FileReferenceRelease, u32> {
+    fn release_file(
+        &mut self,
+        file_id: u64,
+    ) -> Result<nt_io_completion::FileReferenceRelease, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_file(file_id) }
     }
 
-    fn release_handle(&mut self, file_id: u64) -> Result<nt_io_completion::FileReferenceRelease, u32> {
+    fn release_handle(
+        &mut self,
+        file_id: u64,
+    ) -> Result<nt_io_completion::FileReferenceRelease, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_handle(file_id) }
     }

@@ -1953,8 +1953,11 @@ unsafe fn redirect_pending_user_callback(
         return false;
     }
 
-    let redirected =
-        nt_user_callback::callback_redirect_context(redirect_context, dispatcher, layout.frame_pointer);
+    let redirected = nt_user_callback::callback_redirect_context(
+        redirect_context,
+        dispatcher,
+        layout.frame_pointer,
+    );
     let error = tcb_write_regs20(tcb, &redirected, false);
     if error != 0 {
         print_str(b"[user-callback] client redirect TCB_WriteRegisters failed error=");
@@ -2037,9 +2040,15 @@ unsafe fn flush_returned_user_callback_gdi_batch(
     let Some(teb_alias) = client_callback_teb_alias(client) else {
         return;
     };
-    crate::ke_gdi_flush_user_batch(win32k_client_context_from_callback_client(client), teb_alias);
-    let identity =
-        nt_user_callback::ClientThreadIdentity::new(request.client_pi, request.client_tid, request.client_badge);
+    crate::ke_gdi_flush_user_batch(
+        win32k_client_context_from_callback_client(client),
+        teb_alias,
+    );
+    let identity = nt_user_callback::ClientThreadIdentity::new(
+        request.client_pi,
+        request.client_tid,
+        request.client_badge,
+    );
     reassert_top_client_callback_window(&identity);
 }
 
@@ -2294,18 +2303,18 @@ pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64
     if teb == 0 {
         print_str(b"[cb-crash] CLIENTINFO unavailable\n");
     } else {
-    let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
-    print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
-    print_crash_hex64(read(0x820));
-    print_str(b" ulClientDelta=0x");
-    print_crash_hex64(read(0x828));
-    print_str(b" CallbackWnd{hWnd=0x");
-    print_hex(read(0x840) as u32);
-    print_str(b" pWnd=0x");
-    print_crash_hex64(read(0x848));
-    print_str(b" pActCtx=0x");
-    print_crash_hex64(read(0x850));
-    print_str(b"}\n");
+        let read = |offset: u64| core::ptr::read_volatile((teb + offset) as *const u64);
+        print_str(b"[cb-crash] CLIENTINFO pDeskInfo=0x");
+        print_crash_hex64(read(0x820));
+        print_str(b" ulClientDelta=0x");
+        print_crash_hex64(read(0x828));
+        print_str(b" CallbackWnd{hWnd=0x");
+        print_hex(read(0x840) as u32);
+        print_str(b" pWnd=0x");
+        print_crash_hex64(read(0x848));
+        print_str(b" pActCtx=0x");
+        print_crash_hex64(read(0x850));
+        print_str(b"}\n");
     }
     if let Some(frame) = active_frame {
         let request = frame.request();
@@ -2751,8 +2760,7 @@ pub(crate) unsafe fn inject_win32k_nested_dispatch_slip(
             victim_rip,
             victim_rsp,
             victim_flags,
-        )
-        else {
+        ) else {
             break;
         };
         callback_returns += 1;
@@ -3442,7 +3450,12 @@ unsafe fn map_static_win32k_arena_into_client(
     for p in 0..(frames + 511) / 512 {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, client_base + p * 0x20_0000, pml4);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            client_base + p * 0x20_0000,
+            pml4,
+        );
     }
     for i in 0..frames {
         let (cp, copy_error) = copy_cap_r(frame_base + i);
@@ -5356,7 +5369,7 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
     }
 }
 
-pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 16;
+pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 24;
 pub(crate) const TCB_DEBUG_NONE: u64 = u64::MAX;
 pub(crate) const TCB_DBG_STATE: usize = 0;
 pub(crate) const TCB_DBG_SCHEDULABLE: usize = 1;
@@ -5374,10 +5387,17 @@ pub(crate) const TCB_DBG_PENDING_FAULT: usize = 12;
 pub(crate) const TCB_DBG_HOSTED_SYSCALLS: usize = 13;
 pub(crate) const TCB_DBG_REPLY_BOUND_TCB: usize = 14;
 pub(crate) const TCB_DBG_CURRENT_TCB: usize = 15;
+pub(crate) const TCB_DBG_TARGET_TCB: usize = 16;
+pub(crate) const TCB_DBG_CSPACE_INDEX: usize = 17;
+pub(crate) const TCB_DBG_FAULT_CAP_KIND: usize = 18;
+pub(crate) const TCB_DBG_FAULT_CAP_DETAIL: usize = 19;
+pub(crate) const TCB_DBG_FAULT_EP_STATE: usize = 20;
+pub(crate) const TCB_DBG_FAULT_EP_HEAD: usize = 21;
+pub(crate) const TCB_DBG_FAULT_EP_TAIL: usize = 22;
 
 /// rust-micro extension: `TCB::ReadDebugState(reply_cap)` returns compact scheduler/IPC state for
 /// a target TCB and, when `reply_cap != 0`, the TCB currently bound to that reply object.
-pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u64; 16]) {
+pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u64; 24]) {
     let (r0, r1, r2, r3): (u64, u64, u64, u64);
     core::arch::asm!(
         "syscall",
@@ -5395,7 +5415,12 @@ pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u
     out[1] = r1;
     out[2] = r2;
     out[3] = r3;
-    for (i, slot) in out.iter_mut().enumerate().take(TCB_DEBUG_STATE_WORDS).skip(4) {
+    for (i, slot) in out
+        .iter_mut()
+        .enumerate()
+        .take(TCB_DEBUG_STATE_WORDS)
+        .skip(4)
+    {
         *slot = crate::get_recv_mr(i);
     }
 }
