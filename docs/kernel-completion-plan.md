@@ -61,6 +61,12 @@ enters the low-water zone. Local validation is green: `cargo fmt --all`,
 `git diff --check`. Next serialized desktop proof should confirm the shell still reaches desktop
 icons while the new census shows nonzero shared-cache reuse and zero `shared-full`/`shared-dup`.
 
+Desktop proof interpretation (2026-08-12): the latest screenshots confirm the shell frontier has
+moved beyond launch and paint. Treat Explorer desktop/icon/chrome rendering as a working mechanism
+on the shared-pager proof path, not as synthetic scaffolding. The remaining red gates are kernel
+systems work: LSA logon/auth-port routing and total VM/CSlot/root-untyped retention under the later
+service wave.
+
 Serialized validation (2026-08-12): `.tmp/run-desktop-shared-pager-20260812.log` reaches the
 harness sentinel with real Explorer desktop and icon paint. Screenshot proof
 `.tmp/run-desktop-shared-pager-20260812-2.png` shows the ReactOS desktop with `My Computer`,
@@ -103,7 +109,15 @@ map-cap tracking now applies to every hosted image process. Local validation is 
 `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
 x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof should confirm Explorer
 desktop/icon paint still reaches the quiesce frontier with the executable-only sharing invariant
-restored.
+restored. Follow-up retry `.tmp/run-desktop-executable-image-sharing-20260812.log` restored the
+CSRSS/winsrv path and reached `userinit.exe`, `explorer.exe`, `NtUserProcessConnect`, and GDI handle
+table mapping, then quiesced before the first `NtUserCreateWindowEx` with Explorer's main thread at
+`ws2_32` DLL attach. That retry is now a generic hosted-thread fault/IPC frontier, not a reason to
+add shell policy: hosted main-thread quiesce diagnostics report TCB scheduler/reply/fault state plus
+the committed mapping, private frame record, shared image map-cap, and shared DLL cache entry for
+the stalled instruction page. Local validation for the diagnostic wiring is green: `cargo fmt
+--all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`.
 
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the

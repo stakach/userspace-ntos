@@ -17921,6 +17921,62 @@ fn print_quiesce_tag(label: &[u8], suffix: &[u8]) {
 }
 
 #[inline(never)]
+unsafe fn dump_hosted_quiesce_rip_mapping(label: &[u8], pi: usize, rip: u64) {
+    let page = rip & !0xfff;
+    print_quiesce_tag(label, b"-rip-map");
+    print_str(b" page=0x");
+    print_hex_u64(page);
+    if let Some(info) = process_committed_mapping_basic_information(pi as u64, page) {
+        print_str(b" base=0x");
+        print_hex_u64(info.base_address);
+        print_str(b" alloc=0x");
+        print_hex_u64(info.allocation_base);
+        print_str(b" size=0x");
+        print_hex_u64(info.region_size);
+        print_str(b" state=0x");
+        print_hex(info.state);
+        print_str(b" protect=0x");
+        print_hex(info.protect);
+        print_str(b" type=0x");
+        print_hex(info.type_);
+    } else {
+        print_str(b" committed=none");
+    }
+    if let Some(image) = process_committed_image_allocation(pi as u64, page) {
+        print_str(b" image=[0x");
+        print_hex_u64(image.allocation_base);
+        print_str(b"..0x");
+        print_hex_u64(image.allocation_end);
+        print_str(b")");
+    } else {
+        print_str(b" image=none");
+    }
+    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
+        print_str(b" exact-frame=0x");
+        print_hex(record.frame as u32);
+        print_str(b" alias=0x");
+        print_hex(record.alias as u32);
+        print_str(b" source=0x");
+        print_hex(record.source_cap as u32);
+        print_str(b" owns=");
+        print_u64(record.owns_frame as u64);
+    } else {
+        print_str(b" exact-frame=none");
+    }
+    match shared_image_mapping_get(pi as u64, page) {
+        Some(map_cap) => {
+            print_str(b" shared-map=0x");
+            print_hex(map_cap as u32);
+        }
+        None => print_str(b" shared-map=none"),
+    }
+    let shared_cache = dll_cache_get(page);
+    print_str(b" shared-cache=0x");
+    print_hex(shared_cache as u32);
+    print_str(b"\n");
+}
+
+#[inline(never)]
 unsafe fn dump_hosted_main_thread_quiesce(
     label: &[u8],
     pi: usize,
@@ -17995,6 +18051,13 @@ unsafe fn dump_hosted_main_thread_quiesce(
     print_str(b" r9=0x");
     print_hex_u64(r9);
     print_str(b"\n");
+
+    crate::win32k_glue::trace_hosted_tcb_debug_state(
+        label,
+        tcb,
+        REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+    );
+    dump_hosted_quiesce_rip_mapping(label, pi, rip);
 
     let mut threads = [HostedThreadQuiesceRecord::empty(); 32];
     let (count, overflow) = nt_handler.hosted_thread_quiesce_records_for_pi(pi, &mut threads);

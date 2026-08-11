@@ -5440,15 +5440,8 @@ fn print_tcb_debug_opt(value: u64) {
     }
 }
 
-pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
-    let tcb = WIN32K_TCB.load(Ordering::Relaxed);
-    let reply = REPLY_W32_SLOT.load(Ordering::Relaxed);
-    if tcb == 0 {
-        return;
-    }
-    let mut state = [0u64; TCB_DEBUG_STATE_WORDS];
-    tcb_read_debug_state(tcb, reply, &mut state);
-    print_str(b"[w32disp] tcb state=");
+fn print_tcb_debug_state_body(state: &[u64; TCB_DEBUG_STATE_WORDS]) {
+    print_str(b" state=");
     print_u64(state[TCB_DBG_STATE]);
     print_str(b" sched=");
     print_u64(state[TCB_DBG_SCHEDULABLE]);
@@ -5502,6 +5495,34 @@ pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
     print_tcb_debug_opt(state[TCB_DBG_FAULT_EP_HEAD]);
     print_str(b"/");
     print_tcb_debug_opt(state[TCB_DBG_FAULT_EP_TAIL]);
+}
+
+pub(crate) unsafe fn trace_hosted_tcb_debug_state(label: &[u8], tcb: u64, reply_cap: u64) {
+    if tcb == 0 {
+        return;
+    }
+    let mut state = [0u64; TCB_DEBUG_STATE_WORDS];
+    tcb_read_debug_state(tcb, reply_cap, &mut state);
+    print_str(b"[");
+    print_str(label);
+    print_str(b"-tcb] tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" reply_cap=0x");
+    print_hex(reply_cap as u32);
+    print_tcb_debug_state_body(&state);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
+    let tcb = WIN32K_TCB.load(Ordering::Relaxed);
+    let reply = REPLY_W32_SLOT.load(Ordering::Relaxed);
+    if tcb == 0 {
+        return;
+    }
+    let mut state = [0u64; TCB_DEBUG_STATE_WORDS];
+    tcb_read_debug_state(tcb, reply, &mut state);
+    print_str(b"[w32disp] tcb");
+    print_tcb_debug_state_body(&state);
     print_str(b"\n");
 }
 
