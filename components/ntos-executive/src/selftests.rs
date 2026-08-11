@@ -526,6 +526,52 @@ pub(crate) unsafe fn xview_spawn(
     (pml4, tcb, fault_ep)
 }
 
+unsafe fn xview_recv_syscall(
+    ep: u64,
+    reply: u64,
+    tag: &[u8],
+    expected_rax: Option<u64>,
+) -> (u64, u64, u64, u64) {
+    let mut selected = (0, 0, 0, 0);
+    let mut guard = 0;
+    while guard < 4 {
+        guard += 1;
+        let (_badge, msginfo, m0, m1, _m2, m3) = recv_full_r12(ep, reply);
+        let is_syscall = (msginfo >> 12) == 2;
+        let matches_rax = expected_rax.is_none_or(|expected| m0 == expected);
+        xview_trace(
+            if is_syscall && matches_rax {
+                tag
+            } else {
+                b"foreign"
+            },
+            msginfo,
+            m0,
+            m1,
+            m3,
+        );
+        if is_syscall && matches_rax {
+            selected = (msginfo, m0, m1, m3);
+            break;
+        }
+    }
+    selected
+}
+
+unsafe fn xview_trace(tag: &[u8], msginfo: u64, m0: u64, m1: u64, m3: u64) {
+    print_str(b"[alpc-xview] ");
+    print_str(tag);
+    print_str(b" label=");
+    print_u64(msginfo >> 12);
+    print_str(b" m0=");
+    print_hex(m0 as u32);
+    print_str(b" m1=");
+    print_hex(m1 as u32);
+    print_str(b" m3=");
+    print_hex(m3 as u32);
+    print_str(b"\n");
+}
+
 /// ALPC last-mile item (b): the physical two-VSpace section-view proof. Returns a bitmask (0x3F =
 /// all 6 sub-proofs). See the block comment above. Post-loop, throwaway-only, byte-identical boot.
 pub(crate) unsafe fn alpc_cross_vspace_selftest() -> u64 {
@@ -581,7 +627,7 @@ pub(crate) unsafe fn alpc_cross_vspace_selftest() -> u64 {
     // its fault FIRST so the section carries A's write before endpoint B reads it (serialized).
     let writer = xview_writer_code(0x0000_0000_4000_0000, PATTERN);
     let (pml4_a, tcb_a, ep_a) = xview_spawn(&writer, f0, f1, write_scratch_a, &mut slots, &mut n);
-    let (_ba, mia, m0a, _1a, _2a, _3a) = recv_full_r12(ep_a, reply_a);
+    let (mia, m0a, _m1a, _m3a) = xview_recv_syscall(ep_a, reply_a, b"writer", Some(0x0A));
     if (mia >> 12) == 2 && m0a == 0x0A {
         ok |= 1 << 1; // the writer ran in VSpace A + wrote its big data, then fault-reported done
     }
@@ -603,7 +649,7 @@ pub(crate) unsafe fn alpc_cross_vspace_selftest() -> u64 {
     };
     let reader = xview_reader_code(0x0000_0000_4000_0000);
     let (pml4_b, tcb_b, ep_b) = xview_spawn(&reader, cf0, cf1, write_scratch_b, &mut slots, &mut n);
-    let (_bb, mib, m0b, _1b, _2b, m3b) = recv_full_r12(ep_b, reply_b);
+    let (mib, m0b, _m1b, m3b) = xview_recv_syscall(ep_b, reply_b, b"reader", None);
 
     if pml4_a != 0 && pml4_b != 0 && pml4_a != pml4_b {
         ok |= 1 << 0; // two SEPARATE endpoint VSpaces stood up

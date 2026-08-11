@@ -31,28 +31,28 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest serialized gate validation (2026-08-12): `.tmp/run-desktop-dbgk-brk-select-20260812.log`
+Latest serialized gate validation (2026-08-12): `.tmp/run-desktop-alpc-xview-select-20260812.log`
 rebuilds ntdll, the executive, rust-micro, and the disk image, reaches the quiesce gate after the
-later service wave, and exits through the microtest sentinel at `291/295`. This closes the Dbgk
-remote-breakin slice without adding a fallback: the throwaway remote-thread proof now ignores the
-initial hosted admission event (`[dbgk-brk] f1-foreign ... marker=0`) and selects the real break-in
-thread breakpoint (`label=4`, marker `0x11`), after which the selftest reaches bits `0x7f` and
-marker `0x12`. `exec_dbgk_remote_breakin_thread_runs` and
-`exec_dbgk_remote_breakin_reports_breakpoint` now pass along with Dbgk target blocking and
-client-reply binding. The repeated `[wl-quiesce]` frame remains an idle post-desktop observation:
-winlogon is parked in user32 `NtUserMessageCall`, the run has already painted Explorer chrome, and
-no synthetic worker-injection probe follows it. Real userinit/explorer flow is green
-(`userinit.exe` at `pi=5`, `explorer.exe` at `pi=6`), IDD_LOGON paint and credential delivery are
-green, profile/user hive loading is green, and the Explorer framebuffer proof reports all `786432`
-pixels non-background with at least 32 distinct non-background colors. Remaining red gates are
-generic kernel-system targets: `exec_alpc_section_view_cross_vspace`,
+later service wave, and exits through the microtest sentinel at `292/295`. This closes the generic
+ALPC cross-vspace section-view proof without adding a fallback: the throwaway hosted VSpace proof now
+ignores initial hosted admission events on both private endpoints and selects the real writer and
+reader unknown-syscall completions. Proof lines show `[alpc-xview] foreign label=13`, then
+`writer label=2 m0=0x0000000a`, then `reader label=2 m0=0xdeadbeef m3=0xdeadbeef`; the ALPC
+selftest reaches `ok=0x3f`, the writer sees `0x0a`, and both readers observe the shared
+`0xcafebabe_deadbeef` section-view pattern. `exec_alpc_section_view_cross_vspace` now passes along
+with the earlier Dbgk target-blocking, Dbgk remote-breakin, client-reply binding, profile/user hive,
+IDD_LOGON, userinit, Explorer launch, real callback dispatch, and Explorer chrome gates. The
+repeated `[wl-quiesce]` frame remains an idle post-desktop observation: winlogon is parked in user32
+`NtUserMessageCall`, the run has already painted Explorer chrome, and no synthetic worker-injection
+probe follows it. Remaining red gates are generic kernel-system targets:
 `exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and `exec_vm_pool_headroom`. Review
 adjustment: keep treating shell launch, profile staging, WM_PAINT, callback dispatch, Explorer
-chrome, Dbgk target blocking, Dbgk remote break-in, and client reply binding as working real
-mechanisms. The next useful implementation slice should either fix generic ALPC cross-vspace section
-view transfer, make the LSA auth/logon gates reflect the now-observed real data-plane handoff, or
-reduce retained VM/CSlot/root-untyped resources through real teardown and reclaim. The latest
-resource proof is still tight: final headroom was `slot-free=1536` and `ut-free=11692KiB`.
+chrome, Dbgk proofs, client reply binding, and ALPC section-view transfer as working real
+mechanisms. The next useful implementation slice should make the LSA auth/logon gates reflect the
+now-observed real data-plane handoff or reduce retained VM/CSlot/root-untyped resources through real
+teardown and reclaim. The latest resource proof is still tight: final headroom was
+`slot-free=2529` and `ut-free=12995KiB`; a later-service `thread-pool REFUSED NtCreateThread`
+line for `pi=14` is also a useful lead for the remaining pool-headroom work.
 
 Latest desktop/icon validation (2026-08-12): serialized graphics retry
 `.tmp/run-desktop-late-freeze-20260812.log` rebuilt ntdll, the executive, rust-micro, and the disk
