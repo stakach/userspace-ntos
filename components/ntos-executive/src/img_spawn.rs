@@ -73,10 +73,6 @@ pub(crate) fn image_rva_protection(pe: &nt_pe_loader::PeFile, rva: u32) -> u32 {
     }
 }
 
-pub(crate) fn image_rva_executable(pe: &nt_pe_loader::PeFile, rva: u32) -> bool {
-    pe.image_protection_at(rva).executable()
-}
-
 pub(crate) unsafe fn register_image_committed_mappings(
     pi: u64,
     pe: &nt_pe_loader::PeFile,

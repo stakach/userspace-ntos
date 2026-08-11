@@ -89,6 +89,18 @@ x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof shou
 Explorer desktop/icon paint; remaining root untyped headroom still needs total fresh-retype
 reduction, not gate relaxation.
 
+Current SEC_IMAGE sharing slice (2026-08-12): the latest desktop screenshots and serial census show
+real Explorer desktop/icons, but the later service wave still drives root untyped and root CSlot
+headroom below the gate. The next reduction is mechanism-level sharing, not a gate relaxation:
+read-faulted DLL image pages whose current protection maps non-writable now use the shared image
+cache, so clean read-only and write-copy data pages share the same frame across processes just like
+executable text. First writes still flow through the existing image COW promotion path, preserving
+loader/runtime fixups. The obsolete executable-only helper was removed. Local validation is green:
+`cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof should confirm Explorer
+desktop/icon paint still reaches the quiesce frontier while `shared-frames`/`shared-hits` rise and
+root untyped/CSlot headroom improves.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.

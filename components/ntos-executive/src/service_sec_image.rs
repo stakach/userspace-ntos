@@ -6226,12 +6226,11 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     break;
                 }
-                // SHAREABLE = a registered DLL's executable text (not the per-process main image at
-                // PE_LOAD_BASE, and an RX page). Byte-identical across processes (each DLL loaded at a
-                // fixed base + pre-relocated) → filled ONCE into a frame, mapped READ-ONLY (RX) into
-                // every process that faults it — real image sharing.
-                let shareable =
-                    base != PE_LOAD_BASE && image_rva_executable(tpe, rva) && !image_map_writable;
+                // SHAREABLE = a registered DLL image page whose current fault installs a non-writable
+                // mapping. That includes executable text and clean read-only/write-copy data: the
+                // first write promotes through the image COW path below, so read faults can share the
+                // same cached frame instead of allocating identical per-process copies.
+                let shareable = base != PE_LOAD_BASE && !image_map_writable;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 if is_fault_page && image_fault_plan.copy_on_write {
                     let read_fault_protection =
