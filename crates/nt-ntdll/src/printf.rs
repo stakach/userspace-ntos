@@ -415,15 +415,21 @@ unsafe fn write_count(pointer: usize, length: Length, value: usize) {
     }
 }
 
-unsafe fn string_length(pointer: usize, wide: bool, bounded: Option<usize>) -> usize {
+unsafe fn string_length(
+    pointer: usize,
+    wide: bool,
+    bounded: Option<usize>,
+    precision: Option<usize>,
+) -> usize {
     if pointer == 0 {
-        return 6;
+        return precision.map_or(6, |limit| limit.min(6));
     }
     if let Some(length) = bounded {
-        return length;
+        return precision.map_or(length, |limit| length.min(limit));
     }
+    let limit = precision.unwrap_or(usize::MAX);
     let mut length = 0usize;
-    loop {
+    while length < limit {
         let unit = if wide {
             unsafe { core::ptr::read_unaligned((pointer as *const u16).add(length)) }
         } else {
@@ -434,6 +440,7 @@ unsafe fn string_length(pointer: usize, wide: bool, bounded: Option<usize>) -> u
         }
         length += 1;
     }
+    length
 }
 
 unsafe fn emit_string<O: Output>(
@@ -446,10 +453,7 @@ unsafe fn emit_string<O: Output>(
     precision: Option<usize>,
     left: bool,
 ) -> Result<(), ()> {
-    let mut length = unsafe { string_length(pointer, wide, bounded) };
-    if let Some(limit) = precision {
-        length = length.min(limit);
-    }
+    let length = unsafe { string_length(pointer, wide, bounded, precision) };
     emit_padded_units(output, position, length, width, left, |out, pos| {
         for index in 0..length {
             let unit = if pointer == 0 {
@@ -975,6 +979,15 @@ mod tests {
                 ]
             ),
             Ok(b"smss   Wi Win".to_vec())
+        );
+    }
+
+    #[test]
+    fn precision_limits_string_scan() {
+        let wide_without_nul = [b'O' as u16, b'K' as u16, b'!' as u16];
+        assert_eq!(
+            render(b"%.*S\0", &[2, wide_without_nul.as_ptr() as u64]),
+            Ok(b"OK".to_vec())
         );
     }
 

@@ -420,6 +420,19 @@ next implementation slice should decode and implement those native syscalls thro
 mechanisms, then continue the NPFS/RPC association investigation without service-name or
 executable-order fallbacks.
 
+Current desktop retry `.tmp/boot-printf-precision-desktop-20260811.log` restores a useful
+pre-SAS proof point after the ntdll formatter slice. ReactOS ntdll's printf core now honors string
+precision while measuring `%S`/`%s` data, so ReactOS `debugstr_wn` no longer scans past counted
+wide strings; local validation covered `cargo test -p nt-ntdll printf::tests` and
+`./scripts/build_ntdll_dll.sh`. The serialized desktop run reaches real `NtUserSwitchDesktop`
+background paint, starts services and LSASS, signals the LSA RPC server, and serves Winlogon's
+`Winlogon\Notify` registry enumeration through the mounted SOFTWARE hive. It does not yet reach
+SAS/profile/userinit/explorer: `ProfileList` opens, `userinit.exe` opens, and explorer spawns all
+remain zero. The active blocker is now before SAS, around Winlogon's notification DLL load and the
+subsequent native/registry progress; the next fix should be generic hosted-thread/native-syscall
+forward progress or real mapped registry copyout, not a profile, userinit, explorer, or paint
+fallback.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in
