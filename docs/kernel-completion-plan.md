@@ -131,6 +131,21 @@ fix the isolated service's memory/faultability; if it reaches `done` but the cal
 fix the executive-side SURT completion wait/multiplexing; if it never reaches `begin`, fix the
 request notification path. Do not add EventLog, SCM, process-launch, or shell-paint policy.
 
+Current scheduling-boundary slice (2026-08-11): `.tmp/run-desktop-lpc-broker-trace2-20260811.log`
+proved the `\ErrorLogPort` request did not reach `lpc_server_entry` at all: EventLog worker slot 1
+entered `NtCreatePort(\ErrorLogPort)`, the last broker trace was only `#93`, and no `begin` appeared
+for the new create request. The generic gap was a priority inversion introduced by the hosted-image
+runtime scaffolding: hosted user processes were assigned `100 + pi`, while isolated kernel service
+brokers were fixed at `100`, so later dynamic service processes could outrank the LPC broker they
+were synchronously calling. The repair removes the stale `pi`-derived hosted-process priority and
+runs internal isolated service brokers at priority `200`, below the rootserver executive (`255`) but
+above hosted ReactOS user mode (`100`). The uncommitted extra SURT wake latch was removed; the ring
+is back to its protocol-defined wake path. Local validation: `cargo fmt --all` and
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+Next serialized desktop proof should show `NtCreatePort(\ErrorLogPort)` reaching an LPC broker
+`begin`/`done`, then either EventLog/SCM progress toward explorer shell chrome or the next real
+mechanism gap.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in

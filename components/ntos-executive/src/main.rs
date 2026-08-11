@@ -11209,6 +11209,8 @@ unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
     pml4
 }
 
+const KERNEL_SERVICE_PRIORITY: u64 = 200;
+
 /// Spawn one isolated service component at `entry`, seeded with `seeds`.
 unsafe fn spawn_service(
     entry: unsafe extern "C" fn() -> !,
@@ -11250,7 +11252,7 @@ unsafe fn spawn_service(
     );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
-    let _ = tcb_set_priority(tcb, 100);
+    let _ = tcb_set_priority(tcb, KERNEL_SERVICE_PRIORITY);
     if let Err(e_sc) = attach_sched_context(tcb) {
         print_str(b"[thread-life] service SC attach failed tcb=0x");
         print_hex(tcb as u32);

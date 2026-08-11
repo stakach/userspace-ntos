@@ -88,7 +88,7 @@ struct HostedProcessAddressLayout {
     image_mirror_va: u64,
 }
 
-const HOSTED_PROCESS_PRIORITY_BASE: u64 = 100;
+const HOSTED_PROCESS_DEFAULT_PRIORITY: u64 = 100;
 const SMSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1074_0000;
 const CSRSS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1078_0000;
 const HOSTED_DYNAMIC_FIRST_PI: usize = 7;
@@ -256,7 +256,7 @@ fn runtime_for_image(
     };
     Ok(HostedProcessRuntime {
         pi: image.pi,
-        priority: HOSTED_PROCESS_PRIORITY_BASE + image.pi as u64,
+        priority: HOSTED_PROCESS_DEFAULT_PRIORITY,
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,
         heap_mirror_va: layout.heap_mirror_va,
