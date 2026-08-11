@@ -117,6 +117,20 @@ rechecks the completion ring. `NtCreatePort` also has bounded entry/exit tracing
 serialized run can prove whether EventLog's LPC port create returns or exposes the next generic LPC
 broker/object-manager boundary. No EventLog, SCM, userinit, explorer, or paint policy was added.
 
+Current service-frontier note (2026-08-11): serialized retry
+`.tmp/run-desktop-surt-client-timer-20260811.log` proves the desktop path now gets past the earlier
+userinit/explorer launch failures: `userinit.exe`, `explorer.exe`, and EventLog/SCM RPC/NPFS traffic
+are live. The new wall is narrower and generic: while EventLog worker slot 1 is servicing
+`NtCreatePort(\ErrorLogPort)`, the executive parks on the isolated LPC broker completion and later
+hosted user page faults accumulate without a final broker completion, gate report, or deadman line.
+The next slice adds bounded LPC service request/response tracing around the shared LPC/ALPC
+`PortCore` dispatch. The trace counter is stack-local inside the service entry because spawned
+services map the executive image read-only; service diagnostics must not mutate image-resident
+statics. The proof target is structural: if `\ErrorLogPort` reaches broker `begin` but not `done`,
+fix the isolated service's memory/faultability; if it reaches `done` but the caller does not resume,
+fix the executive-side SURT completion wait/multiplexing; if it never reaches `begin`, fix the
+request notification path. Do not add EventLog, SCM, process-launch, or shell-paint policy.
+
 Current retry note: `.tmp/run-desktop-long-explorer-frontier-20260811.log` did not reach
 `WlxActivateUserShell`; it exposed an earlier NPFS/RPC lifetime wall where terminating or cancelled
 threads could drop the executive waiter while leaving a retained npfs.sys IRP behind. The repair in
