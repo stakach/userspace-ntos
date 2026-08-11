@@ -982,6 +982,11 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((pp + 0x80) as *mut u64, SMSS_PARAMS_VA + 0x1000); // Environment
         let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
         let _ = page_map(copy_cap(env_frame), SMSS_PARAMS_VA + 0x1000, RW_NX, pml4);
+        // win32k reads PsGetCurrentProcess()->Peb->ProcessParameters while attached to the
+        // caller. Register the process parameters and environment alongside the PEB so those
+        // dereferences resolve to this process's real pages.
+        csrss_frame_put_at(pi, SMSS_PARAMS_VA, params, pp);
+        csrss_frame_put_at(pi, SMSS_PARAMS_VA + 0x1000, env_frame, env_scr);
         register_spawn_private_mapping(
             pi,
             SMSS_PARAMS_VA,

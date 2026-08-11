@@ -180,6 +180,30 @@ through the hosted driver's cancel routine instead of preserving stale pipe IRPs
 desktop validation should prove whether the DCE/RPC context-handle faults (`0x1c00001a`) disappear
 and whether the run returns to userinit/explorer shell activation.
 
+Callback-resume PEB slice (2026-08-11): the desktop retry now gets through the old null
+`EPROCESS.Peb->ProcessParameters` wall in winlogon's `NtUserProcessConnect`. Real client parameter
+and environment pages are registered with the hosted process frame registry, and win32k installs the
+client PEB into the selected dynamic EPROCESS while it is running in the fault-serviceable client
+dispatch path. The next wall was a rootserver-side `#GP` immediately after a real api7 user callback
+returned: the executive callback-resume path re-derived `TEB->ProcessEnvironmentBlock` from the
+hosted client TEB while running without a user fault handler. The repair keeps the PEB as recorded
+win32k process-context metadata and reuses that recorded value on callback resume without touching
+hosted user memory. The next serialized desktop proof should show api7 return completing
+`NtUserProcessConnect` and either progress to later explorer shell startup/chrome rendering or expose
+the next real win32k/user32 callback gap.
+
+Recorded-PEB validation (2026-08-11): `.tmp/run-desktop-recorded-peb-resume-20260811.log` proves the
+callback-resume repair. Win32k records the client PEB in its PID/TID-keyed process context during the
+fault-serviceable dispatch path and reuses that value when the executive resumes a parked callback
+component; the old rootserver-side `[#GP: no fault handler]` after api7 `NtCallbackReturn` is gone.
+The run reaches real `WlxActivateUserShell`, spawns `userinit.exe`, maps its GDI shared table, drives
+userinit win32k traffic, spawns `explorer.exe`, and explorer executes a long sequence of real win32k
+syscalls and user-callback returns. QEMU was terminated by the external timeout while a later dynamic
+`svchost.exe` was being admitted, before the harness printed a final framebuffer gate. The current
+frontier is therefore no longer winlogon/userinit/explorer launch; it is obtaining a stable final
+desktop/chrome proof from the later service/process wave and identifying any real blocked waiter if
+the watchdog stops forward progress.
+
 Completed boot-fix slice: `.tmp/boot-final-async-setevent-20260810-124334.log` rebuilt ntdll,
 the executive, rust-micro, and the disk image, then reached `[microtest done]` with QEMU exiting via
 the sentinel and the harness reporting `SUCCESS -- the ReactOS stack booted and the win32k desktop
@@ -3678,3 +3702,29 @@ before unrelated executive traffic monopolises the receive loop.
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Remaining validation: rebuild the executive/rootserver and run one serialized `./run.sh --desktop`
   to confirm the EventLog/SCM DCE/RPC context-handle fault moves forward.
+
+  Follow-up repair: `.tmp/run-headless-msgina-dialog-gate-20260811.log` exposed that the intended
+  retained-IRP cancel did not actually reach npfs. `NtCancelIoFile` found pending pipe waiters, but
+  `driver_launch::cancel_pending_file_irps` sent the private
+  `FSD_DISPATCH_CANCEL_PENDING_FILE` selector through the public IRP-major path, whose `u8` major
+  validation rejected it as `STATUS_INVALID_PARAMETER`. The cancel route now resolves the hosted
+  device binding and drives the owning component through `dispatch_irp_for_instance`, the same
+  generic private component transport used for unload, AddDevice, and interrupt delivery. Validation
+  so far: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `cargo test -p nt-io-manager cancel_thread -- --nocapture`, and
+  `cargo test -p nt-io-completion file -- --nocapture`. Remaining validation is one serialized
+  `./run.sh --desktop` boot to confirm the EventLog/SCM DCE/RPC context-handle path moves forward
+  and that retained pipe cancels no longer report `STATUS_INVALID_PARAMETER`.
+
+  Follow-up repair in progress: the next desktop/background-only retry moved past EventLog/SCM into
+  real `userinit.exe`, `explorer.exe`, and `rundll32.exe` GUI traffic, then retired win32k inside
+  `rundll32.exe` `NtUserCreateWindowEx`. The fault was in ReactOS win32k
+  `IntFixWindowCoordinates`: `PsGetCurrentProcess()->Peb` existed, but the selected `EPROCESS`
+  still pointed at the synthetic bootstrap PEB whose `ProcessParameters` was null. The fix keeps the
+  boundary dynamic: hosted process parameter/environment pages are now registered as per-client
+  frames, and win32k derives the real PEB VA from the dispatch caller's TEB when selecting the
+  PID/TID-keyed `EPROCESS`. Bootstrap/no-client contexts still get a self-consistent synthetic PEB,
+  but hosted GUI dispatches use the caller's attached PEB and `RTL_USER_PROCESS_PARAMETERS`. Next
+  validation: format/check, then one serialized desktop proof that the `rundll32`
+  `NtUserCreateWindowEx` wall disappears and explorer shell chrome keeps rendering.

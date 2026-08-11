@@ -3653,7 +3653,10 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
     check(
         b"exec_msgina_logon_dialog_created",
         WINLOGON_GDI_MAPPED.load(Ordering::Relaxed) != 0
-            && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) >= 2,
+            && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+            && WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed) == 0,
         passed,
     );
     print_str(b"[winlogon] IDD_LOGON correlation ready=");

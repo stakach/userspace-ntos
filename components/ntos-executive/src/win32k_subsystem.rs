@@ -4670,6 +4670,8 @@ static WIN32K_PROCESS_CTX_EPROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
 static WIN32K_PROCESS_CTX_W32PROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
+static WIN32K_PROCESS_CTX_CLIENT_PEB: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
+    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
 static WIN32K_PROCESS_CTX_TOKEN_AUTH: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
 static WIN32K_PROCESS_CTX_PRIMARY_TOKEN: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
@@ -4695,6 +4697,7 @@ static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_RESTORES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_PEB_INSTALLS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -5212,9 +5215,29 @@ unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64) {
+unsafe fn client_peb_from_teb(client_teb: u64) -> u64 {
+    if client_teb < 0x10000 {
+        return 0;
+    }
+    let peb = read_volatile((client_teb + TEB_PROCESS_ENVIRONMENT_BLOCK_OFF) as *const u64);
+    if peb < 0x10000 {
+        0
+    } else {
+        peb
+    }
+}
+
+unsafe fn record_process_client_peb(process_index: usize, client_peb: u64) {
+    if client_peb != 0 {
+        WIN32K_PROCESS_CTX_CLIENT_PEB[process_index].store(client_peb, Ordering::Relaxed);
+    }
+}
+
+unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64, client_peb: u64) {
     let q = eprocess + 0x900;
     let zstr = eprocess + 0xA00;
+    let synthetic_peb = eprocess + 0x800;
+    let synthetic_params = eprocess + 0xB00;
     write_volatile((eprocess + 0x20) as *mut u64, q);
     write_volatile((q + 0x80) as *mut u64, zstr);
     write_volatile(zstr as *mut u16, 0);
@@ -5222,8 +5245,27 @@ unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64) {
         (eprocess + EPROCESS_UNIQUE_PROCESS_ID_OFF) as *mut u64,
         process_id,
     );
-    if read_volatile((eprocess + EPROCESS_PEB_OFF) as *const u64) == 0 {
-        write_volatile((eprocess + EPROCESS_PEB_OFF) as *mut u64, eprocess + 0x800);
+    if client_peb != 0 {
+        let current = read_volatile((eprocess + EPROCESS_PEB_OFF) as *const u64);
+        if current != client_peb {
+            write_volatile((eprocess + EPROCESS_PEB_OFF) as *mut u64, client_peb);
+            let n = WIN32K_CLIENT_PEB_INSTALLS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[win32k-context] EPROCESS.Peb <- client PEB pid=");
+                print_u64(process_id);
+                print_str(b" peb=0x");
+                print_hex((client_peb >> 32) as u32);
+                print_hex(client_peb as u32);
+                print_str(b" params=<client>");
+                print_str(b"\n");
+            }
+        }
+    } else if read_volatile((eprocess + EPROCESS_PEB_OFF) as *const u64) == 0 {
+        write_volatile((eprocess + EPROCESS_PEB_OFF) as *mut u64, synthetic_peb);
+        write_volatile(
+            (synthetic_peb + PEB_PROCESS_PARAMETERS_OFF) as *mut u64,
+            synthetic_params,
+        );
     }
 }
 
@@ -5512,6 +5554,8 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     if client_teb != 0 {
         WIN32K_THREAD_CTX_TEB[thread_index].store(client_teb, Ordering::Relaxed);
     }
+    let recorded_client_peb = WIN32K_PROCESS_CTX_CLIENT_PEB[process_index].load(Ordering::Relaxed);
+    initialize_eprocess_body(eprocess, pid, recorded_client_peb);
     let Some(teb) = seed_win32k_callout_teb(thread_index) else {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
@@ -5605,7 +5649,12 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
     true
 }
 
-unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) -> Option<usize> {
+unsafe fn ensure_process_context(
+    pi: usize,
+    pid: u64,
+    supplied_eprocess: u64,
+    client_peb: u64,
+) -> Option<usize> {
     if pid == 0 {
         return None;
     }
@@ -5623,7 +5672,8 @@ unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) ->
             supplied_eprocess,
             WIN32K_EPROCESS_BYTES,
         )?;
-        initialize_eprocess_body(eprocess, pid);
+        record_process_client_peb(index, client_peb);
+        initialize_eprocess_body(eprocess, pid, client_peb);
         return Some(index);
     }
     for index in 0..WIN32K_GUI_PROCESS_CAP {
@@ -5635,7 +5685,8 @@ unsafe fn ensure_process_context(pi: usize, pid: u64, supplied_eprocess: u64) ->
             )?;
             WIN32K_PROCESS_CTX_PIDS[index].store(pid, Ordering::Relaxed);
             WIN32K_PROCESS_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
-            initialize_eprocess_body(eprocess, pid);
+            record_process_client_peb(index, client_peb);
+            initialize_eprocess_body(eprocess, pid, client_peb);
             return Some(index);
         }
     }
@@ -5760,7 +5811,9 @@ unsafe fn adopt_bootstrap_csrss_context(
 
     WIN32K_PROCESS_CTX_PIDS[process_index].store(pid, Ordering::Relaxed);
     WIN32K_PROCESS_CTX_PIS[process_index].store(pi as u64, Ordering::Relaxed);
-    initialize_eprocess_body(eprocess, pid);
+    let client_peb = client_peb_from_teb(teb);
+    record_process_client_peb(process_index, client_peb);
+    initialize_eprocess_body(eprocess, pid, client_peb);
     if !record_process_token_context(
         process_index,
         token_authentication_id,
@@ -5850,7 +5903,8 @@ unsafe fn select_win32k_client_context(
             return Some(adopted);
         }
     }
-    let process_index = ensure_process_context(pi, pid, supplied_eprocess)?;
+    let client_peb = client_peb_from_teb(client_teb);
+    let process_index = ensure_process_context(pi, pid, supplied_eprocess, client_peb)?;
     if !record_process_token_context(
         process_index,
         token_authentication_id,
@@ -5862,7 +5916,8 @@ unsafe fn select_win32k_client_context(
     let thread_index = ensure_thread_context(pi, pid, tid, client_teb, supplied_ethread)?;
     let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
     let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
-    initialize_eprocess_body(eprocess, pid);
+    record_process_client_peb(process_index, client_peb);
+    initialize_eprocess_body(eprocess, pid, client_peb);
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
     WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
@@ -9264,7 +9319,7 @@ unsafe fn setup_dispatch_context() {
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA); // bootstrap compatibility context
     write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
-    initialize_eprocess_body(eprocess, FAKE_PROCESS_HANDLE);
+    initialize_eprocess_body(eprocess, FAKE_PROCESS_HANDLE, 0);
 
     // win32k's IntCbAllocateMemory (callback.c:44) does
     // `InsertTailList(&W32Thread->W32CallbackListHead, &Mem->ListEntry)` in the desktop-init callback
@@ -9946,7 +10001,7 @@ unsafe fn establish_client_and_dispatch() {
 
     // EPROCESS.Peb must be non-null (the callout ASSERTs it — an `int 0x2c` otherwise). Point it at a
     // small zeroed sub-region of the EPROCESS page.
-    initialize_eprocess_body(eprocess, FAKE_PROCESS_HANDLE);
+    initialize_eprocess_body(eprocess, FAKE_PROCESS_HANDLE, 0);
 
     // Invoke win32k's process-create callout: W32pProcessCallout(PEPROCESS, BOOLEAN Initialize=TRUE).
     let callout = read_volatile(WIN32_CALLOUTS as *const u64);

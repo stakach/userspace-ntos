@@ -12609,15 +12609,32 @@ pub(crate) unsafe fn cancel_pending_file_irps(
     device_id: u64,
     file_id: u64,
 ) -> Result<u64, u32> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(STATUS_DEVICE_NOT_READY as u32)?;
+    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    };
+    if !inst.ready || inst.driver_id == 0 || binding.device_object == 0 {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    }
+    if io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .is_none()
+    {
+        return Err(STATUS_DEVICE_NOT_READY as u32);
+    }
     let mut out = [];
-    let (status, cancelled) = dispatch_irp_to_device_result(
-        device_id,
+    let (status, cancelled) = dispatch_irp_for_instance(
+        binding.instance,
         FSD_DISPATCH_CANCEL_PENDING_FILE,
+        0,
+        binding.device_object,
         0,
         file_id,
         &[],
         &mut out,
-    )?;
+    )
+    .ok_or(STATUS_DEVICE_NOT_READY as u32)?;
     if status == 0 {
         Ok(cancelled)
     } else {
