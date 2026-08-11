@@ -7139,6 +7139,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.context_continue_redirected = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.mutable_hives_dirty = false;
+                nt_handler.registry_services_order_cache_dirty = false;
                 nt_handler.hosted_exe_dirty = false;
                 nt_handler.token_dirty = false;
                 nt_handler.process_dirty = false;
@@ -7586,6 +7587,10 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 if nt_handler.mutable_hives_dirty {
                     nt_handler.mutable_hives_dirty = false;
+                    pin_durable_heap_mark(&mut heap_mark);
+                }
+                if nt_handler.registry_services_order_cache_dirty {
+                    nt_handler.registry_services_order_cache_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a

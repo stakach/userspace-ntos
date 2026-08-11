@@ -2027,6 +2027,7 @@ const ISR_DONE_BADGE: u64 = 0x80;
 const SYS_REPLY_RECV: i64 = -2;
 pub const SYS_NB_SEND_RECV: i64 = -3;
 pub const SYS_NB_RECV: i64 = -8;
+const SYS_REPLY_HANDOFF_MAGIC: u64 = 0x4e54_4f53_5245_5431;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
@@ -11697,6 +11698,32 @@ unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3:
         inout("r8") r1 => _,
         inout("r9") r2 => _,
         inout("r15") r3 => _,
+        in("r13") 0u64,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn reply_on_handoff(
+    reply_cptr: u64,
+    msginfo: u64,
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") reply_cptr => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") r0 => _,
+        inout("r8") r1 => _,
+        inout("r9") r2 => _,
+        inout("r15") r3 => _,
+        in("r13") SYS_REPLY_HANDOFF_MAGIC,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11721,7 +11748,7 @@ pub(crate) static CLIENT_REPLY_BOUND: AtomicU64 = AtomicU64::new(0);
 /// would be parsed as an `InvocationLabel` by `decode_invocation` and rejected before reaching
 /// `decode_reply` (migration correction 1).
 unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
-    let label = reply_on(reply_cptr, msginfo, r0, r1, r2, r3);
+    let label = reply_on_handoff(reply_cptr, msginfo, r0, r1, r2, r3);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if label != 0 && CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
         print_str(b"[client-reply] UNBOUND reply object cptr=");
@@ -16170,6 +16197,12 @@ struct ExecNtHandler {
     /// Set when a mutable hive create/value write allocates new key/value arena state above the
     /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
     mutable_hives_dirty: bool,
+    /// Cached indexed view of `HKLM\SYSTEM\CurrentControlSet\Services` in the order ReactOS SCM uses
+    /// while building its service database. The mounted hive remains the authority; this is only the
+    /// kernel-side enumeration index, invalidated by any mutable hive write and rebuilt on demand.
+    registry_services_order_cache: alloc::vec::Vec<alloc::string::String>,
+    registry_services_order_cache_valid: bool,
+    registry_services_order_cache_dirty: bool,
     /// Last successful mutable-hive value copyout to a hosted process. ReactOS `RegCopyTreeW`
     /// enumerates a source value into a process heap buffer, then calls `NtSetValueKey` with a data
     /// pointer into that same buffer. Keeping the source value identity here lets the Configuration

@@ -39,7 +39,6 @@ const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
 const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
 const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
-const REGISTRY_SERVICE_NAME_COPY_MAX: usize = 512;
 
 fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
     let timeout = if request.timeout_specified {
@@ -69,6 +68,7 @@ static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_NATIVE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_READBACK_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -585,6 +585,11 @@ fn trace_wait_object(
             print_str(b" name=\"");
             print_sanitized_ascii(entry.name(), 48);
             print_str(b"\"");
+            let mut full = [0u8; 192];
+            let full_len = handler.query_object_namespace_path(index, &mut full);
+            print_str(b" path=\"");
+            print_sanitized_ascii(&full[..full_len.min(full.len())], 192);
+            print_str(b"\"");
         }
         if let Some((kind, signaled)) = handler.events.query_existing(index as u64) {
             print_str(b" event=");
@@ -601,6 +606,66 @@ fn trace_wait_object(
             print_u64(maximum as u64);
         } else if handler.mutants.contains(index as u64) {
             print_str(b" mutant=1");
+        }
+    }
+    print_str(b"\n");
+}
+
+fn trace_named_event_object(
+    handler: &ExecNtHandler,
+    op: &[u8],
+    root_idx: usize,
+    requested_path: &[u8],
+    object_index: Option<usize>,
+    status: u32,
+    handle: u64,
+    existed: bool,
+) {
+    let n = NAMED_EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 256 {
+        return;
+    }
+    print_str(b"[named-event] #");
+    print_u64(n);
+    print_str(b" pi=");
+    print_u64(handler.pi as u64);
+    print_str(b" badge=");
+    print_u64(handler.current_badge);
+    print_str(b" tid=");
+    print_u64(handler.current_tid);
+    print_str(b" op=");
+    print_str(op);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" handle=0x");
+    print_hex_u64(handle);
+    print_str(b" existed=");
+    print_u64(existed as u64);
+    print_str(b" root=");
+    print_u64(root_idx as u64);
+    let mut root_path = [0u8; 192];
+    let root_len = handler.query_object_namespace_path(root_idx, &mut root_path);
+    print_str(b" root_path=\"");
+    print_sanitized_ascii(&root_path[..root_len.min(root_path.len())], 192);
+    print_str(b"\" request=\"");
+    print_sanitized_ascii(requested_path, 192);
+    print_str(b"\"");
+    if let Some(index) = object_index {
+        let mut full = [0u8; 192];
+        let full_len = handler.query_object_namespace_path(index, &mut full);
+        print_str(b" object=");
+        print_u64(index as u64);
+        print_str(b" path=\"");
+        print_sanitized_ascii(&full[..full_len.min(full.len())], 192);
+        print_str(b"\"");
+        if let Some((kind, signaled)) = handler.events.query_existing(index as u64) {
+            print_str(b" kind=");
+            print_str(match kind {
+                EventKind::Notification => b"notification",
+                EventKind::Synchronization => b"synchronization",
+            });
+            print_str(b" signaled=");
+            print_u64(signaled as u64);
         }
     }
     print_str(b"\n");
@@ -2063,6 +2128,12 @@ impl ExecNtHandler {
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hives_dirty, false);
         write_field!(
+            registry_services_order_cache,
+            alloc::vec::Vec::with_capacity(256)
+        );
+        write_field!(registry_services_order_cache_valid, false);
+        write_field!(registry_services_order_cache_dirty, false);
+        write_field!(
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
@@ -2375,7 +2446,7 @@ impl ExecNtHandler {
             print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
             return;
         }
-        self.mutable_hives_dirty = true;
+        self.mark_mutable_hives_dirty();
         print_str(
             b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned in mutable hive\n",
         );
@@ -2399,7 +2470,7 @@ impl ExecNtHandler {
         );
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
         if mask != 0 {
-            self.mutable_hives_dirty = true;
+            self.mark_mutable_hives_dirty();
             print_str(b"[shell-com] provisioned explorer HKCR classes mask=0x");
             print_hex(mask as u32);
             print_str(b" in mutable hive\n");
@@ -2416,7 +2487,7 @@ impl ExecNtHandler {
             print_str(b"[print-setup] ReactOS print setup not provisioned\n");
             return;
         }
-        self.mutable_hives_dirty = true;
+        self.mark_mutable_hives_dirty();
         print_str(b"[print-setup] HKLM\\SYSTEM print setup provisioned: root=");
         print_u64(stats.root_values as u64);
         print_str(b" env=");
@@ -2443,7 +2514,7 @@ impl ExecNtHandler {
             print_str(b"[profile-setup] default-user shell folders not provisioned\n");
             return;
         }
-        self.mutable_hives_dirty = true;
+        self.mark_mutable_hives_dirty();
         print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
         print_u64(stats.shell_folder_values as u64);
         print_str(b" User Shell Folders=");
@@ -2594,7 +2665,7 @@ impl ExecNtHandler {
             );
             return;
         }
-        self.mutable_hives_dirty = true;
+        self.mark_mutable_hives_dirty();
         DEFAULT_USER_LOCALE_BYTES.store(user_locale_len as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
         print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
@@ -2685,7 +2756,7 @@ impl ExecNtHandler {
         let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
         self.mutable_key_handles.push(Some(key));
         if grows_buffer {
-            self.mutable_hives_dirty = true;
+            self.mark_mutable_hives_dirty();
         }
         Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
     }
@@ -3513,7 +3584,7 @@ impl ExecNtHandler {
                 .mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
-        self.mutable_hives_dirty = true;
+        self.mark_mutable_hives_dirty();
         self.hive_mounts.push(HiveMount {
             sel: HIVE_SEL_DYNAMIC[slot],
             canon,
@@ -3797,7 +3868,7 @@ impl ExecNtHandler {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
         if self.mutable_hives.unmount(&mount.mount).is_some() {
-            self.mutable_hives_dirty = true;
+            self.mark_mutable_hives_dirty();
         }
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
@@ -3891,7 +3962,7 @@ impl ExecNtHandler {
                 .mutable_hives
                 .set_key_security_descriptor(key, descriptor)
             {
-                self.mutable_hives_dirty = true;
+                self.mark_mutable_hives_dirty();
                 return Ok(());
             }
             return Err(0xC000_0008);
@@ -4044,7 +4115,7 @@ impl ExecNtHandler {
             .mutable_hives
             .set_value(key, name, value_type, data.to_vec());
         if updated {
-            self.mutable_hives_dirty = true;
+            self.mark_mutable_hives_dirty();
         }
         updated
     }
@@ -4454,8 +4525,18 @@ impl ExecNtHandler {
         stats
     }
 
+    fn mark_mutable_hives_dirty(&mut self) {
+        self.mutable_hives_dirty = true;
+        self.invalidate_registry_services_order_cache();
+    }
+
+    fn invalidate_registry_services_order_cache(&mut self) {
+        self.registry_services_order_cache_valid = false;
+        self.registry_services_order_cache.clear();
+    }
+
     fn registry_subkey_by_index(
-        &self,
+        &mut self,
         target: KeyRef,
         requested_index: usize,
     ) -> Option<alloc::string::String> {
@@ -4547,26 +4628,34 @@ impl ExecNtHandler {
     }
 
     fn registry_ordered_service_subkey_by_index(
-        &self,
+        &mut self,
         requested_index: usize,
     ) -> Option<alloc::string::String> {
-        let heap_mark = allocator::mark();
-        let mut name_buf = [0u8; REGISTRY_SERVICE_NAME_COPY_MAX];
-        let selected_len =
-            self.registry_ordered_service_subkey_copy(requested_index, &mut name_buf);
-        unsafe { allocator::reset_to(heap_mark) };
-        let selected_len = selected_len?;
-        alloc::string::String::from_utf8(alloc::vec::Vec::from(&name_buf[..selected_len])).ok()
+        if !self.registry_services_order_cache_valid
+            && !self.rebuild_registry_services_order_cache()
+        {
+            return None;
+        }
+        self.registry_services_order_cache
+            .get(requested_index)
+            .cloned()
     }
 
-    fn registry_ordered_service_subkey_copy(
-        &self,
-        requested_index: usize,
-        out: &mut [u8],
-    ) -> Option<usize> {
-        let services_key = self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)?;
-        let hive = self.mutable_hives.hive(services_key.hive)?;
-        let mut entries = alloc::vec::Vec::new();
+    fn rebuild_registry_services_order_cache(&mut self) -> bool {
+        let Some(services_key) = self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)
+        else {
+            self.registry_services_order_cache.clear();
+            self.registry_services_order_cache_valid = true;
+            self.registry_services_order_cache_dirty = true;
+            return true;
+        };
+        let Some(hive) = self.mutable_hives.hive(services_key.hive) else {
+            self.registry_services_order_cache.clear();
+            self.registry_services_order_cache_valid = true;
+            self.registry_services_order_cache_dirty = true;
+            return true;
+        };
+        let mut entries = alloc::vec::Vec::with_capacity(hive.subkey_count(services_key.key));
         for index in 0..hive.subkey_count(services_key.key) {
             let Some(name) = hive.subkey_name_by_index(services_key.key, index) else {
                 continue;
@@ -4584,13 +4673,13 @@ impl ExecNtHandler {
         }
         let group_order = Self::hive_service_group_order(hive);
         nt_config_manager::sort_service_database_order_entries(&mut entries, &group_order);
-        let selected = entries.get(requested_index)?;
-        let bytes = selected.name.as_bytes();
-        if bytes.len() > out.len() {
-            return None;
+        self.registry_services_order_cache.clear();
+        for entry in entries {
+            self.registry_services_order_cache.push(entry.name);
         }
-        out[..bytes.len()].copy_from_slice(bytes);
-        Some(bytes.len())
+        self.registry_services_order_cache_valid = true;
+        self.registry_services_order_cache_dirty = true;
+        true
     }
 
     fn hive_service_group_order(
@@ -12179,6 +12268,30 @@ impl ExecNtHandler {
         true
     }
 
+    fn read_user_i64(&self, va: u64) -> Result<i64, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        if va == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let mut bytes = [0u8; 8];
+        if !unsafe { self.xas_read(va, &mut bytes) } {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn wait_timeout_due(&self, timeout_ptr: u64) -> Result<Option<nt_delay_execution::Due>, u32> {
+        if timeout_ptr == 0 {
+            return Ok(None);
+        }
+        let interval = self.read_user_i64(timeout_ptr)?;
+        Ok(Some(nt_delay_execution::due_time(
+            interval,
+            monotonic_time_100ns(),
+            nt_system_time_100ns(),
+        )))
+    }
+
     unsafe fn current_image_protection_for_page(&self, ctx: ExecLoopCtx, page: u64) -> Option<u32> {
         if page >= PE_LOAD_BASE && page < ctx.img_end {
             return Some(image_page_protection(&*ctx.pe, PE_LOAD_BASE, page));
@@ -15945,13 +16058,12 @@ impl ExecNtHandler {
         // anything else parks the caller on the object's EventsPresent dispatcher event, so the
         // queue-side signal wakes it through the ordinary wait machinery.
         let timeout_ptr = args[2];
-        if timeout_ptr != 0 {
-            let interval = smss_stack_read(timeout_ptr) as i64;
-            match nt_delay_execution::due_time(
-                interval,
-                monotonic_time_100ns(),
-                nt_system_time_100ns(),
-            ) {
+        let due = match self.wait_timeout_due(timeout_ptr) {
+            Ok(due) => due,
+            Err(status) => return status,
+        };
+        if let Some(due) = due {
+            match due {
                 nt_delay_execution::Due::Immediate => return 0x102,
                 nt_delay_execution::Due::Monotonic100ns(deadline) => {
                     self.wait_deadline_100ns = deadline;
@@ -16846,7 +16958,7 @@ impl ExecNtHandler {
                             return 0xC000_0008;
                         }
                     }
-                    self.mutable_hives_dirty = true;
+                    self.mark_mutable_hives_dirty();
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
                     // boot paths.
@@ -17157,7 +17269,7 @@ impl ExecNtHandler {
                             false
                         };
                         if shared_installed {
-                            self.mutable_hives_dirty = true;
+                            self.mark_mutable_hives_dirty();
                             return 0;
                         }
                     }
@@ -17180,7 +17292,7 @@ impl ExecNtHandler {
                     ) {
                         return 0xC000_0008;
                     }
-                    self.mutable_hives_dirty = true;
+                    self.mark_mutable_hives_dirty();
                     return 0;
                 }
                 let Some(staged) = data_view else {
@@ -17300,7 +17412,7 @@ impl ExecNtHandler {
                                     self.overlay_dirty = true;
                                 }
                             }
-                            self.mutable_hives_dirty = true;
+                            self.mark_mutable_hives_dirty();
                             return 0;
                         }
                         Err(nt_hive_core::DeleteKeyError::CannotDelete) => {
@@ -17331,7 +17443,7 @@ impl ExecNtHandler {
                     if !self.mutable_hives.delete_value(mutable_key, &name) {
                         return 0xC000_0008;
                     }
-                    self.mutable_hives_dirty = true;
+                    self.mark_mutable_hives_dirty();
                     return 0;
                 }
                 if overlay_key_idx(key).is_some() {
@@ -19483,9 +19595,29 @@ impl ExecNtHandler {
                             }
                             SERVICES_NAMED_EVENTS.fetch_add(1, Ordering::Relaxed);
                             let status = if existed { 0x4000_0000 } else { 0 };
+                            trace_named_event_object(
+                                self,
+                                b"create",
+                                root_idx,
+                                path,
+                                Some(i),
+                                status,
+                                event_handle,
+                                existed,
+                            );
                             status // STATUS_OBJECT_NAME_EXISTS : SUCCESS
                         }
                         None => {
+                            trace_named_event_object(
+                                self,
+                                b"create-fail",
+                                root_idx,
+                                path,
+                                None,
+                                0xC000_009A,
+                                0,
+                                false,
+                            );
                             0xC000_009A
                         }
                     }
@@ -19626,6 +19758,20 @@ impl ExecNtHandler {
                         if self.obj_ns[index].name() == b"lsa_rpc_server_active" {
                             LSA_RPC_SERVER_ACTIVE_SIGNALLED.store(1, Ordering::Relaxed);
                         }
+                        if self.obj_ns[index].parent != OBJ_PARENT_ANONYMOUS {
+                            let root_idx = self.obj_ns[index].parent;
+                            let path = self.obj_ns[index].name();
+                            trace_named_event_object(
+                                self,
+                                b"set",
+                                root_idx,
+                                path,
+                                Some(index),
+                                0,
+                                args[0],
+                                true,
+                            );
+                        }
                         // SAFETY: native dispatch is serialized; the signal and waiter selection
                         // are one executive transition.
                         if !previous {
@@ -19679,8 +19825,28 @@ impl ExecNtHandler {
                         self.close_current_handle(event_handle);
                         return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                     }
+                    trace_named_event_object(
+                        self,
+                        b"open",
+                        root_idx,
+                        path,
+                        Some(i),
+                        0,
+                        event_handle,
+                        true,
+                    );
                     return 0;
                 }
+                trace_named_event_object(
+                    self,
+                    b"open-miss",
+                    root_idx,
+                    path,
+                    None,
+                    0xC000_0034,
+                    0,
+                    false,
+                );
                 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
             },
             NativeService::NtCreateTimer => unsafe {
@@ -20336,11 +20502,11 @@ impl ExecNtHandler {
                     print_str(b" -> WAKE one\n");
                     0
                 } else if timeout_ptr != 0 {
-                    let interval = smss_stack_read(timeout_ptr) as i64;
-                    if interval == 0 {
-                        0x102
-                    } else {
-                        0xC000_0002
+                    match self.wait_timeout_due(timeout_ptr) {
+                        Ok(Some(nt_delay_execution::Due::Immediate)) => 0x102,
+                        Ok(Some(nt_delay_execution::Due::Monotonic100ns(_))) => 0xC000_0002,
+                        Ok(None) => 0xC000_0002,
+                        Err(status) => status,
                     }
                 } else if keyed_release_remember_pending(key) {
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
@@ -20365,13 +20531,12 @@ impl ExecNtHandler {
                     print_str(b" -> CONSUME pending release\n");
                     return 0;
                 }
-                if timeout_ptr != 0 {
-                    let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
-                    match nt_delay_execution::due_time(
-                        interval,
-                        monotonic_time_100ns(),
-                        nt_system_time_100ns(),
-                    ) {
+        let due = match self.wait_timeout_due(timeout_ptr) {
+                    Ok(due) => due,
+                    Err(status) => return status,
+                };
+                if let Some(due) = due {
+                    match due {
                         nt_delay_execution::Due::Immediate => return 0x102,
                         nt_delay_execution::Due::Monotonic100ns(deadline) => {
                             self.keyed_wait_deadline_100ns = deadline;
@@ -21292,13 +21457,12 @@ impl ExecNtHandler {
                             self.wait_object_consume(object);
                             return 0;
                         }
-                        if timeout_ptr != 0 {
-                            let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
-                            match nt_delay_execution::due_time(
-                                interval,
-                                monotonic_time_100ns(),
-                                nt_system_time_100ns(),
-                            ) {
+                        let due = match self.wait_timeout_due(timeout_ptr) {
+                            Ok(due) => due,
+                            Err(status) => return status,
+                        };
+                        if let Some(due) = due {
+                            match due {
                                 nt_delay_execution::Due::Immediate => {
                                     trace_wait_object(
                                         self,

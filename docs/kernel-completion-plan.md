@@ -3279,3 +3279,17 @@ before unrelated executive traffic monopolises the receive loop.
   activity, with IO completion removers and LSASS RPC worker traffic visible; continue by fixing the
   next generic kernel mechanism shown in the boot log, not by restoring executable, service, message,
   or paint scaffolding.
+
+- SCM service-database enumeration cache. ReactOS SCM enumerates
+  `HKLM\SYSTEM\CurrentControlSet\Services` in registry order while constructing the service
+  database. The mounted SYSTEM hive is now still the authority, but the executive keeps one
+  invalidated-on-write indexed view of that Services subkey order instead of rebuilding and sorting
+  the entire service list for every `NtEnumerateKey(index)`. This removes the quadratic pre-listener
+  wall without adding service-name or executable-order policy. Serialized retry
+  `.tmp/boot-wait-timeout-xas-desktop-20260811.log` reaches `[microtest done]`, keeps genuine base
+  desktop paint green (`exec_win32k_desktop_painted`, `desktop-bg 768/768`), shows winlogon and
+  services sharing `\BaseNamedObjects\SvcctrlStartEvent_A3752DX`, and shows services reach
+  `CheckSetup()` and create `SC_AutoStartComplete`. Review adjustment: the current blocker is now the
+  generic SCM runtime/listener path, with `exec_svc_rpc_listener_multiplex` still red and userinit /
+  explorer naturally absent. Next work should inspect the services syscall/thread sequence after
+  `CheckSetup()` and fix the real SCM RPC listener or wait/reply mechanism it exposes.
