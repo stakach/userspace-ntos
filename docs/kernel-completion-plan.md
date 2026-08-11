@@ -74,6 +74,21 @@ and `shared-dup=0`. The remaining red gates are structural accounting/reclaim ta
 desktop frontier is therefore no longer shell launch or paint scaffolding; the next target is generic
 process/view/image teardown and frame/CSlot reclaim under the live service wave.
 
+Current process-lifetime reclaim slice (2026-08-12): final `NtTerminateProcess` teardown now runs a
+generic process VM reclaim pass. It writes back and drops generic mapped-section views for the
+terminating process, clears DLL mapped-view flags through a host-tested `nt-dll-registry`
+`clear_mapped_for_pi` API, unmaps per-process shared-image mapping caps, drains all registered
+per-process frame records into the reusable frame pool or root-slot recycler, resets the private VAD
+and committed-mapping tables, deletes private VAD page-table caps, clears KUSER/vspace publication
+for the dead process, and prints one `[process-term]` reclaim census. The first
+`NtTerminateProcess(NULL, ...)` shutdown phase is intentionally unchanged so the current thread can
+return through user-mode unload/notify. Local validation is green: `cargo test -p nt-dll-registry`,
+`cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof should show nonzero
+`vm-frames`, `shared-maps`, `dll-views`, or `private-pts` on real process exit without regressing
+Explorer desktop/icon paint; remaining root untyped headroom still needs total fresh-retype
+reduction, not gate relaxation.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.

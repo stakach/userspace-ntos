@@ -402,6 +402,23 @@ impl Registry {
         was_mapped
     }
 
+    /// Clear every mapped-view flag owned by process `pi`, returning the number of views that were
+    /// live before the clear. Process teardown uses this after the executive has torn down the
+    /// effectful page mappings.
+    pub fn clear_mapped_for_pi(&mut self, pi: usize) -> usize {
+        let mut cleared = 0;
+        for d in &mut self.dlls {
+            let Some(slot) = d.mapped_by_pi.get_mut(pi) else {
+                continue;
+            };
+            if *slot != 0 {
+                *slot = 0;
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
     /// True once DLL `i` has been mapped into process `pi`.
     pub fn is_mapped(&self, pi: usize, i: usize) -> bool {
         self.dlls
@@ -770,6 +787,23 @@ mod tests {
         assert!(r.clear_mapped(1, 1));
         assert_eq!(r.dll_for_page(1, basesrv_base), None);
         assert!(!r.clear_mapped(1, 1));
+    }
+
+    #[test]
+    fn clear_mapped_for_pi_only_clears_that_process() {
+        let mut r = seeded();
+        let basesrv_base = r.base(1);
+        let winsrv_base = r.base(2);
+
+        assert!(r.set_mapped(1, 1));
+        assert!(r.set_mapped(1, 2));
+        assert!(r.set_mapped(2, 2));
+
+        assert_eq!(r.clear_mapped_for_pi(1), 2);
+        assert_eq!(r.dll_for_page(1, basesrv_base), None);
+        assert_eq!(r.dll_for_page(1, winsrv_base), None);
+        assert_eq!(r.dll_for_page(2, winsrv_base), Some((2, 0)));
+        assert_eq!(r.clear_mapped_for_pi(1), 0);
     }
 
     #[test]

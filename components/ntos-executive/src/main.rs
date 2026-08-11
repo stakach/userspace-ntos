@@ -1763,6 +1763,13 @@ impl GenericSectionTable {
         None
     }
 
+    pub(crate) fn first_view_for_process(&self, pi: usize) -> Option<GenericSectionView> {
+        self.views
+            .iter()
+            .copied()
+            .find(|view| view.live && view.pi == pi)
+    }
+
     pub(crate) fn view_for_page(
         &self,
         pi: usize,
@@ -7197,6 +7204,41 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
     }
     dropped
 }
+
+pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
+    let mut dropped = 0u64;
+    loop {
+        let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
+        let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+        let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
+        let mut page = 0u64;
+        for index in 0..n {
+            if core::ptr::read(pis.add(index)) as u64 == pi {
+                page = core::ptr::read(vas.add(index));
+                break;
+            }
+        }
+        if page == 0 {
+            break;
+        }
+        detach_win32k_attached_page_for_thread_release(pi as usize, page);
+        while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
+            if owns_frame {
+                vm_frame_release(frame, alias_cap);
+            } else {
+                recycle_mapped_cap(frame);
+                if alias_cap != frame {
+                    recycle_mapped_cap(alias_cap);
+                }
+            }
+            if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
+                recycle_plain_cap(source_cap);
+            }
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    dropped
+}
 /// Exact per-process frame lookup. Unlike `csrss_frame_get`, this never falls back to the shared
 /// executable-page cache, which is important when deciding whether a writable client page has a
 /// persistent private backing frame.
@@ -7556,6 +7598,26 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
             index += 1;
         }
     }
+}
+
+unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
+    let Some(table) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPINGS)).as_mut() else {
+        return 0;
+    };
+    let mut index = 0usize;
+    let mut removed = 0u64;
+    while index < table.len() {
+        let mapping = table[index];
+        if mapping.pi as u64 == pi {
+            let map_cap = table.swap_remove(index).map_cap;
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+            removed = removed.saturating_add(1);
+        } else {
+            index += 1;
+        }
+    }
+    removed
 }
 
 const CLIENT_COPYIN_FRAME_CAP: usize = 256;
@@ -9733,6 +9795,31 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
     } else {
         let _ = cnode_delete_recycle_r(frame);
     }
+}
+
+unsafe fn process_private_pt_caps_release(pi: usize) -> (u64, u64) {
+    if pi >= MAX_PI {
+        return (0, 0);
+    }
+    let caps = core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS) as *mut [u64; PRIVATE_VM_PT_COUNT];
+    let slots = (*caps.add(pi)).as_mut_ptr();
+    let mut released = 0u64;
+    let mut failed = 0u64;
+    for index in 0..PRIVATE_VM_PT_COUNT {
+        let slot = slots.add(index);
+        let cap = core::ptr::read(slot);
+        if cap == 0 {
+            continue;
+        }
+        let status = cnode_delete_recycle_r(cap);
+        if status == 0 {
+            core::ptr::write(slot, 0);
+            released = released.saturating_add(1);
+        } else {
+            failed = failed.saturating_add(1);
+        }
+    }
+    (released, failed)
 }
 
 fn heap_mirror_for_pi(pi: usize) -> u64 {
@@ -13173,6 +13260,89 @@ unsafe fn terminate_hosted_thread_mechanism(
     } else {
         false
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessVmReclaimStats {
+    generic_views: u64,
+    generic_writeback_failures: u64,
+    dll_views: u64,
+    shared_image_maps: u64,
+    registered_frames: u64,
+    private_pts: u64,
+    private_pt_failures: u64,
+}
+
+unsafe fn reclaim_final_process_vm(process_index: u8, handler: &mut ExecNtHandler) -> ProcessVmReclaimStats {
+    let pi = process_index as usize;
+    if pi >= MAX_PI {
+        return ProcessVmReclaimStats::default();
+    }
+
+    let mut stats = ProcessVmReclaimStats::default();
+    if let Some(ctx) = handler.loop_ctx {
+        let generic_sections = &mut *ctx.generic_sections;
+        while let Some(view) = generic_sections.first_view_for_process(pi) {
+            match crate::service_sec_image::service_generic_section_writeback_view(
+                generic_sections,
+                view,
+                ctx.scratch_base,
+            ) {
+                Ok(bytes) => {
+                    if bytes != 0 {
+                        handler.writable_fs_dirty = true;
+                    }
+                }
+                Err(status) => {
+                    stats.generic_writeback_failures =
+                        stats.generic_writeback_failures.saturating_add(1);
+                    print_str(b"[process-vm-reclaim] mapped-section writeback failed pi=");
+                    print_u64(pi as u64);
+                    print_str(b" base=0x");
+                    print_hex((view.base >> 32) as u32);
+                    print_hex(view.base as u32);
+                    print_str(b" size=0x");
+                    print_hex((view.size >> 32) as u32);
+                    print_hex(view.size as u32);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+            }
+            let _ = generic_sections.unmap_view(pi, view.base);
+            stats.generic_views = stats.generic_views.saturating_add(1);
+        }
+
+        stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
+        if pi < MAX_PI {
+            let dll_pd_created = &mut *ctx.dll_pd_created;
+            dll_pd_created[pi] = false;
+            let dll_pt_bits = &mut *ctx.dll_pt_bits;
+            for word in dll_pt_bits[pi].iter_mut() {
+                *word = 0;
+            }
+            let procs = &mut *ctx.procs;
+            procs[pi] = ProcExec::empty();
+        }
+    }
+
+    stats.shared_image_maps = shared_image_mapping_unmap_process(pi as u64);
+    stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
+    process_committed_mapping_reset(pi);
+    let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
+    core::ptr::write(
+        vm_maps.add(pi),
+        nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
+    );
+    let (private_pts, private_pt_failures) = process_private_pt_caps_release(pi);
+    stats.private_pts = private_pts;
+    stats.private_pt_failures = private_pt_failures;
+    KUSER_PAGE_ALIAS[pi].store(0, Ordering::Release);
+    if let Some(slot) = handler.process_vspaces.get_mut(pi) {
+        *slot = 0;
+    }
+    stats
 }
 
 unsafe fn terminate_hosted_process_mechanisms(

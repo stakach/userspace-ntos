@@ -7739,7 +7739,13 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             false
                         };
-                        if drop_reply || current_tid == 0 {
+                        let final_process_teardown = drop_reply || current_tid == 0;
+                        let vm_reclaim = if final_process_teardown {
+                            reclaim_final_process_vm(process_index, &mut nt_handler)
+                        } else {
+                            ProcessVmReclaimStats::default()
+                        };
+                        if final_process_teardown {
                             let _ = win32k_glue::unwind_dead_client_user_callbacks(
                                 process_index as u32,
                             );
@@ -7763,6 +7769,20 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(reclaimed as u64);
                         print_str(b" current-deleted=");
                         print_u64(current_deleted as u64);
+                        print_str(b" vm-frames=");
+                        print_u64(vm_reclaim.registered_frames);
+                        print_str(b" shared-maps=");
+                        print_u64(vm_reclaim.shared_image_maps);
+                        print_str(b" dll-views=");
+                        print_u64(vm_reclaim.dll_views);
+                        print_str(b" section-views=");
+                        print_u64(vm_reclaim.generic_views);
+                        print_str(b" section-writeback-fails=");
+                        print_u64(vm_reclaim.generic_writeback_failures);
+                        print_str(b" private-pts=");
+                        print_u64(vm_reclaim.private_pts);
+                        print_str(b"/");
+                        print_u64(vm_reclaim.private_pt_failures);
                         print_str(b"\n");
                         if drop_reply {
                             procs[pi].faults = faults;
