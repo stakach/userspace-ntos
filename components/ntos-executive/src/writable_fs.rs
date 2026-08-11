@@ -17,11 +17,11 @@
 //!
 //! ## The seam
 //!
-//! * **Namespace.** A path belongs to the writable volume iff its canonical volume-relative form
-//!   (the SAME [`nt_fs::nt_path_to_volume_relative`] canonicalisation the read-only reader uses) is
-//!   at or under one of [`WRITABLE_PREFIXES`]. That is the general "writable mount at prefix P"
-//!   mechanism ([`nt_fs::writable_mount_relative`]) — adding a writable subtree is one entry in
-//!   that table, not a new code path, and nothing outside those prefixes changes behaviour.
+//! * **Namespace.** Some subtrees are prefix-owned by the writable volume: their canonical
+//!   volume-relative form (the same [`nt_fs::nt_path_to_volume_relative`] canonicalisation the
+//!   read-only reader uses) is at or under one of [`WRITABLE_PREFIXES`]. Other fixed-drive paths can
+//!   still acquire real writable-layer entries when user mode creates them, while installed files
+//!   remain sourced from the read-only FAT image until they are actually written.
 //! * **Backing.** [`nt_fs::MemFs`] behind the [`nt_fs::FileSystem`] `Zw*` facade — RAM-backed and
 //!   therefore **not persistent across boots**, which is a deliberate, user-approved staging step.
 //!   Persisting these writes through to FAT32 is a separate, tracked milestone; when it lands only
@@ -419,6 +419,16 @@ pub(crate) fn writable_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
     nt_fs::writable_mount_relative(name, b"reactos", WRITABLE_PREFIXES)
 }
 
+/// Classify an NT object name into the local fixed C: volume. Unlike [`writable_path`], this does
+/// not claim prefix ownership; callers use it for the writable layer of the same installed volume,
+/// while read-only FAT stays the source for installed files that have no writable-layer entry.
+pub(crate) fn volume_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
+    if !WRITABLE_OVERLAY_MOUNTED {
+        return None;
+    }
+    nt_fs::nt_path_to_volume_relative(name, b"reactos")
+}
+
 pub(crate) fn writable_path_into(
     name: &[u16],
     folded: &mut [u8],
@@ -481,6 +491,63 @@ pub(crate) unsafe fn query_attributes_relative(
     let info = fs.query_attributes_relative(relative)?;
     OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
     Some(info)
+}
+
+/// Query an existing writable-layer entry without mounting the writable volume. This is used by
+/// fixed-drive union paths: an existing writable entry wins, but a missing writable entry must leave
+/// the installed read-only FAT namespace visible.
+pub(crate) unsafe fn query_attributes_relative_if_mounted(
+    relative: &[u8],
+) -> Option<nt_fs::StandardInformation> {
+    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
+        return None;
+    };
+    OVERLAY_ATTR_QUERIES.fetch_add(1, Ordering::Relaxed);
+    let info = fs.query_attributes_relative(relative)?;
+    OVERLAY_ATTR_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(info)
+}
+
+/// Open an existing writable-layer entry without mounting the writable volume. Missing entries are
+/// reported as `None` so the caller can continue resolving against the installed read-only source.
+pub(crate) unsafe fn open_existing_relative_if_mounted(
+    relative: &[u8],
+    desired_access: u32,
+    file_attributes: u32,
+    share_access: u32,
+    options: u32,
+) -> (u32, Option<u64>, u64) {
+    let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() else {
+        return (nt_fs::STATUS_OBJECT_NAME_NOT_FOUND, None, 0);
+    };
+    let result = fs.zw_create_file_relative(
+        relative,
+        desired_access,
+        file_attributes,
+        share_access,
+        nt_fs::FILE_OPEN,
+        options,
+    );
+    if result.status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_OPENS.fetch_add(1, Ordering::Relaxed);
+        (
+            result.status,
+            Some(result.handle),
+            result.information as u64,
+        )
+    } else {
+        (result.status, None, 0)
+    }
+}
+
+/// Provision a writable-layer directory by already-folded volume-relative path. This is not a
+/// syscall success path; it materializes directory objects that the installed read-only image proves
+/// exist so later creates can allocate children in the writable layer.
+pub(crate) unsafe fn provision_directory_relative(relative: &[u8]) -> bool {
+    let Some(fs) = writable_fs() else {
+        return false;
+    };
+    fs.provision_directory_relative(relative)
 }
 
 /// `NtReadFile` on a writable-volume file object.

@@ -165,6 +165,11 @@ fn local_nt_paths_resolve_to_the_fat_volume() {
         b"reactos"
     );
     assert_eq!(
+        nt_path_to_volume_relative(&utf16(r"\??\C:\Program Files\Common Files"), b"reactos")
+            .unwrap(),
+        b"program files\\common files"
+    );
+    assert_eq!(
         nt_path_to_volume_relative(&utf16(r"\??\C:\"), b"reactos").unwrap(),
         b""
     );
@@ -723,6 +728,9 @@ fn writable_mount_covers_a_prefix_subtree_only() {
     assert!(
         writable_mount_relative(&wide(r"\??\C:\Windows\system.ini"), b"reactos", PREFIXES)
             .is_none()
+    );
+    assert!(
+        writable_mount_relative(&wide(r"\??\C:\Program Files"), b"reactos", PREFIXES).is_none()
     );
     assert!(writable_mount_relative(
         &wide(r"\SystemRoot\system32\ntdll.dll"),

@@ -3784,5 +3784,27 @@ before unrelated executive traffic monopolises the receive loop.
   `cargo test -p nt-syscall -- --nocapture`, `cargo test -p nt-syscall-abi -- --nocapture`,
   `cargo test -p nt-ntdll trap -- --nocapture`, `./scripts/build_ntdll_dll.sh`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
-  and `git diff --check`. Remaining validation is a serialized desktop retry to confirm
-  `kbswitch.exe` moves past SSN `0x96` and exposes the next real service/filesystem gap.
+  and `git diff --check`. Serialized retry `.tmp/run-desktop-ui-language-20260811.log` confirmed
+  the repair: `kbswitch.exe` moves past SSN `0x96`, issues real win32k calls, and the screen reaches
+  genuine Explorer shell chrome. Screenshot proof is
+  `.tmp/run-desktop-ui-language-20260811.png` with desktop icons and the Start/taskbar visible.
+
+  Fixed-drive writable-layer slice completed: the same UI-language retry exposed the next generic
+  filesystem miss, `NtCreateFile("\??\C:\Program Files") -> STATUS_NOT_IMPLEMENTED`, while a ReactOS
+  setup/helper path was trying to create the installed application directory. The repair is not a new
+  named prefix or process-specific path. Prefix-owned writable paths (`Profiles`,
+  `reactos\system32\config`) remain authoritative, while any valid local fixed-drive path can acquire
+  a real writable-layer entry on create/write. Existing writable entries win on later opens and
+  attribute queries; installed files with no writable entry remain sourced from the read-only FAT
+  image. Local validation is green: `cargo fmt --all`, `cargo test -p nt-fs -- --nocapture`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `git diff --check`. Serialized visible retry
+  `.tmp/run-desktop-program-files-20260811.log` confirms the `Program Files` miss is gone: there is
+  no unsupported fixed-drive namespace failure, the writable overlay mounts and materialises the real
+  `Profiles` source (`dirs=45 files=32 bytes=135989`), winlogon creates the Administrator profile
+  tree through ordinary `NtCreateFile`, `NtLoadKey` mounts
+  `\Registry\User\S-1-5-21-1775002603-20693388-2146334011-500` from
+  `\??\C:\Profiles\Administrator\ntuser.dat`, and dynamic EventLog/SCM process launch reaches
+  `eventlog.exe` plus `svchost.exe`. QEMU was externally terminated before
+  `WlxActivateUserShell`/userinit/explorer, so the next frontier is the post-profile shell handoff
+  after normal service/profile work, not a `Program Files` or profile-staging miss.

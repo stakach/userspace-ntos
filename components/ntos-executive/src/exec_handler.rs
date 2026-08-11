@@ -6452,6 +6452,43 @@ impl ExecNtHandler {
             .and_then(|path| unsafe { exec_fs().and_then(|fs| fat_open_path(&fs, &path)) })
     }
 
+    fn readonly_volume_entry(name16: &[u16]) -> Option<(u32, u32, u8)> {
+        let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
+        unsafe {
+            let fs = exec_fs()?;
+            if path.is_empty() {
+                Some((fs.root_cl, 0, 0x10))
+            } else {
+                fat_open_path_entry(&fs, &path)
+            }
+        }
+    }
+
+    fn readonly_volume_relative_is_dir(relative: &[u8]) -> bool {
+        unsafe {
+            let Some(fs) = exec_fs() else {
+                return false;
+            };
+            if relative.is_empty() {
+                return true;
+            }
+            fat_open_path_entry(&fs, relative).is_some_and(|(_, _, attributes)| {
+                attributes & 0x10 != 0
+            })
+        }
+    }
+
+    fn volume_relative_parent(relative: &[u8]) -> Option<&[u8]> {
+        let trimmed = relative.strip_suffix(b"\\").unwrap_or(relative);
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(match trimmed.iter().rposition(|byte| *byte == b'\\') {
+            Some(index) => &trimmed[..index],
+            None => &[],
+        })
+    }
+
     fn readonly_disk_open_miss_status(name16: &[u16]) -> Option<u32> {
         let path = nt_fs::nt_path_to_volume_relative(name16, b"reactos")?;
         let fs = unsafe { exec_fs() }?;
@@ -15474,6 +15511,17 @@ impl ExecNtHandler {
                 None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
             };
         }
+        if let Some(relative) = crate::writable_fs::volume_path(name16) {
+            if let Some(info) =
+                crate::writable_fs::query_attributes_relative_if_mounted(&relative)
+            {
+                return if self.write_file_basic_attributes(args[1], info.attributes) {
+                    nt_fs::STATUS_SUCCESS
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                };
+            }
+        }
         // General read-only namespace lookup. This is intentionally below the writable mount so
         // profile paths stay overlay-backed, but above loader-specific EXE/DLL probes.
         if let Some(attributes) = crate::fs_loader::query_nt_path_attributes_into(
@@ -15576,6 +15624,17 @@ impl ExecNtHandler {
                 Some(_) => STATUS_ACCESS_VIOLATION,
                 None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
             };
+        }
+        if let Some(relative) = crate::writable_fs::volume_path(name16) {
+            if let Some(info) =
+                crate::writable_fs::query_attributes_relative_if_mounted(&relative)
+            {
+                return if self.write_file_network_open_information(args[1], info) {
+                    nt_fs::STATUS_SUCCESS
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                };
+            }
         }
 
         if let Some(info) = crate::fs_loader::query_nt_path_standard_info_into(
@@ -15895,6 +15954,52 @@ impl ExecNtHandler {
                 &nb[..nlen],
             );
             return status;
+        }
+        if let Some(relative) = crate::writable_fs::volume_path(&name16) {
+            if crate::writable_fs::query_attributes_relative_if_mounted(&relative).is_some() {
+                let (mut status, file_id, information) =
+                    crate::writable_fs::open_existing_relative_if_mounted(
+                        &relative,
+                        args[1] as u32,
+                        0,
+                        args[4] as u32,
+                        args[5] as u32,
+                    );
+                let mut opened_handle = 0u64;
+                if let Some(file_id) = file_id {
+                    self.writable_fs_dirty = true;
+                    match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                        Some(handle) => {
+                            opened_handle = handle;
+                            self.queue_write(file_handle_out, handle);
+                        }
+                        None => status = 0xC000_009A,
+                    }
+                }
+                if opened_handle == 0 {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                }
+                let iosb = get_recv_mr(8);
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    let info = if status == nt_fs::STATUS_SUCCESS {
+                        information
+                    } else {
+                        0
+                    };
+                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    None,
+                    0,
+                    opened_handle,
+                    &nb[..nlen],
+                );
+                return status;
+            }
         }
         // Classify SxS/activation-context paths without admitting them to image loading.
         let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
@@ -23269,6 +23374,10 @@ impl ExecNtHandler {
                 }
                 let mut status;
                 let mut info = 0u64;
+                let volume_relative = crate::writable_fs::volume_path(&name16);
+                let volume_overlay_hit = volume_relative.as_ref().is_some_and(|relative| {
+                    crate::writable_fs::query_attributes_relative_if_mounted(relative).is_some()
+                });
                 if boot_status_path_matches(&name16) {
                     if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
@@ -23371,7 +23480,7 @@ impl ExecNtHandler {
                     }
                 } else if let Some(relative) = crate::writable_fs::writable_path(&name16) {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
-                    // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the seam the
+                    // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the boundary the
                     // previous batch's STATUS_NOT_IMPLEMENTED miss left open, and it is where
                     // `CreateDirectoryW("C:\Profiles")` (userenv/profile.c:929) now lands. The
                     // disposition, `FILE_DIRECTORY_FILE`, and `FileAttributes` are passed straight
@@ -23407,6 +23516,87 @@ impl ExecNtHandler {
                             None => {
                                 status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                                 info = 0;
+                            }
+                        }
+                    }
+                } else if let Some(relative) = volume_relative
+                    .as_deref()
+                    .filter(|_| args[7] as u32 != nt_fs::FILE_OPEN || volume_overlay_hit)
+                {
+                    let disposition = args[7] as u32;
+                    let options = args[8] as u32;
+                    if disposition == nt_fs::FILE_OPEN {
+                        let (st, file_id, information) =
+                            crate::writable_fs::open_existing_relative_if_mounted(
+                                relative,
+                                args[1] as u32,
+                                args[5] as u32,
+                                args[6] as u32,
+                                options,
+                            );
+                        status = st;
+                        info = information;
+                        if let Some(file_id) = file_id {
+                            self.writable_fs_dirty = true;
+                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                                Some(handle) => self.queue_write(args[0], handle),
+                                None => {
+                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                    info = 0;
+                                }
+                            }
+                        }
+                    } else if disposition == nt_fs::FILE_CREATE
+                        && Self::readonly_volume_entry(&name16).is_some()
+                    {
+                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                    } else {
+                        if let Some(parent) = Self::volume_relative_parent(relative) {
+                            if Self::readonly_volume_relative_is_dir(parent) {
+                                let _ = crate::writable_fs::provision_directory_relative(parent);
+                            }
+                        }
+                        let (st, file_id, information) = crate::writable_fs::create(
+                            relative,
+                            args[1] as u32,
+                            args[5] as u32,
+                            args[6] as u32,
+                            disposition,
+                            options,
+                        );
+                        status = st;
+                        info = information;
+                        if file_id.is_some() {
+                            self.writable_fs_dirty = true;
+                        }
+                        if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                            if status == nt_fs::STATUS_SUCCESS
+                                && info == nt_fs::FILE_CREATED as u64
+                            {
+                                crate::writable_fs::note_directory_create(
+                                    self.pi,
+                                    relative,
+                                    true,
+                                );
+                            } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
+                                crate::writable_fs::note_directory_create(
+                                    self.pi,
+                                    relative,
+                                    false,
+                                );
+                            }
+                        } else if status == nt_fs::STATUS_SUCCESS
+                            && info == nt_fs::FILE_CREATED as u64
+                        {
+                            crate::writable_fs::note_profile_file_create(self.pi, relative);
+                        }
+                        if let Some(file_id) = file_id {
+                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                                Some(handle) => self.queue_write(args[0], handle),
+                                None => {
+                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                    info = 0;
+                                }
                             }
                         }
                     }
