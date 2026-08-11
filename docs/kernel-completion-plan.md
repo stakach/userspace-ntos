@@ -61,6 +61,19 @@ enters the low-water zone. Local validation is green: `cargo fmt --all`,
 `git diff --check`. Next serialized desktop proof should confirm the shell still reaches desktop
 icons while the new census shows nonzero shared-cache reuse and zero `shared-full`/`shared-dup`.
 
+Serialized validation (2026-08-12): `.tmp/run-desktop-shared-pager-20260812.log` reaches the
+harness sentinel with real Explorer desktop and icon paint. Screenshot proof
+`.tmp/run-desktop-shared-pager-20260812-2.png` shows the ReactOS desktop with `My Computer`,
+`Internet Browser`, `Command Prompt`, `Read Me`, the Start button, and taskbar clock. The final
+Explorer gates pass (`exec_explorer_process_spawned`, callback redirect, client WndProc install,
+shell COM class open, and `exec_explorer_shell_chrome_painted`), and `[explorer-fb]` reports the
+full 1024x768 framebuffer as non-background with at least 32 distinct non-background colors. The new
+shared-page census stays healthy: `shared-frames=3422/16384`, `shared-hits=10315`, `shared-full=0`,
+and `shared-dup=0`. The remaining red gates are structural accounting/reclaim targets:
+`exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and `exec_vm_pool_headroom`. The
+desktop frontier is therefore no longer shell launch or paint scaffolding; the next target is generic
+process/view/image teardown and frame/CSlot reclaim under the live service wave.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.
