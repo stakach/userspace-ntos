@@ -87,6 +87,10 @@ pub enum WdmIoStackParameters {
     Write {
         length: u32,
     },
+    QueryInformation {
+        length: u32,
+        information_class: u32,
+    },
     SetInformation {
         length: u32,
         information_class: u32,
@@ -246,7 +250,11 @@ pub fn write_wdm_io_stack_location(
         WdmIoStackParameters::Read { length } | WdmIoStackParameters::Write { length } => {
             put_u32(bytes, 0x08, length);
         }
-        WdmIoStackParameters::SetInformation {
+        WdmIoStackParameters::QueryInformation {
+            length,
+            information_class,
+        }
+        | WdmIoStackParameters::SetInformation {
             length,
             information_class,
         } => {

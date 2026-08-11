@@ -1843,7 +1843,8 @@ unsafe fn seed_gui_thread_client_info(
     core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
     core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
     core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
-    if let Some((_kl, hkl, codepage)) = win32k_subsystem::current_thread_keyboard_layout_client_info()
+    if let Some((_kl, hkl, codepage)) =
+        win32k_subsystem::current_thread_keyboard_layout_client_info()
     {
         core::ptr::write_volatile((teb_alias + 0x890) as *mut u64, hkl);
         core::ptr::write_volatile((teb_alias + 0x898) as *mut u16, codepage);
@@ -8849,9 +8850,9 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
-                                          // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
-                                          // winsrv created these events via NtCreateEvent into its own image globals. Forward
-                                          // exactly what the caller supplied; no executive-side substitution is permitted.
+                // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
+                // winsrv created these events via NtCreateEvent into its own image globals. Forward
+                // exactly what the caller supplied; no executive-side substitution is permitted.
                 if m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE_REAL {
                     print_str(b"[ntuser-init] raw power=0x");
                     print_hex((a1 >> 32) as u32);

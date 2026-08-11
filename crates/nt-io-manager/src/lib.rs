@@ -2222,6 +2222,26 @@ mod tests {
         write_wdm_io_stack_location(
             &mut stack,
             WdmIoStackLocationInit {
+                major: major::IRP_MJ_QUERY_INFORMATION,
+                minor: 0,
+                device_object: 0x4444,
+                file_object: 0x5555,
+                parameters: WdmIoStackParameters::QueryInformation {
+                    length: 0x28,
+                    information_class: 24,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x00], major::IRP_MJ_QUERY_INFORMATION);
+        assert_eq!(le_u32(&stack, 0x08), 0x28);
+        assert_eq!(le_u32(&stack, 0x10), 24);
+        assert_eq!(le_u64(&stack, 0x28), 0x4444);
+        assert_eq!(le_u64(&stack, 0x30), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
                 major: major::IRP_MJ_CREATE_NAMED_PIPE,
                 minor: 0,
                 device_object: 0x4444,

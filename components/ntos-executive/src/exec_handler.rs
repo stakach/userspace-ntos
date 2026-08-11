@@ -80,6 +80,7 @@ static PIPE_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_PIPE_IO_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SCM_WORKER_READ_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
 static SCM_WORKER_FLUSH_IO_TRACE_N: [AtomicU64; TP_WORKER_SLOT_COUNT] =
@@ -4692,7 +4693,8 @@ impl ExecNtHandler {
     }
 
     fn rebuild_registry_services_order_cache(&mut self) -> bool {
-        let Some(services_key) = self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)
+        let Some(services_key) =
+            self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)
         else {
             self.registry_services_order_cache.clear();
             self.registry_services_order_cache_valid = true;
@@ -22327,6 +22329,73 @@ impl ExecNtHandler {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
                     }
                     return nt_fs::STATUS_SUCCESS;
+                }
+                if let Some(route) = self.npfs_file_route_for(args[0]) {
+                    if iosb == 0 || output == 0 {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    if iosb & 7 != 0 || output & 3 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if !self.probe_user_output(iosb, 16)
+                        || !self.probe_user_output(output, length)
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+
+                    let mut routed_output = alloc::vec::Vec::new();
+                    if routed_output.try_reserve_exact(length).is_err() {
+                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                    }
+                    routed_output.resize(length, 0);
+
+                    let mut information = 0u64;
+                    let status = match self.npfs_route_raw_for(
+                        route,
+                        major::IRP_MJ_QUERY_INFORMATION as u64,
+                        class as u64,
+                        &[],
+                        &mut routed_output,
+                    ) {
+                        Ok((driver_status, completed, _)) => {
+                            information = completed;
+                            driver_status as u32
+                        }
+                        Err(route_status) => route_status,
+                    };
+
+                    let copy_len = information.min(length as u64) as usize;
+                    if copy_len != 0 && !self.xas_try_write_buf(output, &routed_output[..copy_len])
+                    {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    let mut iosb_bytes = [0u8; 16];
+                    iosb_bytes[..4].copy_from_slice(&status.to_le_bytes());
+                    iosb_bytes[8..16].copy_from_slice(&information.to_le_bytes());
+                    if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+                    if NT_QUERY_INFORMATION_FILE_NPFS_TRACE_N.fetch_add(1, Ordering::Relaxed) < 32
+                    {
+                        print_str(b"[nt-query-info-file-npfs] pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" handle=0x");
+                        print_hex(args[0] as u32);
+                        print_str(b" fid=0x");
+                        print_hex(route.file_id as u32);
+                        print_str(b" dev=");
+                        print_u64(route.device_id);
+                        print_str(b" class=");
+                        print_u64(class as u64);
+                        print_str(b" length=");
+                        print_u64(length as u64);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b" info=");
+                        print_u64(information);
+                        print_str(b"\n");
+                    }
+                    return status;
                 }
                 // 40 = the largest class this encoder produces (FILE_BASIC_INFORMATION); it was 24
                 // when FILE_STANDARD_INFORMATION was the only one supported.

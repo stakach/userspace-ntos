@@ -326,6 +326,7 @@ const STATUS_PENDING: u32 = 0x0000_0103;
 
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
 const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
+const IRP_MJ_QUERY_INFORMATION: u64 = major::IRP_MJ_QUERY_INFORMATION as u64;
 const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u64 = major::IRP_MJ_FILE_SYSTEM_CONTROL as u64;
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
@@ -396,7 +397,9 @@ static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 
 #[inline]
 fn pending_irp_returns_read_bytes(major: u64, fsctl: u64) -> bool {
-    major == IRP_MJ_READ || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
+    major == IRP_MJ_READ
+        || major == IRP_MJ_QUERY_INFORMATION
+        || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
 }
 
 // BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
@@ -527,8 +530,7 @@ unsafe fn completed_read_slot(data_base: u64, index: usize) -> *mut CompletedRea
 unsafe fn pending_irp_slot(data_base: u64, index: usize) -> *mut PendingIrpNode {
     (data_base
         + FSD_PENDING_IRPS_OFF
-        + (index as u64) * core::mem::size_of::<PendingIrpNode>() as u64)
-        as *mut PendingIrpNode
+        + (index as u64) * core::mem::size_of::<PendingIrpNode>() as u64) as *mut PendingIrpNode
 }
 
 #[inline]
@@ -541,8 +543,8 @@ unsafe fn pending_irp_node_valid(node: u64) -> bool {
             .checked_add(core::mem::size_of::<PendingIrpNode>() as u64)
             .is_some_and(|end| end <= pool_end);
     let table_start = FSD_DATA_VADDR + FSD_PENDING_IRPS_OFF;
-    let table_end = table_start
-        + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
+    let table_end =
+        table_start + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64;
     let in_table = node >= table_start
         && node & 7 == 0
         && node
@@ -1843,9 +1845,11 @@ unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
         print_str(b"/");
         print_u64(info);
     }
-    if let Some(iosl) =
-        component_pool_to_exec_va(inst.exec_pool_va, iosl_c, WDM_X64_IO_STACK_LOCATION_SIZE as u64)
-    {
+    if let Some(iosl) = component_pool_to_exec_va(
+        inst.exec_pool_va,
+        iosl_c,
+        WDM_X64_IO_STACK_LOCATION_SIZE as u64,
+    ) {
         let mj = read_unaligned(iosl as *const u8);
         let mn = read_unaligned((iosl + WDM_X64_IO_STACK_MINOR_OFFSET) as *const u8);
         let length = read_unaligned((iosl + 0x08) as *const u32);
@@ -1867,9 +1871,11 @@ unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
         print_hex64(device);
         print_str(b" stack.fo=");
         print_hex64(file_object);
-        if let Some(fo) =
-            component_pool_to_exec_va(inst.exec_pool_va, file_object, WDM_X64_FILE_OBJECT_SIZE as u64)
-        {
+        if let Some(fo) = component_pool_to_exec_va(
+            inst.exec_pool_va,
+            file_object,
+            WDM_X64_FILE_OBJECT_SIZE as u64,
+        ) {
             let fsctx = read_unaligned((fo + 0x18) as *const u64);
             let fsctx2 = read_unaligned((fo + 0x20) as *const u64);
             print_str(b" fsctx=");
@@ -8316,7 +8322,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
 
     // IO_STACK_LOCATION. Parameters union @ +0x08:
     // Create/CreatePipe: SecurityContext@+0x08, Options@+0x10, ShareAccess@+0x1a, Parameters@+0x20.
-    // Read/Write: Length@+0x08. SetFile: Length@+0x08, FileInformationClass@+0x10.
+    // Read/Write: Length@+0x08. QueryFile/SetFile: Length@+0x08, FileInformationClass@+0x10.
     // FS/DeviceControl: OutputBufferLength@+0x08, InputBufferLength@+0x10, IoControlCode@+0x18,
     // Type3InputBuffer@+0x20. `Irp->UserBuffer` carries the output buffer.
     let iosl_len = if major == IRP_MJ_PNP {
@@ -8392,6 +8398,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         },
         IRP_MJ_WRITE => WdmIoStackParameters::Write {
             length: inlen as u32,
+        },
+        IRP_MJ_QUERY_INFORMATION => WdmIoStackParameters::QueryInformation {
+            length: outlen as u32,
+            information_class: fsctl as u32,
         },
         IRP_MJ_SET_INFORMATION => WdmIoStackParameters::SetInformation {
             length: inlen as u32,
@@ -8495,9 +8505,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, irp);
-    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, current_iosl);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64,
+        current_iosl,
+    );
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, data);
-    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64, data_capacity);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64,
+        data_capacity,
+    );
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, fo);
 
     // Call the driver's MajorFunction handler THROUGH the bugcheck escape: if the driver raises its
@@ -12212,6 +12228,16 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_TARGET_TCB]);
             print_str(b" comp-handoff=");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_COMPOSITE_REPLY_HANDOFF]);
+            print_str(b" aff=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_AFFINITY]);
+            print_str(b" dom=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_DOMAIN]);
+            print_str(b" cur-dom=");
+            print_u64(state[crate::win32k_glue::TCB_DBG_CURRENT_DOMAIN]);
+            print_str(b" qtop=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_QUEUE_TOP_PRIORITY]);
+            print_str(b" direct=");
+            print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_DIRECT_HANDOFF]);
             print_str(b" cspace=");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_CSPACE_INDEX]);
             print_str(b" fault-cap-kind=");
@@ -12224,6 +12250,38 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_FAULT_EP_HEAD]);
             print_str(b"/");
             print_tcb_debug_opt(state[crate::win32k_glue::TCB_DBG_FAULT_EP_TAIL]);
+            print_str(b"\n");
+
+            let mut exec_state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
+            unsafe {
+                crate::win32k_glue::tcb_read_debug_state(1, 0, &mut exec_state);
+            }
+            print_str(b"[deadman] executive-tcb state=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_STATE]);
+            print_str(b" sched=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_SCHEDULABLE]);
+            print_str(b" enq=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_ENQUEUED]);
+            print_str(b" prio=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_PRIORITY]);
+            print_str(b" sc=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_SC]);
+            print_str(b" current=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_CURRENT_TCB]);
+            print_str(b" target=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_TARGET_TCB]);
+            print_str(b" comp-handoff=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_COMPOSITE_REPLY_HANDOFF]);
+            print_str(b" aff=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_AFFINITY]);
+            print_str(b" dom=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_DOMAIN]);
+            print_str(b" cur-dom=");
+            print_u64(exec_state[crate::win32k_glue::TCB_DBG_CURRENT_DOMAIN]);
+            print_str(b" qtop=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_QUEUE_TOP_PRIORITY]);
+            print_str(b" direct=");
+            print_tcb_debug_opt(exec_state[crate::win32k_glue::TCB_DBG_DIRECT_HANDOFF]);
             print_str(b"\n");
         }
         unsafe {

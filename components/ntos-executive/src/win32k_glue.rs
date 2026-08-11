@@ -5369,7 +5369,7 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
     }
 }
 
-pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 24;
+pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 29;
 pub(crate) const TCB_DEBUG_NONE: u64 = u64::MAX;
 pub(crate) const TCB_DBG_STATE: usize = 0;
 pub(crate) const TCB_DBG_SCHEDULABLE: usize = 1;
@@ -5395,6 +5395,11 @@ pub(crate) const TCB_DBG_FAULT_EP_STATE: usize = 20;
 pub(crate) const TCB_DBG_FAULT_EP_HEAD: usize = 21;
 pub(crate) const TCB_DBG_FAULT_EP_TAIL: usize = 22;
 pub(crate) const TCB_DBG_COMPOSITE_REPLY_HANDOFF: usize = 23;
+pub(crate) const TCB_DBG_AFFINITY: usize = 24;
+pub(crate) const TCB_DBG_DOMAIN: usize = 25;
+pub(crate) const TCB_DBG_CURRENT_DOMAIN: usize = 26;
+pub(crate) const TCB_DBG_QUEUE_TOP_PRIORITY: usize = 27;
+pub(crate) const TCB_DBG_DIRECT_HANDOFF: usize = 28;
 
 fn print_tcb_debug_opt(value: u64) {
     if value == TCB_DEBUG_NONE {
@@ -5448,6 +5453,16 @@ pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
     print_tcb_debug_opt(state[TCB_DBG_TARGET_TCB]);
     print_str(b" comp-handoff=");
     print_tcb_debug_opt(state[TCB_DBG_COMPOSITE_REPLY_HANDOFF]);
+    print_str(b" aff=");
+    print_u64(state[TCB_DBG_AFFINITY]);
+    print_str(b" dom=");
+    print_u64(state[TCB_DBG_DOMAIN]);
+    print_str(b" cur-dom=");
+    print_u64(state[TCB_DBG_CURRENT_DOMAIN]);
+    print_str(b" qtop=");
+    print_tcb_debug_opt(state[TCB_DBG_QUEUE_TOP_PRIORITY]);
+    print_str(b" direct=");
+    print_tcb_debug_opt(state[TCB_DBG_DIRECT_HANDOFF]);
     print_str(b" cspace=");
     print_tcb_debug_opt(state[TCB_DBG_CSPACE_INDEX]);
     print_str(b" fault-ep=");
@@ -5461,7 +5476,11 @@ pub(crate) unsafe fn trace_win32k_tcb_debug_state() {
 
 /// rust-micro extension: `TCB::ReadDebugState(reply_cap)` returns compact scheduler/IPC state for
 /// a target TCB and, when `reply_cap != 0`, the TCB currently bound to that reply object.
-pub(crate) unsafe fn tcb_read_debug_state(tcb: u64, reply_cap: u64, out: &mut [u64; 24]) {
+pub(crate) unsafe fn tcb_read_debug_state(
+    tcb: u64,
+    reply_cap: u64,
+    out: &mut [u64; TCB_DEBUG_STATE_WORDS],
+) {
     let (r0, r1, r2, r3): (u64, u64, u64, u64);
     core::arch::asm!(
         "syscall",

@@ -3396,3 +3396,27 @@ before unrelated executive traffic monopolises the receive loop.
   scheduling/component-pump boundary so an answered component `Call` is allowed to run before the
   executive loops on bound notifications; do not reintroduce service, process, IRQ, paint, keyboard, or
   pipe fallbacks.
+
+- Direct component handoff and EventLog pipe publication. The microkernel side now keeps composite
+  reply wakes attached to the actual receive-half wake source and exposes enough TCB debug state to
+  distinguish runnable-but-not-current from a lost reply. `rust-micro` validation passed through
+  `./scripts/run_specs.sh`, including the direct-handoff and deferred `NBSendRecv` reply-wake specs,
+  and the submodule was pushed through `003b7fa`. The initrd staging script also strips staged boot
+  images and enforces the loader window before packaging, so the parent repository no longer needs to
+  point at unpublished kernel commits. Parent validation for the current I/O slice: `cargo test -p
+  nt-io-manager --lib`, `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  Serialized visible retry `.tmp/run-desktop-npfs-query-20260811.log` restores genuine base desktop
+  paint (`winlogon NtUserSwitchDesktop`, `desktop-bg 768/768`, pixel `0x003a6ea5`) and moves past the
+  old hosted-FSD dispatch wall: NPFS write/read dispatches continue through `#165`, SCM accepts an
+  additional `\ntsvcs` connection, and EventLog's service process eventually creates
+  `\??\pipe\EventLog`. SCM's first `\??\pipe\EventLog` open still races ahead of the server instance
+  and returns `STATUS_OBJECT_NAME_NOT_FOUND`, but a later open succeeds once the real server endpoint is
+  published. The current red edge remains before natural `userinit.exe`/`explorer.exe` launch:
+  periodic census still reports `explorer total=0`, winlogon is parked on the generic service-control
+  event, and EventLog/SCM/LSASS workers are mostly in real dispatcher, IOCP, LPC, or pipe waits. The
+  next slice should continue in generic kernel mechanisms: pending named-pipe open/wait semantics,
+  IOCP packet delivery to parked SCM/LSASS workers, or the concrete wait object that gates winlogon's
+  profile/userinit transition. Do not add EventLog, service-order, executable-launch, or shell-paint
+  policy.
