@@ -1,7 +1,9 @@
 //! PE-loader tests against hand-crafted PE32+ images: parse, map, relocate,
 //! import listing, and malformed-image rejection (no panics).
 
-use nt_pe_loader::{ImageProtection, ImportRef, PeError, PeFile, Protection};
+use nt_pe_loader::{
+    ImageProtection, ImportRef, LoaderWritablePageState, PeError, PeFile, Protection,
+};
 
 // --- a minimal PE32+ image builder -----------------------------------------
 
@@ -222,6 +224,10 @@ fn imports_are_listed() {
         other => panic!("expected ByName, got {other:?}"),
     }
     assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert_eq!(
+        pe.loader_writable_page_state(iat).unwrap(),
+        LoaderWritablePageState::Iat
+    );
     assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
 }
 
@@ -243,6 +249,10 @@ fn iat_directory_marks_loader_writable_state_without_import_walk() {
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert_eq!(
+        pe.loader_writable_page_state(iat).unwrap(),
+        LoaderWritablePageState::Iat
+    );
     assert_eq!(pe.page_has_loader_writable_state(iat + 8).unwrap(), true);
     assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
 }
@@ -282,6 +292,10 @@ fn relocations_are_applied_on_rebase() {
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.relocations().unwrap().len(), 2); // DIR64 + ABSOLUTE
     assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert_eq!(
+        pe.loader_writable_page_state(data_va).unwrap(),
+        LoaderWritablePageState::Relocation
+    );
     assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
 
     let new_base = 0x2_0000_0000u64;
@@ -324,6 +338,10 @@ fn unsupported_relocation_kind_marks_only_its_page_loader_writable() {
         PeError::UnsupportedRelocation(3)
     );
     assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert_eq!(
+        pe.loader_writable_page_state(data_va).unwrap(),
+        LoaderWritablePageState::Relocation
+    );
     assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
 }
 
@@ -350,6 +368,10 @@ fn security_cookie_from_load_config() {
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.security_cookie_rva(), Some(0x3000));
     assert_eq!(pe.page_has_loader_writable_state(0x3000).unwrap(), true);
+    assert_eq!(
+        pe.loader_writable_page_state(0x3000).unwrap(),
+        LoaderWritablePageState::SecurityCookie
+    );
 
     // No load-config directory → None.
     let plain = build_pe(
@@ -388,7 +410,58 @@ fn tls_index_page_is_loader_writable_state() {
         pe.page_has_loader_writable_state(tls_index_rva).unwrap(),
         true
     );
+    assert_eq!(
+        pe.loader_writable_page_state(tls_index_rva).unwrap(),
+        LoaderWritablePageState::TlsIndex
+    );
     assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
+}
+
+#[test]
+fn relocated_tls_index_page_is_loader_writable_at_runtime_base() {
+    let tls_va: u32 = 0x2000;
+    let tls_index_rva: u32 = 0x3000;
+    let runtime_base = BASE - 0x1000_0000;
+    let mut tls = vec![0u8; 0x28];
+    // The executive relocates SEC_IMAGE bytes in place before storing the PeFile metadata. TLS
+    // AddressOfIndex is an absolute VA and the relocation pass fixes it to the runtime base, while
+    // PeFile::headers still carries the preferred base parsed from the original header.
+    tls[16..24].copy_from_slice(&(runtime_base + tls_index_rva as u64).to_le_bytes());
+    let tls_sec = Sec {
+        name: *b".tls\0\0\0\0",
+        va: tls_va,
+        chars: 0xC000_0040,
+        data: tls,
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x4000,
+        &[text_section(0x1000, vec![0xC3]), tls_sec],
+        &[(9, tls_va, 0x28)],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.tls_index_rva().unwrap_err(), PeError::PatchOutOfBounds);
+    assert_eq!(
+        pe.tls_index_rva_at_base(runtime_base).unwrap(),
+        Some(tls_index_rva)
+    );
+    assert_eq!(
+        pe.loader_writable_page_state_at_base(tls_index_rva, runtime_base)
+            .unwrap(),
+        LoaderWritablePageState::TlsIndex
+    );
+    assert_eq!(
+        pe.loader_writable_page_state(tls_index_rva)
+            .unwrap_err()
+            .pe_error(),
+        PeError::PatchOutOfBounds
+    );
+    assert_eq!(
+        pe.page_has_loader_writable_state_at_base(tls_index_rva, runtime_base)
+            .unwrap(),
+        true
+    );
 }
 
 #[test]

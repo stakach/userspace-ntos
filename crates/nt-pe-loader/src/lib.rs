@@ -78,6 +78,21 @@ pub enum ImageProtection {
     ExecuteWriteCopy,
 }
 
+/// Why a 4 KiB SEC_IMAGE page is expected to be written by the user-mode loader.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LoaderWritablePageState {
+    /// No loader-written bytes were found on this page.
+    Clean,
+    /// The page contains one or more import address table slots.
+    Iat,
+    /// The page contains one or more relocation targets.
+    Relocation,
+    /// The page contains load-config security cookie storage.
+    SecurityCookie,
+    /// The page contains the TLS index word.
+    TlsIndex,
+}
+
 impl ImageProtection {
     /// True if a page with this protection can be executed.
     pub fn executable(self) -> bool {
@@ -130,6 +145,31 @@ pub enum PeError {
     UnsupportedRelocation(u16),
     /// A relocation / IAT patch target is out of the mapped image.
     PatchOutOfBounds,
+}
+
+/// Which PE directory prevented a loader-writable page classification.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LoaderWritablePageError {
+    /// Import/IAT directory parsing failed.
+    Import(PeError),
+    /// Base-relocation directory parsing failed.
+    Relocation(PeError),
+    /// Load-config security-cookie parsing failed.
+    LoadConfig(PeError),
+    /// TLS directory parsing failed.
+    Tls(PeError),
+}
+
+impl LoaderWritablePageError {
+    /// The underlying PE parse error.
+    pub fn pe_error(self) -> PeError {
+        match self {
+            LoaderWritablePageError::Import(err)
+            | LoaderWritablePageError::Relocation(err)
+            | LoaderWritablePageError::LoadConfig(err)
+            | LoaderWritablePageError::Tls(err) => err,
+        }
+    }
 }
 
 // --- bounded readers (never panic) -----------------------------------------
@@ -315,24 +355,47 @@ impl<'a> PeFile<'a> {
     /// data directory's `SecurityCookie` VA (offset 88). `None` if the image has no
     /// load config / cookie. The MSVC `GsDriverEntry` wrapper fastfails if this word
     /// is left 0, so a loader must seed it before calling `DriverEntry`.
-    pub fn security_cookie_rva(&self) -> Option<u32> {
+    fn security_cookie_rva_checked_at_base(&self, image_base: u64) -> Result<Option<u32>, PeError> {
         let dir = self
             .headers
             .data_directory(headers::DIRECTORY_ENTRY_LOAD_CONFIG);
         if dir.virtual_address == 0 || dir.size < 96 {
-            return None;
+            return Ok(None);
         }
-        let cookie_va =
-            rva::u64_at_rva(self.bytes, self.sections(), dir.virtual_address + 88).ok()?;
+        let cookie_field_rva = dir
+            .virtual_address
+            .checked_add(88)
+            .ok_or(PeError::Truncated)?;
+        let cookie_va = rva::u64_at_rva(self.bytes, self.sections(), cookie_field_rva)?;
         if cookie_va == 0 {
-            return None;
+            return Ok(None);
         }
-        u32::try_from(cookie_va.checked_sub(self.headers.image_base)?).ok()
+        image_va_to_rva(cookie_va, image_base, self.headers.size_of_image)
+    }
+
+    fn security_cookie_rva_checked(&self) -> Result<Option<u32>, PeError> {
+        self.security_cookie_rva_checked_at_base(self.headers.image_base)
+    }
+
+    pub fn security_cookie_rva(&self) -> Option<u32> {
+        self.security_cookie_rva_checked().ok().flatten()
     }
 
     /// The RVA of the TLS index word (`IMAGE_TLS_DIRECTORY64.AddressOfIndex`) the user-mode loader
     /// writes while attaching this image. `Ok(None)` means there is no TLS directory or no index word.
     pub fn tls_index_rva(&self) -> Result<Option<u32>, PeError> {
+        self.tls_index_rva_at_base(self.headers.image_base)
+    }
+
+    /// The RVA of the TLS index word for image bytes whose absolute VA fields have already been
+    /// relocated to `image_base`.
+    ///
+    /// The default [`PeFile::tls_index_rva`] is for raw file bytes. The executive also keeps
+    /// in-place relocated SEC_IMAGE bytes around for demand faults; their TLS directory has been
+    /// fixed up by base relocations even though this parsed [`PeFile`] still records the original
+    /// preferred ImageBase. Those callers must pass the runtime image base here so TLS index pages
+    /// remain private instead of being misclassified as malformed or clean.
+    pub fn tls_index_rva_at_base(&self, image_base: u64) -> Result<Option<u32>, PeError> {
         let dir = self.headers.data_directory(headers::DIRECTORY_ENTRY_TLS);
         if dir.virtual_address == 0 || dir.size == 0 {
             return Ok(None);
@@ -351,39 +414,72 @@ impl<'a> PeFile<'a> {
         if index_va == 0 {
             return Ok(None);
         }
-        let index_rva = index_va
-            .checked_sub(self.headers.image_base)
-            .and_then(|rva| u32::try_from(rva).ok())
-            .ok_or(PeError::PatchOutOfBounds)?;
-        Ok(Some(index_rva))
+        image_va_to_rva(index_va, image_base, self.headers.size_of_image)
     }
 
-    /// True when the 4 KiB page containing `rva` carries bytes the loader is expected to write:
-    /// import IAT slots, DIR64 relocation targets, the load-config security cookie, or the TLS index.
+    /// Classify whether the 4 KiB page containing `rva` carries bytes the loader is expected to
+    /// write: import IAT slots, relocation targets, the load-config security cookie, or the TLS
+    /// index.
+    pub fn loader_writable_page_state(
+        &self,
+        rva: u32,
+    ) -> Result<LoaderWritablePageState, LoaderWritablePageError> {
+        self.loader_writable_page_state_at_base(rva, self.headers.image_base)
+    }
+
+    /// Classify loader-written state for image bytes relocated in place to `image_base`.
+    pub fn loader_writable_page_state_at_base(
+        &self,
+        rva: u32,
+        image_base: u64,
+    ) -> Result<LoaderWritablePageState, LoaderWritablePageError> {
+        let page = rva & !0x0fffu32;
+        if imports::page_has_iat_slot(self.bytes, &self.headers, self.sections(), page)
+            .map_err(LoaderWritablePageError::Import)?
+        {
+            return Ok(LoaderWritablePageState::Iat);
+        }
+        if relocs::page_has_relocation(self.bytes, &self.headers, self.sections(), page)
+            .map_err(LoaderWritablePageError::Relocation)?
+        {
+            return Ok(LoaderWritablePageState::Relocation);
+        }
+        if self
+            .security_cookie_rva_checked_at_base(image_base)
+            .map_err(LoaderWritablePageError::LoadConfig)?
+            .is_some_and(|cookie| rva_range_intersects_page(cookie, 8, page))
+        {
+            return Ok(LoaderWritablePageState::SecurityCookie);
+        }
+        if self
+            .tls_index_rva_at_base(image_base)
+            .map_err(LoaderWritablePageError::Tls)?
+            .is_some_and(|index| rva_range_intersects_page(index, 4, page))
+        {
+            return Ok(LoaderWritablePageState::TlsIndex);
+        }
+        Ok(LoaderWritablePageState::Clean)
+    }
+
+    /// True when the 4 KiB page containing `rva` carries bytes the loader is expected to write.
     ///
     /// SEC_IMAGE can safely share plain write-copy pages only when this returns `Ok(false)`. On any
     /// parse error, callers should keep the page private.
     pub fn page_has_loader_writable_state(&self, rva: u32) -> Result<bool, PeError> {
-        let page = rva & !0x0fffu32;
-        if imports::page_has_iat_slot(self.bytes, &self.headers, self.sections(), page)? {
-            return Ok(true);
+        self.page_has_loader_writable_state_at_base(rva, self.headers.image_base)
+    }
+
+    /// True when the page contains loader-written state in image bytes relocated to `image_base`.
+    pub fn page_has_loader_writable_state_at_base(
+        &self,
+        rva: u32,
+        image_base: u64,
+    ) -> Result<bool, PeError> {
+        match self.loader_writable_page_state_at_base(rva, image_base) {
+            Ok(LoaderWritablePageState::Clean) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(err) => Err(err.pe_error()),
         }
-        if relocs::page_has_relocation(self.bytes, &self.headers, self.sections(), page)? {
-            return Ok(true);
-        }
-        if self
-            .security_cookie_rva()
-            .is_some_and(|cookie| rva_range_intersects_page(cookie, 8, page))
-        {
-            return Ok(true);
-        }
-        if self
-            .tls_index_rva()?
-            .is_some_and(|index| rva_range_intersects_page(index, 4, page))
-        {
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     /// Seed the image's `__security_cookie` at `code_vaddr + security_cookie_rva()` with
@@ -482,4 +578,18 @@ fn rva_range_intersects_page(rva: u32, len: u32, page_start: u32) -> bool {
         return true;
     };
     rva < page_end && end > page_start
+}
+
+fn image_va_to_rva(va: u64, image_base: u64, size_of_image: u32) -> Result<Option<u32>, PeError> {
+    if va == 0 {
+        return Ok(None);
+    }
+    let rva = va
+        .checked_sub(image_base)
+        .and_then(|rva| u32::try_from(rva).ok())
+        .ok_or(PeError::PatchOutOfBounds)?;
+    if rva >= size_of_image {
+        return Err(PeError::PatchOutOfBounds);
+    }
+    Ok(Some(rva))
 }

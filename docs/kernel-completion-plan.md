@@ -215,6 +215,59 @@ source-specific predicate counters or a host-side PE survey. After that, continu
 pressure through generic per-image map-cap reclaim, per-process section-view reclaim, and terminated
 thread/process lifetime teardown; do not relax the VM pool gate.
 
+Current write-copy predicate attribution slice (2026-08-12): implemented. `nt-pe-loader` now exposes a
+structured loader-writable page classifier so the executive can distinguish clean pages from IAT,
+relocation, security-cookie, and TLS-index pages, and can attribute predicate parse failures to the
+import/IAT, relocation, load-config, or TLS directory. The SEC_IMAGE pool census keeps the existing
+`wc-loader-private=` and `wc-pred-err=` totals and adds compact detail fields
+`wc-loader-detail=iat/reloc/cookie/tls` and `wc-pred-detail=import/reloc/load-config/tls`.
+Serialized proof `.tmp/run-desktop-writecopy-pred-detail-20260812.log` reached real Explorer chrome
+again (`exec_explorer_shell_chrome_painted` green) and showed the high predicate-error count was not
+generic: `wc-pred-detail=0/0/0/22118`, so every predicate error came from TLS classification. The
+same run kept the VM pool gate red (`ut-free=47380KiB`) and had a nondeterministic modal-paint
+prefix red while `exec_msgina_logon_dialog_painted` and the full Explorer shell gates stayed green.
+
+TLS classifier review: the first attempted relaxation treated a TLS `AddressOfIndex` below
+`PeFile::headers.image_base` as no in-image TLS index page. Serialized proof
+`.tmp/run-desktop-writecopy-tls-index-20260812.log` rejected that approach: memory headroom became
+green (`ut-free=92193KiB`, `wc-pred-err=0`), but Explorer quiesced before its first
+`NtUserCreateWindowEx`, with the main thread at `lpk.dll+0x3780`, and the shell COM/WndProc/chrome
+gates went red. The root cause is generic, not `lpk`: SEC_IMAGE DLL bytes are relocated in place to
+their compact runtime base, while stored `PeFile` metadata still records the original preferred base.
+Absolute TLS/load-config fields in the bytes must therefore be classified against the runtime image
+base. The retained fix adds base-aware PE-loader classification and passes each DLL's registered
+runtime base from the SEC_IMAGE fault path. Unknown/out-of-image absolute fields still fail closed.
+Local validation is green (`cargo fmt --all`, `cargo test -p nt-pe-loader`, and executive
+`cargo check`).
+
+Runtime-base desktop proof `.tmp/run-desktop-writecopy-runtime-base-20260812.log` kept the retained
+TLS/load-config fail-closed behavior and reached real Explorer chrome again:
+`exec_explorer_process_spawned`, callback redirect, client WndProc install, shell COM classes,
+`exec_userinit_scrollbar_classinfo`, and `exec_explorer_shell_chrome_painted` all passed, with
+`wc-pred-detail=0/0/0/0`. That run also exposed the next real resource wall: the monolithic
+`SharedImageMapping` registry hit `image-mapcaps=16384`, then a 1 MiB heap reallocation failed,
+producing `image-mapcap-fails=5`, `exec_image_writecopy_cow_isolated` red with
+`STATUS_INSUFFICIENT_RESOURCES`, and `exec_vm_pool_headroom` red despite `ut-free=65755KiB`.
+
+Completed shared-image map-cap registry slice (2026-08-12): the CNode bank itself did not fail
+(`image-bank-fails=0`); the failed resource was the contiguous `Vec<SharedImageMapping>` registry.
+The retained replacement stores the packed mapping registry in fixed 512-entry heap chunks allocated
+through the fallible global allocator, keeps the existing `(pi, page) -> cap` API and real failure
+semantics, and preserves swap-remove compaction so deleted process/view mappings reuse slots.
+
+The first serialized chunked-registry run,
+`.tmp/run-desktop-writecopy-chunked-mapcaps-20260812.log`, proved the targeted resource fix
+(`image-mapcap-fails=0`, `exec_image_writecopy_cow_isolated` green, and `exec_vm_pool_headroom`
+green) but sampled an early winlogon/user32 quiesce before Explorer's shell counters advanced. The
+accepted proof is `.tmp/run-desktop-writecopy-chunked-rerun-20260812.log`: it reached the harness
+sentinel with `295/295` executive checks passing, `image-mapcaps=18717`, `image-mapcap-fails=0`,
+`image-bank-fails=0`, `wc-pred-detail=0/0/0/0`, `ut-free=57328KiB`, both mapped-section and
+SEC_IMAGE write-copy COW selftests green, and real Explorer shell chrome green
+(`exec_explorer_user_callbacks_redirected`, client WndProc install, shell COM classes, and
+`exec_explorer_shell_chrome_painted` all pass). Review adjustment: the next pressure target is no
+longer the shared-image mapping registry; continue with generic live resident-frame reduction or
+post-service reclaim work without adding process-name policy or fallback success paths.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.

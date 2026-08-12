@@ -17,7 +17,15 @@ static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SEC_IMAGE_PRIVATE_PREFETCH_SKIPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SEC_IMAGE_CLEAN_WRITECOPY_SHARED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_IAT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_RELOC: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_COOKIE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_TLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_IMPORT_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_RELOC_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_LOAD_CONFIG_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_TLS_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct SecImageForwardPolicy {
@@ -732,18 +740,54 @@ fn sec_image_forward_policy() -> SecImageForwardPolicy {
     }
 }
 
-fn sec_image_clean_writecopy_shareable(pe: &nt_pe_loader::PeFile, rva: u32) -> bool {
-    match pe.page_has_loader_writable_state(rva) {
-        Ok(false) => {
+fn sec_image_clean_writecopy_shareable(
+    pe: &nt_pe_loader::PeFile,
+    rva: u32,
+    image_base: u64,
+) -> bool {
+    match pe.loader_writable_page_state_at_base(rva, image_base) {
+        Ok(nt_pe_loader::LoaderWritablePageState::Clean) => {
             SEC_IMAGE_CLEAN_WRITECOPY_SHARED.fetch_add(1, Ordering::Relaxed);
             true
         }
-        Ok(true) => {
+        Ok(nt_pe_loader::LoaderWritablePageState::Iat) => {
             SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PRIVATE_IAT.fetch_add(1, Ordering::Relaxed);
             false
         }
-        Err(_) => {
+        Ok(nt_pe_loader::LoaderWritablePageState::Relocation) => {
+            SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PRIVATE_RELOC.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Ok(nt_pe_loader::LoaderWritablePageState::SecurityCookie) => {
+            SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PRIVATE_COOKIE.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Ok(nt_pe_loader::LoaderWritablePageState::TlsIndex) => {
+            SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PRIVATE_TLS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(nt_pe_loader::LoaderWritablePageError::Import(_)) => {
             SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PREDICATE_IMPORT_ERRORS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(nt_pe_loader::LoaderWritablePageError::Relocation(_)) => {
+            SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PREDICATE_RELOC_ERRORS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(nt_pe_loader::LoaderWritablePageError::LoadConfig(_)) => {
+            SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PREDICATE_LOAD_CONFIG_ERRORS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(nt_pe_loader::LoaderWritablePageError::Tls(_)) => {
+            SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            SEC_IMAGE_WRITECOPY_PREDICATE_TLS_ERRORS.fetch_add(1, Ordering::Relaxed);
             false
         }
     }
@@ -6284,7 +6328,7 @@ pub(crate) unsafe fn service_sec_image(
                 let clean_writecopy_shareable = base != PE_LOAD_BASE
                     && !image_fault_plan.copy_on_write
                     && (image_view_info.protect & 0xff) == nt_address_space::PAGE_WRITECOPY
-                    && sec_image_clean_writecopy_shareable(tpe, rva);
+                    && sec_image_clean_writecopy_shareable(tpe, rva, base);
                 let shareable = base != PE_LOAD_BASE
                     && (nt_address_space::image_view_shared_cacheable(
                         image_view_info.protect,
