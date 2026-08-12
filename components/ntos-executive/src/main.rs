@@ -21125,6 +21125,68 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
     0xFF // timeout
 }
 
+/// Bring up AHCI port 0 and WRITE one 512-byte sector (`sector`) from the DMA frame at
+/// `dma_vaddr + 0x800` (paddr `dma_paddr + 0x800`) via ATA WRITE DMA EXT. Command/FIS/table state
+/// reuses the same 4 KiB DMA frame layout as [`ahci_read_sector`]; the data buffer itself is not
+/// cleared here, so the caller must fill exactly one sector before issuing the write.
+#[allow(dead_code)]
+unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sector: u64) -> u32 {
+    let port = ahci_vaddr + 0x100; // port 0 register set
+    let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
+    let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
+    let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
+    core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
+    pw(0x18, pr(0x18) & !((1 << 0) | (1 << 4)));
+    for _ in 0..1_000_000u64 {
+        if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
+            break;
+        }
+        yield_now();
+    }
+    for i in 0..(0x800u64 / 8) {
+        core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
+    }
+    pw(0x00, dma_paddr as u32);
+    pw(0x04, (dma_paddr >> 32) as u32);
+    pw(0x08, (dma_paddr + 0x400) as u32);
+    pw(0x0C, (dma_paddr >> 32) as u32);
+    pw(0x18, pr(0x18) | (1 << 4));
+    yield_now();
+    pw(0x18, pr(0x18) | (1 << 0));
+    pw(0x10, 0xFFFF_FFFF);
+
+    let ct = dma_vaddr + 0x500;
+    let cb = |o: u64, v: u8| core::ptr::write_volatile((ct + o) as *mut u8, v);
+    cb(0, 0x27); // FIS type = Register H2D
+    cb(1, 0x80); // C = 1 (command), PMPort 0
+    cb(2, 0x35); // command = WRITE DMA EXT
+    cb(4, sector as u8);
+    cb(5, (sector >> 8) as u8);
+    cb(6, (sector >> 16) as u8);
+    cb(7, 0x40);
+    cb(8, (sector >> 24) as u8);
+    cb(9, (sector >> 32) as u8);
+    cb(10, (sector >> 40) as u8);
+    core::ptr::write_volatile((ct + 12) as *mut u16, 1);
+    core::ptr::write_volatile((ct + 0x80) as *mut u32, (dma_paddr + 0x800) as u32);
+    core::ptr::write_volatile((ct + 0x84) as *mut u32, (dma_paddr >> 32) as u32);
+    core::ptr::write_volatile((ct + 0x8C) as *mut u32, 511 | (1 << 31));
+
+    // Command Header slot 0: CFL(5) | W(1)<<6 | PRDTL(1)<<16.
+    core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 6) | (1u32 << 16));
+    core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32);
+    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, (dma_paddr >> 32) as u32);
+
+    pw(0x38, 1);
+    for _ in 0..5_000_000u64 {
+        if pr(0x38) & 1 == 0 {
+            return pr(0x20) & 0xFF;
+        }
+        yield_now();
+    }
+    0xFF
+}
+
 /// FAT32 filesystem geometry parsed from the volume's BPB (sector 0), plus the AHCI handles
 /// needed to read further sectors. All reads go through `ahci_read_sector` into the shared
 /// data buffer at `AHCI_DMA_VADDR + 0x800` — so a caller MUST consume one sector's bytes
@@ -21137,6 +21199,7 @@ struct Fat32 {
     scratch_vaddr: u64,
     bps: u32,        // bytes per sector
     spc: u32,        // sectors per cluster
+    total_sectors: u32, // FAT-visible sector count from the BPB
     fat_start: u32,  // first FAT sector
     data_start: u32, // first data sector (cluster 2)
     root_cl: u32,    // root directory cluster

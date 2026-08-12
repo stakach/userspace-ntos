@@ -54,6 +54,9 @@ pub(crate) unsafe fn storage_probe(
     let spc = bp(0x0D) as u32;
     let reserved = bp16(0x0E);
     let nfats = bp(0x10) as u32;
+    let total16 = bp16(0x13);
+    let total32 = bp32(0x20);
+    let total_sectors = if total16 != 0 { total16 } else { total32 };
     let spf32 = bp32(0x24);
     let root_cl = bp32(0x2C);
     let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
@@ -67,6 +70,8 @@ pub(crate) unsafe fn storage_probe(
     print_u64(nfats as u64);
     print_str(b" spf=");
     print_u64(spf32 as u64);
+    print_str(b" total=");
+    print_u64(total_sectors as u64);
     print_str(b"\n");
     let (mut cluster, mut size, mut hive_size, mut smss_size, mut imports_size, mut ntdll_size) =
         (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
@@ -79,6 +84,7 @@ pub(crate) unsafe fn storage_probe(
             scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
             bps,
             spc,
+            total_sectors,
             fat_start: reserved,
             data_start: reserved + nfats * spf32,
             root_cl,

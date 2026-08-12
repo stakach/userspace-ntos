@@ -22,6 +22,31 @@ pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
     (fs.dma_vaddr + 0x800) as *const u8
 }
 
+/// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
+#[allow(dead_code)]
+pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
+    if fs.bps != 512 || data.len() != fs.bps as usize {
+        return 0xff;
+    }
+    core::ptr::copy_nonoverlapping(data.as_ptr(), (fs.dma_vaddr + 0x800) as *mut u8, data.len());
+    ahci_write_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64)
+}
+
+#[allow(dead_code)]
+pub(crate) const WRITABLE_SNAPSHOT_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
+#[allow(dead_code)]
+pub(crate) const WRITABLE_SNAPSHOT_RESERVE_SECTORS: u32 = WRITABLE_SNAPSHOT_RESERVE_BYTES / 512;
+
+/// Return the raw disk region reserved immediately after the FAT-visible volume, if the BPB
+/// exposes a finite volume size. The image builder appends this reserve outside FAT metadata.
+#[allow(dead_code)]
+pub(crate) fn writable_snapshot_reserve(fs: &Fat32) -> Option<(u32, u32)> {
+    if fs.total_sectors == 0 {
+        return None;
+    }
+    Some((fs.total_sectors, WRITABLE_SNAPSHOT_RESERVE_SECTORS))
+}
+
 /// First disk sector of a cluster.
 pub(crate) fn fat_cluster_sector(fs: &Fat32, cluster: u32) -> u32 {
     fs.data_start + (cluster - 2) * fs.spc
@@ -883,6 +908,9 @@ pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64
     let spc = bp(0x0D) as u32;
     let reserved = bp16(0x0E);
     let nfats = bp(0x10) as u32;
+    let total16 = bp16(0x13);
+    let total32 = bp32(0x20);
+    let total_sectors = if total16 != 0 { total16 } else { total32 };
     let spf32 = bp32(0x24);
     let root_cl = bp32(0x2C);
     let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
@@ -894,6 +922,7 @@ pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64
             scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
             bps,
             spc,
+            total_sectors,
             fat_start: reserved,
             data_start: reserved + nfats * spf32,
             root_cl,

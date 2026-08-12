@@ -4308,3 +4308,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`. Review adjustment: next wire the executive-side AHCI sector writer and a
   reserved snapshot region behind this trait, then mount `writable_fs` from the latest valid stored
   snapshot before provisioning missing first-boot source trees.
+
+  D3 disk-reserve and sector-write primitive (2026-08-12): the boot image now appends a default
+  16 MiB raw persistence tail after the 256 MiB FAT superfloppy. This range is intentionally outside
+  the BPB `TotalSectors` count, so FAT/BOOTBOOT continue to see the original read-mostly volume while
+  the executive can address the tail by LBA for the two-slot writable-overlay snapshot store. The
+  executive parses and retains the FAT-visible sector count in `Fat32`, exposes the reserved region
+  as `(start_lba, sector_count)`, and has a bounded ATA `WRITE DMA EXT` sector primitive plus a
+  `fat_write_sector` wrapper that fills the existing AHCI DMA data page before issuing one-sector
+  writes. Review adjustment: the next D3 slice should implement the executive `SnapshotBlockDevice`
+  backend over this reserve, then use it to restore `writable_fs` before first-boot provisioning and
+  commit checkpoints after hive/profile flushes.
