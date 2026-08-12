@@ -61,14 +61,11 @@ now passes with real `ScrollBar` metadata (`atom=0xc004`, style `0x8b`, `cbWndEx
 pool-headroom gate passes with `slot-free=68642`, `ut-free=58629KiB`, `image-bank=8491/8491/8491`,
 and `image-bank-fails=0`.
 
-Active frontier: that follow-up run reached Explorer's `NtUserProcessConnect` and then quiesced
-before the first Explorer `NtUserCreateWindowEx`. The main thread was running inside
-`comdlg32+0x31080` during DLL process attach with the instruction page present as a banked shared
-image mapping and shared-cache hit. This is now a generic hosted-loader/DLL-init progress problem,
-not shell launch policy, not static executable identity, and not synthetic paint. The next useful
-target is to diagnose why that hosted thread makes no kernel-visible progress after
-`NtUserProcessConnect`: inspect the `comdlg32` attach path, loader lock/wait state, and any missing
-ntdll/user32 service it expects before window creation.
+Superseded frontier: that follow-up run reached Explorer's `NtUserProcessConnect` and then quiesced
+before the first Explorer `NtUserCreateWindowEx` inside `comdlg32` DLL process attach. Later desktop
+proofs below move past that wall into genuine Explorer shell chrome, so treat any new
+`comdlg32+0x31080` quiesce as a possible stale-binary/stale-branch signal unless it reproduces on the
+current tree.
 
 Serialized validation (2026-08-12): `.tmp/run-desktop-shared-pager-20260812.log` reaches the
 harness sentinel with real Explorer desktop and icon paint. Screenshot proof
@@ -82,6 +79,16 @@ and `shared-dup=0`. That run's red gates included LSA auth/logon accounting and 
 later multi-client LSA proof above closes the LSA entries. The desktop frontier is therefore no
 longer shell launch, paint scaffolding, or LSA routing; the next target is generic process/view/image
 teardown and frame/CSlot reclaim under the live service wave.
+
+Current timer slice (2026-08-12): HPET one-shot delivery now passes a single effective timestamp to
+every due-wait table. Because the comparator is programmed from 100ns time with a ceil conversion,
+the interrupt-side wake scan uses the armed deadline as the minimum `now` for a non-stale delivery
+instead of recalculating each subsystem's timestamp with a floor conversion. Serialized validation
+`.tmp/run-desktop-effective-timer-now-20260812.log` reaches the harness sentinel with
+`exec_delay_timer_disarms` green (`deliveries=566`, `woke-nothing=1`, `early-stale=177`), LSA auth
+and logon green, and real Explorer shell chrome still painted. The remaining red gate is now only
+`exec_vm_pool_headroom`, with `ut-free=18092KiB`, `slot-free=11853`, `image-bank-fails=0`, and no
+VM allocation failure counters.
 
 Current process-lifetime reclaim slice (2026-08-12): final `NtTerminateProcess` teardown now runs a
 generic process VM reclaim pass. It writes back and drops generic mapped-section views for the
@@ -811,12 +818,12 @@ before unrelated executive traffic monopolises the receive loop.
 ## Immediate Iteration
 
 Review adjustment (2026-08-12): continue the memory-manager/resource frontier before opening new
-driver or registry fronts. First close the current SEC_IMAGE cap-banking slice by committing the
-generic child-CNode bank, live Untyped accounting, and `NtUserGetClassInfo` output marshalling
-cleanup. Then diagnose the active hosted-loader stall: Explorer reaches `NtUserProcessConnect` and
-quiesces in `comdlg32` DLL process attach before its first `NtUserCreateWindowEx`. Keep this
-mechanism-level: no executable-name launch policy, no shell-specific paint path, and no fallback
-root-held image caps when banking fails.
+driver or registry fronts. The SEC_IMAGE cap-banking slice is committed (`a3e1017`) with generic
+child-CNode banking, live Untyped accounting, and `NtUserGetClassInfo` output marshalling cleanup.
+The latest desktop/icon proof moves past the earlier hosted-loader `comdlg32` wall, and the
+deadline-aware HPET wake scan closes the post-desktop delay-timer gate. The active slice is now
+VM/root-resource headroom under the service wave. Keep this mechanism-level: no executable-name
+launch policy, no shell-specific paint path, and no fallback root-held image caps when banking fails.
 
 1. Continue B3 cleanup after the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive
    state carries the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and

@@ -12752,8 +12752,8 @@ unsafe fn delay_park(
 unsafe fn delay_wake_due(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    now: u64,
 ) -> u64 {
-    let now = monotonic_time_100ns();
     let mut woken = 0;
     while let Some(waiter) = queue.pop_due(now) {
         set_reply_mr(15, waiter.resume_ip);
@@ -12781,8 +12781,7 @@ unsafe fn delay_wake_due(
     woken
 }
 
-unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
-    let now = monotonic_time_100ns();
+unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
     while let Some(waiter) =
         unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
@@ -12823,8 +12822,7 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
-unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
-    let now = monotonic_time_100ns();
+unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
     while let Some(waiter) =
         unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS)).pop_due(now) }
@@ -12845,8 +12843,8 @@ unsafe fn pipe_name_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
-unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler) -> u64 {
-    let fired = handler.user_timer_fire_due(monotonic_time_100ns());
+unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
+    let fired = handler.user_timer_fire_due(now);
     if fired != 0 {
         let woken = wait_wake_dispatcher_set(handler);
         USER_TIMER_FIRED_COUNT.fetch_add(fired, Ordering::Relaxed);
@@ -12980,13 +12978,18 @@ unsafe fn delay_timer_interrupt(
     // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
     // it must not be counted as a spurious wake — `exec_delay_timer_disarms`' `spurious <= 64`
     // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
+    // The comparator is programmed with hundred_ns_to_ticks_ceil().  When HPET delivers at that
+    // tick, ticks_to_100ns() can still floor one quantum below the original deadline; use the armed
+    // deadline as the minimum effective time for this non-stale delivery.
+    let now_100ns =
+        monotonic_time_100ns().max(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
     let watchdog_tick = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
-    let woken = delay_wake_due(handler, queue)
-        + wait_wake_due(handler)
-        + keyed_wait_wake_due(handler)
-        + io_completion_wake_due(handler)
-        + pipe_name_wait_wake_due(handler)
-        + user_timer_wake_due(handler)
+    let woken = delay_wake_due(handler, queue, now_100ns)
+        + wait_wake_due(handler, now_100ns)
+        + keyed_wait_wake_due(handler, now_100ns)
+        + io_completion_wake_due(handler, now_100ns)
+        + pipe_name_wait_wake_due(handler, now_100ns)
+        + user_timer_wake_due(handler, now_100ns)
         + watchdog_tick;
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
@@ -13390,8 +13393,7 @@ fn keyed_release_remember_pending(key: u64) -> bool {
     false
 }
 
-unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
-    let now = monotonic_time_100ns();
+unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
     for slot in 0..KEYED_WAITER_N {
         if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
@@ -13974,8 +13976,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
     woken
 }
 
-unsafe fn wait_wake_due(handler: &mut ExecNtHandler) -> u64 {
-    let now = monotonic_time_100ns();
+unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
     for slot in 0..WAITER_N {
         if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
