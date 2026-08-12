@@ -4,8 +4,13 @@
 use crate::*;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
-const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
-const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 4 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_STEADY_PAGES: u64 = 16;
+const SEC_IMAGE_PREFETCH_SOFT_PAGES: u64 = 8;
+const SEC_IMAGE_PREFETCH_LOW_PAGES: u64 = 1;
+const SEC_IMAGE_PREFETCH_SOFT_UNTYPED_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES: u64 = 8 * 1024 * 1024;
+const SEC_IMAGE_PREFETCH_SOFT_SLOT_HEADROOM: u64 = 96 * 1024;
 const SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM: u64 = 64 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM: u64 = 16 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -660,21 +665,33 @@ fn sec_image_forward_run() -> u64 {
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slot_free = root_slot_available_count();
+    let slot_soft = slots_cap != 0 && slot_free <= SEC_IMAGE_PREFETCH_SOFT_SLOT_HEADROOM;
     let slot_pressure = slots_cap != 0 && slot_free <= SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM;
     let slot_critical =
         slots_cap != 0 && slot_free <= SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM;
     let frame_hw = CSRSS_FRAME_HW.load(Ordering::Relaxed);
+    let frame_soft = frame_hw * 2 >= CSRSS_FRAME_CAP as u64;
     let frame_pressure = frame_hw * 5 >= CSRSS_FRAME_CAP as u64 * 3;
     let frame_critical = frame_hw * 10 >= CSRSS_FRAME_CAP as u64 * 9;
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let untyped_free = untyped_total.saturating_sub(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
+    let untyped_soft = untyped_total != 0
+        && untyped_free
+            <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_SOFT_UNTYPED_MARGIN_BYTES;
     let untyped_low = untyped_total != 0
         && untyped_free
             <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES;
     let untyped_critical = untyped_total != 0
         && untyped_free
             <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_CRITICAL_UNTYPED_MARGIN_BYTES;
-    if slot_pressure || frame_pressure || untyped_low {
+    let batch_pages = if slot_pressure || frame_pressure || untyped_low {
+        SEC_IMAGE_PREFETCH_LOW_PAGES
+    } else if slot_soft || frame_soft || untyped_soft {
+        SEC_IMAGE_PREFETCH_SOFT_PAGES
+    } else {
+        SEC_IMAGE_PREFETCH_STEADY_PAGES
+    };
+    if batch_pages != SEC_IMAGE_PREFETCH_STEADY_PAGES {
         if SEC_IMAGE_PREFETCH_THROTTLE_LOGGED.swap(1, Ordering::Relaxed) == 0 {
             print_str(b"[sec-image] forward prefetch throttled under pool pressure: cslots=");
             print_u64(slots_used);
@@ -691,12 +708,12 @@ fn sec_image_forward_run() -> u64 {
             print_str(b"KiB");
             print_str(b" critical=");
             print_u64((slot_critical || frame_critical || untyped_critical) as u64);
+            print_str(b" batch=");
+            print_u64(batch_pages);
             print_str(b"\n");
         }
-        1
-    } else {
-        32
     }
+    batch_pages
 }
 
 fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
@@ -6136,9 +6153,10 @@ pub(crate) unsafe fn service_sec_image(
             // eager mapping made every untouched section resident and retained one root-CNode cap for
             // each scratch mapping plus one for each process mapping. A broad LSASS dependency scan
             // therefore exhausted the finite root CSpace before those pages were ever referenced.
-            // Thirty-two pages amortize the QEMU fault round-trip while preserving genuine demand
-            // paging; once root-slot or frame-registry pressure approaches the gate, shrink the
-            // speculative run so late userinit DLL loads stop pre-residenting mostly untouched pages.
+            // A small forward run amortizes the QEMU fault round-trip while preserving genuine
+            // demand paging; once root-slot, frame-registry, or root-Untyped pressure approaches the
+            // gate, shrink the speculative run so late service DLL loads stop pre-residenting mostly
+            // untouched pages.
             let (batch_start, batch_pages) = (page, sec_image_forward_run());
             let mut allocation_failed = false;
             let mut image_protect_failed = false;

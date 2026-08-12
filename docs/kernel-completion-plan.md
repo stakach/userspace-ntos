@@ -90,6 +90,18 @@ and logon green, and real Explorer shell chrome still painted. The remaining red
 `exec_vm_pool_headroom`, with `ut-free=18092KiB`, `slot-free=11853`, `image-bank-fails=0`, and no
 VM allocation failure counters.
 
+Current SEC_IMAGE prefetch slice (2026-08-12): the VM pool gate is now failing on measured resource
+runway after the real desktop/icon proof, not on a shell/frontier behavior gap. The speculative
+SEC_IMAGE forward-fill window is pressure-tiered from measured root slots, frame-registry high-water,
+and live root-Untyped headroom: the retained policy maps at most 16 pages in steady state, 8 pages
+under soft pressure, and only the faulting page under low pressure. Retained serialized validation
+`.tmp/run-desktop-secimage-prefetch-retained-20260812.log` reaches the harness sentinel with
+Explorer shell chrome, GDI/user-batch, LSA/logon, and delay-timer gates green, while improving final
+root-Untyped headroom to `33476KiB`; `exec_vm_pool_headroom` remains the only red gate. A tighter
+8/4/1 experiment improved the final census to `38816KiB` but exhausted the executive bump heap before
+a clean gate, so it is not the retained policy. The next reduction must come from total resident
+frame/retype sharing or reclaim, not more prefetch shrinking or gate relaxation.
+
 Current process-lifetime reclaim slice (2026-08-12): final `NtTerminateProcess` teardown now runs a
 generic process VM reclaim pass. It writes back and drops generic mapped-section views for the
 terminating process, clears DLL mapped-view flags through a host-tested `nt-dll-registry`
@@ -108,26 +120,17 @@ reduction, not gate relaxation.
 Current SEC_IMAGE sharing slice (2026-08-12): the latest desktop screenshots and serial census show
 real Explorer desktop/icons, but the later service wave still drives root untyped and root CSlot
 headroom below the gate. The next reduction is mechanism-level sharing, not a gate relaxation. The
-first clean-data sharing attempt widened the DLL cache to every non-writable image page, but the
-desktop proof regressed in CSRSS/winsrv with `STATUS_ACCESS_VIOLATION`; until we add a stronger
-resident image data COW/protect proof, the production predicate is back to executable,
-non-writable DLL image pages only. That still keeps clean text sharing in place and avoids the old
-helper by deriving executability from the current image fault plan. The retry also exposed a real
-`smss` write-copy case: `pi == 0` shared image mappings must be retained too, otherwise the later
-COW promotion cannot unmap the clean view before installing the private writable page. Shared-image
-map-cap tracking now applies to every hosted image process. Local validation is green:
-`cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof should confirm Explorer
-desktop/icon paint still reaches the quiesce frontier with the executable-only sharing invariant
-restored. Follow-up retry `.tmp/run-desktop-executable-image-sharing-20260812.log` restored the
-CSRSS/winsrv path and reached `userinit.exe`, `explorer.exe`, `NtUserProcessConnect`, and GDI handle
-table mapping, then quiesced before the first `NtUserCreateWindowEx` with Explorer's main thread at
-`ws2_32` DLL attach. That retry is now a generic hosted-thread fault/IPC frontier, not a reason to
-add shell policy: hosted main-thread quiesce diagnostics report TCB scheduler/reply/fault state plus
-the committed mapping, private frame record, shared image map-cap, and shared DLL cache entry for
-the stalled instruction page. Local validation for the diagnostic wiring is green: `cargo fmt
---all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-x86_64-unknown-none`, and `git diff --check`.
+first clean-data sharing attempt widened the DLL cache to every non-writable image page and regressed
+in CSRSS/winsrv with `STATUS_ACCESS_VIOLATION`; later cap-bank work fixed the missing `pi == 0`
+shared-image mapping record that prevented write-copy promotion from unmapping a clean shared view,
+but that was not sufficient. Retry logs
+`.tmp/run-desktop-writecopy-image-sharing-20260812.log` and
+`.tmp/run-desktop-writecopy-image-sharing-guarded-20260812.log` both fail during winsrv
+initialization with `STATUS_ACCESS_VIOLATION`; the guarded run removes the duplicate-map collisions
+but still dies, so plain `PAGE_WRITECOPY` image data is not a production sharing source yet. The
+production predicate remains immutable image pages plus execute/read text derived from the current
+fault plan. Future clean-data sharing needs a stronger resident-data/write-copy proof, likely at the
+VAD/section-object layer, before changing the live SEC_IMAGE predicate again.
 
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
@@ -822,8 +825,11 @@ driver or registry fronts. The SEC_IMAGE cap-banking slice is committed (`a3e101
 child-CNode banking, live Untyped accounting, and `NtUserGetClassInfo` output marshalling cleanup.
 The latest desktop/icon proof moves past the earlier hosted-loader `comdlg32` wall, and the
 deadline-aware HPET wake scan closes the post-desktop delay-timer gate. The active slice is now
-VM/root-resource headroom under the service wave. Keep this mechanism-level: no executable-name
-launch policy, no shell-specific paint path, and no fallback root-held image caps when banking fails.
+VM/root-resource headroom under the service wave. Pressure-tiered SEC_IMAGE prefetching recovered
+some runway but did not close the gate by itself; the write-copy clean-data sharing retry regressed
+CSRSS/winsrv and is not retained. Continue with generic resident frame/retype reduction, process/view
+reclaim, or section-object sharing proofs. Keep this mechanism-level: no executable-name launch
+policy, no shell-specific paint path, and no fallback root-held image caps when banking fails.
 
 1. Continue B3 cleanup after the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive
    state carries the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and
