@@ -129,6 +129,24 @@ x86_64-unknown-none`, and `git diff --check`. Next serialized desktop proof shou
 Explorer desktop/icon paint; remaining root untyped headroom still needs total fresh-retype
 reduction, not gate relaxation.
 
+Current hosted-thread fixed-frame census slice (2026-08-12): the new gate-time
+`[frame-reg-census]` diagnostic shows the shell proof is stable and resident-frame attribution is now
+complete without changing VM authority. The first census run,
+`.tmp/run-desktop-frame-reg-census-20260812.log`, reached the sentinel with real Explorer chrome
+green but reported `unknown=1136`. A follow-up attempt to register every hosted secondary thread
+stack/TEB/ACS/IPC/trampoline range as a committed private mapping proved the wrong boundary:
+`.tmp/run-desktop-thread-fixed-mappings-20260812.log` reached the sentinel but regressed to `245/295`,
+with winlogon SAS/api0/login gates red and Explorer never spawned. The retained diagnostic only
+classifies already-registered client frames with no VAD extent directly as `fixed-private`, without
+publishing ACS or other hosted-thread internals through the committed-map authority that
+`NtQueryVirtualMemory`, protection, and fixed-overlap checks consume. Serialized proof
+`.tmp/run-desktop-frame-census-direct-20260812.log` reaches the sentinel with Explorer shell chrome
+green, `294/295` gates passing, and `exec_vm_pool_headroom` the only red gate; it reports
+`live=19824`, `image=11098`, `vad-private=7469`, `fixed-private=1253`, and `unknown=0`, plus
+`explorer-paint begin/end=2/22`, `direct-gdi-returns=169`, and a saturated final Explorer
+framebuffer. The next target is still real root pressure reduction through sharing or reclaim, not
+gate relaxation or committed-map tricks.
+
 Current SEC_IMAGE sharing slice (2026-08-12): the latest desktop screenshots and serial census show
 real Explorer desktop/icons, but the later service wave still drives root untyped and root CSlot
 headroom below the gate. The next reduction is mechanism-level sharing, not a gate relaxation. The

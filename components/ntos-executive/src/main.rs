@@ -5127,6 +5127,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let protection_overrides = VM_PROTECTION_OVERRIDE_HW.load(Ordering::Relaxed);
     let free_list = VM_FREE_FRAME_HW.load(Ordering::Relaxed);
     print_pool_census(b"gate");
+    print_frame_registry_census(b"gate");
     check(
         b"exec_vm_pool_headroom",
         // The boot Untyped's size was really read from BootInfo (so this is measured, not assumed) …
@@ -7569,6 +7570,171 @@ unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
         return frame;
     }
     dll_cache_get(page)
+}
+
+const FRAME_REGISTRY_TOP_PI_COUNT: usize = 6;
+
+struct FrameRegistryCensus {
+    live: u64,
+    owned: u64,
+    borrowed: u64,
+    source_caps: u64,
+    aliases: u64,
+    image: u64,
+    fixed_private: u64,
+    mapped: u64,
+    vad_private: u64,
+    vad_reserved: u64,
+    unknown: u64,
+    by_pi: [u64; MAX_PI],
+}
+
+impl FrameRegistryCensus {
+    const fn new() -> Self {
+        Self {
+            live: 0,
+            owned: 0,
+            borrowed: 0,
+            source_caps: 0,
+            aliases: 0,
+            image: 0,
+            fixed_private: 0,
+            mapped: 0,
+            vad_private: 0,
+            vad_reserved: 0,
+            unknown: 0,
+            by_pi: [0; MAX_PI],
+        }
+    }
+}
+
+unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
+    let mut census = FrameRegistryCensus::new();
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
+    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
+    let aliases = core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64;
+    let source_caps = core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64;
+    let owns_frames = core::ptr::addr_of!(CSRSS_FRAME_OWNS_FRAME) as *const bool;
+    let vm_maps = core::ptr::addr_of!(PROCESS_VM_REGIONS)
+        as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
+
+    for index in 0..n {
+        let pi = core::ptr::read(pis.add(index)) as usize;
+        let page = core::ptr::read(vas.add(index));
+        census.live = census.live.saturating_add(1);
+        if core::ptr::read(owns_frames.add(index)) {
+            census.owned = census.owned.saturating_add(1);
+        } else {
+            census.borrowed = census.borrowed.saturating_add(1);
+        }
+        if core::ptr::read(source_caps.add(index)) != 0 {
+            census.source_caps = census.source_caps.saturating_add(1);
+        }
+        if core::ptr::read(aliases.add(index)) != 0 {
+            census.aliases = census.aliases.saturating_add(1);
+        }
+        if pi >= MAX_PI {
+            census.unknown = census.unknown.saturating_add(1);
+            continue;
+        }
+        census.by_pi[pi] = census.by_pi[pi].saturating_add(1);
+
+        if let Some(info) = process_committed_mapping_basic_information(pi as u64, page) {
+            match info.type_ {
+                nt_address_space::MEM_IMAGE => {
+                    census.image = census.image.saturating_add(1);
+                }
+                nt_address_space::MEM_MAPPED => {
+                    census.mapped = census.mapped.saturating_add(1);
+                }
+                nt_address_space::MEM_PRIVATE => {
+                    census.fixed_private = census.fixed_private.saturating_add(1);
+                }
+                _ => {
+                    census.unknown = census.unknown.saturating_add(1);
+                }
+            }
+            continue;
+        }
+
+        if let Some(extent) = (*vm_maps.add(pi)).extent_at(page) {
+            if extent.state == nt_address_space::VmExtentState::Committed {
+                census.vad_private = census.vad_private.saturating_add(1);
+            } else {
+                census.vad_reserved = census.vad_reserved.saturating_add(1);
+            }
+        } else if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+            census.fixed_private = census.fixed_private.saturating_add(1);
+        } else {
+            census.unknown = census.unknown.saturating_add(1);
+        }
+    }
+
+    census
+}
+
+fn print_frame_registry_top_pi(by_pi: &[u64; MAX_PI]) {
+    let mut used = [false; MAX_PI];
+    let mut printed = 0usize;
+    while printed < FRAME_REGISTRY_TOP_PI_COUNT {
+        let mut best_pi = usize::MAX;
+        let mut best_count = 0u64;
+        for pi in 0..MAX_PI {
+            let count = by_pi[pi];
+            if !used[pi] && count > best_count {
+                best_pi = pi;
+                best_count = count;
+            }
+        }
+        if best_pi == usize::MAX || best_count == 0 {
+            break;
+        }
+        if printed != 0 {
+            print_str(b",");
+        }
+        print_u64(best_pi as u64);
+        print_str(b":");
+        print_u64(best_count);
+        used[best_pi] = true;
+        printed += 1;
+    }
+    if printed == 0 {
+        print_str(b"none");
+    }
+}
+
+fn print_frame_registry_census(tag: &[u8]) {
+    let census = unsafe { collect_frame_registry_census() };
+    print_str(b"[frame-reg-census] ");
+    print_str(tag);
+    print_str(b" live=");
+    print_u64(census.live);
+    print_str(b" hw=");
+    print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
+    print_str(b" owned/borrowed=");
+    print_u64(census.owned);
+    print_str(b"/");
+    print_u64(census.borrowed);
+    print_str(b" source-caps=");
+    print_u64(census.source_caps);
+    print_str(b" aliases=");
+    print_u64(census.aliases);
+    print_str(b" image=");
+    print_u64(census.image);
+    print_str(b" fixed-private=");
+    print_u64(census.fixed_private);
+    print_str(b" mapped=");
+    print_u64(census.mapped);
+    print_str(b" vad-private=");
+    print_u64(census.vad_private);
+    print_str(b" vad-reserved=");
+    print_u64(census.vad_reserved);
+    print_str(b" unknown=");
+    print_u64(census.unknown);
+    print_str(b" top-pi=");
+    print_frame_registry_top_pi(&census.by_pi);
+    print_str(b"\n");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19382,10 +19548,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     if t.resume {
         let _ = tcb_resume(tcb);
     }
-    HostedThreadSpawnResult::new(
-        tcb,
-        HostedThreadMechanismCaps::new(raw, cnode, sched_context),
-    )
+    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode, sched_context))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
