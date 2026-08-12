@@ -18,6 +18,7 @@ mod fs;
 mod hive_provider;
 mod path;
 mod query;
+mod snapshot_store;
 mod status;
 
 pub use directory::*;
@@ -34,6 +35,9 @@ pub use path::{
     MountManager, DOS_DRIVE_FIXED, MEMFS_VOLUME,
 };
 pub use query::*;
+pub use snapshot_store::{
+    SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, StoredSnapshot,
+};
 pub use status::*;
 
 #[cfg(test)]

@@ -1,5 +1,66 @@
 use super::*;
 
+struct MemoryBlockDevice {
+    sector_size: usize,
+    data: alloc::vec::Vec<u8>,
+    writes: usize,
+    fail_write: Option<usize>,
+}
+
+impl MemoryBlockDevice {
+    fn new(sector_size: usize, sectors: usize) -> Self {
+        Self {
+            sector_size,
+            data: alloc::vec![0; sector_size * sectors],
+            writes: 0,
+            fail_write: None,
+        }
+    }
+
+    fn fail_next_write(&mut self) {
+        self.fail_write = Some(self.writes);
+    }
+
+    fn corrupt(&mut self, lba: u64, offset: usize) {
+        let index = lba as usize * self.sector_size + offset;
+        self.data[index] ^= 0x55;
+    }
+}
+
+impl SnapshotBlockDevice for MemoryBlockDevice {
+    fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
+    fn sector_count(&self) -> u64 {
+        (self.data.len() / self.sector_size) as u64
+    }
+
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        if out.len() != self.sector_size || lba >= self.sector_count() {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let start = lba as usize * self.sector_size;
+        out.copy_from_slice(&self.data[start..start + self.sector_size]);
+        Ok(())
+    }
+
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        if data.len() != self.sector_size || lba >= self.sector_count() {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        if self.fail_write == Some(self.writes) {
+            self.writes += 1;
+            self.fail_write = None;
+            return Err(SnapshotBlockStoreError::Io);
+        }
+        self.writes += 1;
+        let start = lba as usize * self.sector_size;
+        self.data[start..start + self.sector_size].copy_from_slice(data);
+        Ok(())
+    }
+}
+
 #[test]
 fn query_information_encodes_standard_layout() {
     let metadata = QueryMetadata {
@@ -739,6 +800,118 @@ fn memfs_snapshot_rejects_corrupt_or_malformed_images() {
         MemFs::from_snapshot(&extra),
         Err(MemFsSnapshotError::InvalidRecord)
     ));
+}
+
+#[test]
+fn snapshot_block_store_commits_latest_valid_slot() {
+    let store = SnapshotBlockStore::new(2, 16);
+    let mut dev = MemoryBlockDevice::new(512, 24);
+    assert_eq!(store.payload_capacity(&dev).unwrap(), 7 * 512);
+    assert!(store.read_latest(&mut dev).unwrap().is_none());
+
+    assert_eq!(store.commit_next(&mut dev, b"first").unwrap(), 1);
+    let first = store.read_latest(&mut dev).unwrap().unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.payload, b"first");
+
+    assert_eq!(
+        store
+            .commit_next(&mut dev, b"second snapshot payload")
+            .unwrap(),
+        2
+    );
+    let second = store.read_latest(&mut dev).unwrap().unwrap();
+    assert_eq!(second.generation, 2);
+    assert_eq!(second.payload, b"second snapshot payload");
+}
+
+#[test]
+fn snapshot_block_store_keeps_previous_generation_when_update_write_fails() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let mut dev = MemoryBlockDevice::new(512, 16);
+    assert_eq!(store.commit_next(&mut dev, b"committed").unwrap(), 1);
+
+    dev.fail_next_write();
+    assert_eq!(
+        store.commit_next(&mut dev, b"new generation"),
+        Err(SnapshotBlockStoreError::Io)
+    );
+    let latest = store.read_latest(&mut dev).unwrap().unwrap();
+    assert_eq!(latest.generation, 1);
+    assert_eq!(latest.payload, b"committed");
+}
+
+#[test]
+fn snapshot_block_store_rejects_bad_geometry_oversize_and_corruption() {
+    let mut dev = MemoryBlockDevice::new(512, 8);
+    let bad = SnapshotBlockStore::new(0, 3);
+    assert_eq!(
+        bad.commit_next(&mut dev, b"x"),
+        Err(SnapshotBlockStoreError::InvalidGeometry)
+    );
+
+    let store = SnapshotBlockStore::new(0, 8);
+    let too_large = alloc::vec![0x5a; store.payload_capacity(&dev).unwrap() + 1];
+    assert_eq!(
+        store.commit_next(&mut dev, &too_large),
+        Err(SnapshotBlockStoreError::OutOfSpace)
+    );
+
+    assert_eq!(store.commit_next(&mut dev, b"valid").unwrap(), 1);
+    dev.corrupt(1, 0);
+    assert_eq!(
+        store.read_latest(&mut dev),
+        Err(SnapshotBlockStoreError::Corrupt)
+    );
+}
+
+#[test]
+fn memfs_snapshot_restores_from_block_store_payload() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let dir = fs.zw_create_file(
+        r"\??\C:\Profiles",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    fs.zw_close(dir.handle);
+    let file = fs.zw_create_file(
+        r"\??\C:\Profiles\persisted.txt",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(file.handle, None, b"survived storage").0,
+        STATUS_SUCCESS
+    );
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    let store = SnapshotBlockStore::new(4, 32);
+    let mut dev = MemoryBlockDevice::new(512, 40);
+    assert_eq!(store.commit_next(&mut dev, &snapshot).unwrap(), 1);
+    let stored = store.read_latest(&mut dev).unwrap().unwrap();
+    let mut restored = FileSystem::from_volume_snapshot(&stored.payload).unwrap();
+
+    let reopened = restored.zw_create_file(
+        r"\??\C:\Profiles\persisted.txt",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(reopened.status, STATUS_SUCCESS);
+    assert_eq!(
+        restored.zw_read_file(reopened.handle, Some(0), 64).1,
+        b"survived storage"
+    );
 }
 
 #[test]

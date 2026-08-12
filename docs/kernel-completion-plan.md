@@ -1004,9 +1004,10 @@ before unrelated executive traffic monopolises the receive loop.
   `system32\config` on `NtFlushKey`; source boot hive files stay read-through FAT entries until a
   flush creates a writable-layer replacement. The heap-neutral read-through/checkpoint path has a
   clean serialized desktop proof. `nt-fs::MemFs` now also has a versioned, checksummed volume
-  snapshot/restore primitive that preserves sparse files without expanding zero ranges; remaining D3
-  work is binding that image to real storage and proving repeat-boot reuse across system hive,
-  profile hive, and writable overlay state.
+  snapshot/restore primitive that preserves sparse files without expanding zero ranges, plus a
+  two-slot block-backed snapshot store contract for atomic payload commit over sector I/O. Remaining
+  D3 work is binding that store to the real AHCI/storage write path and proving repeat-boot reuse
+  across system hive, profile hive, and writable overlay state.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
 
@@ -4292,3 +4293,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo fmt --all` and `cargo test -p nt-fs`. Review adjustment: the next D3 slice should mount the
   executive writable overlay from a persisted snapshot source when present and checkpoint it through
   a real storage write path; do not claim reboot persistence from the in-memory snapshot alone.
+
+  D3 snapshot block-store contract (2026-08-12): `nt-fs` now owns the storage-facing contract for
+  persisted writable-volume snapshots. `SnapshotBlockStore` writes an opaque snapshot into a fixed
+  sector range using two commit slots: payload sectors first, then a CRC-checked header sector last.
+  On restart it scans both slots and returns the highest valid generation; if an update fails before
+  the new header commits, the previous generation remains readable. The store is deliberately below
+  FAT path policy and above device-specific AHCI details: any real backend only has to implement the
+  `SnapshotBlockDevice` sector read/write trait. Host tests cover latest-slot selection, failed
+  update preservation, invalid geometry, oversize payload refusal, payload corruption detection, and
+  restoring a real `MemFs` volume snapshot after it has been committed to a block device. Validation:
+  `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: next wire the executive-side AHCI sector writer and a
+  reserved snapshot region behind this trait, then mount `writable_fs` from the latest valid stored
+  snapshot before provisioning missing first-boot source trees.
