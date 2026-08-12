@@ -31,28 +31,25 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest serialized gate validation (2026-08-12): `.tmp/run-desktop-alpc-xview-select-20260812.log`
-rebuilds ntdll, the executive, rust-micro, and the disk image, reaches the quiesce gate after the
-later service wave, and exits through the microtest sentinel at `292/295`. This closes the generic
-ALPC cross-vspace section-view proof without adding a fallback: the throwaway hosted VSpace proof now
-ignores initial hosted admission events on both private endpoints and selects the real writer and
-reader unknown-syscall completions. Proof lines show `[alpc-xview] foreign label=13`, then
-`writer label=2 m0=0x0000000a`, then `reader label=2 m0=0xdeadbeef m3=0xdeadbeef`; the ALPC
-selftest reaches `ok=0x3f`, the writer sees `0x0a`, and both readers observe the shared
-`0xcafebabe_deadbeef` section-view pattern. `exec_alpc_section_view_cross_vspace` now passes along
-with the earlier Dbgk target-blocking, Dbgk remote-breakin, client-reply binding, profile/user hive,
-IDD_LOGON, userinit, Explorer launch, real callback dispatch, and Explorer chrome gates. The
-repeated `[wl-quiesce]` frame remains an idle post-desktop observation: winlogon is parked in user32
-`NtUserMessageCall`, the run has already painted Explorer chrome, and no synthetic worker-injection
-probe follows it. Remaining red gates are generic kernel-system targets:
-`exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and `exec_vm_pool_headroom`. Review
-adjustment: keep treating shell launch, profile staging, WM_PAINT, callback dispatch, Explorer
-chrome, Dbgk proofs, client reply binding, and ALPC section-view transfer as working real
-mechanisms. The next useful implementation slice should make the LSA auth/logon gates reflect the
-now-observed real data-plane handoff or reduce retained VM/CSlot/root-untyped resources through real
-teardown and reclaim. The latest resource proof is still tight: final headroom was
-`slot-free=2529` and `ut-free=12995KiB`; a later-service `thread-pool REFUSED NtCreateThread`
-line for `pi=14` is also a useful lead for the remaining pool-headroom work.
+Latest serialized gate validation (2026-08-12):
+`.tmp/run-desktop-lsa-multi-client-gates-20260812.log` rebuilds ntdll, the executive, rust-micro,
+and the disk image, reaches the post-desktop quiesce gate after the later service wave, and exits
+through the microtest sentinel at `294/295`. This closes the LSA auth/logon accounting without adding
+a fallback: the real `\LsaAuthenticationPort` server accepts multiple live clients, winlogon's
+accepted comm-port handle remains latched, `OperationalMode=0x43218765` is copied back from the real
+server, and the data plane balances three real requests with three replies. The proof is now
+sequence-independent: `exec_lsa_auth_port_connected` checks dynamic connection invariants, and
+`exec_lsa_logon_user_reached` checks the observed API mask plus successful per-API statuses and
+client-memory reads rather than requiring api 2 to be the last request seen globally. The latest
+proof lines show `connects-delivered=2`, `completed=2`, `requests=3`, `replies=3`,
+`api-mask=0x0000000c`, `lookup-status=0`, `logon-status=0`, and `logon-client-reads=6`, followed by
+passing `exec_lsa_auth_port_connected` and `exec_lsa_logon_user_reached`. Explorer still paints real
+shell chrome: `[explorer-fb] final non-bg pixels=786432 ... unique-non-bg>=32 saturated`, and
+`exec_explorer_shell_chrome_painted` passes. The only remaining red gate is
+`exec_vm_pool_headroom`; final resource proof is `ut-free=11823KiB`, `slot-free=1641`, zero
+allocation failures, `shared-frames=3422/16384`, `shared-hits=10313`, `shared-full=0`, and
+`shared-dup=0`. A later-service `thread-pool REFUSED NtCreateThread` line for `pi=14` remains the
+best lead for the next generic resource-lifetime slice.
 
 Latest desktop/icon validation (2026-08-12): serialized graphics retry
 `.tmp/run-desktop-late-freeze-20260812.log` rebuilt ntdll, the executive, rust-micro, and the disk
@@ -86,9 +83,9 @@ icons while the new census shows nonzero shared-cache reuse and zero `shared-ful
 
 Desktop proof interpretation (2026-08-12): the latest screenshots confirm the shell frontier has
 moved beyond launch and paint. Treat Explorer desktop/icon/chrome rendering as a working mechanism
-on the shared-pager proof path, not as synthetic scaffolding. The remaining red gates are kernel
-systems work: LSA logon/auth-port routing and total VM/CSlot/root-untyped retention under the later
-service wave.
+on the shared-pager proof path, not as synthetic scaffolding. The LSA auth/logon gates are now closed
+by the later multi-client proof above; the remaining red gate is total VM/CSlot/root-untyped
+retention under the later service wave.
 
 Callback-harness cleanup slice (2026-08-12): `.tmp/run-desktop-20260812-090617.log` reached the
 post-desktop quiesce frontier, then the old post-loop `w32-slip`/`cb-inject` probes deliberately
@@ -101,7 +98,8 @@ and the final callback/transport gates now assert live invariants only: redirect
 continuation-stack balance, zero reply errors, completed call-bound win32k dispatches, live nested
 depth, zero suspended component outstanding, and no walled win32k dispatches. Next serialized
 desktop proof should contain no `[w32-slip]`, `[cb-inject]`, or post-gate `no fault handler` lines;
-remaining failures should be structural LSA routing and VM/CSlot/root-untyped retention. Local
+the later multi-client LSA proof has since closed the structural LSA routing failures, leaving
+VM/CSlot/root-untyped retention as the active gate. Local
 validation is green: `cargo fmt --all`, `cargo check --manifest-path
 components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
 
@@ -113,10 +111,10 @@ Explorer gates pass (`exec_explorer_process_spawned`, callback redirect, client 
 shell COM class open, and `exec_explorer_shell_chrome_painted`), and `[explorer-fb]` reports the
 full 1024x768 framebuffer as non-background with at least 32 distinct non-background colors. The new
 shared-page census stays healthy: `shared-frames=3422/16384`, `shared-hits=10315`, `shared-full=0`,
-and `shared-dup=0`. The remaining red gates are structural accounting/reclaim targets:
-`exec_lsa_auth_port_connected`, `exec_lsa_logon_user_reached`, and `exec_vm_pool_headroom`. The
-desktop frontier is therefore no longer shell launch or paint scaffolding; the next target is generic
-process/view/image teardown and frame/CSlot reclaim under the live service wave.
+and `shared-dup=0`. That run's red gates included LSA auth/logon accounting and VM pool headroom; the
+later multi-client LSA proof above closes the LSA entries. The desktop frontier is therefore no
+longer shell launch, paint scaffolding, or LSA routing; the next target is generic process/view/image
+teardown and frame/CSlot reclaim under the live service wave.
 
 Current process-lifetime reclaim slice (2026-08-12): final `NtTerminateProcess` teardown now runs a
 generic process VM reclaim pass. It writes back and drops generic mapped-section views for the

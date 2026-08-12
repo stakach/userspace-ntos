@@ -3788,16 +3788,25 @@ unsafe fn check_logon_dialog_gates(passed: &mut u64) {
 fn lsa_authentication_port_specs(passed: &mut u64) {
     let server_port = LSA_AUTH_PORT_OBJECT_HANDLE.load(Ordering::Relaxed);
     let client_port = WINLOGON_LSA_PORT_HANDLE.load(Ordering::Relaxed);
+    let connects_delivered = LSA_CONNECT_DELIVERED.load(Ordering::Relaxed);
+    let connects_completed = LSA_CONNECT_COMPLETED.load(Ordering::Relaxed);
+    let requests = LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed);
+    let replies = LSA_REPLIES_DELIVERED.load(Ordering::Relaxed);
+    let api_mask = LSA_API_MASK.load(Ordering::Relaxed);
+    let lookup_status = LSA_LOOKUP_REPLY_STATUS.load(Ordering::Relaxed);
+    let logon_status = LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed);
+    let logon_client_reads = LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed);
+    let last_api = LSA_LAST_API_NUMBER.load(Ordering::Relaxed);
     print_str(b"[lsa] \\LsaAuthenticationPort: server-port=0x");
     print_hex(server_port as u32);
     print_str(b" server-receive-parks=");
     print_u64(LSA_SERVER_PARKS.load(Ordering::Relaxed));
     print_str(b" connects-delivered=");
-    print_u64(LSA_CONNECT_DELIVERED.load(Ordering::Relaxed));
+    print_u64(connects_delivered);
     print_str(b" accept-decision=");
     print_u64(LSA_ACCEPT_DECISION.load(Ordering::Relaxed));
     print_str(b" completed=");
-    print_u64(LSA_CONNECT_COMPLETED.load(Ordering::Relaxed));
+    print_u64(connects_completed);
     print_str(b" winlogon-client-port=0x");
     print_hex(client_port as u32);
     print_str(b" OperationalMode=0x");
@@ -3805,18 +3814,20 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
     print_str(b" server-wall-ssn=");
     print_u64(LSA_SERVER_WALL_SSN.load(Ordering::Relaxed));
     print_str(b"\n");
-    // The connector holds a REAL comm-port handle that lsass' REAL server thread accepted: the port
-    // came from lsass' own NtCreatePort, the server genuinely blocked in NtReplyWaitReceivePort, the
-    // accept decision (Accept = TRUE) was the real `LsapHandlePortConnection`'s, the completion is the
-    // broker's, and `OperationalMode = 0x43218765` is the constant the real server wrote into its own
+    // One or more clients may connect to `\LsaAuthenticationPort` during a full desktop boot. The
+    // gate therefore checks dynamic port invariants instead of the historical one-client sequence:
+    // lsass published the real port, at least one connection was delivered and completed, winlogon's
+    // accepted comm-port handle remains latched, and the server did not wall while a client was
+    // blocked. `OperationalMode = 0x43218765` is the constant the real server wrote into its own
     // `ConnectInfo` (`references/reactos/dll/win32/lsasrv/authport.c:181`) and we copied back.
     check(
         b"exec_lsa_auth_port_connected",
         server_port != 0
             && LSA_SERVER_PARKS.load(Ordering::Relaxed) >= 1
-            && LSA_CONNECT_DELIVERED.load(Ordering::Relaxed) == 1
+            && connects_delivered >= 1
             && LSA_ACCEPT_DECISION.load(Ordering::Relaxed) == 2
-            && LSA_CONNECT_COMPLETED.load(Ordering::Relaxed) == 1
+            && connects_completed >= 1
+            && connects_completed == connects_delivered
             && WINLOGON_LSA_CONNECTED.load(Ordering::Relaxed) != 0
             && client_port != 0
             && client_port != server_port
@@ -3830,37 +3841,38 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
         passed,
     );
     print_str(b"[lsa] data plane: requests=");
-    print_u64(LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed));
+    print_u64(requests);
     print_str(b" replies=");
-    print_u64(LSA_REPLIES_DELIVERED.load(Ordering::Relaxed));
+    print_u64(replies);
     print_str(b" api-mask=0x");
-    print_hex(LSA_API_MASK.load(Ordering::Relaxed) as u32);
+    print_hex(api_mask as u32);
     print_str(b" lookup-status=0x");
-    print_hex(LSA_LOOKUP_REPLY_STATUS.load(Ordering::Relaxed) as u32);
+    print_hex(lookup_status as u32);
     print_str(b" logon-status=0x");
-    print_hex(LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) as u32);
+    print_hex(logon_status as u32);
     print_str(b" logon-client-reads=");
-    print_u64(LSA_LOGON_CLIENT_READS.load(Ordering::Relaxed));
+    print_u64(logon_client_reads);
+    print_str(b" last-api=");
+    print_u64(last_api);
     print_str(b"\n");
     // msgina's `ConnectToLsa` tail: `LsaLookupAuthenticationPackage(MSV1_0_PACKAGE_NAME)` (api 3)
     // went over the real port to the real server and came back SUCCESS — the auth package is loaded
     // and resolvable — and `LsaLogonUser` (api 2) was then delivered and answered by that same server.
     const API_LOGON_USER: u64 = 1 << 2;
     const API_LOOKUP_PACKAGE: u64 = 1 << 3;
-    // `LsaLookupAuthenticationPackage` (api 3) round-trips COMPLETELY — request and reply, SUCCESS —
-    // and so, now, does `LsaLogonUser` (api 2). The previous form asserted `replies + 1 == requests`
-    // because the api-2 request was permanently outstanding at the `NtCreateToken` wall; with the
-    // service in place EVERY request is answered, so the relation is the strictly stronger
-    // `replies == requests`. A dropped reply, or a second outstanding request, both fail it.
+    // `LsaLookupAuthenticationPackage` (api 3) and `LsaLogonUser` (api 2) both round-trip
+    // completely. Later services can issue additional successful lookup requests, so the proof is the
+    // observed API mask plus successful per-API reply statuses and client-memory reads during the real
+    // logon request, not "api 2 was the last request seen globally".
     check(
         b"exec_lsa_logon_user_reached",
-        LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed) >= 2
-            && LSA_REPLIES_DELIVERED.load(Ordering::Relaxed)
-                == LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed)
-            && LSA_API_MASK.load(Ordering::Relaxed) & API_LOOKUP_PACKAGE != 0
-            && LSA_API_MASK.load(Ordering::Relaxed) & API_LOGON_USER != 0
-            && LSA_LOOKUP_REPLY_STATUS.load(Ordering::Relaxed) == 0
-            && LSA_LAST_API_NUMBER.load(Ordering::Relaxed) == 2,
+        requests >= 2
+            && replies == requests
+            && api_mask & API_LOOKUP_PACKAGE != 0
+            && api_mask & API_LOGON_USER != 0
+            && lookup_status == 0
+            && logon_status == 0
+            && logon_client_reads >= 4,
         passed,
     );
     // ★ HONEST WALL — and it MOVED (batch 51). The real MSV1_0 authentication package runs
