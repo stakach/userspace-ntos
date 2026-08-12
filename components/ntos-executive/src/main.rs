@@ -2160,12 +2160,14 @@ static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(0);
 static ROOT_CSPACE_START: AtomicU64 = AtomicU64::new(0);
 const ROOT_SLOT_RECYCLE_CAP: usize = 32768;
 const ROOT_SLOT_LIVE_WORDS: usize = 4096;
+const ROOT_SLOT_TRACK_CAP: usize = ROOT_SLOT_LIVE_WORDS * 64;
 static mut ROOT_SLOT_RECYCLE: [u64; ROOT_SLOT_RECYCLE_CAP] = [0; ROOT_SLOT_RECYCLE_CAP];
 static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_REUSED: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static mut ROOT_SLOT_LIVE_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
+static mut ROOT_SLOT_RETYPE_BYTES: [u32; ROOT_SLOT_TRACK_CAP] = [0; ROOT_SLOT_TRACK_CAP];
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -5112,7 +5114,7 @@ fn image_writecopy_cow_spec(passed: &mut u64) {
 /// makes exhaustion a RED SPEC rather than a mystery. Thresholds are deliberately below capacity:
 /// the point is to fail BEFORE the wall, while there is still room to diagnose.
 fn vm_pool_headroom_spec(passed: &mut u64) {
-    let untyped_used = UT_RETYPE_BYTES.load(Ordering::Relaxed);
+    let untyped_used = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let untyped_free = untyped_total.saturating_sub(untyped_used);
     let slots_total =
@@ -6838,6 +6840,16 @@ fn root_slot_bit(slot: u64) -> Option<(usize, u64)> {
     Some((word, 1u64 << (index % 64)))
 }
 
+fn root_slot_index(slot: u64) -> Option<usize> {
+    let start = ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
+    if slot < start || slot >= end {
+        return None;
+    }
+    let index = (slot - start) as usize;
+    (index < ROOT_SLOT_TRACK_CAP).then_some(index)
+}
+
 unsafe fn root_slot_mark_live(slot: u64) -> bool {
     let Some((word, bit)) = root_slot_bit(slot) else {
         return false;
@@ -6887,6 +6899,38 @@ unsafe fn root_slot_note_occupied(slot: u64) {
     }
 }
 
+unsafe fn root_slot_note_retype_bytes(slot: u64, bytes: u64) {
+    let Some(index) = root_slot_index(slot) else {
+        return;
+    };
+    let tracked = core::ptr::addr_of_mut!(ROOT_SLOT_RETYPE_BYTES) as *mut u32;
+    let previous = core::ptr::read(tracked.add(index)) as u64;
+    if previous != 0 {
+        UT_RETYPE_LIVE_BYTES.fetch_sub(previous, Ordering::Relaxed);
+    }
+    let stored = bytes.min(u32::MAX as u64) as u32;
+    core::ptr::write(tracked.add(index), stored);
+    if stored != 0 {
+        let live = UT_RETYPE_LIVE_BYTES.fetch_add(stored as u64, Ordering::Relaxed) + stored as u64;
+        note_high_water(&UT_RETYPE_LIVE_HIGH_WATER, live);
+    }
+}
+
+unsafe fn root_slot_take_retype_bytes(slot: u64) -> u64 {
+    let Some(index) = root_slot_index(slot) else {
+        return 0;
+    };
+    let tracked = core::ptr::addr_of_mut!(ROOT_SLOT_RETYPE_BYTES) as *mut u32;
+    let bytes = core::ptr::read(tracked.add(index)) as u64;
+    if bytes == 0 {
+        return 0;
+    }
+    core::ptr::write(tracked.add(index), 0);
+    UT_RETYPE_LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    UT_RETYPE_RELEASED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    bytes
+}
+
 fn try_recycled_root_slot() -> Option<u64> {
     loop {
         let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
@@ -6912,6 +6956,7 @@ unsafe fn recycle_deleted_root_slot(slot: u64) {
     if !root_slot_clear_live(slot) {
         return;
     }
+    let _ = root_slot_take_retype_bytes(slot);
     let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
     if n >= ROOT_SLOT_RECYCLE_CAP as u64 {
         ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -7526,15 +7571,33 @@ unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
     dll_cache_get(page)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedImageMappingCap {
+    Root(u64),
+    Bank { cnode: u64, slot: u16 },
+}
+
 #[derive(Clone, Copy)]
 struct SharedImageMapping {
     pi: u8,
     page: u64,
-    map_cap: u64,
+    cap: SharedImageMappingCap,
 }
 
 static mut SHARED_IMAGE_MAPPINGS: Option<Vec<SharedImageMapping>> = None;
 static SHARED_IMAGE_MAPPING_DIRTY: AtomicBool = AtomicBool::new(false);
+const IMAGE_MAP_CAP_BANK_RADIX: u32 = 12;
+const IMAGE_MAP_CAP_BANK_SLOTS: u64 = 1u64 << IMAGE_MAP_CAP_BANK_RADIX;
+const IMAGE_MAP_CAP_BANK_GUARD_BADGE: u64 = 64 - IMAGE_MAP_CAP_BANK_RADIX as u64;
+static IMAGE_MAP_CAP_BANK_RAW: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_CNODE: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_NEXT: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_LIVE: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_BANK_TO_ROOT: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn shared_image_mappings_mut() -> &'static mut Vec<SharedImageMapping> {
     let slot = &mut *core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPINGS);
@@ -7548,7 +7611,125 @@ pub(crate) fn take_shared_image_mapping_dirty() -> bool {
     SHARED_IMAGE_MAPPING_DIRTY.swap(false, Ordering::Relaxed)
 }
 
-unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
+unsafe fn image_map_cap_bank_ensure(pi: usize) -> Option<u64> {
+    if pi >= MAX_PI {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let existing = IMAGE_MAP_CAP_BANK_CNODE[pi].load(Ordering::Relaxed);
+    if existing != 0 {
+        return Some(existing);
+    }
+    let Some(raw) = try_alloc_slot() else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    if untyped_retype_r(
+        CAP_INIT_UNTYPED,
+        OBJ_CNODE,
+        IMAGE_MAP_CAP_BANK_RADIX,
+        1,
+        raw,
+    ) != 0
+    {
+        recycle_deleted_root_slot(raw);
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(cnode) = try_alloc_slot() else {
+        let _ = cnode_delete_recycle_r(raw);
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, IMAGE_MAP_CAP_BANK_GUARD_BADGE);
+    if mint != 0 {
+        recycle_deleted_root_slot(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    IMAGE_MAP_CAP_BANK_RAW[pi].store(raw, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_CNODE[pi].store(cnode, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_NEXT[pi].store(0, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE[pi].store(0, Ordering::Relaxed);
+    Some(cnode)
+}
+
+unsafe fn image_map_cap_bank_next_slot(pi: usize) -> Option<u16> {
+    let next = IMAGE_MAP_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
+    if next >= IMAGE_MAP_CAP_BANK_SLOTS {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    IMAGE_MAP_CAP_BANK_NEXT[pi].store(next + 1, Ordering::Relaxed);
+    Some(next as u16)
+}
+
+unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImageMappingCap> {
+    if pi >= MAX_PI as u64 {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let pi = pi as usize;
+    let cnode = image_map_cap_bank_ensure(pi)?;
+    let slot = image_map_cap_bank_next_slot(pi)?;
+    let label = cnode_move_root_to_cnode_r(cnode, slot as u64, root_cap);
+    if label != 0 {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    recycle_deleted_root_slot(root_cap);
+    IMAGE_MAP_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE[pi].fetch_add(1, Ordering::Relaxed);
+    let live = IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    note_high_water(&IMAGE_MAP_CAP_BANK_LIVE_HW, live);
+    Some(SharedImageMappingCap::Bank { cnode, slot })
+}
+
+unsafe fn image_map_cap_bank_take_root(
+    pi: u8,
+    cnode: u64,
+    slot: u16,
+) -> Result<u64, u64> {
+    let Some(root_cap) = try_alloc_slot() else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return Err(4);
+    };
+    let label = cnode_move_cnode_to_root_r(root_cap, cnode, slot as u64);
+    if label != 0 {
+        recycle_deleted_root_slot(root_cap);
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return Err(label);
+    }
+    IMAGE_MAP_CAP_BANK_TO_ROOT.fetch_add(1, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE[pi as usize].fetch_sub(1, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+    Ok(root_cap)
+}
+
+unsafe fn image_map_cap_bank_delete(pi: u8, cnode: u64, slot: u16) -> bool {
+    let label = cnode_delete_in_cnode_r(cnode, slot as u64);
+    if label == 0 {
+        IMAGE_MAP_CAP_BANK_LIVE[pi as usize].fetch_sub(1, Ordering::Relaxed);
+        IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+        true
+    } else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+fn image_map_cap_bank_live_next_totals() -> (u64, u64) {
+    let mut live = 0u64;
+    let mut next = 0u64;
+    for pi in 0..MAX_PI {
+        live += IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed);
+        next += IMAGE_MAP_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
+    }
+    (live, next)
+}
+
+unsafe fn shared_image_mapping_prepare_insert(pi: u64, page: u64, map_cap: u64) -> bool {
     if pi > u8::MAX as u64 || map_cap == 0 {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -7556,9 +7737,6 @@ unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
     let table = shared_image_mappings_mut();
     for existing in table.iter() {
         if existing.pi as u64 == pi && existing.page == page {
-            if existing.map_cap == map_cap {
-                return true;
-            }
             SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -7570,21 +7748,57 @@ unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
         }
         SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
     }
+    true
+}
+
+unsafe fn shared_image_mapping_push_prepared(
+    pi: u64,
+    page: u64,
+    cap: SharedImageMappingCap,
+) -> bool {
+    let table = shared_image_mappings_mut();
     table.push(SharedImageMapping {
         pi: pi as u8,
         page,
-        map_cap,
+        cap,
     });
     note_high_water(&SHARED_IMAGE_MAPPING_HW, table.len() as u64);
     true
 }
 
-unsafe fn shared_image_mapping_get(pi: u64, page: u64) -> Option<u64> {
+unsafe fn shared_image_mapping_put(pi: u64, page: u64, map_cap: u64) -> bool {
+    if !shared_image_mapping_prepare_insert(pi, page, map_cap) {
+        return false;
+    }
+    shared_image_mapping_push_prepared(pi, page, SharedImageMappingCap::Root(map_cap))
+}
+
+unsafe fn shared_image_mapping_put_banked(pi: u64, page: u64, map_cap: u64) -> bool {
+    if !shared_image_mapping_prepare_insert(pi, page, map_cap) {
+        return false;
+    }
+    let Some(cap) = image_map_cap_bank_store(pi, map_cap) else {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    shared_image_mapping_push_prepared(pi, page, cap)
+}
+
+unsafe fn shared_image_mapping_contains(pi: u64, page: u64) -> bool {
+    let Some(table) = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPINGS)).as_ref() else {
+        return false;
+    };
+    table
+        .iter()
+        .any(|mapping| mapping.pi as u64 == pi && mapping.page == page)
+}
+
+unsafe fn shared_image_mapping_debug(pi: u64, page: u64) -> Option<SharedImageMappingCap> {
     let table = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPINGS)).as_ref()?;
     table
         .iter()
         .find(|mapping| mapping.pi as u64 == pi && mapping.page == page)
-        .map(|mapping| mapping.map_cap)
+        .map(|mapping| mapping.cap)
 }
 
 unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
@@ -7592,7 +7806,29 @@ unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
     let index = table
         .iter()
         .position(|mapping| mapping.pi as u64 == pi && mapping.page == page)?;
-    Some(table.swap_remove(index).map_cap)
+    match table[index].cap {
+        SharedImageMappingCap::Root(map_cap) => {
+            table.swap_remove(index);
+            Some(map_cap)
+        }
+        SharedImageMappingCap::Bank { cnode, slot } => {
+            let map_cap = image_map_cap_bank_take_root(table[index].pi, cnode, slot).ok()?;
+            table.swap_remove(index);
+            Some(map_cap)
+        }
+    }
+}
+
+unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) {
+    match cap {
+        SharedImageMappingCap::Root(map_cap) => {
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+        }
+        SharedImageMappingCap::Bank { cnode, slot } => {
+            let _ = image_map_cap_bank_delete(pi, cnode, slot);
+        }
+    }
 }
 
 unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
@@ -7603,9 +7839,8 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
     while index < table.len() {
         let mapping = table[index];
         if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
-            let map_cap = table.swap_remove(index).map_cap;
-            let _ = page_unmap_r(map_cap);
-            let _ = cnode_delete_recycle_r(map_cap);
+            let mapping = table.swap_remove(index);
+            shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
         } else {
             index += 1;
         }
@@ -7621,12 +7856,17 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
     while index < table.len() {
         let mapping = table[index];
         if mapping.pi as u64 == pi {
-            let map_cap = table.swap_remove(index).map_cap;
-            let _ = page_unmap_r(map_cap);
-            let _ = cnode_delete_recycle_r(map_cap);
+            let mapping = table.swap_remove(index);
+            shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
             removed = removed.saturating_add(1);
         } else {
             index += 1;
+        }
+    }
+    if pi <= u8::MAX as u64 {
+        let pi = pi as usize;
+        if pi < MAX_PI && IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed) == 0 {
+            IMAGE_MAP_CAP_BANK_NEXT[pi].store(0, Ordering::Relaxed);
         }
     }
     removed
@@ -7699,11 +7939,16 @@ unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
 // heap at 93 %; `HEAP_FRAMES`; the VAD map). Every pool that backs a hosted process's private
 // memory is now MEASURED — a high-water mark next to its capacity — and printed at the gate, so the
 // NEXT exhaustion names itself instead of surfacing as a mysterious `STATUS_INSUFFICIENT_RESOURCES`.
-/// Bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`, 256 MiB) — the ONE pool with no
-/// executive-side capacity constant, because the number lives in the kernel's `ROOTSERVER_UT_SIZE_BITS`.
-/// seL4 aligns each retype to the object's own size, so this is a close lower bound, not exact.
+/// Cumulative successful bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`, 256 MiB).
+/// This is diagnostic churn: live runway is tracked separately because root-cap delete can return
+/// typed objects to the parent Untyped and recycled root slots can be retyped again.
 pub(crate) static UT_RETYPE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static UT_RETYPE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Live bytes currently represented by root-CNode slots that were produced by retyping the boot
+/// Untyped. This is the resource value used by the VM pool gate and SEC_IMAGE pressure throttling.
+pub(crate) static UT_RETYPE_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UT_RETYPE_LIVE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static UT_RETYPE_RELEASED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The boot Untyped's size, published by the kernel in `BootInfo.untyped_list[..]` (the one
 /// non-device untyped). Read at `_start`; 0 until then.
 pub(crate) static UT_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -7764,15 +8009,28 @@ fn retype_object_bytes(obj: u64, bits: u32) -> u64 {
     }
 }
 
-fn note_retype(untyped: u64, obj: u64, bits: u32, num: u32) {
+fn note_retype_attempt(untyped: u64) {
     if untyped != CAP_INIT_UNTYPED {
         return;
     }
     UT_RETYPE_CALLS.fetch_add(1, Ordering::Relaxed);
-    UT_RETYPE_BYTES.fetch_add(
-        retype_object_bytes(obj, bits) * num as u64,
-        Ordering::Relaxed,
-    );
+}
+
+fn note_retype_success(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) {
+    if untyped != CAP_INIT_UNTYPED {
+        return;
+    }
+    let bytes = retype_object_bytes(obj, bits);
+    UT_RETYPE_BYTES.fetch_add(bytes * num as u64, Ordering::Relaxed);
+    let mut i = 0;
+    while i < num {
+        let slot = dest + i as u64;
+        unsafe {
+            root_slot_note_occupied(slot);
+            root_slot_note_retype_bytes(slot, bytes);
+        }
+        i += 1;
+    }
 }
 
 fn note_retype_error(untyped: u64, obj: u64, label: u64) {
@@ -7788,8 +8046,10 @@ fn note_retype_error(untyped: u64, obj: u64, label: u64) {
 /// glob, so every existing call site is measured with no edit. The SEND form cannot see an error
 /// label (that is the documented `SYS_SEND` hazard) — only the bytes are counted here.
 pub(crate) fn untyped_retype(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
-    note_retype(untyped, obj, bits, num);
-    sel4_rt::untyped_retype(untyped, obj, bits, num, dest)
+    note_retype_attempt(untyped);
+    let result = sel4_rt::untyped_retype(untyped, obj, bits, num, dest);
+    note_retype_success(untyped, obj, bits, num, dest);
+    result
 }
 
 /// Monotone high-water helper.
@@ -7805,19 +8065,27 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_cap =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let live_untyped = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
+    let cumulative_untyped = UT_RETYPE_BYTES.load(Ordering::Relaxed);
     print_str(b"[pools] ");
     print_str(tag);
     print_str(b" untyped=");
-    print_u64(UT_RETYPE_BYTES.load(Ordering::Relaxed) >> 10);
+    print_u64(live_untyped >> 10);
     print_str(b"KiB/");
     print_u64(UT_TOTAL_BYTES.load(Ordering::Relaxed) >> 10);
     print_str(b"KiB ut-free=");
     print_u64(
         UT_TOTAL_BYTES
             .load(Ordering::Relaxed)
-            .saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed))
+            .saturating_sub(live_untyped)
             >> 10,
     );
+    print_str(b"KiB ut-cum=");
+    print_u64(cumulative_untyped >> 10);
+    print_str(b"KiB ut-live-hw=");
+    print_u64(UT_RETYPE_LIVE_HIGH_WATER.load(Ordering::Relaxed) >> 10);
+    print_str(b"KiB ut-released=");
+    print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed) >> 10);
     print_str(b"KiB retypes=");
     print_u64(UT_RETYPE_CALLS.load(Ordering::Relaxed));
     print_str(b" ut-fails=");
@@ -7850,6 +8118,19 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(SHARED_IMAGE_MAPPING_HW.load(Ordering::Relaxed));
     print_str(b" image-mapcap-fails=");
     print_u64(SHARED_IMAGE_MAPPING_FAILS.load(Ordering::Relaxed));
+    let (image_bank_live, image_bank_next) = image_map_cap_bank_live_next_totals();
+    print_str(b" image-bank=");
+    print_u64(image_bank_live);
+    print_str(b"/");
+    print_u64(image_bank_next);
+    print_str(b"/");
+    print_u64(IMAGE_MAP_CAP_BANK_LIVE_HW.load(Ordering::Relaxed));
+    print_str(b" image-bank-move=");
+    print_u64(IMAGE_MAP_CAP_BANK_TO_BANK.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(IMAGE_MAP_CAP_BANK_TO_ROOT.load(Ordering::Relaxed));
+    print_str(b" image-bank-fails=");
+    print_u64(IMAGE_MAP_CAP_BANK_FAILS.load(Ordering::Relaxed));
     print_str(b" shared-frames=");
     print_u64(unsafe { core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64 });
     print_str(b"/");
@@ -9511,7 +9792,7 @@ unsafe fn finish_image_writecopy_cow_selftest(
     }
     vm_unmap_private_page(pi, page);
     let clean = csrss_frame_get_exact(pi as u64, page).0 == 0
-        && shared_image_mapping_get(pi as u64, page).is_none();
+        && !shared_image_mapping_contains(pi as u64, page);
     if source_frame != 0 {
         vm_frame_release(source_frame, 0);
     }
@@ -9690,7 +9971,7 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
     };
     if record.owns_frame
         && record.frame != source_frame
-        && shared_image_mapping_get(pi as u64, page).is_none()
+        && !shared_image_mapping_contains(pi as u64, page)
     {
         proof |= IMAGE_WRITECOPY_COW_PROMOTED;
     }
@@ -10090,14 +10371,14 @@ unsafe fn vm_reprotect_shared_image_mapping(
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
-    let Some(map_cap) = shared_image_mapping_get(pi as u64, page) else {
+    if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());
+    }
+    let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     };
     let new_rights = vm_page_rights(new_protection);
     if new_rights == 0 {
-        let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
-            return Ok(());
-        };
         let _ = page_unmap_r(map_cap);
         let _ = cnode_delete_recycle_r(map_cap);
         return Ok(());
@@ -10105,9 +10386,15 @@ unsafe fn vm_reprotect_shared_image_mapping(
     let old_rights = vm_page_rights(old_protection);
     let _ = page_unmap_r(map_cap);
     if page_map_r(map_cap, page, new_rights, pml4) == 0 {
+        if !shared_image_mapping_put(pi as u64, page, map_cap) {
+            let _ = page_unmap_r(map_cap);
+            let _ = cnode_delete_recycle_r(map_cap);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
         Ok(())
     } else {
         let _ = page_map_r(map_cap, page, old_rights, pml4);
+        let _ = shared_image_mapping_put(pi as u64, page, map_cap);
         Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
@@ -10173,23 +10460,33 @@ unsafe fn vm_promote_image_cow_page(
         }
     }
 
+    let mut shared_source_cap = 0u64;
     let source_cap = if let Some(record) = exact_record {
         if record.source_cap != 0 {
             record.source_cap
         } else {
             record.frame
         }
-    } else if let Some(map_cap) = shared_image_mapping_get(pi as u64, page) {
+    } else if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
+        shared_source_cap = map_cap;
         map_cap
     } else {
         return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
     };
     let new_frame = match vm_frame_acquire(scratch_base) {
         Ok(frame) => frame,
-        Err(status) => return Err(status),
+        Err(status) => {
+            if shared_source_cap != 0 {
+                let _ = shared_image_mapping_put(pi as u64, page, shared_source_cap);
+            }
+            return Err(status);
+        }
     };
     if let Err(status) = vm_copy_frame_4k(source_cap, new_frame, scratch_base) {
         vm_frame_release(new_frame, 0);
+        if shared_source_cap != 0 {
+            let _ = shared_image_mapping_put(pi as u64, page, shared_source_cap);
+        }
         return Err(status);
     }
 
@@ -10210,10 +10507,7 @@ unsafe fn vm_promote_image_cow_page(
             },
         )
     } else {
-        let Some(map_cap) = shared_image_mapping_take(pi as u64, page) else {
-            vm_frame_release(new_frame, 0);
-            return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
-        };
+        let map_cap = shared_source_cap;
         (map_cap, OldImageMapping::Shared)
     };
     let _ = page_unmap_r(old_map_cap);
@@ -10305,7 +10599,7 @@ pub(crate) unsafe fn vm_promote_image_cow_for_kernel_write(
         if record.owns_frame {
             return Ok(());
         }
-    } else if shared_image_mapping_get(pi as u64, page).is_none() {
+    } else if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());
     }
     let read_plan = nt_address_space::image_view_fault_plan(image_protection, false);
@@ -10481,7 +10775,7 @@ unsafe fn vm_reprotect_resident_image_page(
         }
         return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
     }
-    if shared_image_mapping_get(pi as u64, page).is_none() {
+    if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());
     }
     if vm_protection_writable(new_protection) {
@@ -10525,7 +10819,7 @@ unsafe fn mint_badged(src: u64, badge: u64) -> u64 {
 // the same register layout via seL4_Call and hand back the reply's error label so callers can
 // detect and react. The reply's message-info comes back in rsi; its label is `reply >> 12`.
 unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
-    note_retype(untyped, obj, bits, num);
+    note_retype_attempt(untyped);
     let size_num = ((bits as u64) << 32) | (num as u64);
     let reply: u64;
     core::arch::asm!(
@@ -10542,7 +10836,7 @@ unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u6
     let label = reply >> 12;
     note_retype_error(untyped, obj, label);
     if label == 0 {
-        root_slot_note_occupied(dest);
+        note_retype_success(untyped, obj, bits, num, dest);
     }
     label
 }
@@ -10619,6 +10913,46 @@ unsafe fn cnode_mint_r(cnode: u64, dest: u64, src: u64, badge: u64) -> u64 {
     let label = reply >> 12;
     if label == 0 && cnode == CAP_INIT_THREAD_CNODE {
         root_slot_note_occupied(dest);
+    }
+    label
+}
+const LBL_CNODE_MOVE: u64 = 27;
+unsafe fn cnode_move_root_to_cnode_r(dest_cnode: u64, dest_index: u64, src_root_slot: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") dest_cnode => _,
+        inout("rsi") LBL_CNODE_MOVE << 12 => reply,
+        inout("r10") dest_index => _,
+        inout("r8") src_root_slot => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn cnode_move_cnode_to_root_r(dest_root_slot: u64, src_cnode: u64, src_index: u64) -> u64 {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, src_cnode);
+    let msginfo = (LBL_CNODE_MOVE << 12) | (1 << 9) | (1 << 7) | 4;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_THREAD_CNODE => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") dest_root_slot => _,
+        inout("r8") 64u64 => _,
+        inout("r9") src_index => _,
+        inout("r15") 64u64 => _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    let label = reply >> 12;
+    if label == 0 {
+        root_slot_note_occupied(dest_root_slot);
     }
     label
 }
@@ -11087,6 +11421,22 @@ unsafe fn cnode_delete_r(idx: u64) -> u64 {
         inout("rsi") LBL_CNODE_DELETE << 12 => reply,
         inout("r10") idx => _, // a2 = slot index under the root CNode
         inout("r8") 0u64 => _, // a3 = depth (ignored; msginfo length 0 → WORD_BITS)
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") cnode => _,
+        inout("rsi") LBL_CNODE_DELETE << 12 => reply,
+        inout("r10") idx => _,
+        inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -19254,6 +19604,10 @@ const PM_RUNTIME_THREAD_SLOTS: usize = 16;
 /// (and the first few reported with the pool's state) because the ONLY thing the caller ever sees is
 /// `STATUS_INSUFFICIENT_RESOURCES` — rpcrt4 answers it by silently dropping an RPC connection.
 pub(crate) static PM_POOL_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Free usage slots skipped because their terminated ETHREAD still has a live user handle and is not
+/// reclaimable yet. The selector must continue to another slot instead of falsely reporting pool
+/// exhaustion.
+pub(crate) static PM_POOL_UNRECLAIMABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);

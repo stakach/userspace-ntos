@@ -489,6 +489,24 @@ pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewF
     }
 }
 
+/// True when a SEC_IMAGE page can be backed by one immutable shared cache frame for the current
+/// fault plan. Plain write-copy data is intentionally excluded: ReactOS loader fixups and later
+/// `NtProtectVirtualMemory`/COW promotion need private ownership for those pages. Execute-writecopy
+/// read faults remain cacheable because their read plan maps executable text as execute-read; a later
+/// write fault promotes through the normal image COW path.
+pub fn image_view_shared_cacheable(protection: u32, map_protection: u32) -> bool {
+    if protection & PAGE_GUARD != 0 {
+        return false;
+    }
+    matches!(
+        base_protection(protection),
+        PAGE_READONLY | PAGE_EXECUTE | PAGE_EXECUTE_READ
+    ) || matches!(
+        base_protection(map_protection),
+        PAGE_EXECUTE | PAGE_EXECUTE_READ
+    )
+}
+
 impl VmCommittedRange {
     pub const fn private(base: u64, size: u64, protect: u32) -> Self {
         Self {

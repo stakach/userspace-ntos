@@ -4991,9 +4991,12 @@ impl ExecNtHandler {
         (slot < TP_WORKER_SLOT_COUNT && slot < 64).then_some(1u64 << slot)
     }
 
-    fn claim_pool_usage_slot(&mut self, pi: usize) -> Option<usize> {
+    fn claim_pool_usage_slot_excluding(&mut self, pi: usize, skip_mask: u64) -> Option<usize> {
         let used = self.pool_used.get_mut(pi)?;
-        let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| *used & (1u64 << slot) == 0)?;
+        let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| {
+            let bit = 1u64 << slot;
+            *used & bit == 0 && skip_mask & bit == 0
+        })?;
         *used |= 1u64 << slot;
         Some(slot)
     }
@@ -8408,38 +8411,42 @@ impl ExecNtHandler {
         entry: u64,
         create_suspended: bool,
     ) -> Option<(usize, u64)> {
-        let slot = self.claim_pool_usage_slot(pi)?;
-        let tid = match self.pm_pool_tid_for_slot(pi, slot) {
-            Some(tid) => tid as u64,
-            None => {
+        let mut skipped = 0u64;
+        loop {
+            let slot = self.claim_pool_usage_slot_excluding(pi, skipped)?;
+            let Some(tid32) = self.pm_pool_tid_for_slot(pi, slot) else {
                 self.release_pool_usage_slot(pi, slot);
-                return None;
+                skipped |= 1u64 << slot;
+                crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let tid = tid32 as u64;
+            let t = tid as nt_process::ThreadId;
+            let prepared = if self
+                .pm
+                .thread(t)
+                .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
+            {
+                self.pm
+                    .reuse_reclaimed_thread(t, entry, create_suspended)
+                    .is_ok()
+            } else {
+                self.pm.set_thread_start_address(t, entry)
+                    && if create_suspended {
+                        self.pm.suspend_thread(t).is_ok()
+                    } else {
+                        self.pm
+                            .set_thread_state(t, nt_process::ThreadState::Running)
+                            .is_ok()
+                    }
+            };
+            if prepared {
+                return Some((slot, tid));
             }
-        };
-        let t = tid as nt_process::ThreadId;
-        let prepared = if self
-            .pm
-            .thread(t)
-            .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
-        {
-            self.pm
-                .reuse_reclaimed_thread(t, entry, create_suspended)
-                .is_ok()
-        } else {
-            self.pm.set_thread_start_address(t, entry)
-                && if create_suspended {
-                    self.pm.suspend_thread(t).is_ok()
-                } else {
-                    self.pm
-                        .set_thread_state(t, nt_process::ThreadState::Running)
-                        .is_ok()
-                }
-        };
-        if !prepared {
             self.release_pool_usage_slot(pi, slot);
-            return None;
+            skipped |= 1u64 << slot;
+            crate::PM_POOL_UNRECLAIMABLE_SKIPS.fetch_add(1, Ordering::Relaxed);
         }
-        Some((slot, tid))
     }
 
     /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
@@ -8470,6 +8477,8 @@ impl ExecNtHandler {
                         print_hex(self.pool_used_mask(self.pi) as u32);
                         print_str(b" slots=");
                         print_u64(PM_RUNTIME_THREAD_SLOTS as u64);
+                        print_str(b" skipped=");
+                        print_u64(crate::PM_POOL_UNRECLAIMABLE_SKIPS.load(Ordering::Relaxed));
                         print_str(b" pool-tids:");
                         for index in 0..PM_RUNTIME_THREAD_SLOTS {
                             print_str(b" ");

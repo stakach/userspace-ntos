@@ -1770,6 +1770,40 @@ fn image_view_fault_plan_tracks_writecopy_cow() {
 }
 
 #[test]
+fn image_view_shared_cacheable_only_accepts_immutable_image_pages() {
+    assert!(image_view_shared_cacheable(PAGE_READONLY, PAGE_READONLY));
+    assert!(image_view_shared_cacheable(PAGE_EXECUTE, PAGE_EXECUTE));
+    assert!(image_view_shared_cacheable(
+        PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READ
+    ));
+    assert!(image_view_shared_cacheable(
+        PAGE_EXECUTE_READ | PAGE_NOCACHE,
+        PAGE_EXECUTE_READ | PAGE_NOCACHE
+    ));
+    assert!(image_view_shared_cacheable(
+        PAGE_EXECUTE_WRITECOPY,
+        PAGE_EXECUTE_READ
+    ));
+
+    assert!(!image_view_shared_cacheable(PAGE_READWRITE, PAGE_READWRITE));
+    assert!(!image_view_shared_cacheable(PAGE_WRITECOPY, PAGE_READONLY));
+    assert!(!image_view_shared_cacheable(
+        PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_READWRITE
+    ));
+    assert!(!image_view_shared_cacheable(
+        PAGE_EXECUTE_WRITECOPY,
+        PAGE_EXECUTE_READWRITE
+    ));
+    assert!(!image_view_shared_cacheable(
+        PAGE_READONLY | PAGE_GUARD,
+        PAGE_READONLY | PAGE_GUARD
+    ));
+    assert!(!image_view_shared_cacheable(PAGE_NOACCESS, PAGE_NOACCESS));
+}
+
+#[test]
 fn committed_range_table_rejects_unbounded_or_unaligned_ranges() {
     let mut table = VmCommittedRangeTable::<4>::new();
     assert_eq!(

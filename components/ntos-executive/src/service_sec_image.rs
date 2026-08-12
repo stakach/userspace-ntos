@@ -667,7 +667,7 @@ fn sec_image_forward_run() -> u64 {
     let frame_pressure = frame_hw * 5 >= CSRSS_FRAME_CAP as u64 * 3;
     let frame_critical = frame_hw * 10 >= CSRSS_FRAME_CAP as u64 * 9;
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
-    let untyped_free = untyped_total.saturating_sub(UT_RETYPE_BYTES.load(Ordering::Relaxed));
+    let untyped_free = untyped_total.saturating_sub(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed));
     let untyped_low = untyped_total != 0
         && untyped_free
             <= MIN_BOOT_UNTYPED_HEADROOM_BYTES + SEC_IMAGE_PREFETCH_LOW_UNTYPED_MARGIN_BYTES;
@@ -2804,16 +2804,18 @@ unsafe fn capture_get_class_info_graph(
     }
 
     let mut wnd = [0u8; WNDCLASSEXW_SIZE];
-    if !img_spawn::client_copyin_mapped(
+    // NtUserGetClassInfo probes lpWndClassEx for write before copying it into a temporary
+    // WNDCLASSEXW, but ReactOS does not depend on the caller's initial contents. Treat this as an
+    // output graph at the isolation boundary; otherwise an unfaulted-but-valid caller output page
+    // prevents us from rebasing the class-name graph and win32k sees a foreign client pointer.
+    let _ = img_spawn::client_copyin_mapped(
         pi,
         wnd_class,
         &mut wnd,
         filled_pages,
         nfilled,
         scratch_base,
-    ) {
-        return None;
-    }
+    );
     let wnd_out = out_base;
     let menu_out = out_base + WNDCLASSEXW_SIZE as u64;
     core::ptr::copy_nonoverlapping(wnd.as_ptr(), wnd_out as *mut u8, wnd.len());
@@ -6207,10 +6209,6 @@ pub(crate) unsafe fn service_sec_image(
                     is_fault_page && image_fault_access == nt_address_space::FaultAccess::Write,
                 );
                 let image_map_rights = vm_page_rights(image_fault_plan.map_protection);
-                let image_map_writable = matches!(
-                    image_fault_plan.map_protection & 0xff,
-                    nt_address_space::PAGE_READWRITE | nt_address_space::PAGE_EXECUTE_READWRITE
-                );
                 if image_map_rights == 0 {
                     if is_fault_page {
                         print_str(b"[vmf-image-protect] denied image access pi=");
@@ -6226,24 +6224,22 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     break;
                 }
-                let image_map_executable = matches!(
-                    image_fault_plan.map_protection & 0xff,
-                    nt_address_space::PAGE_EXECUTE
-                        | nt_address_space::PAGE_EXECUTE_READ
-                        | nt_address_space::PAGE_EXECUTE_READWRITE
-                        | nt_address_space::PAGE_EXECUTE_WRITECOPY
-                );
-                // SHAREABLE = a registered DLL image page whose current fault installs an executable,
-                // non-writable mapping. Non-executable clean image data still needs a stronger
-                // protect/COW proof before it can use the shared cache without regressing CSRSS.
-                let shareable = base != PE_LOAD_BASE && image_map_executable && !image_map_writable;
+                // SHAREABLE = a registered DLL image page whose live SEC_IMAGE protection is
+                // immutable, or whose read fault plan installs execute/read text. Plain write-copy
+                // data stays private because loader fixups and later COW/protect transitions require
+                // per-process ownership.
+                let shareable = base != PE_LOAD_BASE
+                    && nt_address_space::image_view_shared_cacheable(
+                        image_view_info.protect,
+                        image_fault_plan.map_protection,
+                    );
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 if is_fault_page && image_fault_plan.copy_on_write {
                     let read_fault_protection =
                         nt_address_space::image_view_fault_plan(image_view_info.protect, false)
                             .map_protection;
                     if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
-                        || shared_image_mapping_get(pi as u64, bpage).is_some()
+                        || shared_image_mapping_contains(pi as u64, bpage)
                     {
                         match vm_promote_image_cow_page(
                             pi,
@@ -6467,7 +6463,8 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if mapped_into_process && shareable {
-                    if !shared_image_mapping_put(pi as u64, bpage, cc) {
+                    let registered = shared_image_mapping_put_banked(pi as u64, bpage, cc);
+                    if !registered {
                         let _ = page_unmap_r(cc);
                         let _ = cnode_delete_recycle_r(cc);
                         print_str(b"[image-shared] register failed pi=");
@@ -17962,10 +17959,16 @@ unsafe fn dump_hosted_quiesce_rip_mapping(label: &[u8], pi: usize, rip: u64) {
     } else {
         print_str(b" exact-frame=none");
     }
-    match shared_image_mapping_get(pi as u64, page) {
-        Some(map_cap) => {
+    match shared_image_mapping_debug(pi as u64, page) {
+        Some(SharedImageMappingCap::Root(map_cap)) => {
             print_str(b" shared-map=0x");
             print_hex(map_cap as u32);
+        }
+        Some(SharedImageMappingCap::Bank { cnode, slot }) => {
+            print_str(b" shared-map-bank=0x");
+            print_hex(cnode as u32);
+            print_str(b"/");
+            print_u64(slot as u64);
         }
         None => print_str(b" shared-map=none"),
     }

@@ -31,77 +31,44 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest serialized gate validation (2026-08-12):
-`.tmp/run-desktop-lsa-multi-client-gates-20260812.log` rebuilds ntdll, the executive, rust-micro,
-and the disk image, reaches the post-desktop quiesce gate after the later service wave, and exits
-through the microtest sentinel at `294/295`. This closes the LSA auth/logon accounting without adding
-a fallback: the real `\LsaAuthenticationPort` server accepts multiple live clients, winlogon's
-accepted comm-port handle remains latched, `OperationalMode=0x43218765` is copied back from the real
-server, and the data plane balances three real requests with three replies. The proof is now
-sequence-independent: `exec_lsa_auth_port_connected` checks dynamic connection invariants, and
-`exec_lsa_logon_user_reached` checks the observed API mask plus successful per-API statuses and
-client-memory reads rather than requiring api 2 to be the last request seen globally. The latest
-proof lines show `connects-delivered=2`, `completed=2`, `requests=3`, `replies=3`,
-`api-mask=0x0000000c`, `lookup-status=0`, `logon-status=0`, and `logon-client-reads=6`, followed by
-passing `exec_lsa_auth_port_connected` and `exec_lsa_logon_user_reached`. Explorer still paints real
-shell chrome: `[explorer-fb] final non-bg pixels=786432 ... unique-non-bg>=32 saturated`, and
-`exec_explorer_shell_chrome_painted` passes. The only remaining red gate is
-`exec_vm_pool_headroom`; final resource proof is `ut-free=11823KiB`, `slot-free=1641`, zero
-allocation failures, `shared-frames=3422/16384`, `shared-hits=10313`, `shared-full=0`, and
-`shared-dup=0`. A later-service `thread-pool REFUSED NtCreateThread` line for `pi=14` remains the
-best lead for the next generic resource-lifetime slice.
+Current serialized frontier (2026-08-12): the real desktop/icon path is past shell launch and paint
+scaffolding. The executive no longer contains live `[w32-slip]` or `[cb-inject]` post-quiesce
+callback probes; any run that still emits those tags is using a stale binary or stale branch state.
+The callback/transport gates now assert live invariants from the real workload.
 
-Latest desktop/icon validation (2026-08-12): serialized graphics retry
-`.tmp/run-desktop-late-freeze-20260812.log` rebuilt ntdll, the executive, rust-micro, and the disk
-image, then reached a live ReactOS desktop without shell-launch or paint fallbacks. Screenshot proof
-`.tmp/run-desktop-late-freeze-20260812.png` shows the real Explorer desktop with `My Computer`,
-`Internet Browser`, `Command Prompt`, `Read Me`, the Start button, and taskbar clock. The serial log
-has no `FAIL`, `panic`, `RUNEXIT`, or `no fault handler` before the manual interrupt, and Explorer
-continues making real native/win32k progress: at the 156s census `explorer total=10416 native=7422
-win32k=2994`, with real `NtUserGetIconInfo`, `NtGdiCreateDIBSection`, and `NtGdiExtTextOutW` calls.
-`nt-ntdll` import snapping reports `missing=0` across large ReactOS import sets. This run did not
-emit a final quiesce/harness gate because the desktop kept processing work; treat it as a strong
-live desktop proof, not a post-quiesce closeout. Current implementation cleanup keeps this
-mechanism-owned: stale HPET deliveries are detected and acked without redriving waiters, quiesce
-client-memory inspection uses process-mapped copyin instead of root-context user reads, and the
-blanket hosted-TCB freeze now runs only after active post-quiesce probes. Next target is long-run
-resource/lifetime stability under the later service wave: at the last census root untyped headroom
-was down to `17453 KiB` with no allocation failures, so continue reducing retained caps/views/driver
-state through real teardown and reclaim rather than adding process or shell-specific exits.
+Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
+path in per-process guarded child CNodes. The shared-image mapping table records each map cap as
+root-held or banked, banked caps are moved with `CNodeMove` after the process mapping succeeds,
+unmap/teardown deletes the child slot, and protect/COW paths recall a banked cap into a root slot
+before remapping or copying. Banking is not a fallback: if a shareable image mapping cannot be
+recorded in the bank, registration fails and the caller tears down the process mapping with a real
+resource error. The pool census now prints `image-bank=live/next/high-water`,
+`image-bank-move=to-bank/to-root`, and `image-bank-fails`.
 
-Current resource-lifetime slice (2026-08-12): the shared DLL executable-page cache no longer has a
-silent overflow path. Its capacity is raised from 4096 to 16384 pages, failed duplicate/full inserts
-are counted, and every periodic pool census prints `shared-frames`, `shared-hits`, `shared-full`,
-and `shared-dup` beside `image-mapcaps`. A newly filled shared RX frame is now usable only if the
-cache records ownership; otherwise the pager unmaps/deletes the scratch frame and surfaces a real
-`image-map-resource` wall instead of retaining an untracked cap. SEC_IMAGE forward prefetch also
-collapses from 32 pages to the touched page as soon as root CSlot, client-frame, or untyped headroom
-enters the low-water zone. Local validation is green: `cargo fmt --all`,
-`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
-`git diff --check`. Next serialized desktop proof should confirm the shell still reaches desktop
-icons while the new census shows nonzero shared-cache reuse and zero `shared-full`/`shared-dup`.
+Serialized validation (2026-08-12):
+`.tmp/run-desktop-image-map-cap-bank-all-shareable-20260812.log` proves the cap-bank mechanism under
+real Explorer load. It banked `10548` shared image map caps with `image-bank-fails=0`, avoided the
+previous root CSpace exhaustion, and preserved the real shell proof:
+`exec_explorer_process_spawned`, `exec_explorer_create_window_strings_captured`,
+`exec_explorer_register_window_messages_captured`, callback redirect, client WndProc install, shell
+COM class open, and `exec_explorer_shell_chrome_painted` all passed. The only remaining red gates in
+that run were `exec_vm_pool_headroom` and `exec_userinit_scrollbar_classinfo`.
 
-Desktop proof interpretation (2026-08-12): the latest screenshots confirm the shell frontier has
-moved beyond launch and paint. Treat Explorer desktop/icon/chrome rendering as a working mechanism
-on the shared-pager proof path, not as synthetic scaffolding. The LSA auth/logon gates are now closed
-by the later multi-client proof above; the remaining red gate is total VM/CSlot/root-untyped
-retention under the later service wave.
+Follow-up validation (2026-08-12):
+`.tmp/run-desktop-getclassinfo-output-marshal-20260812.log` fixes the `NtUserGetClassInfo` output
+marshalling boundary for caller-supplied `WNDCLASSEXW` buffers. `exec_userinit_scrollbar_classinfo`
+now passes with real `ScrollBar` metadata (`atom=0xc004`, style `0x8b`, `cbWndExtra=0x48`), and the
+pool-headroom gate passes with `slot-free=68642`, `ut-free=58629KiB`, `image-bank=8491/8491/8491`,
+and `image-bank-fails=0`.
 
-Callback-harness cleanup slice (2026-08-12): `.tmp/run-desktop-20260812-090617.log` reached the
-post-desktop quiesce frontier, then the old post-loop `w32-slip`/`cb-inject` probes deliberately
-drove a winlogon worker through WM_NULL callback injection. The selected `tid=156` was a dynamic
-worker/listener, not a guaranteed GUI callback thread; win32k reported `ClientThreadSetup failed`
-and the synthetic victim-kill path ended in a root-side `no fault handler` line after the real run
-had already gated. That probe is retired rather than papered over. The executive no longer runs the
-post-quiesce winlogon-worker callback injections, the proof latches and victim selectors are removed,
-and the final callback/transport gates now assert live invariants only: redirect/return accounting,
-continuation-stack balance, zero reply errors, completed call-bound win32k dispatches, live nested
-depth, zero suspended component outstanding, and no walled win32k dispatches. Next serialized
-desktop proof should contain no `[w32-slip]`, `[cb-inject]`, or post-gate `no fault handler` lines;
-the later multi-client LSA proof has since closed the structural LSA routing failures, leaving
-VM/CSlot/root-untyped retention as the active gate. Local
-validation is green: `cargo fmt --all`, `cargo check --manifest-path
-components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Active frontier: that follow-up run reached Explorer's `NtUserProcessConnect` and then quiesced
+before the first Explorer `NtUserCreateWindowEx`. The main thread was running inside
+`comdlg32+0x31080` during DLL process attach with the instruction page present as a banked shared
+image mapping and shared-cache hit. This is now a generic hosted-loader/DLL-init progress problem,
+not shell launch policy, not static executable identity, and not synthetic paint. The next useful
+target is to diagnose why that hosted thread makes no kernel-visible progress after
+`NtUserProcessConnect`: inspect the `comdlg32` attach path, loader lock/wait state, and any missing
+ntdll/user32 service it expects before window creation.
 
 Serialized validation (2026-08-12): `.tmp/run-desktop-shared-pager-20260812.log` reaches the
 harness sentinel with real Explorer desktop and icon paint. Screenshot proof
@@ -842,6 +809,14 @@ before unrelated executive traffic monopolises the receive loop.
   behavior needed for repeat boots.
 
 ## Immediate Iteration
+
+Review adjustment (2026-08-12): continue the memory-manager/resource frontier before opening new
+driver or registry fronts. First close the current SEC_IMAGE cap-banking slice by committing the
+generic child-CNode bank, live Untyped accounting, and `NtUserGetClassInfo` output marshalling
+cleanup. Then diagnose the active hosted-loader stall: Explorer reaches `NtUserProcessConnect` and
+quiesces in `comdlg32` DLL process attach before its first `NtUserCreateWindowEx`. Keep this
+mechanism-level: no executable-name launch policy, no shell-specific paint path, and no fallback
+root-held image caps when banking fails.
 
 1. Continue B3 cleanup after the NDIS-backed PCI path for ReactOS `e1000.sys`: generated SYSTEM hive
    state carries the registry-selected `E1000` service, PCI `Enum` devnode, class driver key, and
