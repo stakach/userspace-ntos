@@ -36,6 +36,19 @@ scaffolding. The executive no longer contains live `[w32-slip]` or `[cb-inject]`
 callback probes; any run that still emits those tags is using a stale binary or stale branch state.
 The callback/transport gates now assert live invariants from the real workload.
 
+Latest accepted desktop proof (2026-08-12):
+`.tmp/run-desktop-heap-direct-20260812.log` reaches the harness sentinel with `295/295`
+executive-to-isolated-service checks passing. It rebuilds and stages the current ntdll, reaches real
+credential paint and LSA validation, spawns userinit and Explorer through the dynamic process path,
+and paints real Explorer shell chrome. The final Explorer gates pass: process spawn, create-window
+string capture, registered shell messages, redirected user callbacks, client WndProc install, shell
+COM class service, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports the full
+1024x768 framebuffer as non-background with at least 32 distinct non-background colors, while the
+pool gate remains green (`ut-free=82298KiB`, `slot-free=70980`, `image-bank-fails=0`,
+`wc-pred-err=0`). The same run parks one later dynamic process on a generic `vmf-out` after shell
+proof is already established and with no active callback; keep that as a generic image/view/process
+diagnostic if it reproduces, not as the current shell-chrome frontier.
+
 Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
 path in per-process guarded child CNodes. The shared-image mapping table records each map cap as
 root-held or banked, banked caps are moved with `CNodeMove` after the process mapping succeeds,
@@ -4188,7 +4201,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   allocation header directly from the payload pointer for ordinary size/free/realloc and validates
   the immediate boundary-tag neighbours before mutating/coalescing. Local validation is green:
   `cargo test -p nt-ntdll heap -- --nocapture`, `cargo test -p nt-ntdll`, `cargo fmt --all`, and
-  `./scripts/build_ntdll_dll.sh`. Next serialized desktop proof should determine whether Explorer
-  now advances past the post-`NtUserProcessConnect` activation-context teardown into real
-  `NtUserCreateWindowEx`/shell chrome again; if not, add bounded generic actctx create/release/free
-  counters rather than any Explorer/provider/COM shortcut.
+  `./scripts/build_ntdll_dll.sh`. Serialized desktop proof
+  `.tmp/run-desktop-heap-direct-20260812.log` closes the slice: Explorer advances past the
+  post-`NtUserProcessConnect` activation-context teardown, issues real `NtUserCreateWindowEx` and
+  shell USER/GDI calls, redirects 487 Explorer api0 callbacks, installs the client WndProc, opens the
+  shell COM classes, and paints shell chrome with the full framebuffer non-background. The run reaches
+  `295/295` gates, so no actctx-specific counters are needed unless a fresh current-tree run
+  reproduces a teardown stall.
