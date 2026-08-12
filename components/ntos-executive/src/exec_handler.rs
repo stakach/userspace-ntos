@@ -2313,6 +2313,8 @@ impl ExecNtHandler {
         write_field!(overlay_dirty, false);
         write_field!(hosted_exe_dirty, false);
         write_field!(writable_fs_dirty, false);
+        write_field!(writable_fs_commit_required, false);
+        write_field!(writable_fs_commit_iosb, 0);
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
@@ -2613,6 +2615,7 @@ impl ExecNtHandler {
         }
         let len = image.len();
         if unsafe { crate::writable_fs::set_default_user_ntuser_dat_image(image) } {
+            self.writable_fs_dirty = true;
             print_str(b"[profile-setup] Default User\\ntuser.dat <- mutable HKU\\.DEFAULT image ");
             print_u64(len as u64);
             print_str(b"B\n");
@@ -3459,6 +3462,7 @@ impl ExecNtHandler {
         status = unsafe { crate::writable_fs::flush(file_id) };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
             NT_SAVE_KEY_ROOT_SAVED.fetch_add(1, Ordering::Relaxed);
             NT_SAVE_KEY_BYTES.store(image_len as u64, Ordering::Relaxed);
         }
@@ -3491,6 +3495,7 @@ impl ExecNtHandler {
         let status = unsafe { crate::writable_fs::write_file_atomic(file_path, &image) };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
@@ -3541,6 +3546,7 @@ impl ExecNtHandler {
         let status = unsafe { crate::writable_fs::write_file_atomic(&file_path, &image) };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
@@ -24942,9 +24948,9 @@ impl ExecNtHandler {
                         Err(status) => status,
                     }
                 } else if self.overlay_file_id_for(handle).is_some() {
-                    // The writable volume is coherent by construction (RAM-backed) — a flush has
-                    // nothing to push. When the backing becomes FAT write-through this is the seam
-                    // that has to push it.
+                    self.writable_fs_dirty = true;
+                    self.writable_fs_commit_required = true;
+                    self.writable_fs_commit_iosb = iosb;
                     nt_fs::STATUS_SUCCESS
                 } else {
                     match self.npfs_flush_file_route_for(handle) {

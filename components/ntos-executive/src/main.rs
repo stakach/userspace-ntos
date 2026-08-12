@@ -17685,6 +17685,12 @@ struct ExecNtHandler {
     /// directories a hosted process created SURVIVE the next per-syscall bump reset. Without it the
     /// volume would be handed back to the allocator the instant the syscall returned.
     writable_fs_dirty: bool,
+    /// Flush-like callers set this when user-visible success depends on the dirty writable volume
+    /// reaching its snapshot reserve before the current syscall reply is sent.
+    writable_fs_commit_required: bool,
+    /// Optional caller IOSB for writable-volume `NtFlushBuffersFile`; updated if the post-dispatch
+    /// snapshot commit fails after the handler staged the optimistic in-memory flush result.
+    writable_fs_commit_iosb: u64,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =

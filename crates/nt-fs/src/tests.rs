@@ -3,6 +3,7 @@ use super::*;
 struct MemoryBlockDevice {
     sector_size: usize,
     data: alloc::vec::Vec<u8>,
+    reads: usize,
     writes: usize,
     fail_write: Option<usize>,
 }
@@ -12,6 +13,7 @@ impl MemoryBlockDevice {
         Self {
             sector_size,
             data: alloc::vec![0; sector_size * sectors],
+            reads: 0,
             writes: 0,
             fail_write: None,
         }
@@ -24,6 +26,10 @@ impl MemoryBlockDevice {
     fn corrupt(&mut self, lba: u64, offset: usize) {
         let index = lba as usize * self.sector_size + offset;
         self.data[index] ^= 0x55;
+    }
+
+    fn reset_reads(&mut self) {
+        self.reads = 0;
     }
 }
 
@@ -40,6 +46,7 @@ impl SnapshotBlockDevice for MemoryBlockDevice {
         if out.len() != self.sector_size || lba >= self.sector_count() {
             return Err(SnapshotBlockStoreError::InvalidGeometry);
         }
+        self.reads += 1;
         let start = lba as usize * self.sector_size;
         out.copy_from_slice(&self.data[start..start + self.sector_size]);
         Ok(())
@@ -814,15 +821,13 @@ fn snapshot_block_store_commits_latest_valid_slot() {
     assert_eq!(first.generation, 1);
     assert_eq!(first.payload, b"first");
 
-    assert_eq!(
-        store
-            .commit_next(&mut dev, b"second snapshot payload")
-            .unwrap(),
-        2
-    );
+    let second_payload = alloc::vec![0x5a; 1400];
+    dev.reset_reads();
+    assert_eq!(store.commit_next(&mut dev, &second_payload).unwrap(), 2);
+    assert_eq!(dev.reads, 2, "commit should read only the two slot headers");
     let second = store.read_latest(&mut dev).unwrap().unwrap();
     assert_eq!(second.generation, 2);
-    assert_eq!(second.payload, b"second snapshot payload");
+    assert_eq!(second.payload, second_payload);
 }
 
 #[test]

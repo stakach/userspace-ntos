@@ -8002,8 +8002,23 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
                         print_hex(snapshot_status);
                         print_str(b"\n");
+                        if nt_handler.writable_fs_commit_required {
+                            result = snapshot_status as u64;
+                            if nt_handler.writable_fs_commit_iosb != 0 {
+                                nt_handler.xas_write_buf(
+                                    nt_handler.writable_fs_commit_iosb,
+                                    &snapshot_status.to_le_bytes(),
+                                );
+                                nt_handler.xas_write_buf(
+                                    nt_handler.writable_fs_commit_iosb + 8,
+                                    &0u64.to_le_bytes(),
+                                );
+                            }
+                        }
                     }
                 }
+                nt_handler.writable_fs_commit_required = false;
+                nt_handler.writable_fs_commit_iosb = 0;
                 if take_shared_image_mapping_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);
                 }

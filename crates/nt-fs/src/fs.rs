@@ -193,16 +193,24 @@ fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
-fn put_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u16_at(out: &mut [u8], value: u16) {
+    out.copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32_at(out: &mut [u8], value: u32) {
+    out.copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64_at(out: &mut [u8], value: u64) {
+    out.copy_from_slice(&value.to_le_bytes());
 }
 
 struct SnapshotReader<'a> {
@@ -363,22 +371,28 @@ impl MemFs {
     /// Serialize the volume tree to a versioned, checksummed snapshot. Open FILE_OBJECT handles are
     /// intentionally not part of the image; a restored boot reopens files through normal Zw paths.
     pub fn to_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
-        let mut payload = Vec::new();
         let mut record_count = 0u32;
-        self.write_snapshot_children(0, "", &mut payload, &mut record_count)?;
+        let payload_len = self.measure_snapshot_children(0, "", &mut record_count)?;
 
         let mut out = Vec::new();
-        out.try_reserve_exact(MEMFS_SNAPSHOT_HEADER_LEN + payload.len())
+        let total_len = MEMFS_SNAPSHOT_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(MemFsSnapshotError::InvalidRecord)?;
+        out.try_reserve_exact(total_len)
             .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
-        out.extend_from_slice(&MEMFS_SNAPSHOT_MAGIC);
-        put_u16(&mut out, MEMFS_SNAPSHOT_HEADER_LEN as u16);
-        put_u16(&mut out, MEMFS_SNAPSHOT_VERSION);
-        put_u32(&mut out, record_count);
-        put_u64(&mut out, payload.len() as u64);
-        put_u32(&mut out, crc32c(&payload));
-        let header_crc = crc32c(&out);
-        put_u32(&mut out, header_crc);
-        out.extend_from_slice(&payload);
+        out.resize(MEMFS_SNAPSHOT_HEADER_LEN, 0);
+        let mut written_records = 0u32;
+        self.write_snapshot_children(0, "", &mut out, &mut written_records)?;
+        if written_records != record_count || out.len() != total_len {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        }
+        let payload_crc = crc32c(&out[MEMFS_SNAPSHOT_HEADER_LEN..]);
+        Self::write_snapshot_header(
+            &mut out[..MEMFS_SNAPSHOT_HEADER_LEN],
+            record_count,
+            payload_len as u64,
+            payload_crc,
+        );
         Ok(out)
     }
 
@@ -472,6 +486,68 @@ impl MemFs {
         Ok(())
     }
 
+    fn measure_snapshot_children(
+        &self,
+        parent: u64,
+        prefix: &str,
+        record_count: &mut u32,
+    ) -> Result<usize, MemFsSnapshotError> {
+        let Some(node) = self.node(parent) else {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        };
+        if !node.is_dir {
+            return Err(MemFsSnapshotError::InvalidRecord);
+        }
+        let mut total = 0usize;
+        for (_, name, child_id) in &node.children {
+            let Some(child) = self.node(*child_id) else {
+                return Err(MemFsSnapshotError::InvalidRecord);
+            };
+            let mut path = String::new();
+            let extra_sep = usize::from(!prefix.is_empty());
+            path.try_reserve_exact(prefix.len() + extra_sep + name.len())
+                .map_err(|_| MemFsSnapshotError::OutOfMemory)?;
+            path.push_str(prefix);
+            if !prefix.is_empty() {
+                path.push('\\');
+            }
+            path.push_str(name);
+            total = total
+                .checked_add(self.snapshot_record_len(&path, child)?)
+                .ok_or(MemFsSnapshotError::InvalidRecord)?;
+            *record_count = record_count
+                .checked_add(1)
+                .ok_or(MemFsSnapshotError::InvalidRecord)?;
+            if child.is_dir {
+                total = total
+                    .checked_add(self.measure_snapshot_children(*child_id, &path, record_count)?)
+                    .ok_or(MemFsSnapshotError::InvalidRecord)?;
+            }
+        }
+        Ok(total)
+    }
+
+    fn snapshot_record_len(
+        &self,
+        path: &str,
+        node: &MemFsNode,
+    ) -> Result<usize, MemFsSnapshotError> {
+        let path_len = u32::try_from(path.len()).map_err(|_| MemFsSnapshotError::InvalidPath)?;
+        let data_len = if node.is_dir {
+            0
+        } else {
+            Self::snapshot_file_data_encoded_len(&self.blobs, &node.data)?
+        };
+        1usize
+            .checked_add(4)
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(8))
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(path_len as usize))
+            .and_then(|n| n.checked_add(data_len))
+            .ok_or(MemFsSnapshotError::InvalidRecord)
+    }
+
     fn write_snapshot_record(
         &self,
         path: &str,
@@ -506,11 +582,69 @@ impl MemFs {
         Ok(())
     }
 
+    fn write_snapshot_header(
+        out: &mut [u8],
+        record_count: u32,
+        payload_len: u64,
+        payload_crc: u32,
+    ) {
+        out.fill(0);
+        out[0..8].copy_from_slice(&MEMFS_SNAPSHOT_MAGIC);
+        put_u16_at(&mut out[8..10], MEMFS_SNAPSHOT_HEADER_LEN as u16);
+        put_u16_at(&mut out[10..12], MEMFS_SNAPSHOT_VERSION);
+        put_u32_at(&mut out[12..16], record_count);
+        put_u64_at(&mut out[16..24], payload_len);
+        put_u32_at(&mut out[24..28], payload_crc);
+        let header_crc = crc32c(&out[..MEMFS_SNAPSHOT_HEADER_LEN - 4]);
+        put_u32_at(&mut out[28..32], header_crc);
+    }
+
     fn snapshot_extent_count(data: &FileData) -> usize {
         match data {
             FileData::Bytes(bytes) => usize::from(!bytes.is_empty()),
             FileData::Extents(extents) => extents.iter().filter(|extent| extent.len != 0).count(),
         }
+    }
+
+    fn snapshot_file_data_encoded_len(
+        blobs: &[Vec<u8>],
+        data: &FileData,
+    ) -> Result<usize, MemFsSnapshotError> {
+        let mut total = 0usize;
+        match data {
+            FileData::Bytes(bytes) => {
+                if !bytes.is_empty() {
+                    total = total
+                        .checked_add(1 + 8)
+                        .and_then(|n| n.checked_add(bytes.len()))
+                        .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                }
+            }
+            FileData::Extents(extents) => {
+                for extent in extents.iter().filter(|extent| extent.len != 0) {
+                    let data_len = if extent.blob == ZERO_EXTENT_BLOB {
+                        0
+                    } else {
+                        let Some(blob) = blobs.get(extent.blob) else {
+                            return Err(MemFsSnapshotError::InvalidRecord);
+                        };
+                        let end = extent
+                            .offset
+                            .checked_add(extent.len)
+                            .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                        if blob.get(extent.offset..end).is_none() {
+                            return Err(MemFsSnapshotError::InvalidRecord);
+                        }
+                        extent.len
+                    };
+                    total = total
+                        .checked_add(1 + 8)
+                        .and_then(|n| n.checked_add(data_len))
+                        .ok_or(MemFsSnapshotError::InvalidRecord)?;
+                }
+            }
+        }
+        Ok(total)
     }
 
     fn write_snapshot_file_data(

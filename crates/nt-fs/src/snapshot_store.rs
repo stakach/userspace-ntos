@@ -53,9 +53,14 @@ struct SlotHeader {
 
 #[derive(Clone)]
 struct SlotSnapshot {
-    slot: u32,
     generation: u64,
     payload: Vec<u8>,
+}
+
+#[derive(Copy, Clone)]
+struct SlotSummary {
+    slot: u32,
+    generation: u64,
 }
 
 impl SnapshotBlockStore {
@@ -118,7 +123,7 @@ impl SnapshotBlockStore {
         if payload.len() > self.payload_capacity(dev)? {
             return Err(SnapshotBlockStoreError::OutOfSpace);
         }
-        let latest = match (self.read_slot(dev, 0), self.read_slot(dev, 1)) {
+        let latest = match (self.read_slot_header(dev, 0), self.read_slot_header(dev, 1)) {
             (Ok(a), Ok(b)) => match (a, b) {
                 (Some(a), Some(b)) => Some(if b.generation > a.generation { b } else { a }),
                 (Some(a), None) => Some(a),
@@ -242,9 +247,42 @@ impl SnapshotBlockStore {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         Ok(Some(SlotSnapshot {
-            slot,
             generation: header.generation,
             payload,
+        }))
+    }
+
+    fn read_slot_header<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        slot: u32,
+    ) -> Result<Option<SlotSummary>, SnapshotBlockStoreError> {
+        let (sector_size, slot_sectors) = self.geometry(dev)?;
+        let slot_base = self.slot_lba(slot_sectors, slot)?;
+        let mut sector = Vec::new();
+        sector
+            .try_reserve_exact(sector_size)
+            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+        sector.resize(sector_size, 0);
+        dev.read_sector(slot_base, &mut sector)?;
+        let Some(header) = decode_header(&sector)? else {
+            return Ok(None);
+        };
+        if header.slot != slot || header.payload_sectors as u64 > slot_sectors - 1 {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let payload_len =
+            usize::try_from(header.payload_len).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+        let payload_capacity = usize::try_from(header.payload_sectors)
+            .ok()
+            .and_then(|sectors| sectors.checked_mul(sector_size))
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        if payload_len > payload_capacity {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        Ok(Some(SlotSummary {
+            slot,
+            generation: header.generation,
         }))
     }
 }

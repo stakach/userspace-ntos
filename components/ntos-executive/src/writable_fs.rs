@@ -246,7 +246,6 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
         };
         if provisioned {
             mark_snapshot_dirty();
-            let _ = checkpoint_dirty_volume();
         }
         provisioned
     } else {
@@ -1053,24 +1052,16 @@ pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
         OVERLAY_BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
         mark_snapshot_dirty();
-        return checkpoint_dirty_volume();
     }
     status
 }
 
 /// `NtFlushBuffersFile` on a writable-volume file object.
 pub(crate) unsafe fn flush(file_id: u64) -> u32 {
-    let status = {
-        let Some(fs) = writable_fs() else {
-            return nt_fs::STATUS_INVALID_HANDLE;
-        };
-        fs.zw_flush_buffers_file(file_id)
+    let Some(fs) = writable_fs() else {
+        return nt_fs::STATUS_INVALID_HANDLE;
     };
-    if status == nt_fs::STATUS_SUCCESS {
-        checkpoint_dirty_volume()
-    } else {
-        status
-    }
+    fs.zw_flush_buffers_file(file_id)
 }
 
 /// `NtQueryInformationFile` metadata for a writable-volume file object.

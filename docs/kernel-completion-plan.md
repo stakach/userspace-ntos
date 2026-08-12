@@ -4328,10 +4328,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   tracking is now split: the existing `writable_fs_dirty` still pins per-boot handle/tree allocations,
   while a module-local snapshot dirty bit is set only by durable tree mutations (create/overwrite,
   write, rename/delete, provisioning, and delete-on-close). Explicit atomic hive replacement and
-  `NtFlushBuffersFile` commit dirty snapshots synchronously; the service loop acts as a lazy writer
-  after it pins the overlay heap mark so temporary snapshot serialization is reclaimed by the normal
-  per-syscall allocator reset. Validation: `cargo fmt --all` and
+  `NtFlushBuffersFile` now request a commit-before-reply, but the service loop performs the actual
+  checkpoint only after it has pinned the live overlay heap mark. This preserves flush/save failure
+  reporting without retaining temporary snapshot payloads as durable heap state. Validation:
+  `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Review adjustment: next run a serialized desktop boot twice from the same
   disk image and gate on first boot committing a snapshot, second boot restoring it, and the shell
   reaching desktop paint without re-provision-only evidence.
+
+  D3 snapshot memory-boundary fix (2026-08-12): the first same-disk proof attempt
+  `.tmp/run-headless-snapshot-first-20260812.log` mounted a fresh reserve, committed real snapshots
+  through generation `38`, and reached real winlogon dialog paint, but later failed with
+  `[writable-fs-snapshot] export failed err=out-of-memory` followed by the executive allocator panic
+  site. The retained fix removes in-handler checkpointing from `write_file_atomic`,
+  `NtFlushBuffersFile`, and default-user hive publication; flush-like syscalls instead set a
+  commit-required bit consumed by the service loop before reply. `MemFs::to_snapshot` also measures
+  the payload and writes one pre-sized snapshot buffer rather than building a separate payload vector
+  and output vector, and `SnapshotBlockStore::commit_next` reads only the two slot headers when
+  choosing the next generation. Host coverage locks the header-only commit path. Validation:
+  `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rerun the same-disk proof from a freshly rebuilt image;
+  the first boot should create/commit a snapshot without allocator failure before the second boot
+  proves restore.
