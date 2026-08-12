@@ -49,6 +49,19 @@ pool gate remains green (`ut-free=82298KiB`, `slot-free=70980`, `image-bank-fail
 proof is already established and with no active callback; keep that as a generic image/view/process
 diagnostic if it reproduces, not as the current shell-chrome frontier.
 
+Current generic-section handle-lifetime slice (2026-08-12): the parked post-proof process exposed a
+real handle side-table lifetime bug, not a shell or callback problem. `rundll32.exe` created and
+closed a small generic data section whose process-local handle value was later reused for
+`NtCreateSection(SEC_IMAGE)` on `explorer.exe`; the real EPROCESS handle slot was closed, but the
+generic-section side table kept the old `(pi, handle) -> section` binding, so a later
+`NtMapViewOfSection` resolved the stale data section and handed user mode the wrong bytes. The
+retained fix routes `HandleObject::Section` through the generic section release path during normal
+handle cleanup, so `NtClose` and process teardown clear the section record, its views, and its pages
+before the handle value can be reused. Local validation is green:
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`cargo fmt --all`. Next serialized desktop proof should verify that the late `vmf-out` no longer
+reproduces after shell paint.
+
 Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
 path in per-process guarded child CNodes. The shared-image mapping table records each map cap as
 root-held or banked, banked caps are moved with `CNodeMove` after the process mapping succeeds,

@@ -11655,6 +11655,13 @@ impl ExecNtHandler {
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
             }
+            nt_process::HandleObject::Section(section) => {
+                if let Some(loop_ctx) = self.loop_ctx {
+                    unsafe {
+                        (&mut *loop_ctx.generic_sections).clear_section(section as usize);
+                    }
+                }
+            }
             // The last handle on a writable-overlay file object: run the volume's cleanup/close
             // (which actions a pending delete) and free the FILE_OBJECT.
             nt_process::HandleObject::OverlayFile(file_id) => {
