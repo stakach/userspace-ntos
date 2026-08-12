@@ -56,11 +56,17 @@ closed a small generic data section whose process-local handle value was later r
 generic-section side table kept the old `(pi, handle) -> section` binding, so a later
 `NtMapViewOfSection` resolved the stale data section and handed user mode the wrong bytes. The
 retained fix routes `HandleObject::Section` through the generic section release path during normal
-handle cleanup, so `NtClose` and process teardown clear the section record, its views, and its pages
-before the handle value can be reused. Local validation is green:
-`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
-`cargo fmt --all`. Next serialized desktop proof should verify that the late `vmf-out` no longer
-reproduces after shell paint.
+handle cleanup, so `NtClose` and process teardown clear only the caller-visible handle binding before
+the value can be reused. Mapped views keep the section record and resident pages alive, matching NT
+section-object semantics; when the last view unmaps and no handle remains, the table reclaims the
+section record. The rejected intermediate proof
+`.tmp/run-desktop-generic-section-close-20260812.log` cleared the whole section at handle close and
+regressed mapped-section/ALPC/selftest behavior plus Explorer shell gates (`283/295`), proving that
+view references must own the section past `NtClose`. Local validation for the corrected lifetime rule
+is green: `cargo fmt --all` and
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+Next serialized desktop proof should verify both that the late stale-section `vmf-out` no longer
+reproduces and that mapped-section/ALPC plus shell chrome gates return to green.
 
 Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
 path in per-process guarded child CNodes. The shared-image mapping table records each map cap as

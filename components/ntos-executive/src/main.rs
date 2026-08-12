@@ -1713,6 +1713,35 @@ impl GenericSectionTable {
         }
     }
 
+    fn section_has_views(&self, index: usize) -> bool {
+        self.views
+            .iter()
+            .any(|view| view.live && view.section_index == index)
+    }
+
+    fn clear_section_if_unreferenced(&mut self, index: usize) {
+        if self
+            .sections
+            .get(index)
+            .is_some_and(|section| section.live && section.handle == 0)
+            && !self.section_has_views(index)
+        {
+            self.clear_section(index);
+        }
+    }
+
+    pub(crate) fn release_handle(&mut self, index: usize) -> bool {
+        let Some(section) = self.sections.get_mut(index) else {
+            return false;
+        };
+        if !section.live {
+            return false;
+        }
+        section.handle = 0;
+        self.clear_section_if_unreferenced(index);
+        true
+    }
+
     pub(crate) fn index_for_handle(&self, owner_pi: usize, handle: u64) -> Option<usize> {
         self.sections.iter().position(|section| {
             section.live && section.owner_pi == owner_pi && section.handle == handle
@@ -1758,6 +1787,7 @@ impl GenericSectionTable {
             if view.live && view.pi == pi && view.base == base {
                 let removed = *view;
                 *view = GenericSectionView::empty();
+                self.clear_section_if_unreferenced(removed.section_index);
                 return Some(removed);
             }
         }

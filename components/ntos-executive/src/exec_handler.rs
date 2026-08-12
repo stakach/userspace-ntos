@@ -11658,7 +11658,7 @@ impl ExecNtHandler {
             nt_process::HandleObject::Section(section) => {
                 if let Some(loop_ctx) = self.loop_ctx {
                     unsafe {
-                        (&mut *loop_ctx.generic_sections).clear_section(section as usize);
+                        let _ = (&mut *loop_ctx.generic_sections).release_handle(section as usize);
                     }
                 }
             }
