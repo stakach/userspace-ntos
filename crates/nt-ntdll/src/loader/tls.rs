@@ -69,9 +69,23 @@ impl<const N: usize> StaticTlsCatalog<N> {
         self.len == 0
     }
 
+    pub fn entry_for_module(&self, module_base: u64) -> Option<&StaticTlsEntry> {
+        self.entries()
+            .iter()
+            .find(|entry| entry.module_base == module_base)
+    }
+
     /// Forget the current process catalog without copying its fixed-capacity backing array.
     pub fn clear(&mut self) {
         self.len = 0;
+    }
+
+    /// Restore a previous catalog length. Callers use this to roll back a failed append before any
+    /// callbacks observe the new TLS slot.
+    pub fn truncate(&mut self, len: usize) {
+        if len <= self.len {
+            self.len = len;
+        }
     }
 
     pub fn add(
@@ -196,5 +210,23 @@ mod tests {
         catalog.clear();
         assert!(catalog.is_empty());
         assert_eq!(catalog.add(5, directory(6, 7, 8, 0)).unwrap().index, 0);
+    }
+
+    #[test]
+    fn catalog_can_find_entries_and_rollback_append() {
+        let mut catalog = StaticTlsCatalog::<3>::new();
+        catalog
+            .add(0x1000, directory(0x2000, 0x2008, 0x3000, 0))
+            .unwrap();
+        let checkpoint = catalog.len();
+        catalog
+            .add(0x4000, directory(0x5000, 0x5010, 0x6000, 4))
+            .unwrap();
+
+        assert_eq!(catalog.entry_for_module(0x4000).unwrap().index, 1);
+        catalog.truncate(checkpoint);
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.entry_for_module(0x4000).is_none());
+        assert_eq!(catalog.entry_for_module(0x1000).unwrap().index, 0);
     }
 }

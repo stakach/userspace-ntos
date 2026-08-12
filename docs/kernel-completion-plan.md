@@ -4150,12 +4150,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   (`NtUserProcessConnect`, plus two early USER calls) but does not reach its first
   `NtUserCreateWindowEx`, shell COM open, api0 callback, or shell chrome paint before the gate.
 
-  New active frontier: Explorer is runnable in `nfs41_np.dll`'s TLS/CRT startup path after MPR loads
-  the registry-ordered network provider. The earlier green proof faults the same provider at
-  `nfs41_np+0x3460` and then immediately continues to the provider `.data` faults
-  (`0x821e6018`, `0x821e6040`) before loading the shell UI stack. The latest retry logs the
-  `0x821e3460` page fault but never observes the next provider fault or any later Explorer progress;
-  census stays fixed at `explorer total=327 native=324 win32k=3`. Treat this as a generic image-loader /
-  runnable-thread / network-provider initialization issue. Do not add Explorer, MPR, or NFS-specific
-  shell shortcuts; the next repair should either prove a serviced VM fault always resumes into the
-  next guest access, or expose the real user-mode wait/spin it enters.
+  Runtime static-TLS checkpoint (2026-08-12): the stale `nfs41_np.dll` frontier was a symptom of a
+  generic ntdll loader gap. Initial process TLS was catalogued once during `LdrpInitialize`, but
+  runtime `LdrLoadDll` modules with static TLS could run TLS callbacks before ntdll assigned their
+  TLS index, extended the current thread's `ThreadLocalStoragePointer`, or marked the LDR entry's TLS
+  slot. `ensure_current_module_static_tls` now appends runtime TLS directories atomically before
+  `DLL_PROCESS_ATTACH`, grows the current thread's TLS vector, writes `AddressOfIndex`, and rolls
+  back the catalog on allocation failure. Local validation passed `cargo fmt --all`,
+  `cargo test -p nt-ntdll loader::tls -- --nocapture`, `cargo test -p nt-ntdll`, and
+  `./scripts/build_ntdll_dll.sh`.
+
+  Serialized proof `.tmp/run-desktop-runtime-tls-20260812.log` reaches the sentinel at `284/295` and
+  proves the loader moved past both previous network-provider/TLS walls: `userinit.exe` and
+  `explorer.exe` are genuinely spawned, Explorer gets an EPROCESS, VSpace, image PTEs, a running main
+  thread, system fonts, built-in classes, cursor identity, and the final framebuffer is fully
+  non-background (`786432/786432`, unique non-background saturated). The remaining red Explorer gates
+  are still pre-shell-chrome: no Explorer create-window strings, no registered shell messages, no
+  Explorer api0 redirect/WndProc install, no shell COM class opens, and no shell chrome paint.
+
+  New active frontier: Explorer has completed `NtUserProcessConnect` but still quiesces before its
+  first `NtUserCreateWindowEx`. The sampled Explorer thread is inside ntdll at
+  `ntdll+0x32fa1`, whose PE unwind entry is the internal helper range `0x32ca0..0x32fdb`; disassembly
+  shows activation-context object teardown/freeing rather than TLS or win32k dispatch. The stack has
+  loader/attach frames for `advapi32`, `rpcrt4`, and `ws2_32`, so treat this as a generic activation
+  context lifetime/destructor or loader-callout progress problem. Do not add Explorer, MPR, provider,
+  shell, or COM shortcuts; the next repair should make ntdll's activation-context ownership and
+  temporary-query references behave like NT5/ReactOS and add a small proof counter for
+  create/release/free progress if needed.

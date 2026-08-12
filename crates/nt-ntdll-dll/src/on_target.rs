@@ -730,6 +730,11 @@ unsafe fn attach_dfs(
             mn = crate::write_u64_hex(&mut mb, mn, base);
             crate::dbg_print_bytes(mb.as_ptr(), mn);
         }
+        let tls_status = ensure_current_module_static_tls(base);
+        if tls_status != 0 {
+            (*table).mods[module_index].attaching = false;
+            return tls_status;
+        }
         call_tls_initializers(base, DLL_PROCESS_ATTACH);
         if call_dll_main(base, DLL_PROCESS_ATTACH, attach_reserved) == 0 {
             (*table).mods[module_index].attaching = false;
@@ -1587,32 +1592,113 @@ unsafe fn allocate_current_thread_static_tls() -> u32 {
     unsafe { core::ptr::write_bytes(vector.cast::<u8>(), 0, vector_size) };
 
     for entry in catalog.entries() {
-        let Some(size) = entry.allocation_size() else {
-            unsafe { free_static_tls_vector(vector) };
-            return STATUS_NO_MEMORY as u32;
+        let block = match unsafe { allocate_static_tls_block(*entry) } {
+            Ok(block) => block,
+            Err(status) => {
+                unsafe { free_static_tls_vector(vector) };
+                return status;
+            }
         };
-        let block = unsafe { crate::process_heap_alloc(size.max(1)) };
-        if block.is_null() {
-            unsafe { free_static_tls_vector(vector) };
-            return STATUS_NO_MEMORY as u32;
-        }
-        if entry.raw_data_size != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    entry.raw_data_address as *const u8,
-                    block,
-                    entry.raw_data_size,
-                )
-            };
-        }
-        if entry.zero_fill_size != 0 {
-            unsafe {
-                core::ptr::write_bytes(block.add(entry.raw_data_size), 0, entry.zero_fill_size)
-            };
-        }
         unsafe { core::ptr::write(vector.add(entry.index as usize), block as u64) };
     }
     unsafe { (*teb).thread_local_storage_pointer = vector as u64 };
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn allocate_static_tls_block(
+    entry: nt_ntdll::loader::tls::StaticTlsEntry,
+) -> Result<*mut u8, u32> {
+    let Some(size) = entry.allocation_size() else {
+        return Err(STATUS_NO_MEMORY as u32);
+    };
+    let block = unsafe { crate::process_heap_alloc(size.max(1)) };
+    if block.is_null() {
+        return Err(STATUS_NO_MEMORY as u32);
+    }
+    if entry.raw_data_size != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                entry.raw_data_address as *const u8,
+                block,
+                entry.raw_data_size,
+            )
+        };
+    }
+    if entry.zero_fill_size != 0 {
+        unsafe {
+            core::ptr::write_bytes(block.add(entry.raw_data_size), 0, entry.zero_fill_size)
+        };
+    }
+    Ok(block)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn extend_current_thread_static_tls(
+    entry: nt_ntdll::loader::tls::StaticTlsEntry,
+    old_len: usize,
+    new_len: usize,
+) -> u32 {
+    let teb = unsafe { current_teb() };
+    if teb.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let old_vector = unsafe { (*teb).thread_local_storage_pointer as *mut u64 };
+    if old_vector.is_null() {
+        return unsafe { allocate_current_thread_static_tls() };
+    }
+    let new_vector_size = match new_len.checked_mul(core::mem::size_of::<u64>()) {
+        Some(size) => size,
+        None => return STATUS_NO_MEMORY as u32,
+    };
+    let new_vector = unsafe { crate::process_heap_alloc(new_vector_size) } as *mut u64;
+    if new_vector.is_null() {
+        return STATUS_NO_MEMORY as u32;
+    }
+    unsafe { core::ptr::write_bytes(new_vector.cast::<u8>(), 0, new_vector_size) };
+    if old_len != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(old_vector, new_vector, old_len) };
+    }
+
+    let block = match unsafe { allocate_static_tls_block(entry) } {
+        Ok(block) => block,
+        Err(status) => {
+            let _ = unsafe { crate::process_heap_free(new_vector.cast()) };
+            return status;
+        }
+    };
+    unsafe { core::ptr::write(new_vector.add(entry.index as usize), block as u64) };
+    unsafe { (*teb).thread_local_storage_pointer = new_vector as u64 };
+    let _ = unsafe { crate::process_heap_free(old_vector.cast()) };
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ensure_current_module_static_tls(base: u64) -> u32 {
+    let Some(directory) = (unsafe { image_tls_directory(base) }) else {
+        return 0;
+    };
+    let catalog = unsafe { &mut *core::ptr::addr_of_mut!(STATIC_TLS_CATALOG) };
+    if let Some(entry) = catalog.entry_for_module(base).copied() {
+        unsafe { core::ptr::write_unaligned(entry.address_of_index as *mut u32, entry.index) };
+        return 0;
+    }
+
+    let old_len = catalog.len();
+    let entry = match catalog.add(base, directory) {
+        Ok(entry) => *entry,
+        Err(_) => return 0xC000_007B, // STATUS_INVALID_IMAGE_FORMAT
+    };
+    let status = unsafe { extend_current_thread_static_tls(entry, old_len, catalog.len()) };
+    if status != 0 {
+        catalog.truncate(old_len);
+        return status;
+    }
+    unsafe { core::ptr::write_unaligned(entry.address_of_index as *mut u32, entry.index) };
+    let ldr_entry = unsafe { ldr_entry_for_base(entry.module_base) };
+    if ldr_entry != 0 {
+        unsafe { core::ptr::write_unaligned((ldr_entry + 0x6e) as *mut u16, u16::MAX) };
+    }
     0
 }
 
