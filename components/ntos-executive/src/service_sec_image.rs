@@ -853,6 +853,93 @@ fn pin_durable_heap_mark(heap_mark: &mut usize) {
     *heap_mark = (*heap_mark).max(allocator::mark());
 }
 
+fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
+    if !unsafe { crate::writable_fs::writable_fs_mounted() } {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
+    if dirty_cells == 0 {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    print_str(b"[cm-flush] quiesce lazy boot hive sweep dirty-cells=");
+    print_u64(dirty_cells as u64);
+    print_str(b"\n");
+    let status = nt_handler.checkpoint_dirty_boot_mutable_hives();
+    if status != nt_fs::STATUS_SUCCESS {
+        print_str(b"[cm-flush] quiesce boot hive sweep failed status=0x");
+        print_hex(status);
+        print_str(b"\n");
+        return status;
+    }
+    let snapshot_mark = allocator::mark();
+    let snapshot_status = {
+        let _alloc_ctx =
+            allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+        unsafe { crate::writable_fs::checkpoint_dirty_volume() }
+    };
+    unsafe { allocator::reset_to(snapshot_mark) };
+    if snapshot_status != nt_fs::STATUS_SUCCESS {
+        print_str(b"[writable-fs-snapshot] quiesce checkpoint status=0x");
+        print_hex(snapshot_status);
+        print_str(b"\n");
+    }
+    snapshot_status
+}
+
+fn checkpoint_one_boot_hive_if_headroom(
+    nt_handler: &mut ExecNtHandler,
+    heap_mark: &mut usize,
+) -> u32 {
+    const MIN_DIRTY_CELLS: usize = 32;
+    const MIN_IMAGE_HINT: usize = 0x1_0000;
+    // Keep enough contiguous bump-heap runway for the largest measured post-logon
+    // service image activation allocation before spending memory on a lazy hive image.
+    const MIN_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
+
+    if !unsafe { crate::writable_fs::writable_fs_mounted() } {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    let total_dirty = nt_handler.boot_mutable_hive_dirty_cells();
+    if total_dirty < MIN_DIRTY_CELLS {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    let Some((next_dirty, image_len_hint)) =
+        nt_handler.next_dirty_boot_mutable_hive_checkpoint_hint(MIN_DIRTY_CELLS)
+    else {
+        return nt_fs::STATUS_SUCCESS;
+    };
+    let required_headroom = image_len_hint
+        .max(MIN_IMAGE_HINT)
+        .saturating_add(MIN_POST_CHECKPOINT_HEADROOM);
+    let headroom = allocator::remaining();
+    if headroom < required_headroom {
+        return nt_fs::STATUS_SUCCESS;
+    }
+
+    print_str(b"[cm-flush] lazy boot hive slice total-dirty=");
+    print_u64(total_dirty as u64);
+    print_str(b" next-dirty=");
+    print_u64(next_dirty as u64);
+    print_str(b" image-hint=");
+    print_u64(image_len_hint as u64);
+    print_str(b" headroom=");
+    print_u64(headroom as u64);
+    print_str(b"\n");
+    let status = nt_handler.checkpoint_next_dirty_boot_mutable_hive(MIN_DIRTY_CELLS);
+    if status != nt_fs::STATUS_SUCCESS {
+        print_str(b"[cm-flush] lazy boot hive slice failed status=0x");
+        print_hex(status);
+        print_str(b"\n");
+        nt_handler.mutable_hives_dirty = true;
+        return status;
+    }
+    pin_durable_heap_mark(heap_mark);
+    if nt_handler.boot_mutable_hive_dirty_cells() != 0 {
+        nt_handler.mutable_hives_dirty = true;
+    }
+    status
+}
+
 unsafe fn service_generic_section_frame(
     generic_sections: &mut GenericSectionTable,
     section_index: usize,
@@ -7941,8 +8028,16 @@ pub(crate) unsafe fn service_sec_image(
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 if nt_handler.mutable_hives_dirty {
+                    let _alloc_scope = allocator::enter_scope(b"service-loop-mutable-hives");
                     nt_handler.mutable_hives_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
+                    let status =
+                        checkpoint_one_boot_hive_if_headroom(&mut nt_handler, &mut heap_mark);
+                    if status != nt_fs::STATUS_SUCCESS {
+                        print_str(b"[cm-flush] background boot hive checkpoint retained dirty status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                    }
                 }
                 if nt_handler.registry_services_order_cache_dirty {
                     nt_handler.registry_services_order_cache_dirty = false;
@@ -7954,6 +8049,7 @@ pub(crate) unsafe fn service_sec_image(
                 // metadata. Pin them before the next per-syscall reset so the process can fault its
                 // main image just like a bootstrap image.
                 if nt_handler.hosted_exe_dirty {
+                    let _alloc_scope = allocator::enter_scope(b"service-loop-hosted-exe");
                     nt_handler.hosted_exe_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -7962,6 +8058,7 @@ pub(crate) unsafe fn service_sec_image(
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 if nt_handler.process_dirty {
+                    let _alloc_scope = allocator::enter_scope(b"service-loop-process-state");
                     nt_handler.process_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -7982,6 +8079,7 @@ pub(crate) unsafe fn service_sec_image(
                 // mounted it. (The source regf BYTES live in a static slot; the mutable cells own
                 // their runtime strings/value data.)
                 if nt_handler.hive_mounts_dirty {
+                    let _alloc_scope = allocator::enter_scope(b"service-loop-hive-mounts");
                     nt_handler.hive_mounts_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -7995,9 +8093,22 @@ pub(crate) unsafe fn service_sec_image(
                 let writable_fs_touched =
                     nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty();
                 if writable_fs_touched {
+                    let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
                     nt_handler.writable_fs_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
-                    let snapshot_status = crate::writable_fs::checkpoint_dirty_volume();
+                    if crate::writable_fs::snapshot_restore_seen()
+                        && nt_handler.refresh_boot_hive_checkpoints_from_writable_config()
+                    {
+                        nt_handler.hive_mounts_dirty = false;
+                        pin_durable_heap_mark(&mut heap_mark);
+                    }
+                    let checkpoint_mark = allocator::mark();
+                    let snapshot_status = {
+                        let _alloc_ctx =
+                            allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
+                        crate::writable_fs::checkpoint_dirty_volume()
+                    };
+                    unsafe { allocator::reset_to(checkpoint_mark) };
                     if snapshot_status != nt_fs::STATUS_SUCCESS {
                         print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
                         print_hex(snapshot_status);
@@ -14444,6 +14555,10 @@ pub(crate) unsafe fn service_sec_image(
         }
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
+    }
+    let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);
+    if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
+        stop = quiesce_cm_status as u64;
     }
     dump_interactive_logon_quiesce(
         &nt_handler,

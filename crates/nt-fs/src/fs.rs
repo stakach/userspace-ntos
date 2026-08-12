@@ -12,6 +12,10 @@ use crate::directory::{
     query_directory_by_index, DirectoryEntry, DirectoryQueryResult, DirectoryQueryState,
 };
 use crate::path::{normalize_separators, MountManager, MEMFS_VOLUME};
+use crate::snapshot_store::{
+    SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, SnapshotPayloadReader,
+    SnapshotPayloadSink,
+};
 use crate::status::*;
 
 /// A MemFs node (spec §12.3). Carries the node's DOS attributes and its parent link so the volume
@@ -31,6 +35,12 @@ pub struct MemFsSnapshotInfo {
     pub version: u16,
     pub record_count: u32,
     pub payload_len: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct MemFsSnapshotHeader {
+    info: MemFsSnapshotInfo,
+    payload_crc: u32,
 }
 
 /// Snapshot decode/validation failures. Snapshots are durable storage input, so malformed bytes are
@@ -178,19 +188,140 @@ impl FileData {
     }
 }
 
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x82F6_3B78
-            } else {
-                crc >> 1
-            };
+struct Crc32c {
+    crc: u32,
+}
+
+impl Crc32c {
+    fn new() -> Self {
+        Self { crc: 0xFFFF_FFFF }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        for &b in data {
+            self.crc ^= b as u32;
+            for _ in 0..8 {
+                self.crc = if self.crc & 1 != 0 {
+                    (self.crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    self.crc >> 1
+                };
+            }
         }
     }
-    !crc
+
+    fn finish(self) -> u32 {
+        !self.crc
+    }
+}
+
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = Crc32c::new();
+    crc.update(data);
+    crc.finish()
+}
+
+struct SnapshotCrcSink {
+    crc: Crc32c,
+    len: usize,
+}
+
+impl SnapshotCrcSink {
+    fn new() -> Self {
+        Self {
+            crc: Crc32c::new(),
+            len: 0,
+        }
+    }
+
+    fn finish(self) -> (u32, usize) {
+        (self.crc.finish(), self.len)
+    }
+}
+
+impl SnapshotPayloadSink for SnapshotCrcSink {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.crc.update(bytes);
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        Ok(())
+    }
+}
+
+struct SnapshotStreamReader<'a, S: SnapshotPayloadReader> {
+    source: &'a mut S,
+    crc: Crc32c,
+    len: usize,
+}
+
+impl<'a, S: SnapshotPayloadReader> SnapshotStreamReader<'a, S> {
+    fn new(source: &'a mut S) -> Self {
+        Self {
+            source,
+            crc: Crc32c::new(),
+            len: 0,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.source.remaining()
+    }
+
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.source.read_exact(out)?;
+        self.crc.update(out);
+        self.len = self
+            .len
+            .checked_add(out.len())
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        Ok(())
+    }
+
+    fn u8(&mut self) -> Result<u8, SnapshotBlockStoreError> {
+        let mut buf = [0u8; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, SnapshotBlockStoreError> {
+        let mut buf = [0u8; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn u64(&mut self) -> Result<u64, SnapshotBlockStoreError> {
+        let mut buf = [0u8; 8];
+        self.read_exact(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn vec(&mut self, len: usize) -> Result<Vec<u8>, SnapshotBlockStoreError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+        out.resize(len, 0);
+        self.read_exact(&mut out)?;
+        Ok(out)
+    }
+
+    fn finish(self) -> (u32, usize) {
+        (self.crc.finish(), self.len)
+    }
+}
+
+fn snapshot_error_to_store_error(err: MemFsSnapshotError) -> SnapshotBlockStoreError {
+    match err {
+        MemFsSnapshotError::OutOfMemory => SnapshotBlockStoreError::OutOfMemory,
+        MemFsSnapshotError::BadMagic
+        | MemFsSnapshotError::BadChecksum
+        | MemFsSnapshotError::Truncated
+        | MemFsSnapshotError::UnsupportedVersion
+        | MemFsSnapshotError::InvalidRecord
+        | MemFsSnapshotError::InvalidPath
+        | MemFsSnapshotError::NameCollision => SnapshotBlockStoreError::Corrupt,
+    }
 }
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
@@ -323,12 +454,11 @@ impl MemFs {
         fs
     }
 
-    /// Parse and validate a snapshot header without restoring the tree.
-    pub fn snapshot_info(bytes: &[u8]) -> Result<MemFsSnapshotInfo, MemFsSnapshotError> {
-        if bytes.len() < MEMFS_SNAPSHOT_HEADER_LEN {
+    fn snapshot_header(bytes: &[u8]) -> Result<MemFsSnapshotHeader, MemFsSnapshotError> {
+        if bytes.len() != MEMFS_SNAPSHOT_HEADER_LEN {
             return Err(MemFsSnapshotError::Truncated);
         }
-        let mut r = SnapshotReader::new(&bytes[..MEMFS_SNAPSHOT_HEADER_LEN]);
+        let mut r = SnapshotReader::new(bytes);
         if r.take(MEMFS_SNAPSHOT_MAGIC.len())? != MEMFS_SNAPSHOT_MAGIC {
             return Err(MemFsSnapshotError::BadMagic);
         }
@@ -347,8 +477,24 @@ impl MemFs {
         if crc32c(&bytes[..MEMFS_SNAPSHOT_HEADER_LEN - 4]) != header_crc {
             return Err(MemFsSnapshotError::BadChecksum);
         }
-        let payload_len_usize =
-            usize::try_from(payload_len).map_err(|_| MemFsSnapshotError::InvalidRecord)?;
+        Ok(MemFsSnapshotHeader {
+            info: MemFsSnapshotInfo {
+                version,
+                record_count,
+                payload_len,
+            },
+            payload_crc,
+        })
+    }
+
+    /// Parse and validate a snapshot header without restoring the tree.
+    pub fn snapshot_info(bytes: &[u8]) -> Result<MemFsSnapshotInfo, MemFsSnapshotError> {
+        if bytes.len() < MEMFS_SNAPSHOT_HEADER_LEN {
+            return Err(MemFsSnapshotError::Truncated);
+        }
+        let header = Self::snapshot_header(&bytes[..MEMFS_SNAPSHOT_HEADER_LEN])?;
+        let payload_len_usize = usize::try_from(header.info.payload_len)
+            .map_err(|_| MemFsSnapshotError::InvalidRecord)?;
         let end = MEMFS_SNAPSHOT_HEADER_LEN
             .checked_add(payload_len_usize)
             .ok_or(MemFsSnapshotError::InvalidRecord)?;
@@ -358,14 +504,21 @@ impl MemFs {
         if bytes.len() != end {
             return Err(MemFsSnapshotError::InvalidRecord);
         }
-        if crc32c(&bytes[MEMFS_SNAPSHOT_HEADER_LEN..end]) != payload_crc {
+        if crc32c(&bytes[MEMFS_SNAPSHOT_HEADER_LEN..end]) != header.payload_crc {
             return Err(MemFsSnapshotError::BadChecksum);
         }
-        Ok(MemFsSnapshotInfo {
-            version,
-            record_count,
-            payload_len,
-        })
+        Ok(header.info)
+    }
+
+    fn snapshot_header_payload_len(
+        header: MemFsSnapshotHeader,
+    ) -> Result<usize, MemFsSnapshotError> {
+        let payload_len_usize = usize::try_from(header.info.payload_len)
+            .map_err(|_| MemFsSnapshotError::InvalidRecord)?;
+        MEMFS_SNAPSHOT_HEADER_LEN
+            .checked_add(payload_len_usize)
+            .ok_or(MemFsSnapshotError::InvalidRecord)?;
+        Ok(payload_len_usize)
     }
 
     /// Serialize the volume tree to a versioned, checksummed snapshot. Open FILE_OBJECT handles are
@@ -442,6 +595,116 @@ impl MemFs {
         Ok(fs)
     }
 
+    fn from_snapshot_reader<S: SnapshotPayloadReader>(
+        source: &mut S,
+    ) -> Result<Self, SnapshotBlockStoreError> {
+        let total_len = source.remaining();
+        if total_len < MEMFS_SNAPSHOT_HEADER_LEN {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let mut header_bytes = [0u8; MEMFS_SNAPSHOT_HEADER_LEN];
+        source.read_exact(&mut header_bytes)?;
+        let header = Self::snapshot_header(&header_bytes).map_err(snapshot_error_to_store_error)?;
+        let payload_len =
+            Self::snapshot_header_payload_len(header).map_err(snapshot_error_to_store_error)?;
+        if source.remaining() != payload_len {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+
+        let mut fs = MemFs::new();
+        let mut r = SnapshotStreamReader::new(source);
+        let mut seen = 0u32;
+        while r.remaining() != 0 {
+            let kind = r.u8()?;
+            let attributes = r.u32()?;
+            let path_len =
+                usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let logical_len =
+                usize::try_from(r.u64()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let extent_count =
+                usize::try_from(r.u32()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let path_bytes = r.vec(path_len)?;
+            let path =
+                core::str::from_utf8(&path_bytes).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            let is_dir = match kind {
+                SNAP_REC_DIR => true,
+                SNAP_REC_FILE => false,
+                _ => return Err(SnapshotBlockStoreError::Corrupt),
+            };
+            let id = fs
+                .restore_snapshot_node(path, is_dir, attributes)
+                .map_err(snapshot_error_to_store_error)?;
+            if is_dir {
+                if logical_len != 0 || extent_count != 0 {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+            } else {
+                let data =
+                    fs.read_snapshot_file_data_streaming(&mut r, logical_len, extent_count)?;
+                let Some(node) = fs.node_mut(id) else {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                };
+                node.data = data;
+            }
+            seen = seen
+                .checked_add(1)
+                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        }
+        if seen != header.info.record_count {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        let (payload_crc, payload_read) = r.finish();
+        if payload_read != payload_len || payload_crc != header.payload_crc {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        Ok(fs)
+    }
+
+    fn commit_snapshot_to_store<D: SnapshotBlockDevice>(
+        &self,
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        let mut record_count = 0u32;
+        let payload_len = self
+            .measure_snapshot_children(0, "", &mut record_count)
+            .map_err(snapshot_error_to_store_error)?;
+        let total_len = MEMFS_SNAPSHOT_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+
+        let mut payload_crc_sink = SnapshotCrcSink::new();
+        let written_records = self.write_snapshot_payload_to_sink(&mut payload_crc_sink)?;
+        let (payload_crc, payload_written) = payload_crc_sink.finish();
+        if written_records != record_count || payload_written != payload_len {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+
+        let payload_len_u64 =
+            u64::try_from(payload_len).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+        let mut header = [0u8; MEMFS_SNAPSHOT_HEADER_LEN];
+        Self::write_snapshot_header(&mut header, record_count, payload_len_u64, payload_crc);
+
+        let mut store_crc_sink = SnapshotCrcSink::new();
+        store_crc_sink.write_all(&header)?;
+        let written_records = self.write_snapshot_payload_to_sink(&mut store_crc_sink)?;
+        let (store_payload_crc, store_payload_len) = store_crc_sink.finish();
+        if written_records != record_count || store_payload_len != total_len {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+
+        let generation =
+            store.commit_next_streaming(dev, total_len, store_payload_crc, |writer| {
+                writer.write_all(&header)?;
+                let written_records = self.write_snapshot_payload_to_sink(writer)?;
+                if written_records != record_count {
+                    return Err(SnapshotBlockStoreError::Corrupt);
+                }
+                Ok(())
+            })?;
+        Ok((generation, total_len))
+    }
+
     fn node(&self, id: u64) -> Option<&MemFsNode> {
         self.nodes.get(id as usize)?.as_ref()
     }
@@ -481,6 +744,52 @@ impl MemFs {
                 .ok_or(MemFsSnapshotError::InvalidRecord)?;
             if child.is_dir {
                 self.write_snapshot_children(*child_id, &path, out, record_count)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_snapshot_payload_to_sink<S: SnapshotPayloadSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<u32, SnapshotBlockStoreError> {
+        let mut record_count = 0u32;
+        self.write_snapshot_children_to_sink(0, "", sink, &mut record_count)?;
+        Ok(record_count)
+    }
+
+    fn write_snapshot_children_to_sink<S: SnapshotPayloadSink>(
+        &self,
+        parent: u64,
+        prefix: &str,
+        sink: &mut S,
+        record_count: &mut u32,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        let Some(node) = self.node(parent) else {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        };
+        if !node.is_dir {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        for (_, name, child_id) in &node.children {
+            let Some(child) = self.node(*child_id) else {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            };
+            let mut path = String::new();
+            let extra_sep = usize::from(!prefix.is_empty());
+            path.try_reserve_exact(prefix.len() + extra_sep + name.len())
+                .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+            path.push_str(prefix);
+            if !prefix.is_empty() {
+                path.push('\\');
+            }
+            path.push_str(name);
+            self.write_snapshot_record_to_sink(&path, child, sink)?;
+            *record_count = record_count
+                .checked_add(1)
+                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            if child.is_dir {
+                self.write_snapshot_children_to_sink(*child_id, &path, sink, record_count)?;
             }
         }
         Ok(())
@@ -578,6 +887,43 @@ impl MemFs {
         out.extend_from_slice(path.as_bytes());
         if !node.is_dir {
             self.write_snapshot_file_data(&node.data, out)?;
+        }
+        Ok(())
+    }
+
+    fn write_snapshot_record_to_sink<S: SnapshotPayloadSink>(
+        &self,
+        path: &str,
+        node: &MemFsNode,
+        sink: &mut S,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        let path_len = u32::try_from(path.len()).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+        let logical_len = if node.is_dir {
+            0
+        } else {
+            u64::try_from(node.data.len(&self.blobs))
+                .map_err(|_| SnapshotBlockStoreError::Corrupt)?
+        };
+        let extent_count = if node.is_dir {
+            0
+        } else {
+            u32::try_from(Self::snapshot_extent_count(&node.data))
+                .map_err(|_| SnapshotBlockStoreError::Corrupt)?
+        };
+        let mut header = [0u8; 21];
+        header[0] = if node.is_dir {
+            SNAP_REC_DIR
+        } else {
+            SNAP_REC_FILE
+        };
+        put_u32_at(&mut header[1..5], node.attributes);
+        put_u32_at(&mut header[5..9], path_len);
+        put_u64_at(&mut header[9..17], logical_len);
+        put_u32_at(&mut header[17..21], extent_count);
+        sink.write_all(&header)?;
+        sink.write_all(path.as_bytes())?;
+        if !node.is_dir {
+            self.write_snapshot_file_data_to_sink(&node.data, sink)?;
         }
         Ok(())
     }
@@ -686,6 +1032,54 @@ impl MemFs {
         Ok(())
     }
 
+    fn write_snapshot_file_data_to_sink<S: SnapshotPayloadSink>(
+        &self,
+        data: &FileData,
+        sink: &mut S,
+    ) -> Result<(), SnapshotBlockStoreError> {
+        match data {
+            FileData::Bytes(bytes) => {
+                if !bytes.is_empty() {
+                    let len =
+                        u64::try_from(bytes.len()).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+                    let mut header = [0u8; 9];
+                    header[0] = SNAP_EXTENT_DATA;
+                    put_u64_at(&mut header[1..9], len);
+                    sink.write_all(&header)?;
+                    sink.write_all(bytes)?;
+                }
+            }
+            FileData::Extents(extents) => {
+                for extent in extents.iter().filter(|extent| extent.len != 0) {
+                    let len =
+                        u64::try_from(extent.len).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+                    let mut header = [0u8; 9];
+                    if extent.blob == ZERO_EXTENT_BLOB {
+                        header[0] = SNAP_EXTENT_ZERO;
+                        put_u64_at(&mut header[1..9], len);
+                        sink.write_all(&header)?;
+                        continue;
+                    }
+                    let Some(blob) = self.blobs.get(extent.blob) else {
+                        return Err(SnapshotBlockStoreError::Corrupt);
+                    };
+                    let end = extent
+                        .offset
+                        .checked_add(extent.len)
+                        .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                    let Some(bytes) = blob.get(extent.offset..end) else {
+                        return Err(SnapshotBlockStoreError::Corrupt);
+                    };
+                    header[0] = SNAP_EXTENT_DATA;
+                    put_u64_at(&mut header[1..9], len);
+                    sink.write_all(&header)?;
+                    sink.write_all(bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn restore_snapshot_node(
         &mut self,
         path: &str,
@@ -782,6 +1176,61 @@ impl MemFs {
         }
         if total != logical_len {
             return Err(MemFsSnapshotError::InvalidRecord);
+        }
+        Ok(FileData::Extents(extents))
+    }
+
+    fn read_snapshot_file_data_streaming<S: SnapshotPayloadReader>(
+        &mut self,
+        r: &mut SnapshotStreamReader<'_, S>,
+        logical_len: usize,
+        extent_count: usize,
+    ) -> Result<FileData, SnapshotBlockStoreError> {
+        if logical_len == 0 && extent_count == 0 {
+            return Ok(FileData::empty());
+        }
+        let mut extents = Vec::new();
+        extents
+            .try_reserve_exact(extent_count)
+            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
+        let mut total = 0usize;
+        for _ in 0..extent_count {
+            let kind = r.u8()?;
+            let len = usize::try_from(r.u64()?).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
+            if len == 0 {
+                return Err(SnapshotBlockStoreError::Corrupt);
+            }
+            total = total
+                .checked_add(len)
+                .ok_or(SnapshotBlockStoreError::Corrupt)?;
+            match kind {
+                SNAP_EXTENT_ZERO => Self::push_extent_merged(
+                    &mut extents,
+                    FileExtent {
+                        blob: ZERO_EXTENT_BLOB,
+                        offset: 0,
+                        len,
+                    },
+                ),
+                SNAP_EXTENT_DATA => {
+                    let bytes = r.vec(len)?;
+                    let blob = self
+                        .intern_blob_owned(bytes)
+                        .ok_or(SnapshotBlockStoreError::OutOfMemory)?;
+                    Self::push_extent_merged(
+                        &mut extents,
+                        FileExtent {
+                            blob,
+                            offset: 0,
+                            len,
+                        },
+                    );
+                }
+                _ => return Err(SnapshotBlockStoreError::Corrupt),
+            }
+        }
+        if total != logical_len {
+            return Err(SnapshotBlockStoreError::Corrupt);
         }
         Ok(FileData::Extents(extents))
     }
@@ -1449,6 +1898,23 @@ impl MemFs {
         true
     }
 
+    /// Replace a file node's contents by taking ownership of the already-built byte buffer.
+    /// This avoids a second full-size allocation for internal kernel checkpoint writers that
+    /// already hold an owned image.
+    fn set_file_data_owned(&mut self, id: u64, bytes: Vec<u8>) -> bool {
+        let Some(node) = self.node(id) else {
+            return false;
+        };
+        if node.is_dir {
+            return false;
+        }
+        let Some(node) = self.node_mut(id) else {
+            return false;
+        };
+        node.data = FileData::Bytes(bytes);
+        true
+    }
+
     /// A file node's bytes, borrowed in place. `None` for a directory or a missing node.
     fn file_data(&self, rel_path: &str) -> Option<&[u8]> {
         let id = self.lookup(rel_path)?;
@@ -1664,6 +2130,12 @@ impl MemFs {
         Some(self.blobs.len() - 1)
     }
 
+    fn intern_blob_owned(&mut self, bytes: Vec<u8>) -> Option<usize> {
+        self.blobs.try_reserve_exact(1).ok()?;
+        self.blobs.push(bytes);
+        Some(self.blobs.len() - 1)
+    }
+
     fn find_blob_slice(&self, bytes: &[u8]) -> Option<FileExtent> {
         if bytes.is_empty() {
             return None;
@@ -1769,6 +2241,30 @@ impl FileSystem {
     /// included.
     pub fn export_volume_snapshot(&self) -> Result<Vec<u8>, MemFsSnapshotError> {
         self.volume.to_snapshot()
+    }
+
+    /// Commit the durable volume tree to a block-backed snapshot store without allocating the full
+    /// snapshot image. The stored payload is byte-for-byte identical to [`Self::export_volume_snapshot`].
+    pub fn commit_volume_snapshot<D: SnapshotBlockDevice>(
+        &self,
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<(u64, usize), SnapshotBlockStoreError> {
+        self.volume.commit_snapshot_to_store(store, dev)
+    }
+
+    /// Restore the durable volume tree from a block-backed snapshot store without allocating the
+    /// entire stored payload as a temporary buffer.
+    pub fn restore_volume_snapshot_from_store<D: SnapshotBlockDevice>(
+        store: &SnapshotBlockStore,
+        dev: &mut D,
+    ) -> Result<Option<(Self, u64, usize)>, SnapshotBlockStoreError> {
+        match store.read_latest_streaming(dev, |reader| {
+            Ok(Self::new(MemFs::from_snapshot_reader(reader)?))
+        })? {
+            Some((generation, bytes, fs)) => Ok(Some((fs, generation, bytes))),
+            None => Ok(None),
+        }
     }
 
     /// Restore a file system from a durable volume snapshot, with a fresh handle table and the
@@ -2014,6 +2510,27 @@ impl FileSystem {
             self.obj_mut(handle).unwrap().current_offset = offset + n as u64;
         }
         (STATUS_SUCCESS, n)
+    }
+
+    /// Replace the whole contents of an open file by taking ownership of `data`.
+    ///
+    /// This is an internal helper for checkpoint providers that already materialized a complete
+    /// image. It preserves the normal handle and directory validation of the Zw facade while
+    /// avoiding an additional copy into MemFs storage.
+    pub fn replace_file_data_owned(&mut self, handle: u64, data: Vec<u8>) -> u32 {
+        let Some(obj) = self.obj(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let node_id = obj.node_id;
+        if self.volume.is_dir(node_id) {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let len = data.len() as u64;
+        if !self.volume.set_file_data_owned(node_id, data) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        self.obj_mut(handle).unwrap().current_offset = len;
+        STATUS_SUCCESS
     }
 
     /// `ZwFlushBuffersFile` (spec §8.4) — MemFs is already coherent, so this is a no-op success.

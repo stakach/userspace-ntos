@@ -46,7 +46,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 
 use bytemuck::Pod;
@@ -71,6 +71,85 @@ const ALPC_SECTION_BASE: u64 = 0x0000_4153_0000_0001;
 /// covers the WOW64 large-transfer path (real ALPC caps a section at
 /// `MaximumViewSize`, typically well under this).
 const MAX_SECTION_SIZE: u64 = 8 * 1024 * 1024;
+const SECTION_PAGE_SIZE: usize = 4096;
+
+struct SparseSectionBacking {
+    len: usize,
+    pages: Vec<Option<Box<[u8; SECTION_PAGE_SIZE]>>>,
+}
+
+impl SparseSectionBacking {
+    fn new(len: u64) -> Result<Self, NtStatus> {
+        if len > usize::MAX as u64 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let len = len as usize;
+        let page_count = len
+            .checked_add(SECTION_PAGE_SIZE - 1)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            / SECTION_PAGE_SIZE;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        for _ in 0..page_count {
+            pages.push(None);
+        }
+        Ok(Self { len, pages })
+    }
+
+    fn check_range(&self, offset: usize, len: usize) -> Result<(), NtStatus> {
+        let end = offset.checked_add(len).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if end > self.len {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: usize, data: &[u8]) -> Result<(), NtStatus> {
+        self.check_range(offset, data.len())?;
+        let mut done = 0usize;
+        while done < data.len() {
+            let absolute = offset + done;
+            let page_index = absolute / SECTION_PAGE_SIZE;
+            let page_offset = absolute % SECTION_PAGE_SIZE;
+            let count = (SECTION_PAGE_SIZE - page_offset).min(data.len() - done);
+            if self.pages[page_index].is_none() {
+                self.pages[page_index] = Some(Box::new([0u8; SECTION_PAGE_SIZE]));
+            }
+            let page = self.pages[page_index]
+                .as_mut()
+                .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+            page[page_offset..page_offset + count].copy_from_slice(&data[done..done + count]);
+            done += count;
+        }
+        Ok(())
+    }
+
+    fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), NtStatus> {
+        self.check_range(offset, out.len())?;
+        let mut done = 0usize;
+        while done < out.len() {
+            let absolute = offset + done;
+            let page_index = absolute / SECTION_PAGE_SIZE;
+            let page_offset = absolute % SECTION_PAGE_SIZE;
+            let count = (SECTION_PAGE_SIZE - page_offset).min(out.len() - done);
+            match self.pages[page_index].as_ref() {
+                Some(page) => {
+                    out[done..done + count].copy_from_slice(&page[page_offset..page_offset + count])
+                }
+                None => out[done..done + count].fill(0),
+            }
+            done += count;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn allocated_pages(&self) -> usize {
+        self.pages.iter().filter(|page| page.is_some()).count()
+    }
+}
 
 /// A port section: the REAL shared-memory region both endpoints map. `backing` is
 /// the actual bytes — every view of this section aliases it, so a write through
@@ -78,12 +157,14 @@ const MAX_SECTION_SIZE: u64 = 8 * 1024 * 1024;
 /// In a live two-VSpace deployment the broker additionally `copy_cap`+`page_map`s
 /// these frames into each endpoint's address space (the CSR-anonymous-section
 /// machinery); with the synthetic single-address-space endpoints exercised here
-/// the shared `backing` IS that region.
+/// the shared `backing` IS that region. The section is sparse: creating a large
+/// ALPC transfer window reserves the object extent, but pages materialize only
+/// when a caller writes them, matching NT's demand-committed section semantics.
 struct PortSection {
     handle: u64,
     port_handle: u64,
     size: u64,
-    backing: Vec<u8>,
+    backing: SparseSectionBacking,
 }
 
 /// A mapped view of a section: a `view_base` handle plus the section it aliases
@@ -306,12 +387,13 @@ impl AlpcServer {
         }
         let handle = self.next_section;
         self.next_section += 1;
-        // Allocate the REAL backing store — the shared region views will alias.
+        // Reserve the REAL shared backing object without eagerly committing every byte.
+        let backing = SparseSectionBacking::new(req.section_size)?;
         self.sections.push(PortSection {
             handle,
             port_handle: req.port_handle,
             size: req.section_size,
-            backing: alloc::vec![0u8; req.section_size as usize],
+            backing,
         });
         // detail0 = AlpcSectionHandle, information = ActualSectionSize (low 32).
         Ok(reply(NtStatus::SUCCESS, req.section_size as u32, handle, 0))
@@ -374,12 +456,7 @@ impl AlpcServer {
             .find(|s| s.handle == section_handle)
             .ok_or(NtStatus::INVALID_HANDLE)?;
         let start = section_offset as usize;
-        let end = start + data.len();
-        section
-            .backing
-            .get_mut(start..end)
-            .ok_or(NtStatus::INVALID_PARAMETER)?
-            .copy_from_slice(data);
+        section.backing.write(start, data)?;
         Ok(reply(NtStatus::SUCCESS, data.len() as u32, 0, 0))
     }
 
@@ -400,13 +477,8 @@ impl AlpcServer {
             .find(|s| s.handle == section_handle)
             .ok_or(NtStatus::INVALID_HANDLE)?;
         let start = section_offset as usize;
-        let end = start + len as usize;
-        let src = section
-            .backing
-            .get(start..end)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let n = src.len().min(out_buf.len());
-        out_buf[..n].copy_from_slice(&src[..n]);
+        let n = (len as usize).min(out_buf.len());
+        section.backing.read(start, &mut out_buf[..n])?;
         Ok(reply(NtStatus::SUCCESS, n as u32, 0, 0))
     }
 

@@ -161,11 +161,7 @@ pub(crate) fn hive_image_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
     let Some(bytes) = fs.file_bytes(path) else {
         return 0;
     };
-    if nt_hive_core::decode_image(bytes).is_ok_and(|hive| hive.subkey_count(hive.root()) > 0) {
-        bytes.len()
-    } else {
-        0
-    }
+    nt_hive_core::image_len_if_valid(bytes).unwrap_or(0)
 }
 
 /// Return the byte length of a value inside a hive image file on the writable volume.
@@ -234,21 +230,27 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
         return false;
     }
     let len = image.len() as u64;
-    *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
-    NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
-        let Some(bytes) = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref() else {
-            return false;
-        };
-        let provisioned = {
+        let (already_current, provisioned) = {
             let fs = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut().unwrap();
-            fs.provision_file(DEFAULT_USER_NTUSER_DAT, bytes)
+            let already_current = fs.file_bytes(DEFAULT_USER_NTUSER_DAT) == Some(image.as_slice());
+            let provisioned =
+                already_current || fs.provision_file(DEFAULT_USER_NTUSER_DAT, image.as_slice());
+            (already_current, provisioned)
         };
-        if provisioned {
+        if provisioned && !already_current {
             mark_snapshot_dirty();
+        }
+        if provisioned {
+            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = None;
+            NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
+        } else {
+            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
         }
         provisioned
     } else {
+        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
+        NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
         true
     }
 }
@@ -316,6 +318,7 @@ static mut EXEC_WRITABLE_FS: Option<nt_fs::FileSystem> = None;
 static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
+static WRITABLE_FS_SNAPSHOT_RESTORE_PROBED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -509,13 +512,6 @@ fn snapshot_store_error_status(err: nt_fs::SnapshotBlockStoreError) -> u32 {
     }
 }
 
-fn snapshot_export_error_status(err: nt_fs::MemFsSnapshotError) -> u32 {
-    match err {
-        nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
-        _ => 0xC000_0001,
-    }
-}
-
 fn print_snapshot_store_error(err: nt_fs::SnapshotBlockStoreError) {
     print_str(match err {
         nt_fs::SnapshotBlockStoreError::InvalidGeometry => b"invalid-geometry",
@@ -526,19 +522,6 @@ fn print_snapshot_store_error(err: nt_fs::SnapshotBlockStoreError) {
     });
 }
 
-fn print_snapshot_export_error(err: nt_fs::MemFsSnapshotError) {
-    print_str(match err {
-        nt_fs::MemFsSnapshotError::BadMagic => b"bad-magic",
-        nt_fs::MemFsSnapshotError::BadChecksum => b"bad-checksum",
-        nt_fs::MemFsSnapshotError::Truncated => b"truncated",
-        nt_fs::MemFsSnapshotError::UnsupportedVersion => b"unsupported-version",
-        nt_fs::MemFsSnapshotError::InvalidRecord => b"invalid-record",
-        nt_fs::MemFsSnapshotError::InvalidPath => b"invalid-path",
-        nt_fs::MemFsSnapshotError::NameCollision => b"name-collision",
-        nt_fs::MemFsSnapshotError::OutOfMemory => b"out-of-memory",
-    });
-}
-
 unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
     let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
         WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -546,25 +529,8 @@ unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, us
         return Err(0xC000_0001);
     };
     let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
-    match store.read_latest(&mut dev) {
-        Ok(Some(stored)) => {
-            let generation = stored.generation;
-            let bytes = stored.payload.len();
-            match nt_fs::FileSystem::from_volume_snapshot(&stored.payload) {
-                Ok(fs) => Ok(Some((fs, generation, bytes))),
-                Err(err) => {
-                    WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[writable-fs-snapshot] restore payload rejected err=");
-                    print_snapshot_export_error(err);
-                    print_str(b" generation=");
-                    print_u64(generation);
-                    print_str(b" bytes=");
-                    print_u64(bytes as u64);
-                    print_str(b"\n");
-                    Err(snapshot_export_error_status(err))
-                }
-            }
-        }
+    match nt_fs::FileSystem::restore_volume_snapshot_from_store(&store, &mut dev) {
+        Ok(Some((fs, generation, bytes))) => Ok(Some((fs, generation, bytes))),
         Ok(None) => {
             WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
             print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");
@@ -582,36 +548,62 @@ unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, us
     }
 }
 
+unsafe fn restore_snapshot_volume_once() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
+    if WRITABLE_FS_SNAPSHOT_RESTORE_PROBED.swap(true, Ordering::AcqRel) {
+        return Ok(None);
+    }
+    restore_snapshot_volume()
+}
+
+unsafe fn snapshot_reserve_available() -> bool {
+    let Some(fat) = crate::fs_loader::exec_fs() else {
+        return false;
+    };
+    crate::fs_loader::writable_snapshot_reserve(&fat).is_some()
+}
+
+fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
+    WRITABLE_FS_SNAPSHOT_RESTORES.fetch_add(1, Ordering::Relaxed);
+    WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION.store(generation, Ordering::Relaxed);
+    WRITABLE_FS_SNAPSHOT_RESTORE_BYTES.store(bytes as u64, Ordering::Relaxed);
+    print_str(b"[writable-fs-snapshot] restored generation=");
+    print_u64(generation);
+    print_str(b" bytes=");
+    print_u64(bytes as u64);
+    print_str(b" nodes=");
+    print_u64(nodes as u64);
+    print_str(b"\n");
+}
+
+unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) {
+    selftest(&mut fs);
+    let provisioned = provision_missing_installed_sources(&mut fs);
+    let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
+    *slot = Some(fs);
+    WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
+    if provisioned || !restored {
+        mark_snapshot_dirty();
+    }
+}
+
 unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
     let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
-    };
-    let payload = match fs.export_volume_snapshot() {
-        Ok(payload) => payload,
-        Err(err) => {
-            print_str(b"[writable-fs-snapshot] export failed err=");
-            print_snapshot_export_error(err);
-            print_str(b"\n");
-            return Err(snapshot_export_error_status(err));
-        }
     };
     let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
         print_str(b"[writable-fs-snapshot] no executable FAT/reserve geometry for commit\n");
         return Err(0xC000_0001);
     };
     let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
-    let generation = match store.commit_next(&mut dev, &payload) {
-        Ok(generation) => generation,
+    match fs.commit_volume_snapshot(&store, &mut dev) {
+        Ok((generation, bytes)) => Ok((generation, bytes)),
         Err(err) => {
             print_str(b"[writable-fs-snapshot] commit failed err=");
             print_snapshot_store_error(err);
-            print_str(b" bytes=");
-            print_u64(payload.len() as u64);
             print_str(b"\n");
-            return Err(snapshot_store_error_status(err));
+            Err(snapshot_store_error_status(err))
         }
-    };
-    Ok((generation, payload.len()))
+    }
 }
 
 pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
@@ -639,6 +631,10 @@ pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
             status
         }
     }
+}
+
+pub(crate) fn snapshot_restore_seen() -> bool {
+    WRITABLE_FS_SNAPSHOT_RESTORES.load(Ordering::Acquire) != 0
 }
 
 fn has_directory_relative(fs: &nt_fs::FileSystem, relative: &[u8]) -> bool {
@@ -704,18 +700,9 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
     }
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     if slot.is_none() {
-        let (mut fs, restored) = match restore_snapshot_volume() {
+        let (fs, restored) = match restore_snapshot_volume_once() {
             Ok(Some((fs, generation, bytes))) => {
-                WRITABLE_FS_SNAPSHOT_RESTORES.fetch_add(1, Ordering::Relaxed);
-                WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION.store(generation, Ordering::Relaxed);
-                WRITABLE_FS_SNAPSHOT_RESTORE_BYTES.store(bytes as u64, Ordering::Relaxed);
-                print_str(b"[writable-fs-snapshot] restored generation=");
-                print_u64(generation);
-                print_str(b" bytes=");
-                print_u64(bytes as u64);
-                print_str(b" nodes=");
-                print_u64(fs.node_count() as u64);
-                print_str(b"\n");
+                note_restored_snapshot(generation, bytes, fs.node_count());
                 (fs, true)
             }
             Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
@@ -727,20 +714,61 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
                 return None;
             }
         };
-        selftest(&mut fs);
-        let provisioned = provision_missing_installed_sources(&mut fs);
-        *slot = Some(fs);
-        if provisioned || !restored {
-            mark_snapshot_dirty();
-            WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
-        }
+        install_writable_fs(fs, restored);
     }
     slot.as_mut()
+}
+
+/// Mount an already-persisted writable-volume snapshot during executive initialization, before hosted
+/// processes can read or mutate boot hives. A missing snapshot leaves the normal lazy first-boot mount
+/// path intact.
+///
+/// # Safety
+/// Single-threaded executive initialization; installs the global writable volume when a snapshot exists.
+pub(crate) unsafe fn mount_restored_snapshot_for_boot() -> bool {
+    if !WRITABLE_OVERLAY_MOUNTED {
+        return false;
+    }
+    if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return false;
+    }
+    if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
+        return snapshot_restore_seen();
+    }
+    if !snapshot_reserve_available() {
+        return false;
+    }
+    match restore_snapshot_volume_once() {
+        Ok(Some((fs, generation, bytes))) => {
+            let nodes = fs.node_count();
+            note_restored_snapshot(generation, bytes, nodes);
+            install_writable_fs(fs, true);
+            true
+        }
+        Ok(None) => false,
+        Err(status) => {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            print_str(b"[writable-fs-snapshot] refusing writable mount after restore status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            false
+        }
+    }
 }
 
 /// Whether the volume has been mounted (i.e. something actually resolved into it).
 pub(crate) unsafe fn writable_fs_mounted() -> bool {
     (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some()
+}
+
+/// Borrow a mounted writable-volume file's contents without forcing a mount. Used by boot-time CM
+/// restore to import persisted hive checkpoints after the volume has already been restored.
+///
+/// # Safety
+/// Single-threaded executive; callers must not mutate the writable volume while holding the slice.
+pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> {
+    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref()?;
+    fs.file_bytes(path)
 }
 
 /// Consume the one-shot dirty bit set by the lazy writable-volume mount/materialisation.
@@ -984,12 +1012,13 @@ fn delete_open_file(fs: &mut nt_fs::FileSystem, handle: u64) {
     let _ = fs.zw_close(handle);
 }
 
-/// Atomically replace a writable-volume file with `bytes` using the same temp-file +
-/// `FileRenameInformation` contract as the hive I/O provider.
+/// Atomically replace a writable-volume file with an already-owned byte image using the same
+/// temp-file + `FileRenameInformation` contract as the hive I/O provider.
 ///
 /// # Safety
 /// Single-threaded executive; borrows the mounted writable volume for the duration of the replace.
-pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
+pub(crate) unsafe fn write_file_atomic_owned(path: &str, bytes: alloc::vec::Vec<u8>) -> u32 {
+    let byte_len = bytes.len();
     let status = 'replace: {
         let Some(fs) = writable_fs() else {
             break 'replace nt_fs::STATUS_INVALID_HANDLE;
@@ -1007,17 +1036,13 @@ pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
             break 'replace create.status;
         }
 
-        let (write_status, written) = fs.zw_write_file(create.handle, Some(0), bytes);
+        let write_status = fs.replace_file_data_owned(create.handle, bytes);
         if write_status != nt_fs::STATUS_SUCCESS {
             delete_open_file(fs, create.handle);
             break 'replace write_status;
         }
-        if written != bytes.len() {
-            delete_open_file(fs, create.handle);
-            break 'replace nt_fs::STATUS_INSUFFICIENT_RESOURCES;
-        }
 
-        let eof = (bytes.len() as u64).to_le_bytes();
+        let eof = (byte_len as u64).to_le_bytes();
         let status =
             fs.zw_set_information_file(create.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
         if status != nt_fs::STATUS_SUCCESS {
@@ -1049,7 +1074,7 @@ pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
     };
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
-        OVERLAY_BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        OVERLAY_BYTES_WRITTEN.fetch_add(byte_len as u64, Ordering::Relaxed);
         OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
         mark_snapshot_dirty();
     }
@@ -1389,6 +1414,7 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
                     stats.files += 1;
                     stats.bytes += hive.len() as u64;
                     NTUSER_DAT_PROVISIONED.store(hive.len() as u64, Ordering::Relaxed);
+                    *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = None;
                 }
             }
             _ => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),

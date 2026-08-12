@@ -1,5 +1,9 @@
 use super::*;
+use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::hive::{Cell, KeyCell, ValueCell};
 
 #[test]
 fn hive_create_open_set_query() {
@@ -590,6 +594,81 @@ fn image_checksum_rejects_corruption() {
     m[0] = b'X';
     assert!(matches!(decode_image(&m), Err(HiveDecodeError::BadMagic)));
     assert!(decode_image(&[0u8; 4]).is_err());
+}
+
+#[test]
+fn image_len_validation_checks_header_without_decoding_cells() {
+    let mut h = Hive::new(HiveKind::Software);
+    let key = h.create_key(r"Microsoft\Windows NT\CurrentVersion\ProfileList");
+    h.set_value(
+        key,
+        "ProfileImagePath",
+        RegistryValueType::ExpandSz,
+        b"C:\\Profiles\\Administrator\0".to_vec(),
+    );
+
+    let mut bytes = encode_image(&h);
+    assert_eq!(image_len_if_valid(&bytes), Ok(bytes.len()));
+
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x55;
+    assert_eq!(
+        image_len_if_valid(&bytes),
+        Err(HiveDecodeError::BadChecksum)
+    );
+}
+
+#[test]
+fn hive_image_compacts_sparse_cell_ids_on_encode_and_decode() {
+    let mut h = Hive {
+        cells: Vec::new(),
+        value_blobs: alloc::vec![Rc::new(b"service".to_vec())],
+        root: CellId(64),
+        next_id: 2048,
+        kind: HiveKind::System,
+        generation: 7,
+        sequence: 9,
+        clean_sequence: 9,
+    };
+    h.cells.resize_with(1025, || None);
+    h.cells[64] = Some(Cell::Key(KeyCell {
+        id: CellId(64),
+        parent: None,
+        name: String::new(),
+        subkeys: alloc::vec![CellId(512)],
+        values: Vec::new(),
+        class_name: None,
+        security_descriptor: None,
+        last_write_sequence: 1,
+    }));
+    h.cells[512] = Some(Cell::Key(KeyCell {
+        id: CellId(512),
+        parent: Some(CellId(64)),
+        name: String::from("Services"),
+        subkeys: Vec::new(),
+        values: alloc::vec![CellId(1024)],
+        class_name: None,
+        security_descriptor: None,
+        last_write_sequence: 2,
+    }));
+    h.cells[1024] = Some(Cell::Value(ValueCell {
+        id: CellId(1024),
+        parent_key: CellId(512),
+        name: String::from("Name"),
+        value_type: RegistryValueType::Sz,
+        data_blob: 0,
+        last_write_sequence: 3,
+    }));
+
+    assert_eq!(h.cell_count(), 3);
+    assert_eq!(h.cells.len(), 1025);
+
+    let decoded = decode_image(&encode_image(&h)).expect("decode compacted hive image");
+    assert_eq!(decoded.root(), CellId(0));
+    assert_eq!(decoded.cell_count(), 3);
+    assert_eq!(decoded.cells.len(), 3);
+    let key = decoded.open_key("Services").unwrap();
+    assert_eq!(decoded.query_value(key, "Name").unwrap().1, b"service");
 }
 
 #[test]

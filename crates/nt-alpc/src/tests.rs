@@ -407,6 +407,109 @@ fn section_view_shared_memory_not_a_copy() {
     );
 }
 
+#[test]
+fn large_port_section_is_sparse_until_written() {
+    let mut alpc = AlpcServer::new();
+
+    let cs = bytes(&AlpcCreatePortSectionRequest {
+        abi_size: size_of::<AlpcCreatePortSectionRequest>() as u16,
+        port_handle: 0x1000,
+        section_size: 0x80000,
+        ..Default::default()
+    });
+    let section = alpc
+        .dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_CREATE_PORT_SECTION,
+            &cs,
+            &mut [],
+        )
+        .detail0;
+    assert_ne!(section, 0);
+    assert_eq!(alpc.sections[0].backing.allocated_pages(), 0);
+
+    let mk_view = |alpc: &mut AlpcServer| {
+        let cv = bytes(&AlpcCreateSectionViewRequest {
+            abi_size: size_of::<AlpcCreateSectionViewRequest>() as u16,
+            port_handle: 0x1000,
+            alpc_section_handle: section,
+            view_size: 0x80000,
+            ..Default::default()
+        });
+        alpc.dispatch(
+            &mut PortCore::new(),
+            aop::ALPC_OP_CREATE_SECTION_VIEW,
+            &cv,
+            &mut [],
+        )
+        .detail0
+    };
+    let view_a = mk_view(&mut alpc);
+    let view_b = mk_view(&mut alpc);
+
+    let rd = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_b,
+        view_offset: 0x70000,
+        data_len_bytes: 16,
+        ..Default::default()
+    });
+    let mut zeroes = [0xccu8; 16];
+    let r = alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_READ_SECTION_VIEW,
+        &rd,
+        &mut zeroes,
+    );
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(zeroes, [0u8; 16]);
+    assert_eq!(
+        alpc.sections[0].backing.allocated_pages(),
+        0,
+        "zero reads must not commit sparse pages"
+    );
+
+    let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let mut wr = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_a,
+        view_offset: 0x0ffe,
+        data_offset: size_of::<AlpcViewIoRequest>() as u32,
+        data_len_bytes: payload.len() as u32,
+        ..Default::default()
+    });
+    wr.extend_from_slice(&payload);
+    let r = alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_WRITE_SECTION_VIEW,
+        &wr,
+        &mut [],
+    );
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(
+        alpc.sections[0].backing.allocated_pages(),
+        2,
+        "a write crossing one page boundary commits only touched pages"
+    );
+
+    let rd_written = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_b,
+        view_offset: 0x0ffe,
+        data_len_bytes: payload.len() as u32,
+        ..Default::default()
+    });
+    let mut out = [0u8; 8];
+    let r = alpc.dispatch(
+        &mut PortCore::new(),
+        aop::ALPC_OP_READ_SECTION_VIEW,
+        &rd_written,
+        &mut out,
+    );
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(out, payload);
+}
+
 // --- attribute (de)serialization + degradation ----------------------------
 
 #[test]

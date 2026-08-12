@@ -23047,16 +23047,25 @@ pub unsafe extern "system" fn rtl_capture_context(context: *mut c_void) {
 ///
 /// # Safety
 /// Does not return on target unless a native handler transfers control.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[export_name = "RtlRaiseStatus"]
-pub unsafe extern "system" fn rtl_raise_status(status: NtStatus) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::seh::rtl_raise_status(status);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = status;
-    }
+pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
+    core::arch::naked_asm!(
+        "mov rdx, [rsp]",
+        "lea r8, [rsp + 8]",
+        "jmp {raise_status}",
+        raise_status = sym crate::seh::rtl_raise_status_from_caller,
+    );
+}
+
+/// Host fallback for `RtlRaiseStatus`.
+///
+/// # Safety
+/// Host builds do not run the live software-SEH dispatcher.
+#[cfg(not(target_arch = "x86_64"))]
+#[export_name = "RtlRaiseStatus"]
+pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
 }
 
 /// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — BATCH 42: the REAL software raise
@@ -23066,17 +23075,25 @@ pub unsafe extern "system" fn rtl_raise_status(status: NtStatus) {
 ///
 /// # Safety
 /// `exception_record` a valid EXCEPTION_RECORD.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[export_name = "RtlRaiseException"]
-pub unsafe extern "system" fn rtl_raise_exception(exception_record: *mut c_void) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: valid EXCEPTION_RECORD; the real raise dispatches or last-chances.
-    unsafe {
-        crate::seh::rtl_raise_exception(exception_record);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = exception_record;
-    }
+pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {
+    core::arch::naked_asm!(
+        "mov rdx, [rsp]",
+        "lea r8, [rsp + 8]",
+        "jmp {raise_exception}",
+        raise_exception = sym crate::seh::rtl_raise_exception_from_caller,
+    );
+}
+
+/// Host fallback for `RtlRaiseException`.
+///
+/// # Safety
+/// Host builds do not run the live software-SEH dispatcher.
+#[cfg(not(target_arch = "x86_64"))]
+#[export_name = "RtlRaiseException"]
+pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {
 }
 
 /// `RtlDispatchException(PEXCEPTION_RECORD, PCONTEXT) -> BOOLEAN` — BATCH 42: the REAL first-pass

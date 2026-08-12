@@ -30,16 +30,42 @@ pub enum HiveDecodeError {
     UnsupportedSchema,
 }
 
+/// Why encoding a hive image failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveEncodeError {
+    SizeOverflow,
+    OutOfMemory,
+}
+
 // --- image (spec §11) --------------------------------------------------------
 
 /// Serialize a hive to a versioned, checksummed image (spec §11).
 pub fn encode_image(hive: &Hive) -> Vec<u8> {
-    let mut p = Writer::new();
+    try_encode_image(hive).expect("hive image encode failed")
+}
+
+/// Serialize a hive to a versioned, checksummed image without panicking on allocation failure.
+pub fn try_encode_image(hive: &Hive) -> Result<Vec<u8>, HiveEncodeError> {
     let mut record_count = 0u64;
+    let id_map = try_compact_cell_id_map(hive)?;
+    let root = compact_cell_id(&id_map, hive.root()).unwrap_or(CellId(0));
+    let payload_len = image_payload_len(hive)?;
+    let total_len = IMAGE_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(HiveEncodeError::SizeOverflow)?;
+    let mut p = CheckedWriter::with_capacity(total_len)?;
+    p.bytes(&[0u8; IMAGE_HEADER_LEN]);
     for k in hive.key_cells() {
+        let Some(id) = compact_cell_id(&id_map, k.id) else {
+            continue;
+        };
+        let parent = k
+            .parent
+            .and_then(|parent| compact_cell_id(&id_map, parent))
+            .unwrap_or(CellId(0));
         p.u16(REC_KEY_CELL);
-        p.u64(k.id.0);
-        p.u64(k.parent.map(|c| c.0).unwrap_or(0));
+        p.u64(id.0);
+        p.u64(parent.0);
         p.str16(&k.name);
         p.u32(0); // flags
         match &k.class_name {
@@ -60,36 +86,189 @@ pub fn encode_image(hive: &Hive) -> Vec<u8> {
         record_count += 1;
     }
     for v in hive.value_cells() {
+        let (Some(id), Some(parent_key)) = (
+            compact_cell_id(&id_map, v.id),
+            compact_cell_id(&id_map, v.parent_key),
+        ) else {
+            continue;
+        };
         p.u16(REC_VALUE_CELL);
-        p.u64(v.id.0);
-        p.u64(v.parent_key.0);
+        p.u64(id.0);
+        p.u64(parent_key.0);
         p.str16(&v.name);
         p.u32(v.value_type as u32);
         p.blob(hive.value_data(v).unwrap_or(&[]));
         p.u64(v.last_write_sequence);
         record_count += 1;
     }
-    let payload = p.buf;
-    let payload_crc = crc32c(&payload);
+    debug_assert_eq!(p.buf.len(), total_len);
+    let payload_crc = crc32c(&p.buf[IMAGE_HEADER_LEN..]);
 
-    let mut h = Writer::new();
-    h.bytes(&IMAGE_MAGIC);
-    h.u16(IMAGE_HEADER_LEN as u16);
-    h.u16(SCHEMA_VERSION);
-    h.u32(0); // flags
-    h.u32(hive.kind as u32);
-    h.u64(hive.generation);
-    h.u64(hive.sequence);
-    h.u64(hive.root().0);
-    h.u64(record_count);
-    h.u64(payload.len() as u64);
-    h.u32(payload_crc);
-    let header_crc = crc32c(&h.buf);
-    h.u32(header_crc);
+    let mut header = [0u8; IMAGE_HEADER_LEN];
+    header[..IMAGE_MAGIC.len()].copy_from_slice(&IMAGE_MAGIC);
+    put_u16_at(&mut header[8..10], IMAGE_HEADER_LEN as u16);
+    put_u16_at(&mut header[10..12], SCHEMA_VERSION);
+    put_u32_at(&mut header[12..16], 0); // flags
+    put_u32_at(&mut header[16..20], hive.kind as u32);
+    put_u64_at(&mut header[20..28], hive.generation);
+    put_u64_at(&mut header[28..36], hive.sequence);
+    put_u64_at(&mut header[36..44], root.0);
+    put_u64_at(&mut header[44..52], record_count);
+    put_u64_at(&mut header[52..60], payload_len as u64);
+    put_u32_at(&mut header[60..64], payload_crc);
+    let header_crc = crc32c(&header[..IMAGE_HEADER_LEN - 4]);
+    put_u32_at(&mut header[64..68], header_crc);
+    p.buf[..IMAGE_HEADER_LEN].copy_from_slice(&header);
+    Ok(p.buf)
+}
 
-    let mut out = h.buf;
-    out.extend_from_slice(&payload);
-    out
+struct CheckedWriter {
+    buf: Vec<u8>,
+}
+
+impl CheckedWriter {
+    fn with_capacity(capacity: usize) -> Result<Self, HiveEncodeError> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(capacity)
+            .map_err(|_| HiveEncodeError::OutOfMemory)?;
+        Ok(Self { buf })
+    }
+
+    fn u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    fn u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+
+    fn blob(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.bytes(b);
+    }
+
+    fn str16(&mut self, s: &str) {
+        let byte_len = s.encode_utf16().count() * 2;
+        self.u32(byte_len as u32);
+        for unit in s.encode_utf16() {
+            self.u16(unit);
+        }
+    }
+}
+
+fn image_payload_len(hive: &Hive) -> Result<usize, HiveEncodeError> {
+    let mut len = 0usize;
+    for key in hive.key_cells() {
+        len = checked_add(len, key_record_len(key)?)?;
+    }
+    for value in hive.value_cells() {
+        len = checked_add(len, value_record_len(hive, value)?)?;
+    }
+    Ok(len)
+}
+
+fn key_record_len(key: &KeyCell) -> Result<usize, HiveEncodeError> {
+    let mut len = 2usize + 8 + 8;
+    len = checked_add(len, str16_record_len(&key.name)?)?;
+    len = checked_add(len, 4 + 1)?;
+    if let Some(class_name) = &key.class_name {
+        len = checked_add(len, str16_record_len(class_name)?)?;
+    }
+    len = checked_add(len, 1)?;
+    if let Some(descriptor) = &key.security_descriptor {
+        len = checked_add(len, blob_record_len(descriptor.len())?)?;
+    }
+    checked_add(len, 8)
+}
+
+fn value_record_len(hive: &Hive, value: &ValueCell) -> Result<usize, HiveEncodeError> {
+    let mut len = 2usize + 8 + 8;
+    len = checked_add(len, str16_record_len(&value.name)?)?;
+    len = checked_add(len, 4)?;
+    len = checked_add(
+        len,
+        blob_record_len(hive.value_data(value).unwrap_or(&[]).len())?,
+    )?;
+    checked_add(len, 8)
+}
+
+fn str16_record_len(s: &str) -> Result<usize, HiveEncodeError> {
+    let units = s.encode_utf16().count();
+    let bytes = units.checked_mul(2).ok_or(HiveEncodeError::SizeOverflow)?;
+    if bytes > u32::MAX as usize {
+        return Err(HiveEncodeError::SizeOverflow);
+    }
+    checked_add(4, bytes)
+}
+
+fn blob_record_len(bytes: usize) -> Result<usize, HiveEncodeError> {
+    if bytes > u32::MAX as usize {
+        return Err(HiveEncodeError::SizeOverflow);
+    }
+    checked_add(4, bytes)
+}
+
+fn checked_add(a: usize, b: usize) -> Result<usize, HiveEncodeError> {
+    a.checked_add(b).ok_or(HiveEncodeError::SizeOverflow)
+}
+
+fn put_u16_at(out: &mut [u8], v: u16) {
+    out.copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32_at(out: &mut [u8], v: u32) {
+    out.copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64_at(out: &mut [u8], v: u64) {
+    out.copy_from_slice(&v.to_le_bytes());
+}
+
+fn try_compact_cell_id_map(hive: &Hive) -> Result<Vec<(CellId, CellId)>, HiveEncodeError> {
+    let capacity = 1usize
+        .checked_add(hive.key_cells().count())
+        .and_then(|n| n.checked_add(hive.value_cells().count()))
+        .ok_or(HiveEncodeError::SizeOverflow)?;
+    let mut map = Vec::new();
+    map.try_reserve_exact(capacity)
+        .map_err(|_| HiveEncodeError::OutOfMemory)?;
+    let mut next = 0u64;
+    push_compact_cell_id(&mut map, hive.root(), &mut next);
+    for k in hive.key_cells() {
+        push_compact_cell_id(&mut map, k.id, &mut next);
+    }
+    for v in hive.value_cells() {
+        push_compact_cell_id(&mut map, v.id, &mut next);
+    }
+    Ok(map)
+}
+
+fn push_compact_cell_id(map: &mut Vec<(CellId, CellId)>, raw: CellId, next: &mut u64) -> CellId {
+    if let Some(mapped) = compact_cell_id(map, raw) {
+        return mapped;
+    }
+    let mapped = CellId(*next);
+    *next = next.saturating_add(1);
+    map.push((raw, mapped));
+    mapped
+}
+
+fn compact_cell_id(map: &[(CellId, CellId)], raw: CellId) -> Option<CellId> {
+    map.iter()
+        .find(|(existing, _)| *existing == raw)
+        .map(|(_, mapped)| *mapped)
 }
 
 /// Decode a hive image into a fresh [`Hive`], validating both CRCs + the schema (spec §11).
@@ -124,14 +303,17 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
         return Err(HiveDecodeError::BadChecksum);
     }
 
-    // Rebuild the arena: key cells first, then values; parent/subkey links reconstructed.
-    let mut hive = Hive::empty(kind, CellId(root_cell), generation, sequence);
+    // Rebuild the arena with compact CellIds. Older images can contain REGF cell offsets as
+    // CellIds; preserving them would inflate the restored `Vec<Option<Cell>>` into a sparse arena.
+    let mut hive = Hive::empty(kind, CellId(0), generation, sequence);
+    let mut id_map: Vec<(CellId, CellId)> = Vec::new();
+    let mut next_id = 0u64;
+    map_decoded_cell_id(&mut id_map, CellId(root_cell), &mut next_id);
     let mut pr = Reader::new(payload);
-    let mut pending_values: Vec<(ValueCell, Vec<u8>)> = Vec::new();
     while !pr.is_empty() {
         match pr.u16().ok_or(HiveDecodeError::Truncated)? {
             REC_KEY_CELL => {
-                let id = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
+                let raw_id = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
                 let parent_raw = pr.u64().ok_or(HiveDecodeError::Truncated)?;
                 let name = pr.str16().ok_or(HiveDecodeError::Truncated)?;
                 let _flags = pr.u32().ok_or(HiveDecodeError::Truncated)?;
@@ -148,8 +330,10 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                     None
                 };
                 let seq = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                let id = map_decoded_cell_id(&mut id_map, raw_id, &mut next_id);
                 // The root cell has no parent (encoded as 0); every other key links to its parent.
-                let parent = (id.0 != root_cell).then_some(CellId(parent_raw));
+                let parent = (raw_id.0 != root_cell)
+                    .then(|| map_decoded_cell_id(&mut id_map, CellId(parent_raw), &mut next_id));
                 hive.insert_key(KeyCell {
                     id,
                     parent,
@@ -162,34 +346,91 @@ pub fn decode_image(bytes: &[u8]) -> Result<Hive, HiveDecodeError> {
                 });
             }
             REC_VALUE_CELL => {
-                let id = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
-                let parent_key = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
+                let raw_id = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
+                let raw_parent_key = CellId(pr.u64().ok_or(HiveDecodeError::Truncated)?);
                 let name = pr.str16().ok_or(HiveDecodeError::Truncated)?;
                 let ty = pr.u32().ok_or(HiveDecodeError::Truncated)?;
                 let data = pr.blob().ok_or(HiveDecodeError::Truncated)?;
                 let seq = pr.u64().ok_or(HiveDecodeError::Truncated)?;
-                pending_values.push((
-                    ValueCell {
-                        id,
-                        parent_key,
-                        name,
-                        value_type: RegistryValueType::from_u32(ty)
-                            .unwrap_or(RegistryValueType::Binary),
-                        data_blob: 0,
-                        last_write_sequence: seq,
-                    },
-                    data,
-                ));
+                let Some(parent_key) = compact_cell_id(&id_map, raw_parent_key) else {
+                    return Err(HiveDecodeError::Truncated);
+                };
+                let id = map_decoded_cell_id(&mut id_map, raw_id, &mut next_id);
+                let data_blob = hive.intern_value_data(data);
+                hive.insert_value(ValueCell {
+                    id,
+                    parent_key,
+                    name,
+                    value_type: RegistryValueType::from_u32(ty)
+                        .unwrap_or(RegistryValueType::Binary),
+                    data_blob,
+                    last_write_sequence: seq,
+                });
             }
             _ => return Err(HiveDecodeError::Truncated),
         }
     }
     hive.relink_subkeys();
-    for (mut v, data) in pending_values {
-        v.data_blob = hive.intern_value_data(data);
-        hive.insert_value(v);
-    }
     Ok(hive)
+}
+
+/// Validate a hive image header and payload checksum without materialising a [`Hive`].
+///
+/// Storage and checkpoint scheduling sometimes only need to know whether a byte slice is a valid
+/// mutable-hive checkpoint and how long it is. This follows the fixed-header, schema, kind,
+/// header-CRC, payload-bounds, and payload-CRC checks used by [`decode_image`] without allocating
+/// the registry cell arena.
+pub fn image_len_if_valid(bytes: &[u8]) -> Result<usize, HiveDecodeError> {
+    let mut r = Reader::new(bytes);
+    let magic = r.blob_fixed::<8>().ok_or(HiveDecodeError::Truncated)?;
+    if magic != IMAGE_MAGIC {
+        return Err(HiveDecodeError::BadMagic);
+    }
+    let header_len = r.u16().ok_or(HiveDecodeError::Truncated)? as usize;
+    if header_len != IMAGE_HEADER_LEN || bytes.len() < IMAGE_HEADER_LEN {
+        return Err(HiveDecodeError::Truncated);
+    }
+    let schema = r.u16().ok_or(HiveDecodeError::Truncated)?;
+    if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema) {
+        return Err(HiveDecodeError::UnsupportedSchema);
+    }
+    let _flags = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    let _kind = HiveKind::from_u32(r.u32().ok_or(HiveDecodeError::Truncated)?)
+        .ok_or(HiveDecodeError::UnsupportedSchema)?;
+    let _generation = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let _sequence = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let _root_cell = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let _record_count = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let payload_len64 = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    if payload_len64 > usize::MAX as u64 {
+        return Err(HiveDecodeError::Truncated);
+    }
+    let payload_len = payload_len64 as usize;
+    let payload_crc = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    let header_crc = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    if crc32c(&bytes[..IMAGE_HEADER_LEN - 4]) != header_crc {
+        return Err(HiveDecodeError::BadChecksum);
+    }
+    let image_len = IMAGE_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(HiveDecodeError::Truncated)?;
+    let payload = bytes
+        .get(IMAGE_HEADER_LEN..image_len)
+        .ok_or(HiveDecodeError::Truncated)?;
+    if crc32c(payload) != payload_crc {
+        return Err(HiveDecodeError::BadChecksum);
+    }
+    Ok(bytes.len())
+}
+
+fn map_decoded_cell_id(map: &mut Vec<(CellId, CellId)>, raw: CellId, next: &mut u64) -> CellId {
+    if let Some(mapped) = compact_cell_id(map, raw) {
+        return mapped;
+    }
+    let mapped = CellId(*next);
+    *next = next.saturating_add(1);
+    map.push((raw, mapped));
+    mapped
 }
 
 // --- log (spec §12) ----------------------------------------------------------

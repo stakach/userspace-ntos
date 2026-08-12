@@ -70,6 +70,11 @@ pub struct RegfHiveImportStats {
     pub skipped_values: usize,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RegfHiveImportError {
+    OutOfMemory,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RegfHiveCellCounts {
     keys: usize,
@@ -752,7 +757,10 @@ impl<'a> RegfHive<'a> {
 /// The returned hive is clean: import-time construction does not appear as dirty runtime state, and
 /// the first later `HiveManager::mutate` call owns sequence number 1. Malformed value records are
 /// counted and skipped, matching the read-only parser's fail-closed cell access.
-pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, RegfHiveImportStats) {
+pub fn try_import_regf_into_hive(
+    source: &RegfHive<'_>,
+    kind: HiveKind,
+) -> Result<(Hive, RegfHiveImportStats), RegfHiveImportError> {
     let mut target = Hive::new(kind);
     let counts = count_regf_key_cells(source, source.root(), 0);
     let imported_cells = counts.keys.saturating_add(counts.values);
@@ -764,8 +772,12 @@ pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, Re
 
     // Imported hives become live Configuration Manager authority immediately. Leave measured arena
     // headroom for early boot mutations without doubling large hives.
-    let _ = target.reserve_cells(live_cells.saturating_sub(1));
-    let _ = target.reserve_value_blobs(live_value_blobs);
+    if !target.reserve_cells(live_cells.saturating_sub(1)) {
+        return Err(RegfHiveImportError::OutOfMemory);
+    }
+    if !target.reserve_value_blobs(live_value_blobs) {
+        return Err(RegfHiveImportError::OutOfMemory);
+    }
     let mut stats = RegfHiveImportStats {
         keys: 1,
         ..RegfHiveImportStats::default()
@@ -773,7 +785,11 @@ pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, Re
     let root = target.root();
     import_regf_key_into_hive(source, source.root(), &mut target, root, &mut stats, 0);
     target.finish_clean_import();
-    (target, stats)
+    Ok((target, stats))
+}
+
+pub fn import_regf_into_hive(source: &RegfHive<'_>, kind: HiveKind) -> (Hive, RegfHiveImportStats) {
+    try_import_regf_into_hive(source, kind).expect("regf hive import failed")
 }
 
 fn count_regf_key_cells(

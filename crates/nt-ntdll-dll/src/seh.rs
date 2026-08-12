@@ -599,17 +599,19 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
 // RtlRaiseException / RtlRaiseStatus — the software raise entry
 // =================================================================================================
 
-/// `RtlRaiseException(EXCEPTION_RECORD*)` — capture the CONTEXT at the raise site, set
-/// `record->ExceptionAddress = Rip`, and dispatch. If dispatch returns (unhandled), fall through to
-/// `NtRaiseException(FirstChance=FALSE)` so the kernel terminates the process (an honest last chance,
-/// never a silent continue).
+/// `RtlRaiseException(EXCEPTION_RECORD*)` — capture a CONTEXT, rewrite it to the caller that invoked
+/// the exported raise entry, set `record->ExceptionAddress = caller Rip`, and dispatch. If dispatch
+/// returns (unhandled), fall through to `NtRaiseException(FirstChance=FALSE)` so the kernel
+/// terminates the process (an honest last chance, never a silent continue).
 ///
-/// The CONTEXT capture is done by `RtlCaptureContext` (naked). `ExceptionAddress` (record+0x10) is
-/// set to the captured Rip; the dispatch walks from there.
+/// ReactOS' amd64 `RtlRaiseException` records `[rsp]` as the caller's RIP, captures the current
+/// context, then rewrites `CONTEXT.Rip/Rsp` to that caller before first-pass dispatch. Our Rust
+/// implementation has one extra internal helper frame, so the exported naked shim passes the ABI
+/// boundary caller explicitly into this helper.
 ///
 /// # Safety
 /// `record` a valid EXCEPTION_RECORD.
-pub unsafe fn rtl_raise_exception(record: *mut c_void) {
+unsafe fn rtl_raise_exception_with_caller(record: *mut c_void, caller_rip: u64, caller_rsp: u64) {
     if record.is_null() {
         return;
     }
@@ -618,8 +620,15 @@ pub unsafe fn rtl_raise_exception(record: *mut c_void) {
     unsafe {
         capture_context(ctx.as_mut_ptr());
         core::ptr::write_unaligned(ctx.as_mut_ptr().add(CTX_FLAGS) as *mut u32, CONTEXT_FULL);
-        // record->ExceptionAddress @ +0x10 = the captured Rip (the raise site).
-        let rip = core::ptr::read_unaligned(ctx.as_ptr().add(CTX_RIP) as *const u64);
+        let mut rip = core::ptr::read_unaligned(ctx.as_ptr().add(CTX_RIP) as *const u64);
+        if caller_rip != 0 {
+            rip = caller_rip;
+            core::ptr::write_unaligned(ctx.as_mut_ptr().add(CTX_RIP) as *mut u64, caller_rip);
+            if caller_rsp != 0 {
+                core::ptr::write_unaligned(ctx.as_mut_ptr().add(CTX_RSP) as *mut u64, caller_rsp);
+            }
+        }
+        // record->ExceptionAddress @ +0x10 = the caller Rip (the real raise site).
         core::ptr::write_unaligned((record as *mut u8).add(0x10) as *mut u64, rip);
         // First-chance dispatch through the live stack. NOTE: if a `__except` filter fires, the
         // language handler calls `RtlUnwindEx`, which restores the target CONTEXT and never returns
@@ -636,8 +645,40 @@ pub unsafe fn rtl_raise_exception(record: *mut c_void) {
     }
 }
 
+/// Fallback for internal callers that do not enter through the exported ABI shim.
+///
+/// # Safety
+/// `record` a valid EXCEPTION_RECORD.
+pub unsafe fn rtl_raise_exception(record: *mut c_void) {
+    unsafe { rtl_raise_exception_with_caller(record, 0, 0) };
+}
+
+/// `RtlRaiseException` implementation entered from the exported naked x64 shim.
+///
+/// # Safety
+/// `record` a valid EXCEPTION_RECORD; `caller_rip/caller_rsp` describe the original caller frame.
+pub unsafe extern "system" fn rtl_raise_exception_from_caller(
+    record: *mut c_void,
+    caller_rip: u64,
+    caller_rsp: u64,
+) {
+    unsafe { rtl_raise_exception_with_caller(record, caller_rip, caller_rsp) };
+}
+
 /// Raise `status` as a noncontinuable software exception through the live x64 SEH dispatcher.
 pub unsafe fn rtl_raise_status(status: u32) {
+    unsafe { rtl_raise_status_from_caller(status, 0, 0) };
+}
+
+/// `RtlRaiseStatus` implementation entered from the exported naked x64 shim.
+///
+/// # Safety
+/// `caller_rip/caller_rsp` describe the original caller frame.
+pub unsafe extern "system" fn rtl_raise_status_from_caller(
+    status: u32,
+    caller_rip: u64,
+    caller_rsp: u64,
+) {
     let mut record = RawExceptionRecord {
         code: status,
         flags: ex::EXCEPTION_NONCONTINUABLE,
@@ -647,7 +688,13 @@ pub unsafe fn rtl_raise_status(status: u32) {
         padding: 0,
         information: [0; 15],
     };
-    unsafe { rtl_raise_exception((&mut record as *mut RawExceptionRecord).cast()) };
+    unsafe {
+        rtl_raise_exception_with_caller(
+            (&mut record as *mut RawExceptionRecord).cast(),
+            caller_rip,
+            caller_rsp,
+        )
+    };
 }
 
 // =================================================================================================

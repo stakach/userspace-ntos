@@ -32,20 +32,42 @@ in SCM, user-mode system processes, and our ntdll where possible.
 ### Current Desktop Frontier
 
 Current serialized frontier (2026-08-12): the real desktop/icon path is past shell launch and paint
-scaffolding. The executive no longer contains live `[w32-slip]` or `[cb-inject]` post-quiesce
-callback probes; any run that still emits those tags is using a stale binary or stale branch state.
-The callback/transport gates now assert live invariants from the real workload.
+scaffolding again on the Rust ntdll. The executive no longer contains live `[w32-slip]` or
+`[cb-inject]` post-quiesce callback probes; any run that still emits those tags is using a stale
+binary or stale branch state. The callback/transport gates now assert live invariants from the real
+workload.
 
 Latest accepted desktop proof (2026-08-12):
-`.tmp/run-desktop-boot-hive-checkpoint-refresh-20260812.log` reaches the harness sentinel with
-`295/295` executive-to-isolated-service checks passing. It rebuilds and stages the current ntdll,
-reaches real credential paint and LSA validation, checkpoints dirty boot/profile hives through the
-writable overlay, spawns userinit and Explorer through the dynamic process path, and paints real
-Explorer shell chrome. The final Explorer gates pass: process spawn, create-window string capture,
-registered shell messages, redirected user callbacks, client WndProc install, shell COM class
-service, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports the full 1024x768
-framebuffer as non-background with at least 32 distinct non-background colors, while the pool gate
-remains green (`ut-free=60847KiB`, `image-bank-fails=0`, `vm-fail ... 0`, `asid-fails=0`).
+`rust-micro/.tmp/run-headless-seh-caller-context-gates-20260812.log` reaches the harness sentinel
+with `294/294` executive-to-isolated-service checks passing. It rebuilds and stages the Rust ntdll
+with no ReactOS ntdll fallback, reaches real credential paint and LSA validation, checkpoints dirty
+boot/profile hives through the writable overlay, spawns userinit and Explorer through the dynamic
+process path, and paints real Explorer shell chrome. The final Explorer gates pass: process spawn,
+create-window string capture, registered shell messages, redirected user callbacks, client WndProc
+install, shell COM class service, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports
+the full 1024x768 framebuffer as non-background with at least 32 distinct non-background colors,
+while the pool gate remains green (`ut-free=86016KiB`, `image-bank-fails=0`, `vm-fail ... 0`,
+`asid-fails=0`).
+
+Completed ntdll SEH caller-context slice (2026-08-12): the post-profile/userinit crash was an ntdll
+ABI bug, not a kernel launch-policy gap. ReactOS callers expect `RtlRaiseException` and
+`RtlRaiseStatus` to raise from the original caller frame, with `EXCEPTION_RECORD.ExceptionAddress`,
+`CONTEXT.Rip`, and `CONTEXT.Rsp` describing the site that called ntdll rather than the internal
+helper frame. The Rust ntdll x64 exports now use naked shims to pass the caller return address and
+post-return stack pointer into the shared SEH helper before dispatching vectored/frame handlers or
+last-chance `NtRaiseException`. This keeps exception reporting compatible with NT/ReactOS behavior
+and lets `userinit.exe` proceed through shell activation instead of surfacing a synthetic internal
+ntdll address.
+
+Completed proof-gate cleanup (2026-08-12): the shell proof no longer depends on historical
+post-quiesce or persistent-live-process scaffolding. `userinit.exe` is a transient shell launcher, so
+the final `exec_userinit_process_spawned` gate now requires durable ProcessManager identity,
+image/section/query/create-process evidence, vspace publication, hosted main-thread runtime
+publication, primary token assignment, shell/explorer attempts, and USER/GDI observations; the live
+EPROCESS link remains a diagnostic (`eprocess-linked-now`) because the process can legitimately exit
+after launching Explorer. The duplicate `exec_desktop_shell_frontier` check is retired in favor of
+the base desktop paint gate plus the real Explorer shell chrome framebuffer proof. Do not reintroduce
+fallback shell launch, callback, or paint success paths to satisfy these gates.
 
 Current generic-section handle-lifetime slice (2026-08-12): the parked post-proof process exposed a
 real handle side-table lifetime bug, not a shell or callback problem. `rundll32.exe` created and
@@ -4352,3 +4374,158 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`. Review adjustment: rerun the same-disk proof from a freshly rebuilt image;
   the first boot should create/commit a snapshot without allocator failure before the second boot
   proves restore.
+
+  D3 streaming snapshot checkpoint slice (2026-08-12): the retained same-disk retry widened
+  boot-hive checkpointing correctly, but that made the durable writable-overlay snapshot about
+  1 MiB after `SYSTEM`, `SOFTWARE`, and `.DEFAULT` were materialised. Building the complete snapshot
+  payload as a temporary `Vec` exhausted the executive's early bump heap, so the storage contract now
+  has a streaming commit path. `SnapshotBlockStore::commit_next_streaming` writes payload sectors
+  through one reusable sector buffer and publishes the CRC/header last; `FileSystem::commit_volume_snapshot`
+  computes the existing MemFs snapshot header, payload CRC, and outer store CRC in streaming passes,
+  then stores bytes that are byte-for-byte identical to `export_volume_snapshot`. The executive
+  checkpoint path now calls the streaming commit directly instead of exporting a full payload first.
+  Host coverage compares a streaming block-store commit against the legacy exported snapshot and
+  restores it through the existing reader. Validation so far: `cargo fmt --all`,
+  `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rerun the first/second boot same-disk proof; the first
+  boot should checkpoint all dirty boot hives and commit the writable snapshot without allocator
+  failure, and the second boot must restore `SOFTWARE`/`.DEFAULT` from that snapshot before naturally
+  reaching userinit, Explorer, and shell chrome.
+
+  D3 restored-boot idempotent provisioning slice (2026-08-12): the current same-disk retry restored
+  snapshot generation `58` (`1166876` bytes, `119` nodes) and mounted persisted `SYSTEM`, `SOFTWARE`,
+  and `.DEFAULT` hive checkpoints, but the second boot still OOMed after LSASS startup on a
+  `524288`-byte allocation while the lazy boot-hive checkpoint path was preparing to reserialize
+  already-restored setup state. The cause was not a missing storage primitive: boot provisioning
+  reran setup, locale, print, shell-folder, and shell-COM seed writes as unconditional mutable-hive
+  replacements, so restored hives became dirty even when every value already matched the saved
+  checkpoint. The retained fix makes ReactOS setup seeders compare value type and payload before
+  writing, keeps COM class reporting based on materialized class presence, adds an executive
+  `ensure_mutable_registry_value_by_path` helper for setup/locale values, and skips rebuilding
+  `Default User\ntuser.dat` when the mounted writable volume already has a valid copy and `.DEFAULT`
+  has no dirty cells. This preserves first-boot provisioning but should make restored boots leave
+  boot hives zero-dirty until real runtime registry writes occur. Validation so far:
+  `cargo fmt --all`, `cargo test -p nt-hive-core`, `cargo test -p nt-alpc`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rebuild the boot image and rerun the serialized
+  same-disk proof; the second boot should show restored hives already present, no
+  `[alloc-oom]`, and progress past LSASS LPC receive toward userinit/Explorer desktop paint.
+
+  D3 restored-boot identity persistence follow-up (2026-08-12): the rebuilt same-disk proof
+  `.tmp/run-headless-snapshot-first-20260812-r14.log` closed the restored-boot allocator failure and
+  reached the desktop/userinit/explorer path on first boot, committing snapshot generation `56`
+  (`1166790` bytes). The matching second boot
+  `.tmp/run-headless-snapshot-second-20260812-r14.log` restored that snapshot and mounted `SYSTEM`,
+  `SOFTWARE`, and `.DEFAULT` from writable config without re-provision OOM, but exposed the next real
+  persistence bug: LSA/SAM rebuilt a different account-domain SID on the restored boot
+  (`S-1-5-21-1271654662-1122398986-1130690968-500` instead of
+  `S-1-5-21-566804007-1758080591-498852088-500`). Because the copied
+  `C:\Profiles\Administrator\ntuser.dat` already existed, ReactOS `userenv!LoadUserProfileW` skipped
+  `CreateUserProfileW` and then failed opening `HKLM\...\ProfileList\<new SID>` with `Error: 2`.
+  Root cause: the service loop used a one-shot lazy boot-hive checkpoint. Early setup writes
+  persisted `SYSTEM`, `SOFTWARE`, and `.DEFAULT`, then later real `SECURITY`/`SAM` account-domain
+  writes and winlogon's `SOFTWARE\ProfileList\<SID>` writes set hive dirty state after the one-shot
+  had already been consumed. A first retry that swept on every mutable-hive write proved the opposite
+  failure mode: LSA policy setup generated dozens of tiny `SECURITY` checkpoints and exhausted the
+  executive heap before the shell. The retained fix removes the obsolete one-shot state but keeps NT's
+  lazy-writer shape: normal mutable-hive writes pin live CM cells immediately, explicit `NtFlushKey`
+  remains synchronous, and quiesce performs one dirty-cell boot-hive sweep plus a writable snapshot
+  commit. Review adjustment: rerun the serialized same-disk proof; the first boot should emit a
+  coarse quiesce checkpoint for later `SECURITY`/`SAM` and `SOFTWARE` mutations, and the second boot
+  should reuse the same SID/ProfileList state before launching the real shell.
+
+  D3 boot-hive lazy-writer headroom follow-up (2026-08-12): the next serialized first boot reached
+  real credential paint, LSA authentication, userinit/explorer activity, and many writable snapshot
+  generations, but rejected the final proof at quiesce: after shell diagnostics had consumed transient
+  heap headroom, the all-hive quiesce sweep attempted to encode the dirty `SYSTEM` image and hit
+  `[alloc-oom] size=370248`. The retained fix keeps the quiesce sweep, but moves it before the
+  interactive quiesce dumps and adds a bounded service-loop lazy-writer slice: when enough allocator
+  headroom exists and boot-hive dirty cells are above a coarse threshold, checkpoint exactly one dirty
+  boot hive, re-arm the dirty bit if more hives remain, and let the normal writable-volume commit path
+  persist that slice. This avoids both old extremes: no one-shot checkpoint that misses late
+  `SECURITY`/`SAM` or `ProfileList` writes, and no tiny per-write hive encode storm. Validation so
+  far: `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: rebuild the executive/rootserver
+  and rerun the same-disk proof. The first boot should show one or more
+  `[cm-flush] lazy boot hive slice` lines before quiesce, no `[alloc-oom]`, and a final snapshot
+  commit; the second boot should restore the persisted boot hives, keep the same account-domain SID
+  and `ProfileList`, then reach userinit/Explorer shell paint without profile scaffolding.
+
+  D3 large-hive checkpoint safety slice (2026-08-12): the first rebuilt proof with lazy boot-hive
+  slices did not reach the prior desktop frontier. It passed the early writable snapshot commits, then
+  failed just after LSASS signalled `\SeLsaInitEvent` with `[alloc-oom] size=1245184` while the
+  executive heap was already pinned at `7821392/8388608`. Comparison against the previous
+  desktop-reaching run showed the same heap mark, so the regression is the new checkpoint policy
+  trying to encode a large boot hive in a single infallible allocation instead of allowing the LSA
+  SRM rendezvous to continue. The retained cleanup restores NT `NtFlushKey` scope: explicit flush of
+  a mounted boot-hive key checkpoints that key's hive only; whole boot-hive sweeps stay owned by the
+  lazy writer and quiesce drain. `nt-hive-core` now also exposes a fallible image encoder that
+  pre-measures payload size, reserves exactly once, and reports out-of-memory/overflow so executive
+  checkpoint and `NtSaveKey` paths return `STATUS_INSUFFICIENT_RESOURCES` while keeping the hive
+  dirty instead of panicking. Validation so far: `cargo fmt --all`, `cargo test -p nt-hive-core`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  Review adjustment: rebuild and rerun the first boot. It should pass the LSASS `SeLsaCommandPort`
+  rendezvous again; any remaining red gate should identify the next real persistence requirement,
+  likely a disk-backed/streaming checkpoint for large `SECURITY`/`SAM` boot-hive images rather than
+  another executive heap increase.
+
+  D3 lazy checkpoint batching correction (2026-08-12): the first fallible-encoder retry proved the
+  remaining heap wall was no longer the large-hive encoder itself. `NtFlushKey` correctly wrote only
+  `SYSTEM` (`364436B`), but the service-loop lazy writer immediately selected `SYSTEM` again for a
+  single dirty cell while total boot-hive dirty state was only `54` cells. That unnecessary rewrite
+  retained another full hive image in the bump-backed writable overlay and left too little contiguous
+  runway for the later `1245184`-byte service activation allocation. The retained policy now treats
+  the service-loop writer as a real coarse lazy writer: it selects the first hive whose own dirty
+  count has reached the batch threshold, skips tiny per-hive deltas until quiesce, and requires the
+  candidate hive image plus a measured post-checkpoint heap runway before spending memory. The full
+  quiesce drain still owns final small-delta persistence. Review adjustment: rebuild and rerun the
+  first boot. It should no longer emit a `lazy boot hive slice` for `next-dirty=1`, should pass the
+  LSASS/service activation allocation, and should either reach the prior desktop/quiesce checkpoint
+  or expose the next real persistence storage boundary.
+
+  D3 explicit flush runway correction (2026-08-12): the batching retry
+  `.tmp/run-headless-lazy-runway-first-20260812.log` proved the service-loop selector fix: the lazy
+  line changed from `next-dirty=1` on `SYSTEM` to `next-dirty=38` on `.DEFAULT`, and the `.DEFAULT`
+  checkpoint committed generation `2`. The boot still hit the same `1245184`-byte allocation because
+  a separate explicit boot-hive `NtFlushKey` immediately reserialized `SYSTEM` for one dirty cell,
+  retained another `364436B` image, and lifted the bump high-water to the old failing mark. The
+  retained correction does not report false success: explicit boot-hive flush now shares the measured
+  post-checkpoint runway rule and returns `STATUS_INSUFFICIENT_RESOURCES` while leaving the hive
+  dirty when a synchronous checkpoint would starve the next activation. Dynamic profile-hive flushes
+  are unchanged, and quiesce still owns the final all-hive drain. Review adjustment: rebuild and
+  rerun the first boot. The duplicate one-cell `SYSTEM` flush should become an
+  `insufficient-headroom` line instead of a retained checkpoint, allowing the service activation
+  allocation to proceed. If callers do not tolerate that real status, the next implementation target
+  is reusable/disk-backed boot-hive checkpoint storage rather than a success fallback.
+
+  D3 profile-hive import memory frontier (2026-08-12): the explicit-flush runway retry
+  `.tmp/run-headless-flush-runway-first-20260812.log` moved past the old LSASS/service allocation wall.
+  It reaches EventLog, SAMR/profile RPC traffic, creates the Administrator profile tree, writes
+  `SOFTWARE\...\ProfileList\<SID>`, and mounts the real Administrator profile hive with
+  `NtLoadKey` (`bytes=130682`, `root-subkeys=5`). The next allocator failure occurs immediately after
+  the successful mounted-hive read-back. The retained cleanup starts by making `nt-hive-regf`'s large
+  mutable-import arena precharge fallible and by tagging allocator OOM reports with generic CM/FS
+  contexts (`regf-import`, `hive-encode`, `writable-snapshot`, `writable-atomic-write`,
+  `nt-load-key`). This is diagnostic plus correctness: `NtLoadKey` now returns
+  `STATUS_INSUFFICIENT_RESOURCES` for a real import-resource failure instead of panicking or claiming a
+  mount that cannot be represented. Review adjustment: rebuild and rerun the first boot. If the
+  context confirms `regf-import`, the next real mechanism is a smaller file-backed or copy-on-write
+  hive representation for dynamic profile hives, not another heap raise; if it confirms a boot-hive
+  encode or writable-file growth, move that durable payload out of the executive control heap.
+
+  D3 post-profile allocation owner refinement (2026-08-12): the scoped retry
+  `.tmp/run-headless-ntloadkey-oom-context-first-20260812.log` narrowed the frontier. `NtLoadKey`
+  successfully imported and mounted the Administrator hive, and the allocator failure that followed
+  still had no `nt-load-key`, `regf-import`, `hive-encode`, `writable-snapshot`, or
+  `writable-atomic-write` context. That means the next `0x130000` allocation is outside the hive-load
+  routine itself, most likely a post-syscall service-loop plane or the next native service entered by
+  winlogon/userenv. The allocator now carries an independent static scope label in addition to the
+  narrow numeric context: every native syscall is scoped with its canonical `Nt*` name, service-loop
+  dirty planes are scoped (`mutable-hives`, `hive-mounts`, `writable-fs`, hosted image/process
+  metadata), and dynamic hosted executable / demand-loaded DLL admission are separately scoped. This
+  is still diagnostic, not a heap increase or fallback. Validation so far: `cargo fmt --all`,
+  `cargo test -p nt-hive-regf`, `cargo test -p nt-syscall`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rebuild and rerun the serialized first boot; the next
+  allocator report must include `scope=...`, and that named owner becomes the implementation target.

@@ -306,6 +306,13 @@ trait RgsSeedTarget {
         data: Vec<u8>,
     ) -> bool;
     fn has_value(&self, path: &str, name: &str) -> bool;
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool;
 }
 
 struct OverlayRgsSeedTarget<'a> {
@@ -325,6 +332,9 @@ impl RgsSeedTarget for OverlayRgsSeedTarget<'_> {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
         let (index, _) = self.overlay.create(path);
         self.overlay
             .set_value(index, name, value_type as u32, &data)
@@ -334,6 +344,20 @@ impl RgsSeedTarget for OverlayRgsSeedTarget<'_> {
         self.overlay
             .find(path)
             .is_some_and(|index| self.overlay.value(index, name).is_some())
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        self.overlay.find(path).is_some_and(|index| {
+            self.overlay
+                .value(index, name)
+                .is_some_and(|(ty, existing)| ty == value_type as u32 && existing == data)
+        })
     }
 }
 
@@ -353,6 +377,9 @@ impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
         value_type: RegistryValueType,
         data: Vec<u8>,
     ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
         let Some(key) = self.hives.create_key(path) else {
             return false;
         };
@@ -364,6 +391,19 @@ impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
             .resolve_key(path)
             .and_then(|key| self.hives.query_value(key, name))
             .is_some()
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        self.hives
+            .resolve_key(path)
+            .and_then(|key| self.hives.query_value(key, name))
+            .is_some_and(|(ty, existing)| ty == value_type && existing == data)
     }
 }
 
@@ -463,9 +503,8 @@ fn seed_reactos_explorer_shell_com_classes_into<T: RgsSeedTarget>(
 ) -> u64 {
     let mut mask = 0;
     for script in REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS {
-        if seed_rgs_script(target, classes_root, script.module, script.rgs)
-            && rgs_script_materialized_expected_class(target, classes_root, script.clsid)
-        {
+        let _ = seed_rgs_script(target, classes_root, script.module, script.rgs);
+        if rgs_script_materialized_expected_class(target, classes_root, script.clsid) {
             mask |= script.mask_bit;
         }
     }
@@ -840,6 +879,7 @@ mod tests {
         assert_eq!(data, utf16le_sz("Apartment"));
 
         let first_cell_count = hives.hive(2).expect("software hive").cell_count();
+        assert!(hives.clear_hive_dirty(2));
         let second_mask = seed_reactos_explorer_shell_com_classes_in_mutable_hives(
             &mut hives,
             r"\Registry\Machine\Software\Classes",
@@ -849,6 +889,7 @@ mod tests {
             hives.hive(2).expect("software hive").cell_count(),
             first_cell_count
         );
+        assert_eq!(hives.hive(2).expect("software hive").dirty_count(), 0);
     }
 
     #[test]
@@ -890,15 +931,17 @@ mod tests {
         assert!(hives.query_value(shell_key, "Temp").is_none());
 
         let first_cell_count = hives.hive(5).expect("default hive").cell_count();
+        assert!(hives.clear_hive_dirty(5));
         let second_stats = seed_reactos_default_user_shell_folders_in_mutable_hives(
             &mut hives,
             r"C:\Profiles\Default User",
         );
-        assert_eq!(second_stats, stats);
+        assert_eq!(second_stats, ReactOsProfileShellFolderSeedStats::default());
         assert_eq!(
             hives.hive(5).expect("default hive").cell_count(),
             first_cell_count
         );
+        assert_eq!(hives.hive(5).expect("default hive").dirty_count(), 0);
     }
 
     #[test]
@@ -942,12 +985,14 @@ mod tests {
         assert_eq!(data, utf16le_sz("localmon.dll"));
 
         let first_cell_count = hives.hive(1).expect("system hive").cell_count();
+        assert!(hives.clear_hive_dirty(1));
         let second_stats = seed_reactos_print_setup_in_mutable_hives(&mut hives);
-        assert_eq!(second_stats, stats);
+        assert_eq!(second_stats, ReactOsPrintSetupSeedStats::default());
         assert_eq!(
             hives.hive(1).expect("system hive").cell_count(),
             first_cell_count
         );
+        assert_eq!(hives.hive(1).expect("system hive").dirty_count(), 0);
     }
 
     #[test]

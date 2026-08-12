@@ -11,7 +11,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Base of the RW heap region the broker maps into each component. Sits just past the executive
 /// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
@@ -62,6 +62,51 @@ const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the free
 struct Bump;
 
 static OOM_REPORTED: AtomicBool = AtomicBool::new(false);
+static OOM_CONTEXT: AtomicU32 = AtomicU32::new(0);
+static OOM_SCOPE_PTR: AtomicUsize = AtomicUsize::new(0);
+static OOM_SCOPE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub const ALLOC_CTX_REGF_IMPORT: u32 = 1;
+pub const ALLOC_CTX_HIVE_ENCODE: u32 = 2;
+pub const ALLOC_CTX_WRITABLE_SNAPSHOT: u32 = 3;
+pub const ALLOC_CTX_WRITABLE_ATOMIC_WRITE: u32 = 4;
+pub const ALLOC_CTX_NT_LOAD_KEY: u32 = 5;
+
+pub struct AllocContext {
+    previous: u32,
+}
+
+pub struct AllocScope {
+    previous_ptr: usize,
+    previous_len: usize,
+}
+
+impl Drop for AllocContext {
+    fn drop(&mut self) {
+        OOM_CONTEXT.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AllocScope {
+    fn drop(&mut self) {
+        OOM_SCOPE_PTR.store(self.previous_ptr, Ordering::Relaxed);
+        OOM_SCOPE_LEN.store(self.previous_len, Ordering::Relaxed);
+    }
+}
+
+pub fn enter_context(context: u32) -> AllocContext {
+    let previous = OOM_CONTEXT.swap(context, Ordering::Relaxed);
+    AllocContext { previous }
+}
+
+pub fn enter_scope(scope: &'static [u8]) -> AllocScope {
+    let previous_ptr = OOM_SCOPE_PTR.swap(scope.as_ptr() as usize, Ordering::Relaxed);
+    let previous_len = OOM_SCOPE_LEN.swap(scope.len(), Ordering::Relaxed);
+    AllocScope {
+        previous_ptr,
+        previous_len,
+    }
+}
 
 fn debug_bytes(bytes: &[u8]) {
     for &byte in bytes {
@@ -84,6 +129,18 @@ fn debug_usize(mut value: usize) {
     debug_bytes(&buf[i..]);
 }
 
+fn debug_context(context: u32) {
+    let label: &[u8] = match context {
+        ALLOC_CTX_REGF_IMPORT => b"regf-import",
+        ALLOC_CTX_HIVE_ENCODE => b"hive-encode",
+        ALLOC_CTX_WRITABLE_SNAPSHOT => b"writable-snapshot",
+        ALLOC_CTX_WRITABLE_ATOMIC_WRITE => b"writable-atomic-write",
+        ALLOC_CTX_NT_LOAD_KEY => b"nt-load-key",
+        _ => b"unknown",
+    };
+    debug_bytes(label);
+}
+
 fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end: usize) {
     if OOM_REPORTED.swap(true, Ordering::Relaxed) {
         return;
@@ -100,6 +157,18 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     debug_usize(requested_end);
     debug_bytes(b" cap=");
     debug_usize(HEAP_SIZE);
+    let context = OOM_CONTEXT.load(Ordering::Relaxed);
+    if context != 0 {
+        debug_bytes(b" ctx=");
+        debug_context(context);
+    }
+    let scope_ptr = OOM_SCOPE_PTR.load(Ordering::Relaxed);
+    let scope_len = OOM_SCOPE_LEN.load(Ordering::Relaxed);
+    if scope_ptr != 0 && scope_len != 0 {
+        debug_bytes(b" scope=");
+        // SAFETY: scopes are static byte strings installed through `enter_scope`.
+        debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
+    }
     crate::debug_put_char(b'\n');
 }
 
@@ -449,6 +518,11 @@ static ALLOC: Bump = Bump;
 /// `reset_to` runs; it may be handed out again.
 pub fn mark() -> usize {
     unsafe { read_word(CTR) }
+}
+
+/// Bytes still available above the current bump mark.
+pub fn remaining() -> usize {
+    HEAP_SIZE.saturating_sub(mark())
 }
 
 /// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.

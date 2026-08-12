@@ -637,6 +637,51 @@ fn hive_persists_through_file_apis() {
 }
 
 #[test]
+fn replace_file_data_owned_installs_complete_file_image() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let file = fs.zw_create_file(
+        r"\??\C:\checkpoint.bin",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+
+    let image = alloc::vec![0x5a; 8192];
+    assert_eq!(
+        fs.replace_file_data_owned(file.handle, image),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_query_standard_information(file.handle)
+            .unwrap()
+            .end_of_file,
+        8192
+    );
+    assert_eq!(fs.zw_read_file(file.handle, Some(0), 4).1, [0x5a; 4]);
+
+    let dir = fs.zw_create_file(
+        r"\??\C:\checkpoint-dir",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.replace_file_data_owned(dir.handle, alloc::vec![0x11]),
+        STATUS_INVALID_DEVICE_REQUEST
+    );
+    assert_eq!(
+        fs.replace_file_data_owned(INVALID_HANDLE, alloc::vec![0x22]),
+        STATUS_INVALID_HANDLE
+    );
+}
+
+#[test]
 fn memfs_snapshot_round_trips_volume_tree_sparse_data_and_attributes() {
     let mut fs = FileSystem::new(MemFs::new());
 
@@ -917,6 +962,101 @@ fn memfs_snapshot_restores_from_block_store_payload() {
         restored.zw_read_file(reopened.handle, Some(0), 64).1,
         b"survived storage"
     );
+
+    let (mut restored, generation, bytes) =
+        FileSystem::restore_volume_snapshot_from_store(&store, &mut dev)
+            .unwrap()
+            .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(bytes, snapshot.len());
+    let reopened = restored.zw_create_file(
+        r"\??\C:\Profiles\persisted.txt",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(reopened.status, STATUS_SUCCESS);
+    assert_eq!(
+        restored.zw_read_file(reopened.handle, Some(0), 64).1,
+        b"survived storage"
+    );
+}
+
+#[test]
+fn memfs_streaming_snapshot_commit_matches_exported_snapshot() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let profiles = fs.zw_create_file(
+        r"\??\C:\Profiles",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(profiles.status, STATUS_SUCCESS);
+    fs.zw_close(profiles.handle);
+    let profile = fs.zw_create_file(
+        r"\??\C:\Profiles\Administrator",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(profile.status, STATUS_SUCCESS);
+    fs.zw_close(profile.handle);
+    let file = fs.zw_create_file(
+        r"\??\C:\Profiles\Administrator\ntuser.dat",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(file.handle, Some(0), b"streamed hive image")
+            .0,
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            file.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &0x4000u64.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+
+    let expected = fs.export_volume_snapshot().unwrap();
+    let store = SnapshotBlockStore::new(2, 48);
+    let mut dev = MemoryBlockDevice::new(512, 56);
+    let (generation, bytes) = fs.commit_volume_snapshot(&store, &mut dev).unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(bytes, expected.len());
+
+    let stored = store.read_latest(&mut dev).unwrap().unwrap();
+    assert_eq!(stored.payload, expected);
+    let (mut restored, generation, bytes) =
+        FileSystem::restore_volume_snapshot_from_store(&store, &mut dev)
+            .unwrap()
+            .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(bytes, expected.len());
+    let reopened = restored.zw_create_file(
+        r"\??\C:\Profiles\Administrator\ntuser.dat",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(reopened.status, STATUS_SUCCESS);
+    let (status, bytes) = restored.zw_read_file(reopened.handle, Some(0), 19);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(bytes, b"streamed hive image");
 }
 
 #[test]

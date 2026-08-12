@@ -41,6 +41,7 @@ const PIPE_DEFAULT_WAIT_INTERVAL_100NS: i64 = -50_000_000;
 const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\services";
 const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
     r"\registry\machine\system\controlset001\control\servicegrouporder";
+const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
 
 fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
     let timeout = if request.timeout_specified {
@@ -1426,6 +1427,7 @@ unsafe fn admit_dynamic_hosted_exe(
     folded_name: &[u8],
     is_sxs: bool,
 ) -> Option<(nt_exe_image::HostedProcessImageRef<'static>, bool)> {
+    let _alloc_scope = crate::allocator::enter_scope(b"hosted-exe-admit");
     if is_sxs {
         return None;
     }
@@ -2194,6 +2196,7 @@ impl ExecNtHandler {
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hives_dirty, false);
+        write_field!(boot_hive_checkpoints_refreshed, false);
         write_field!(
             registry_services_order_cache,
             alloc::vec::Vec::with_capacity(256)
@@ -2339,6 +2342,9 @@ impl ExecNtHandler {
                     .insert(nt_security::AccessToken::system());
                 let _ = handler.pm.replace_process_primary_token(pid, Some(token));
             }
+        }
+        if unsafe { crate::writable_fs::mount_restored_snapshot_for_boot() } {
+            handler.refresh_boot_hive_checkpoints_from_writable_config();
         }
         handler.refresh_process_manager_gates();
         handler.provision_kernel_srm_objects();
@@ -2494,32 +2500,37 @@ impl ExecNtHandler {
             );
             return;
         }
-        let mut all_set = self.set_mutable_registry_value_by_path(
-            SETUP_KEY,
-            "SetupType",
-            REG_DWORD,
-            &0u32.to_le_bytes(),
-        );
-        all_set &= self.set_mutable_registry_value_by_path(
+        let setup_type = 0u32.to_le_bytes();
+        let setup_in_progress = 0u32.to_le_bytes();
+        let cmd_line = registry_sz_bytes("");
+        let Some(setup_type_changed) =
+            self.ensure_mutable_registry_value_by_path(SETUP_KEY, "SetupType", REG_DWORD, &setup_type)
+        else {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
+            return;
+        };
+        let Some(setup_in_progress_changed) = self.ensure_mutable_registry_value_by_path(
             SETUP_KEY,
             "SystemSetupInProgress",
             REG_DWORD,
-            &0u32.to_le_bytes(),
-        );
-        all_set &= self.set_mutable_registry_value_by_path(
-            SETUP_KEY,
-            "CmdLine",
-            REG_SZ,
-            &registry_sz_bytes(""),
-        );
-        if !all_set {
+            &setup_in_progress,
+        ) else {
             print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
             return;
+        };
+        let Some(cmd_line_changed) =
+            self.ensure_mutable_registry_value_by_path(SETUP_KEY, "CmdLine", REG_SZ, &cmd_line)
+        else {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup mutable write failed\n");
+            return;
+        };
+        if setup_type_changed || setup_in_progress_changed || cmd_line_changed {
+            print_str(
+                b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned in mutable hive\n",
+            );
+        } else {
+            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup already in normal installed state\n");
         }
-        self.mark_mutable_hives_dirty();
-        print_str(
-            b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values provisioned in mutable hive\n",
-        );
     }
 
     fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {
@@ -2534,16 +2545,28 @@ impl ExecNtHandler {
     /// registration; the staged LiveCD SOFTWARE hive does not, so the executive imports the
     /// ReactOS `.rgs` setup output into the mounted mutable SOFTWARE hive.
     fn provision_reactos_explorer_shell_com_classes(&mut self) {
+        let before_dirty = self
+            .mutable_hives
+            .hive(HIVE_SEL_SOFTWARE)
+            .map_or(0, |hive| hive.dirty_count());
         let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes_in_mutable_hives(
             &mut self.mutable_hives,
             r"\Registry\Machine\Software\Classes",
         );
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
-        if mask != 0 {
+        let after_dirty = self
+            .mutable_hives
+            .hive(HIVE_SEL_SOFTWARE)
+            .map_or(0, |hive| hive.dirty_count());
+        if after_dirty != before_dirty {
             self.mark_mutable_hives_dirty();
             print_str(b"[shell-com] provisioned explorer HKCR classes mask=0x");
             print_hex(mask as u32);
             print_str(b" in mutable hive\n");
+        } else if mask != 0 {
+            print_str(b"[shell-com] explorer HKCR classes already present mask=0x");
+            print_hex(mask as u32);
+            print_str(b"\n");
         }
     }
 
@@ -2554,7 +2577,17 @@ impl ExecNtHandler {
         let stats =
             nt_hive_core::seed_reactos_print_setup_in_mutable_hives(&mut self.mutable_hives);
         if stats.total_values() == 0 {
-            print_str(b"[print-setup] ReactOS print setup not provisioned\n");
+            if self
+                .mutable_registry_value_by_path(
+                    r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
+                    "Driver",
+                )
+                .is_some()
+            {
+                print_str(b"[print-setup] ReactOS print setup already present\n");
+            } else {
+                print_str(b"[print-setup] ReactOS print setup not provisioned\n");
+            }
             return;
         }
         self.mark_mutable_hives_dirty();
@@ -2581,7 +2614,17 @@ impl ExecNtHandler {
             r"C:\Profiles\Default User",
         );
         if stats.total_values() == 0 {
-            print_str(b"[profile-setup] default-user shell folders not provisioned\n");
+            if self
+                .mutable_registry_value_by_path(
+                    r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+                    "AppData",
+                )
+                .is_some()
+            {
+                print_str(b"[profile-setup] default-user shell folders already present\n");
+            } else {
+                print_str(b"[profile-setup] default-user shell folders not provisioned\n");
+            }
             return;
         }
         self.mark_mutable_hives_dirty();
@@ -2606,7 +2649,26 @@ impl ExecNtHandler {
             );
             return;
         };
-        let image = nt_hive_core::encode_image(hive);
+        if hive.dirty_count() == 0
+            && unsafe {
+                crate::writable_fs::hive_image_len_at(crate::writable_fs::DEFAULT_USER_NTUSER_DAT)
+            } != 0
+        {
+            print_str(b"[profile-setup] Default User\\ntuser.dat already current on writable volume\n");
+            return;
+        }
+        let image = match nt_hive_core::try_encode_image(hive) {
+            Ok(image) => image,
+            Err(err) => {
+                print_str(b"[profile-setup] HKU\\.DEFAULT image encode failed err=");
+                print_str(match err {
+                    nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
+                    nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
+                });
+                print_str(b"\n");
+                return;
+            }
+        };
         if image.len() > USER_HIVE_SLOT_BYTES {
             print_str(b"[profile-setup] HKU\\.DEFAULT image too large for NtLoadKey slot: ");
             print_u64(image.len() as u64);
@@ -2706,45 +2768,48 @@ impl ExecNtHandler {
             print_str(b"[locale-setup] .Default\\Control Panel\\International absent -> skipped\n");
             return;
         }
-        if !self.set_mutable_registry_value_by_path(
+        let Some(user_locale_changed) = self.ensure_mutable_registry_value_by_path(
             USER_INTERNATIONAL,
             "Locale",
             REG_SZ,
             &user_locale[..user_locale_len],
-        ) {
+        ) else {
             print_str(
                 b"[locale-setup] .Default\\Control Panel\\International mutable write failed\n",
             );
             return;
-        }
+        };
         if self.mutable_registry_key_by_path(NLS_LANGUAGE).is_none() {
             print_str(b"[locale-setup] HKLM\\...\\Nls\\Language absent -> no system locale\n");
             return;
         }
-        if !self.set_mutable_registry_value_by_path(
+        let Some(system_default_changed) = self.ensure_mutable_registry_value_by_path(
             NLS_LANGUAGE,
             "Default",
             REG_SZ,
             &system_locale[..system_locale_len],
-        ) {
+        ) else {
             print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default mutable write failed\n");
             return;
-        }
-        if !self.set_mutable_registry_value_by_path(
+        };
+        let Some(install_language_changed) = self.ensure_mutable_registry_value_by_path(
             NLS_LANGUAGE,
             "InstallLanguage",
             REG_SZ,
             &system_locale[..system_locale_len],
-        ) {
+        ) else {
             print_str(
                 b"[locale-setup] HKLM\\...\\Nls\\Language\\InstallLanguage mutable write failed\n",
             );
             return;
-        }
-        self.mark_mutable_hives_dirty();
+        };
         DEFAULT_USER_LOCALE_BYTES.store(user_locale_len as u64, Ordering::Relaxed);
         DEFAULT_USER_LOCALE_TYPE.store(REG_SZ as u64, Ordering::Relaxed);
-        print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
+        if user_locale_changed || system_default_changed || install_language_changed {
+            print_str(b"[locale-setup] HKU\\.DEFAULT\\Control Panel\\International\\Locale <- ");
+        } else {
+            print_str(b"[locale-setup] locale registry values already present: ");
+        }
         for &byte in &locale_ascii {
             debug_put_char(if (0x20..0x7f).contains(&byte) {
                 byte
@@ -3385,6 +3450,7 @@ impl ExecNtHandler {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
         const KEY_READ: u32 = 0x0002_0019;
         NT_SAVE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -3423,7 +3489,22 @@ impl ExecNtHandler {
                 NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
                 return STATUS_NOT_IMPLEMENTED;
             }
-            owned_image = nt_hive_core::encode_image(hive);
+            owned_image = {
+                let _alloc_ctx =
+                    crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
+                match nt_hive_core::try_encode_image(hive) {
+                    Ok(image) => image,
+                    Err(err) => {
+                        print_str(b"[cm-save] mutable hive image encode failed err=");
+                        print_str(match err {
+                            nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
+                            nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
+                        });
+                        print_str(b"\n");
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                }
+            };
             owned_image.as_slice()
         } else {
             let (hive, cell) = match self.base_hive(key) {
@@ -3480,6 +3561,108 @@ impl ExecNtHandler {
         }
     }
 
+    fn ensure_user_default_mutable_mount_only(&mut self) {
+        if let Some(mount) = self
+            .hive_mounts
+            .iter_mut()
+            .find(|mount| mount.sel == HIVE_SEL_USER_DEFAULT)
+        {
+            mount.hive = None;
+            return;
+        }
+        let mount = hive_mount(HIVE_SEL_USER_DEFAULT);
+        self.hive_mounts.push(HiveMount {
+            sel: HIVE_SEL_USER_DEFAULT,
+            canon: nt_hive_core::canon_path(mount),
+            mount: alloc::string::String::from(mount),
+            file: alloc::string::String::from(crate::writable_fs::CONFIG_DEFAULT_HIVE_PATH),
+            hive: None,
+            slot: None,
+            dynamic: false,
+        });
+        self.hive_mounts_dirty = true;
+    }
+
+    fn refresh_boot_hive_checkpoint_from_path(&mut self, hive_sel: u32, file_path: &str) -> bool {
+        let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_if_mounted(file_path) }) else {
+            return false;
+        };
+        let mount_path = hive_mount(hive_sel);
+        if let Ok(hive) = nt_hive_core::decode_image(bytes) {
+            let root_subkeys = hive.subkey_count(hive.root()) as u64;
+            self.mutable_hives.mount(mount_path, hive_sel, hive);
+            self.mutable_hives.clear_hive_dirty(hive_sel);
+            if hive_sel == HIVE_SEL_USER_DEFAULT {
+                self.ensure_user_default_mutable_mount_only();
+            }
+            print_str(b"[cm-restore] boot hive checkpoint mounted ");
+            print_ascii_str(mount_path);
+            print_str(b" <- ");
+            print_ascii_str(file_path);
+            print_str(b" bytes=");
+            print_u64(bytes.len() as u64);
+            print_str(b" root-subkeys=");
+            print_u64(root_subkeys);
+            print_str(b" format=core\n");
+            return true;
+        }
+        if let Some(regf) = RegfHive::new(bytes) {
+            let root_subkeys = regf.subkeys(regf.root()).len() as u64;
+            mount_mutable_regf_hive(&mut self.mutable_hives, hive_sel, mount_path, &regf);
+            self.mutable_hives.clear_hive_dirty(hive_sel);
+            if hive_sel == HIVE_SEL_USER_DEFAULT {
+                self.ensure_user_default_mutable_mount_only();
+            }
+            print_str(b"[cm-restore] boot hive checkpoint mounted ");
+            print_ascii_str(mount_path);
+            print_str(b" <- ");
+            print_ascii_str(file_path);
+            print_str(b" bytes=");
+            print_u64(bytes.len() as u64);
+            print_str(b" root-subkeys=");
+            print_u64(root_subkeys);
+            print_str(b" format=regf\n");
+            return true;
+        }
+        print_str(b"[cm-restore] boot hive checkpoint rejected ");
+        print_ascii_str(file_path);
+        print_str(b" bytes=");
+        print_u64(bytes.len() as u64);
+        print_str(b"\n");
+        false
+    }
+
+    pub(crate) fn refresh_boot_hive_checkpoints_from_writable_config(&mut self) -> bool {
+        if self.boot_hive_checkpoints_refreshed {
+            return false;
+        }
+        self.boot_hive_checkpoints_refreshed = true;
+        let mut mounted = false;
+        for (hive_sel, file_path) in [
+            (HIVE_SEL_SYSTEM, crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH),
+            (
+                HIVE_SEL_SOFTWARE,
+                crate::writable_fs::CONFIG_SOFTWARE_HIVE_PATH,
+            ),
+            (
+                HIVE_SEL_SECURITY,
+                crate::writable_fs::CONFIG_SECURITY_HIVE_PATH,
+            ),
+            (HIVE_SEL_SAM, crate::writable_fs::CONFIG_SAM_HIVE_PATH),
+            (
+                HIVE_SEL_USER_DEFAULT,
+                crate::writable_fs::CONFIG_DEFAULT_HIVE_PATH,
+            ),
+        ] {
+            mounted |= self.refresh_boot_hive_checkpoint_from_path(hive_sel, file_path);
+        }
+        if mounted {
+            self.registry_services_order_cache_valid = false;
+            print_str(b"[cm-restore] boot hive checkpoints refreshed from writable config\n");
+        }
+        mounted
+    }
+
     fn checkpoint_boot_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         if dirty_cells == 0 {
@@ -3491,16 +3674,46 @@ impl ExecNtHandler {
         let Some(hive) = self.mutable_hives.hive(hive_sel) else {
             return STATUS_INVALID_HANDLE;
         };
-        let image = nt_hive_core::encode_image(hive);
-        let status = unsafe { crate::writable_fs::write_file_atomic(file_path, &image) };
+        print_str(b"[cm-flush] boot hive checkpoint begin dirty-cells=");
+        print_u64(dirty_cells as u64);
+        print_str(b" heap-headroom=");
+        print_u64(crate::allocator::remaining() as u64);
+        print_str(b" path=");
+        print_ascii_str(file_path);
+        print_str(b"\n");
+        let image = {
+            let _alloc_ctx =
+                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
+            match nt_hive_core::try_encode_image(hive) {
+                Ok(image) => image,
+                Err(err) => {
+                    REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[cm-flush] boot hive checkpoint encode failed err=");
+                    print_str(match err {
+                        nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
+                        nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
+                    });
+                    print_str(b" path=");
+                    print_ascii_str(file_path);
+                    print_str(b"\n");
+                    return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+        };
+        let image_len = image.len();
+        let status = {
+            let _alloc_ctx =
+                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_WRITABLE_ATOMIC_WRITE);
+            unsafe { crate::writable_fs::write_file_atomic_owned(file_path, image) }
+        };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-            REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
+            REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
             print_str(b"[cm-flush] boot hive checkpoint ");
-            print_u64(image.len() as u64);
+            print_u64(image_len as u64);
             print_str(b"B dirty-cells=");
             print_u64(dirty_cells as u64);
             print_str(b" path=");
@@ -3515,6 +3728,135 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         status
+    }
+
+    fn checkpoint_boot_mutable_hive_preserving_headroom(
+        &mut self,
+        hive_sel: u32,
+        dirty_cells: usize,
+        min_post_checkpoint_headroom: usize,
+    ) -> u32 {
+        const MIN_IMAGE_HINT: usize = 0x1_0000;
+        if dirty_cells == 0 {
+            return nt_fs::STATUS_SUCCESS;
+        }
+        let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+            return 0xC000_0008;
+        };
+        let image_len_hint = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
+        let required_headroom = image_len_hint
+            .max(MIN_IMAGE_HINT)
+            .saturating_add(min_post_checkpoint_headroom);
+        let headroom = crate::allocator::remaining();
+        if headroom < required_headroom {
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] boot hive checkpoint insufficient-headroom dirty-cells=");
+            print_u64(dirty_cells as u64);
+            print_str(b" heap-headroom=");
+            print_u64(headroom as u64);
+            print_str(b" required=");
+            print_u64(required_headroom as u64);
+            print_str(b" preserve=");
+            print_u64(min_post_checkpoint_headroom as u64);
+            print_str(b" path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+            return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+        }
+        self.checkpoint_boot_mutable_hive(hive_sel, dirty_cells)
+    }
+
+    pub(crate) fn checkpoint_dirty_boot_mutable_hives(&mut self) -> u32 {
+        let mut total_dirty = 0usize;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            total_dirty = total_dirty.saturating_add(dirty);
+            let status = self.checkpoint_boot_mutable_hive(hive_sel, dirty);
+            if status != nt_fs::STATUS_SUCCESS {
+                REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+                return status;
+            }
+        }
+        REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+        nt_fs::STATUS_SUCCESS
+    }
+
+    pub(crate) fn next_dirty_boot_mutable_hive_checkpoint_hint(
+        &self,
+        min_dirty_cells: usize,
+    ) -> Option<(usize, usize)> {
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            if dirty < min_dirty_cells {
+                continue;
+            }
+            let image_len = Self::boot_mutable_hive_checkpoint_path(hive_sel)
+                .map(|path| unsafe { crate::writable_fs::hive_image_len_at(path) })
+                .unwrap_or(0);
+            return Some((dirty, image_len));
+        }
+        None
+    }
+
+    pub(crate) fn checkpoint_next_dirty_boot_mutable_hive(&mut self, min_dirty_cells: usize) -> u32 {
+        let mut total_dirty = 0usize;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            total_dirty = total_dirty.saturating_add(dirty);
+            if dirty < min_dirty_cells {
+                continue;
+            }
+            let status = self.checkpoint_boot_mutable_hive(hive_sel, dirty);
+            REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+            return status;
+        }
+        REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+        nt_fs::STATUS_SUCCESS
+    }
+
+    pub(crate) fn boot_mutable_hive_dirty_cells(&self) -> usize {
+        let mut total_dirty = 0usize;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            total_dirty = total_dirty.saturating_add(
+                self.mutable_hives
+                    .hive(hive_sel)
+                    .map_or(0, |hive| hive.dirty_count()),
+            );
+        }
+        total_dirty
     }
 
     fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
@@ -3533,7 +3875,25 @@ impl ExecNtHandler {
         let Some(hive) = self.mutable_hives.hive(hive_sel) else {
             return STATUS_INVALID_HANDLE;
         };
-        let image = nt_hive_core::encode_image(hive);
+        let image = {
+            let _alloc_ctx =
+                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
+            match nt_hive_core::try_encode_image(hive) {
+                Ok(image) => image,
+                Err(err) => {
+                    REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[cm-flush] dynamic hive checkpoint encode failed err=");
+                    print_str(match err {
+                        nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
+                        nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
+                    });
+                    print_str(b" path=");
+                    print_ascii_str(&file_path);
+                    print_str(b"\n");
+                    return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+        };
         if image.len() > USER_HIVE_SLOT_BYTES {
             REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] dynamic hive checkpoint too large bytes=");
@@ -3543,15 +3903,20 @@ impl ExecNtHandler {
             print_str(b"\n");
             return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
         }
-        let status = unsafe { crate::writable_fs::write_file_atomic(&file_path, &image) };
+        let image_len = image.len();
+        let status = {
+            let _alloc_ctx =
+                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_WRITABLE_ATOMIC_WRITE);
+            unsafe { crate::writable_fs::write_file_atomic_owned(&file_path, image) }
+        };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
             self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-            REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
+            REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
             print_str(b"[cm-flush] dynamic hive checkpoint ");
-            print_u64(image.len() as u64);
+            print_u64(image_len as u64);
             print_str(b"B dirty-cells=");
             print_u64(dirty_cells as u64);
             print_str(b" path=");
@@ -3583,6 +3948,8 @@ impl ExecNtHandler {
         flags: u32,
         trust_class_key: u64,
     ) -> u32 {
+        let _load_alloc_ctx =
+            crate::allocator::enter_context(crate::allocator::ALLOC_CTX_NT_LOAD_KEY);
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -3694,16 +4061,33 @@ impl ExecNtHandler {
             }
         };
         USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
+        let hive_sel = HIVE_SEL_DYNAMIC[slot];
         if let Some(ref hive) = regf_hive {
-            mount_mutable_regf_hive(&mut self.mutable_hives, HIVE_SEL_DYNAMIC[slot], &full, hive);
+            let imported = {
+                let _import_alloc_ctx =
+                    crate::allocator::enter_context(crate::allocator::ALLOC_CTX_REGF_IMPORT);
+                nt_hive_regf::try_import_regf_into_hive(hive, hive_kind_for_selector(hive_sel))
+            };
+            let (hive, _stats) = match imported {
+                Ok(imported) => imported,
+                Err(nt_hive_regf::RegfHiveImportError::OutOfMemory) => {
+                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                    print_str(b"[cm-load] NtLoadKey: mutable import out of memory bytes=");
+                    print_u64(len as u64);
+                    print_str(b" target=");
+                    print_ascii_str(&full);
+                    print_str(b"\n");
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+            };
+            self.mutable_hives.mount(&full, hive_sel, hive);
         } else if let Some(hive) = core_hive {
-            self.mutable_hives
-                .mount(&full, HIVE_SEL_DYNAMIC[slot], hive);
+            self.mutable_hives.mount(&full, hive_sel, hive);
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
         self.mark_mutable_hives_dirty();
         self.hive_mounts.push(HiveMount {
-            sel: HIVE_SEL_DYNAMIC[slot],
+            sel: hive_sel,
             canon,
             mount: full,
             file: file_name,
@@ -4237,6 +4621,26 @@ impl ExecNtHandler {
             );
         }
         updated
+    }
+
+    fn ensure_mutable_registry_value_by_path(
+        &mut self,
+        full_path: &str,
+        name: &str,
+        ty: u32,
+        data: &[u8],
+    ) -> Option<bool> {
+        let key = self.mutable_registry_key_by_path(full_path)?;
+        let value_type = nt_hive_core::RegistryValueType::from_u32(ty)?;
+        if self
+            .mutable_hives
+            .query_value(key, name)
+            .is_some_and(|(existing_type, existing)| existing_type == value_type && existing == data)
+        {
+            return Some(false);
+        }
+        self.set_mutable_registry_value_by_path(full_path, name, ty, data)
+            .then_some(true)
     }
 
     fn registry_value_with<R>(
@@ -15551,6 +15955,8 @@ impl NativeSyscallHandler for ExecNtHandler {
         args: &[u64],
         out: &mut alloc::vec::Vec<u8>,
     ) -> u32 {
+        let service_name = ctx.service.name();
+        let _alloc_scope = crate::allocator::enter_scope(service_name.as_bytes());
         let winlogon_trace = trace_winlogon_post_lsa_native_enter(self, ctx, args);
         let status = self.handle_service(ctx, args, out);
         if let Some(trace_index) = winlogon_trace {
@@ -16199,7 +16605,10 @@ impl ExecNtHandler {
             None
         };
         if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
-            let load = demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen]);
+            let load = {
+                let _alloc_scope = crate::allocator::enter_scope(b"demand-load-dll");
+                demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen])
+            };
             match load {
                 Ok(slot) => {
                     dll_i = Some(slot);
@@ -17825,7 +18234,11 @@ impl ExecNtHandler {
                             return status;
                         }
                     } else {
-                        let status = self.checkpoint_boot_mutable_hive(mutable_key.hive, dirty);
+                        let status = self.checkpoint_boot_mutable_hive_preserving_headroom(
+                            mutable_key.hive,
+                            dirty,
+                            BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
+                        );
                         if status != nt_fs::STATUS_SUCCESS {
                             return status;
                         }
@@ -22879,11 +23292,13 @@ impl ExecNtHandler {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
                     }
 
-                    let mut routed_output = alloc::vec::Vec::new();
-                    if routed_output.try_reserve_exact(length).is_err() {
-                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                    }
-                    routed_output.resize(length, 0);
+                    let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
+                    let output_capacity = length.min(transport_capacity);
+                    let routed_output = core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(OVERLAY_WRITE_SCRATCH) as *mut u8,
+                        output_capacity,
+                    );
+                    routed_output.fill(0);
 
                     let mut information = 0u64;
                     let status = match self.npfs_route_raw_for(
@@ -22891,7 +23306,7 @@ impl ExecNtHandler {
                         major::IRP_MJ_QUERY_INFORMATION as u64,
                         class as u64,
                         &[],
-                        &mut routed_output,
+                        &mut *routed_output,
                     ) {
                         Ok((driver_status, completed, _)) => {
                             information = completed;
@@ -22900,7 +23315,9 @@ impl ExecNtHandler {
                         Err(route_status) => route_status,
                     };
 
-                    let copy_len = information.min(length as u64) as usize;
+                    let copy_len = information
+                        .min(length as u64)
+                        .min(routed_output.len() as u64) as usize;
                     if copy_len != 0 && !self.xas_try_write_buf(output, &routed_output[..copy_len])
                     {
                         return nt_syscall::STATUS_ACCESS_VIOLATION;
@@ -22925,6 +23342,8 @@ impl ExecNtHandler {
                         print_u64(class as u64);
                         print_str(b" length=");
                         print_u64(length as u64);
+                        print_str(b" transport=");
+                        print_u64(output_capacity as u64);
                         print_str(b" status=0x");
                         print_hex(status);
                         print_str(b" info=");

@@ -36,7 +36,8 @@ pub use path::{
 };
 pub use query::*;
 pub use snapshot_store::{
-    SnapshotBlockDevice, SnapshotBlockStore, SnapshotBlockStoreError, StoredSnapshot,
+    PayloadSectorReader, PayloadSectorWriter, SnapshotBlockDevice, SnapshotBlockStore,
+    SnapshotBlockStoreError, SnapshotPayloadReader, SnapshotPayloadSink, StoredSnapshot,
 };
 pub use status::*;
 

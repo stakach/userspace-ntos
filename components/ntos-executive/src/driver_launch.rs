@@ -117,6 +117,7 @@ const _: () = assert!(FSD_SHARED_VADDR + FSD_SHARED_FRAMES * 0x1000 <= FSD_ARG_V
 /// its own context; the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
 pub const FSD_ARG_VADDR: u64 = 0x0000_0100_0F3A_0000;
 pub const FSD_ARG_FRAMES: u64 = 4;
+const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 
 // --- PER-INSTANCE executive-side load/comm VAs (multi-driver de-singleton) --------------------
 //
@@ -10316,6 +10317,22 @@ fn external_len(len: usize) -> u32 {
     len.min(u32::MAX as usize) as u32
 }
 
+fn external_dispatch_buffer_lengths(
+    input_len: usize,
+    output_len: usize,
+) -> Result<(u32, u32, usize), u32> {
+    let transport_capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
+    if input_len > transport_capacity {
+        return Err(STATUS_INVALID_BUFFER_SIZE);
+    }
+    let output_len = output_len.min(transport_capacity);
+    Ok((
+        external_len(input_len),
+        external_len(output_len),
+        input_len.max(output_len),
+    ))
+}
+
 fn external_code(fsctl: u64) -> Option<u32> {
     if fsctl <= u32::MAX as u64 {
         Some(fsctl as u32)
@@ -10388,12 +10405,12 @@ fn dispatch_external_irp_to_driver_record_result(
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let input_len = external_len(in_data.len());
-    let output_len = external_len(out.len());
+    let (input_len, output_len, system_buffer_len) =
+        external_dispatch_buffer_lengths(in_data.len(), out.len())?;
     let params = external_irp_parameters(major, fsctl, input_len, output_len)
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
-    system_buffer.resize(in_data.len().max(out.len()), 0);
+    system_buffer.resize(system_buffer_len, 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
     let (status, information) = io_manager_mut()
         .build_and_dispatch_external_to_driver(
@@ -10424,12 +10441,12 @@ fn dispatch_external_irp_to_device_record_result(
     out: &mut [u8],
 ) -> Result<(i32, u64), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let input_len = external_len(in_data.len());
-    let output_len = external_len(out.len());
+    let (input_len, output_len, system_buffer_len) =
+        external_dispatch_buffer_lengths(in_data.len(), out.len())?;
     let params = external_irp_parameters(major, fsctl, input_len, output_len)
         .ok_or(STATUS_INVALID_PARAMETER as u32)?;
     let mut system_buffer = Vec::new();
-    system_buffer.resize(in_data.len().max(out.len()), 0);
+    system_buffer.resize(system_buffer_len, 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
     let (status, information) = io_manager_mut()
         .build_and_dispatch_external_to_device(

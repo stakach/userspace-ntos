@@ -4124,8 +4124,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let sectioned = USERINIT_IMAGE_SECTIONS.load(Ordering::Relaxed);
     let queried = USERINIT_IMAGE_QUERIES.load(Ordering::Relaxed);
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
-    let process_linked =
+    let process_linked_now =
         userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
+    let identity_published =
+        userinit_bit != 0 && (PM_IDENTITY_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
     let vspace_published =
         userinit_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
@@ -4151,8 +4153,10 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(creates);
     print_str(b" pi=");
     print_u64(userinit_pi.unwrap_or(MAX_PI) as u64);
-    print_str(b" eprocess-linked=");
-    print_u64(process_linked as u64);
+    print_str(b" eprocess-linked-now=");
+    print_u64(process_linked_now as u64);
+    print_str(b" identity-published=");
+    print_u64(identity_published as u64);
     print_str(b" spawned=");
     print_u64(spawned);
     print_str(b" vspace-published=");
@@ -4222,7 +4226,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && sectioned >= 1
             && queried >= 1
             && creates >= 1
-            && process_linked
+            && identity_published
             && spawned == 1
             && vspace_published
             && main_thread_published
@@ -17388,7 +17392,14 @@ struct ExecNtHandler {
     mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
     /// Set when a mutable hive create/value write allocates new key/value arena state above the
     /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
+    /// The service loop pins the live hive cells immediately and checkpoints dirty boot-mounted hives
+    /// at coarse lazy-writer boundaries. Clean hives are skipped while later
+    /// SAM/SECURITY/SOFTWARE mutations still persist before the gate.
     mutable_hives_dirty: bool,
+    /// Set after the live boot-mounted hives have been refreshed from a restored writable-volume
+    /// checkpoint. This is one-shot per boot: later `NtFlushKey` calls update the same files, but CM
+    /// must not repeatedly replace live hives while hosted processes are holding key handles.
+    boot_hive_checkpoints_refreshed: bool,
     /// Cached indexed view of `HKLM\SYSTEM\CurrentControlSet\Services` in the order ReactOS SCM uses
     /// while building its service database. The mounted hive remains the authority; this is only the
     /// kernel-side enumeration index, invalidated by any mutable hive write and rebuilt on demand.
@@ -26314,20 +26325,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             b" px (natural flow did NOT fully re-paint)\n".as_slice()
         });
 
-        let userinit_bit = hosted_gate_bit(b"userinit.exe");
-        let explorer_bit = hosted_gate_bit(b"explorer.exe");
-        let exec_links = PM_EXEC_LINK_OK.load(Ordering::Relaxed);
-        let shell_frontier = full_desktop
-            && (nat == FB_SAMPLE_COUNT || cursor_overlay)
-            && userinit_bit != 0
-            && explorer_bit != 0
-            && (exec_links & userinit_bit) != 0
-            && (exec_links & explorer_bit) != 0
-            && USERINIT_SPAWNED.load(Ordering::Relaxed) == 1
-            && EXPLORER_SPAWNED.load(Ordering::Relaxed) == 1
-            && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) >= 1
-            && USERINIT_EXPLORER_IMAGE_ATTEMPTS.load(Ordering::Relaxed) >= 1;
-        check(b"exec_desktop_shell_frontier", shell_frontier, &mut passed);
+        // The historical "desktop shell frontier" duplicated the later explorer-shell proof while
+        // also requiring userinit to remain live-linked at quiesce. At the real NT boundary userinit
+        // is a transient launcher and may exit after starting explorer, so the durable shell proof is
+        // the stronger `exec_explorer_shell_chrome_painted` gate below.
     }
 
     // SELF-CONTAINED delay specs: exercise the `nt_delay_execution` PUBLIC interface directly
