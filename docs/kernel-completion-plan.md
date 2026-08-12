@@ -4177,3 +4177,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   shell, or COM shortcuts; the next repair should make ntdll's activation-context ownership and
   temporary-query references behave like NT5/ReactOS and add a small proof counter for
   create/release/free progress if needed.
+
+  Current ntdll heap/actctx progress slice (2026-08-12): the `ntdll+0x32fa1` sample is in
+  activation-context object teardown, but the immediate generic cost center is the process heap.
+  `RtlFreeHeap` previously validated and linearly walked the complete physical block chain before
+  every free/size/realloc lookup. Activation-context destruction releases many nested `Vec`
+  allocations, so the destructor path could burn the forward-progress window without being an
+  Explorer or shell-specific failure. The retained heap change keeps whole-chain validation for
+  `RtlValidateHeap`, heap walking, compaction, debug snapshots, and tests, but recovers an exact
+  allocation header directly from the payload pointer for ordinary size/free/realloc and validates
+  the immediate boundary-tag neighbours before mutating/coalescing. Local validation is green:
+  `cargo test -p nt-ntdll heap -- --nocapture`, `cargo test -p nt-ntdll`, `cargo fmt --all`, and
+  `./scripts/build_ntdll_dll.sh`. Next serialized desktop proof should determine whether Explorer
+  now advances past the post-`NtUserProcessConnect` activation-context teardown into real
+  `NtUserCreateWindowEx`/shell chrome again; if not, add bounded generic actctx create/release/free
+  counters rather than any Explorer/provider/COM shortcut.

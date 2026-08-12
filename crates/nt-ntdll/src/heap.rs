@@ -15,7 +15,9 @@
 //! `BlockHeader` holds boundary sizes, live/free state, and the allocation's optional user metadata.
 //! `size`/`prev_size` are payload+header sizes in bytes; `prev_size == 0` marks the first block. Free
 //! blocks are found by a linear walk (first-fit) -- adequate and simple; a size-class free-list is a
-//! later optimisation, not correctness.
+//! later optimisation, not correctness. Free/size/realloc recover the target header directly from
+//! the payload pointer and verify the neighbouring boundary tags, so destructor-heavy callers do not
+//! pay a full heap walk for every released allocation.
 
 use core::mem::{align_of, size_of};
 
@@ -501,15 +503,77 @@ impl<B: Backing> Heap<B> {
         None
     }
 
-    fn find_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
-        self.find_physical_block(payload)
-            .filter(|(_, header)| !header.is_free())
+    fn direct_block_offset_for_payload(&self, payload: *const u8) -> Option<usize> {
+        if payload.is_null() || !self.formatted {
+            return None;
+        }
+        let relative = (payload as usize).checked_sub(self.backing.base() as usize)?;
+        if relative < HDR || relative >= self.region_len || relative % HEAP_ALIGN != 0 {
+            return None;
+        }
+        let offset = relative - HDR;
+        if offset % HEAP_ALIGN == 0 {
+            Some(offset)
+        } else {
+            None
+        }
+    }
+
+    fn validate_direct_header(
+        &self,
+        offset: usize,
+        expected_prev_size: Option<usize>,
+    ) -> Option<BlockHeader> {
+        let header = self.header_at_offset(offset)?;
+        if let Some(expected) = expected_prev_size {
+            self.validate_header(offset, expected, header)?;
+        } else {
+            self.validate_header(offset, header.prev_size, header)?;
+        }
+        Some(header)
+    }
+
+    fn direct_live_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
+        let offset = self.direct_block_offset_for_payload(payload)?;
+        let header = self.validate_direct_header(offset, None)?;
+        if header.is_free() {
+            return None;
+        }
+
+        if offset == 0 {
+            if header.prev_size != 0 {
+                return None;
+            }
+        } else {
+            if header.prev_size == 0 || header.prev_size > offset {
+                return None;
+            }
+            let previous_offset = offset - header.prev_size;
+            let previous = self.validate_direct_header(previous_offset, None)?;
+            if previous.size != header.prev_size {
+                return None;
+            }
+        }
+
+        Some((offset, header))
+    }
+
+    fn direct_live_block_with_successor(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
+        let (offset, header) = self.direct_live_block(payload)?;
+        let next_offset = offset.checked_add(header.size)?;
+        if next_offset < self.region_len {
+            self.validate_direct_header(next_offset, Some(header.size))?;
+        } else if next_offset != self.region_len {
+            return None;
+        }
+
+        Some((offset, header))
     }
 
     /// Validate either the complete physical block chain or one exact live allocation.
     pub fn validate(&self, payload: Option<*const u8>) -> bool {
         if let Some(payload) = payload {
-            return self.find_block(payload).is_some();
+            return self.direct_live_block(payload).is_some();
         }
         let mut offset = 0usize;
         let mut previous_size = 0usize;
@@ -843,17 +907,14 @@ impl<B: Backing> Heap<B> {
     /// `payload` must be a pointer previously returned by [`Self::allocate`]/[`Self::reallocate`] on
     /// this heap, or null. (The real ntdll `RtlSizeHeap` trusts the caller's pointer identically.)
     pub unsafe fn size_of(&self, payload: *mut u8) -> Option<usize> {
-        let (_, header) = self.find_block(payload)?;
+        let (_, header) = self.direct_live_block(payload)?;
         Some(header.size - HDR - header.unused_bytes as usize)
     }
 
     /// Validate + recover the block header for a payload pointer.
     fn block_of(&self, payload: *mut u8) -> Option<*mut u8> {
-        if payload.is_null() || !self.validate(None) {
-            return None;
-        }
-        let (offset, _) = self.find_block(payload)?;
-        // SAFETY: find_block proved this offset names a complete live block in the backing.
+        let (offset, _) = self.direct_live_block(payload)?;
+        // SAFETY: direct_live_block proved this offset names a complete live block in the backing.
         Some(unsafe { self.backing.base().add(offset) })
     }
 
@@ -910,9 +971,10 @@ impl<B: Backing> Heap<B> {
     /// `payload` must be a pointer previously returned by [`Self::allocate`]/[`Self::reallocate`] on
     /// this heap, or null (matching the real `RtlFreeHeap` contract).
     pub unsafe fn free(&mut self, payload: *mut u8) -> bool {
-        let Some(block) = self.block_of(payload) else {
+        let Some((offset, _)) = self.direct_live_block_with_successor(payload) else {
             return false;
         };
+        let block = self.backing.base().add(offset);
         let header = &mut *self.hdr(block);
         header.state = BLOCK_FREE;
         header.user_value = 0;
@@ -987,7 +1049,8 @@ impl<B: Backing> Heap<B> {
     ) -> Option<*mut u8> {
         let old_size = self.size_of(payload)?;
         let need = checked_block_size(new_size)?;
-        let block = self.block_of(payload)?;
+        let (offset, _) = self.direct_live_block_with_successor(payload)?;
+        let block = self.backing.base().add(offset);
 
         let cur_total = (*self.hdr(block)).size;
         // Shrink, same-size, or logical growth within existing alignment padding.
