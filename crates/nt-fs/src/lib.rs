@@ -23,7 +23,10 @@ mod status;
 pub use directory::*;
 pub use fat_directory::*;
 pub use file_backing::FileBacking;
-pub use fs::{CreateResult, FileSystem, MemFs, StandardInformation, INVALID_HANDLE};
+pub use fs::{
+    CreateResult, FileSystem, MemFs, MemFsSnapshotError, MemFsSnapshotInfo, StandardInformation,
+    INVALID_HANDLE,
+};
 pub use hive_provider::NtFileHiveIoProvider;
 pub use path::{
     is_named_pipe_path, is_under_prefix, normalize_separators, nt_path_to_volume_relative,

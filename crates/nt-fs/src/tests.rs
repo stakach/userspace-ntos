@@ -569,6 +569,179 @@ fn hive_persists_through_file_apis() {
 }
 
 #[test]
+fn memfs_snapshot_round_trips_volume_tree_sparse_data_and_attributes() {
+    let mut fs = FileSystem::new(MemFs::new());
+
+    let profiles = fs.zw_create_file(
+        r"\??\C:\Profiles",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(profiles.status, STATUS_SUCCESS);
+    assert_eq!(profiles.information, FILE_CREATED);
+    fs.zw_close(profiles.handle);
+
+    let user = fs.zw_create_file(
+        r"\??\C:\Profiles\Administrator",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(user.status, STATUS_SUCCESS);
+    fs.zw_close(user.handle);
+
+    let ntuser = fs.zw_create_file(
+        r"\??\C:\Profiles\Administrator\ntuser.dat",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_HIDDEN,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(ntuser.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(ntuser.handle, None, b"checkpointed hive")
+            .0,
+        STATUS_SUCCESS
+    );
+
+    for dir in [
+        r"\??\C:\ReactOS",
+        r"\??\C:\ReactOS\System32",
+        r"\??\C:\ReactOS\System32\Config",
+    ] {
+        let r = fs.zw_create_file(dir, FILE_READ_DATA, 0, 0, FILE_OPEN_IF, FILE_DIRECTORY_FILE);
+        assert_eq!(r.status, STATUS_SUCCESS);
+        fs.zw_close(r.handle);
+    }
+    let event_log = fs.zw_create_file(
+        r"\??\C:\ReactOS\System32\Config\AppEvent.Evt",
+        FILE_READ_DATA | FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(event_log.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            event_log.handle,
+            FILE_END_OF_FILE_INFORMATION,
+            &0x20_000u64.to_le_bytes(),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_write_file(event_log.handle, Some(0x1000), b"evt").0,
+        STATUS_SUCCESS
+    );
+
+    let stale = fs.zw_create_file(
+        r"\??\C:\Profiles\Administrator\delete-me.tmp",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,
+    );
+    assert_eq!(stale.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_close(stale.handle), STATUS_SUCCESS);
+
+    let snapshot = fs.export_volume_snapshot().unwrap();
+    let info = MemFs::snapshot_info(&snapshot).unwrap();
+    assert!(info.record_count >= 7);
+
+    let mut rebooted = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+    assert_eq!(
+        rebooted.zw_read_file(ntuser.handle, Some(0), 1).0,
+        STATUS_INVALID_HANDLE
+    );
+    let ntuser_info = rebooted
+        .query_attributes(r"\??\C:\Profiles\Administrator\ntuser.dat")
+        .unwrap();
+    assert_eq!(ntuser_info.end_of_file, b"checkpointed hive".len() as u64);
+    assert_eq!(
+        ntuser_info.attributes & FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_HIDDEN
+    );
+    assert!(rebooted
+        .query_attributes(r"\??\C:\Profiles\Administrator\delete-me.tmp")
+        .is_none());
+
+    let ntuser2 = rebooted.zw_create_file(
+        r"\??\C:\Profiles\Administrator\ntuser.dat",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(ntuser2.status, STATUS_SUCCESS);
+    assert_eq!(
+        rebooted.zw_read_file(ntuser2.handle, Some(0), 64).1,
+        b"checkpointed hive"
+    );
+
+    let event2 = rebooted.zw_create_file(
+        r"\??\C:\ReactOS\System32\Config\AppEvent.Evt",
+        FILE_READ_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(event2.status, STATUS_SUCCESS);
+    let (status, bytes) = rebooted.zw_read_file(event2.handle, Some(0x0ffe), 6);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(bytes, &[0, 0, b'e', b'v', b't', 0]);
+    assert_eq!(
+        rebooted
+            .query_attributes(r"\??\C:\ReactOS\System32\Config\AppEvent.Evt")
+            .unwrap()
+            .end_of_file,
+        0x20_000
+    );
+}
+
+#[test]
+fn memfs_snapshot_rejects_corrupt_or_malformed_images() {
+    let fs = FileSystem::new(MemFs::with_fixture());
+    let snapshot = fs.export_volume_snapshot().unwrap();
+
+    let mut bad_magic = snapshot.clone();
+    bad_magic[0] ^= 0x55;
+    assert!(matches!(
+        MemFs::from_snapshot(&bad_magic),
+        Err(MemFsSnapshotError::BadMagic)
+    ));
+
+    let mut bad_payload = snapshot.clone();
+    let last = bad_payload.len() - 1;
+    bad_payload[last] ^= 0x55;
+    assert!(matches!(
+        MemFs::from_snapshot(&bad_payload),
+        Err(MemFsSnapshotError::BadChecksum)
+    ));
+
+    assert!(matches!(
+        MemFs::from_snapshot(&snapshot[..snapshot.len() - 1]),
+        Err(MemFsSnapshotError::Truncated)
+    ));
+
+    let mut extra = snapshot.clone();
+    extra.push(0);
+    assert!(matches!(
+        MemFs::from_snapshot(&extra),
+        Err(MemFsSnapshotError::InvalidRecord)
+    ));
+}
+
+#[test]
 fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
     let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
     let mut provider = NtFileHiveIoProvider::open(&fs, SYSTEM_HIVE);

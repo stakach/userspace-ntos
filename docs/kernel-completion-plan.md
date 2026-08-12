@@ -1003,8 +1003,10 @@ before unrelated executive traffic monopolises the receive loop.
   `NtUnloadKey`. Boot-mounted mutable hives now checkpoint their live `nt-hive-core` image into
   `system32\config` on `NtFlushKey`; source boot hive files stay read-through FAT entries until a
   flush creates a writable-layer replacement. The heap-neutral read-through/checkpoint path has a
-  clean serialized desktop proof; remaining D3 work is explicit repeat-boot persistence proof across
-  system hive, profile hive, and writable overlay state.
+  clean serialized desktop proof. `nt-fs::MemFs` now also has a versioned, checksummed volume
+  snapshot/restore primitive that preserves sparse files without expanding zero ranges; remaining D3
+  work is binding that image to real storage and proving repeat-boot reuse across system hive,
+  profile hive, and writable overlay state.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
 
@@ -4277,3 +4279,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: D3's remaining work is now a
   repeat-boot persistence proof that reuses the written SYSTEM/profile/overlay state, not another
   first-boot desktop paint proof.
+
+  D3 writable-volume snapshot primitive (2026-08-12): `nt-fs::MemFs` can now export and restore a
+  versioned, CRC-32C checked snapshot of the durable volume tree. The format records directories and
+  files in parent-before-child order, preserves attributes and directory enumeration order, and stores
+  files as zero/data extents so sparse EventLog-style files do not get expanded just because the
+  volume is persisted. The `FileSystem` facade exposes this as `export_volume_snapshot` and
+  `from_volume_snapshot`; restored file systems get a fresh handle table and normal mounts, so
+  FILE_OBJECT state remains per boot. Host tests cover round-tripping profile/config paths, hidden
+  `ntuser.dat`, sparse `AppEvent.Evt` bytes, delete-on-close absence, transient-handle rejection
+  after restore, and bad magic/checksum/truncation/extra-tail rejection. Validation:
+  `cargo fmt --all` and `cargo test -p nt-fs`. Review adjustment: the next D3 slice should mount the
+  executive writable overlay from a persisted snapshot source when present and checkpoint it through
+  a real storage write path; do not claim reboot persistence from the in-memory snapshot alone.
