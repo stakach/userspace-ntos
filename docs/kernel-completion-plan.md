@@ -37,17 +37,15 @@ callback probes; any run that still emits those tags is using a stale binary or 
 The callback/transport gates now assert live invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-12):
-`.tmp/run-desktop-heap-direct-20260812.log` reaches the harness sentinel with `295/295`
-executive-to-isolated-service checks passing. It rebuilds and stages the current ntdll, reaches real
-credential paint and LSA validation, spawns userinit and Explorer through the dynamic process path,
-and paints real Explorer shell chrome. The final Explorer gates pass: process spawn, create-window
-string capture, registered shell messages, redirected user callbacks, client WndProc install, shell
-COM class service, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports the full
-1024x768 framebuffer as non-background with at least 32 distinct non-background colors, while the
-pool gate remains green (`ut-free=82298KiB`, `slot-free=70980`, `image-bank-fails=0`,
-`wc-pred-err=0`). The same run parks one later dynamic process on a generic `vmf-out` after shell
-proof is already established and with no active callback; keep that as a generic image/view/process
-diagnostic if it reproduces, not as the current shell-chrome frontier.
+`.tmp/run-desktop-boot-hive-checkpoint-refresh-20260812.log` reaches the harness sentinel with
+`295/295` executive-to-isolated-service checks passing. It rebuilds and stages the current ntdll,
+reaches real credential paint and LSA validation, checkpoints dirty boot/profile hives through the
+writable overlay, spawns userinit and Explorer through the dynamic process path, and paints real
+Explorer shell chrome. The final Explorer gates pass: process spawn, create-window string capture,
+registered shell messages, redirected user callbacks, client WndProc install, shell COM class
+service, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports the full 1024x768
+framebuffer as non-background with at least 32 distinct non-background colors, while the pool gate
+remains green (`ut-free=60847KiB`, `image-bank-fails=0`, `vm-fail ... 0`, `asid-fails=0`).
 
 Current generic-section handle-lifetime slice (2026-08-12): the parked post-proof process exposed a
 real handle side-table lifetime bug, not a shell or callback problem. `rundll32.exe` created and
@@ -1002,7 +1000,11 @@ before unrelated executive traffic monopolises the receive loop.
 - `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
-  `NtUnloadKey`; remaining D3 work is system/boot hive backing plus explicit reboot proofs.
+  `NtUnloadKey`. Boot-mounted mutable hives now checkpoint their live `nt-hive-core` image into
+  `system32\config` on `NtFlushKey`; source boot hive files stay read-through FAT entries until a
+  flush creates a writable-layer replacement. The heap-neutral read-through/checkpoint path has a
+  clean serialized desktop proof; remaining D3 work is explicit repeat-boot persistence proof across
+  system hive, profile hive, and writable overlay state.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
 
@@ -3246,10 +3248,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
 - D3 writable system-config subtree slice. The writable filesystem can now mount
   `reactos\system32\config` through the same prefix mechanism as profiles, provision staged
-  installed config files by folded volume-relative paths, and handle EventLog-style sparse file
-  growth without materializing multi-megabyte zero buffers. The executive copies the staged
-  `system32\config` tree into the writable volume on mount and records real SYSTEM/SOFTWARE hive
-  content checks. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
+  installed non-hive config files by folded volume-relative paths, and handle EventLog-style sparse
+  file growth without materializing multi-megabyte zero buffers. Boot hive source files are validated
+  from FAT with the fixed staging buffer, then deferred until Configuration Manager writes a live
+  mutable checkpoint into the writable layer. Validation: `cargo fmt --all`, `cargo test -p nt-fs`,
+  and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
   Boot attempts in `.tmp/boot-kbd-layout-common-registry-*.log` were not accepted as proof because
   competing Codex-owned QEMU lanes were holding or killing the disk image. Review adjustment: the
@@ -4247,3 +4250,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   shell COM classes, and paints shell chrome with the full framebuffer non-background. The run reaches
   `295/295` gates, so no actctx-specific counters are needed unless a fresh current-tree run
   reproduces a teardown stall.
+
+  Current D3 boot-hive checkpoint slice (2026-08-12): `NtSaveKey` and `NtFlushKey` no longer save
+  borrowed boot-media bytes for mutable hive roots. Root saves serialize the live `nt-hive-core`
+  image, and dirty boot-mounted hives checkpoint to their canonical writable config paths
+  (`SYSTEM`, `SOFTWARE`, `SECURITY`, `SAM`, `.DEFAULT`) through the same atomic writable-overlay
+  replace path as dynamic profile hives. The first serialized desktop run
+  `.tmp/run-desktop-boot-hive-checkpoint-20260812.log` proved the new gate data
+  (`NtFlushKey calls=4`, `mutable=3`, `boot-checkpoints=2`, `boot-checkpoint-bytes=364436`,
+  `boot-checkpoint-failures=0`) and passed `exec_reg_flush_key_serviced`, but then hit the executive
+  bump allocator before final shell gates because the overlay had also materialised the five raw
+  `system32\config` hive files (`835584` bytes) before replacing `SYSTEM`. The retained follow-up
+  fixes the storage boundary instead of weakening the proof: config hives stay read-through FAT
+  source files until flushed, `FILE_OPEN`/attribute misses below writable prefixes fall through to
+  FAT when no writable-layer entry exists, and source hive proofs validate directly from FAT with the
+  fixed staging buffer. The accepted retry
+  `.tmp/run-desktop-boot-hive-checkpoint-refresh-20260812.log` reaches the harness sentinel with
+  `295/295` gates. It records `deferred-boot-hives=5`, two SYSTEM checkpoints
+  (`boot-checkpoints=2`, `boot-checkpoint-bytes=364436`, `boot-checkpoint-failures=0`), a dynamic
+  profile-hive checkpoint (`130716B`), `exec_reg_flush_key_serviced`, `exec_eprocess_linked_mechanism`,
+  and real Explorer shell chrome all green. Final pool state remains healthy (`ut-fails=0`,
+  `image-bank-fails=0`, `vm-fail ... 0`, `asid-fails=0`), and `[explorer-fb]` reports the full
+  framebuffer as non-background with at least 32 colors. Local validation is green:
+  `cargo fmt --all`, `cargo test -p nt-hive-core`, `cargo test -p nt-fs`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: D3's remaining work is now a
+  repeat-boot persistence proof that reuses the written SYSTEM/profile/overlay state, not another
+  first-boot desktop paint proof.

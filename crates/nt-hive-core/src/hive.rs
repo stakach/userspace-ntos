@@ -919,6 +919,15 @@ impl MutableHiveSet {
             .map(|(_, hive)| hive)
     }
 
+    /// Mark one mounted hive's current contents as checkpointed.
+    pub fn clear_hive_dirty(&mut self, hive_id: HiveId) -> bool {
+        let Some(hive) = self.hive_mut(hive_id) else {
+            return false;
+        };
+        hive.clear_dirty();
+        true
+    }
+
     pub fn resolve_key(&self, full_path: &str) -> Option<ResolvedHiveKey> {
         let (hive_id, rel_path) = self.mounts.resolve(full_path)?;
         let hive = self.hive(hive_id)?;

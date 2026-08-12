@@ -7858,6 +7858,7 @@ pub(crate) unsafe fn service_sec_image(
                                 process_index as u32,
                             );
                         }
+                        nt_handler.refresh_process_manager_gates();
                         if drop_reply && reply_dropped && current_deleted {
                             PM_TERMINATE_PROCESS_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                             if process_index < 64 {

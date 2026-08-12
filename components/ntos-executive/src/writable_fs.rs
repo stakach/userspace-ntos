@@ -38,10 +38,11 @@ use crate::*;
 /// `profiles` is `%SystemDrive%\Profiles`, the `ProfilesDirectory` the real SOFTWARE hive names and
 /// the tree winlogon's `LoadUserProfileW` -> `CreateUserProfileW` builds.
 ///
-/// `reactos\system32\config` is the installed-system state directory. The staged hives are copied
-/// into the writable volume at mount, then ordinary services can create their own state files there
-/// through `NtCreateFile` rather than hitting the read-only FAT reader. EventLog's
-/// `AppEvent.Evt`/`SecEvent.Evt`/`SysEvent.Evt` files are the first real users.
+/// `reactos\system32\config` is the installed-system state directory. Ordinary services can create
+/// their own state files there through `NtCreateFile` rather than hitting the read-only FAT reader.
+/// Boot hive source files stay on the FAT volume until the Configuration Manager flushes a live
+/// mutable hive checkpoint into the writable layer. EventLog's `AppEvent.Evt`/`SecEvent.Evt`/
+/// `SysEvent.Evt` files are the first real users.
 pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles", b"reactos\\system32\\config"];
 
 /// ★ BYPASS SWITCH (the batch's control experiment). `false` unmounts the writable volume: every
@@ -252,6 +253,14 @@ pub(crate) const STAGED_CONFIG_DIR: &[u8] = br"reactos\system32\config";
 pub(crate) const CONFIG_VOLUME_ROOT_RELATIVE: &[u8] = b"reactos\\system32\\config";
 pub(crate) const CONFIG_SYSTEM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\system";
 pub(crate) const CONFIG_SOFTWARE_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\software";
+pub(crate) const CONFIG_SECURITY_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\security";
+pub(crate) const CONFIG_SAM_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\sam";
+pub(crate) const CONFIG_DEFAULT_HIVE_RELATIVE: &[u8] = b"reactos\\system32\\config\\default";
+pub(crate) const CONFIG_SYSTEM_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SYSTEM";
+pub(crate) const CONFIG_SOFTWARE_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SOFTWARE";
+pub(crate) const CONFIG_SECURITY_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SECURITY";
+pub(crate) const CONFIG_SAM_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\SAM";
+pub(crate) const CONFIG_DEFAULT_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\DEFAULT";
 /// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
 /// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
 pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
@@ -892,6 +901,19 @@ struct StagedTreeStats {
     files: u64,
     bytes: u64,
     skipped_large_files: u64,
+    deferred_boot_hives: u64,
+}
+
+fn is_deferred_boot_hive_source(relative: &[u8]) -> bool {
+    [
+        CONFIG_SYSTEM_HIVE_RELATIVE,
+        CONFIG_SOFTWARE_HIVE_RELATIVE,
+        CONFIG_SECURITY_HIVE_RELATIVE,
+        CONFIG_SAM_HIVE_RELATIVE,
+        CONFIG_DEFAULT_HIVE_RELATIVE,
+    ]
+    .iter()
+    .any(|candidate| relative.eq_ignore_ascii_case(candidate))
 }
 
 unsafe fn provision_staged_tree(
@@ -939,6 +961,8 @@ unsafe fn provision_staged_tree(
                         stack.push((child, path, depth + 1));
                     }
                 }
+            } else if is_deferred_boot_hive_source(&path) {
+                stats.deferred_boot_hives += 1;
             } else if size as usize <= MAX_STAGED_FILE {
                 let data = core::slice::from_raw_parts_mut(
                     core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
@@ -959,6 +983,25 @@ unsafe fn provision_staged_tree(
         }
     }
     stats
+}
+
+unsafe fn staged_config_hive_ok(fat: &Fat32, root_cluster: u32, leaf: &[u8]) -> bool {
+    let Some((cluster, size, attr)) = crate::fs_loader::dir_find_lfn(fat, root_cluster, leaf) else {
+        return false;
+    };
+    if attr & 0x10 != 0 || size as usize > MAX_STAGED_FILE {
+        return false;
+    }
+    let data = core::slice::from_raw_parts_mut(
+        core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
+        size as usize,
+    );
+    let got = if size == 0 {
+        0
+    } else {
+        crate::fs_loader::fat_read_file(fat, cluster, size, data.as_mut_ptr() as u64)
+    };
+    got == size && hive_image_ok(data)
 }
 
 unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
@@ -1045,12 +1088,8 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
     CONFIG_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
     CONFIG_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
     CONFIG_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
-    let system_hive_ok = fs
-        .file_bytes_relative(CONFIG_SYSTEM_HIVE_RELATIVE)
-        .is_some_and(hive_image_ok);
-    let software_hive_ok = fs
-        .file_bytes_relative(CONFIG_SOFTWARE_HIVE_RELATIVE)
-        .is_some_and(hive_image_ok);
+    let system_hive_ok = staged_config_hive_ok(&fat, root_cluster, b"system");
+    let software_hive_ok = staged_config_hive_ok(&fat, root_cluster, b"software");
     CONFIG_SOURCE_SYSTEM_HIVE_OK.store(system_hive_ok as u64, Ordering::Relaxed);
     CONFIG_SOURCE_SOFTWARE_HIVE_OK.store(software_hive_ok as u64, Ordering::Relaxed);
     print_str(
@@ -1063,6 +1102,8 @@ unsafe fn provision_staged_config(fs: &mut nt_fs::FileSystem) {
     print_u64(stats.bytes);
     print_str(b" skipped-large=");
     print_u64(stats.skipped_large_files);
+    print_str(b" deferred-boot-hives=");
+    print_u64(stats.deferred_boot_hives);
     print_str(b" system-hive-ok=");
     print_u64(system_hive_ok as u64);
     print_str(b" software-hive-ok=");

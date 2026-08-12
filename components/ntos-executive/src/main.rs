@@ -3964,8 +3964,10 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
 ///  2. **The live counters** — real directories created, bytes written and read back by REAL
 ///     hosted-process syscalls during the boot.
 ///
-/// Read-only `\reactos\…` is untouched: it is outside every writable prefix, so it still resolves
-/// through the FAT reader that carries the entire boot.
+/// Installed files remain visible below the writable namespace too: the overlay wins once a file is
+/// created or modified, while unmodified `FILE_OPEN` and attribute probes read through to the FAT
+/// source. Boot hive source files use that path until Configuration Manager flushes live mutable
+/// checkpoints into `system32\config`.
 ///
 /// **NOT PERSISTENT.** The backing is RAM: everything written is gone at the next boot. That is a
 /// deliberate staging step — persistent FAT32 write-through is a separate, tracked milestone, and
@@ -5945,6 +5947,9 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let volatile_flushes = REG_FLUSH_KEY_VOLATILE.load(Ordering::Relaxed);
     let mutable_flushes = REG_FLUSH_KEY_MUTABLE.load(Ordering::Relaxed);
     let mutable_dirty_cells = REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.load(Ordering::Relaxed);
+    let boot_checkpoints = REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.load(Ordering::Relaxed);
+    let boot_checkpoint_bytes = REG_FLUSH_KEY_BOOT_HIVE_BYTES.load(Ordering::Relaxed);
+    let boot_checkpoint_failures = REG_FLUSH_KEY_BOOT_HIVE_FAILURES.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
     print_str(b"[lsa-rpc] NtFlushKey calls=");
@@ -5955,6 +5960,12 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_u64(mutable_flushes);
     print_str(b" mutable-dirty-cells=");
     print_u64(mutable_dirty_cells);
+    print_str(b" boot-checkpoints=");
+    print_u64(boot_checkpoints);
+    print_str(b" boot-checkpoint-bytes=");
+    print_u64(boot_checkpoint_bytes);
+    print_str(b" boot-checkpoint-failures=");
+    print_u64(boot_checkpoint_failures);
     print_str(b" ActiveComputerName-created=");
     print_u64(active_name);
     print_str(b" RPCRT4_new_client-reached=");
@@ -5971,15 +5982,21 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     //     the live NT service table at the `sysfuncs.lst`-derived SSN 83 with its one-argument
     //     contract, it was actually CALLED on this boot, and every call resolved a real key handle
     //     through `resolve_registry_key` (a bad handle would have returned the real error instead).
-    //     At least one call was on a key that lives in a mounted mutable hive: the
-    //     ActiveComputerName path is now a real SYSTEM-hive write, not a registry-overlay shadow.
+    //     At least one call was on a key that lives in a mounted mutable hive, and that dirty boot
+    //     hive was checkpointed into the writable config tree: the ActiveComputerName path is now a
+    //     real SYSTEM-hive write, not a registry-overlay shadow or borrowed boot-media save.
     //     Volatile overlay flushes remain reported separately for the D4 volatile-hive cleanup. The
     //     counters CANNOT move if the SSN is unserviced: the caller parks instead.
     let table_ok = nt_syscall_abi::ssn_of("NtFlushKey") == Some(83)
         && nt_syscall_abi::exact_argc_of("NtFlushKey") == Some(1);
     check(
         b"exec_reg_flush_key_serviced",
-        table_ok && flushes >= 1 && mutable_flushes >= 1,
+        table_ok
+            && flushes >= 1
+            && mutable_flushes >= 1
+            && boot_checkpoints >= 1
+            && boot_checkpoint_bytes > 0
+            && boot_checkpoint_failures == 0,
         passed,
     );
     // (2) lsass' `\pipe\lsarpc` rpcrt4 SERVER thread crossed the WHOLE handoff and reached
@@ -17010,9 +17027,15 @@ pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64:
 pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Failed attempts to checkpoint a dynamic profile hive during `NtFlushKey`.
 pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Boot-mounted hive checkpoints written by `NtFlushKey` to the writable config tree.
+pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+/// Bytes in the most recent boot-mounted hive checkpoint image.
+pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Failed attempts to checkpoint a boot-mounted hive during `NtFlushKey`.
+pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
-/// writable overlay FILE_OBJECT. Dynamic profile roots use the live mutable image; boot roots still
-/// use their borrowed `regf` backing until D3 adds a checkpoint provider.
+/// writable overlay FILE_OBJECT. Mutable hive roots use the live `nt-hive-core` image so saved state
+/// reflects the Configuration Manager write authority rather than borrowed boot media.
 pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_ROOT_SAVED: AtomicU64 = AtomicU64::new(0);

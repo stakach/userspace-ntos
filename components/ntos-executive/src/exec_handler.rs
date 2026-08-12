@@ -3420,18 +3420,8 @@ impl ExecNtHandler {
                 NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
                 return STATUS_NOT_IMPLEMENTED;
             }
-            if is_dynamic_hive_selector(mutable_key.hive) {
-                owned_image = nt_hive_core::encode_image(hive);
-                owned_image.as_slice()
-            } else {
-                // Boot hives still have borrowed `regf` backing until D3 gives them a real
-                // checkpoint provider. Do not imply reboot persistence by serializing those large
-                // imported mirrors here.
-                let Some(hive) = self.borrowed_regf_hive_for_selector(mutable_key.hive) else {
-                    return STATUS_INVALID_HANDLE;
-                };
-                hive.bytes()
-            }
+            owned_image = nt_hive_core::encode_image(hive);
+            owned_image.as_slice()
         } else {
             let (hive, cell) = match self.base_hive(key) {
                 Some(hive) => hive,
@@ -3475,6 +3465,53 @@ impl ExecNtHandler {
         status
     }
 
+    fn boot_mutable_hive_checkpoint_path(hive_sel: u32) -> Option<&'static str> {
+        match hive_sel {
+            HIVE_SEL_SYSTEM => Some(crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH),
+            HIVE_SEL_SOFTWARE => Some(crate::writable_fs::CONFIG_SOFTWARE_HIVE_PATH),
+            HIVE_SEL_SECURITY => Some(crate::writable_fs::CONFIG_SECURITY_HIVE_PATH),
+            HIVE_SEL_SAM => Some(crate::writable_fs::CONFIG_SAM_HIVE_PATH),
+            HIVE_SEL_USER_DEFAULT => Some(crate::writable_fs::CONFIG_DEFAULT_HIVE_PATH),
+            _ => None,
+        }
+    }
+
+    fn checkpoint_boot_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if dirty_cells == 0 {
+            return nt_fs::STATUS_SUCCESS;
+        }
+        let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let image = nt_hive_core::encode_image(hive);
+        let status = unsafe { crate::writable_fs::write_file_atomic(file_path, &image) };
+        if status == nt_fs::STATUS_SUCCESS {
+            self.writable_fs_dirty = true;
+            self.mutable_hives.clear_hive_dirty(hive_sel);
+            REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+            REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
+            print_str(b"[cm-flush] boot hive checkpoint ");
+            print_u64(image.len() as u64);
+            print_str(b"B dirty-cells=");
+            print_u64(dirty_cells as u64);
+            print_str(b" path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+        } else {
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] boot hive checkpoint failed status=0x");
+            print_hex(status);
+            print_str(b" path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+        }
+        status
+    }
+
     fn checkpoint_dynamic_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         if dirty_cells == 0 {
@@ -3504,6 +3541,7 @@ impl ExecNtHandler {
         let status = unsafe { crate::writable_fs::write_file_atomic(&file_path, &image) };
         if status == nt_fs::STATUS_SUCCESS {
             self.writable_fs_dirty = true;
+            self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image.len() as u64, Ordering::Relaxed);
             print_str(b"[cm-flush] dynamic hive checkpoint ");
@@ -6072,7 +6110,7 @@ impl ExecNtHandler {
         self.current_thread_has_role(HostedThreadRole::Main)
     }
 
-    fn refresh_process_manager_gates(&self) {
+    pub(crate) fn refresh_process_manager_gates(&self) {
         let mut process_count = 0u64;
         let mut identity_ok = 0u64;
         let mut running_process_mask = 0u64;
@@ -6512,6 +6550,10 @@ impl ExecNtHandler {
                 attributes & 0x10 != 0
             })
         }
+    }
+
+    fn overlay_open_missed(status: u32) -> bool {
+        status == nt_fs::STATUS_OBJECT_NAME_NOT_FOUND || status == nt_fs::STATUS_OBJECT_PATH_NOT_FOUND
     }
 
     fn volume_relative_parent(relative: &[u8]) -> Option<&[u8]> {
@@ -15540,25 +15582,24 @@ impl ExecNtHandler {
         if name16.is_empty() {
             return STATUS_OBJECT_NAME_INVALID;
         }
-        // The writable overlay answers by-path attribute queries for its own namespace. A miss here
-        // is authoritative, not a synthetic success.
+        // The writable overlay wins for paths it owns. A miss is not enough to hide an installed
+        // read-only file that has not been modified yet, so unresolved prefix paths continue into
+        // the FAT lookup below.
         let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
             unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
         if let Some(relative_len) =
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
-            return match crate::writable_fs::query_attributes_relative(
-                &relative_scratch[..relative_len],
-            ) {
-                Some(info)
-                    if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } =>
-                {
+            if let Some(info) =
+                crate::writable_fs::query_attributes_relative(&relative_scratch[..relative_len])
+            {
+                return if unsafe { self.write_file_basic_attributes(args[1], info.attributes) } {
                     nt_fs::STATUS_SUCCESS
-                }
-                Some(_) => STATUS_ACCESS_VIOLATION,
-                None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
-            };
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                };
+            }
         }
         if let Some(relative) = crate::writable_fs::volume_path(name16) {
             if let Some(info) =
@@ -15662,17 +15703,15 @@ impl ExecNtHandler {
         if let Some(relative_len) =
             crate::writable_fs::writable_path_into(name16, folded_scratch, relative_scratch)
         {
-            return match crate::writable_fs::query_attributes_relative(
-                &relative_scratch[..relative_len],
-            ) {
-                Some(info)
-                    if unsafe { self.write_file_network_open_information(args[1], info) } =>
-                {
+            if let Some(info) =
+                crate::writable_fs::query_attributes_relative(&relative_scratch[..relative_len])
+            {
+                return if unsafe { self.write_file_network_open_information(args[1], info) } {
                     nt_fs::STATUS_SUCCESS
-                }
-                Some(_) => STATUS_ACCESS_VIOLATION,
-                None => nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
-            };
+                } else {
+                    STATUS_ACCESS_VIOLATION
+                };
+            }
         }
         if let Some(relative) = crate::writable_fs::volume_path(name16) {
             if let Some(info) =
@@ -15969,40 +16008,43 @@ impl ExecNtHandler {
                 nt_fs::FILE_OPEN,
                 args[5] as u32,
             );
-            let mut opened_handle = 0u64;
-            if let Some(file_id) = file_id {
-                self.writable_fs_dirty = true;
-                match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                    Some(handle) => {
-                        opened_handle = handle;
-                        self.queue_write(file_handle_out, handle);
+            if !Self::overlay_open_missed(status) || Self::readonly_volume_entry(&name16).is_none()
+            {
+                let mut opened_handle = 0u64;
+                if let Some(file_id) = file_id {
+                    self.writable_fs_dirty = true;
+                    match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                        Some(handle) => {
+                            opened_handle = handle;
+                            self.queue_write(file_handle_out, handle);
+                        }
+                        None => status = 0xC000_009A,
                     }
-                    None => status = 0xC000_009A,
                 }
+                if opened_handle == 0 {
+                    self.write_nt_open_file_handle_out(file_handle_out, 0);
+                }
+                let iosb = get_recv_mr(8);
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    let info = if status == nt_fs::STATUS_SUCCESS {
+                        information
+                    } else {
+                        0
+                    };
+                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    None,
+                    0,
+                    opened_handle,
+                    &nb[..nlen],
+                );
+                return status;
             }
-            if opened_handle == 0 {
-                self.write_nt_open_file_handle_out(file_handle_out, 0);
-            }
-            let iosb = get_recv_mr(8);
-            if iosb != 0 {
-                self.xas_write_buf(iosb, &status.to_le_bytes());
-                let info = if status == nt_fs::STATUS_SUCCESS {
-                    information
-                } else {
-                    0
-                };
-                self.xas_write_buf(iosb + 8, &info.to_le_bytes());
-            }
-            loader_trace_record(
-                self.pi,
-                LoaderOp::OpenFile,
-                status,
-                None,
-                0,
-                opened_handle,
-                &nb[..nlen],
-            );
-            return status;
         }
         if let Some(relative) = crate::writable_fs::volume_path(&name16) {
             if crate::writable_fs::query_attributes_relative_if_mounted(&relative).is_some() {
@@ -17753,9 +17795,9 @@ impl ExecNtHandler {
             // NT references the key object by handle with no access mask, rejects deleted KCBs, then
             // calls `CmFlushKey(kcb, FALSE)`. This host now has two live write authorities:
             // volatile overlay keys, which match `HvSyncHive`'s volatile-hive early return, and
-            // mounted mutable hives. Dynamic `NtLoadKey` profile hives are checkpointed back to the
-            // source file on flush, so `RegUnLoadKey` followed by a later `RegLoadKey` sees the file
-            // image instead of a hidden overlay side table.
+            // mounted mutable hives. Mutable hives checkpoint through the writable filesystem:
+            // dynamic `NtLoadKey` profile hives write back to their source file, while boot-mounted
+            // hives write to `system32\config`.
             NativeService::NtFlushKey => {
                 let key = match self.resolve_registry_key(args[0], 0) {
                     Ok(key) => key,
@@ -17776,13 +17818,18 @@ impl ExecNtHandler {
                         if status != nt_fs::STATUS_SUCCESS {
                             return status;
                         }
+                    } else {
+                        let status = self.checkpoint_boot_mutable_hive(mutable_key.hive, dirty);
+                        if status != nt_fs::STATUS_SUCCESS {
+                            return status;
+                        }
                     }
                 }
                 0
             }
             // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive root to a caller-opened file.
             // Mutable hive roots write their live `nt-hive-core` image; borrowed-regf roots without
-            // a mutable authority retain the raw-image path. Subkey export is left as a visible
+            // mutable ownership retain the raw read-only image path. Subkey export is left as a visible
             // STATUS_NOT_IMPLEMENTED until the Configuration Manager owns a subtree serializer.
             NativeService::NtSaveKey => unsafe { self.nt_save_key(args[0], args[1]) },
             // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user hive at
@@ -23543,28 +23590,96 @@ impl ExecNtHandler {
                         args[7] as u32,
                         args[8] as u32,
                     );
-                    status = st;
-                    info = information;
-                    if file_id.is_some() {
-                        self.writable_fs_dirty = true;
-                    }
-                    if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
-                        if status == nt_fs::STATUS_SUCCESS && info == nt_fs::FILE_CREATED as u64 {
-                            crate::writable_fs::note_directory_create(self.pi, &relative, true);
-                        } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
-                            crate::writable_fs::note_directory_create(self.pi, &relative, false);
+                    let disposition = args[7] as u32;
+                    if disposition == nt_fs::FILE_OPEN && Self::overlay_open_missed(st) {
+                        if let Some((first_cluster, file_size)) = Self::readonly_disk_open_entry(
+                            &name16,
+                            args[1] as u32,
+                            args[8] as u32,
+                        ) {
+                            status = nt_fs::STATUS_SUCCESS;
+                            info = nt_fs::FILE_OPENED as u64;
+                            match self.mint_disk_file_handle(
+                                first_cluster,
+                                file_size,
+                                args[1] as u32,
+                            ) {
+                                Some(handle) => {
+                                    self.queue_write(args[0], handle);
+                                    let count = NT_CREATE_FILE_READONLY_FAT_OPENS
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if count < 8 {
+                                        print_str(b"[nt-create-file] pi=");
+                                        print_u64(self.pi as u64);
+                                        print_str(b" read-only FAT open size=");
+                                        print_u64(file_size as u64);
+                                        print_str(b" name=\"");
+                                        for &unit in name16.iter().take(96) {
+                                            debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                                unit as u8
+                                            } else {
+                                                b'?'
+                                            });
+                                        }
+                                        print_str(b"\"\n");
+                                    }
+                                }
+                                None => {
+                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                    info = 0;
+                                }
+                            }
+                        } else {
+                            status = Self::readonly_disk_open_miss_status(&name16).unwrap_or(st);
+                            info = 0;
+                            let count =
+                                NT_CREATE_FILE_READONLY_FAT_MISSES.fetch_add(1, Ordering::Relaxed);
+                            if count < 8 {
+                                print_str(b"[nt-create-file] pi=");
+                                print_u64(self.pi as u64);
+                                print_str(b" read-only FAT miss status=0x");
+                                print_hex(status);
+                                print_str(b" name=\"");
+                                for &unit in name16.iter().take(96) {
+                                    debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                        unit as u8
+                                    } else {
+                                        b'?'
+                                    });
+                                }
+                                print_str(b"\"\n");
+                            }
                         }
-                    } else if status == nt_fs::STATUS_SUCCESS
-                        && info == nt_fs::FILE_CREATED as u64
-                    {
-                        crate::writable_fs::note_profile_file_create(self.pi, &relative);
-                    }
-                    if let Some(file_id) = file_id {
-                        match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                            Some(handle) => self.queue_write(args[0], handle),
-                            None => {
-                                status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
-                                info = 0;
+                    } else {
+                        status = st;
+                        info = information;
+                        if file_id.is_some() {
+                            self.writable_fs_dirty = true;
+                        }
+                        if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                            if status == nt_fs::STATUS_SUCCESS
+                                && info == nt_fs::FILE_CREATED as u64
+                            {
+                                crate::writable_fs::note_directory_create(self.pi, &relative, true);
+                            } else if status == nt_fs::STATUS_OBJECT_NAME_COLLISION {
+                                crate::writable_fs::note_directory_create(
+                                    self.pi,
+                                    &relative,
+                                    false,
+                                );
+                            }
+                        } else if status == nt_fs::STATUS_SUCCESS
+                            && info == nt_fs::FILE_CREATED as u64
+                        {
+                            crate::writable_fs::note_profile_file_create(self.pi, &relative);
+                        }
+                        if let Some(file_id) = file_id {
+                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                                Some(handle) => self.queue_write(args[0], handle),
+                                None => {
+                                    status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                                    info = 0;
+                                }
                             }
                         }
                     }

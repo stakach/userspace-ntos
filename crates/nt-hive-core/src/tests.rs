@@ -134,6 +134,8 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
     let mut set = MutableHiveSet::new();
     set.mount(SYSTEM_HIVE_PATH, 1, system);
     set.mount(r"\Registry\Machine\Software", 2, software);
+    assert!(set.clear_hive_dirty(1));
+    assert_eq!(set.hive(1).unwrap().dirty_count(), 0);
 
     let svc = set
         .create_key(r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs")
@@ -156,6 +158,9 @@ fn mutable_hive_set_resolves_mutates_and_unmounts_hives() {
             .map(|(ty, data)| (ty, data.to_vec())),
         Some((RegistryValueType::Dword, 2u32.to_le_bytes().to_vec()))
     );
+    assert!(set.hive(1).unwrap().dirty_count() > 0);
+    assert!(set.clear_hive_dirty(1));
+    assert_eq!(set.hive(1).unwrap().dirty_count(), 0);
     assert!(set.owns_path(r"\Registry\Machine\System\CurrentControlSet\Services\Missing"));
     assert!(set.delete_value(svc, "Start"));
     assert!(set.query_value(svc, "start").is_none());
