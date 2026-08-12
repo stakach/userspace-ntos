@@ -34,6 +34,7 @@ struct SecImageForwardPolicy {
 }
 static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
+static SHELL_LAUNCH_QUIESCE_DUMPED: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -1832,6 +1833,74 @@ fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
     None
 }
 
+unsafe fn dump_shell_launch_quiesce(
+    nt_handler: &ExecNtHandler,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) {
+    if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
+        && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
+        && EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed) == 0
+    {
+        if let Some(pi) = live_hosted_pi_for_leaf(nt_handler, b"userinit.exe") {
+            if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(1, Ordering::Relaxed) & 1 == 0 {
+                print_str(b"[shell-launch] userinit spawned but no shell image open attempt; pi=");
+                print_u64(pi as u64);
+                print_str(b" spawned=");
+                print_u64(USERINIT_SPAWNED.load(Ordering::Relaxed));
+                print_str(b" shell-attempts=");
+                print_u64(USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed));
+                print_str(b" explorer-opens=");
+                print_u64(EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed));
+                print_str(b"\n");
+                dump_hosted_main_thread_quiesce(
+                    b"userinit-quiesce",
+                    pi,
+                    nt_handler,
+                    loaded_images,
+                    reg,
+                    ntdll,
+                    procs,
+                    pfilled,
+                );
+            }
+        }
+    }
+
+    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
+        && EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed) == 0
+    {
+        if let Some(pi) = live_hosted_pi_for_leaf(nt_handler, b"explorer.exe") {
+            if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(2, Ordering::Relaxed) & 2 == 0 {
+                print_str(
+                    b"[shell-launch] explorer spawned before first captured CreateWindow string; pi=",
+                );
+                print_u64(pi as u64);
+                print_str(b" spawned=");
+                print_u64(EXPLORER_SPAWNED.load(Ordering::Relaxed));
+                print_str(b" create-window-strings=");
+                print_u64(EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed));
+                print_str(b" connected-mask=0x");
+                print_hex_u64(W32_CONNECTED_MASK.load(Ordering::Relaxed));
+                print_str(b"\n");
+                dump_hosted_main_thread_quiesce(
+                    b"explorer-quiesce",
+                    pi,
+                    nt_handler,
+                    loaded_images,
+                    reg,
+                    ntdll,
+                    procs,
+                    pfilled,
+                );
+            }
+        }
+    }
+}
+
 unsafe fn dump_interactive_shell_frontier_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
@@ -1840,6 +1909,7 @@ unsafe fn dump_interactive_shell_frontier_quiesce(
     procs: &[ProcExec; MAX_PI],
     pfilled: &[[u64; 512]; MAX_PI],
 ) {
+    dump_shell_launch_quiesce(nt_handler, loaded_images, reg, ntdll, procs, pfilled);
     let Some(pi) = interactive_shell_frontier_pi(nt_handler) else {
         return;
     };

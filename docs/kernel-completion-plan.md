@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 ## Objective
 
@@ -31,11 +31,38 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Current serialized frontier (2026-08-12): the real desktop/icon path is past shell launch and paint
+Current serialized frontier (2026-08-13): the real desktop/icon path is past shell launch and paint
 scaffolding again on the Rust ntdll. The executive no longer contains live `[w32-slip]` or
 `[cb-inject]` post-quiesce callback probes; any run that still emits those tags is using a stale
 binary or stale branch state. The callback/transport gates now assert live invariants from the real
 workload.
+
+Latest accepted desktop proof (2026-08-13):
+`rust-micro/.tmp/run-headless-provision-new-image-20260813-scheduled.log` and
+`rust-micro/.tmp/run-headless-restored-same-image-20260813-scheduled.log` both reach the harness
+sentinel with `294/294` executive-to-isolated-service checks passing. The first boot checkpoints the
+late dirty `SOFTWARE`, `SAM`, and `SECURITY` boot hives before deferring an already-persisted
+`SYSTEM` refresh under tight heap headroom; the second boot restores writable snapshot generation
+`147`, reuses the persisted profile tree and `C:\Profiles\Administrator\ntuser.dat`, mounts the
+profile hive through `NtLoadKey`, proves restored SECURITY/SAM content (`restored-policy=1`,
+`restored-db=1`), then launches real userinit and Explorer. Both runs finish with redirected
+Explorer user callbacks, client WndProc installation, served shell COM classes, real GDI paint
+accounting, and a fully non-background 1024x768 Explorer framebuffer with at least 32 distinct
+non-background colors. The remaining D3 reboot-persistence proof for system hives, profile hives,
+and writable overlay state is therefore closed for the current desktop path.
+
+Completed restored-boot proof hardening (2026-08-13): restored profile, LSA, SAM, and writable
+overlay gates now derive from actual persisted state instead of first-boot counters. The writable
+overlay records restored profile-source tree stats by enumerating the real restored `\Profiles`
+directories, profile-copy gates validate the copied Administrator directory and persisted
+`ntuser.dat`, and LSA/SAM restored gates require real SECURITY `Policy\PolAcDmS` SID reads plus SAM
+root opens and successful logon. `nt-hive-core` gained no-allocation encoded-image sizing and
+value-length probing for restored hive proofs, and hive image encode no longer builds a temporary
+cell-ID compaction map. The quiesce boot-hive checkpoint drain now schedules exact-size dirty hive
+candidates, prioritizes not-yet-persisted hives, and preserves remaining dirty state for the next
+lazy writer pass when heap headroom is too tight. Generic bounded userinit/explorer quiesce dumps
+were added for future shell stalls before first shell image open or first Explorer create-window
+capture.
 
 Latest accepted desktop proof (2026-08-12):
 `rust-micro/.tmp/run-headless-seh-caller-context-gates-20260812.log` reaches the harness sentinel
@@ -1019,7 +1046,7 @@ before unrelated executive traffic monopolises the receive loop.
   explorer HKCR shell COM class seeding now mutate the mounted hives directly instead of creating
   overlay shadows. Remaining D2 work is a final persistent-path overlay audit before D3
   flush/reboot proofs.
-- `[~]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
+- `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
   `NtUnloadKey`. Boot-mounted mutable hives now checkpoint their live `nt-hive-core` image into
@@ -1027,9 +1054,11 @@ before unrelated executive traffic monopolises the receive loop.
   flush creates a writable-layer replacement. The heap-neutral read-through/checkpoint path has a
   clean serialized desktop proof. `nt-fs::MemFs` now also has a versioned, checksummed volume
   snapshot/restore primitive that preserves sparse files without expanding zero ranges, plus a
-  two-slot block-backed snapshot store contract for atomic payload commit over sector I/O. Remaining
-  D3 work is binding that store to the real AHCI/storage write path and proving repeat-boot reuse
-  across system hive, profile hive, and writable overlay state.
+  two-slot block-backed snapshot store contract for atomic payload commit over sector I/O. The
+  2026-08-13 fresh/restored same-disk proofs close the desktop-path repeat-boot requirement: restored
+  boots reuse persisted `SOFTWARE`, `SECURITY`, `SAM`, profile hive, and writable-profile directory
+  state, then reach genuine userinit/Explorer shell chrome without first-boot-only evidence. Further
+  storage work moves to D4 semantics and real-device hardening rather than D3 proof closure.
 - `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots.
 

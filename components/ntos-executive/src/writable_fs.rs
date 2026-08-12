@@ -183,14 +183,7 @@ pub(crate) fn hive_image_value_len_on(
             .and_then(|key| regf.value(key, value_name))
             .map_or(0, |(_, data)| data.len());
     }
-    nt_hive_core::decode_image(bytes)
-        .ok()
-        .and_then(|hive| {
-            let key = hive.open_key(key_path)?;
-            hive.query_value(key, value_name)
-                .map(|(_, data)| data.len())
-        })
-        .unwrap_or(0)
+    nt_hive_core::image_value_len_if_valid(bytes, key_path, value_name).unwrap_or(0)
 }
 
 /// [`hive_image_len_on`] against the LIVE mounted volume (the gate specs' read-back).
@@ -272,6 +265,7 @@ pub(crate) const CONFIG_SAM_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\S
 pub(crate) const CONFIG_DEFAULT_HIVE_PATH: &str = r"\??\C:\ReactOS\System32\Config\DEFAULT";
 /// The profile-source directory `CreateUserProfileExW` copies, and a REAL file inside it whose
 /// content the spec reads back (`livecd_start.cmd` is 9 bytes: `@start %1`).
+pub(crate) const PROFILE_ROOT_DIR: &str = r"\??\C:\Profiles";
 pub(crate) const DEFAULT_USER_PROFILE_DIR: &str = r"\??\C:\Profiles\Default User";
 pub(crate) const DEFAULT_USER_PROBE_FILE: &str =
     r"\??\C:\Profiles\Default User\My Documents\livecd_start.cmd";
@@ -279,8 +273,20 @@ pub(crate) const DEFAULT_USER_PROBE_FILE: &str =
 /// The DESTINATION path `CopyDirectory` must have produced for the probe file, and the source
 /// bytes it must contain. The user directory is the real profile name `CreateUserProfileExW`
 /// derived from the logged-on account, so this is the copy's own output path, not a fabrication.
+pub(crate) const COPIED_PROFILE_DIR: &str = r"\??\C:\Profiles\Administrator";
 pub(crate) const COPIED_PROFILE_PROBE_FILE: &str =
     r"\??\C:\Profiles\Administrator\My Documents\livecd_start.cmd";
+
+/// Whether an existing directory is present on the live writable volume, read by path.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the query.
+pub(crate) unsafe fn directory_exists_at(path: &str) -> bool {
+    match writable_fs() {
+        Some(fs) => fs.query_attributes(path).is_some_and(|info| info.is_directory),
+        None => false,
+    }
+}
 
 /// Whether `CopyDirectory` really wrote the SOURCE file's exact bytes to its DESTINATION path —
 /// read back off the LIVE writable volume, by content.
@@ -642,7 +648,138 @@ fn has_directory_relative(fs: &nt_fs::FileSystem, relative: &[u8]) -> bool {
         .is_some_and(|info| info.is_directory)
 }
 
+fn append_ascii_utf16_name(
+    out: &mut alloc::string::String,
+    record: &[u8],
+    name_offset: usize,
+    name_len: usize,
+) -> bool {
+    if name_len == 0 || name_len % 2 != 0 || name_offset + name_len > record.len() {
+        return false;
+    }
+    let before = out.len();
+    for unit in record[name_offset..name_offset + name_len].chunks_exact(2) {
+        if unit[1] != 0 || unit[0] == 0 || unit[0] > 0x7f {
+            out.truncate(before);
+            return false;
+        }
+        out.push(unit[0] as char);
+    }
+    true
+}
+
+fn restored_profile_source_tree_stats(fs: &mut nt_fs::FileSystem) -> StagedTreeStats {
+    const SOURCE_ROOTS: [&str; 2] = [
+        r"\??\C:\Profiles\Default User",
+        r"\??\C:\Profiles\All Users",
+    ];
+    const DIRECTORY_NAME_OFFSET: usize = 64;
+    const FILE_ATTRIBUTES_OFFSET: usize = 56;
+    const FILE_NAME_LENGTH_OFFSET: usize = 60;
+
+    let mut stats = StagedTreeStats::default();
+    let mut stack: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for root in SOURCE_ROOTS {
+        let Some(info) = fs.query_attributes(root) else {
+            continue;
+        };
+        if info.is_directory {
+            stats.dirs += 1;
+            stack.push(alloc::string::String::from(root));
+        } else {
+            stats.files += 1;
+            stats.bytes += info.end_of_file;
+        }
+    }
+
+    while let Some(path) = stack.pop() {
+        let dir = fs.zw_create_file(
+            &path,
+            nt_fs::FILE_READ_DATA,
+            0,
+            0,
+            nt_fs::FILE_OPEN,
+            nt_fs::FILE_DIRECTORY_FILE,
+        );
+        if dir.status != nt_fs::STATUS_SUCCESS {
+            continue;
+        }
+
+        let mut buffer = [0u8; 4096];
+        let mut restart = true;
+        loop {
+            let result = fs.zw_query_directory_file(
+                dir.handle,
+                nt_fs::FILE_DIRECTORY_INFORMATION,
+                false,
+                None,
+                restart,
+                &mut buffer,
+            );
+            restart = false;
+            if result.status != nt_fs::STATUS_SUCCESS {
+                break;
+            }
+
+            let mut offset = 0usize;
+            loop {
+                if offset + DIRECTORY_NAME_OFFSET > result.information {
+                    break;
+                }
+                let next = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap())
+                    as usize;
+                let attributes = u32::from_le_bytes(
+                    buffer[offset + FILE_ATTRIBUTES_OFFSET..offset + FILE_ATTRIBUTES_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                let name_len = u32::from_le_bytes(
+                    buffer[offset + FILE_NAME_LENGTH_OFFSET..offset + FILE_NAME_LENGTH_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let record_end = if next == 0 {
+                    result.information
+                } else {
+                    offset.saturating_add(next).min(result.information)
+                };
+                if record_end < offset || record_end > buffer.len() {
+                    break;
+                }
+                let record = &buffer[offset..record_end];
+                let mut child = path.clone();
+                child.push('\\');
+                if append_ascii_utf16_name(&mut child, record, DIRECTORY_NAME_OFFSET, name_len) {
+                    let name = &child[path.len() + 1..];
+                    if name != "." && name != ".." {
+                        if attributes & nt_fs::FILE_ATTRIBUTE_DIRECTORY != 0 {
+                            stats.dirs += 1;
+                            stack.push(child);
+                        } else {
+                            stats.files += 1;
+                            if let Some(info) = fs.query_attributes(&child) {
+                                stats.bytes += info.end_of_file;
+                            }
+                        }
+                    }
+                }
+                if next == 0 {
+                    break;
+                }
+                offset += next;
+            }
+        }
+        let _ = fs.zw_close(dir.handle);
+    }
+
+    stats
+}
+
 fn refresh_restored_profile_proofs(fs: &mut nt_fs::FileSystem) {
+    let stats = restored_profile_source_tree_stats(fs);
+    PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
+    PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
+    PROFILE_SOURCE_BYTES.store(stats.bytes, Ordering::Relaxed);
     PROFILE_SOURCE_PROBE_OK.store(
         (fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1")) as u64,
         Ordering::Relaxed,

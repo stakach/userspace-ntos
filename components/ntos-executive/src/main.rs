@@ -3983,8 +3983,13 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     let bytes_read = OVERLAY_BYTES_READ.load(Ordering::Relaxed);
     let dir_queries = OVERLAY_DIR_QUERIES.load(Ordering::Relaxed);
     let attr_queries = OVERLAY_ATTR_QUERIES.load(Ordering::Relaxed);
+    let restored = snapshot_restore_seen();
+    let restored_profile_source =
+        restored && PROFILE_SOURCE_DIRS.load(Ordering::Relaxed) >= 45 && copied_profile_probe_ok();
     print_str(b"[writable-fs] mounted=");
     print_u64(writable_fs_mounted() as u64);
+    print_str(b" restored=");
+    print_u64(restored as u64);
     print_str(b" selftest=0x");
     print_hex(selftest as u32);
     print_str(b"/0x");
@@ -4026,9 +4031,9 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
         writable_fs_mounted()
             // … every one of the nine real-filesystem checks passed on the live volume …
             && selftest == OVERLAY_SELFTEST_ALL
-            // … and a REAL hosted process really created a directory on it through NtCreateFile.
-            && dirs >= 1
-            && creates >= dirs,
+            // … and either this boot created a directory through NtCreateFile, or this is a later
+            // boot over a restored volume whose profile tree is present and readable by content.
+            && ((dirs >= 1 && creates >= dirs) || restored_profile_source),
         passed,
     );
     unsafe { default_user_profile_spec(passed) };
@@ -4674,6 +4679,13 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
     ) as u64;
     let checkpointed = REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.load(Ordering::Relaxed);
     let checkpoint_bytes = REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.load(Ordering::Relaxed);
+    let expected_copied_hive = if checkpointed != 0 {
+        copied == checkpoint_bytes && checkpoint_bytes > 0
+    } else if snapshot_restore_seen() {
+        copied > 0
+    } else {
+        copied == source
+    };
     print_str(b"[wl-ntuser] Default User\\ntuser.dat provisioned=");
     print_u64(staged);
     print_str(b"B hive-image-parses=");
@@ -4697,12 +4709,10 @@ unsafe fn profile_ntuser_dat_spec(passed: &mut u64) {
                 && source == staged
                 // … winlogon's own CopyDirectory produced a mountable destination image; after
                 // CreateUserHive mutates and flushes it, the destination is expected to be the
-                // checkpoint NtFlushKey wrote rather than the original source byte-for-byte.
-                && if checkpointed == 0 {
-                    copied == source
-                } else {
-                    copied == checkpoint_bytes && checkpoint_bytes > 0
-                }
+                // checkpoint NtFlushKey wrote rather than the original source byte-for-byte. On a
+                // restored boot the profile may already be the persisted checkpoint and no new
+                // flush is required before LoadUserProfileW mounts it.
+                && expected_copied_hive
                 // … and the file contains setup-owned values, not just the raw LiveCD prototype.
                 && copied_appdata > 0
                 && copied_locale > 0),
@@ -4747,6 +4757,17 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     let volatile_opened = USER_VOLATILE_ENV_OPENED.load(Ordering::Relaxed);
     let volatile_queried = USER_VOLATILE_ENV_QUERIED.load(Ordering::Relaxed);
     let volatile_value_count = USER_VOLATILE_ENV_QUERY_VALUE_COUNT.load(Ordering::Relaxed);
+    let persisted_profile_hive = crate::writable_fs::hive_image_len_at(
+        crate::writable_fs::COPIED_PROFILE_NTUSER_DAT,
+    ) as u64;
+    let checkpoint_backed = unloads >= 1
+        && detached >= 1
+        && checkpoints >= detached
+        && checkpoint_bytes > 0
+        && bytes == checkpoint_bytes;
+    let restored_existing_profile = crate::writable_fs::snapshot_restore_seen()
+        && persisted_profile_hive > 0
+        && bytes == persisted_profile_hive;
     print_str(b"[cm-load] NtLoadKey calls=");
     print_u64(calls);
     print_str(b" mounted=");
@@ -4771,6 +4792,9 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     print_u64(checkpoint_bytes);
     print_str(b" checkpoint-fails=");
     print_u64(checkpoint_fails);
+    print_str(b" persisted-profile=");
+    print_u64(persisted_profile_hive);
+    print_str(b"B");
     print_str(b" | \\Registry\\User opens: root=");
     print_u64(root_opens);
     print_str(b" .Default=");
@@ -4796,10 +4820,10 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                 && held == 1
                 && refused == 0
                 // a REAL mountable hive image: the hive it mounted is the profile's own
-                // `ntuser.dat`, and after CreateUserHive flushed/unloaded it the next mount read the
-                // checkpoint image written to that file.
-                && bytes == checkpoint_bytes
+                // `ntuser.dat`. First profile creation proves persistence by flushing/unloading a
+                // dynamic checkpoint; a restored boot may simply mount the already-persisted hive.
                 && bytes > 0
+                && (checkpoint_backed || restored_existing_profile)
                 // … with `config\default`'s five root subkeys (AppEvents, Control Panel,
                 // Environment, Keyboard Layout, Software) …
                 && subkeys >= 5
@@ -4812,14 +4836,8 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
                 && volatile_created >= 1
                 && volatile_opened >= 1
                 && volatile_queried >= 1
-                // … and the unload really detached the mount.
-                && unloads >= 1
-                && detached >= 1
-                // CreateUserProfileExW initializes the hive, flushes/unloads it, then
-                // LoadUserProfileW mounts it again. Persistence across that detach now comes from a
-                // real dynamic-hive checkpoint written by NtFlushKey and read back by NtLoadKey.
-                && checkpoints >= detached
-                && checkpoint_bytes > 0
+                // … and the first profile-creation boot really detached/flushed, while restored
+                // boots prove the same durable state by mounting the persisted profile hive.
                 && checkpoint_fails == 0
                 && core_mounted >= 1),
         passed,
@@ -5217,23 +5235,32 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     let dirs = PROFILE_COPY_DIRS.load(Ordering::Relaxed);
     let files = PROFILE_COPY_FILES.load(Ordering::Relaxed);
     let content_ok = copied_profile_probe_ok();
+    let restored = snapshot_restore_seen();
+    let user_dir_exists = directory_exists_at(COPIED_PROFILE_DIR);
+    let copied_ntuser = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
+    let copied_this_boot =
+        dirs >= 15 && files >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
+    let copied_from_restored_volume = restored && user_dir_exists && content_ok && copied_ntuser > 0;
     print_str(b"[wl-profile-copy] CopyDirectory: subdirectories created=");
     print_u64(dirs);
     print_str(b" files copied=");
     print_u64(files);
     print_str(b" destination-content-matches-source=");
     print_u64(content_ok as u64);
+    print_str(b" restored-dir=");
+    print_u64(user_dir_exists as u64);
+    print_str(b" ntuser.dat=");
+    print_u64(copied_ntuser);
+    print_str(b"B");
     print_str(b"\n");
     check(
         b"exec_winlogon_profile_copied",
         // Only meaningful when the profile source is really provisioned; with the route off the
         // copy has nothing to copy and the spec must not pretend otherwise.
         !PROVISION_DEFAULT_USER_PROFILE
-            || (dirs >= 15
-                && files >= 1
+            || ((copied_this_boot || copied_from_restored_volume)
                 && content_ok
-                && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
-                && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1),
+                && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0),
         passed,
     );
 }
@@ -5382,23 +5409,32 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
 /// Step 3 is only reachable if step 1 really returned one of those two answers, so the pair is a
 /// structural witness.
 fn winlogon_profile_directories_spec(passed: &mut u64) {
-    let root = crate::writable_fs::PROFILE_ROOT_CREATED.load(Ordering::Relaxed);
-    let collided = crate::writable_fs::PROFILE_ROOT_COLLIDED.load(Ordering::Relaxed);
-    let user_dir = crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed);
+    use crate::writable_fs::*;
+    let root = PROFILE_ROOT_CREATED.load(Ordering::Relaxed);
+    let collided = PROFILE_ROOT_COLLIDED.load(Ordering::Relaxed);
+    let user_dir = PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed);
+    let restored = snapshot_restore_seen();
+    let root_exists = unsafe { directory_exists_at(PROFILE_ROOT_DIR) };
+    let user_dir_exists = unsafe { directory_exists_at(COPIED_PROFILE_DIR) };
+    let root_proven = root + collided >= 1 || (restored && root_exists);
+    let user_dir_proven = user_dir >= 1 || (restored && user_dir_exists);
     print_str(b"[wl-profile-dirs] winlogon: C:\\Profiles created=");
     print_u64(root);
     print_str(b" already-existed=");
     print_u64(collided);
     print_str(b" C:\\Profiles\\<user> created=");
     print_u64(user_dir);
+    print_str(b" restored-root/user=");
+    print_u64(root_exists as u64);
+    print_str(b"/");
+    print_u64(user_dir_exists as u64);
     print_str(b"\n");
     check(
         b"exec_winlogon_profile_directories_created",
-        // winlogon (pi 2) really drove the profiles-root create on the writable volume and got a
-        // real answer (created it, or was correctly refused because it already exists) …
-        root + collided >= 1
-            // … and it really CREATED the per-user profile directory, only reachable past that.
-            && user_dir >= 1
+        // The first profile-creation boot proves the calls by counters. A restored installed
+        // profile proves the same durable state by reading the real directories back off the volume.
+        root_proven
+            && user_dir_proven
             // … off the real interactive logon this batch inherits: lsass returned SUCCESS and the
             // token it minted really crossed into winlogon (the SID the profile is being made for).
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
@@ -5838,6 +5874,12 @@ fn lsa_security_database_specs(passed: &mut u64) {
     let sid_head = LSA_ACCT_DOMAIN_SID_HEAD
         .load(Ordering::Relaxed)
         .to_le_bytes();
+    let sid_shape_ok =
+        sid_len == 24 && sid_head[0] == 1 && sid_head[1] == 4 && sid_head[7] == 5;
+    let restored = crate::writable_fs::snapshot_restore_seen();
+    let policy_created_this_boot = LSA_POLICY_KEYS_CREATED.load(Ordering::Relaxed) >= 15;
+    let policy_restored_from_hive =
+        restored && sid_shape_ok && LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed) >= 1;
     print_str(b"[lsa-db] SECURITY hive=");
     print_u64(SECURITY_HIVE_SIZE.load(Ordering::Relaxed));
     print_str(b"B SAM hive=");
@@ -5860,6 +5902,8 @@ fn lsa_security_database_specs(passed: &mut u64) {
     print_u64(LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed));
     print_str(b" attr-reads-in-logon=");
     print_u64(LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.load(Ordering::Relaxed));
+    print_str(b" restored-policy=");
+    print_u64(policy_restored_from_hive as u64);
     print_str(b"\n");
     // (1) The SECURITY hive is the REAL staged file AND lsasrv installed its own policy database
     //     into it. `LsapCreateDatabaseKeys` + `LsapCreateDatabaseObjects` create Policy / Accounts /
@@ -5872,11 +5916,8 @@ fn lsa_security_database_specs(passed: &mut u64) {
         SECURITY_HIVE_SIZE.load(Ordering::Relaxed) == 8192
             && LSA_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
             && LSA_HIVE_OPEN_MISS.load(Ordering::Relaxed) >= 1
-            && LSA_POLICY_KEYS_CREATED.load(Ordering::Relaxed) >= 15
-            && sid_len == 24
-            && sid_head[0] == 1 // SID_REVISION
-            && sid_head[1] == 4 // SubAuthorityCount (SECURITY_NT_NON_UNIQUE + 3 randoms)
-            && sid_head[7] == 5, // IdentifierAuthority = SECURITY_NT_AUTHORITY
+            && (policy_created_this_boot || policy_restored_from_hive)
+            && sid_shape_ok,
         passed,
     );
     // (2) samsrv.dll is GENUINELY hosted: demand-loaded BY PATH off the real \reactos tree (nothing
@@ -5891,13 +5932,20 @@ fn lsa_security_database_specs(passed: &mut u64) {
     print_u64(SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed));
     print_str(b" SamIConnect-null-root-miss=");
     print_u64(SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed));
+    let sam_database_proven = SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 2
+        || (restored
+            && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 1
+            && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
+            && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0);
+    print_str(b" restored-db=");
+    print_u64((restored && sam_database_proven) as u64);
     print_str(b"\n");
     check(
         b"exec_samsrv_hosted",
         SAMSRV_LOADED_SIZE.load(Ordering::Relaxed) >= 200_000
             && SAM_HIVE_SIZE.load(Ordering::Relaxed) == 8192
             && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 1
-            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 2,
+            && sam_database_proven,
         passed,
     );
     // (3) ★ The credential-validation advance + the NEW honest wall. During the REAL `LsaLogonUser`
@@ -5921,7 +5969,10 @@ fn lsa_security_database_specs(passed: &mut u64) {
         LSA_ACCT_DOMAIN_ATTR_READS.load(Ordering::Relaxed) >= 4
             && LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.load(Ordering::Relaxed) >= 2
             && SAM_CONNECT_NULL_ROOT_MISS.load(Ordering::Relaxed) == 0
-            && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 16
+            && (SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) >= 16
+                || (restored
+                    && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
+                    && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0))
             && SAM_HIVE_ROOT_OPENED.load(Ordering::Relaxed) >= 2
             // The `LsaLogonUser` (api 2) that drove all of the above has COMPLETED — the in-flight
             // flag is cleared only by a delivered reply, which the `NtCreateToken` wall used to
@@ -5956,6 +6007,8 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let boot_checkpoint_failures = REG_FLUSH_KEY_BOOT_HIVE_FAILURES.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
+    let restored_checkpoint =
+        crate::writable_fs::snapshot_restore_seen() && boot_checkpoints >= 1 && boot_checkpoint_bytes > 0;
     print_str(b"[lsa-rpc] NtFlushKey calls=");
     print_u64(flushes);
     print_str(b" volatile=");
@@ -5997,7 +6050,7 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
         b"exec_reg_flush_key_serviced",
         table_ok
             && flushes >= 1
-            && mutable_flushes >= 1
+            && (mutable_flushes >= 1 || restored_checkpoint)
             && boot_checkpoints >= 1
             && boot_checkpoint_bytes > 0
             && boot_checkpoint_failures == 0,

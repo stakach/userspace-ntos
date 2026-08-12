@@ -3743,7 +3743,13 @@ impl ExecNtHandler {
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return 0xC000_0008;
         };
-        let image_len_hint = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
+        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+            return 0xC000_0008;
+        };
+        let image_len_hint = match nt_hive_core::encoded_image_len(hive) {
+            Ok(len) => len,
+            Err(_) => usize::MAX,
+        };
         let required_headroom = image_len_hint
             .max(MIN_IMAGE_HINT)
             .saturating_add(min_post_checkpoint_headroom);
@@ -3767,26 +3773,97 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn checkpoint_dirty_boot_mutable_hives(&mut self) -> u32 {
-        let mut total_dirty = 0usize;
-        for hive_sel in [
+        #[derive(Copy, Clone)]
+        struct Candidate {
+            hive_sel: u32,
+            dirty: usize,
+            image_len: usize,
+            checkpointed: bool,
+        }
+
+        const HIVE_SELS: [u32; 5] = [
             HIVE_SEL_SYSTEM,
             HIVE_SEL_SOFTWARE,
             HIVE_SEL_SECURITY,
             HIVE_SEL_SAM,
             HIVE_SEL_USER_DEFAULT,
-        ] {
+        ];
+
+        let mut total_dirty = 0usize;
+        let mut candidates = [None; 5];
+        let mut candidate_len = 0usize;
+        for hive_sel in HIVE_SELS {
             let dirty = self
                 .mutable_hives
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.dirty_count());
             total_dirty = total_dirty.saturating_add(dirty);
-            let status = self.checkpoint_boot_mutable_hive(hive_sel, dirty);
-            if status != nt_fs::STATUS_SUCCESS {
-                REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
-                return status;
+            if dirty == 0 {
+                continue;
             }
+            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                continue;
+            };
+            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                continue;
+            };
+            let image_len = match nt_hive_core::encoded_image_len(hive) {
+                Ok(len) => len,
+                Err(_) => usize::MAX,
+            };
+            candidates[candidate_len] = Some(Candidate {
+                hive_sel,
+                dirty,
+                image_len,
+                checkpointed: unsafe { crate::writable_fs::hive_image_len_at(path) != 0 },
+            });
+            candidate_len += 1;
         }
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+
+        loop {
+            let headroom = crate::allocator::remaining();
+            let mut selected: Option<(usize, Candidate)> = None;
+            for (index, candidate) in candidates[..candidate_len].iter().enumerate() {
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                if candidate.image_len > headroom {
+                    continue;
+                }
+                let replace = match selected {
+                    None => true,
+                    Some((_, best)) => {
+                        (!candidate.checkpointed && best.checkpointed)
+                            || (candidate.checkpointed == best.checkpointed
+                                && candidate.image_len > best.image_len)
+                    }
+                };
+                if replace {
+                    selected = Some((index, *candidate));
+                }
+            }
+
+            let Some((index, candidate)) = selected else {
+                break;
+            };
+            let status = self.checkpoint_boot_mutable_hive(candidate.hive_sel, candidate.dirty);
+            if status != nt_fs::STATUS_SUCCESS {
+                return status;
+            }
+            candidates[index] = None;
+        }
+
+        let remaining_dirty = self.boot_mutable_hive_dirty_cells();
+        REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(remaining_dirty as u64, Ordering::Relaxed);
+        if remaining_dirty != 0 {
+            self.mutable_hives_dirty = true;
+            print_str(b"[cm-flush] quiesce boot hive dirty refresh deferred dirty-cells=");
+            print_u64(remaining_dirty as u64);
+            print_str(b" heap-headroom=");
+            print_u64(crate::allocator::remaining() as u64);
+            print_str(b"\n");
+        }
         nt_fs::STATUS_SUCCESS
     }
 
@@ -3808,8 +3885,10 @@ impl ExecNtHandler {
             if dirty < min_dirty_cells {
                 continue;
             }
-            let image_len = Self::boot_mutable_hive_checkpoint_path(hive_sel)
-                .map(|path| unsafe { crate::writable_fs::hive_image_len_at(path) })
+            let image_len = self
+                .mutable_hives
+                .hive(hive_sel)
+                .and_then(|hive| nt_hive_core::encoded_image_len(hive).ok())
                 .unwrap_or(0);
             return Some((dirty, image_len));
         }
@@ -19195,6 +19274,17 @@ impl ExecNtHandler {
                             if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
                                 LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON
                                     .fetch_add(1, Ordering::Relaxed);
+                            }
+                            if name_lc.is_empty()
+                                && key_path.as_deref()
+                                    == Some(r"\registry\machine\security\policy\polacdms")
+                            {
+                                LSA_ACCT_DOMAIN_SID_LEN.store(data.len() as u64, Ordering::Relaxed);
+                                let mut head = [0u8; 8];
+                                let n = data.len().min(head.len());
+                                head[..n].copy_from_slice(&data[..n]);
+                                LSA_ACCT_DOMAIN_SID_HEAD
+                                    .store(u64::from_le_bytes(head), Ordering::Relaxed);
                             }
                         }
                         if shell_com_inproc_bit != 0 {

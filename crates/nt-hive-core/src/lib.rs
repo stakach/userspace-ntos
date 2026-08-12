@@ -36,8 +36,9 @@ pub use reactos_registration::{
 };
 
 pub use codec::{
-    decode_image, encode_image, encode_log_record, image_len_if_valid, replay_log,
-    try_encode_image, HiveDecodeError, HiveEncodeError, HiveLogOp,
+    decode_image, encode_image, encode_log_record, encoded_image_len, image_len_if_valid,
+    image_value_len_if_valid, replay_log, try_encode_image, HiveDecodeError, HiveEncodeError,
+    HiveLogOp,
 };
 pub use config_import::{
     import_control_set_class_into_config_manager, import_control_set_enum_into_config_manager,

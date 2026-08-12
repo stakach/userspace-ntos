@@ -57,6 +57,64 @@ fn hive_class_metadata_roundtrips_in_image() {
 }
 
 #[test]
+fn security_hive_lsa_policy_paths_roundtrip_in_image() {
+    let mut hive = Hive::new(HiveKind::Security);
+    let account_secret = hive.create_key(r"Policy\Accounts\S");
+    hive.set_value(
+        account_secret,
+        "SecDesc",
+        RegistryValueType::Binary,
+        b"account-secret-descriptor".to_vec(),
+    );
+    let account_domain = hive.create_key(r"Policy\PolAcDmS");
+    let domain_sid = [
+        1u8, 4, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 0x47, 0xb1, 0xa6, 0x49, 0x9c, 0x8f, 0x77, 0x1f,
+        0xf3, 0xce, 0x43, 0x7e,
+    ];
+    hive.set_value(
+        account_domain,
+        "",
+        RegistryValueType::Binary,
+        domain_sid.to_vec(),
+    );
+
+    let image = encode_image(&hive);
+    assert_eq!(encoded_image_len(&hive), Ok(image.len()));
+    assert_eq!(
+        image_value_len_if_valid(&image, r"Policy\PolAcDmS", ""),
+        Ok(domain_sid.len())
+    );
+    assert_eq!(
+        image_value_len_if_valid(&image, r"policy\accounts\s", "secdesc"),
+        Ok(b"account-secret-descriptor".len())
+    );
+    assert_eq!(
+        image_value_len_if_valid(&image, r"Policy\Missing", ""),
+        Ok(0)
+    );
+
+    let decoded = decode_image(&image).expect("decode security hive image");
+    assert_eq!(decoded.kind, HiveKind::Security);
+    assert_eq!(decoded.dirty_count(), 0);
+
+    let decoded_secret = decoded
+        .open_key(r"policy\accounts\s")
+        .expect("Accounts\\S key");
+    assert_eq!(
+        decoded.query_value(decoded_secret, "SecDesc"),
+        Some((
+            RegistryValueType::Binary,
+            b"account-secret-descriptor".as_slice()
+        ))
+    );
+    let decoded_domain = decoded.open_key(r"Policy\PolAcDmS").expect("PolAcDmS key");
+    assert_eq!(
+        decoded.query_value(decoded_domain, ""),
+        Some((RegistryValueType::Binary, domain_sid.as_slice()))
+    );
+}
+
+#[test]
 fn hive_borrowed_indexed_enumeration_preserves_names_and_data() {
     let mut h = Hive::new(HiveKind::System);
     let services = h.create_key(r"ControlSet001\Services");
@@ -619,7 +677,7 @@ fn image_len_validation_checks_header_without_decoding_cells() {
 }
 
 #[test]
-fn hive_image_compacts_sparse_cell_ids_on_encode_and_decode() {
+fn hive_image_compacts_sparse_cell_ids_on_decode() {
     let mut h = Hive {
         cells: Vec::new(),
         value_blobs: alloc::vec![Rc::new(b"service".to_vec())],
