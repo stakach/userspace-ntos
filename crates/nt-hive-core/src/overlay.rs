@@ -69,6 +69,7 @@ struct OverlayKey {
     path: String,
     values: Vec<OverlayValue>,
     security_descriptor: Option<usize>,
+    volatile: bool,
     detached: bool,
 }
 
@@ -138,13 +139,27 @@ impl RegistryOverlay {
     /// create. `NtLoadKey` remounts must reload the hive image from their backing file; detached
     /// overlay values are not persistent registry storage.
     pub fn create(&mut self, canon: &str) -> (usize, bool) {
-        self.create_owned(String::from(canon))
+        self.create_with_volatility(canon, true)
+    }
+
+    /// Create-or-open a key and record whether a newly-created slot is volatile.
+    ///
+    /// Existing keys keep their original volatility. NT's `REG_OPTION_VOLATILE` is a create-time
+    /// property: reopening the same key with a different option must not rewrite key metadata.
+    pub fn create_with_volatility(&mut self, canon: &str, volatile: bool) -> (usize, bool) {
+        self.create_owned_with_volatility(String::from(canon), volatile)
     }
 
     /// Create-or-open a key, taking ownership of the caller's canonical path when a new overlay
     /// slot is needed. This lets the executive transfer durable registry paths into the write plane
     /// after dropping pre-mutation scratch allocations.
     pub fn create_owned(&mut self, canon: String) -> (usize, bool) {
+        self.create_owned_with_volatility(canon, true)
+    }
+
+    /// Create-or-open a key, taking ownership of the caller's canonical path and recording whether
+    /// a newly-created slot is volatile.
+    pub fn create_owned_with_volatility(&mut self, canon: String, volatile: bool) -> (usize, bool) {
         if let Some(i) = self.find(&canon) {
             return (i, false);
         }
@@ -152,12 +167,14 @@ impl RegistryOverlay {
             self.keys[i].detached = false;
             self.keys[i].values.clear();
             self.keys[i].security_descriptor = None;
+            self.keys[i].volatile = volatile;
             return (i, true);
         }
         self.keys.push(OverlayKey {
             path: canon,
             values: Vec::new(),
             security_descriptor: None,
+            volatile,
             detached: false,
         });
         (self.keys.len() - 1, true)
@@ -169,6 +186,31 @@ impl RegistryOverlay {
             .get(idx)
             .filter(|k| !k.detached)
             .map(|k| k.path.as_str())
+    }
+
+    /// Whether a live overlay key was created as volatile.
+    pub fn is_volatile(&self, idx: usize) -> Option<bool> {
+        self.keys
+            .get(idx)
+            .filter(|k| !k.detached)
+            .map(|k| k.volatile)
+    }
+
+    /// Count visible overlay keys created with `REG_OPTION_VOLATILE`.
+    pub fn volatile_len(&self) -> usize {
+        self.keys
+            .iter()
+            .filter(|k| !k.detached && k.volatile)
+            .count()
+    }
+
+    /// Count visible overlay keys that are runtime-only because they have no mounted hive backing,
+    /// but were not explicitly created as volatile.
+    pub fn nonvolatile_shadow_len(&self) -> usize {
+        self.keys
+            .iter()
+            .filter(|k| !k.detached && !k.volatile)
+            .count()
     }
 
     /// DETACH every key at or below `canon` — the write-plane half of `NtUnloadKey`. Without this
@@ -463,6 +505,48 @@ mod tests {
         assert_eq!(i0, i1);
         assert!(!created1);
         assert_eq!(ov.path(i0), Some(r"\registry\machine\software\classes"));
+    }
+
+    #[test]
+    fn create_records_volatility_only_for_new_slots() {
+        let mut ov = RegistryOverlay::new();
+        let (volatile, created) = ov.create_with_volatility(r"\runtime", true);
+        assert!(created);
+        assert_eq!(ov.is_volatile(volatile), Some(true));
+        assert_eq!(ov.volatile_len(), 1);
+        assert_eq!(ov.nonvolatile_shadow_len(), 0);
+
+        let (again, created_again) = ov.create_with_volatility(r"\runtime", false);
+        assert_eq!(again, volatile);
+        assert!(!created_again);
+        assert_eq!(
+            ov.is_volatile(again),
+            Some(true),
+            "reopening a key with different CreateOptions must not mutate key metadata"
+        );
+
+        let (shadow, created_shadow) = ov.create_with_volatility(r"\shadow", false);
+        assert!(created_shadow);
+        assert_eq!(ov.is_volatile(shadow), Some(false));
+        assert_eq!(ov.volatile_len(), 1);
+        assert_eq!(ov.nonvolatile_shadow_len(), 1);
+    }
+
+    #[test]
+    fn reattached_overlay_slot_gets_new_volatility() {
+        let mut ov = RegistryOverlay::new();
+        let (idx, created) = ov.create_with_volatility(r"\registry\user\s-1-5-21-1", false);
+        assert!(created);
+        assert_eq!(ov.is_volatile(idx), Some(false));
+        ov.set_value(idx, "Stale", 4, &7u32.to_le_bytes());
+        assert_eq!(ov.detach_subtree(r"\registry\user\s-1-5-21-1"), 1);
+        assert_eq!(ov.is_volatile(idx), None);
+
+        let (again, created_again) = ov.create_with_volatility(r"\registry\user\s-1-5-21-1", true);
+        assert_eq!(again, idx);
+        assert!(created_again);
+        assert_eq!(ov.is_volatile(idx), Some(true));
+        assert_eq!(ov.values_len(idx), 0);
     }
 
     #[test]

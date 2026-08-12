@@ -1059,8 +1059,15 @@ before unrelated executive traffic monopolises the receive loop.
   boots reuse persisted `SOFTWARE`, `SECURITY`, `SAM`, profile hive, and writable-profile directory
   state, then reach genuine userinit/Explorer shell chrome without first-boot-only evidence. Further
   storage work moves to D4 semantics and real-device hardening rather than D3 proof closure.
-- `[ ]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
-  behavior needed for repeat boots.
+- `[~]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
+  behavior needed for repeat boots. The first D4 slice gives the volatile registry overlay
+  first-class key volatility metadata and pins NT create semantics host-side: `REG_OPTION_VOLATILE`
+  controls only creation of a new key, reopening an existing key keeps the original key identity and
+  storage class, detached overlay slots reattach with fresh volatility and no stale values, and the
+  executive now opens existing mounted mutable-hive keys even when callers supply
+  `REG_OPTION_VOLATILE`. Remaining D4 work is volatile hive/query metadata, log replay integration
+  for mutable checkpoints, and broader setup/user-profile durability semantics beyond the current
+  desktop repeat-boot proof.
 
 ## Immediate Iteration
 

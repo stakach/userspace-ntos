@@ -17748,17 +17748,17 @@ impl ExecNtHandler {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // Disposition/storage split: existing overlay keys keep their overlay identity
-                // because they may be volatile. Non-volatile keys owned by a mounted mutable hive
-                // now open/create in the Hive Manager instead of shadowing through the overlay.
+                // because they may be volatile. Existing mounted-hive keys open from the Hive
+                // Manager even when the caller supplied REG_OPTION_VOLATILE; the volatile bit only
+                // controls creation of a new key. Non-volatile new keys owned by a mounted mutable
+                // hive are created in the Hive Manager instead of shadowing through the overlay.
                 let create_options = args[5] as u32;
                 let create_volatile = create_options & 0x1 != 0;
                 let overlay_existing = self.overlay.find(&canon);
-                let mutable_existing = if create_volatile {
-                    None
-                } else {
-                    self.mutable_hives.resolve_key(&full)
-                };
-                let base_existing = if mutable_existing.is_none() {
+                let mutable_existing = self.mutable_hives.resolve_key(&full);
+                let base_existing = if mutable_existing.is_none()
+                    && !self.mutable_hive_owns_path(&full)
+                {
                     self.resolve_key(&full)
                 } else {
                     None
@@ -17982,7 +17982,9 @@ impl ExecNtHandler {
                 } else {
                     None
                 };
-                let (oidx, _) = self.overlay.create_owned(durable_canon);
+                let (oidx, _) = self
+                    .overlay
+                    .create_owned_with_volatility(durable_canon, create_volatile);
                 if let Some(descriptor) = initial_security.as_deref() {
                     if !self.overlay.set_key_security_descriptor(oidx, descriptor) {
                         return 0xC000_0008;
