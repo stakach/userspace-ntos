@@ -4319,3 +4319,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   writes. Review adjustment: the next D3 slice should implement the executive `SnapshotBlockDevice`
   backend over this reserve, then use it to restore `writable_fs` before first-boot provisioning and
   commit checkpoints after hive/profile flushes.
+
+  D3 executive snapshot backend (2026-08-12): `writable_fs` now mounts from the latest valid
+  two-slot snapshot in the raw reserve before provisioning missing installed source trees. The
+  executive implements `nt_fs::SnapshotBlockDevice` over the AHCI reserve, reads/writes absolute LBAs
+  through the existing DMA frame, rejects corrupt snapshot payloads instead of silently fabricating a
+  fresh volume, and records restore/commit generations and byte counts. Writable-volume dirty
+  tracking is now split: the existing `writable_fs_dirty` still pins per-boot handle/tree allocations,
+  while a module-local snapshot dirty bit is set only by durable tree mutations (create/overwrite,
+  write, rename/delete, provisioning, and delete-on-close). Explicit atomic hive replacement and
+  `NtFlushBuffersFile` commit dirty snapshots synchronously; the service loop acts as a lazy writer
+  after it pins the overlay heap mark so temporary snapshot serialization is reclaimed by the normal
+  per-syscall allocator reset. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: next run a serialized desktop boot twice from the same
+  disk image and gate on first boot committing a snapshot, second boot restoring it, and the shell
+  reaching desktop paint without re-provision-only evidence.

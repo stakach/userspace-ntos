@@ -7992,9 +7992,17 @@ pub(crate) unsafe fn service_sec_image(
                 // reset. Exactly the `overlay_dirty` contract, for the file system instead of the
                 // registry; bounded (the profile tree is a handful of nodes) and only on the
                 // iterations that actually touched the volume.
-                if nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty() {
+                let writable_fs_touched =
+                    nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty();
+                if writable_fs_touched {
                     nt_handler.writable_fs_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
+                    let snapshot_status = crate::writable_fs::checkpoint_dirty_volume();
+                    if snapshot_status != nt_fs::STATUS_SUCCESS {
+                        print_str(b"[writable-fs-snapshot] service-loop checkpoint status=0x");
+                        print_hex(snapshot_status);
+                        print_str(b"\n");
+                    }
                 }
                 if take_shared_image_mapping_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);

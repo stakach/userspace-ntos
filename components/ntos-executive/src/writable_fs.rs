@@ -22,10 +22,10 @@
 //!   read-only reader uses) is at or under one of [`WRITABLE_PREFIXES`]. Other fixed-drive paths can
 //!   still acquire real writable-layer entries when user mode creates them, while installed files
 //!   remain sourced from the read-only FAT image until they are actually written.
-//! * **Backing.** [`nt_fs::MemFs`] behind the [`nt_fs::FileSystem`] `Zw*` facade — RAM-backed and
-//!   therefore **not persistent across boots**, which is a deliberate, user-approved staging step.
-//!   Persisting these writes through to FAT32 is a separate, tracked milestone; when it lands only
-//!   the backing behind this module changes, because every caller is above the `Zw*` seam.
+//! * **Backing.** [`nt_fs::MemFs`] behind the [`nt_fs::FileSystem`] `Zw*` facade, restored from and
+//!   checkpointed to the raw snapshot reserve after the FAT volume when that reserve contains a valid
+//!   snapshot. The callers stay above the `Zw*` seam: persistence changes the backing source, not
+//!   create/read/write semantics.
 //! * **Handles.** An open file object is owned by a per-process `nt-process` handle
 //!   (`HandleObject::OverlayFile`), so it is closable, duplicable and reclaimed with the process
 //!   like every other executive object.
@@ -236,11 +236,19 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
     let len = image.len() as u64;
     *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
     NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
-    if let Some(fs) = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut() {
+    if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
         let Some(bytes) = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref() else {
             return false;
         };
-        fs.provision_file(DEFAULT_USER_NTUSER_DAT, bytes)
+        let provisioned = {
+            let fs = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut().unwrap();
+            fs.provision_file(DEFAULT_USER_NTUSER_DAT, bytes)
+        };
+        if provisioned {
+            mark_snapshot_dirty();
+            let _ = checkpoint_dirty_volume();
+        }
+        provisioned
     } else {
         true
     }
@@ -307,6 +315,17 @@ pub(crate) static CONFIG_SOURCE_SOFTWARE_HIVE_OK: AtomicU64 = AtomicU64::new(0);
 /// created lazily so a boot that never writes pays nothing).
 static mut EXEC_WRITABLE_FS: Option<nt_fs::FileSystem> = None;
 static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
+static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
+static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_RESTORE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_COMMITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Statistics — every one of these is a REAL operation that went through the `Zw*` surface.
 pub(crate) static OVERLAY_CREATES: AtomicU64 = AtomicU64::new(0);
@@ -387,6 +406,292 @@ pub(crate) fn note_profile_file_create(pi: usize, relative: &[u8]) {
     }
 }
 
+struct AhciSnapshotDevice {
+    fat: Fat32,
+    start_lba: u32,
+    sectors: u32,
+}
+
+impl AhciSnapshotDevice {
+    unsafe fn from_exec_fs() -> Option<Self> {
+        let fat = crate::fs_loader::exec_fs()?;
+        let (start_lba, sectors) = crate::fs_loader::writable_snapshot_reserve(&fat)?;
+        Some(Self {
+            fat,
+            start_lba,
+            sectors,
+        })
+    }
+
+    fn absolute_lba(&self, lba: u64) -> Result<u32, nt_fs::SnapshotBlockStoreError> {
+        let relative = u32::try_from(lba).map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        if relative >= self.sectors {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
+        }
+        self.start_lba
+            .checked_add(relative)
+            .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)
+    }
+}
+
+impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
+    fn sector_size(&self) -> usize {
+        512
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.sectors as u64
+    }
+
+    fn read_sector(
+        &mut self,
+        lba: u64,
+        out: &mut [u8],
+    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        if out.len() != self.sector_size() {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let absolute = self.absolute_lba(lba)?;
+        let tfd = unsafe {
+            ahci_read_sector(
+                self.fat.ahci_vaddr,
+                self.fat.dma_vaddr,
+                self.fat.dma_paddr,
+                absolute as u64,
+            )
+        };
+        if tfd & 0x89 != 0 {
+            return Err(nt_fs::SnapshotBlockStoreError::Io);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (self.fat.dma_vaddr + 0x800) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        Ok(())
+    }
+
+    fn write_sector(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        if data.len() != self.sector_size() {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let absolute = self.absolute_lba(lba)?;
+        let tfd = unsafe { crate::fs_loader::fat_write_sector(&self.fat, absolute, data) };
+        if tfd & 0x89 == 0 {
+            Ok(())
+        } else {
+            Err(nt_fs::SnapshotBlockStoreError::Io)
+        }
+    }
+}
+
+fn mark_snapshot_dirty() {
+    WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+}
+
+fn create_information_changes_volume(information: u32) -> bool {
+    information == nt_fs::FILE_CREATED
+        || information == nt_fs::FILE_OVERWRITTEN
+        || information == nt_fs::FILE_SUPERSEDED
+}
+
+fn snapshot_store_error_status(err: nt_fs::SnapshotBlockStoreError) -> u32 {
+    match err {
+        nt_fs::SnapshotBlockStoreError::OutOfMemory
+        | nt_fs::SnapshotBlockStoreError::OutOfSpace
+        | nt_fs::SnapshotBlockStoreError::InvalidGeometry => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+        nt_fs::SnapshotBlockStoreError::Io | nt_fs::SnapshotBlockStoreError::Corrupt => 0xC000_0001,
+    }
+}
+
+fn snapshot_export_error_status(err: nt_fs::MemFsSnapshotError) -> u32 {
+    match err {
+        nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+        _ => 0xC000_0001,
+    }
+}
+
+fn print_snapshot_store_error(err: nt_fs::SnapshotBlockStoreError) {
+    print_str(match err {
+        nt_fs::SnapshotBlockStoreError::InvalidGeometry => b"invalid-geometry",
+        nt_fs::SnapshotBlockStoreError::OutOfSpace => b"out-of-space",
+        nt_fs::SnapshotBlockStoreError::Io => b"io",
+        nt_fs::SnapshotBlockStoreError::Corrupt => b"corrupt",
+        nt_fs::SnapshotBlockStoreError::OutOfMemory => b"out-of-memory",
+    });
+}
+
+fn print_snapshot_export_error(err: nt_fs::MemFsSnapshotError) {
+    print_str(match err {
+        nt_fs::MemFsSnapshotError::BadMagic => b"bad-magic",
+        nt_fs::MemFsSnapshotError::BadChecksum => b"bad-checksum",
+        nt_fs::MemFsSnapshotError::Truncated => b"truncated",
+        nt_fs::MemFsSnapshotError::UnsupportedVersion => b"unsupported-version",
+        nt_fs::MemFsSnapshotError::InvalidRecord => b"invalid-record",
+        nt_fs::MemFsSnapshotError::InvalidPath => b"invalid-path",
+        nt_fs::MemFsSnapshotError::NameCollision => b"name-collision",
+        nt_fs::MemFsSnapshotError::OutOfMemory => b"out-of-memory",
+    });
+}
+
+unsafe fn restore_snapshot_volume() -> Result<Option<(nt_fs::FileSystem, u64, usize)>, u32> {
+    let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
+        WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[writable-fs-snapshot] no executable FAT/reserve geometry for restore\n");
+        return Err(0xC000_0001);
+    };
+    let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
+    match store.read_latest(&mut dev) {
+        Ok(Some(stored)) => {
+            let generation = stored.generation;
+            let bytes = stored.payload.len();
+            match nt_fs::FileSystem::from_volume_snapshot(&stored.payload) {
+                Ok(fs) => Ok(Some((fs, generation, bytes))),
+                Err(err) => {
+                    WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[writable-fs-snapshot] restore payload rejected err=");
+                    print_snapshot_export_error(err);
+                    print_str(b" generation=");
+                    print_u64(generation);
+                    print_str(b" bytes=");
+                    print_u64(bytes as u64);
+                    print_str(b"\n");
+                    Err(snapshot_export_error_status(err))
+                }
+            }
+        }
+        Ok(None) => {
+            WRITABLE_FS_SNAPSHOT_EMPTY_MOUNTS.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[writable-fs-snapshot] no stored snapshot in reserve sectors=");
+            print_u64(dev.sectors as u64);
+            print_str(b"\n");
+            Ok(None)
+        }
+        Err(err) => {
+            WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[writable-fs-snapshot] restore failed err=");
+            print_snapshot_store_error(err);
+            print_str(b"\n");
+            Err(snapshot_store_error_status(err))
+        }
+    }
+}
+
+unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
+    let Some(fs) = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref() else {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    };
+    let payload = match fs.export_volume_snapshot() {
+        Ok(payload) => payload,
+        Err(err) => {
+            print_str(b"[writable-fs-snapshot] export failed err=");
+            print_snapshot_export_error(err);
+            print_str(b"\n");
+            return Err(snapshot_export_error_status(err));
+        }
+    };
+    let Some(mut dev) = AhciSnapshotDevice::from_exec_fs() else {
+        print_str(b"[writable-fs-snapshot] no executable FAT/reserve geometry for commit\n");
+        return Err(0xC000_0001);
+    };
+    let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
+    let generation = match store.commit_next(&mut dev, &payload) {
+        Ok(generation) => generation,
+        Err(err) => {
+            print_str(b"[writable-fs-snapshot] commit failed err=");
+            print_snapshot_store_error(err);
+            print_str(b" bytes=");
+            print_u64(payload.len() as u64);
+            print_str(b"\n");
+            return Err(snapshot_store_error_status(err));
+        }
+    };
+    Ok((generation, payload.len()))
+}
+
+pub(crate) unsafe fn checkpoint_dirty_volume() -> u32 {
+    if !WRITABLE_FS_SNAPSHOT_DIRTY.swap(false, Ordering::AcqRel) {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    match checkpoint_volume_snapshot() {
+        Ok((generation, bytes)) => {
+            WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
+            WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
+            WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
+            print_str(b"[writable-fs-snapshot] committed generation=");
+            print_u64(generation);
+            print_str(b" bytes=");
+            print_u64(bytes as u64);
+            print_str(b"\n");
+            nt_fs::STATUS_SUCCESS
+        }
+        Err(status) => {
+            WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
+            WRITABLE_FS_SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[writable-fs-snapshot] dirty checkpoint retained after status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            status
+        }
+    }
+}
+
+fn has_directory_relative(fs: &nt_fs::FileSystem, relative: &[u8]) -> bool {
+    fs.query_attributes_relative(relative)
+        .is_some_and(|info| info.is_directory)
+}
+
+fn refresh_restored_profile_proofs(fs: &mut nt_fs::FileSystem) {
+    PROFILE_SOURCE_PROBE_OK.store(
+        (fs.file_bytes(DEFAULT_USER_PROBE_FILE) == Some(b"@start %1")) as u64,
+        Ordering::Relaxed,
+    );
+    PROFILE_SOURCE_ENTRIES.store(
+        count_entries(fs, DEFAULT_USER_PROFILE_DIR),
+        Ordering::Relaxed,
+    );
+    let ntuser_len = hive_image_len_on(fs, DEFAULT_USER_NTUSER_DAT);
+    if ntuser_len != 0 {
+        NTUSER_DAT_PROVISIONED.store(ntuser_len as u64, Ordering::Relaxed);
+    }
+}
+
+fn refresh_restored_config_proofs(fs: &nt_fs::FileSystem) {
+    CONFIG_SOURCE_SYSTEM_HIVE_OK.store(
+        (hive_image_len_on(fs, CONFIG_SYSTEM_HIVE_PATH) != 0) as u64,
+        Ordering::Relaxed,
+    );
+    CONFIG_SOURCE_SOFTWARE_HIVE_OK.store(
+        (hive_image_len_on(fs, CONFIG_SOFTWARE_HIVE_PATH) != 0) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> bool {
+    let mut changed = false;
+    if PROVISION_DEFAULT_USER_PROFILE && !has_directory_relative(fs, PROFILES_VOLUME_ROOT_RELATIVE) {
+        let before = fs.node_count();
+        provision_staged_profiles(fs);
+        changed |= fs.node_count() != before;
+    } else {
+        refresh_restored_profile_proofs(fs);
+    }
+    if !has_directory_relative(fs, CONFIG_VOLUME_ROOT_RELATIVE) {
+        let before = fs.node_count();
+        provision_staged_config(fs);
+        changed |= fs.node_count() != before;
+    } else {
+        refresh_restored_config_proofs(fs);
+    }
+    changed
+}
+
 /// The live writable volume, mounting it on first use. `None` when the overlay is bypassed.
 ///
 /// # Safety
@@ -395,16 +700,41 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
     if !WRITABLE_OVERLAY_MOUNTED {
         return None;
     }
+    if WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return None;
+    }
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     if slot.is_none() {
-        *slot = Some(nt_fs::FileSystem::new(nt_fs::MemFs::new()));
-        let fs = slot.as_mut().unwrap();
-        selftest(fs);
-        if PROVISION_DEFAULT_USER_PROFILE {
-            provision_staged_profiles(fs);
+        let (mut fs, restored) = match restore_snapshot_volume() {
+            Ok(Some((fs, generation, bytes))) => {
+                WRITABLE_FS_SNAPSHOT_RESTORES.fetch_add(1, Ordering::Relaxed);
+                WRITABLE_FS_SNAPSHOT_RESTORE_GENERATION.store(generation, Ordering::Relaxed);
+                WRITABLE_FS_SNAPSHOT_RESTORE_BYTES.store(bytes as u64, Ordering::Relaxed);
+                print_str(b"[writable-fs-snapshot] restored generation=");
+                print_u64(generation);
+                print_str(b" bytes=");
+                print_u64(bytes as u64);
+                print_str(b" nodes=");
+                print_u64(fs.node_count() as u64);
+                print_str(b"\n");
+                (fs, true)
+            }
+            Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
+            Err(status) => {
+                WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+                print_str(b"[writable-fs-snapshot] refusing writable mount after restore status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                return None;
+            }
+        };
+        selftest(&mut fs);
+        let provisioned = provision_missing_installed_sources(&mut fs);
+        *slot = Some(fs);
+        if provisioned || !restored {
+            mark_snapshot_dirty();
+            WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
         }
-        provision_staged_config(fs);
-        WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
     }
     slot.as_mut()
 }
@@ -471,6 +801,9 @@ pub(crate) unsafe fn create(
         options,
     );
     if result.status == nt_fs::STATUS_SUCCESS {
+        if create_information_changes_volume(result.information) {
+            mark_snapshot_dirty();
+        }
         match result.information {
             nt_fs::FILE_CREATED => {
                 OVERLAY_CREATES.fetch_add(1, Ordering::Relaxed);
@@ -556,7 +889,12 @@ pub(crate) unsafe fn provision_directory_relative(relative: &[u8]) -> bool {
     let Some(fs) = writable_fs() else {
         return false;
     };
-    fs.provision_directory_relative(relative)
+    let before = fs.node_count();
+    let provisioned = fs.provision_directory_relative(relative);
+    if provisioned && fs.node_count() != before {
+        mark_snapshot_dirty();
+    }
+    provisioned
 }
 
 /// `NtReadFile` on a writable-volume file object.
@@ -606,6 +944,9 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_WRITTEN.fetch_add(written as u64, Ordering::Relaxed);
+        if written != 0 {
+            mark_snapshot_dirty();
+        }
     } else {
         trace_io_refusal(b"write", file_id, byte_offset, data.len(), status);
     }
@@ -650,73 +991,86 @@ fn delete_open_file(fs: &mut nt_fs::FileSystem, handle: u64) {
 /// # Safety
 /// Single-threaded executive; borrows the mounted writable volume for the duration of the replace.
 pub(crate) unsafe fn write_file_atomic(path: &str, bytes: &[u8]) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
-    };
-    let tmp_path = alloc::format!("{}.TMP", path);
-    let create = fs.zw_create_file(
-        &tmp_path,
-        nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
-        0,
-        0,
-        nt_fs::FILE_OVERWRITE_IF,
-        0,
-    );
-    if create.status != nt_fs::STATUS_SUCCESS {
-        return create.status;
-    }
-
-    let (write_status, written) = fs.zw_write_file(create.handle, Some(0), bytes);
-    if write_status != nt_fs::STATUS_SUCCESS {
-        delete_open_file(fs, create.handle);
-        return write_status;
-    }
-    if written != bytes.len() {
-        delete_open_file(fs, create.handle);
-        return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    let eof = (bytes.len() as u64).to_le_bytes();
-    let status =
-        fs.zw_set_information_file(create.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
-    if status != nt_fs::STATUS_SUCCESS {
-        delete_open_file(fs, create.handle);
-        return status;
-    }
-    let status = fs.zw_flush_buffers_file(create.handle);
-    if status != nt_fs::STATUS_SUCCESS {
-        delete_open_file(fs, create.handle);
-        return status;
-    }
-
-    let rename = match rename_information(true, 0, path) {
-        Ok(rename) => rename,
-        Err(status) => {
-            delete_open_file(fs, create.handle);
-            return status;
+    let status = 'replace: {
+        let Some(fs) = writable_fs() else {
+            break 'replace nt_fs::STATUS_INVALID_HANDLE;
+        };
+        let tmp_path = alloc::format!("{}.TMP", path);
+        let create = fs.zw_create_file(
+            &tmp_path,
+            nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+            0,
+            0,
+            nt_fs::FILE_OVERWRITE_IF,
+            0,
+        );
+        if create.status != nt_fs::STATUS_SUCCESS {
+            break 'replace create.status;
         }
+
+        let (write_status, written) = fs.zw_write_file(create.handle, Some(0), bytes);
+        if write_status != nt_fs::STATUS_SUCCESS {
+            delete_open_file(fs, create.handle);
+            break 'replace write_status;
+        }
+        if written != bytes.len() {
+            delete_open_file(fs, create.handle);
+            break 'replace nt_fs::STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        let eof = (bytes.len() as u64).to_le_bytes();
+        let status =
+            fs.zw_set_information_file(create.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
+        if status != nt_fs::STATUS_SUCCESS {
+            delete_open_file(fs, create.handle);
+            break 'replace status;
+        }
+        let status = fs.zw_flush_buffers_file(create.handle);
+        if status != nt_fs::STATUS_SUCCESS {
+            delete_open_file(fs, create.handle);
+            break 'replace status;
+        }
+
+        let rename = match rename_information(true, 0, path) {
+            Ok(rename) => rename,
+            Err(status) => {
+                delete_open_file(fs, create.handle);
+                break 'replace status;
+            }
+        };
+        let status =
+            fs.zw_set_information_file(create.handle, nt_fs::FILE_RENAME_INFORMATION, &rename);
+        if status != nt_fs::STATUS_SUCCESS {
+            delete_open_file(fs, create.handle);
+            break 'replace status;
+        }
+        let status = fs.zw_flush_buffers_file(create.handle);
+        let _ = fs.zw_close(create.handle);
+        status
     };
-    let status = fs.zw_set_information_file(create.handle, nt_fs::FILE_RENAME_INFORMATION, &rename);
-    if status != nt_fs::STATUS_SUCCESS {
-        delete_open_file(fs, create.handle);
-        return status;
-    }
-    let status = fs.zw_flush_buffers_file(create.handle);
-    let _ = fs.zw_close(create.handle);
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        mark_snapshot_dirty();
+        return checkpoint_dirty_volume();
     }
     status
 }
 
 /// `NtFlushBuffersFile` on a writable-volume file object.
 pub(crate) unsafe fn flush(file_id: u64) -> u32 {
-    let Some(fs) = writable_fs() else {
-        return nt_fs::STATUS_INVALID_HANDLE;
+    let status = {
+        let Some(fs) = writable_fs() else {
+            return nt_fs::STATUS_INVALID_HANDLE;
+        };
+        fs.zw_flush_buffers_file(file_id)
     };
-    fs.zw_flush_buffers_file(file_id)
+    if status == nt_fs::STATUS_SUCCESS {
+        checkpoint_dirty_volume()
+    } else {
+        status
+    }
 }
 
 /// `NtQueryInformationFile` metadata for a writable-volume file object.
@@ -732,6 +1086,7 @@ pub(crate) unsafe fn set_information(file_id: u64, class: u32, data: &[u8]) -> u
     let status = fs.zw_set_information_file(file_id, class, data);
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        mark_snapshot_dirty();
     }
     status
 }
@@ -859,8 +1214,12 @@ pub(crate) unsafe fn retain(file_id: u64) -> Result<(), u32> {
 /// `NtClose` on a writable-volume file object (honours a pending delete).
 pub(crate) unsafe fn close(file_id: u64) {
     if let Some(fs) = writable_fs() {
+        let before = fs.node_count();
         if fs.zw_close(file_id) == nt_fs::STATUS_SUCCESS {
             OVERLAY_CLOSES.fetch_add(1, Ordering::Relaxed);
+            if fs.node_count() != before {
+                mark_snapshot_dirty();
+            }
         }
     }
 }
@@ -1157,16 +1516,18 @@ fn count_entries(fs: &mut nt_fs::FileSystem, path: &str) -> u64 {
 /// hosted processes use: create a directory, create a file in it, write bytes, read them back,
 /// enumerate the directory and see the file, then delete both and confirm they are gone. Each
 /// check that passes sets one bit of [`OVERLAY_SELFTEST`]; the scratch subtree is removed, so the
-/// volume is left EMPTY (just its root) for the hosted processes.
+/// mounted volume has the same node occupancy after the probe that it had before the probe.
 ///
 /// It runs on `\.fsselftest\…`, deliberately NOT under any [`WRITABLE_PREFIXES`] entry, so no
-/// hosted-process syscall can reach it and — crucially — `\profiles` is left untouched: when
-/// winlogon later creates `C:\Profiles` it is genuinely the creator.
+/// hosted-process syscall can reach it and — crucially — it leaves preexisting mounted state
+/// untouched: on a first boot `\profiles` is still absent, while on a restored boot no persisted node
+/// is added or removed.
 fn selftest(fs: &mut nt_fs::FileSystem) {
     const DIR: &str = r"\??\C:\.fsselftest";
     const FILE: &str = r"\??\C:\.fsselftest\probe.bin";
     const PAYLOAD: &[u8] = b"writable overlay probe";
     let mut bits = 0u64;
+    let initial_nodes = fs.node_count();
 
     // (1) A real directory create.
     let dir = fs.zw_create_file(
@@ -1299,9 +1660,8 @@ fn selftest(fs: &mut nt_fs::FileSystem) {
     if fs.query_attributes(FILE).is_none() && fs.query_attributes(DIR).is_none() {
         bits |= 1 << 7;
     }
-    // (9) …and the volume is back to exactly its root: the self-test left nothing behind, so
-    // `\profiles` is still absent and winlogon's create will genuinely be the creating one.
-    if fs.node_count() == 1 {
+    // (9) …and the volume is back to the exact occupancy it had before the scratch probe.
+    if fs.node_count() == initial_nodes {
         bits |= 1 << 8;
     }
     OVERLAY_SELFTEST.store(bits, Ordering::Relaxed);
