@@ -8141,6 +8141,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(DLL_CACHE_FULL.load(Ordering::Relaxed));
     print_str(b" shared-dup=");
     print_u64(DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed));
+    print_str(b" sec-img-private-skip=");
+    print_u64(SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.load(Ordering::Relaxed));
     print_str(b" freelist=");
     print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");

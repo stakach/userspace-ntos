@@ -14,6 +14,13 @@ const SEC_IMAGE_PREFETCH_SOFT_SLOT_HEADROOM: u64 = 96 * 1024;
 const SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM: u64 = 64 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM: u64 = 16 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_PRIVATE_PREFETCH_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct SecImageForwardPolicy {
+    pages: u64,
+    private_neighbours: bool,
+}
 static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
@@ -660,7 +667,7 @@ fn ntgdi_create_bitmap_bits_size(
     Some(size as usize)
 }
 
-fn sec_image_forward_run() -> u64 {
+fn sec_image_forward_policy() -> SecImageForwardPolicy {
     let slots_cap =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_used = NEXT_SLOT.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
@@ -691,6 +698,7 @@ fn sec_image_forward_run() -> u64 {
     } else {
         SEC_IMAGE_PREFETCH_STEADY_PAGES
     };
+    let private_neighbours = batch_pages == SEC_IMAGE_PREFETCH_STEADY_PAGES;
     if batch_pages != SEC_IMAGE_PREFETCH_STEADY_PAGES {
         if SEC_IMAGE_PREFETCH_THROTTLE_LOGGED.swap(1, Ordering::Relaxed) == 0 {
             print_str(b"[sec-image] forward prefetch throttled under pool pressure: cslots=");
@@ -710,10 +718,15 @@ fn sec_image_forward_run() -> u64 {
             print_u64((slot_critical || frame_critical || untyped_critical) as u64);
             print_str(b" batch=");
             print_u64(batch_pages);
+            print_str(b" private-neighbours=");
+            print_u64(private_neighbours as u64);
             print_str(b"\n");
         }
     }
-    batch_pages
+    SecImageForwardPolicy {
+        pages: batch_pages,
+        private_neighbours,
+    }
 }
 
 fn hosted_thread_tcb_or_zero(nt_handler: &ExecNtHandler, tid: u64) -> u64 {
@@ -6157,7 +6170,8 @@ pub(crate) unsafe fn service_sec_image(
             // demand paging; once root-slot, frame-registry, or root-Untyped pressure approaches the
             // gate, shrink the speculative run so late service DLL loads stop pre-residenting mostly
             // untouched pages.
-            let (batch_start, batch_pages) = (page, sec_image_forward_run());
+            let forward_policy = sec_image_forward_policy();
+            let (batch_start, batch_pages) = (page, forward_policy.pages);
             let mut allocation_failed = false;
             let mut image_protect_failed = false;
             let mut bi: u64 = 0;
@@ -6252,6 +6266,11 @@ pub(crate) unsafe fn service_sec_image(
                         image_fault_plan.map_protection,
                     );
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                if !is_fault_page && !shareable && !forward_policy.private_neighbours {
+                    SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    bi += 1;
+                    continue;
+                }
                 if is_fault_page && image_fault_plan.copy_on_write {
                     let read_fault_protection =
                         nt_address_space::image_view_fault_plan(image_view_info.protect, false)

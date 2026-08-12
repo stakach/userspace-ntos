@@ -102,6 +102,18 @@ root-Untyped headroom to `33476KiB`; `exec_vm_pool_headroom` remains the only re
 a clean gate, so it is not the retained policy. The next reduction must come from total resident
 frame/retype sharing or reclaim, not more prefetch shrinking or gate relaxation.
 
+Current SEC_IMAGE private-neighbour slice (2026-08-12): under pressure, speculative forward prefetch
+now keeps the actual faulting image page authoritative but stops pre-residenting non-shareable
+private neighbour pages. This preserves immutable/text sharing and demand-fill correctness while
+avoiding thousands of early private frame retypes for pages the boot wave may never touch. Serialized
+validation `.tmp/run-desktop-secimage-private-prefetch-skip-20260812.log` reaches the sentinel with
+real Explorer shell chrome still green (`exec_explorer_process_spawned`,
+`exec_explorer_wndproc_installed_by_client`, and `exec_explorer_shell_chrome_painted` pass), records
+`sec-img-private-skip=29265`, and improves final headroom to `ut-free=43099KiB` with
+`frame-reg=19881`. `exec_vm_pool_headroom` remains the only red gate, so the remaining work is roughly
+another 6 MiB of real sharing/reclaim or a measured correction to what the gate considers live root
+pressure.
+
 Current process-lifetime reclaim slice (2026-08-12): final `NtTerminateProcess` teardown now runs a
 generic process VM reclaim pass. It writes back and drops generic mapped-section views for the
 terminating process, clears DLL mapped-view flags through a host-tested `nt-dll-registry`
