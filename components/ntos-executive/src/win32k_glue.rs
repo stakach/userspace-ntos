@@ -53,6 +53,7 @@ static USER_CALLBACK_DEAD_CLIENT_UNWINDS: AtomicU64 = AtomicU64::new(0);
 /// either returned by the client or torn down because the client died).
 static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_OWNER_MISMATCHES: AtomicU64 = AtomicU64::new(0);
@@ -615,6 +616,12 @@ fn callback_process_role_code(role: Option<nt_exe_image::HostedProcessRole>) -> 
         Some(nt_exe_image::HostedProcessRole::InteractiveLogon) => {
             win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_LOGON as u32
         }
+        Some(nt_exe_image::HostedProcessRole::ServiceControlManager) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER as u32
+        }
+        Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority) => {
+            win32k_subsystem::HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY as u32
+        }
         Some(nt_exe_image::HostedProcessRole::NonInteractiveService) => {
             win32k_subsystem::HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE as u32
         }
@@ -638,6 +645,12 @@ fn callback_process_role_from_code(code: u32) -> Option<nt_exe_image::HostedProc
         }
         win32k_subsystem::HOSTED_PROCESS_ROLE_INTERACTIVE_LOGON => {
             Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER => {
+            Some(nt_exe_image::HostedProcessRole::ServiceControlManager)
+        }
+        win32k_subsystem::HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY => {
+            Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority)
         }
         win32k_subsystem::HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE => {
             Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
@@ -2212,45 +2225,85 @@ unsafe fn resume_suspended_user_callback_component(
 /// is necessarily the array's top whichever threads have chains open: it was pushed by the callback
 /// request the executive is still servicing, so no other client event has been able to run since.
 pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
-    let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-    let Some(active_frame) = active.top().copied() else {
-        return (0xC000_0001u32 as i32, false);
-    };
-    if active_frame.is_redirected() {
-        return (0xC000_0001u32 as i32, false);
+    const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
+    let mut cancelled_count = 0u64;
+    let mut last_status = STATUS_UNSUCCESSFUL;
+    while cancelled_count < nt_user_callback::MAX_CONTINUATION_DEPTH as u64 {
+        let (request, dispatch_context, cancelled_frame) = {
+            let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+            let Some(active_frame) = active.top().copied() else {
+                if cancelled_count != 0 {
+                    abort_controlled_user_callbacks();
+                }
+                return (last_status, false);
+            };
+            if active_frame.is_redirected() {
+                if cancelled_count != 0 {
+                    abort_controlled_user_callbacks();
+                }
+                return (STATUS_UNSUCCESSFUL, false);
+            }
+            let request = *active_frame.request();
+            let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+            let dispatch_context = *active_frame.dispatch_context();
+            write_callback_failure_reply(request, STATUS_UNSUCCESSFUL);
+            let unwind_ok = unwind_controlled_callback(request);
+            let cancelled = active.cancel_pending(correlation);
+            let Ok(cancelled_frame) = cancelled else {
+                abort_controlled_user_callbacks();
+                return (STATUS_UNSUCCESSFUL, false);
+            };
+            restore_client_callback_window(cancelled_frame);
+            if !unwind_ok {
+                abort_controlled_user_callbacks();
+                return (STATUS_UNSUCCESSFUL, false);
+            }
+            (request, dispatch_context, cancelled_frame)
+        };
+
+        cancelled_count += 1;
+        let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+            dispatch_context,
+        );
+        let result = resume_suspended_user_callback_component(
+            request,
+            callback_client_from_frame(request, cancelled_frame),
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+            previous_dispatch,
+        );
+        last_status = result.status;
+
+        if result.callback_suspended {
+            let n = USER_CALLBACK_CANCEL_CHAINED.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[user-callback] cancel propagated to chained callback api=");
+                let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+                let api = active
+                    .top()
+                    .map(|frame| frame.request().api_index as u64)
+                    .unwrap_or(u64::MAX);
+                print_u64(api);
+                print_str(b" cancelled=");
+                print_u64(cancelled_count);
+                print_str(b"\n");
+            }
+            continue;
+        }
+
+        let stack_ok = result.completed && unwind_controlled_dispatch(request);
+        if !stack_ok {
+            abort_controlled_user_callbacks();
+        }
+        return (result.status, stack_ok);
     }
-    let request = *active_frame.request();
-    let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
-    let dispatch_context = *active_frame.dispatch_context();
-    write_callback_failure_reply(request, 0xc000_0001u32 as i32);
-    let unwind_ok = unwind_controlled_callback(request);
-    let cancelled = active.cancel_pending(correlation);
-    if let Ok(frame) = cancelled {
-        restore_client_callback_window(frame);
-    }
-    if !unwind_ok || cancelled.is_err() {
-        abort_controlled_user_callbacks();
-        return (0xC000_0001u32 as i32, false);
-    }
-    let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    core::ptr::write(
-        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        dispatch_context,
-    );
-    let result = resume_suspended_user_callback_component(
-        request,
-        callback_client_from_frame(request, active_frame),
-    );
-    core::ptr::write(
-        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        previous_dispatch,
-    );
-    let stack_ok =
-        result.completed && !result.callback_suspended && unwind_controlled_dispatch(request);
-    if !stack_ok {
-        abort_controlled_user_callbacks();
-    }
-    (result.status, stack_ok)
+
+    print_str(b"[user-callback] cancel chain exceeded bounded continuation depth\n");
+    abort_controlled_user_callbacks();
+    (last_status, false)
 }
 
 unsafe fn print_crash_hex64(value: u64) {

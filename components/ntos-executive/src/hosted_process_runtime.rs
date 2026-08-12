@@ -228,6 +228,8 @@ fn address_layout_for_image(
             })
         }
         nt_exe_image::HostedProcessRole::InteractiveLogon
+        | nt_exe_image::HostedProcessRole::ServiceControlManager
+        | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
         | nt_exe_image::HostedProcessRole::NonInteractiveService => {
             core_service_layout(image.pi).or_else(|| dynamic_layout(image.pi))
         }

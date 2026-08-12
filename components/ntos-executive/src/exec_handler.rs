@@ -5995,11 +5995,12 @@ impl ExecNtHandler {
     }
 
     fn current_process_is_noninteractive_service(&self) -> bool {
-        self.current_process_has_role(nt_exe_image::HostedProcessRole::NonInteractiveService)
+        self.current_hosted_process_role()
+            .is_some_and(nt_exe_image::HostedProcessRole::is_noninteractive_service_class)
     }
 
     fn current_process_is_services(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"services.exe")
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::ServiceControlManager)
     }
 
     fn current_process_is_smss(&self) -> bool {
@@ -6011,7 +6012,7 @@ impl ExecNtHandler {
     }
 
     fn current_process_is_lsass(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"lsass.exe")
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::LocalSecurityAuthority)
     }
 
     fn current_process_is_winlogon(&self) -> bool {
@@ -6031,6 +6032,8 @@ impl ExecNtHandler {
             self.current_hosted_process_role(),
             Some(
                 nt_exe_image::HostedProcessRole::InteractiveLogon
+                    | nt_exe_image::HostedProcessRole::ServiceControlManager
+                    | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
                     | nt_exe_image::HostedProcessRole::NonInteractiveService
                     | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
                     | nt_exe_image::HostedProcessRole::InteractiveShell
@@ -6043,6 +6046,8 @@ impl ExecNtHandler {
             self.current_hosted_process_role(),
             Some(
                 nt_exe_image::HostedProcessRole::InteractiveLogon
+                    | nt_exe_image::HostedProcessRole::ServiceControlManager
+                    | nt_exe_image::HostedProcessRole::LocalSecurityAuthority
                     | nt_exe_image::HostedProcessRole::NonInteractiveService
                     | nt_exe_image::HostedProcessRole::InteractiveShellBootstrap
                     | nt_exe_image::HostedProcessRole::InteractiveShell
@@ -15443,7 +15448,7 @@ impl ExecNtHandler {
 
     fn dynamic_child_role(&self) -> Option<nt_exe_image::HostedProcessRole> {
         match self.current_hosted_process_role()? {
-            nt_exe_image::HostedProcessRole::NonInteractiveService => {
+            role if role.is_noninteractive_service_class() => {
                 Some(nt_exe_image::HostedProcessRole::NonInteractiveService)
             }
             nt_exe_image::HostedProcessRole::InteractiveShellBootstrap

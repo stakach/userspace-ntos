@@ -4122,3 +4122,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   active frontier is post-desktop generic timer/resource cleanup under service pressure, with final
   pool state around `ut-free=8239KiB`, `slot-free=1284`, and executive heap `7675240/8388608`, not
   profile loading, dynamic process identity, userinit/explorer launch, or shell paint.
+
+  Callback-cancel/role-cleanup checkpoint (2026-08-12): core boot image identities no longer need to
+  collapse `services.exe` and `lsass.exe` into the generic `NonInteractiveService` role just so exact
+  executable-leaf checks keep working. They are now explicit `ServiceControlManager` and
+  `LocalSecurityAuthority` roles, while code that needs the NT service-session behaviour asks the
+  role-class predicate (`is_noninteractive_service_class`) instead of matching a single enum variant.
+  This keeps the boundary explicit without reintroducing path-name dispatch.
+
+  The same slice fixed a real win32k/user-callback lifecycle bug exposed by the user's quiesce trace:
+  an executive-originated win32k redrive can cancel a parked user callback, and resuming win32k through
+  that failure can immediately raise a second callback before the original dispatch completes. The old
+  cancellation path treated that as corruption and aborted the callback stacks, leaving the pump
+  accounting live. `cancel_suspended_user_callback` now drains that bounded callback-cancellation chain
+  through the ordinary `KeUserModeCallback`/`NtCallbackReturn` continuation path until win32k completes
+  the root dispatch. Local validation is green: `cargo fmt --all`, `cargo test -p nt-exe-image`,
+  `cargo test -p nt-io-completion`, `cargo test -p nt-user-callback`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  and `git diff --check`.
+
+  Serialized desktop retry `.tmp/run-desktop-callback-cancel-chain-20260812.log` confirms the specific
+  hang signature is gone: win32k transport reports `completions=3236/3236`, `reply-errors=0`, and
+  `suspended-outstanding=0`; the real user-callback proof reports `real-redirects=216`,
+  `real-returns=216`, `continuation-pushes=1409`, and `continuation-unwinds=1409`; `exec_delay_timer_disarms`,
+  `exec_vm_pool_headroom`, login dialog paint, LSA logon, userinit, profile loading, and Explorer process
+  spawn all pass. This was not a full desktop-shell proof (`284/295`): Explorer connects to win32k
+  (`NtUserProcessConnect`, plus two early USER calls) but does not reach its first
+  `NtUserCreateWindowEx`, shell COM open, api0 callback, or shell chrome paint before the gate.
+
+  New active frontier: Explorer is runnable in `nfs41_np.dll`'s TLS/CRT startup path after MPR loads
+  the registry-ordered network provider. The earlier green proof faults the same provider at
+  `nfs41_np+0x3460` and then immediately continues to the provider `.data` faults
+  (`0x821e6018`, `0x821e6040`) before loading the shell UI stack. The latest retry logs the
+  `0x821e3460` page fault but never observes the next provider fault or any later Explorer progress;
+  census stays fixed at `explorer total=327 native=324 win32k=3`. Treat this as a generic image-loader /
+  runnable-thread / network-provider initialization issue. Do not add Explorer, MPR, or NFS-specific
+  shell shortcuts; the next repair should either prove a serviced VM fault always resumes into the
+  next guest access, or expose the real user-mode wait/spin it enters.

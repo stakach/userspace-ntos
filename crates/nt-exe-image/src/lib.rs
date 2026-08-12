@@ -88,17 +88,30 @@ pub enum HostedProcessRole {
     NativeSession,
     Win32Subsystem,
     InteractiveLogon,
+    ServiceControlManager,
+    LocalSecurityAuthority,
     NonInteractiveService,
     InteractiveShellBootstrap,
     InteractiveShell,
 }
 
 impl HostedProcessRole {
+    pub fn is_noninteractive_service_class(self) -> bool {
+        matches!(
+            self,
+            Self::ServiceControlManager
+                | Self::LocalSecurityAuthority
+                | Self::NonInteractiveService
+        )
+    }
+
     pub fn uses_win32_client_gdi(self) -> bool {
         matches!(
             self,
             Self::Win32Subsystem
                 | Self::InteractiveLogon
+                | Self::ServiceControlManager
+                | Self::LocalSecurityAuthority
                 | Self::NonInteractiveService
                 | Self::InteractiveShellBootstrap
                 | Self::InteractiveShell
@@ -269,7 +282,8 @@ impl<'a, const N: usize> HostedImageCatalog<'a, N> {
     }
 
     pub fn path_is_noninteractive_service(&self, path: &[u8]) -> bool {
-        self.role_for_path(path) == Some(HostedProcessRole::NonInteractiveService)
+        self.role_for_path(path)
+            .is_some_and(HostedProcessRole::is_noninteractive_service_class)
     }
 
     pub fn probe_image(
@@ -663,7 +677,8 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
     }
 
     pub fn path_is_noninteractive_service(&self, path: &[u8]) -> bool {
-        self.role_for_path(path) == Some(HostedProcessRole::NonInteractiveService)
+        self.role_for_path(path)
+            .is_some_and(HostedProcessRole::is_noninteractive_service_class)
     }
 
     pub fn probe_image(
@@ -1272,7 +1287,7 @@ mod tests {
             3,
             SERVICES_TOP_BADGE,
             b"services.exe",
-            HostedProcessRole::NonInteractiveService,
+            HostedProcessRole::ServiceControlManager,
             b"\\SystemRoot\\System32\\services.exe",
             b"services.exe",
             HostedImageRoot::System32,
@@ -1282,7 +1297,7 @@ mod tests {
             4,
             LSASS_TOP_BADGE,
             b"lsass.exe",
-            HostedProcessRole::NonInteractiveService,
+            HostedProcessRole::LocalSecurityAuthority,
             b"\\SystemRoot\\System32\\lsass.exe",
             b"lsass.exe",
             HostedImageRoot::System32,
@@ -1935,11 +1950,11 @@ mod tests {
 
         assert_eq!(
             catalog.role_for_path(br"\SystemRoot\System32\SERVICES.EXE"),
-            Some(HostedProcessRole::NonInteractiveService)
+            Some(HostedProcessRole::ServiceControlManager)
         );
         assert_eq!(
             catalog.role_for_path(br"\??\C:\ReactOS\System32\lsass.exe"),
-            Some(HostedProcessRole::NonInteractiveService)
+            Some(HostedProcessRole::LocalSecurityAuthority)
         );
         assert!(catalog.path_is_noninteractive_service(b"services.exe"));
         assert!(catalog.path_is_noninteractive_service(b"LSASS.EXE"));
@@ -1953,6 +1968,8 @@ mod tests {
         assert!(!HostedProcessRole::NativeSession.uses_win32_client_gdi());
         assert!(HostedProcessRole::Win32Subsystem.uses_win32_client_gdi());
         assert!(HostedProcessRole::InteractiveLogon.uses_win32_client_gdi());
+        assert!(HostedProcessRole::ServiceControlManager.uses_win32_client_gdi());
+        assert!(HostedProcessRole::LocalSecurityAuthority.uses_win32_client_gdi());
         assert!(HostedProcessRole::NonInteractiveService.uses_win32_client_gdi());
         assert!(HostedProcessRole::InteractiveShellBootstrap.uses_win32_client_gdi());
         assert!(HostedProcessRole::InteractiveShell.uses_win32_client_gdi());
@@ -1964,7 +1981,7 @@ mod tests {
 
         let services = catalog.get_by_pi(3).unwrap();
         assert_eq!(services.top_badge, SERVICES_TOP_BADGE);
-        assert_eq!(services.role, HostedProcessRole::NonInteractiveService);
+        assert_eq!(services.role, HostedProcessRole::ServiceControlManager);
         assert_eq!(
             services.nt_image_path,
             b"\\SystemRoot\\System32\\services.exe"

@@ -277,6 +277,8 @@ pub const HOSTED_PROCESS_ROLE_INTERACTIVE_LOGON: u64 = 3;
 pub const HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE: u64 = 4;
 pub const HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP: u64 = 5;
 pub const HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL: u64 = 6;
+pub const HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER: u64 = 7;
+pub const HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY: u64 = 8;
 
 /// The registered win32k service metadata published by `KeAddSystemServiceTable`.
 ///
@@ -297,6 +299,15 @@ pub fn registered_win32k_service_metadata() -> Option<(u64, u32, u64)> {
             Some((base, count, argument_table))
         }
     }
+}
+
+fn hosted_process_role_is_noninteractive_service_class(process_role: u64) -> bool {
+    matches!(
+        process_role,
+        HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+            | HOSTED_PROCESS_ROLE_SERVICE_CONTROL_MANAGER
+            | HOSTED_PROCESS_ROLE_LOCAL_SECURITY_AUTHORITY
+    )
 }
 
 /// Component-side lookup of the provider's win32k x64 SSPT/KiArgumentTable arity.
@@ -6003,7 +6014,7 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
         WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed),
     );
     link_processinfo_to_eprocess(process_index);
-    if process_role == HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE {
+    if hosted_process_role_is_noninteractive_service_class(process_role) {
         let n = WIN32K_NONINTERACTIVE_WINSTA_RESOLVES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
@@ -6192,7 +6203,7 @@ unsafe fn selected_thread_desktop(
         }
     }
 
-    if process_role != HOSTED_PROCESS_ROLE_NONINTERACTIVE_SERVICE
+    if !hosted_process_role_is_noninteractive_service_class(process_role)
         && BOUND_DESK_BODY != 0
         && BOUND_DESK_PDESKINFO != 0
     {

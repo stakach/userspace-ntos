@@ -8840,7 +8840,7 @@ pub(crate) unsafe fn service_sec_image(
                 let uses_client_gdi = process_role
                     .is_some_and(nt_exe_image::HostedProcessRole::uses_win32_client_gdi);
                 let svc_noninteractive =
-                    process_role == Some(nt_exe_image::HostedProcessRole::NonInteractiveService);
+                    process_role.is_some_and(|role| role.is_noninteractive_service_class());
                 let dialog_modal_expected_ssn = if winlogon_gui_client {
                     winlogon_dialog_modal_expected_ssn()
                 } else {
