@@ -65,8 +65,19 @@ regressed mapped-section/ALPC/selftest behavior plus Explorer shell gates (`283/
 view references must own the section past `NtClose`. Local validation for the corrected lifetime rule
 is green: `cargo fmt --all` and
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
-Next serialized desktop proof should verify both that the late stale-section `vmf-out` no longer
-reproduces and that mapped-section/ALPC plus shell chrome gates return to green.
+Accepted serialized desktop proof
+`.tmp/run-desktop-generic-section-release-20260812.log` verifies the corrected lifetime rule. The
+late stale-section remap no longer reproduces, mapped-section/ALPC behavior is back to green
+(`exec_alpc_section_view_cross_vspace` passes), and real Explorer shell chrome remains green:
+Explorer process spawn, create-window string capture, registered shell messages, redirected user
+callbacks, client WndProc install, shell COM class service, and
+`exec_explorer_shell_chrome_painted` all pass. The proof reaches the harness sentinel at `293/295`.
+The two remaining red gates are not shell or section-frontier failures; they are lifecycle-proof
+semantics. `PM_IDENTITY_OK` covers every hosted EPROCESS that has been admitted, while
+`PM_MAIN_THREADS_OK` and `PM_EXEC_LINK_OK` intentionally drop legitimately terminated dynamic
+processes whose live main thread/mechanism state has been reclaimed. The next slice is to make those
+gate expectations dynamic from ProcessManager's Running state, without hardcoding pi values or image
+names.
 
 Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
 path in per-process guarded child CNodes. The shared-image mapping table records each map cap as

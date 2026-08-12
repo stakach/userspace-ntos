@@ -1825,6 +1825,7 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
     PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
     reset_hosted_gate_metadata();
+    PM_RUNNING_PROCESS_MASK.store(0, Ordering::Relaxed);
     PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
     HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
     PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
@@ -6074,6 +6075,7 @@ impl ExecNtHandler {
     fn refresh_process_manager_gates(&self) {
         let mut process_count = 0u64;
         let mut identity_ok = 0u64;
+        let mut running_process_mask = 0u64;
         let mut main_threads_ok = 0u64;
         let mut min_handle_cap = usize::MAX;
         let mut max_handle_cap = 0usize;
@@ -6081,12 +6083,18 @@ impl ExecNtHandler {
             let Some(pid) = self.pm_pid_for_pi(pi) else {
                 continue;
             };
+            let bit = if pi < 64 { 1u64 << pi } else { 0 };
             process_count += 1;
             let handle_cap = self.pm.handle_capacity(pid);
             min_handle_cap = min_handle_cap.min(handle_cap);
             max_handle_cap = max_handle_cap.max(handle_cap);
             let distinct = (0..MAX_PI)
                 .all(|other_pi| other_pi == pi || self.pm_pid_for_pi(other_pi) != Some(pid));
+            let process_running = self
+                .pm
+                .process(pid)
+                .is_some_and(|process| process.state == nt_process::ProcessState::Running);
+            let mut image_identity_ok = false;
             if let Some(image) = self.hosted_process_image(pi) {
                 if distinct
                     && self.pm.process(pid).is_some_and(|process| {
@@ -6095,27 +6103,28 @@ impl ExecNtHandler {
                             .eq_ignore_ascii_case(image.process_name)
                     })
                 {
-                    identity_ok |= 1 << pi;
+                    image_identity_ok = true;
+                    identity_ok |= bit;
                 }
+            }
+            if image_identity_ok && process_running {
+                running_process_mask |= bit;
             }
             let tid = self.pm_main_tid_for_pi(pi).unwrap_or(0);
             if tid != 0 {
-                let running = self
-                    .pm
-                    .process(pid)
-                    .is_some_and(|process| process.state == nt_process::ProcessState::Running);
                 let cid_ok = self.pm.client_id(tid)
                     == Some(nt_process::ClientId {
                         unique_process: pid,
                         unique_thread: tid,
                     });
-                if self.pm.main_thread(pid) == Some(tid) && running && cid_ok {
-                    main_threads_ok |= 1 << pi;
+                if self.pm.main_thread(pid) == Some(tid) && process_running && cid_ok {
+                    main_threads_ok |= bit;
                 }
             }
         }
         PM_PROC_COUNT.store(process_count, Ordering::Relaxed);
         PM_IDENTITY_OK.store(identity_ok, Ordering::Relaxed);
+        PM_RUNNING_PROCESS_MASK.store(running_process_mask, Ordering::Relaxed);
         PM_MAIN_THREADS_OK.store(main_threads_ok, Ordering::Relaxed);
         PM_HANDLE_CAP_BOOT.store(
             if process_count == 0 {

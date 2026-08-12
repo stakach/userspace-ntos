@@ -20034,8 +20034,11 @@ pub(crate) static PM_POOL_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// reclaimable yet. The selector must continue to another slot instead of falsely reporting pool
 /// exhaustion.
 pub(crate) static PM_POOL_UNRECLAIMABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// Bit i set iff hosted EPROCESS pi=i has proven image identity and ProcessManager still reports it
+/// Running. Identity persists after process termination; live thread/mechanism proofs use this mask.
+static PM_RUNNING_PROCESS_MASK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
-/// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
+/// ClientId resolves — proves each running hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
 /// Post-loop proof bits for hosted runtime roles that were promoted to live TCB-backed records.
 static HOSTED_THREAD_RUNTIME_OK: AtomicU64 = AtomicU64::new(0);
@@ -25535,12 +25538,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" growths=0x");
                     print_hex(growths as u32);
                     print_str(b" (dynamic capacity pinned)\n");
-                    // Path 2 — lifecycle: real ETHREADs back the main threads (bound to their image
-                    // entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm (proven
-                    // by the post-loop self-test on a throwaway EPROCESS; hosted processes are untouched).
+                    // Path 2 — lifecycle: real ETHREADs back the live main threads (bound to their
+                    // image entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm.
+                    // Hosted EPROCESS identity is durable; main-thread liveness is only required for
+                    // processes ProcessManager still reports Running.
+                    let hosted_running_process_mask =
+                        PM_RUNNING_PROCESS_MASK.load(Ordering::Relaxed);
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == hosted_process_mask,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == hosted_running_process_mask,
                         &mut passed,
                     );
                     check(
@@ -25891,12 +25897,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &mut passed,
                     );
                     // Path 3 — the ex-parallel per-pi identity arrays (pml4s/scratch_bases/
-                    // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
-                    // EPROCESS-linked via its `pid`. The expected mask follows the hosted-image
-                    // catalog so this proof moves with the boot process set.
+                    // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each live
+                    // slot EPROCESS-linked via its `pid`. The expected mask follows ProcessManager's
+                    // current Running state; terminated EPROCESS identities remain covered above.
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == hosted_process_mask,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == hosted_running_process_mask,
                         &mut passed,
                     );
                     // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32
@@ -26072,6 +26078,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b"\n");
                     print_str(b"[ntos-exec] nt-process path2: main-threads-ok=0x");
                     print_hex(PM_MAIN_THREADS_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b" running-mask=0x");
+                    print_hex(hosted_running_process_mask as u32);
                     print_str(b" binds=0x");
                     print_hex(PM_THREAD_BINDS.load(Ordering::Relaxed) as u32);
                     print_str(b" open-ok=0x");
