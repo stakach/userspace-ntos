@@ -71,13 +71,22 @@ late stale-section remap no longer reproduces, mapped-section/ALPC behavior is b
 (`exec_alpc_section_view_cross_vspace` passes), and real Explorer shell chrome remains green:
 Explorer process spawn, create-window string capture, registered shell messages, redirected user
 callbacks, client WndProc install, shell COM class service, and
-`exec_explorer_shell_chrome_painted` all pass. The proof reaches the harness sentinel at `293/295`.
-The two remaining red gates are not shell or section-frontier failures; they are lifecycle-proof
-semantics. `PM_IDENTITY_OK` covers every hosted EPROCESS that has been admitted, while
-`PM_MAIN_THREADS_OK` and `PM_EXEC_LINK_OK` intentionally drop legitimately terminated dynamic
-processes whose live main thread/mechanism state has been reclaimed. The next slice is to make those
-gate expectations dynamic from ProcessManager's Running state, without hardcoding pi values or image
-names.
+`exec_explorer_shell_chrome_painted` all pass. That proof reached the harness sentinel at `293/295`.
+The two red gates were lifecycle-proof semantics, not shell or section-frontier failures:
+`PM_IDENTITY_OK` covers every hosted EPROCESS that has been admitted, while `PM_MAIN_THREADS_OK` and
+`PM_EXEC_LINK_OK` intentionally drop legitimately terminated dynamic processes whose live main
+thread/mechanism state has been reclaimed.
+
+Completed lifecycle-proof slice (2026-08-12): commit `e89f7e1` makes the live ETHREAD and ProcExec
+mechanism expectations dynamic from ProcessManager's Running state, without hardcoding pi values or
+image names. Accepted desktop proof
+`.tmp/run-desktop-running-process-gates-20260812.log` reaches the harness sentinel with `295/295`
+checks passing. The process-lifecycle gates now show durable hosted EPROCESS identity
+`identity-ok=0x37ff`, live running expectation `running-mask=0x21ff`, main-thread proof
+`main-threads-ok=0x21ff`, and live ProcExec proof `exec-link-ok=0x21ff`. The same run keeps VM pool
+headroom, ALPC cross-vspace section views, profile/userinit/explorer launch, redirected user
+callbacks, client WndProc install, shell COM classes, and real Explorer shell chrome all green; the
+final Explorer framebuffer is fully non-background with at least 32 distinct colors.
 
 Current cap-lifetime slice: shareable SEC_IMAGE process map caps now have a mechanism-owned storage
 path in per-process guarded child CNodes. The shared-image mapping table records each map cap as
