@@ -7812,6 +7812,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(vm_reclaim.registered_frames);
                         print_str(b" shared-maps=");
                         print_u64(vm_reclaim.shared_image_maps);
+                        print_str(b" dll-cache-evict=");
+                        print_u64(vm_reclaim.dll_cache_evictions);
                         print_str(b" dll-views=");
                         print_u64(vm_reclaim.dll_views);
                         print_str(b" section-views=");
@@ -17673,6 +17675,24 @@ pub(crate) unsafe fn service_sec_image(
     print_u64(core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64);
     print_str(b" shared_hits=");
     print_u64(DLL_SHARED_HITS.load(Ordering::Relaxed));
+    print_str(b"\n[sec-stop] scratch-faults/pi=");
+    for (pi, proc) in procs.iter().enumerate() {
+        if pi != 0 {
+            print_str(b",");
+        }
+        print_u64(pi as u64);
+        print_str(b":");
+        print_u64(proc.faults);
+    }
+    print_str(b" scratch-low-pts/pi=");
+    for (pi, proc) in procs.iter().enumerate() {
+        if pi != 0 {
+            print_str(b",");
+        }
+        print_u64(pi as u64);
+        print_str(b":");
+        print_u64(proc.faults.saturating_add(511) / 512);
+    }
     print_str(b"\n[sec-stop] badge=");
     print_u64(badge);
     print_str(b" (");

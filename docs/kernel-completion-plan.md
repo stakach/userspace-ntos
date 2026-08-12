@@ -162,6 +162,26 @@ production predicate remains immutable image pages plus execute/read text derive
 fault plan. Future clean-data sharing needs a stronger resident-data/write-copy proof, likely at the
 VAD/section-object layer, before changing the live SEC_IMAGE predicate again.
 
+Current DLL-cache reclaim slice (2026-08-12): the shared DLL cache is no longer treated as a
+run-forever source-frame sink. Process final teardown now unmaps the dying process's shared image
+mapping caps, then scans the global DLL source cache and returns any page with no remaining process
+mapping through the normal VM frame recycler. This preserves the real SEC_IMAGE contract: resident
+shared views retain their process map caps, and an evicted, currently-unmapped page can be refilled
+by an ordinary later image fault. The process teardown census now reports `dll-cache-evict=`, and
+the pool census reports cumulative `shared-evict=` plus the per-pi image bank distribution so future
+headroom runs identify whether pressure is live sharing or dead cache. The stop-time SEC_IMAGE
+census also reports per-pi scratch fault counts so the next residency reduction can be aimed at a
+mechanism and not at a process-name special case. Validation: `cargo fmt --all`, `cargo check
+--manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+`.tmp/run-desktop-dll-cache-reclaim-20260812.log`. The desktop proof reaches the sentinel with real
+userinit/explorer, real shell COM, and `exec_explorer_shell_chrome_painted` green; the only remaining
+red gate is still `exec_vm_pool_headroom`. The proof explicitly reports `shared-evict=0`,
+`shared-frames=2954`, `image-bank-pis=16`, and `ut-free=42639KiB`, so the remaining pressure is live
+resident image/view state, not a dead shared-cache tail. Next reduction target: live resident-frame
+reduction by stronger image sharing or demand/reclaim of speculative private image residency, without
+relaxing the gate.
+
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the
 external timeout. The previous winlogon crash in `user32!IntGetWindowLong(GWLP_ID)` is gone.

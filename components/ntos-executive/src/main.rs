@@ -6983,9 +6983,10 @@ fn root_slot_available_count() -> u64 {
 // A DLL's RX (text) page is identical across processes — each DLL is loaded at a fixed system-wide
 // base and (for the ServerDlls) pre-relocated, so no per-process relocation touches its code. So we
 // fill each such page ONCE into a frame and map THAT frame read-only into every process that faults
-// it — real Windows image sharing (fewer frames, one fill). Keyed by page VA (base+rva). Frames
-// persist for the run (no process teardown yet). Accessed via raw pointers to avoid the
-// static_mut_refs lint; single-threaded executive, so no races.
+// it — real Windows image sharing (fewer frames, one fill). Keyed by page VA (base+rva). Cache
+// frames persist while at least one process owns a shared mapping for the page; teardown evicts
+// unreferenced source frames so service churn does not pin dead image text forever. Accessed via raw
+// pointers to avoid the static_mut_refs lint; single-threaded executive, so no races.
 const DLL_CACHE_CAP: usize = 16384;
 static mut DLL_CACHE_VA: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
 static mut DLL_CACHE_FR: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
@@ -6993,6 +6994,7 @@ static mut DLL_CACHE_N: usize = 0;
 static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_FULL: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// The shared frame cap for page VA `va`, or 0 if not yet cached.
 unsafe fn dll_cache_get(va: u64) -> u64 {
     let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
@@ -7026,6 +7028,41 @@ unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
         DLL_CACHE_FULL.fetch_add(1, Ordering::Relaxed);
         false
     }
+}
+
+unsafe fn dll_cache_evict_index(index: usize) {
+    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)).min(DLL_CACHE_CAP);
+    if index >= n {
+        return;
+    }
+    let vas = core::ptr::addr_of_mut!(DLL_CACHE_VA) as *mut u64;
+    let frs = core::ptr::addr_of_mut!(DLL_CACHE_FR) as *mut u64;
+    let frame = core::ptr::read(frs.add(index));
+    vm_frame_release(frame, 0);
+    let last = n - 1;
+    if index != last {
+        core::ptr::write(vas.add(index), core::ptr::read(vas.add(last)));
+        core::ptr::write(frs.add(index), core::ptr::read(frs.add(last)));
+    }
+    core::ptr::write(vas.add(last), 0);
+    core::ptr::write(frs.add(last), 0);
+    core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), last);
+    DLL_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
+    let mut evicted = 0u64;
+    let mut index = 0usize;
+    while index < core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)).min(DLL_CACHE_CAP) {
+        let page = core::ptr::read((core::ptr::addr_of!(DLL_CACHE_VA) as *const u64).add(index));
+        if !shared_image_mapping_page_referenced(page) {
+            dll_cache_evict_index(index);
+            evicted = evicted.saturating_add(1);
+        } else {
+            index += 1;
+        }
+    }
+    evicted
 }
 
 // --- per-process private-page frame tracking ------------------------------------------------------
@@ -7895,6 +7932,46 @@ fn image_map_cap_bank_live_next_totals() -> (u64, u64) {
     (live, next)
 }
 
+fn image_map_cap_bank_live_process_count() -> u64 {
+    let mut count = 0u64;
+    for pi in 0..MAX_PI {
+        if IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed) != 0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn print_image_map_cap_bank_top_pi() {
+    let mut used = [false; MAX_PI];
+    let mut printed = 0usize;
+    while printed < FRAME_REGISTRY_TOP_PI_COUNT {
+        let mut best_pi = usize::MAX;
+        let mut best_live = 0u64;
+        for pi in 0..MAX_PI {
+            let live = IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed);
+            if !used[pi] && live > best_live {
+                best_pi = pi;
+                best_live = live;
+            }
+        }
+        if best_pi == usize::MAX || best_live == 0 {
+            break;
+        }
+        if printed != 0 {
+            print_str(b",");
+        }
+        print_u64(best_pi as u64);
+        print_str(b":");
+        print_u64(best_live);
+        used[best_pi] = true;
+        printed += 1;
+    }
+    if printed == 0 {
+        print_str(b"none");
+    }
+}
+
 unsafe fn shared_image_mapping_prepare_insert(pi: u64, page: u64, map_cap: u64) -> bool {
     if pi > u8::MAX as u64 || map_cap == 0 {
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -7957,6 +8034,13 @@ unsafe fn shared_image_mapping_contains(pi: u64, page: u64) -> bool {
     table
         .iter()
         .any(|mapping| mapping.pi as u64 == pi && mapping.page == page)
+}
+
+unsafe fn shared_image_mapping_page_referenced(page: u64) -> bool {
+    let Some(table) = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPINGS)).as_ref() else {
+        return false;
+    };
+    table.iter().any(|mapping| mapping.page == page)
 }
 
 unsafe fn shared_image_mapping_debug(pi: u64, page: u64) -> Option<SharedImageMappingCap> {
@@ -8291,6 +8375,10 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(image_bank_next);
     print_str(b"/");
     print_u64(IMAGE_MAP_CAP_BANK_LIVE_HW.load(Ordering::Relaxed));
+    print_str(b" image-bank-pis=");
+    print_u64(image_map_cap_bank_live_process_count());
+    print_str(b" image-bank-top=");
+    print_image_map_cap_bank_top_pi();
     print_str(b" image-bank-move=");
     print_u64(IMAGE_MAP_CAP_BANK_TO_BANK.load(Ordering::Relaxed));
     print_str(b"/");
@@ -8307,6 +8395,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(DLL_CACHE_FULL.load(Ordering::Relaxed));
     print_str(b" shared-dup=");
     print_u64(DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed));
+    print_str(b" shared-evict=");
+    print_u64(DLL_CACHE_EVICTIONS.load(Ordering::Relaxed));
     print_str(b" sec-img-private-skip=");
     print_u64(SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.load(Ordering::Relaxed));
     print_str(b" freelist=");
@@ -13800,6 +13890,7 @@ struct ProcessVmReclaimStats {
     generic_writeback_failures: u64,
     dll_views: u64,
     shared_image_maps: u64,
+    dll_cache_evictions: u64,
     registered_frames: u64,
     private_pts: u64,
     private_pt_failures: u64,
@@ -13859,6 +13950,7 @@ unsafe fn reclaim_final_process_vm(process_index: u8, handler: &mut ExecNtHandle
     }
 
     stats.shared_image_maps = shared_image_mapping_unmap_process(pi as u64);
+    stats.dll_cache_evictions = dll_cache_evict_unreferenced_all();
     stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
     process_committed_mapping_reset(pi);
     let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
