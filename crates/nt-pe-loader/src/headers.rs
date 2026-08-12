@@ -16,6 +16,7 @@ pub const DIRECTORY_ENTRY_RESOURCE: usize = 2;
 pub const DIRECTORY_ENTRY_BASERELOC: usize = 5;
 pub const DIRECTORY_ENTRY_TLS: usize = 9;
 pub const DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
+pub const DIRECTORY_ENTRY_IAT: usize = 12;
 
 /// Section characteristics (subset).
 pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;

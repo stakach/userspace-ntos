@@ -15,6 +15,9 @@ const SEC_IMAGE_PREFETCH_LOW_SLOT_HEADROOM: u64 = 64 * 1024;
 const SEC_IMAGE_PREFETCH_CRITICAL_SLOT_HEADROOM: u64 = 16 * 1024;
 static SEC_IMAGE_PREFETCH_THROTTLE_LOGGED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SEC_IMAGE_PRIVATE_PREFETCH_SKIPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_CLEAN_WRITECOPY_SHARED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct SecImageForwardPolicy {
@@ -726,6 +729,23 @@ fn sec_image_forward_policy() -> SecImageForwardPolicy {
     SecImageForwardPolicy {
         pages: batch_pages,
         private_neighbours,
+    }
+}
+
+fn sec_image_clean_writecopy_shareable(pe: &nt_pe_loader::PeFile, rva: u32) -> bool {
+    match pe.page_has_loader_writable_state(rva) {
+        Ok(false) => {
+            SEC_IMAGE_CLEAN_WRITECOPY_SHARED.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Ok(true) => {
+            SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(_) => {
+            SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -6257,14 +6277,19 @@ pub(crate) unsafe fn service_sec_image(
                     break;
                 }
                 // SHAREABLE = a registered DLL image page whose live SEC_IMAGE protection is
-                // immutable, or whose read fault plan installs execute/read text. Plain write-copy
-                // data stays private because loader fixups and later COW/protect transitions require
-                // per-process ownership.
+                // immutable, whose read fault plan installs execute/read text, or a plain
+                // write-copy data page that the PE predicate proves has no loader-written state.
+                // Loader-patched pages stay private; later runtime writes to clean shared data still
+                // promote through the normal image COW path.
+                let clean_writecopy_shareable = base != PE_LOAD_BASE
+                    && !image_fault_plan.copy_on_write
+                    && (image_view_info.protect & 0xff) == nt_address_space::PAGE_WRITECOPY
+                    && sec_image_clean_writecopy_shareable(tpe, rva);
                 let shareable = base != PE_LOAD_BASE
-                    && nt_address_space::image_view_shared_cacheable(
+                    && (nt_address_space::image_view_shared_cacheable(
                         image_view_info.protect,
                         image_fault_plan.map_protection,
-                    );
+                    ) || clean_writecopy_shareable);
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
                 if !is_fault_page && !shareable && !forward_policy.private_neighbours {
                     SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);

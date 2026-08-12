@@ -330,6 +330,62 @@ impl<'a> PeFile<'a> {
         u32::try_from(cookie_va.checked_sub(self.headers.image_base)?).ok()
     }
 
+    /// The RVA of the TLS index word (`IMAGE_TLS_DIRECTORY64.AddressOfIndex`) the user-mode loader
+    /// writes while attaching this image. `Ok(None)` means there is no TLS directory or no index word.
+    pub fn tls_index_rva(&self) -> Result<Option<u32>, PeError> {
+        let dir = self.headers.data_directory(headers::DIRECTORY_ENTRY_TLS);
+        if dir.virtual_address == 0 || dir.size == 0 {
+            return Ok(None);
+        }
+        // IMAGE_TLS_DIRECTORY64.AddressOfIndex is the third VA-sized field, at offset 16.
+        if dir.size < 24 {
+            return Err(PeError::Truncated);
+        }
+        let index_va = rva::u64_at_rva(
+            self.bytes,
+            self.sections(),
+            dir.virtual_address
+                .checked_add(16)
+                .ok_or(PeError::Truncated)?,
+        )?;
+        if index_va == 0 {
+            return Ok(None);
+        }
+        let index_rva = index_va
+            .checked_sub(self.headers.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .ok_or(PeError::PatchOutOfBounds)?;
+        Ok(Some(index_rva))
+    }
+
+    /// True when the 4 KiB page containing `rva` carries bytes the loader is expected to write:
+    /// import IAT slots, DIR64 relocation targets, the load-config security cookie, or the TLS index.
+    ///
+    /// SEC_IMAGE can safely share plain write-copy pages only when this returns `Ok(false)`. On any
+    /// parse error, callers should keep the page private.
+    pub fn page_has_loader_writable_state(&self, rva: u32) -> Result<bool, PeError> {
+        let page = rva & !0x0fffu32;
+        if imports::page_has_iat_slot(self.bytes, &self.headers, self.sections(), page)? {
+            return Ok(true);
+        }
+        if relocs::page_has_relocation(self.bytes, &self.headers, self.sections(), page)? {
+            return Ok(true);
+        }
+        if self
+            .security_cookie_rva()
+            .is_some_and(|cookie| rva_range_intersects_page(cookie, 8, page))
+        {
+            return Ok(true);
+        }
+        if self
+            .tls_index_rva()?
+            .is_some_and(|index| rva_range_intersects_page(index, 4, page))
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Seed the image's `__security_cookie` at `code_vaddr + security_cookie_rva()` with
     /// a valid `/GS` cookie ([`SECURITY_COOKIE_SEED`]), the last step before calling
     /// `DriverEntry`. Returns `true` if the image had a cookie to seed. Centralizing this
@@ -416,4 +472,14 @@ impl<'a> PeFile<'a> {
 
 fn page_align_up(n: u32) -> u32 {
     n.saturating_add(0x0fff) & !0x0fffu32
+}
+
+fn rva_range_intersects_page(rva: u32, len: u32, page_start: u32) -> bool {
+    let Some(end) = rva.checked_add(len) else {
+        return true;
+    };
+    let Some(page_end) = page_start.checked_add(0x1000) else {
+        return true;
+    };
+    rva < page_end && end > page_start
 }

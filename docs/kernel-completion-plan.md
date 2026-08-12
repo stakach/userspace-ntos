@@ -158,9 +158,10 @@ but that was not sufficient. Retry logs
 `.tmp/run-desktop-writecopy-image-sharing-guarded-20260812.log` both fail during winsrv
 initialization with `STATUS_ACCESS_VIOLATION`; the guarded run removes the duplicate-map collisions
 but still dies, so plain `PAGE_WRITECOPY` image data is not a production sharing source yet. The
-production predicate remains immutable image pages plus execute/read text derived from the current
-fault plan. Future clean-data sharing needs a stronger resident-data/write-copy proof, likely at the
-VAD/section-object layer, before changing the live SEC_IMAGE predicate again.
+retained production predicate remains immutable image pages plus execute/read text derived from the
+current fault plan. The targeted clean write-copy retry below is the next attempt at the required
+stronger proof; if it regresses desktop boot, keep loader-writeable pages private and do not retain a
+broad data-sharing predicate.
 
 Current DLL-cache reclaim slice (2026-08-12): the shared DLL cache is no longer treated as a
 run-forever source-frame sink. Process final teardown now unmaps the dying process's shared image
@@ -181,6 +182,38 @@ red gate is still `exec_vm_pool_headroom`. The proof explicitly reports `shared-
 resident image/view state, not a dead shared-cache tail. Next reduction target: live resident-frame
 reduction by stronger image sharing or demand/reclaim of speculative private image residency, without
 relaxing the gate.
+
+Current clean write-copy SEC_IMAGE sharing slice (2026-08-12): implemented and validated as a
+mechanism slice. The host-testable `nt-pe-loader` predicate identifies loader-written state on a
+4 KiB image page without allocating in the fault path: IAT slots, relocation targets, load-config
+security cookie storage, and the TLS index word. The executive shares only clean `PAGE_WRITECOPY`
+SEC_IMAGE read faults when that predicate returns `Ok(false)`. Loader-writable pages stay private,
+write faults still promote through the existing image COW path, and predicate parse errors keep the
+page private. This reduces live image residency without changing service launch policy or adding a
+fallback success path.
+
+Validation for the clean write-copy slice is green at the local and shell-behavior levels:
+`cargo fmt --all`, `cargo test -p nt-pe-loader`, `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Serialized desktop proof `.tmp/run-desktop-clean-writecopy-iatdir-20260812.log` reached the sentinel
+with real userinit/explorer shell chrome, `exec_vm_pool_headroom` green, `ut-free=74914KiB`,
+`shared-frames=3311`, `wc-clean-share=11610`, `wc-loader-private=13164`, and
+`wc-pred-err=19807`; that narrower run still had `exec_userinit_scrollbar_classinfo` red. Follow-up
+proof `.tmp/run-desktop-clean-writecopy-relocpred-20260812.log` reached the sentinel under the
+broader 16-process service wave with real Explorer chrome and scrollbar metadata green:
+`exec_userinit_process_spawned`, callback redirect, client WndProc install, shell COM service,
+`exec_userinit_scrollbar_classinfo`, and `exec_explorer_shell_chrome_painted` all pass, and
+`[explorer-fb]` reports the full 1024x768 framebuffer as non-background with at least 32 colors. The
+remaining red gate is again only `exec_vm_pool_headroom`; final metrics are `ut-free=47168KiB`,
+`shared-frames=3385`, `shared-hits=12374`, `image-bank-pis=16`, `wc-clean-share=12450`,
+`wc-loader-private=14793`, and `wc-pred-err=21722`. Compared with the DLL-cache reclaim baseline,
+the slice recovers about 4.5 MiB under the same broad service load, but it does not by itself close
+the headroom gate.
+
+Review adjustment: keep this sharing mechanism, then investigate the high `wc-pred-err` count with
+source-specific predicate counters or a host-side PE survey. After that, continue reducing live root
+pressure through generic per-image map-cap reclaim, per-process section-view reclaim, and terminated
+thread/process lifetime teardown; do not relax the VM pool gate.
 
 Completed desktop-heap mapping slice: `.tmp/run-desktop-desktopheap-mapping-20260811.log` rebuilt
 ntdll, the executive, rust-micro, and the disk image, then ran `./run.sh --desktop` until the

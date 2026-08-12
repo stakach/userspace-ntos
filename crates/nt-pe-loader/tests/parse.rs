@@ -221,6 +221,30 @@ fn imports_are_listed() {
         }
         other => panic!("expected ByName, got {other:?}"),
     }
+    assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
+}
+
+#[test]
+fn iat_directory_marks_loader_writable_state_without_import_walk() {
+    let iat: u32 = 0x2000;
+    let data = Sec {
+        name: *b".idata\0\0",
+        va: iat,
+        chars: 0xC000_0040,
+        data: vec![0u8; 0x40],
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xC3]), data],
+        &[(12, iat, 0x10)], // IMAGE_DIRECTORY_ENTRY_IAT
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.page_has_loader_writable_state(iat).unwrap(), true);
+    assert_eq!(pe.page_has_loader_writable_state(iat + 8).unwrap(), true);
+    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
 }
 
 #[test]
@@ -257,11 +281,50 @@ fn relocations_are_applied_on_rebase() {
     let pe_bytes = build_pe(BASE, 0x1000, 0x4000, &sections, &[(5, reloc_va, 12)]);
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.relocations().unwrap().len(), 2); // DIR64 + ABSOLUTE
+    assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
 
     let new_base = 0x2_0000_0000u64;
     let img = pe.map(new_base).unwrap();
     // The rebased pointer must have the delta applied.
     assert_eq!(img.u64_at_rva(data_va).unwrap(), new_base);
+}
+
+#[test]
+fn unsupported_relocation_kind_marks_only_its_page_loader_writable() {
+    let data_va: u32 = 0x2000;
+    let reloc_va: u32 = 0x3000;
+    let data = vec![0u8; 0x10];
+
+    let mut reloc = vec![0u8; 0];
+    reloc.extend_from_slice(&data_va.to_le_bytes());
+    reloc.extend_from_slice(&12u32.to_le_bytes());
+    reloc.extend_from_slice(&(3u16 << 12).to_le_bytes()); // unsupported by the applier
+    reloc.extend_from_slice(&0u16.to_le_bytes());
+
+    let sections = [
+        text_section(0x1000, vec![0xC3]),
+        Sec {
+            name: *b".data\0\0\0",
+            va: data_va,
+            chars: 0xC000_0040,
+            data,
+        },
+        Sec {
+            name: *b".reloc\0\0",
+            va: reloc_va,
+            chars: 0x4200_0040,
+            data: reloc,
+        },
+    ];
+    let pe_bytes = build_pe(BASE, 0x1000, 0x4000, &sections, &[(5, reloc_va, 12)]);
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(
+        pe.relocations().unwrap_err(),
+        PeError::UnsupportedRelocation(3)
+    );
+    assert_eq!(pe.page_has_loader_writable_state(data_va).unwrap(), true);
+    assert_eq!(pe.page_has_loader_writable_state(reloc_va).unwrap(), false);
 }
 
 #[test]
@@ -286,6 +349,7 @@ fn security_cookie_from_load_config() {
     );
     let pe = PeFile::parse(&pe_bytes).unwrap();
     assert_eq!(pe.security_cookie_rva(), Some(0x3000));
+    assert_eq!(pe.page_has_loader_writable_state(0x3000).unwrap(), true);
 
     // No load-config directory → None.
     let plain = build_pe(
@@ -296,6 +360,35 @@ fn security_cookie_from_load_config() {
         &[],
     );
     assert_eq!(PeFile::parse(&plain).unwrap().security_cookie_rva(), None);
+}
+
+#[test]
+fn tls_index_page_is_loader_writable_state() {
+    let tls_va: u32 = 0x2000;
+    let tls_index_rva: u32 = 0x3000;
+    let mut tls = vec![0u8; 0x28];
+    // IMAGE_TLS_DIRECTORY64.AddressOfIndex at offset 16, stored as a VA.
+    tls[16..24].copy_from_slice(&(BASE + tls_index_rva as u64).to_le_bytes());
+    let tls_sec = Sec {
+        name: *b".tls\0\0\0\0",
+        va: tls_va,
+        chars: 0xC000_0040,
+        data: tls,
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x4000,
+        &[text_section(0x1000, vec![0xC3]), tls_sec],
+        &[(9, tls_va, 0x28)],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.tls_index_rva().unwrap(), Some(tls_index_rva));
+    assert_eq!(
+        pe.page_has_loader_writable_state(tls_index_rva).unwrap(),
+        true
+    );
+    assert_eq!(pe.page_has_loader_writable_state(0x1000).unwrap(), false);
 }
 
 #[test]
@@ -317,6 +410,7 @@ fn protection_from_section_characteristics() {
     assert_eq!(pe.protection_at(0x1000), Protection::ReadExecute); // .text
     assert_eq!(pe.protection_at(0x2000), Protection::ReadWrite); // .data
     assert_eq!(pe.protection_at(0), Protection::ReadOnly); // headers
+    assert_eq!(pe.page_has_loader_writable_state(0x2000).unwrap(), false);
 }
 
 #[test]
@@ -633,6 +727,7 @@ proptest! {
         if let Ok(pe) = PeFile::parse(&bytes) {
             let _ = pe.imports();
             let _ = pe.relocations();
+            let _ = pe.page_has_loader_writable_state(0x1000);
             let _ = pe.map(0x1_0000_0000);
         }
     }
@@ -651,6 +746,7 @@ proptest! {
         if let Ok(pe) = PeFile::parse(&b) {
             let _ = pe.imports();
             let _ = pe.relocations();
+            let _ = pe.page_has_loader_writable_state(0x1000);
             let _ = pe.map(0x2_0000_0000);
         }
     }

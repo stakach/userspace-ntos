@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::headers::{Headers, Section, DIRECTORY_ENTRY_IMPORT};
+use crate::headers::{Headers, Section, DIRECTORY_ENTRY_IAT, DIRECTORY_ENTRY_IMPORT};
 use crate::rva::{cstr_at_rva, u16_at_rva, u32_at_rva, u64_at_rva};
 use crate::PeError;
 
@@ -124,4 +124,97 @@ pub fn parse_imports(
         }
     }
     Ok(out)
+}
+
+fn rva_range_intersects_page(rva: u32, len: u32, page_start: u32) -> bool {
+    let Some(end) = rva.checked_add(len) else {
+        return true;
+    };
+    let Some(page_end) = page_start.checked_add(0x1000) else {
+        return true;
+    };
+    rva < page_end && end > page_start
+}
+
+/// True when the import table contains an IAT slot on the 4 KiB page containing `page_rva`.
+///
+/// This is intentionally non-allocating for the SEC_IMAGE fault path, which only needs to know
+/// whether the user-mode loader will write into the page while snapping imports.
+pub fn page_has_iat_slot(
+    b: &[u8],
+    headers: &Headers,
+    sections: &[Section],
+    page_rva: u32,
+) -> Result<bool, PeError> {
+    let page_start = page_rva & !0x0fffu32;
+    let iat = headers.data_directory(DIRECTORY_ENTRY_IAT);
+    if iat.virtual_address != 0 && iat.size != 0 {
+        return Ok(rva_range_intersects_page(
+            iat.virtual_address,
+            iat.size,
+            page_start,
+        ));
+    }
+
+    let dir = headers.data_directory(DIRECTORY_ENTRY_IMPORT);
+    if dir.virtual_address == 0 || dir.size == 0 {
+        return Ok(false);
+    }
+
+    let mut desc_rva = dir.virtual_address;
+    let mut dlls = 0usize;
+    loop {
+        let original_first_thunk = u32_at_rva(b, sections, desc_rva)?;
+        let name_rva = u32_at_rva(
+            b,
+            sections,
+            desc_rva
+                .checked_add(12)
+                .ok_or(PeError::ImportTableInvalid)?,
+        )?;
+        let first_thunk = u32_at_rva(
+            b,
+            sections,
+            desc_rva
+                .checked_add(16)
+                .ok_or(PeError::ImportTableInvalid)?,
+        )?;
+        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+            return Ok(false);
+        }
+
+        let thunk_table = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        };
+        let mut i: u32 = 0;
+        loop {
+            let thunk_rva = thunk_table
+                .checked_add(i.checked_mul(8).ok_or(PeError::ImportTableInvalid)?)
+                .ok_or(PeError::ImportTableInvalid)?;
+            let iat_slot_rva = first_thunk
+                .checked_add(i.checked_mul(8).ok_or(PeError::ImportTableInvalid)?)
+                .ok_or(PeError::ImportTableInvalid)?;
+            let thunk = u64_at_rva(b, sections, thunk_rva)?;
+            if thunk == 0 {
+                break;
+            }
+            if rva_range_intersects_page(iat_slot_rva, 8, page_start) {
+                return Ok(true);
+            }
+            i += 1;
+            if i > MAX_FUNCS {
+                return Err(PeError::ImportTableInvalid);
+            }
+        }
+
+        dlls += 1;
+        if dlls > MAX_DLLS {
+            return Err(PeError::ImportTableInvalid);
+        }
+        desc_rva = desc_rva
+            .checked_add(20)
+            .ok_or(PeError::ImportTableInvalid)?;
+    }
 }

@@ -8399,6 +8399,12 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(DLL_CACHE_EVICTIONS.load(Ordering::Relaxed));
     print_str(b" sec-img-private-skip=");
     print_u64(SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.load(Ordering::Relaxed));
+    print_str(b" wc-clean-share=");
+    print_u64(SEC_IMAGE_CLEAN_WRITECOPY_SHARED.load(Ordering::Relaxed));
+    print_str(b" wc-loader-private=");
+    print_u64(SEC_IMAGE_WRITECOPY_PRIVATE_LOADER_STATE.load(Ordering::Relaxed));
+    print_str(b" wc-pred-err=");
+    print_u64(SEC_IMAGE_WRITECOPY_PREDICATE_ERRORS.load(Ordering::Relaxed));
     print_str(b" freelist=");
     print_u64(VM_FREE_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");
