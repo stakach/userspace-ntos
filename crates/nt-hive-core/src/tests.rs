@@ -481,6 +481,73 @@ fn image_roundtrips_registry_tree() {
 }
 
 #[test]
+fn subtree_image_roundtrips_selected_key_as_hive_root() {
+    let mut h = Hive::new(HiveKind::System);
+    let services = h.create_key(r"ControlSet001\Services");
+    assert!(h.set_key_class(services, Some("Services Root")));
+    assert!(h.set_value(
+        services,
+        "RootValue",
+        RegistryValueType::Dword,
+        7u32.to_le_bytes().to_vec()
+    ));
+    let descriptor =
+        b"\x01\x00\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    assert!(h.set_key_security_descriptor(services, descriptor));
+    let afd = h.create_key(r"ControlSet001\Services\Afd\Parameters");
+    assert!(h.set_value(
+        afd,
+        "DeviceName",
+        RegistryValueType::Sz,
+        utf16le_sz(r"\Device\Afd")
+    ));
+    let sibling = h.create_key(r"ControlSet001\Control");
+    assert!(h.set_value(
+        sibling,
+        "DoNotSave",
+        RegistryValueType::Dword,
+        1u32.to_le_bytes().to_vec()
+    ));
+
+    let image = try_encode_subtree_image(&h, services).expect("encode subtree");
+    let decoded = decode_image(&image).expect("decode subtree image");
+    assert_eq!(decoded.kind, HiveKind::System);
+    assert_eq!(decoded.key_class(decoded.root()), Some("Services Root"));
+    assert_eq!(
+        decoded.key_security_descriptor(decoded.root()),
+        Some(&descriptor[..])
+    );
+    assert_eq!(
+        decoded.query_value(decoded.root(), "RootValue"),
+        Some((RegistryValueType::Dword, &7u32.to_le_bytes()[..]))
+    );
+    assert!(
+        decoded.open_key(r"ControlSet001").is_none(),
+        "ancestors outside the selected subtree must not be serialized"
+    );
+    let decoded_afd = decoded
+        .open_key(r"Afd\Parameters")
+        .expect("subtree child preserved");
+    assert_eq!(
+        decoded.query_value(decoded_afd, "DeviceName"),
+        Some((RegistryValueType::Sz, utf16le_sz(r"\Device\Afd").as_slice()))
+    );
+    assert!(
+        decoded.open_key(r"Control").is_none(),
+        "siblings outside the selected subtree must not be serialized"
+    );
+}
+
+#[test]
+fn subtree_image_rejects_invalid_root() {
+    let h = Hive::new(HiveKind::Software);
+    assert_eq!(
+        try_encode_subtree_image(&h, CellId(999)),
+        Err(HiveSubtreeEncodeError::InvalidRoot)
+    );
+}
+
+#[test]
 fn imports_control_set_services_into_config_manager() {
     let mut h = Hive::new(HiveKind::System);
     let svc = h.create_key(r"ControlSet001\Services\RpcSs");

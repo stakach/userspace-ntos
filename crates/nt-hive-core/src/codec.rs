@@ -40,6 +40,19 @@ pub enum HiveEncodeError {
     OutOfMemory,
 }
 
+/// Why encoding a selected hive subtree failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveSubtreeEncodeError {
+    InvalidRoot,
+    Encode(HiveEncodeError),
+}
+
+impl From<HiveEncodeError> for HiveSubtreeEncodeError {
+    fn from(value: HiveEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
 // --- image (spec §11) --------------------------------------------------------
 
 /// Serialize a hive to a versioned, checksummed image (spec §11).
@@ -100,6 +113,50 @@ pub fn try_encode_image(hive: &Hive) -> Result<Vec<u8>, HiveEncodeError> {
     put_u64_at(&mut header[20..28], hive.generation);
     put_u64_at(&mut header[28..36], hive.sequence);
     put_u64_at(&mut header[36..44], root.0);
+    put_u64_at(&mut header[44..52], record_count);
+    put_u64_at(&mut header[52..60], payload_len as u64);
+    put_u32_at(&mut header[60..64], payload_crc);
+    let header_crc = crc32c(&header[..IMAGE_HEADER_LEN - 4]);
+    put_u32_at(&mut header[64..68], header_crc);
+    p.buf[..IMAGE_HEADER_LEN].copy_from_slice(&header);
+    Ok(p.buf)
+}
+
+/// Serialize `subtree_root` as a standalone hive image whose root is the selected key.
+///
+/// This is the Configuration Manager subtree-save path used by `NtSaveKey` on non-root keys: the
+/// selected key's values and descendants are preserved, while ancestors outside the subtree are not
+/// emitted into the image.
+pub fn try_encode_subtree_image(
+    hive: &Hive,
+    subtree_root: CellId,
+) -> Result<Vec<u8>, HiveSubtreeEncodeError> {
+    if hive.key(subtree_root).is_none() {
+        return Err(HiveSubtreeEncodeError::InvalidRoot);
+    }
+    let (payload_len, record_count) =
+        subtree_payload_len(hive, subtree_root).map_err(HiveSubtreeEncodeError::Encode)?;
+    let total_len =
+        IMAGE_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(HiveSubtreeEncodeError::Encode(
+                HiveEncodeError::SizeOverflow,
+            ))?;
+    let mut p = CheckedWriter::with_capacity(total_len).map_err(HiveSubtreeEncodeError::Encode)?;
+    p.bytes(&[0u8; IMAGE_HEADER_LEN]);
+    write_subtree_records(hive, subtree_root, subtree_root, &mut p);
+    debug_assert_eq!(p.buf.len(), total_len);
+    let payload_crc = crc32c(&p.buf[IMAGE_HEADER_LEN..]);
+
+    let mut header = [0u8; IMAGE_HEADER_LEN];
+    header[..IMAGE_MAGIC.len()].copy_from_slice(&IMAGE_MAGIC);
+    put_u16_at(&mut header[8..10], IMAGE_HEADER_LEN as u16);
+    put_u16_at(&mut header[10..12], SCHEMA_VERSION);
+    put_u32_at(&mut header[12..16], 0);
+    put_u32_at(&mut header[16..20], hive.kind as u32);
+    put_u64_at(&mut header[20..28], hive.generation);
+    put_u64_at(&mut header[28..36], hive.sequence);
+    put_u64_at(&mut header[36..44], subtree_root.0);
     put_u64_at(&mut header[44..52], record_count);
     put_u64_at(&mut header[52..60], payload_len as u64);
     put_u32_at(&mut header[60..64], payload_crc);
@@ -171,6 +228,81 @@ fn image_payload_len(hive: &Hive) -> Result<usize, HiveEncodeError> {
         len = checked_add(len, value_record_len(hive, value)?)?;
     }
     Ok(len)
+}
+
+fn subtree_payload_len(hive: &Hive, root: CellId) -> Result<(usize, u64), HiveEncodeError> {
+    let Some(key) = hive.key(root) else {
+        return Ok((0, 0));
+    };
+    let mut len = key_record_len(key)?;
+    let mut records = 1u64;
+    for value in &key.values {
+        if let Some(value) = hive.value(*value) {
+            len = checked_add(len, value_record_len(hive, value)?)?;
+            records += 1;
+        }
+    }
+    for child in &key.subkeys {
+        let (child_len, child_records) = subtree_payload_len(hive, *child)?;
+        len = checked_add(len, child_len)?;
+        records = records
+            .checked_add(child_records)
+            .ok_or(HiveEncodeError::SizeOverflow)?;
+    }
+    Ok((len, records))
+}
+
+fn write_key_record(p: &mut CheckedWriter, key: &KeyCell, encoded_parent: CellId) {
+    p.u16(REC_KEY_CELL);
+    p.u64(key.id.0);
+    p.u64(encoded_parent.0);
+    p.str16(&key.name);
+    p.u32(0);
+    match &key.class_name {
+        Some(class_name) => {
+            p.u8(1);
+            p.str16(class_name);
+        }
+        None => p.u8(0),
+    }
+    match &key.security_descriptor {
+        Some(descriptor) => {
+            p.u8(1);
+            p.blob(descriptor);
+        }
+        None => p.u8(0),
+    }
+    p.u64(key.last_write_sequence);
+}
+
+fn write_value_record(p: &mut CheckedWriter, hive: &Hive, value: &ValueCell) {
+    p.u16(REC_VALUE_CELL);
+    p.u64(value.id.0);
+    p.u64(value.parent_key.0);
+    p.str16(&value.name);
+    p.u32(value.value_type as u32);
+    p.blob(hive.value_data(value).unwrap_or(&[]));
+    p.u64(value.last_write_sequence);
+}
+
+fn write_subtree_records(hive: &Hive, root: CellId, subtree_root: CellId, p: &mut CheckedWriter) {
+    let Some(key) = hive.key(root) else {
+        return;
+    };
+    let encoded_parent = if root == subtree_root {
+        CellId(0)
+    } else {
+        key.parent.unwrap_or(CellId(0))
+    };
+    write_key_record(p, key, encoded_parent);
+    for value in &key.values {
+        if let Some(value) = hive.value(*value) {
+            write_value_record(p, hive, value);
+        }
+    }
+    for child in &key.subkeys {
+        write_subtree_records(hive, *child, subtree_root, p);
+    }
 }
 
 fn key_record_len(key: &KeyCell) -> Result<usize, HiveEncodeError> {

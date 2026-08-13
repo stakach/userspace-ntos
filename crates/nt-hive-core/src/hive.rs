@@ -147,7 +147,7 @@ impl Hive {
         self.cells[idx] = Some(cell);
     }
 
-    fn key(&self, id: CellId) -> Option<&KeyCell> {
+    pub(crate) fn key(&self, id: CellId) -> Option<&KeyCell> {
         match self.cells.get(id.0 as usize)?.as_ref()? {
             Cell::Key(k) => Some(k),
             _ => None,
@@ -159,7 +159,7 @@ impl Hive {
             _ => None,
         }
     }
-    fn value(&self, id: CellId) -> Option<&ValueCell> {
+    pub(crate) fn value(&self, id: CellId) -> Option<&ValueCell> {
         match self.cells.get(id.0 as usize)?.as_ref()? {
             Cell::Value(v) => Some(v),
             _ => None,

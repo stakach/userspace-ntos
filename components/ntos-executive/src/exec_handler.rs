@@ -3819,16 +3819,21 @@ impl ExecNtHandler {
             let Some(hive) = self.mutable_hives.hive(mutable_key.hive) else {
                 return STATUS_INVALID_HANDLE;
             };
-            if mutable_key.key != hive.root() {
-                NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
-                return STATUS_NOT_IMPLEMENTED;
-            }
             owned_image = {
                 let _alloc_ctx =
                     crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
-                match nt_hive_core::try_encode_image(hive) {
+                let encoded = if mutable_key.key == hive.root() {
+                    nt_hive_core::try_encode_image(hive)
+                        .map_err(nt_hive_core::HiveSubtreeEncodeError::Encode)
+                } else {
+                    nt_hive_core::try_encode_subtree_image(hive, mutable_key.key)
+                };
+                match encoded {
                     Ok(image) => image,
-                    Err(err) => {
+                    Err(nt_hive_core::HiveSubtreeEncodeError::InvalidRoot) => {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    Err(nt_hive_core::HiveSubtreeEncodeError::Encode(err)) => {
                         print_str(b"[cm-save] mutable hive image encode failed err=");
                         print_str(match err {
                             nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
@@ -19108,10 +19113,10 @@ impl ExecNtHandler {
                 }
                 0
             }
-            // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive root to a caller-opened file.
-            // Mutable hive roots write their live `nt-hive-core` image; borrowed-regf roots without
-            // mutable ownership retain the raw read-only image path. Subkey export is left as a visible
-            // STATUS_NOT_IMPLEMENTED until the Configuration Manager owns a subtree serializer.
+            // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive key to a caller-opened file.
+            // Mutable hive keys write their live `nt-hive-core` image, with subkeys serialized as
+            // standalone subtree hives. Borrowed-regf roots without mutable ownership retain the raw
+            // read-only image path.
             NativeService::NtSaveKey => unsafe { self.nt_save_key(args[0], args[1]) },
             // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user hive at
             // `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW` and `LoadUserProfileW` usually go

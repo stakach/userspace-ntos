@@ -1046,9 +1046,10 @@ before unrelated executive traffic monopolises the receive loop.
   explorer HKCR shell COM class seeding now mutate the mounted hives directly instead of creating
   overlay shadows. The persistent-path overlay audit also removed path-based precedence for
   nonvolatile overlay shadows over mounted mutable hives; remaining overlay authority should be
-  explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Remaining
-  D2 work is subtree serialization behavior plus any residual virtual-root security/class edge
-  cases.
+  explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Mounted
+  mutable-hive subkeys now save as standalone subtree hive images; borrowed non-root `regf` keys
+  still fail visibly because they are not mutable CM authority. Remaining D2 work is any residual
+  virtual-root security/class edge cases.
 - `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
@@ -4667,4 +4668,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   rule so old nonvolatile shadows under mounted hives do not materialize duplicate root children.
   This makes virtual registry containers reflect mounted hive identity without hardcoding shell or
   service paths. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D2 mounted-hive subtree save cleanup (2026-08-13): `nt-hive-core` now has a premeasured
+  one-buffer `try_encode_subtree_image` path that serializes a selected key as a standalone hive
+  root, preserving values, descendants, class, and security metadata while excluding ancestors and
+  siblings. `NtSaveKey` uses it for mounted mutable-hive subkeys; root saves still use full-hive
+  images and borrowed `regf` roots keep the raw-image path. Borrowed non-root `regf` keys still fail
+  visibly because they are not mutable CM authority. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
