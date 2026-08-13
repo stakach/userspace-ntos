@@ -5603,8 +5603,8 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
     print_u64(NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed));
     print_str(b" readonly-fat-create-misses=");
     print_u64(NT_CREATE_FILE_READONLY_FAT_MISSES.load(Ordering::Relaxed));
-    print_str(b" unsupported-file-opens=");
-    print_u64(NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed));
+    print_str(b" unserved-file-opens=");
+    print_u64(NT_CREATE_FILE_UNSERVED_NAMESPACE.load(Ordering::Relaxed));
     print_str(
         b" (HandleLogon reaches profile load; userinit/explorer spawn is proven by later gates)\n",
     );
@@ -5620,12 +5620,12 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
             // is reachable at all.
             && reads >= 1
             // … and legacy profile/WinMM probes now open real read-only disk files through
-            // NtCreateFile instead of falling straight into the unsupported namespace branch.
+            // NtCreateFile instead of falling straight into the unserved namespace branch.
             && NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed) >= 1
             // ... while any ordinary misses under that same mounted namespace stay real filesystem
-            // misses, not STATUS_NOT_IMPLEMENTED scaffolding. A fully satisfied boot is allowed to
+            // misses, not unserved-namespace misses. A fully satisfied boot is allowed to
             // have zero misses.
-            && NT_CREATE_FILE_UNSUPPORTED.load(Ordering::Relaxed) == 0
+            && NT_CREATE_FILE_UNSERVED_NAMESPACE.load(Ordering::Relaxed) == 0
             // … off the same real logon this batch inherits (unchanged clauses).
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0
             && WINLOGON_LOGON_TOKEN_DUPLICATES.load(Ordering::Relaxed) >= 1,
@@ -17293,10 +17293,11 @@ static NAMED_PIPE_LOG_COUNT: [AtomicU64; 8] = [
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 /// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
-/// One-shot trace + running count for `NtCreateFile` on a file namespace this host has no service
-/// for (a plain disk file). Answered STATUS_NOT_IMPLEMENTED — honestly, without parking the caller.
-pub(crate) static NT_CREATE_FILE_UNSUPPORTED_TRACED: AtomicBool = AtomicBool::new(false);
-pub(crate) static NT_CREATE_FILE_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+/// One-shot trace + running count for `NtCreateFile` on a file namespace this host has no mounted
+/// device or filesystem service for. The call fails as an NT object namespace miss; no handle is
+/// fabricated.
+pub(crate) static NT_CREATE_FILE_UNSERVED_NAMESPACE_TRACED: AtomicBool = AtomicBool::new(false);
+pub(crate) static NT_CREATE_FILE_UNSERVED_NAMESPACE: AtomicU64 = AtomicU64::new(0);
 /// Count of read-only FAT files opened by `NtCreateFile(FILE_OPEN)`, using the same real disk-file
 /// handle path as `NtOpenFile`.
 pub(crate) static NT_CREATE_FILE_READONLY_FAT_OPENS: AtomicU64 = AtomicU64::new(0);

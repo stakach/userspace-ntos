@@ -7953,17 +7953,14 @@ impl ExecNtHandler {
         })
     }
 
-    fn unsupported_nt_create_file(&self, name16: &[u16]) -> u32 {
-        // A file namespace this host has no service for. Answer HONESTLY with
-        // STATUS_NOT_IMPLEMENTED: no fabricated handle, and the CALLER decides what to do. This
-        // used to also set `self.stop`, which PARKED the calling process as unrecoverable - a
-        // development tripwire, not a correctness requirement. Traced once + counted so the
-        // frontier stays visible rather than silent.
-        if !NT_CREATE_FILE_UNSUPPORTED_TRACED.swap(true, Ordering::Relaxed) {
+    fn unserved_nt_create_file_namespace(&self, name16: &[u16]) -> u32 {
+        // A file namespace this kernel has no mounted device or filesystem service for. Report a
+        // real object namespace miss: no fabricated handle, and no implementation-stub status.
+        if !NT_CREATE_FILE_UNSERVED_NAMESPACE_TRACED.swap(true, Ordering::Relaxed) {
             print_str(b"[nt-create-file] pi=");
             print_u64(self.pi as u64);
             print_str(
-                b" unsupported file namespace -> STATUS_NOT_IMPLEMENTED (honest miss, no park) name=\"",
+                b" unserved file namespace -> STATUS_OBJECT_PATH_NOT_FOUND name=\"",
             );
             for &unit in name16.iter().take(96) {
                 debug_put_char(if (0x20..0x7f).contains(&unit) {
@@ -7974,8 +7971,8 @@ impl ExecNtHandler {
             }
             print_str(b"\"\n");
         }
-        NT_CREATE_FILE_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
-        0xC000_0002 // STATUS_NOT_IMPLEMENTED
+        NT_CREATE_FILE_UNSERVED_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        nt_fs::STATUS_OBJECT_PATH_NOT_FOUND
     }
 
     /// Mint a process-local handle for a directory on the mounted FAT volume.
@@ -25654,7 +25651,7 @@ impl ExecNtHandler {
                 } else if let Some(relative) = crate::writable_fs::writable_path(&name16) {
                     // ★ THE WRITABLE FILESYSTEM OVERLAY. The path resolved into a declared writable
                     // mount prefix (see `writable_fs::WRITABLE_PREFIXES`) — this is the boundary the
-                    // previous batch's STATUS_NOT_IMPLEMENTED miss left open, and it is where
+                    // previous batch's unserved namespace miss left open, and it is where
                     // `CreateDirectoryW("C:\Profiles")` (userenv/profile.c:929) now lands. The
                     // disposition, `FILE_DIRECTORY_FILE`, and `FileAttributes` are passed straight
                     // through to a REAL file system: a create that cannot be satisfied still fails
@@ -25894,10 +25891,10 @@ impl ExecNtHandler {
                             print_str(b"\"\n");
                         }
                     } else {
-                        status = self.unsupported_nt_create_file(&name16);
+                        status = self.unserved_nt_create_file_namespace(&name16);
                     }
                 } else {
-                    status = self.unsupported_nt_create_file(&name16);
+                    status = self.unserved_nt_create_file_namespace(&name16);
                 }
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());

@@ -4201,7 +4201,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `.tmp/run-desktop-ui-language-20260811.png` with desktop icons and the Start/taskbar visible.
 
   Fixed-drive writable-layer slice completed: the same UI-language retry exposed the next generic
-  filesystem miss, `NtCreateFile("\??\C:\Program Files") -> STATUS_NOT_IMPLEMENTED`, while a ReactOS
+  filesystem miss, `NtCreateFile("\??\C:\Program Files") -> unserved namespace miss`, while a ReactOS
   setup/helper path was trying to create the installed application directory. The repair is not a new
   named prefix or process-specific path. Prefix-owned writable paths (`Profiles`,
   `reactos\system32\config`) remain authoritative, while any valid local fixed-drive path can acquire
@@ -4211,7 +4211,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
   and `git diff --check`. Serialized visible retry
   `.tmp/run-desktop-program-files-20260811.log` confirms the `Program Files` miss is gone: there is
-  no unsupported fixed-drive namespace failure, the writable overlay mounts and materialises the real
+  no unserved fixed-drive namespace failure, the writable overlay mounts and materialises the real
   `Profiles` source (`dirs=45 files=32 bytes=135989`), winlogon creates the Administrator profile
   tree through ordinary `NtCreateFile`, `NtLoadKey` mounts
   `\Registry\User\S-1-5-21-1775002603-20693388-2146334011-500` from
@@ -4883,5 +4883,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   normally, and the `V_MJ` proof bit now means `DriverEntry` installed a real create dispatch rather
   than merely inheriting the default table. The component dispatch bridge's zero-slot guard now
   reports `STATUS_INVALID_DEVICE_REQUEST` as corruption/absence, not `STATUS_NOT_IMPLEMENTED`.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D1 `NtCreateFile` namespace-miss cleanup (2026-08-13): the residual file-open frontier no longer
+  reports `STATUS_NOT_IMPLEMENTED` for paths outside mounted device/filesystem namespaces. The
+  diagnostic counter is now named as an unserved namespace miss, and the syscall returns
+  `STATUS_OBJECT_PATH_NOT_FOUND` with no fabricated handle. Known mounted paths still flow through
+  writable overlay, read-only FAT, NPFS, or explicit device handles before reaching this miss path.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
