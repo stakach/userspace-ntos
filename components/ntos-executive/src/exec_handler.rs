@@ -3010,6 +3010,175 @@ impl ExecNtHandler {
         Some(self.overlay_canon(&full))
     }
 
+    fn mutable_key_relative_path(&self, key: ResolvedHiveKey) -> Option<alloc::string::String> {
+        self.mutable_hives
+            .hive(key.hive)?
+            .key_path(key.key)
+            .map(alloc::string::String::from)
+    }
+
+    fn mutable_child_relative_path(
+        &self,
+        parent: ResolvedHiveKey,
+        leaf: &str,
+    ) -> Option<alloc::string::String> {
+        if leaf.is_empty() || leaf.contains('\\') {
+            return None;
+        }
+        let mut relative = self.mutable_key_relative_path(parent)?;
+        if !relative.is_empty() {
+            relative.push('\\');
+        }
+        relative.push_str(leaf);
+        Some(relative)
+    }
+
+    fn mutable_hive_checkpoint_path_owned(
+        &self,
+        hive_sel: u32,
+    ) -> Option<alloc::string::String> {
+        Self::boot_mutable_hive_checkpoint_path(hive_sel)
+            .map(alloc::string::String::from)
+            .or_else(|| {
+                self.hive_mounts
+                    .iter()
+                    .find(|mount| mount.dynamic && mount.sel == hive_sel)
+                    .map(|mount| mount.file.clone())
+            })
+    }
+
+    fn mutable_hive_journal_status(err: nt_hive_core::HiveIoError) -> u32 {
+        match err {
+            nt_hive_core::HiveIoError::Io | nt_hive_core::HiveIoError::NotSupported => {
+                STATUS_UNSUCCESSFUL
+            }
+        }
+    }
+
+    fn journal_mutable_hive_op(
+        &mut self,
+        hive_sel: u32,
+        op: nt_hive_core::HiveLogOp<'_>,
+    ) -> Result<(), u32> {
+        let path = self
+            .mutable_hive_checkpoint_path_owned(hive_sel)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let hive = self
+            .mutable_hives
+            .hive_mut(hive_sel)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let provider = crate::writable_fs::WritableHiveIoProvider::new(&path);
+        let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
+        manager
+            .mutate(hive, op)
+            .map_err(Self::mutable_hive_journal_status)
+    }
+
+    fn journal_create_mutable_subkey(
+        &mut self,
+        parent: ResolvedHiveKey,
+        leaf: &str,
+    ) -> Result<ResolvedHiveKey, u32> {
+        let relative = self
+            .mutable_child_relative_path(parent, leaf)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        self.journal_mutable_hive_op(
+            parent.hive,
+            nt_hive_core::HiveLogOp::CreateKey { path: &relative },
+        )?;
+        let key = self
+            .mutable_hives
+            .hive(parent.hive)
+            .and_then(|hive| hive.open_key(&relative))
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(ResolvedHiveKey {
+            hive: parent.hive,
+            key,
+        })
+    }
+
+    fn journal_set_mutable_value(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: &[u8],
+    ) -> Result<(), u32> {
+        let relative = self
+            .mutable_key_relative_path(key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.journal_mutable_hive_op(
+            key.hive,
+            nt_hive_core::HiveLogOp::SetValue {
+                path: &relative,
+                name,
+                value_type,
+                data,
+            },
+        )
+    }
+
+    fn journal_delete_mutable_value(
+        &mut self,
+        key: ResolvedHiveKey,
+        name: &str,
+    ) -> Result<(), u32> {
+        let relative = self
+            .mutable_key_relative_path(key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.journal_mutable_hive_op(
+            key.hive,
+            nt_hive_core::HiveLogOp::DeleteValue {
+                path: &relative,
+                name,
+            },
+        )
+    }
+
+    fn journal_delete_mutable_key(&mut self, key: ResolvedHiveKey) -> Result<(), u32> {
+        let relative = self
+            .mutable_key_relative_path(key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.journal_mutable_hive_op(
+            key.hive,
+            nt_hive_core::HiveLogOp::DeleteKey { path: &relative },
+        )
+    }
+
+    fn journal_set_mutable_key_class(
+        &mut self,
+        key: ResolvedHiveKey,
+        class_name: Option<&str>,
+    ) -> Result<(), u32> {
+        let relative = self
+            .mutable_key_relative_path(key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.journal_mutable_hive_op(
+            key.hive,
+            nt_hive_core::HiveLogOp::SetKeyClass {
+                path: &relative,
+                class_name,
+            },
+        )
+    }
+
+    fn journal_set_mutable_key_security_descriptor(
+        &mut self,
+        key: ResolvedHiveKey,
+        descriptor: &[u8],
+    ) -> Result<(), u32> {
+        let relative = self
+            .mutable_key_relative_path(key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.journal_mutable_hive_op(
+            key.hive,
+            nt_hive_core::HiveLogOp::SetKeySecurityDescriptor {
+                path: &relative,
+                descriptor,
+            },
+        )
+    }
+
     fn registry_target_path(&self, target: KeyRef) -> Option<alloc::string::String> {
         if target == MACHINE_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\machine"));
@@ -4568,14 +4737,9 @@ impl ExecNtHandler {
             return Err(0xC000_0008);
         }
         if let Some(key) = self.mutable_registry_key(target) {
-            if self
-                .mutable_hives
-                .set_key_security_descriptor(key, descriptor)
-            {
-                self.mark_mutable_hives_dirty_preserving_services_order();
-                return Ok(());
-            }
-            return Err(0xC000_0008);
+            self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
+            self.mark_mutable_hives_dirty_preserving_services_order();
+            return Ok(());
         }
         if self.base_hive(target).is_some() {
             return Err(0xC000_0022);
@@ -17923,21 +18087,23 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
-                    let Some(mutable_key) = self.mutable_hives.create_subkey(mutable_parent, leaf)
-                    else {
-                        return 0xC000_0034;
-                    };
-                    if class_present
-                        && !self.mutable_hives.set_key_class(mutable_key, class_name)
+                    let mutable_key = match self.journal_create_mutable_subkey(mutable_parent, leaf)
                     {
-                        return 0xC000_0008;
+                        Ok(key) => key,
+                        Err(status) => return status,
+                    };
+                    if class_present {
+                        if let Err(status) =
+                            self.journal_set_mutable_key_class(mutable_key, class_name)
+                        {
+                            return status;
+                        }
                     }
                     if let Some(descriptor) = initial_security.as_deref() {
-                        if !self
-                            .mutable_hives
-                            .set_key_security_descriptor(mutable_key, descriptor)
+                        if let Err(status) =
+                            self.journal_set_mutable_key_security_descriptor(mutable_key, descriptor)
                         {
-                            return 0xC000_0008;
+                            return status;
                         }
                     }
                     self.mark_mutable_hives_dirty_for_services_order_change(
@@ -18246,17 +18412,28 @@ impl ExecNtHandler {
                                         REG_VALUE_SCRATCH_CAP,
                                 )
                             });
-                        let shared_installed = if source_matches {
-                            self.mutable_hives.set_value_from_existing_value(
+                        let logged_copy = if source_matches {
+                            let source_data = match self
+                                .mutable_hives
+                                .query_resolved_value(source)
+                                .map(|(_, data)| data.to_vec())
+                            {
+                                Some(data) => data,
+                                None => return 0xC000_0008,
+                            };
+                            if let Err(status) = self.journal_set_mutable_value(
                                 mutable_key,
                                 durable_name,
                                 value_type,
-                                source,
-                            )
+                                &source_data,
+                            ) {
+                                return status;
+                            }
+                            true
                         } else {
                             false
                         };
-                        if shared_installed {
+                        if logged_copy {
                             self.mark_mutable_hives_dirty_for_services_order_change(
                                 services_order_may_change,
                             );
@@ -18274,13 +18451,13 @@ impl ExecNtHandler {
                             Err(status) => return status,
                         },
                     };
-                    if !self.mutable_hives.set_value(
+                    if let Err(status) = self.journal_set_mutable_value(
                         mutable_key,
                         durable_name,
                         value_type,
-                        value_data,
+                        &value_data,
                     ) {
-                        return 0xC000_0008;
+                        return status;
                     }
                     self.mark_mutable_hives_dirty_for_services_order_change(
                         services_order_may_change,
@@ -18411,7 +18588,7 @@ impl ExecNtHandler {
                     let services_order_may_change = key_path
                         .as_deref()
                         .is_some_and(Self::registry_services_order_key_membership_may_change);
-                    match self.mutable_hives.delete_key(mutable_key) {
+                    match self.journal_delete_mutable_key(mutable_key) {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
                                 if self.overlay.detach_subtree(path) != 0 {
@@ -18423,10 +18600,7 @@ impl ExecNtHandler {
                             );
                             return 0;
                         }
-                        Err(nt_hive_core::DeleteKeyError::CannotDelete) => {
-                            return STATUS_CANNOT_DELETE;
-                        }
-                        Err(nt_hive_core::DeleteKeyError::NotFound) => return 0xC000_0034,
+                        Err(status) => return status,
                     }
                 }
                 0xC000_0022 // STATUS_ACCESS_DENIED: borrowed regf keys are read-only.
@@ -18452,8 +18626,8 @@ impl ExecNtHandler {
                         .registry_target_path(key)
                         .as_deref()
                         .is_some_and(Self::registry_services_order_value_write_may_reorder);
-                    if !self.mutable_hives.delete_value(mutable_key, &name) {
-                        return 0xC000_0008;
+                    if let Err(status) = self.journal_delete_mutable_value(mutable_key, &name) {
+                        return status;
                     }
                     self.mark_mutable_hives_dirty_for_services_order_change(
                         services_order_may_change,

@@ -213,6 +213,13 @@ impl<P: HiveIoProvider> HiveManager<P> {
             flush_mode: FlushMode::Strict,
         }
     }
+    pub fn for_live_hive(provider: P, hive: &Hive) -> Self {
+        Self {
+            provider,
+            next_log_sequence: hive.sequence.saturating_add(1),
+            flush_mode: FlushMode::Strict,
+        }
+    }
     pub fn with_flush_mode(mut self, mode: FlushMode) -> Self {
         self.flush_mode = mode;
         self

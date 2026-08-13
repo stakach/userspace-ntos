@@ -1090,6 +1090,12 @@ before unrelated executive traffic monopolises the receive loop.
   Configuration Manager no longer has separate image-only checkpoint code in the executive for
   those paths. Sidecar logs are represented as `<hive>.LOG` provider files; mutation journaling is
   the next step now that flush/checkpoint storage has one boundary.
+  The first mutation-journaling slice adds a live-hive manager attachment mode so short-lived
+  managers continue log sequence numbers from the mounted hive, with a host replay test proving
+  multiple per-call managers do not collapse to one replayed record. Executive registry syscalls now
+  journal mounted mutable-hive create-key, set-value, delete-key, delete-value, key-class, and key
+  security-descriptor mutations through the writable provider before applying them. Import/mount and
+  clean-baseline paths remain direct because they are not runtime mutations.
 
 ## Immediate Iteration
 

@@ -847,6 +847,34 @@ fn manager_replays_deletes_and_key_metadata_after_checkpoint() {
 }
 
 #[test]
+fn live_hive_managers_continue_log_sequence_across_calls() {
+    let provider = MemoryHiveIoProvider::new();
+    let mut mgr = HiveManager::new(provider);
+    let mut hive = mgr.boot(HiveKind::System).unwrap();
+    let mut provider = mgr.into_provider();
+
+    for (name, value) in [("First", 1u32), ("Second", 2u32)] {
+        let mut mgr = HiveManager::for_live_hive(provider, &hive);
+        mgr.mutate(
+            &mut hive,
+            HiveLogOp::SetValue {
+                path: r"ControlSet001\Services\Tcpip",
+                name,
+                value_type: RegistryValueType::Dword,
+                data: &value.to_le_bytes(),
+            },
+        )
+        .unwrap();
+        provider = mgr.into_provider();
+    }
+
+    let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
+    let key = booted.open_key(r"ControlSet001\Services\Tcpip").unwrap();
+    assert_eq!(booted.query_dword(key, "First"), Some(1));
+    assert_eq!(booted.query_dword(key, "Second"), Some(2));
+}
+
+#[test]
 fn log_replay_idempotent_and_torn() {
     let mut h = Hive::new(HiveKind::System);
     let rec = encode_log_record(
