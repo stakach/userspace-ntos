@@ -1564,6 +1564,17 @@ fn writable_volume_set_information_and_delete() {
         fs.file_bytes(r"\??\C:\profiles\collision.txt"),
         Some(&b"0123"[..])
     );
+    // MemFs has one parent entry per node today; hardlinks require a real link-count/parent-entry
+    // model, so the class fails as unsupported instead of returning a fabricated link success.
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_LINK_INFORMATION,
+            &rename_information("alias.txt", dir.handle, false),
+        ),
+        STATUS_INVALID_INFO_CLASS
+    );
+    assert!(fs.query_attributes(r"\??\C:\profiles\alias.txt").is_none());
     // FileDispositionInformation deletes at close.
     assert_eq!(
         fs.zw_set_information_file(f.handle, FILE_DISPOSITION_INFORMATION, &[1u8]),

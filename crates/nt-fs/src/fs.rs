@@ -2670,7 +2670,7 @@ impl FileSystem {
                         .rename_relative_to_dir(node_id, root_id, &target, replace_if_exists)
                 }
             }
-            _ => STATUS_NOT_IMPLEMENTED,
+            _ => STATUS_INVALID_INFO_CLASS,
         }
     }
 

@@ -4823,3 +4823,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   rather than as stub statuses. Validation: `cargo fmt --all`,
   `cargo test -p nt-ntdll debug_buffer`, `./scripts/build_ntdll_dll.sh`, and a target-side export
   scan showing no live `STATUS_NOT_IMPLEMENTED` return sites beyond the shared status constant.
+
+  D1 writable-filesystem set-information status cleanup (2026-08-13): `nt-fs` no longer reports
+  `STATUS_NOT_IMPLEMENTED` for writable-volume `ZwSetInformationFile` classes that the MemFs node
+  model does not yet implement. The existing real set paths still handle basic attributes,
+  delete-on-close, file position, EOF/allocation sizing, and rename. Other classes now fail with the
+  native invalid-information-class status instead of looking like an executable stub. The regression
+  explicitly covers `FileLinkInformation`: hardlinks are not fabricated because MemFs currently has
+  a single parent entry per node; a real hardlink implementation needs link-count and multiple
+  parent directory-entry ownership. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
