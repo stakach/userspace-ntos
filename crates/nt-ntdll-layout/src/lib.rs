@@ -403,7 +403,9 @@ pub struct Teb {
     pub free_stack_on_termination: u8,
     /// `HasFiberData` (offset 0x1746 in the hosted ReactOS x64 kernel32 ABI).
     pub has_fiber_data: u8,
-    _rsvd_1747: [u8; 0x1760 - 0x1747],
+    /// `IdealProcessor` (offset 0x1747 in the ReactOS NT 5.2 x64 ABI).
+    pub ideal_processor: u8,
+    _rsvd_1748: [u8; 0x1760 - 0x1748],
     /// `WaitingOnLoaderLock` (offset 0x1760).
     pub waiting_on_loader_lock: u32,
     _rsvd_1764: [u8; 0x1780 - 0x1764],
@@ -492,6 +494,7 @@ const _: () = assert!(offset_of!(Teb, activity_id) == 0x1710);
 const _: () = assert!(offset_of!(Teb, gdi_batch_count) == 0x1740); // C_ASSERT(... GdiBatchCount) == 0x1740
 const _: () = assert!(offset_of!(Teb, free_stack_on_termination) == 0x1745);
 const _: () = assert!(offset_of!(Teb, has_fiber_data) == 0x1746);
+const _: () = assert!(offset_of!(Teb, ideal_processor) == 0x1747);
 const _: () = assert!(offset_of!(Teb, waiting_on_loader_lock) == 0x1760); // C_ASSERT(...) == 0x1760
 const _: () = assert!(offset_of!(Teb, tls_expansion_slots) == 0x1780); // C_ASSERT(... TlsExpansionSlots) == 0x1780
 const _: () = assert!(offset_of!(Teb, impersonation_locale) == 0x1798);
@@ -503,6 +506,9 @@ const _: () = assert!(offset_of!(Teb, same_teb_flags) == 0x17EE); // C_ASSERT(..
 
 pub const TEB_IMPERSONATION_LOCALE_OFFSET: u64 = offset_of!(Teb, impersonation_locale) as u64;
 pub const TEB_IS_IMPERSONATING_OFFSET: u64 = offset_of!(Teb, is_impersonating) as u64;
+pub const TEB_TLS_SLOTS_OFFSET: u64 = offset_of!(Teb, tls_slots) as u64;
+pub const TEB_TLS_EXPANSION_SLOTS_OFFSET: u64 = offset_of!(Teb, tls_expansion_slots) as u64;
+pub const TEB_IDEAL_PROCESSOR_OFFSET: u64 = offset_of!(Teb, ideal_processor) as u64;
 /// `TEB.NtTib.ArbitraryUserPointer`, used by `NtCreateProcess[Ex]` to return the child PEB to
 /// kernel32's `BasePushProcessParameters`.
 pub const TEB_ARBITRARY_USER_POINTER_OFFSET: u64 =

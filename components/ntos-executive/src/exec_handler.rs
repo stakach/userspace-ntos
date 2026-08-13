@@ -25,6 +25,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
@@ -10748,6 +10749,8 @@ impl ExecNtHandler {
 
     pub(crate) fn thread_set_length(information_class: u32) -> Result<usize, u32> {
         match information_class {
+            2 | 3 | 10 => Ok(4),
+            4 | 13 => Ok(8),
             9 | 14 => Ok(8),
             17 => Ok(0),
             18 => Ok(4),
@@ -10780,7 +10783,35 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         let update = match information_class {
+            2 => {
+                let priority = value as u32 as i32;
+                if priority >= nt_process::LOW_REALTIME_PRIORITY
+                    && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
+                {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                self.pm.set_thread_priority(tid, priority)
+            }
+            3 => self.pm.set_thread_base_priority(tid, value as u32 as i32),
+            4 => self.pm.set_thread_affinity_mask(tid, value),
             9 => self.pm.set_thread_win32_start_address(tid, value),
+            13 => {
+                let update = self.pm.set_thread_ideal_processor(tid, value);
+                if update.is_ok() {
+                    if let Some(teb) = self.pm.thread_teb(tid).filter(|teb| *teb != 0) {
+                        let ideal = [value as u8];
+                        if unsafe {
+                            !self.xas_try_write_buf(
+                                teb + nt_ntdll_layout::TEB_IDEAL_PROCESSOR_OFFSET,
+                                &ideal,
+                            )
+                        } {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                    }
+                }
+                update
+            }
             14 => self.pm.set_thread_disable_boost(tid, value != 0),
             17 => self.pm.set_thread_hide_from_debugger(tid),
             18 => self
@@ -10872,6 +10903,100 @@ impl ExecNtHandler {
         self.pm
             .set_thread_name(tid, &name[..byte_length / 2])
             .map_or_else(|status| status, |()| 0)
+    }
+
+    unsafe fn nt_set_thread_zero_tls_cell(
+        &mut self,
+        handle: u64,
+        information: u64,
+        information_length: u32,
+    ) -> u32 {
+        const THREAD_SET_INFORMATION: u32 = 0x0020;
+        const TLS_MINIMUM_AVAILABLE: u32 = 64;
+        const TLS_EXPANSION_SLOTS: u32 = 1024;
+        const TEB_CAPTURE_LIMIT: usize = 1 + PM_RUNTIME_THREAD_SLOTS;
+
+        if information_length != 4 {
+            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        let mut encoded = [0u8; 4];
+        if information == 0 || !self.xas_read(information, &mut encoded) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let tls_index = u32::from_le_bytes(encoded);
+
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let current_tid = self.current_tid as nt_process::ThreadId;
+        let tid = match self.pm.resolve_thread_handle(
+            caller,
+            current_tid,
+            handle,
+            THREAD_SET_INFORMATION,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        if tid != current_tid {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let process_id = match self.pm.thread(tid).map(|thread| thread.process_id) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+
+        let mut tebs = [0u64; TEB_CAPTURE_LIMIT];
+        let mut count = 0usize;
+        let mut overflow = false;
+        if let Err(status) = self
+            .pm
+            .for_each_process_thread_teb(process_id, |_, teb| {
+                if count < tebs.len() {
+                    tebs[count] = teb;
+                    count += 1;
+                } else {
+                    overflow = true;
+                }
+            })
+        {
+            return status;
+        }
+        if overflow {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        for teb in tebs[..count].iter().copied() {
+            if tls_index < TLS_MINIMUM_AVAILABLE {
+                let slot = teb
+                    + nt_ntdll_layout::TEB_TLS_SLOTS_OFFSET
+                    + u64::from(tls_index) * core::mem::size_of::<u64>() as u64;
+                if !self.xas_write_u64(slot, 0) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+            } else if tls_index < TLS_MINIMUM_AVAILABLE + TLS_EXPANSION_SLOTS {
+                let mut expansion = [0u8; 8];
+                let expansion_slots = teb + nt_ntdll_layout::TEB_TLS_EXPANSION_SLOTS_OFFSET;
+                if !self.xas_read(expansion_slots, &mut expansion) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let expansion_slots = u64::from_le_bytes(expansion);
+                if expansion_slots != 0 {
+                    let slot = expansion_slots
+                        + u64::from(tls_index - TLS_MINIMUM_AVAILABLE)
+                            * core::mem::size_of::<u64>() as u64;
+                    if !self.xas_write_u64(slot, 0) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+            }
+        }
+
+        0
     }
 
     pub(crate) fn query_thread_information_captured(
@@ -11399,7 +11524,7 @@ impl ExecNtHandler {
             }
             18 => {
                 let priority = self.pm.query_process_priority_class(caller_pid, handle)?;
-                output[0] = 0;
+                output[0] = self.pm.query_process_foreground(caller_pid, handle)? as u8;
                 output[1] = priority;
                 0x02
             }
@@ -23563,91 +23688,16 @@ impl ExecNtHandler {
                 self.keyed_wait_key = key;
                 0x102
             }
-            // Model the process information classes now used on the live boot route. Unknown classes
-            // still degrade as success for compatibility with existing callers that only probe whether
-            // the setter exists.
+            // Model process information setters through real EPROCESS state. Unsupported classes fail
+            // visibly so new callers add the missing mechanism instead of relying on fallback success.
             NativeService::NtSetInformationProcess => unsafe {
                 if args[1] == 9 {
                     return self.nt_set_process_access_token(args);
                 }
-                if args[1] == 12 {
-                    const PROCESS_SET_INFORMATION: u32 = 0x0200;
-                    if args[3] != 4 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let mut value = [0u8; 4];
-                    if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    let caller = match self.pm_pid_for_pi(self.pi) {
-                        Some(pid) => pid,
-                        None => return 0xC000_0008,
-                    };
-                    let pid = match self.pm.resolve_process_handle(
-                        caller,
-                        args[0],
-                        PROCESS_SET_INFORMATION,
-                    ) {
-                        Ok(pid) => pid,
-                        Err(status) => return status,
-                    };
-                    return match self.pm.set_process_default_hard_error_processing(
-                        pid,
-                        u32::from_le_bytes(value),
-                    ) {
-                        Ok(()) => 0,
-                        Err(status) => status,
-                    };
-                }
-                if args[1] == 18 {
-                    const PROCESS_SET_INFORMATION: u32 = 0x0200;
-                    if args[3] != 2 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let mut value = [0u8; 2];
-                    if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    let priority_class = value[1];
-                    if priority_class == nt_process::PROCESS_PRIORITY_CLASS_REALTIME
-                        && !self.current_token_has_privilege(nt_security::SE_INCREASE_BASE_PRIORITY)
-                    {
-                        return 0xC000_0061; // STATUS_PRIVILEGE_NOT_HELD
-                    }
-                    let caller = match self.pm_pid_for_pi(self.pi) {
-                        Some(pid) => pid,
-                        None => return 0xC000_0008,
-                    };
-                    let pid = match self.pm.resolve_process_handle(
-                        caller,
-                        args[0],
-                        PROCESS_SET_INFORMATION,
-                    ) {
-                        Ok(pid) => pid,
-                        Err(status) => return status,
-                    };
-                    return match self.pm.set_process_priority_class(pid, priority_class) {
-                        Ok(()) => 0,
-                        Err(status) => status,
-                    };
-                }
-                if args[1] != 29 {
-                    return 0;
-                }
                 const PROCESS_SET_INFORMATION: u32 = 0x0200;
-                if args[3] != 4 {
-                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                }
-                let mut value = [0u8; 4];
-                if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                    return 0xC000_0005;
-                }
-                if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
-                    return 0xC000_0061; // STATUS_PRIVILEGE_NOT_HELD
-                }
                 let caller = match self.pm_pid_for_pi(self.pi) {
                     Some(pid) => pid,
-                    None => return 0xC000_0008,
+                    None => return STATUS_INVALID_HANDLE,
                 };
                 let pid = match self.pm.resolve_process_handle(
                     caller,
@@ -23657,12 +23707,158 @@ impl ExecNtHandler {
                     Ok(pid) => pid,
                     Err(status) => return status,
                 };
-                match self.pm.set_process_break_on_termination(
-                    pid,
-                    u32::from_le_bytes(value) != 0,
-                ) {
-                    Ok(()) => 0,
-                    Err(status) => status,
+
+                match args[1] as u32 {
+                    5 => {
+                        if args[3] != 4 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        if args[2] & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut value = [0u8; 4];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        let raw = u32::from_le_bytes(value);
+                        let base_priority = (raw & !0x8000_0000) as i32;
+                        let current = self
+                            .pm
+                            .process(pid)
+                            .map(|process| process.base_priority())
+                            .unwrap_or(nt_process::DEFAULT_PROCESS_BASE_PRIORITY);
+                        if base_priority > current
+                            && !self.current_token_has_privilege(
+                                nt_security::SE_INCREASE_BASE_PRIORITY,
+                            )
+                        {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        self.pm
+                            .set_process_base_priority(pid, base_priority)
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    8 => {
+                        if args[3] != 8 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        if args[2] & 7 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut value = [0u8; 8];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        let port_handle = u64::from_le_bytes(value);
+                        match lpc_client() {
+                            Some(client) => {
+                                if let Err(status) = client.query_handle(port_handle) {
+                                    return status.raw() as u32;
+                                }
+                            }
+                            None => return STATUS_UNSUCCESSFUL,
+                        }
+                        self.pm
+                            .set_process_exception_port(pid, port_handle)
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    12 => {
+                        if args[3] != 4 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        if args[2] & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut value = [0u8; 4];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        self.pm
+                            .set_process_default_hard_error_processing(
+                                pid,
+                                u32::from_le_bytes(value),
+                            )
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    18 => {
+                        if args[3] != 2 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        let mut value = [0u8; 2];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        let priority_class = value[1];
+                        if priority_class == nt_process::PROCESS_PRIORITY_CLASS_REALTIME
+                            && !self.current_token_has_privilege(
+                                nt_security::SE_INCREASE_BASE_PRIORITY,
+                            )
+                        {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        match self.pm.set_process_priority_class(pid, priority_class) {
+                            Ok(()) => self
+                                .pm
+                                .set_process_foreground(pid, value[0] != 0)
+                                .map_or_else(|status| status, |()| 0),
+                            Err(status) => status,
+                        }
+                    }
+                    24 => {
+                        if args[3] != 4 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        if args[2] & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut value = [0u8; 4];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if !self.current_token_has_privilege(nt_security::SE_TCB) {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        self.pm
+                            .set_process_session_id(pid, u32::from_le_bytes(value))
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    25 => {
+                        if args[3] != 1 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        let mut value = [0u8; 1];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        self.pm
+                            .set_process_foreground(pid, value[0] != 0)
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    29 => {
+                        if args[3] != 4 {
+                            return nt_process::STATUS_INFO_LENGTH_MISMATCH;
+                        }
+                        if args[2] & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut value = [0u8; 4];
+                        if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        self.pm
+                            .set_process_break_on_termination(
+                                pid,
+                                u32::from_le_bytes(value) != 0,
+                            )
+                            .map_or_else(|status| status, |()| 0)
+                    }
+                    _ => nt_process::STATUS_INVALID_INFO_CLASS,
                 }
             },
             NativeService::NtSetInformationThread => unsafe {
@@ -23670,12 +23866,15 @@ impl ExecNtHandler {
                 if information_class == 5 {
                     return self.nt_set_thread_impersonation_token(args);
                 }
+                if information_class == 10 {
+                    return self.nt_set_thread_zero_tls_cell(args[0], args[2], args[3] as u32);
+                }
                 if information_class == 38 {
                     return self.nt_set_thread_name(args[0], args[2], args[3] as u32);
                 }
                 let expected = match Self::thread_set_length(information_class) {
                     Ok(length) => length,
-                    _ => return 0,
+                    Err(status) => return status,
                 };
                 if args[3] as u32 as usize != expected {
                     return 0xC000_0004;

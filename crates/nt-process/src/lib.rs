@@ -34,6 +34,7 @@ pub const STATUS_INVALID_CID: u32 = 0xC000_000B;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+pub const STATUS_PORT_ALREADY_SET: u32 = 0xC000_0048;
 pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_HANDLE_NOT_CLOSABLE: u32 = 0xC000_0235;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
@@ -58,6 +59,15 @@ pub const PROCESS_PRIORITY_CLASS_HIGH: u8 = 3;
 pub const PROCESS_PRIORITY_CLASS_REALTIME: u8 = 4;
 pub const PROCESS_PRIORITY_CLASS_BELOW_NORMAL: u8 = 5;
 pub const PROCESS_PRIORITY_CLASS_ABOVE_NORMAL: u8 = 6;
+pub const DEFAULT_PROCESS_BASE_PRIORITY: i32 = 13;
+pub const LOW_PRIORITY: i32 = 0;
+pub const LOW_REALTIME_PRIORITY: i32 = 16;
+pub const HIGH_PRIORITY: i32 = 31;
+pub const THREAD_BASE_PRIORITY_LOWRT: i32 = 15;
+pub const THREAD_BASE_PRIORITY_MAX: i32 = 2;
+pub const THREAD_BASE_PRIORITY_MIN: i32 = -2;
+pub const THREAD_BASE_PRIORITY_IDLE: i32 = -15;
+pub const MAXIMUM_PROCESSORS: u64 = 64;
 
 /// Expand generic process access bits using the NT process-object generic mapping. Until process
 /// security descriptors are modelled, `MAXIMUM_ALLOWED` grants the full process mask.
@@ -507,8 +517,17 @@ pub struct NtProcess {
     /// `PEB` base reported by `NtQueryInformationProcess(ProcessBasicInformation)`. The kernel host
     /// sets this when it maps the process environment.
     peb_base_address: u64,
+    /// `KPROCESS.Affinity`; single-processor hosts expose bit 0 by default.
+    affinity_mask: u64,
+    /// `KPROCESS.BasePriority`, surfaced through `ProcessBasicInformation`.
+    base_priority: i32,
     /// `EPROCESS.PriorityClass`. ReactOS initializes new processes to NORMAL (2).
     priority_class: u8,
+    /// Foreground/background priority mode carried by `PROCESS_PRIORITY_CLASS.Foreground` and
+    /// `ProcessForegroundInformation`.
+    foreground: bool,
+    /// `EPROCESS.ExceptionPort`, represented by the executive's broker-owned LPC port handle.
+    exception_port: Option<u64>,
     /// `EPROCESS.DebugPort` — the `DEBUG_OBJECT` a debugger attached to this process, if any.
     debug_port: Option<DebugObjectId>,
     /// `PEB.BeingDebugged` — mirrors `DebugPort != NULL` (`DbgkpMarkProcessPeb`).
@@ -546,6 +565,18 @@ impl NtProcess {
     /// `EPROCESS.PriorityClass`.
     pub fn priority_class(&self) -> u8 {
         self.priority_class
+    }
+    /// `KPROCESS.BasePriority`.
+    pub fn base_priority(&self) -> i32 {
+        self.base_priority
+    }
+    /// Foreground/background priority mode.
+    pub fn foreground(&self) -> bool {
+        self.foreground
+    }
+    /// `EPROCESS.ExceptionPort`.
+    pub fn exception_port(&self) -> Option<u64> {
+        self.exception_port
     }
 }
 
@@ -656,6 +687,14 @@ pub struct NtThread {
     /// spawns the backing thread (its TEB is a per-thread page); read back by
     /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`. `0` until the TEB is mapped.
     pub teb_base: u64,
+    /// `KTHREAD.Affinity`; constrained by the owning process affinity mask.
+    affinity_mask: u64,
+    /// `KTHREAD.Priority`.
+    priority: i32,
+    /// `KTHREAD.BasePriority`.
+    base_priority: i32,
+    /// `KTHREAD.IdealProcessor`.
+    ideal_processor: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
     break_on_termination: bool,
     /// `ThreadPriorityBoost`: true when dynamic priority boosts are disabled.
@@ -846,6 +885,22 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.session_id)
             .unwrap_or(0);
+        let affinity_mask = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.affinity_mask)
+            .unwrap_or(1);
+        let base_priority = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.base_priority)
+            .unwrap_or(DEFAULT_PROCESS_BASE_PRIORITY);
+        let priority_class = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.priority_class)
+            .unwrap_or(PROCESS_PRIORITY_CLASS_NORMAL);
+        let foreground = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .map(|process| process.foreground)
+            .unwrap_or(false);
         self.processes.insert(
             pid,
             NtProcess {
@@ -868,7 +923,11 @@ impl ProcessManager {
                 break_on_termination: false,
                 image_base: 0,
                 peb_base_address: 0,
-                priority_class: PROCESS_PRIORITY_CLASS_NORMAL,
+                affinity_mask,
+                base_priority,
+                priority_class,
+                foreground,
+                exception_port: None,
                 debug_port: None,
                 being_debugged: false,
                 create_reported: false,
@@ -956,8 +1015,8 @@ impl ProcessManager {
                 STATUS_PENDING
             },
             peb_base_address: process.peb_base_address,
-            affinity_mask: 1,
-            base_priority: 13,
+            affinity_mask: process.affinity_mask,
+            base_priority: process.base_priority,
             unique_process_id: pid,
             inherited_from_unique_process_id: process.parent.unwrap_or(0),
         })
@@ -1038,6 +1097,17 @@ impl ProcessManager {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub fn query_process_foreground(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<bool, u32> {
+        let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
+        self.process(pid)
+            .map(|process| process.foreground)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
     pub fn query_process_session_id(&self, caller_pid: ProcessId, handle: u64) -> Result<u32, u32> {
         let pid = self.resolve_process_handle(caller_pid, handle, PROCESS_QUERY_INFORMATION)?;
         self.process(pid)
@@ -1064,6 +1134,45 @@ impl ProcessManager {
         let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
         process.priority_class = priority_class;
         Ok(())
+    }
+
+    pub fn set_process_base_priority(
+        &mut self,
+        pid: ProcessId,
+        base_priority: i32,
+    ) -> Result<(), u32> {
+        if !((LOW_PRIORITY + 1)..=HIGH_PRIORITY).contains(&base_priority) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.base_priority = base_priority;
+        Ok(())
+    }
+
+    pub fn set_process_foreground(&mut self, pid: ProcessId, foreground: bool) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.foreground = foreground;
+        Ok(())
+    }
+
+    pub fn set_process_exception_port(
+        &mut self,
+        pid: ProcessId,
+        port_handle: u64,
+    ) -> Result<(), u32> {
+        if port_handle == 0 {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if process.exception_port.is_some() {
+            return Err(STATUS_PORT_ALREADY_SET);
+        }
+        process.exception_port = Some(port_handle);
+        Ok(())
+    }
+
+    pub fn process_exception_port(&self, pid: ProcessId) -> Option<u64> {
+        self.process(pid).and_then(|process| process.exception_port)
     }
     pub fn thread(&self, tid: ThreadId) -> Option<&NtThread> {
         self.threads.get(&tid)
@@ -1188,6 +1297,8 @@ impl ProcessManager {
         if matches!(proc.state, ProcessState::Exiting | ProcessState::Terminated) {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
+        let affinity_mask = proc.affinity_mask;
+        let base_priority = proc.base_priority;
         let tid = allocate_client_id(&mut self.next_cid);
         proc.threads.insert(tid);
         if proc.main_thread.is_none() {
@@ -1215,6 +1326,10 @@ impl ProcessManager {
                 win32_thread: None,
                 kernel_thread_object: None,
                 teb_base: 0,
+                affinity_mask,
+                priority: base_priority,
+                base_priority,
+                ideal_processor: 0,
                 break_on_termination: false,
                 disable_boost: false,
                 hide_from_debugger: false,
@@ -1417,9 +1532,9 @@ impl ProcessManager {
                 unique_process: thread.process_id,
                 unique_thread: tid,
             },
-            affinity_mask: 1,
-            priority: 0,
-            base_priority: 0,
+            affinity_mask: thread.affinity_mask,
+            priority: thread.priority,
+            base_priority: thread.base_priority,
         })
     }
 
@@ -1524,6 +1639,82 @@ impl ProcessManager {
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         thread.disable_boost = disabled;
         Ok(())
+    }
+
+    pub fn set_thread_priority(&mut self, tid: ThreadId, priority: i32) -> Result<(), u32> {
+        if !((LOW_PRIORITY + 1)..=HIGH_PRIORITY).contains(&priority) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.priority = priority;
+        Ok(())
+    }
+
+    pub fn set_thread_base_priority(
+        &mut self,
+        tid: ThreadId,
+        base_priority: i32,
+    ) -> Result<(), u32> {
+        let process_id = self
+            .threads
+            .get(&tid)
+            .map(|thread| thread.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let process = self
+            .processes
+            .get(&process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let normal_delta =
+            (THREAD_BASE_PRIORITY_MIN..=THREAD_BASE_PRIORITY_MAX).contains(&base_priority);
+        let special = base_priority == THREAD_BASE_PRIORITY_LOWRT + 1
+            || base_priority == THREAD_BASE_PRIORITY_IDLE - 1;
+        let realtime_absolute = process.priority_class == PROCESS_PRIORITY_CLASS_REALTIME
+            && ((THREAD_BASE_PRIORITY_IDLE - 1)..=HIGH_PRIORITY).contains(&base_priority);
+        if !(normal_delta || special || realtime_absolute) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.base_priority = base_priority;
+        Ok(())
+    }
+
+    pub fn set_thread_affinity_mask(&mut self, tid: ThreadId, affinity: u64) -> Result<(), u32> {
+        if affinity == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let process_id = self
+            .threads
+            .get(&tid)
+            .map(|thread| thread.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let process_affinity = self
+            .processes
+            .get(&process_id)
+            .map(|process| process.affinity_mask)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if affinity & !process_affinity != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.affinity_mask = affinity;
+        Ok(())
+    }
+
+    pub fn set_thread_ideal_processor(
+        &mut self,
+        tid: ThreadId,
+        ideal_processor: u64,
+    ) -> Result<(), u32> {
+        if ideal_processor > MAXIMUM_PROCESSORS {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.ideal_processor = ideal_processor;
+        Ok(())
+    }
+
+    pub fn thread_ideal_processor(&self, tid: ThreadId) -> Option<u64> {
+        self.thread(tid).map(|thread| thread.ideal_processor)
     }
 
     pub fn set_thread_hide_from_debugger(&mut self, tid: ThreadId) -> Result<(), u32> {
@@ -1882,6 +2073,8 @@ impl ProcessManager {
         ) {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
+        let affinity_mask = process.affinity_mask;
+        let base_priority = process.base_priority;
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if thread.impersonation.is_some() {
             return Err(STATUS_INVALID_PARAMETER);
@@ -1902,6 +2095,10 @@ impl ProcessManager {
         thread.suspend_count = create_suspended as u32;
         thread.win32_thread = None;
         thread.teb_base = 0;
+        thread.affinity_mask = affinity_mask;
+        thread.priority = base_priority;
+        thread.base_priority = base_priority;
+        thread.ideal_processor = 0;
         thread.security_descriptor = Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]);
         thread.break_on_termination = false;
         thread.disable_boost = false;
@@ -1957,6 +2154,21 @@ impl ProcessManager {
     /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`.
     pub fn thread_teb(&self, tid: ThreadId) -> Option<u64> {
         self.threads.get(&tid).map(|t| t.teb_base)
+    }
+
+    /// Visit every mapped TEB belonging to `pid` without allocating. Unknown processes are rejected;
+    /// threads whose TEB has not been mapped yet are skipped.
+    pub fn for_each_process_thread_teb<F>(&self, pid: ProcessId, mut f: F) -> Result<(), u32>
+    where
+        F: FnMut(ThreadId, u64),
+    {
+        let process = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        for tid in &process.threads {
+            if let Some(teb) = self.thread_teb(*tid).filter(|teb| *teb != 0) {
+                f(*tid, teb);
+            }
+        }
+        Ok(())
     }
 
     /// The `pid`'s main (first) thread id, if any (spec §7.1) — the identity a host binds/queries.

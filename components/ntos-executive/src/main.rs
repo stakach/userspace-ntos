@@ -975,7 +975,8 @@ pub const SSN_NT_QUERY_DEBUG_FILTER_STATE: u64 = 148;
 /// ntdll's NtSetDebugFilterState SSN. The executive has no SeDebugPrivilege plane yet, so the
 /// handler returns STATUS_ACCESS_DENIED just like a real kernel would for an unprivileged caller.
 pub const SSN_NT_SET_DEBUG_FILTER_STATE: u64 = 222;
-/// Remaining no-op-success thread/process information setters.
+/// Native virtual-memory and process/thread information setters. Process/thread setters are backed
+/// by ProcessManager state; unsupported information classes fail instead of falling back to success.
 pub const SSN_NT_FREE_VM: u64 = 87;
 pub const SSN_NT_READ_VM: u64 = 194;
 pub const SSN_NT_WRITE_VM: u64 = 287;

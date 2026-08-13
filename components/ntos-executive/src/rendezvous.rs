@@ -752,7 +752,8 @@ pub(crate) unsafe fn sm_fill_page(
 /// connection `conn_id` Pending (Manual policy). A nested loop on `SM_FAULT_EP`/`REPLY_SMLOOP`
 /// (mirroring `win32k_dispatch`, but the SM-loop thread is a HOSTED faulter, not a Call peer) services
 /// its real syscalls until `NtCompleteConnectPort`: the preamble (RtlSetThreadIsCritical →
-/// NtSetInformationThread no-op; NtQueryInformationProcess ProcessBasicInformation → write
+/// NtSetInformationThread real ETHREAD critical-state setter; NtQueryInformationProcess
+/// ProcessBasicInformation → write
 /// UniqueProcessId = PID_SMSS), then NtReplyWaitReceivePort (drain the pending connection from the
 /// broker + marshal the PORT_MESSAGE: Type=LPC_CONNECTION_REQUEST, ClientId.UniqueProcess=PID_SMSS →
 /// the "SM connecting to itself" branch of SmpHandleConnectionRequest, no NtOpenProcess/SB connect-back)
@@ -3817,7 +3818,7 @@ unsafe fn csr_sb_api_request_rendezvous(
 /// NtReplyWaitReceivePort (drain the broker's pending connection + marshal the PORT_MESSAGE:
 /// Type=LPC_CONNECTION_REQUEST, ClientId = the CSR worker CID so CsrLocateThreadByClientId matches a
 /// registered CSR_THREAD → CsrProcess=CsrRootProcess → AllowConnection=TRUE) → [NtMapViewOfSection of
-/// the CSR shared section — no-op success] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
+/// the CSR shared section handled by this rendezvous path] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
 /// (broker complete). Returns the client comm-port handle (0 on wall). After the accept reply, the
 /// worker is left to run into its next receive and the next rendezvous drains that state if needed.
 ///
@@ -4147,11 +4148,10 @@ pub(crate) unsafe fn csr_rendezvous(
                     }
                 }
                 _ => {
-                    // An incidental syscall on the accept path (NtDelayExecution retry,
-                    // NtSetInformationThread, …) — no-op success + keep going (bounded by `guard`).
-                    print_str(b"[csr-rdv] incidental SSN=");
+                    print_str(b"[csr-rdv] WALL: unsupported accept-path SSN=");
                     print_u64(ssn);
-                    print_str(b" -> no-op success\n");
+                    print_str(b"\n");
+                    break;
                 }
             }
             set_reply_mr(15, resume_ip);

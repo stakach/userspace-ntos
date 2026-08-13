@@ -5035,3 +5035,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   placeholder. Validation: `cargo fmt --all`, `cargo test -p nt-syscall`,
   `cargo test -p nt-process`, `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  Native process/thread information setter cleanup (2026-08-14): `NtSetInformationProcess` no
+  longer succeeds unknown information classes and now backs the boot-used NT5 setters with real
+  ProcessManager state. Implemented classes cover `ProcessBasePriority`, `ProcessExceptionPort`,
+  `ProcessAccessToken`, `ProcessDefaultHardErrorMode`, `ProcessPriorityClass`,
+  `ProcessSessionInformation`, `ProcessForegroundInformation`, and `ProcessBreakOnTermination`;
+  unsupported classes return `STATUS_INVALID_INFO_CLASS`. `NtSetInformationThread` now rejects
+  unsupported classes and backs `ThreadPriority`, `ThreadBasePriority`, `ThreadAffinityMask`,
+  `ThreadQuerySetWin32StartAddress`, `ThreadIdealProcessor`, `ThreadPriorityBoost`,
+  `ThreadHideFromDebugger`, `ThreadBreakOnTermination`, and `ThreadNameInformation` with ETHREAD
+  state. `ThreadZeroTlsCell` now resolves the current thread and clears the requested TLS slot
+  across every mapped TEB in the process, using exported x64 TEB offsets from `nt-ntdll-layout`.
+  The CSR accept rendezvous no longer replies success to unknown incidental syscalls; it walls with
+  the unsupported SSN so the next missing mechanism is explicit. Remaining no-op candidates are
+  separate follow-up work: registry write-enable/value persistence, locale setter storage, and
+  documented win32k atom/pool lifetime no-ops. Validation: `cargo fmt --all`,
+  `cargo test -p nt-process`, `cargo test -p nt-ntdll-layout`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.

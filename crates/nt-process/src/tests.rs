@@ -1101,6 +1101,41 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
         STATUS_PENDING
     );
     assert_eq!(
+        pm.query_thread_basic(pid, current, handle as u64)
+            .unwrap()
+            .priority,
+        DEFAULT_PROCESS_BASE_PRIORITY
+    );
+    pm.set_thread_priority(target, 10).unwrap();
+    pm.set_thread_base_priority(target, 2).unwrap();
+    pm.set_thread_affinity_mask(target, 1).unwrap();
+    pm.set_thread_ideal_processor(target, 1).unwrap();
+    let basic = pm.query_thread_basic(pid, current, handle as u64).unwrap();
+    assert_eq!(basic.priority, 10);
+    assert_eq!(basic.base_priority, 2);
+    assert_eq!(basic.affinity_mask, 1);
+    assert_eq!(pm.thread_ideal_processor(target), Some(1));
+    assert_eq!(
+        pm.set_thread_priority(target, HIGH_PRIORITY + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        pm.set_thread_base_priority(target, THREAD_BASE_PRIORITY_MAX + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        pm.set_thread_affinity_mask(target, 0),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        pm.set_thread_affinity_mask(target, 2),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
+        pm.set_thread_ideal_processor(target, MAXIMUM_PROCESSORS + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(
         pm.query_thread_times(pid, current, handle as u64).unwrap(),
         ThreadTimes {
             create_time: 100,
@@ -1183,6 +1218,8 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
     let basic = pm.query_process_basic(caller, handle as u64).unwrap();
     assert_eq!(basic.exit_status, STATUS_PENDING);
     assert_eq!(basic.peb_base_address, 0x0000_0100_1602_0000);
+    assert_eq!(basic.affinity_mask, 1);
+    assert_eq!(basic.base_priority, DEFAULT_PROCESS_BASE_PRIORITY);
     assert_eq!(basic.unique_process_id, target);
     assert_eq!(basic.inherited_from_unique_process_id, caller);
     assert_eq!(
@@ -1212,6 +1249,17 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
     );
     pm.set_process_session_id(target, 3).unwrap();
     assert_eq!(pm.query_process_session_id(caller, handle as u64), Ok(3));
+    pm.set_process_base_priority(target, 11).unwrap();
+    assert_eq!(
+        pm.query_process_basic(caller, handle as u64)
+            .unwrap()
+            .base_priority,
+        11
+    );
+    assert_eq!(
+        pm.set_process_base_priority(target, HIGH_PRIORITY + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
     let session_child = pm.create_process("session-child.exe", Some(target), None);
     let session_child_handle = pm
         .insert_handle(
@@ -1225,24 +1273,44 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
         Ok(3)
     );
     assert_eq!(
+        pm.query_process_basic(caller, session_child_handle as u64)
+            .unwrap()
+            .base_priority,
+        11
+    );
+    assert_eq!(
         pm.set_process_session_id(0xffff_ffff, 1),
         Err(STATUS_INVALID_HANDLE)
     );
     pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
         .unwrap();
+    pm.set_process_foreground(target, true).unwrap();
     assert_eq!(
         pm.query_process_priority_class(caller, handle as u64),
         Ok(PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
     );
+    assert_eq!(pm.query_process_foreground(caller, handle as u64), Ok(true));
     pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_INVALID)
         .unwrap();
+    pm.set_process_foreground(target, false).unwrap();
     assert_eq!(
         pm.query_process_priority_class(caller, handle as u64),
         Ok(PROCESS_PRIORITY_CLASS_INVALID)
     );
     assert_eq!(
+        pm.query_process_foreground(caller, handle as u64),
+        Ok(false)
+    );
+    assert_eq!(
         pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL + 1),
         Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(pm.process_exception_port(target), None);
+    pm.set_process_exception_port(target, 0xCAFE).unwrap();
+    assert_eq!(pm.process_exception_port(target), Some(0xCAFE));
+    assert_eq!(
+        pm.set_process_exception_port(target, 0xBEEF),
+        Err(STATUS_PORT_ALREADY_SET)
     );
 
     let debug = pm

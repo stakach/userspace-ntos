@@ -46,12 +46,18 @@ fn teb_offsets() {
     assert_eq!(offset_of!(Teb, static_unicode_string), 0x1258);
     assert_eq!(offset_of!(Teb, static_unicode_buffer), 0x1268);
     assert_eq!(offset_of!(Teb, deallocation_stack), 0x1478);
+    assert_eq!(offset_of!(Teb, tls_slots), 0x1480);
+    assert_eq!(TEB_TLS_SLOTS_OFFSET, 0x1480);
     assert_eq!(offset_of!(Teb, free_stack_on_termination), 0x1745);
+    assert_eq!(offset_of!(Teb, has_fiber_data), 0x1746);
+    assert_eq!(offset_of!(Teb, ideal_processor), 0x1747);
+    assert_eq!(TEB_IDEAL_PROCESSOR_OFFSET, 0x1747);
     assert_eq!(offset_of!(Teb, vdm), 0x1690);
     assert_eq!(offset_of!(Teb, hard_error_mode), 0x16B0);
     assert_eq!(offset_of!(Teb, gdi_batch_count), 0x1740);
     assert_eq!(offset_of!(Teb, waiting_on_loader_lock), 0x1760);
     assert_eq!(offset_of!(Teb, tls_expansion_slots), 0x1780);
+    assert_eq!(TEB_TLS_EXPANSION_SLOTS_OFFSET, 0x1780);
     assert_eq!(offset_of!(Teb, impersonation_locale), 0x1798);
     assert_eq!(offset_of!(Teb, is_impersonating), 0x179C);
     assert_eq!(offset_of!(Teb, current_transaction_handle), 0x17B8);
