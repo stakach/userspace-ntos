@@ -52,8 +52,8 @@ pub use hive::{
     SYSTEM_HIVE_PATH,
 };
 pub use io::{
-    FaultInjectionHiveIoProvider, FlushMode, HiveIoError, HiveIoProvider, HiveIoProviderKind,
-    HiveIoStatus, HiveManager, MemoryHiveIoProvider,
+    FaultInjectionHiveIoProvider, FlushMode, HiveFlushError, HiveIoError, HiveIoProvider,
+    HiveIoProviderKind, HiveIoStatus, HiveManager, MemoryHiveIoProvider,
 };
 
 #[cfg(test)]

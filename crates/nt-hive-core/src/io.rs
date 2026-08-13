@@ -4,7 +4,8 @@
 use alloc::vec::Vec;
 
 use crate::codec::{
-    decode_image, encode_image, encode_log_record, replay_log, HiveDecodeError, HiveLogOp,
+    decode_image, encode_image, encode_log_record, replay_log, try_encode_image, HiveDecodeError,
+    HiveEncodeError, HiveLogOp,
 };
 use crate::hive::{Hive, HiveKind};
 
@@ -15,6 +16,13 @@ pub enum HiveIoError {
     Io,
     /// The provider cannot support this operation.
     NotSupported,
+}
+
+/// Why a manager checkpoint failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveFlushError {
+    Io(HiveIoError),
+    Encode(HiveEncodeError),
 }
 
 /// Which backend a provider is (spec §10.2).
@@ -234,6 +242,23 @@ impl<P: HiveIoProvider> HiveManager<P> {
         self.provider.flush_image()?;
         self.provider.truncate_log()?;
         self.provider.flush_log()?;
+        hive.clear_dirty();
+        self.next_log_sequence = hive.sequence + 1;
+        Ok(())
+    }
+
+    /// Fallible checkpoint for kernel paths where allocation failure must return a status instead
+    /// of panicking. I/O failures preserve the previous image and the current log, matching
+    /// [`Self::flush`].
+    pub fn try_flush(&mut self, hive: &mut Hive) -> Result<(), HiveFlushError> {
+        hive.generation += 1;
+        let bytes = try_encode_image(hive).map_err(HiveFlushError::Encode)?;
+        self.provider
+            .write_primary_image_atomic(&bytes)
+            .map_err(HiveFlushError::Io)?;
+        self.provider.flush_image().map_err(HiveFlushError::Io)?;
+        self.provider.truncate_log().map_err(HiveFlushError::Io)?;
+        self.provider.flush_log().map_err(HiveFlushError::Io)?;
         hive.clear_dirty();
         self.next_log_sequence = hive.sequence + 1;
         Ok(())

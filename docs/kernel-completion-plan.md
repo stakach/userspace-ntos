@@ -1079,6 +1079,11 @@ before unrelated executive traffic monopolises the receive loop.
   restart/replay tests across a checkpoint boundary. This is still crate-local groundwork; the next
   D4 step is wiring boot/profile hive mutation paths through a real provider-backed manager rather
   than direct image-only checkpointing.
+  The provider-readiness slice adds a fallible `HiveManager::try_flush` API that uses the checked
+  image encoder and reports typed encode/I/O failures instead of panicking. A host test now proves
+  that an atomic image-write failure is surfaced while the replay log remains sufficient to recover
+  the mutation on restart. This gives the executive a checkpoint primitive that matches its current
+  low-headroom error handling before real writable-volume providers are installed.
 
 ## Immediate Iteration
 

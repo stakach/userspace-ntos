@@ -917,3 +917,29 @@ fn fault_on_image_write_preserves_previous() {
     assert_eq!(booted.query_dword(key, "A"), Some(1)); // image #1
     assert_eq!(booted.query_dword(key, "B"), Some(2)); // replayed log survived
 }
+
+#[test]
+fn try_flush_reports_io_fault_and_preserves_replay_log() {
+    let mut mgr = HiveManager::new(FaultInjectionHiveIoProvider::new().fail_image_write_after(1));
+    let mut hive = mgr.boot(HiveKind::System).unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"ControlSet001\Services\Net",
+            name: "Start",
+            value_type: RegistryValueType::Dword,
+            data: &2u32.to_le_bytes(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        mgr.try_flush(&mut hive),
+        Err(HiveFlushError::Io(HiveIoError::Io))
+    );
+
+    let provider = mgr.into_provider();
+    let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
+    let key = booted.open_key(r"ControlSet001\Services\Net").unwrap();
+    assert_eq!(booted.query_dword(key, "Start"), Some(2));
+}
