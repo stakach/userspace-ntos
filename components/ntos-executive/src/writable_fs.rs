@@ -46,8 +46,8 @@ use crate::*;
 pub(crate) const WRITABLE_PREFIXES: &[&[u8]] = &[b"profiles", b"reactos\\system32\\config"];
 
 /// ★ BYPASS SWITCH (the batch's control experiment). `false` unmounts the writable volume: every
-/// path below falls back to the pre-existing `STATUS_NOT_IMPLEMENTED` miss, `CreateDirectoryW`
-/// returns `Error: 1` again and the overlay specs go red. Nothing else in the executive changes.
+/// path below fails as `STATUS_DEVICE_NOT_READY`, `CreateDirectoryW` fails again, and the overlay
+/// specs go red. Nothing else in the executive changes.
 pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 
 /// ★ THE PROFILE SOURCE — **the ISO's OWN `Profiles/` tree, which our staging was dropping.**
@@ -975,7 +975,7 @@ pub(crate) unsafe fn create(
     options: u32,
 ) -> (u32, Option<u64>, u64) {
     let Some(fs) = writable_fs() else {
-        return (nt_fs::STATUS_NOT_IMPLEMENTED, None, 0);
+        return (nt_fs::STATUS_DEVICE_NOT_READY, None, 0);
     };
     let result = fs.zw_create_file_relative(
         relative,

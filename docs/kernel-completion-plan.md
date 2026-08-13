@@ -4908,3 +4908,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   statuses once the clients are installed. Validation: `cargo fmt --all`,
   `cargo test -p nt-status --quiet`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D1 writable-overlay not-ready cleanup (2026-08-13): the writable filesystem helper no longer
+  returns `STATUS_NOT_IMPLEMENTED` if the overlay volume is disabled or unavailable. `nt-fs` now
+  names `STATUS_DEVICE_NOT_READY`, and early writable-volume creates fail with that concrete
+  filesystem readiness status without fabricating a handle. Validation: `cargo fmt --all`,
+  `cargo test -p nt-fs --quiet`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
