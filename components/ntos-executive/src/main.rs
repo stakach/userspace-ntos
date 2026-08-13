@@ -1201,7 +1201,7 @@ pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
 static SYSTEM_TIME_ZONE_BIAS_100NS: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_TIME_ZONE_ID: AtomicU32 = AtomicU32::new(0);
 static NT_GLOBAL_FLAG: AtomicU32 = AtomicU32::new(0);
-static SYSTEM_SESSION_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static SYSTEM_SESSION_NEXT_ID: AtomicU32 = AtomicU32::new(0);
 static SYSTEM_SESSION_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
 pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 /// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is

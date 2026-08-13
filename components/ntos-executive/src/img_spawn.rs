@@ -1340,6 +1340,12 @@ pub(crate) unsafe fn scratch_for(
     }
     None
 }
+
+unsafe fn unregistered_image_mapping(pi: u64, page: u64) -> bool {
+    process_committed_mapping_basic_information(pi, page)
+        .is_some_and(|info| info.type_ == nt_address_space::MEM_IMAGE)
+}
+
 /// Copy bytes from any already-mapped SEC_IMAGE client page. Prefer the process's persistent
 /// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases, the
 /// client-frame table, and explicit copy-in prefetches. The walk is read-only, bounded by `dst`,
@@ -1415,6 +1421,9 @@ pub(crate) unsafe fn client_copyin_process_mapped(
                     }
                 };
                 if frame == 0 {
+                    if unregistered_image_mapping(pi, page) {
+                        return false;
+                    }
                     if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base)
                     {
                         source
@@ -1544,7 +1553,9 @@ pub(crate) unsafe fn client_copyout_mapped(
                 }
                 alias + (current & 0xfff)
             } else if let Some(destination) =
-                scratch_for(current, filled_pages, nfilled, scratch_base)
+                (!unregistered_image_mapping(pi, page))
+                    .then(|| scratch_for(current, filled_pages, nfilled, scratch_base))
+                    .flatten()
             {
                 destination
             } else {

@@ -1243,6 +1243,18 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
         Ok(PROCESS_PRIORITY_CLASS_NORMAL)
     );
     assert_eq!(pm.query_process_session_id(caller, handle as u64), Ok(0));
+    let native_session_child = pm.create_process("native-session-child.exe", Some(target), None);
+    let native_session_child_handle = pm
+        .insert_handle(
+            caller,
+            HandleObject::Process(native_session_child),
+            PROCESS_QUERY_INFORMATION,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.query_process_session_id(caller, native_session_child_handle as u64),
+        Ok(0)
+    );
     assert_eq!(
         pm.query_process_session_id(caller, denied as u64),
         Err(STATUS_ACCESS_DENIED)

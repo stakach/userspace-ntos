@@ -24250,7 +24250,8 @@ impl ExecNtHandler {
                             return STATUS_INVALID_HANDLE;
                         };
                         let session_id = SYSTEM_SESSION_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                        if session_id == 0 {
+                        if session_id == u32::MAX {
+                            SYSTEM_SESSION_NEXT_ID.store(u32::MAX, Ordering::Relaxed);
                             return STATUS_INSUFFICIENT_RESOURCES;
                         }
                         if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
