@@ -1351,6 +1351,19 @@ fn build_registry_key_query_info(
             info.resize(4, 0);
             Ok((info, 4))
         }
+        6 => {
+            // KEY_VIRTUALIZATION_INFORMATION. Registry virtualization is disabled in this kernel;
+            // expose the real key and report every virtualization bit clear.
+            let mut info = alloc::vec::Vec::new();
+            info.resize(4, 0);
+            Ok((info, 4))
+        }
+        7 => {
+            // KEY_HANDLE_TAGS_INFORMATION. We do not attach per-handle CM tags, so the tag mask is 0.
+            let mut info = alloc::vec::Vec::new();
+            info.resize(4, 0);
+            Ok((info, 4))
+        }
         _ => Err(STATUS_INVALID_PARAMETER),
     }
 }

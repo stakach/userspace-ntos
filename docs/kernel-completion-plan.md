@@ -1072,9 +1072,11 @@ before unrelated executive traffic monopolises the receive loop.
   controls only creation of a new key, reopening an existing key keeps the original key identity and
   storage class, detached overlay slots reattach with fresh volatility and no stale values, and the
   executive now opens existing mounted mutable-hive keys even when callers supply
-  `REG_OPTION_VOLATILE`. Remaining D4 work is volatile hive/query metadata, log replay integration
-  for mutable checkpoints, and broader setup/user-profile durability semantics beyond the current
-  desktop repeat-boot proof.
+  `REG_OPTION_VOLATILE`. The volatile/query metadata cleanup now keeps
+  `NtQueryKey(KeyFlagsInformation)` scoped to KCB user flags and accepts the public virtualization
+  and handle-tag information classes with correctly-sized zeroed records because this kernel exposes
+  real, non-virtualized registry keys and no CM handle tags. Remaining D4 work is broader
+  setup/user-profile durability semantics beyond the current desktop repeat-boot proof.
   The follow-up volatility-accounting slice keeps the API boundary aligned with NT5/ReactOS:
   `NtQueryKey(KeyFlagsInformation)` remains `KcbUserFlags`-shaped rather than pretending that
   `REG_OPTION_VOLATILE` is a query flag, while `NtFlushKey` now classifies overlay keys through the
@@ -4643,6 +4645,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   proving owned shadow paths can be nonvolatile and that reopening them with a volatile create option
   does not rewrite the key's storage class. Validation: `cargo fmt --all`,
   `cargo test -p nt-hive-core`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D4 registry query metadata cleanup (2026-08-13): `NtQueryKey` no longer rejects the public
+  `KeyVirtualizationInformation` and `KeyHandleTagsInformation` classes as invalid. The executive
+  now returns the real NT structure size and a zeroed payload for both: registry virtualization is
+  disabled, keys are not virtual targets/stores/sources, and the kernel does not attach CM handle
+  tags. `KeyFlagsInformation` remains the ReactOS/NT5 `KcbUserFlags` shape and does not expose
+  `REG_OPTION_VOLATILE` as a query flag. This removes a valid-information-class gap without adding a
+  compatibility fallback. Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
   D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found
