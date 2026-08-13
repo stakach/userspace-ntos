@@ -1499,6 +1499,11 @@ const GENERIC_SECTION_BACKING_OVERLAY: u8 = 3;
 const GENERIC_SECTION_CAP: usize = 128;
 const GENERIC_SECTION_VIEW_CAP: usize = 256;
 const GENERIC_SECTION_PAGE_CAP: usize = 2048;
+const SECTION_ATTR_SEC_BASED: u32 = 0x0020_0000;
+const SECTION_ATTR_SEC_FILE: u32 = 0x0080_0000;
+const SECTION_ATTR_SEC_IMAGE: u32 = 0x0100_0000;
+const SECTION_ATTR_SEC_RESERVE: u32 = 0x0400_0000;
+const SECTION_ATTR_SEC_COMMIT: u32 = 0x0800_0000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GenericSectionBacking {
@@ -1557,6 +1562,7 @@ pub(crate) struct GenericSection {
     pub(crate) handle: u64,
     pub(crate) size: u64,
     pub(crate) protection: u32,
+    pub(crate) allocation_attributes: u32,
     pub(crate) backing: GenericSectionBacking,
 }
 
@@ -1568,8 +1574,29 @@ impl GenericSection {
             handle: 0,
             size: 0,
             protection: nt_address_space::PAGE_NOACCESS,
+            allocation_attributes: 0,
             backing: GenericSectionBacking::none(),
         }
+    }
+
+    pub(crate) fn basic_attributes(self) -> u32 {
+        let mut attributes = self.allocation_attributes
+            & (SECTION_ATTR_SEC_BASED
+                | SECTION_ATTR_SEC_IMAGE
+                | SECTION_ATTR_SEC_RESERVE
+                | SECTION_ATTR_SEC_COMMIT);
+        match self.backing.kind {
+            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY => {
+                attributes |= SECTION_ATTR_SEC_FILE;
+            }
+            GENERIC_SECTION_BACKING_ANON => {
+                if attributes & (SECTION_ATTR_SEC_COMMIT | SECTION_ATTR_SEC_RESERVE) == 0 {
+                    attributes |= SECTION_ATTR_SEC_COMMIT;
+                }
+            }
+            _ => {}
+        }
+        attributes
     }
 }
 
@@ -1654,6 +1681,7 @@ impl GenericSectionTable {
         handle: u64,
         size: u64,
         protection: u32,
+        allocation_attributes: u32,
         backing: GenericSectionBacking,
     ) -> Option<usize> {
         if size == 0 || !backing.is_live() {
@@ -1663,6 +1691,7 @@ impl GenericSectionTable {
             if let Some(index) = self.index_for_handle(owner_pi, handle) {
                 self.sections[index].size = size;
                 self.sections[index].protection = protection;
+                self.sections[index].allocation_attributes = allocation_attributes;
                 self.sections[index].backing = backing;
                 return Some(index);
             }
@@ -1675,6 +1704,7 @@ impl GenericSectionTable {
                     handle,
                     size,
                     protection,
+                    allocation_attributes,
                     backing,
                 };
                 return Some(index);
@@ -9790,6 +9820,7 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
         0,
         MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64,
         nt_address_space::PAGE_READWRITE,
+        SECTION_ATTR_SEC_COMMIT,
         GenericSectionBacking::overlay(file_id),
     ) else {
         status = STATUS_UNSUCCESSFUL;

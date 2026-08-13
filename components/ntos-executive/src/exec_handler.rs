@@ -27097,19 +27097,51 @@ impl ExecNtHandler {
                 service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
             // NtQuerySection(SectionHandle[R10], class[RDX]=args[1], buf[R8], len[R9], *ResultLen[sp+0x28]).
-            // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's entry
-            // point, stack sizes + subsystem before creating the initial thread. Return a 64-byte
-            // SECTION_IMAGE_INFORMATION derived from the section's backing PE (a registry DLL at its
-            // registry base, or the csrss.exe EXE at PE_LOAD_BASE).
+            // ReactOS accepts SectionBasicInformation for every valid section and
+            // SectionImageInformation only for SEC_IMAGE sections. Data/file-backed mappings must
+            // therefore report their real basic geometry instead of falling off the hosted-image path.
             NativeService::NtQuerySection => unsafe {
+                const SECTION_BASIC_INFORMATION: u64 = 0;
+                const SECTION_IMAGE_INFORMATION: u64 = 1;
+                const SECTION_BASIC_INFORMATION_SIZE: usize = 24;
+                const SECTION_IMAGE_INFORMATION_SIZE: usize = 64;
+                const STATUS_SECTION_NOT_IMAGE: u32 = 0xC000_0049;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
                 let class = args[1]; // RDX
                 let buf = get_recv_mr(7); // R8
+                let len = get_recv_mr(8); // R9
                 let sect = get_recv_mr(9); // R10 = SectionHandle
                 let sp = get_recv_mr(16);
-                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(self.pi, sect) {
-                    reg.image_info(i).map(|b| (b, reg.name(i)))
+                let result_len = smss_stack_read(sp + 0x28);
+                let required = match class {
+                    SECTION_BASIC_INFORMATION => SECTION_BASIC_INFORMATION_SIZE,
+                    SECTION_IMAGE_INFORMATION => SECTION_IMAGE_INFORMATION_SIZE,
+                    _ => return nt_syscall::STATUS_INVALID_INFO_CLASS,
+                };
+                if len < required as u64 {
+                    return nt_syscall::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if !self.probe_user_output(buf, required) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if result_len != 0 && !self.probe_user_output(result_len, 8) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                let mut basic_info = [0u8; SECTION_BASIC_INFORMATION_SIZE];
+                let image_info: Option<([u8; 64], &[u8])> =
+                    if let Some(i) = reg.index_for_section(self.pi, sect) {
+                        reg.image_info(i).map(|b| {
+                            basic_info[8..12].copy_from_slice(
+                                &(SECTION_ATTR_SEC_IMAGE | SECTION_ATTR_SEC_FILE).to_le_bytes(),
+                            );
+                            basic_info[16..24].copy_from_slice(&u64::from_le_bytes(
+                                b[0x38..0x40].try_into().unwrap(),
+                            )
+                            .to_le_bytes());
+                            (b, reg.name(i))
+                        })
                 } else if let Some(index) =
                     (&*ctx.exe_images).index_for_section(self.pi, sect)
                 {
@@ -27127,42 +27159,79 @@ impl ExecNtHandler {
                             .copy_from_slice(&metadata.subsystem_minor.to_le_bytes());
                         info[0x26..0x28]
                             .copy_from_slice(&metadata.subsystem_major.to_le_bytes());
+                        basic_info[8..12].copy_from_slice(
+                            &(SECTION_ATTR_SEC_IMAGE | SECTION_ATTR_SEC_FILE).to_le_bytes(),
+                        );
+                        basic_info[16..24].copy_from_slice(&(metadata.image_size as u64).to_le_bytes());
                         (info, slot.leaf())
                     })
                 } else {
                     None
                 };
-                if class == 1 && info.is_some() {
-                    let (bytes, who) = info.unwrap();
-                    if who == b"userinit.exe" {
-                        USERINIT_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
-                    } else if who == b"explorer.exe" {
-                        EXPLORER_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
+
+                if image_info.is_none() {
+                    if let Some(section_index) = self
+                        .pm_pid_for_pi(self.pi)
+                        .and_then(|pid| match self.pm.lookup_handle(pid, sect as nt_process::Handle) {
+                            Some(nt_process::HandleObject::Section(id)) => Some(id as usize),
+                            _ => None,
+                        })
+                        .or_else(|| (&*ctx.generic_sections).index_for_handle(self.pi, sect))
+                    {
+                        let Some(section) = (&*ctx.generic_sections).section(section_index) else {
+                            return nt_process::STATUS_INVALID_HANDLE;
+                        };
+                        basic_info[8..12].copy_from_slice(&section.basic_attributes().to_le_bytes());
+                        basic_info[16..24].copy_from_slice(&section.size.to_le_bytes());
+                    } else if *ctx.csrss_anon_section_handle != 0
+                        && sect == *ctx.csrss_anon_section_handle
+                    {
+                        basic_info[8..12].copy_from_slice(&SECTION_ATTR_SEC_RESERVE.to_le_bytes());
+                        basic_info[16..24].copy_from_slice(&(*ctx.csrss_anon_size).to_le_bytes());
+                    } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
+                        let nls_size =
+                            core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32)
+                                as u64;
+                        basic_info[8..12].copy_from_slice(&SECTION_ATTR_SEC_FILE.to_le_bytes());
+                        basic_info[16..24].copy_from_slice(&nls_size.to_le_bytes());
+                    } else {
+                        return nt_process::STATUS_INVALID_HANDLE;
                     }
-                    // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
-                    for k in 0..8 {
-                        let mut w = [0u8; 8];
-                        w.copy_from_slice(&bytes[k * 8..k * 8 + 8]);
-                        smss_stack_write(buf + (k as u64) * 8, u64::from_le_bytes(w));
-                    }
-                    let rl = smss_stack_read(sp + 0x28); // arg4 = *ResultLength
-                    if rl != 0 {
-                        smss_stack_write(rl, 64);
-                    }
-                    let entry = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    print_str(b"[ntos-exec] NtQuerySection ");
-                    print_str(who);
-                    print_str(b" entry=0x");
-                    print_hex((entry >> 32) as u32);
-                    print_hex(entry as u32);
-                    print_str(b" subsystem=");
-                    print_u64(u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()) as u64);
-                    print_str(b"\n");
-                    0
-                } else {
-                    self.stop = true;
-                    0xC0000002
                 }
+
+                let (output, written) = match class {
+                    SECTION_BASIC_INFORMATION => (&basic_info[..], SECTION_BASIC_INFORMATION_SIZE),
+                    SECTION_IMAGE_INFORMATION => {
+                        let Some((bytes, who)) = image_info.as_ref() else {
+                            return STATUS_SECTION_NOT_IMAGE;
+                        };
+                        if *who == b"userinit.exe" {
+                            USERINIT_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
+                        } else if *who == b"explorer.exe" {
+                            EXPLORER_IMAGE_QUERIES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let entry = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                        print_str(b"[ntos-exec] NtQuerySection ");
+                        print_str(*who);
+                        print_str(b" entry=0x");
+                        print_hex((entry >> 32) as u32);
+                        print_hex(entry as u32);
+                        print_str(b" subsystem=");
+                        print_u64(u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()) as u64);
+                        print_str(b"\n");
+                        (&bytes[..], SECTION_IMAGE_INFORMATION_SIZE)
+                    }
+                    _ => unreachable!(),
+                };
+                if !self.xas_try_write_buf(buf, output) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if result_len != 0
+                    && !self.xas_try_write_buf(result_len, &(written as u64).to_le_bytes())
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                0
             },
             // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId[RDX]=args[1]). The caller may pass a
             // stack local (winsrv's hard-error cache) or an image/DLL global (ntdll loader state), so
@@ -27403,6 +27472,7 @@ impl ExecNtHandler {
                     0,
                     backing_size,
                     page_protection,
+                    allocation_attrs,
                     backing,
                 ) else {
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;

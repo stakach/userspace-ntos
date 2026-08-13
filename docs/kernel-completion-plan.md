@@ -4922,3 +4922,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `STATUS_INVALID_PARAMETER`; a missing callout table entry now fails as `STATUS_DEVICE_NOT_READY`.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  Memory-manager section query cleanup (2026-08-14): `NtQuerySection` no longer stops the executive
+  or reports `STATUS_NOT_IMPLEMENTED` outside the hosted SEC_IMAGE happy path. Generic anonymous,
+  disk-backed, and writable-overlay sections now retain their original allocation attributes and
+  answer `SectionBasicInformation` with NT section geometry; hosted executable/DLL image sections
+  answer both basic and image information; valid non-image sections queried for
+  `SectionImageInformation` return `STATUS_SECTION_NOT_IMAGE`, and invalid classes, lengths,
+  handles, or user buffers return concrete NT failures. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.
