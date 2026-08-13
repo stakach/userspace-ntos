@@ -5006,3 +5006,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   section contract instead of treating Dbgk's no-event path as a successful unmap. Validation:
   `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  ntdll runtime DLL section-handle cleanup (2026-08-14): runtime `LdrLoadDll` now closes the
+  transient SEC_IMAGE section handle immediately after `NtMapViewOfSection` consumes the map
+  attempt. The image file handle was already closed by `RtlpMapFile`, and a successful map owns its
+  view lifetime through `NtUnmapViewOfSection`; failed maps no longer leak the section handle.
+  Validation: `cargo fmt --all`, `./scripts/build_ntdll_dll.sh`, and `git diff --check`.

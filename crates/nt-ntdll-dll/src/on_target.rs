@@ -2374,8 +2374,8 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
         buffer: wname.as_ptr() as u64,
     };
 
-    // NtOpenFile(image) → NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes the
-    // file, leaves the SEC_IMAGE handle in `section`).
+    // NtOpenFile(image) -> NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes
+    // the file, leaves the SEC_IMAGE handle in `section` until the map attempt consumes it).
     let mut section: u64 = 0;
     // SAFETY: on-target; us is a valid UNICODE_STRING*, section a writable stack local.
     let st = unsafe {
@@ -2411,6 +2411,7 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
             0x20, // PAGE_EXECUTE_READ
         )
     };
+    unsafe { syscall4(SSN_NT_CLOSE, section, 0, 0, 0) };
     if (st as i32) < 0 {
         return 0;
     }
