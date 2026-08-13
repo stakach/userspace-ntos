@@ -1218,6 +1218,97 @@ pub(crate) unsafe fn write_file_atomic_owned(path: &str, bytes: alloc::vec::Vec<
     status
 }
 
+fn hive_io_status(status: u32) -> Result<(), nt_hive_core::HiveIoError> {
+    if status == nt_fs::STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(nt_hive_core::HiveIoError::Io)
+    }
+}
+
+/// Writable-volume backing for `nt-hive-core`'s image + log provider contract.
+///
+/// Images and logs are ordinary files in the same writable namespace hosted processes use. The log
+/// path is a sidecar (`<image>.LOG`) so a later checkpoint can atomically replace the primary image
+/// and truncate the replay tail without inventing another executive-local persistence plane.
+pub(crate) struct WritableHiveIoProvider {
+    image_path: alloc::string::String,
+    log_path: alloc::string::String,
+}
+
+impl WritableHiveIoProvider {
+    pub(crate) fn new(image_path: &str) -> Self {
+        Self {
+            image_path: alloc::string::String::from(image_path),
+            log_path: alloc::format!("{}.LOG", image_path),
+        }
+    }
+}
+
+impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
+    fn provider_kind(&self) -> nt_hive_core::HiveIoProviderKind {
+        nt_hive_core::HiveIoProviderKind::NtFile
+    }
+
+    fn read_primary_image(
+        &mut self,
+    ) -> Result<Option<alloc::vec::Vec<u8>>, nt_hive_core::HiveIoError> {
+        Ok(unsafe { file_bytes_if_mounted(&self.image_path).map(|bytes| bytes.to_vec()) })
+    }
+
+    fn write_primary_image_atomic(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), nt_hive_core::HiveIoError> {
+        self.write_primary_image_atomic_owned(bytes.to_vec())
+    }
+
+    fn write_primary_image_atomic_owned(
+        &mut self,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> Result<(), nt_hive_core::HiveIoError> {
+        hive_io_status(unsafe { write_file_atomic_owned(&self.image_path, bytes) })
+    }
+
+    fn read_log(&mut self) -> Result<alloc::vec::Vec<u8>, nt_hive_core::HiveIoError> {
+        Ok(unsafe {
+            file_bytes_if_mounted(&self.log_path)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default()
+        })
+    }
+
+    fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
+        let mut log = self.read_log()?;
+        log.extend_from_slice(bytes);
+        hive_io_status(unsafe { write_file_atomic_owned(&self.log_path, log) })
+    }
+
+    fn truncate_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        hive_io_status(unsafe {
+            write_file_atomic_owned(&self.log_path, alloc::vec::Vec::new())
+        })
+    }
+
+    fn flush_image(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
+        Ok(())
+    }
+
+    fn get_status(&self) -> nt_hive_core::HiveIoStatus {
+        let image_present =
+            unsafe { file_bytes_if_mounted(&self.image_path).is_some() };
+        let log_len = unsafe { file_bytes_if_mounted(&self.log_path).map_or(0, |bytes| bytes.len()) };
+        nt_hive_core::HiveIoStatus {
+            image_present,
+            log_len,
+        }
+    }
+}
+
 /// `NtFlushBuffersFile` on a writable-volume file object.
 pub(crate) unsafe fn flush(file_id: u64) -> u32 {
     let Some(fs) = writable_fs() else {

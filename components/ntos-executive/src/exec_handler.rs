@@ -3561,6 +3561,30 @@ impl ExecNtHandler {
         }
     }
 
+    fn mutable_hive_flush_failure_status(err: nt_hive_core::HiveFlushError) -> u32 {
+        match err {
+            nt_hive_core::HiveFlushError::Encode(_) => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+            nt_hive_core::HiveFlushError::Io(_) => STATUS_UNSUCCESSFUL,
+        }
+    }
+
+    fn print_mutable_hive_flush_failure(err: nt_hive_core::HiveFlushError) {
+        match err {
+            nt_hive_core::HiveFlushError::Encode(nt_hive_core::HiveEncodeError::OutOfMemory) => {
+                print_str(b"encode-out-of-memory")
+            }
+            nt_hive_core::HiveFlushError::Encode(nt_hive_core::HiveEncodeError::SizeOverflow) => {
+                print_str(b"encode-size-overflow")
+            }
+            nt_hive_core::HiveFlushError::Io(nt_hive_core::HiveIoError::Io) => {
+                print_str(b"io")
+            }
+            nt_hive_core::HiveFlushError::Io(nt_hive_core::HiveIoError::NotSupported) => {
+                print_str(b"not-supported")
+            }
+        }
+    }
+
     fn ensure_user_default_mutable_mount_only(&mut self) {
         if let Some(mount) = self
             .hive_mounts
@@ -3671,9 +3695,6 @@ impl ExecNtHandler {
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return STATUS_INVALID_HANDLE;
         };
-        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
-            return STATUS_INVALID_HANDLE;
-        };
         print_str(b"[cm-flush] boot hive checkpoint begin dirty-cells=");
         print_u64(dirty_cells as u64);
         print_str(b" heap-headroom=");
@@ -3681,14 +3702,15 @@ impl ExecNtHandler {
         print_str(b" path=");
         print_ascii_str(file_path);
         print_str(b"\n");
-        let image = {
-            let _alloc_ctx =
-                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
-            match nt_hive_core::try_encode_image(hive) {
-                Ok(image) => image,
+        let image_len = {
+            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            match nt_hive_core::encoded_image_len(hive) {
+                Ok(len) => len,
                 Err(err) => {
                     REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[cm-flush] boot hive checkpoint encode failed err=");
+                    print_str(b"[cm-flush] boot hive checkpoint measure failed err=");
                     print_str(match err {
                         nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
                         nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
@@ -3700,16 +3722,28 @@ impl ExecNtHandler {
                 }
             }
         };
-        let image_len = image.len();
-        let status = {
+        let flush_result = {
             let _alloc_ctx =
                 crate::allocator::enter_context(crate::allocator::ALLOC_CTX_WRITABLE_ATOMIC_WRITE);
-            unsafe { crate::writable_fs::write_file_atomic_owned(file_path, image) }
+            let Some(hive) = self.mutable_hives.hive_mut(hive_sel) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            let provider = crate::writable_fs::WritableHiveIoProvider::new(file_path);
+            let mut manager = nt_hive_core::HiveManager::new(provider);
+            manager.try_flush(hive)
         };
-        if status == nt_fs::STATUS_SUCCESS {
+        if let Err(err) = flush_result {
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] boot hive checkpoint failed err=");
+            Self::print_mutable_hive_flush_failure(err);
+            print_str(b" path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+            return Self::mutable_hive_flush_failure_status(err);
+        }
+        {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
-            self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
             print_str(b"[cm-flush] boot hive checkpoint ");
@@ -3719,15 +3753,8 @@ impl ExecNtHandler {
             print_str(b" path=");
             print_ascii_str(file_path);
             print_str(b"\n");
-        } else {
-            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] boot hive checkpoint failed status=0x");
-            print_hex(status);
-            print_str(b" path=");
-            print_ascii_str(file_path);
-            print_str(b"\n");
         }
-        status
+        nt_fs::STATUS_SUCCESS
     }
 
     fn checkpoint_boot_mutable_hive_preserving_headroom(
@@ -3951,17 +3978,15 @@ impl ExecNtHandler {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        let Some(hive) = self.mutable_hives.hive(hive_sel) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        let image = {
-            let _alloc_ctx =
-                crate::allocator::enter_context(crate::allocator::ALLOC_CTX_HIVE_ENCODE);
-            match nt_hive_core::try_encode_image(hive) {
-                Ok(image) => image,
+        let image_len = {
+            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            match nt_hive_core::encoded_image_len(hive) {
+                Ok(len) => len,
                 Err(err) => {
                     REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[cm-flush] dynamic hive checkpoint encode failed err=");
+                    print_str(b"[cm-flush] dynamic hive checkpoint measure failed err=");
                     print_str(match err {
                         nt_hive_core::HiveEncodeError::OutOfMemory => b"out-of-memory",
                         nt_hive_core::HiveEncodeError::SizeOverflow => b"size-overflow",
@@ -3973,25 +3998,37 @@ impl ExecNtHandler {
                 }
             }
         };
-        if image.len() > USER_HIVE_SLOT_BYTES {
+        if image_len > USER_HIVE_SLOT_BYTES {
             REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
             print_str(b"[cm-flush] dynamic hive checkpoint too large bytes=");
-            print_u64(image.len() as u64);
+            print_u64(image_len as u64);
             print_str(b" path=");
             print_ascii_str(&file_path);
             print_str(b"\n");
             return nt_fs::STATUS_INSUFFICIENT_RESOURCES;
         }
-        let image_len = image.len();
-        let status = {
+        let flush_result = {
             let _alloc_ctx =
                 crate::allocator::enter_context(crate::allocator::ALLOC_CTX_WRITABLE_ATOMIC_WRITE);
-            unsafe { crate::writable_fs::write_file_atomic_owned(&file_path, image) }
+            let Some(hive) = self.mutable_hives.hive_mut(hive_sel) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            let provider = crate::writable_fs::WritableHiveIoProvider::new(&file_path);
+            let mut manager = nt_hive_core::HiveManager::new(provider);
+            manager.try_flush(hive)
         };
-        if status == nt_fs::STATUS_SUCCESS {
+        if let Err(err) = flush_result {
+            REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] dynamic hive checkpoint failed err=");
+            Self::print_mutable_hive_flush_failure(err);
+            print_str(b" path=");
+            print_ascii_str(&file_path);
+            print_str(b"\n");
+            return Self::mutable_hive_flush_failure_status(err);
+        }
+        {
             self.writable_fs_dirty = true;
             self.writable_fs_commit_required = true;
-            self.mutable_hives.clear_hive_dirty(hive_sel);
             REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
             print_str(b"[cm-flush] dynamic hive checkpoint ");
@@ -4001,15 +4038,8 @@ impl ExecNtHandler {
             print_str(b" path=");
             print_ascii_str(&file_path);
             print_str(b"\n");
-        } else {
-            REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[cm-flush] dynamic hive checkpoint failed status=0x");
-            print_hex(status);
-            print_str(b" path=");
-            print_ascii_str(&file_path);
-            print_str(b"\n");
         }
-        status
+        nt_fs::STATUS_SUCCESS
     }
 
     /// `NtLoadKey*` — ReactOS `ntoskrnl/config/ntapi.c:1148` (`NtLoadKeyEx`). Mount a hive file at

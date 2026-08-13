@@ -1084,6 +1084,12 @@ before unrelated executive traffic monopolises the receive loop.
   that an atomic image-write failure is surfaced while the replay log remains sufficient to recover
   the mutation on restart. This gives the executive a checkpoint primitive that matches its current
   low-headroom error handling before real writable-volume providers are installed.
+  The first executive integration slice installs a writable-volume `HiveIoProvider` and routes both
+  boot-hive and dynamic profile-hive checkpoints through provider-backed `HiveManager::try_flush`.
+  Image writes still preserve the existing atomic replace and dirty snapshot semantics, but the
+  Configuration Manager no longer has separate image-only checkpoint code in the executive for
+  those paths. Sidecar logs are represented as `<hive>.LOG` provider files; mutation journaling is
+  the next step now that flush/checkpoint storage has one boundary.
 
 ## Immediate Iteration
 

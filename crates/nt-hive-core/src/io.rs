@@ -47,6 +47,9 @@ pub trait HiveIoProvider {
     fn provider_kind(&self) -> HiveIoProviderKind;
     fn read_primary_image(&mut self) -> Result<Option<Vec<u8>>, HiveIoError>;
     fn write_primary_image_atomic(&mut self, bytes: &[u8]) -> Result<(), HiveIoError>;
+    fn write_primary_image_atomic_owned(&mut self, bytes: Vec<u8>) -> Result<(), HiveIoError> {
+        self.write_primary_image_atomic(&bytes)
+    }
     fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError>;
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), HiveIoError>;
     fn truncate_log(&mut self) -> Result<(), HiveIoError>;
@@ -86,6 +89,10 @@ impl HiveIoProvider for MemoryHiveIoProvider {
     }
     fn write_primary_image_atomic(&mut self, bytes: &[u8]) -> Result<(), HiveIoError> {
         self.image = Some(bytes.to_vec());
+        Ok(())
+    }
+    fn write_primary_image_atomic_owned(&mut self, bytes: Vec<u8>) -> Result<(), HiveIoError> {
+        self.image = Some(bytes);
         Ok(())
     }
     fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError> {
@@ -154,6 +161,13 @@ impl HiveIoProvider for FaultInjectionHiveIoProvider {
             return Err(HiveIoError::Io); // previous image left intact
         }
         self.inner.write_primary_image_atomic(bytes)
+    }
+    fn write_primary_image_atomic_owned(&mut self, bytes: Vec<u8>) -> Result<(), HiveIoError> {
+        self.image_writes += 1;
+        if Some(self.image_writes) == self.fail_image_write_after {
+            return Err(HiveIoError::Io); // previous image left intact
+        }
+        self.inner.write_primary_image_atomic_owned(bytes)
     }
     fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError> {
         self.inner.read_log()
@@ -238,7 +252,7 @@ impl<P: HiveIoProvider> HiveManager<P> {
     pub fn flush(&mut self, hive: &mut Hive) -> Result<(), HiveIoError> {
         hive.generation += 1;
         let bytes = encode_image(hive);
-        self.provider.write_primary_image_atomic(&bytes)?;
+        self.provider.write_primary_image_atomic_owned(bytes)?;
         self.provider.flush_image()?;
         self.provider.truncate_log()?;
         self.provider.flush_log()?;
@@ -254,7 +268,7 @@ impl<P: HiveIoProvider> HiveManager<P> {
         hive.generation += 1;
         let bytes = try_encode_image(hive).map_err(HiveFlushError::Encode)?;
         self.provider
-            .write_primary_image_atomic(&bytes)
+            .write_primary_image_atomic_owned(bytes)
             .map_err(HiveFlushError::Io)?;
         self.provider.flush_image().map_err(HiveFlushError::Io)?;
         self.provider.truncate_log().map_err(HiveFlushError::Io)?;
