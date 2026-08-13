@@ -229,6 +229,9 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
             let already_current = fs.file_bytes(DEFAULT_USER_NTUSER_DAT) == Some(image.as_slice());
             let provisioned =
                 already_current || fs.provision_file(DEFAULT_USER_NTUSER_DAT, image.as_slice());
+            if provisioned {
+                refresh_live_profile_source_proofs(fs);
+            }
             (already_current, provisioned)
         };
         if provisioned && !already_current {
@@ -775,7 +778,7 @@ fn restored_profile_source_tree_stats(fs: &mut nt_fs::FileSystem) -> StagedTreeS
     stats
 }
 
-fn refresh_restored_profile_proofs(fs: &mut nt_fs::FileSystem) {
+fn refresh_live_profile_source_proofs(fs: &mut nt_fs::FileSystem) {
     let stats = restored_profile_source_tree_stats(fs);
     PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
     PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);
@@ -812,7 +815,7 @@ unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> boo
         provision_staged_profiles(fs);
         changed |= fs.node_count() != before;
     } else {
-        refresh_restored_profile_proofs(fs);
+        refresh_live_profile_source_proofs(fs);
     }
     if !has_directory_relative(fs, CONFIG_VOLUME_ROOT_RELATIVE) {
         let before = fs.node_count();

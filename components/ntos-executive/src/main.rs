@@ -5362,6 +5362,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
     print_u64(entries);
     print_str(b" probe-content-ok=");
     print_u64(probe);
+    print_str(b" ntuser.dat=");
+    print_u64(crate::writable_fs::NTUSER_DAT_PROVISIONED.load(Ordering::Relaxed));
+    print_str(b"B");
     print_str(b"\n");
     check(
         b"exec_default_user_profile_staged",

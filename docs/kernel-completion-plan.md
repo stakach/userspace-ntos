@@ -4690,3 +4690,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Review adjustment: D2 has no known local class/security code gap left; the
   remaining closure step is a serialized boot/regression proof for the combined registry cleanup.
+
+  D2 combined desktop validation and profile-proof repair (2026-08-13): serialized visible run
+  `.tmp/run-desktop-d2-registry-cleanup-20260813.log` reached the quiesce gate with real login,
+  profile load, userinit, Explorer launch, redirected Explorer callbacks, client WndProc install,
+  served shell COM classes, and `exec_explorer_shell_chrome_painted` green. `[explorer-fb]` reported
+  the full `1024x768` framebuffer as non-background with at least 32 colors, `exec_vm_pool_headroom`
+  stayed green, and the registry cleanup did not regress `NtLoadKey`, `NtFlushKey`, virtual roots,
+  mutable hives, or subtree save coverage. The run ended at `293/294` because
+  `exec_default_user_profile_staged` still read the profile-source file/entry counters captured at
+  writable-volume mount, before the setup-provisioned `Default User\ntuser.dat` image was published.
+  Runtime behavior was already correct in that same run: winlogon copied `ntuser.dat`, `NtLoadKey`
+  mounted it, `exec_profile_ntuser_dat_present` passed, and Explorer rendered. The retained repair
+  refreshes the live profile-source proof counters when `Default User\ntuser.dat` is published into
+  an already-mounted writable volume, and the final profile-source log now includes the provisioned
+  hive byte count. Validation so far: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: rerun one
+  serialized desktop proof; expected closure is `exec_default_user_profile_staged` green and a
+  `294/294` summary without changing kernel registry behavior.
