@@ -5048,9 +5048,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   state. `ThreadZeroTlsCell` now resolves the current thread and clears the requested TLS slot
   across every mapped TEB in the process, using exported x64 TEB offsets from `nt-ntdll-layout`.
   The CSR accept rendezvous no longer replies success to unknown incidental syscalls; it walls with
-  the unsupported SSN so the next missing mechanism is explicit. Remaining no-op candidates are
-  separate follow-up work: registry write-enable/value persistence, locale setter storage, and
+  the unsupported SSN so the next missing mechanism is explicit. Follow-up candidates identified at
+  that checkpoint were registry write-enable/value persistence, locale setter storage, and
   documented win32k atom/pool lifetime no-ops. Validation: `cargo fmt --all`,
   `cargo test -p nt-process`, `cargo test -p nt-ntdll-layout`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  Native registry/locale setter cleanup (2026-08-14): `NtInitializeRegistry` is no longer hidden in
+  a no-op locale arm. The executive now validates NT5 CM boot flags, records the one-time SMSS/setup
+  registry-initialized transition, records the one-time boot-accepted transition, and enables the CM
+  lazy-flush state on accepted control-set publication. `NtSetValueKey` was already migrated to real
+  mutable-hive journaling/volatile-overlay writes in earlier D2 work; the stale service-table comment
+  has been corrected so future work does not treat it as synthetic. `NtSetDefaultLocale` now stores
+  live system/session LCIDs, resolves zero-valued reloads from the NLS/current-user registry values,
+  persists explicit sets as `REG_SZ` through the mounted mutable hive authority, and
+  `NtQueryDefaultLocale` returns that live kernel state instead of a constant. Current-user locale
+  paths resolve from the effective token SID with the NT5 `.Default` fallback already used by
+  `RtlOpenCurrentUser`.
+
+  Win32k atom-table lifetime cleanup (2026-08-14): the documented `RtlDestroyAtomTable` pool-lifetime
+  no-op is retired without changing the general win32k bump pool. Atom tables now have typed
+  fixed-size arena ownership: `RtlCreateAtomTable` allocates or reuses a tracked atom arena,
+  `RtlDestroyAtomTable` validates ownership, clears the raw `RTL_ATOM_TABLE`, invalidates stale raw
+  table users through the `nt-kernel-exec::rtl_atom` signature guard, and releases the typed arena for
+  reuse. The reusable raw atom-table behavior is host-tested in `nt-kernel-exec`; integer atom
+  add/delete/pin remain no-op success only because NT defines integer atoms as synthesized values
+  outside the table.

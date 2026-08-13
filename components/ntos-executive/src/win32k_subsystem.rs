@@ -4599,6 +4599,68 @@ use nt_kernel_exec::rtl_atom;
 /// is a distinct sub-region so class atoms (global table) and global atoms (winsta tables) don't
 /// collide. Each arena is 64 KiB (≈125 full-length entries — ample for system classes + user atoms).
 const ATOM_ARENA_BYTES: u64 = 0x10000;
+const ATOM_ARENA_CAP: usize = (WIN32K_POOL_FRAMES * 0x1000 / ATOM_ARENA_BYTES) as usize;
+const ATOM_ARENA_WORDS: usize = (ATOM_ARENA_CAP + 63) / 64;
+static ATOM_ARENA_PTRS: [AtomicU64; ATOM_ARENA_CAP] =
+    [const { AtomicU64::new(0) }; ATOM_ARENA_CAP];
+static ATOM_ARENA_IN_USE: [AtomicU64; ATOM_ARENA_WORDS] =
+    [const { AtomicU64::new(0) }; ATOM_ARENA_WORDS];
+
+#[inline]
+fn atom_arena_bit(slot: usize) -> (usize, u64) {
+    (slot / 64, 1u64 << (slot % 64))
+}
+
+unsafe fn atom_arena_alloc() -> u64 {
+    for slot in 0..ATOM_ARENA_CAP {
+        let (word, bit) = atom_arena_bit(slot);
+        let ptr = ATOM_ARENA_PTRS[slot].load(Ordering::Acquire);
+        if ptr != 0
+            && ptr != u64::MAX
+            && ATOM_ARENA_IN_USE[word].fetch_or(bit, Ordering::AcqRel) & bit == 0
+        {
+            return ptr;
+        }
+    }
+    for slot in 0..ATOM_ARENA_CAP {
+        if ATOM_ARENA_PTRS[slot]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let arena = pool_alloc(ATOM_ARENA_BYTES);
+        if arena == 0 {
+            ATOM_ARENA_PTRS[slot].store(0, Ordering::Release);
+            return 0;
+        }
+        ATOM_ARENA_PTRS[slot].store(arena, Ordering::Release);
+        let (word, bit) = atom_arena_bit(slot);
+        ATOM_ARENA_IN_USE[word].fetch_or(bit, Ordering::AcqRel);
+        return arena;
+    }
+    0
+}
+
+fn atom_arena_release(table: u64) -> bool {
+    for slot in 0..ATOM_ARENA_CAP {
+        if ATOM_ARENA_PTRS[slot].load(Ordering::Acquire) == table {
+            let (word, bit) = atom_arena_bit(slot);
+            return ATOM_ARENA_IN_USE[word].fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+        }
+    }
+    false
+}
+
+fn atom_arena_is_in_use(table: u64) -> bool {
+    for slot in 0..ATOM_ARENA_CAP {
+        if ATOM_ARENA_PTRS[slot].load(Ordering::Acquire) == table {
+            let (word, bit) = atom_arena_bit(slot);
+            return ATOM_ARENA_IN_USE[word].load(Ordering::Acquire) & bit != 0;
+        }
+    }
+    false
+}
 
 /// `NTSTATUS RtlCreateAtomTable(ULONG TableSize, PRTL_ATOM_TABLE* AtomTable)`. Pool-allocate an
 /// arena, lay a fresh table over it, write `*AtomTable`. Idempotent if `*AtomTable` already set
@@ -4612,12 +4674,13 @@ extern "win64" fn s_rtl_create_atom_table(_size: u32, out_table: *mut u64) -> i3
         if read_unaligned(out_table) != 0 {
             return rtl_atom::status::SUCCESS as i32; // already created
         }
-        let arena = pool_alloc(ATOM_ARENA_BYTES);
+        let arena = atom_arena_alloc();
         if arena == 0 {
             return rtl_atom::status::NO_MEMORY as i32;
         }
         let table = rtl_atom::create(arena as *mut u8, ATOM_ARENA_BYTES as usize);
         if table.is_null() {
+            atom_arena_release(arena);
             return rtl_atom::status::NO_MEMORY as i32;
         }
         write_unaligned(out_table, table as u64);
@@ -4661,8 +4724,21 @@ extern "win64" fn s_rtl_query_atom_in_atom_table(
         ) as i32
     }
 }
-/// `NTSTATUS RtlDestroyAtomTable(PRTL_ATOM_TABLE)` — no-op success (the pool arena is never freed).
-extern "win64" fn s_rtl_destroy_atom_table(_table: u64) -> i32 {
+/// `NTSTATUS RtlDestroyAtomTable(PRTL_ATOM_TABLE)`. Clear the raw table and release its typed atom
+/// arena for reuse. The general win32k pool remains bump-only; atom arenas have separate ownership
+/// because all allocations are fixed-size and only reachable through this RTL atom table API.
+extern "win64" fn s_rtl_destroy_atom_table(table: u64) -> i32 {
+    if table == 0 {
+        return rtl_atom::status::INVALID_PARAMETER as i32;
+    }
+    if !atom_arena_is_in_use(table) {
+        return rtl_atom::status::INVALID_PARAMETER as i32;
+    }
+    let status = unsafe { rtl_atom::destroy(table as *mut u8, ATOM_ARENA_BYTES as usize) };
+    if status != rtl_atom::status::SUCCESS {
+        return status as i32;
+    }
+    atom_arena_release(table);
     rtl_atom::status::SUCCESS as i32
 }
 

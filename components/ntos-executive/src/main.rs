@@ -964,7 +964,8 @@ pub const SSN_NT_QUERY_DEFAULT_UI_LANGUAGE: u64 = 150;
 /// ntdll's NtQueryInstallUILanguage SSN (kernel32/kernelbase locale helpers ask install LANGID).
 pub const SSN_NT_QUERY_INSTALL_UI_LANGUAGE: u64 = 164;
 /// ntdll's NtSetDefaultLocale SSN. winlogon's InitializeSAS → SetDefaultLanguage(NULL) sets the
-/// system default UI locale after reading Nls\Language\Default. No-op SUCCESS (see exec_handler).
+/// session/system default locale after reading the NLS registry value; the executive stores the
+/// active LCID and persists explicit sets through the mounted mutable registry hives.
 pub const SSN_NT_SET_DEFAULT_LOCALE: u64 = 224;
 /// ntdll's NtSetDefaultUILanguage SSN (stores current user UI LANGID in the locale plane).
 pub const SSN_NT_SET_DEFAULT_UI_LANGUAGE: u64 = 225;
@@ -986,11 +987,13 @@ pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 pub const SSN_NT_TEST_ALERT: u64 = 268;
 /// ntdll's NtQueueApcThread SSN (RTL work items queue user APCs to alertable worker threads).
 pub const SSN_NT_QUEUE_APC_THREAD: u64 = 188;
-/// NtInitializeRegistry — smss tells the Config Manager it's safe to enable registry writes
-/// (sminit.c:2429, CM_BOOT_FLAG_SMSS). We don't model CM write-enable → no-op success.
+/// NtInitializeRegistry — smss tells the Config Manager that boot registry initialization has
+/// completed (`CM_BOOT_FLAG_SMSS`), and winlogon later accepts the boot control set. The executive
+/// records that CM state and rejects invalid/repeated transitions.
 pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
-/// NtSetValueKey — smss writes registry values after CM write-enable. Our regf hive is read-only
-/// and we don't persist, so → no-op success (the write "succeeds" but isn't recorded).
+/// NtSetValueKey — registry value writes are routed to mounted mutable hives or volatile overlay
+/// keys, then checkpointed by `NtFlushKey` / lazy-writer state rather than acknowledged
+/// synthetically.
 pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
 /// `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`
 /// (`sysfuncs.lst` line 84 → SSN 83, one argument).

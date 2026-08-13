@@ -363,6 +363,30 @@ pub unsafe fn create(arena: *mut u8, arena_len: usize) -> *mut u8 {
     arena
 }
 
+/// `RtlDestroyAtomTable` — validate an atom table, delete every atom, and invalidate the arena.
+///
+/// The caller owns the backing allocation. Destroying the table does not free that allocation, but
+/// it does zero the arena so a subsequent [`create`] over the same memory starts with an empty
+/// table and any stale table pointer fails the signature check.
+///
+/// # Safety
+/// `table` must be the arena pointer returned by [`create`] and writable for `arena_len` bytes.
+pub unsafe fn destroy(table: *mut u8, arena_len: usize) -> u32 {
+    if table.is_null()
+        || arena_len < hdr::SIZE + ENTRY_SIZE
+        || rd_u32(table, hdr::SIGNATURE) != SIGNATURE_MAGIC
+    {
+        return status::INVALID_PARAMETER;
+    }
+    core::ptr::write_bytes(table, 0, arena_len);
+    status::SUCCESS
+}
+
+#[inline]
+unsafe fn valid_table(table: *const u8) -> bool {
+    !table.is_null() && rd_u32(table, hdr::SIGNATURE) == SIGNATURE_MAGIC
+}
+
 #[inline]
 unsafe fn entry(table: *const u8, i: u32) -> *const u8 {
     table.add(hdr::SIZE + i as usize * ENTRY_SIZE)
@@ -428,7 +452,7 @@ pub unsafe fn add(table: *mut u8, name: *const u16, out_atom: *mut u16) -> u32 {
         }
         return status::SUCCESS;
     }
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let len = wstr_len(name, NAME_CAP + 1);
@@ -502,7 +526,7 @@ pub unsafe fn lookup(table: *const u8, name: *const u16, out_atom: *mut u16) -> 
         }
         return status::SUCCESS;
     }
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let len = wstr_len(name, NAME_CAP + 1);
@@ -530,7 +554,7 @@ pub unsafe fn delete(table: *mut u8, atom: u16) -> u32 {
     if atom < FIRST_DYNAMIC_ATOM {
         return status::SUCCESS;
     }
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let i = match find_by_atom(table, atom) {
@@ -561,7 +585,7 @@ pub unsafe fn pin(table: *mut u8, atom: u16) -> u32 {
     if atom < FIRST_DYNAMIC_ATOM {
         return status::SUCCESS;
     }
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     match find_by_atom(table, atom) {
@@ -580,7 +604,7 @@ pub unsafe fn pin(table: *mut u8, atom: u16) -> u32 {
 /// # Safety
 /// `table` must be a table from [`create`] (or null -> `INVALID_HANDLE`).
 pub unsafe fn empty(table: *mut u8, delete_pinned: bool) -> u32 {
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let cap = rd_u32(table, hdr::CAPACITY);
@@ -629,7 +653,7 @@ pub unsafe fn query(
         }
         return query_write_name_int(atom, name, name_len);
     }
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let i = match find_by_atom(table, atom) {
@@ -680,7 +704,7 @@ pub unsafe fn query(
 /// # Safety
 /// `table` must be a table from [`create`]; `count` must be writable.
 pub unsafe fn query_list(table: *const u8, atoms: &mut [u16], count: *mut u32) -> u32 {
-    if table.is_null() {
+    if !valid_table(table) {
         return status::INVALID_HANDLE;
     }
     let cap = rd_u32(table, hdr::CAPACITY);
@@ -963,6 +987,32 @@ mod tests {
                 add(t, long.as_ptr(), core::ptr::null_mut()),
                 status::INVALID_PARAMETER
             );
+        }
+    }
+
+    #[test]
+    fn destroy_invalidates_and_reuses_raw_arena() {
+        let mut a = arena(65536);
+        let name = w("SessionAtom");
+        unsafe {
+            let t = create(a.as_mut_ptr(), a.len());
+            let mut atom = 0u16;
+            assert_eq!(add(t, name.as_ptr(), &mut atom), status::SUCCESS);
+
+            assert_eq!(destroy(t, a.len()), status::SUCCESS);
+            assert_eq!(
+                lookup(t, name.as_ptr(), core::ptr::null_mut()),
+                status::INVALID_HANDLE
+            );
+            assert_eq!(destroy(t, a.len()), status::INVALID_PARAMETER);
+
+            let recreated = create(a.as_mut_ptr(), a.len());
+            assert_eq!(recreated, t);
+            assert_eq!(
+                lookup(recreated, name.as_ptr(), core::ptr::null_mut()),
+                status::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(add(recreated, name.as_ptr(), &mut atom), status::SUCCESS);
         }
     }
 

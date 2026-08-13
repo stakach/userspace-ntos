@@ -252,9 +252,21 @@ const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
 const EXEC_BSD_DATA_SIZE: usize = 0x88;
 const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
 const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
-static NT_INSTALL_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0x0409);
-static NT_DEFAULT_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0x0409);
+const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
+const NT_BOGUS_LOCALE_ID: u32 = 0xffff_0000;
+const CM_BOOT_FLAG_SMSS: u32 = 0;
+const CM_BOOT_FLAG_SETUP: u32 = 1;
+const CM_BOOT_FLAG_ACCEPTED: u32 = 2;
+const CM_BOOT_FLAG_MAX: u32 = CM_BOOT_FLAG_ACCEPTED + 999;
+static NT_SYSTEM_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
+static NT_SESSION_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
+static NT_INSTALL_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
+static NT_DEFAULT_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
 static NT_PENDING_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0);
+static CM_REGISTRY_BOOT_FLAG: AtomicU32 = AtomicU32::new(u32::MAX);
+static CM_REGISTRY_BOOT_SETUP: AtomicBool = AtomicBool::new(false);
+static CM_REGISTRY_BOOT_ACCEPTED: AtomicBool = AtomicBool::new(false);
+static CM_REGISTRY_LAZY_FLUSH_ENABLED: AtomicBool = AtomicBool::new(false);
 static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
@@ -2168,6 +2180,15 @@ fn parse_utf16le_ascii_hex_u32(bytes: &[u8]) -> Option<u32> {
     parse_hex_u32(trim_ascii(&ascii[..len]))
 }
 
+fn locale_id_ascii4(locale_id: u32, out: &mut [u8; 4]) {
+    let mut i = 0usize;
+    while i < 4 {
+        let shift = (3 - i) * 4;
+        out[i] = lower_hex_digit(locale_id >> shift);
+        i += 1;
+    }
+}
+
 unsafe fn setup_locale_id_from_unattend() -> Option<u32> {
     let fs = crate::fs_loader::exec_fs()?;
     let (cluster, size, attributes) =
@@ -2951,7 +2972,11 @@ impl ExecNtHandler {
             b"HKLM\\SYSTEM\\...\\Nls\\Language\\Default"
         };
         let system_ascii = &locale_ascii[4..8];
-        if let Some(langid) = parse_hex_u32(system_ascii) {
+        if let (Some(locale_id), Some(langid)) =
+            (parse_hex_u32(&locale_ascii), parse_hex_u32(system_ascii))
+        {
+            NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+            NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
             NT_INSTALL_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
             NT_DEFAULT_UI_LANGUAGE.store(langid & 0xffff, Ordering::Relaxed);
             NT_PENDING_UI_LANGUAGE.store(0, Ordering::Relaxed);
@@ -5499,6 +5524,135 @@ impl ExecNtHandler {
         }
         self.set_mutable_registry_value_by_path(full_path, name, ty, data)
             .then_some(true)
+    }
+
+    fn nt_initialize_registry(&self, flag: u32) -> u32 {
+        if flag > CM_BOOT_FLAG_MAX {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (CM_BOOT_FLAG_ACCEPTED..=CM_BOOT_FLAG_MAX).contains(&flag) {
+            if flag == CM_BOOT_FLAG_ACCEPTED {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if CM_REGISTRY_BOOT_ACCEPTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return STATUS_ACCESS_DENIED;
+            }
+            CM_REGISTRY_LAZY_FLUSH_ENABLED.store(true, Ordering::Release);
+            return 0;
+        }
+        if flag != CM_BOOT_FLAG_SMSS && flag != CM_BOOT_FLAG_SETUP {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if CM_REGISTRY_BOOT_FLAG
+            .compare_exchange(u32::MAX, flag, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+        CM_REGISTRY_BOOT_SETUP.store(flag == CM_BOOT_FLAG_SETUP, Ordering::Release);
+        0
+    }
+
+    fn current_user_locale_registry_path(&self) -> alloc::string::String {
+        let candidate = self
+            .pm
+            .effective_token(self.current_tid as nt_process::ThreadId)
+            .and_then(|token| self.token_store.get(token))
+            .map(|token| {
+                let mut path = alloc::string::String::from(r"\Registry\User\");
+                path.push_str(&token.user.to_sddl());
+                path.push_str(r"\Control Panel\International");
+                path
+            });
+        if let Some(path) = candidate {
+            let canon = self.overlay_canon(&path);
+            if self.registry_path_exists(&canon) {
+                return path;
+            }
+        }
+        alloc::string::String::from(r"\Registry\User\.Default\Control Panel\International")
+    }
+
+    fn locale_registry_path_and_value(
+        &self,
+        user_profile: bool,
+    ) -> (alloc::string::String, &'static str) {
+        if user_profile {
+            (self.current_user_locale_registry_path(), "Locale")
+        } else {
+            (
+                alloc::string::String::from(
+                    r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language",
+                ),
+                "Default",
+            )
+        }
+    }
+
+    fn locale_id_from_registry_value(&self, user_profile: bool) -> Result<u32, u32> {
+        const REG_DWORD: u32 = 4;
+        const REG_SZ: u32 = 1;
+        let (path, value_name) = self.locale_registry_path_and_value(user_profile);
+        let (ty, data) = self
+            .mutable_registry_value_by_path(&path, value_name)
+            .or_else(|| {
+                let key = self.resolve_key(&path)?;
+                self.registry_value(key, value_name)
+            })
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if ty == REG_DWORD && data.len() == core::mem::size_of::<u32>() {
+            Ok(u32::from_le_bytes(data[..4].try_into().unwrap()))
+        } else if ty == REG_SZ {
+            parse_utf16le_ascii_hex_u32(&data).ok_or(STATUS_UNSUCCESSFUL)
+        } else {
+            Err(STATUS_UNSUCCESSFUL)
+        }
+    }
+
+    fn persist_default_locale(&mut self, user_profile: bool, locale_id: u32) -> Result<(), u32> {
+        const REG_SZ: u32 = 1;
+        let (path, value_name) = self.locale_registry_path_and_value(user_profile);
+        let mut ascii8 = [0u8; 8];
+        let mut ascii4 = [0u8; 4];
+        let ascii: &[u8] = if user_profile {
+            locale_id_ascii8(locale_id, &mut ascii8);
+            &ascii8
+        } else {
+            locale_id_ascii4(locale_id, &mut ascii4);
+            &ascii4
+        };
+        let mut data = [0u8; 18];
+        let len = utf16le_ascii_z(ascii, &mut data).ok_or(STATUS_INVALID_PARAMETER)?;
+        if self.mutable_registry_key_by_path(&path).is_none() {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
+            .map(|_| ())
+            .ok_or(STATUS_UNSUCCESSFUL)
+    }
+
+    fn nt_set_default_locale(&mut self, user_profile: bool, mut locale_id: u32) -> u32 {
+        if locale_id & NT_BOGUS_LOCALE_ID != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if locale_id == 0 {
+            match self.locale_id_from_registry_value(user_profile) {
+                Ok(found) => locale_id = found,
+                Err(status) => return status,
+            }
+        } else if let Err(status) = self.persist_default_locale(user_profile, locale_id) {
+            return status;
+        }
+        if user_profile {
+            NT_SESSION_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+        } else {
+            NT_SYSTEM_DEFAULT_LOCALE.store(locale_id, Ordering::Relaxed);
+            NT_DEFAULT_UI_LANGUAGE.store(locale_id & 0xffff, Ordering::Relaxed);
+        }
+        0
     }
 
     fn registry_value_with<R>(
@@ -24493,11 +24647,10 @@ impl ExecNtHandler {
                     Err(status) => status,
                 }
             }
-            NativeService::NtInitializeRegistry
-            // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
-            // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
-            // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
-            | NativeService::NtSetDefaultLocale => 0,
+            NativeService::NtInitializeRegistry => self.nt_initialize_registry(args[0] as u32),
+            NativeService::NtSetDefaultLocale => {
+                self.nt_set_default_locale(args[0] != 0, args[1] as u32)
+            }
             NativeService::NtSetDefaultUILanguage => {
                 if args[0] > u16::MAX as u64 {
                     return STATUS_INVALID_PARAMETER;
@@ -27885,7 +28038,12 @@ impl ExecNtHandler {
                 if out == 0 || out & 3 != 0 {
                     return if out == 0 { 0xC000_0005 } else { 0x8000_0002 };
                 }
-                if self.xas_write_u32(out, 0x409) { 0 } else { 0xC000_0005 }
+                let value = if args[0] != 0 {
+                    NT_SESSION_DEFAULT_LOCALE.load(Ordering::Relaxed)
+                } else {
+                    NT_SYSTEM_DEFAULT_LOCALE.load(Ordering::Relaxed)
+                };
+                if self.xas_write_u32(out, value) { 0 } else { 0xC000_0005 }
             },
             NativeService::NtQueryDefaultUILanguage
             | NativeService::NtQueryInstallUILanguage => unsafe {
