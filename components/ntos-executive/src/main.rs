@@ -3996,8 +3996,8 @@ fn lsa_authentication_port_specs(passed: &mut u64) {
 /// The host booted for 55 batches with a READ-ONLY filesystem: `fs_loader`'s FAT32 reader resolves
 /// any `\reactos\…` path to bytes and nothing more. The instant the interactive logon completed,
 /// that became the wall — `userenv!CreateUserProfileW` calls `CreateDirectoryW("C:\Profiles")`
-/// (`profile.c:929`), and with no writable filesystem the `NtCreateFile` behind it was answered
-/// `STATUS_NOT_IMPLEMENTED` ⇒ `GetLastError() == 1` ⇒ `profile.c:933  Error: 1`.
+/// (`profile.c:929`), and with no writable filesystem the `NtCreateFile` behind it failed as an
+/// invalid-function error at `profile.c:933`.
 ///
 /// A writable volume is now MOUNTED over the declared writable namespace prefixes
 /// (`writable_fs::WRITABLE_PREFIXES`, today `%SystemDrive%\Profiles`), backed by `nt-fs`'s `MemFs`
@@ -5450,9 +5450,9 @@ unsafe fn default_user_profile_spec(passed: &mut u64) {
 /// MISSES, honestly, on the writable volume) → `CreateUserProfileW`, under the REAL profile SID the
 /// `NtCreateToken` service minted (`profile.c:2056  Loading profile S-1-5-21-…-500`), which now:
 ///   1. resolves `C:\Profiles` — `CreateDirectoryW(szProfilesPath)`, `profile.c:929`. THIS is the
-///      call that returned `Error: 1` (`STATUS_NOT_IMPLEMENTED` ⇒ ERROR_INVALID_FUNCTION) for every
-///      boot before the writable volume existed and ended the logon. It now gets a real answer from
-///      a real file system: `FILE_CREATED` on a volume whose profiles root is absent, or the
+///      call that returned invalid-function before the writable volume existed and ended the logon.
+///      It now gets a real answer from a real file system: `FILE_CREATED` on a volume whose profiles
+///      root is absent, or the
 ///      `ERROR_ALREADY_EXISTS` arm (a genuine `STATUS_OBJECT_NAME_COLLISION`) once the profile
 ///      SOURCE is provisioned — which is what the call returns on any installed system, since setup
 ///      creates the profiles directory. Either way winlogon really drove it and really got the
@@ -5604,11 +5604,11 @@ unsafe fn software_hive_mount_spec(passed: &mut u64) {
 /// and both must have been served by the mount.
 ///
 /// `CreateUserProfileW` then calls `CreateDirectoryW(szProfilesPath)` (`profile.c:929`,
-/// `C:\Profiles` after `ExpandEnvironmentStringsW`). That used to be answered
-/// STATUS_NOT_IMPLEMENTED (no writable filesystem existed) → `GetLastError() == 1` →
-/// `profile.c:933  Error: 1`. As of the WRITABLE FILESYSTEM OVERLAY it SUCCEEDS against a real file
-/// system — see `exec_writable_overlay_mounted` + `exec_winlogon_profile_directories_created`,
-/// which carry that claim. Later gates now own the userinit/explorer spawn frontier.
+/// `C:\Profiles` after `ExpandEnvironmentStringsW`). Before the writable filesystem existed, that
+/// surfaced as invalid-function at `profile.c:933`. As of the WRITABLE FILESYSTEM OVERLAY it
+/// SUCCEEDS against a real file system — see `exec_writable_overlay_mounted` +
+/// `exec_winlogon_profile_directories_created`, which carry that claim. Later gates now own the
+/// userinit/explorer spawn frontier.
 fn winlogon_profile_directory_spec(passed: &mut u64) {
     let opens = WINLOGON_PROFILE_LIST_OPENS.load(Ordering::Relaxed);
     let hits = WINLOGON_PROFILE_LIST_HITS.load(Ordering::Relaxed);
@@ -9514,8 +9514,8 @@ const MAPPED_SECTION_WRITEBACK_ALL: u64 = 0x7f;
 static MAPPED_SECTION_WRITEBACK_RAN: AtomicBool = AtomicBool::new(false);
 static MAPPED_SECTION_WRITEBACK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 static MAPPED_SECTION_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);
-static MAPPED_SECTION_WRITEBACK_STATUS: AtomicU64 =
-    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+const SELFTEST_NOT_RUN_STATUS: u64 = 0xC000_0001;
+static MAPPED_SECTION_WRITEBACK_STATUS: AtomicU64 = AtomicU64::new(SELFTEST_NOT_RUN_STATUS);
 static mut MAPPED_SECTION_WRITEBACK_TABLE: GenericSectionTable = GenericSectionTable::new();
 const MAPPED_SECTION_WRITEBACK_PAYLOAD: &[u8] = b"section writeback data";
 
@@ -9532,8 +9532,7 @@ const MAPPED_SECTION_WRITECOPY_COW_CLEANED: u64 = 0x100;
 const MAPPED_SECTION_WRITECOPY_COW_ALL: u64 = 0x1ff;
 static MAPPED_SECTION_WRITECOPY_COW_RAN: AtomicBool = AtomicBool::new(false);
 static MAPPED_SECTION_WRITECOPY_COW_SELFTEST: AtomicU64 = AtomicU64::new(0);
-static MAPPED_SECTION_WRITECOPY_COW_STATUS: AtomicU64 =
-    AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+static MAPPED_SECTION_WRITECOPY_COW_STATUS: AtomicU64 = AtomicU64::new(SELFTEST_NOT_RUN_STATUS);
 const MAPPED_SECTION_WRITECOPY_COW_PATTERN: &[u8] = b"mapped writecopy shared source bytes";
 
 // --- MEM_IMAGE WRITECOPY COW SELF-TEST ---------------------------------------------------------
@@ -9549,7 +9548,7 @@ const IMAGE_WRITECOPY_COW_CLEANED: u64 = 0x100;
 const IMAGE_WRITECOPY_COW_ALL: u64 = 0x1ff;
 static IMAGE_WRITECOPY_COW_RAN: AtomicBool = AtomicBool::new(false);
 static IMAGE_WRITECOPY_COW_SELFTEST: AtomicU64 = AtomicU64::new(0);
-static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 = AtomicU64::new(nt_fs::STATUS_NOT_IMPLEMENTED as u64);
+static IMAGE_WRITECOPY_COW_STATUS: AtomicU64 = AtomicU64::new(SELFTEST_NOT_RUN_STATUS);
 const IMAGE_WRITECOPY_COW_PATTERN: &[u8] = b"image writecopy shared source bytes";
 
 // --- CROSS-AUTHORITY VM PLACEMENT SELF-TEST ----------------------------------------------------

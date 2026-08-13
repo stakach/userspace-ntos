@@ -6,8 +6,8 @@
 //! (`fs_loader`): it can resolve any path to bytes, and nothing more. Everything a real NT session
 //! does the moment a user logs on — `CreateDirectoryW("C:\Profiles")`, writing a profile, creating
 //! `ntuser.dat` — needs a filesystem that can be WRITTEN. Without one, `NtCreateFile` on those
-//! paths returned `STATUS_NOT_IMPLEMENTED` (⇒ `GetLastError() == 1`) and `CreateUserProfileW`
-//! failed at `userenv/profile.c:929`.
+//! paths failed as invalid-function to user mode and `CreateUserProfileW` stopped at
+//! `userenv/profile.c:929`.
 //!
 //! This module mounts a **real** filesystem over the writable part of the namespace. Real means
 //! real: create/open with every disposition, `FILE_DIRECTORY_FILE`, read, write at an offset or at

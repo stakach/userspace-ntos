@@ -4976,3 +4976,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `_ => STATUS_NOT_IMPLEMENTED` match arm was removed. Validation: `cargo fmt --all`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, `git diff --check`, and the registered-native-service scan returning empty.
+
+  Executive self-test status cleanup (2026-08-14): the mapped-section writeback and mapped/image
+  write-copy COW proof state no longer initializes its diagnostic status fields to
+  `STATUS_NOT_IMPLEMENTED`. If one of those self-tests has not run yet, the gate now reports the
+  concrete unsuccessful/not-run status until the real proof path stores its terminal result. The
+  writable-filesystem proof comments were also reworded so the live executive code is not littered
+  with obsolete invalid-function history. This is not a gate relaxation: all three gates still
+  require their full proof bits plus `STATUS_SUCCESS`.
