@@ -15081,7 +15081,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
         unsafe { core::ptr::write_unaligned(ret_len, 0) };
     }
     if !matches!(info_class, 1..=6) {
-        return nt_ntdll::STATUS_NOT_IMPLEMENTED;
+        return STATUS_INVALID_PARAMETER;
     }
 
     let mut selected = act_ctx;

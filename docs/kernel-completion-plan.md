@@ -4801,3 +4801,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   and allocation/encode failures stay visible as resource exhaustion. Validation: `cargo fmt --all`,
   `cargo test -p nt-hive-regf`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  ntdll activation-query surface cleanup (2026-08-13): `RtlQueryInformationActivationContext` no
+  longer exposes a live `STATUS_NOT_IMPLEMENTED` result for caller-selected information classes.
+  The Rust ntdll already implements the native activation-context query classes backed by retained
+  activation-context state (`Basic`, `Detailed`, `AssemblyDetailed`, `FileInformation`,
+  `Runlevel`, and `Compatibility`). Unsupported class values now fail as concrete invalid input
+  instead of advertising a missing implementation path; class 7 remains outside the retained
+  manifest model because ReactOS declares the enum value but does not implement query semantics for
+  it in RTL. Validation: `cargo fmt --all` and `./scripts/build_ntdll_dll.sh` (PE32+ parse,
+  complete Nt/Zw export ABI, `LdrpInitialize`, callback exports, and ReactOS import coverage all
+  green).
