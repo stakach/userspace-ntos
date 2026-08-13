@@ -2318,6 +2318,9 @@ impl ExecNtHandler {
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
+        write_field!(registry_machine_root_security_descriptor, None);
+        write_field!(registry_user_root_security_descriptor, None);
+        write_field!(registry_virtual_roots_dirty, false);
         write_field!(time_zone_information, time_zone_information);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
@@ -3460,6 +3463,14 @@ impl ExecNtHandler {
     /// Split an NT registry path into its non-empty components.
     fn key_components(path: &str) -> alloc::vec::Vec<&str> {
         path.split('\\').filter(|c| !c.is_empty()).collect()
+    }
+
+    fn virtual_registry_root_target_from_canon(canon: &str) -> Option<KeyRef> {
+        match canon {
+            r"\registry\machine" => Some(MACHINE_ROOT_KEY),
+            r"\registry\user" => Some(USER_ROOT_KEY),
+            _ => None,
+        }
     }
 
     /// True if `comps` is exactly `Registry\Machine` (the predefined `HKEY_LOCAL_MACHINE` root).
@@ -5098,6 +5109,9 @@ impl ExecNtHandler {
         if let Some(index) = overlay_key_idx(target) {
             return Some(index);
         }
+        if target == MACHINE_ROOT_KEY || target == USER_ROOT_KEY {
+            return None;
+        }
         let path = self.registry_target_path(target)?;
         self.registry_overlay_index_for_path(&path)
     }
@@ -5166,6 +5180,14 @@ impl ExecNtHandler {
     }
 
     fn registry_key_security_descriptor(&self, target: KeyRef) -> Option<&[u8]> {
+        if target == MACHINE_ROOT_KEY {
+            return self
+                .registry_machine_root_security_descriptor
+                .as_deref();
+        }
+        if target == USER_ROOT_KEY {
+            return self.registry_user_root_security_descriptor.as_deref();
+        }
         if let Some(index) = self.registry_overlay_index(target) {
             if let Some(descriptor) = self.overlay.key_security_descriptor(index) {
                 return Some(descriptor);
@@ -5180,6 +5202,16 @@ impl ExecNtHandler {
         target: KeyRef,
         descriptor: &[u8],
     ) -> Result<(), u32> {
+        if target == MACHINE_ROOT_KEY {
+            self.registry_machine_root_security_descriptor = Some(descriptor.to_vec());
+            self.registry_virtual_roots_dirty = true;
+            return Ok(());
+        }
+        if target == USER_ROOT_KEY {
+            self.registry_user_root_security_descriptor = Some(descriptor.to_vec());
+            self.registry_virtual_roots_dirty = true;
+            return Ok(());
+        }
         if let Some(index) = self.registry_overlay_index(target) {
             if self.overlay.set_key_security_descriptor(index, descriptor) {
                 self.overlay_dirty = true;
@@ -5294,6 +5326,12 @@ impl ExecNtHandler {
         out: u64,
     ) -> Option<u32> {
         let canon = self.overlay_canon(full_path);
+        if let Some(target) = Self::virtual_registry_root_target_from_canon(&canon) {
+            if target == USER_ROOT_KEY {
+                USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(self.mint_registry_key(target, desired, out));
+        }
         if let Some(index) = self.registry_overlay_index_for_canon_path(&canon) {
             if Self::is_dynamic_user_volatile_env_canon(&canon) {
                 USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
@@ -18499,6 +18537,23 @@ impl ExecNtHandler {
                 let canon = self.overlay_canon(&full);
                 if canon == r"\" {
                     return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                }
+                if let Some(target) = Self::virtual_registry_root_target_from_canon(&canon) {
+                    if target == USER_ROOT_KEY {
+                        USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let status = self.mint_registry_key(target, args[1] as u32, args[0]);
+                    if status != 0 {
+                        return status;
+                    }
+                    let disp_ptr = args[6];
+                    if disp_ptr != 0 {
+                        self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
+                    }
+                    return 0;
+                }
+                if canon == r"\registry" {
+                    return 0xC000_0022; // STATUS_ACCESS_DENIED
                 }
                 let parent = canon
                     .rsplit_once('\\')

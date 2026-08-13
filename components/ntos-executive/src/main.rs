@@ -17482,6 +17482,13 @@ struct ExecNtHandler {
     /// Manager install the destination as a same-hive shared payload when the pointer/length/type
     /// still match and the user buffer validates byte-for-byte.
     registry_value_copy_provenance: RegistryValueCopyProvenanceTable,
+    /// Security descriptors for virtual registry namespace roots. `\Registry\Machine` and
+    /// `\Registry\User` are CM namespace sentinels, not hive cells and not overlay keys, but
+    /// security queries/updates still target their handle identity.
+    registry_machine_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
+    registry_user_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
+    /// Set when virtual-root descriptor storage grew above the service loop heap mark.
+    registry_virtual_roots_dirty: bool,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark

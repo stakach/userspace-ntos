@@ -8128,6 +8128,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.registry_services_order_cache_dirty = false;
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                if nt_handler.registry_virtual_roots_dirty {
+                    nt_handler.registry_virtual_roots_dirty = false;
+                    pin_durable_heap_mark(&mut heap_mark);
+                }
                 // Dynamic hosted-EXE plane: NtOpenFile can admit a new executable from disk for a
                 // later NtCreateSection/NtCreateProcessEx. Its pool bytes are reset-safe, but the
                 // parsed PE section table and owned image catalog state are bump-allocated loop

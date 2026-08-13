@@ -1048,8 +1048,9 @@ before unrelated executive traffic monopolises the receive loop.
   nonvolatile overlay shadows over mounted mutable hives; remaining overlay authority should be
   explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Mounted
   mutable-hive subkeys now save as standalone subtree hive images; borrowed non-root `regf` keys
-  still fail visibly because they are not mutable CM authority. Remaining D2 work is any residual
-  virtual-root security/class edge cases.
+  still fail visibly because they are not mutable CM authority. Virtual-root security now belongs to
+  the sentinel key identities instead of overlay shadows; no known D2 class/security mechanism gap
+  remains, but D2 stays open until the next serialized boot validates the combined registry cleanup.
 - `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
@@ -4678,3 +4679,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   visibly because they are not mutable CM authority. Validation: `cargo fmt --all`,
   `cargo test -p nt-hive-core`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D2 virtual-root security cleanup (2026-08-13): `\Registry\Machine` and `\Registry\User` now keep
+  security descriptor updates on their sentinel key identities instead of creating nonvolatile
+  overlay keys at the namespace roots. Exact virtual-root `NtOpenKey` and `NtCreateKey` requests
+  return the existing sentinel handles, with `NtCreateKey` reporting `REG_OPENED_EXISTING_KEY`; the
+  overlay authority path no longer participates in sentinel-handle security queries. The service
+  loop pins virtual-root descriptor storage with its own dirty bit, matching the existing durable
+  kernel-state contract without merging it into the registry overlay. Validation:
+  `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: D2 has no known local class/security code gap left; the
+  remaining closure step is a serialized boot/regression proof for the combined registry cleanup.
