@@ -6039,12 +6039,12 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     //     the live NT service table at the `sysfuncs.lst`-derived SSN 83 with its one-argument
     //     contract, it was actually CALLED on this boot, and every call resolved a real key handle
     //     through `resolve_registry_key` (a bad handle would have returned the real error instead).
-    //     At least one call was on a key that lives in a mounted mutable hive, and that dirty boot
-    //     hive was checkpointed into the writable config tree: the ActiveComputerName path is now a
-    //     real SYSTEM-hive write, not a registry-overlay shadow or borrowed boot-media save.
-    //     True volatile overlay flushes remain reported separately for the D4 volatile-hive cleanup.
-    //     Non-volatile overlay shadows do not contribute to that counter. The counters CANNOT move
-    //     if the SSN is unserviced: the caller parks instead.
+    //     ReactOS creates `ActiveComputerName` as REG_OPTION_VOLATILE, so that handle correctly lives
+    //     in the volatile hive and `CmFlushKey` runs the global `CmpDoFlushAll(FALSE)` pass. Dirty
+    //     mounted hives are proven separately by the boot-hive checkpoint counters: full-image
+    //     checkpoints and committed journal sidecar snapshots both come from the writable config tree,
+    //     not from registry-overlay shadows or borrowed boot-media saves. The counters CANNOT move if
+    //     the SSN is unserviced: the caller parks instead.
     let table_ok = nt_syscall_abi::ssn_of("NtFlushKey") == Some(83)
         && nt_syscall_abi::exact_argc_of("NtFlushKey") == Some(1);
     check(
@@ -16819,11 +16819,14 @@ pub(crate) static SE_CREATE_TOKEN_LOGON_SIDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_NS_TRACED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POST_PROFILE_TRACED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POST_PROFILE_FRONTIER_TRACED: AtomicU64 = AtomicU64::new(0);
-/// True once `LoadUserProfileW`'s OWN `RegLoadKeyW` has mounted the user hive (the second load of
-/// the boot — `CreateUserProfileExW` does the first). Everything after this point is winlogon's
-/// remaining `HandleLogon` sequence, whose failures are `WARN`-only in the shipped binary.
+/// True once a user hive has been mounted and verified through the normal `\Registry\User\<SID>`
+/// namespace. First profile-creation boots may load once while building the hive and again from
+/// `LoadUserProfileW`; restored boots commonly load only the existing hive. The verified mount is
+/// the durable witness for winlogon's remaining `HandleLogon` sequence, whose failures are
+/// `WARN`-only in the shipped binary.
 pub(crate) fn post_profile_phase() -> bool {
-    NT_LOAD_KEY_MOUNTED.load(Ordering::Relaxed) >= 2
+    NT_LOAD_KEY_MOUNTED.load(Ordering::Relaxed) >= 1
+        && NT_LOAD_KEY_VALUE_READBACK.load(Ordering::Relaxed) == 1
 }
 pub(crate) static USER_ROOT_OPENED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static USER_DEFAULT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
@@ -17085,11 +17088,12 @@ pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64:
 pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Failed attempts to checkpoint a dynamic profile hive during `NtFlushKey`.
 pub(crate) static REG_FLUSH_KEY_DYNAMIC_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Boot-mounted hive checkpoints written by `NtFlushKey` to the writable config tree.
+/// Boot-mounted hive checkpoints committed to the writable config tree, either as full images from
+/// `NtFlushKey`/lazy-writer compaction or as journal sidecar snapshots.
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
-/// Bytes in the most recent boot-mounted hive checkpoint image.
+/// Bytes in the most recent boot-mounted hive durable image plus sidecar checkpoint.
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Failed attempts to checkpoint a boot-mounted hive during `NtFlushKey`.
+/// Failed attempts to checkpoint a boot-mounted hive during `NtFlushKey` or lazy-writer compaction.
 pub(crate) static REG_FLUSH_KEY_BOOT_HIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
 /// writable overlay FILE_OBJECT. Mutable hive roots use the live `nt-hive-core` image so saved state
@@ -17454,6 +17458,14 @@ struct ExecNtHandler {
     /// itself is synchronous in the mounted volume; this counter batches the expensive snapshot
     /// reserve commit instead of exporting the whole writable volume after every registry value.
     mutable_hive_journal_pending_records: u32,
+    /// Bitmask of boot-mounted hives that have journal records in the pending snapshot batch.
+    /// Dynamic profile hives can share the record counter, but boot-hive checkpoint proof must only
+    /// account for hives whose `system32\config\*.LOG` sidecar actually changed in this batch.
+    mutable_hive_journal_pending_boot_mask: u8,
+    /// Bitmask of boot-mounted hives with live dirty cells backed by their journal sidecar. Unlike
+    /// `mutable_hive_journal_pending_boot_mask`, this survives snapshot batching until a committed
+    /// sidecar snapshot has been observed or a full-image checkpoint clears the hive dirty set.
+    mutable_hive_journal_dirty_boot_mask: u8,
     /// Set after the live boot-mounted hives have been refreshed from a restored writable-volume
     /// checkpoint. This is one-shot per boot: later `NtFlushKey` calls update the same files, but CM
     /// must not repeatedly replace live hives while hosted processes are holding key handles.

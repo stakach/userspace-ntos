@@ -19,6 +19,7 @@ const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
@@ -101,6 +102,112 @@ static mut NT_QUERY_ATTR_NAME16_SCRATCH: [u16; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; 1024] = [0; 1024];
 type ExecServiceHandler = unsafe extern "C" fn(*mut ExecNtHandler, *const u64, usize) -> u32;
+
+struct ExecJournalReactOsSetupSeedTarget<'a> {
+    handler: &'a mut ExecNtHandler,
+    created_keys: u32,
+    changed_values: u32,
+    failed: bool,
+    last_status: u32,
+}
+
+impl<'a> ExecJournalReactOsSetupSeedTarget<'a> {
+    fn new(handler: &'a mut ExecNtHandler) -> Self {
+        Self {
+            handler,
+            created_keys: 0,
+            changed_values: 0,
+            failed: false,
+            last_status: 0,
+        }
+    }
+
+    fn changed(&self) -> bool {
+        self.created_keys != 0 || self.changed_values != 0
+    }
+
+    fn note_failure(&mut self, status: u32) {
+        self.failed = true;
+        self.last_status = status;
+    }
+}
+
+impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<'_> {
+    fn create_key(&mut self, path: &str) -> bool {
+        let existed = self.handler.mutable_registry_key_by_path(path).is_some();
+        match self
+            .handler
+            .ensure_mutable_registry_key_by_path_journaled(path)
+        {
+            Ok(_) => {
+                if !existed {
+                    self.created_keys = self.created_keys.saturating_add(1);
+                }
+                true
+            }
+            Err(status) => {
+                self.note_failure(status);
+                false
+            }
+        }
+    }
+
+    fn set_value(
+        &mut self,
+        path: &str,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: alloc::vec::Vec<u8>,
+    ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
+        let key = match self
+            .handler
+            .ensure_mutable_registry_key_by_path_journaled(path)
+        {
+            Ok(key) => key,
+            Err(status) => {
+                self.note_failure(status);
+                return false;
+            }
+        };
+        match self
+            .handler
+            .journal_set_mutable_value(key, name, value_type, &data)
+        {
+            Ok(()) => {
+                self.changed_values = self.changed_values.saturating_add(1);
+                true
+            }
+            Err(status) => {
+                self.note_failure(status);
+                false
+            }
+        }
+    }
+
+    fn has_value(&self, path: &str, name: &str) -> bool {
+        self.handler
+            .mutable_registry_key_by_path(path)
+            .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+            .is_some()
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: nt_hive_core::RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        self.handler
+            .mutable_registry_key_by_path(path)
+            .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+            .is_some_and(|(ty, existing)| ty == value_type && existing == data)
+    }
+}
+
 #[used]
 static NT_OPEN_FILE_SERVICE_ENTRY: ExecServiceHandler = exec_nt_open_file_service_entry;
 #[used]
@@ -2198,6 +2305,8 @@ impl ExecNtHandler {
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hives_dirty, false);
         write_field!(mutable_hive_journal_pending_records, 0);
+        write_field!(mutable_hive_journal_pending_boot_mask, 0);
+        write_field!(mutable_hive_journal_dirty_boot_mask, 0);
         write_field!(boot_hive_checkpoints_refreshed, false);
         write_field!(
             registry_services_order_cache,
@@ -2547,26 +2656,29 @@ impl ExecNtHandler {
     /// registration; the staged LiveCD SOFTWARE hive does not, so the executive imports the
     /// ReactOS `.rgs` setup output into the mounted mutable SOFTWARE hive.
     fn provision_reactos_explorer_shell_com_classes(&mut self) {
-        let before_dirty = self
-            .mutable_hives
-            .hive(HIVE_SEL_SOFTWARE)
-            .map_or(0, |hive| hive.dirty_count());
-        let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes_in_mutable_hives(
-            &mut self.mutable_hives,
-            r"\Registry\Machine\Software\Classes",
-        );
+        let (mask, changed, failed, last_status) = {
+            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let mask = nt_hive_core::seed_reactos_explorer_shell_com_classes_into_target(
+                &mut target,
+                r"\Registry\Machine\Software\Classes",
+            );
+            (mask, target.changed(), target.failed, target.last_status)
+        };
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
-        let after_dirty = self
-            .mutable_hives
-            .hive(HIVE_SEL_SOFTWARE)
-            .map_or(0, |hive| hive.dirty_count());
-        if after_dirty != before_dirty {
-            self.mark_mutable_hives_dirty();
+        if changed {
+            self.mark_mutable_hives_dirty_preserving_services_order();
             print_str(b"[shell-com] provisioned explorer HKCR classes mask=0x");
             print_hex(mask as u32);
-            print_str(b" in mutable hive\n");
+            print_str(b" through mutable-hive journal\n");
         } else if mask != 0 {
             print_str(b"[shell-com] explorer HKCR classes already present mask=0x");
+            print_hex(mask as u32);
+            print_str(b"\n");
+        }
+        if failed {
+            print_str(b"[shell-com] explorer HKCR class journal incomplete status=0x");
+            print_hex(last_status);
+            print_str(b" mask=0x");
             print_hex(mask as u32);
             print_str(b"\n");
         }
@@ -2576,9 +2688,12 @@ impl ExecNtHandler {
     /// architecture. This lets `spoolsv`/`localspl` discover the print environment through real
     /// registry syscalls and then load `winprint.dll` from the real spool directory.
     fn provision_reactos_print_setup(&mut self) {
-        let stats =
-            nt_hive_core::seed_reactos_print_setup_in_mutable_hives(&mut self.mutable_hives);
-        if stats.total_values() == 0 {
+        let (stats, changed, failed, last_status) = {
+            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let stats = nt_hive_core::seed_reactos_print_setup_into_target(&mut target);
+            (stats, target.changed(), target.failed, target.last_status)
+        };
+        if !changed {
             if self
                 .mutable_registry_value_by_path(
                     r"\Registry\Machine\System\CurrentControlSet\Control\Print\Monitors\Local Port",
@@ -2590,9 +2705,14 @@ impl ExecNtHandler {
             } else {
                 print_str(b"[print-setup] ReactOS print setup not provisioned\n");
             }
+            if failed {
+                print_str(b"[print-setup] ReactOS print setup journal incomplete status=0x");
+                print_hex(last_status);
+                print_str(b"\n");
+            }
             return;
         }
-        self.mark_mutable_hives_dirty();
+        self.mark_mutable_hives_dirty_preserving_services_order();
         print_str(b"[print-setup] HKLM\\SYSTEM print setup provisioned: root=");
         print_u64(stats.root_values as u64);
         print_str(b" env=");
@@ -2602,6 +2722,11 @@ impl ExecNtHandler {
         print_str(b" monitors=");
         print_u64(stats.monitor_values as u64);
         print_str(b"\n");
+        if failed {
+            print_str(b"[print-setup] ReactOS print setup journal incomplete status=0x");
+            print_hex(last_status);
+            print_str(b"\n");
+        }
     }
 
     /// Seed the default-user profile shell-folder registry state ReactOS setup normally writes.
@@ -2611,11 +2736,17 @@ impl ExecNtHandler {
     /// real user. Materialize the setup table into the mounted `.Default` hive so the later
     /// `RegCopyTreeW`/`UpdateUsersShellFolderSettings` path runs through ordinary registry syscalls.
     fn provision_default_user_shell_folders(&mut self) {
-        let stats = nt_hive_core::seed_reactos_default_user_shell_folders_in_mutable_hives(
-            &mut self.mutable_hives,
-            r"C:\Profiles\Default User",
-        );
-        if stats.total_values() == 0 {
+        let (stats, changed, failed, last_status) = {
+            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let stats = nt_hive_core::seed_reactos_user_profile_shell_folders_into_target(
+                &mut target,
+                r"\Registry\User\.Default",
+                r"C:\Profiles\Default User",
+                "%USERPROFILE%",
+            );
+            (stats, target.changed(), target.failed, target.last_status)
+        };
+        if !changed {
             if self
                 .mutable_registry_value_by_path(
                     r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
@@ -2627,14 +2758,24 @@ impl ExecNtHandler {
             } else {
                 print_str(b"[profile-setup] default-user shell folders not provisioned\n");
             }
+            if failed {
+                print_str(b"[profile-setup] default-user shell-folder journal incomplete status=0x");
+                print_hex(last_status);
+                print_str(b"\n");
+            }
             return;
         }
-        self.mark_mutable_hives_dirty();
+        self.mark_mutable_hives_dirty_preserving_services_order();
         print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
         print_u64(stats.shell_folder_values as u64);
         print_str(b" User Shell Folders=");
         print_u64(stats.user_shell_folder_values as u64);
         print_str(b"\n");
+        if failed {
+            print_str(b"[profile-setup] default-user shell-folder journal incomplete status=0x");
+            print_hex(last_status);
+            print_str(b"\n");
+        }
     }
 
     /// Serialize the setup-provisioned `.Default` hive into the profile source's `ntuser.dat`.
@@ -3049,6 +3190,17 @@ impl ExecNtHandler {
             })
     }
 
+    fn boot_mutable_hive_pending_bit(hive_sel: u32) -> Option<u8> {
+        match hive_sel {
+            HIVE_SEL_SYSTEM => Some(1 << 0),
+            HIVE_SEL_SOFTWARE => Some(1 << 1),
+            HIVE_SEL_SECURITY => Some(1 << 2),
+            HIVE_SEL_SAM => Some(1 << 3),
+            HIVE_SEL_USER_DEFAULT => Some(1 << 4),
+            _ => None,
+        }
+    }
+
     fn mutable_hive_journal_status(err: nt_hive_core::HiveIoError) -> u32 {
         match err {
             nt_hive_core::HiveIoError::Io | nt_hive_core::HiveIoError::NotSupported => {
@@ -3077,6 +3229,10 @@ impl ExecNtHandler {
         self.mutable_hive_journal_pending_records = self
             .mutable_hive_journal_pending_records
             .saturating_add(1);
+        if let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) {
+            self.mutable_hive_journal_pending_boot_mask |= bit;
+            self.mutable_hive_journal_dirty_boot_mask |= bit;
+        }
         if self.mutable_hive_journal_pending_records >= MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS {
             self.writable_fs_dirty = true;
         }
@@ -3786,16 +3942,42 @@ impl ExecNtHandler {
     }
 
     fn refresh_boot_hive_checkpoint_from_path(&mut self, hive_sel: u32, file_path: &str) -> bool {
-        let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_if_mounted(file_path) }) else {
-            return false;
-        };
         let mount_path = hive_mount(hive_sel);
-        let mut manager = nt_hive_core::HiveManager::new(
-            crate::writable_fs::WritableHiveIoProvider::new(file_path),
-        );
-        if let Ok(hive) = manager.boot(hive_kind_for_selector(hive_sel)) {
+        let log_bytes =
+            unsafe { crate::writable_fs::hive_log_bytes_if_mounted(file_path) }.unwrap_or(&[]);
+        let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_if_mounted(file_path) }) else {
+            if log_bytes.is_empty() {
+                return false;
+            }
+            let Some(hive) = self.mutable_hives.hive_mut(hive_sel) else {
+                return false;
+            };
+            let base_sequence = hive.sequence;
+            let last_sequence = nt_hive_core::replay_log(hive, log_bytes, base_sequence);
+            self.mutable_hives.clear_hive_dirty(hive_sel);
+            let root_subkeys = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.subkey_count(hive.root()) as u64);
+            print_str(b"[cm-restore] boot hive journal replayed ");
+            print_ascii_str(mount_path);
+            print_str(b" <- ");
+            print_ascii_str(file_path);
+            print_str(b" primary=installed-source root-subkeys=");
+            print_u64(root_subkeys);
+            print_str(b" log-bytes=");
+            print_u64(log_bytes.len() as u64);
+            print_str(b" sequence=");
+            print_u64(base_sequence);
+            print_str(b"..");
+            print_u64(last_sequence);
+            print_str(b"\n");
+            return last_sequence > base_sequence;
+        };
+        if let Ok(mut hive) = nt_hive_core::decode_image(bytes) {
+            let base_sequence = hive.sequence;
+            let last_sequence = nt_hive_core::replay_log(&mut hive, log_bytes, base_sequence);
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
-            let status = nt_hive_core::HiveIoProvider::get_status(manager.provider());
             self.mutable_hives.mount(mount_path, hive_sel, hive);
             self.mutable_hives.clear_hive_dirty(hive_sel);
             if hive_sel == HIVE_SEL_USER_DEFAULT {
@@ -3810,13 +3992,26 @@ impl ExecNtHandler {
             print_str(b" root-subkeys=");
             print_u64(root_subkeys);
             print_str(b" log-bytes=");
-            print_u64(status.log_len as u64);
+            print_u64(log_bytes.len() as u64);
+            print_str(b" sequence=");
+            print_u64(base_sequence);
+            print_str(b"..");
+            print_u64(last_sequence);
             print_str(b" format=core\n");
             return true;
         }
         if let Some(regf) = RegfHive::new(bytes) {
             let root_subkeys = regf.subkeys(regf.root()).len() as u64;
             mount_mutable_regf_hive(&mut self.mutable_hives, hive_sel, mount_path, &regf);
+            let base_sequence = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.sequence);
+            let last_sequence = if let Some(hive) = self.mutable_hives.hive_mut(hive_sel) {
+                nt_hive_core::replay_log(hive, log_bytes, base_sequence)
+            } else {
+                base_sequence
+            };
             self.mutable_hives.clear_hive_dirty(hive_sel);
             if hive_sel == HIVE_SEL_USER_DEFAULT {
                 self.ensure_user_default_mutable_mount_only();
@@ -3829,6 +4024,12 @@ impl ExecNtHandler {
             print_u64(bytes.len() as u64);
             print_str(b" root-subkeys=");
             print_u64(root_subkeys);
+            print_str(b" log-bytes=");
+            print_u64(log_bytes.len() as u64);
+            print_str(b" sequence=");
+            print_u64(base_sequence);
+            print_str(b"..");
+            print_u64(last_sequence);
             print_str(b" format=regf\n");
             return true;
         }
@@ -3930,6 +4131,10 @@ impl ExecNtHandler {
             self.writable_fs_commit_required = true;
             REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
             REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
+            if let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) {
+                self.mutable_hive_journal_pending_boot_mask &= !bit;
+                self.mutable_hive_journal_dirty_boot_mask &= !bit;
+            }
             print_str(b"[cm-flush] boot hive checkpoint ");
             print_u64(image_len as u64);
             print_str(b"B dirty-cells=");
@@ -3939,6 +4144,99 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         nt_fs::STATUS_SUCCESS
+    }
+
+    fn note_boot_hive_journal_checkpoint(&mut self, file_path: &str, dirty_cells: usize) {
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        let image_len = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
+        let log_len = unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) };
+        let durable_bytes = image_len.saturating_add(log_len);
+        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(durable_bytes as u64, Ordering::Relaxed);
+        print_str(b"[cm-flush] boot hive journal checkpoint dirty-cells=");
+        print_u64(dirty_cells as u64);
+        print_str(b" pending-records=");
+        print_u64(self.mutable_hive_journal_pending_records as u64);
+        print_str(b" image-bytes=");
+        print_u64(image_len as u64);
+        print_str(b" log-bytes=");
+        print_u64(log_len as u64);
+        print_str(b" path=");
+        print_ascii_str(file_path);
+        print_str(b"\n");
+    }
+
+    pub(crate) fn complete_committed_mutable_hive_journal_snapshot(&mut self, reason: &[u8]) {
+        let pending_records = self.mutable_hive_journal_pending_records;
+        let pending_boot_mask = self.mutable_hive_journal_pending_boot_mask;
+        let dirty_boot_mask = self.mutable_hive_journal_dirty_boot_mask;
+        if pending_records == 0 && dirty_boot_mask == 0 {
+            return;
+        }
+
+        let mut boot_hives = 0usize;
+        let mut dirty_cells = 0usize;
+        let mut durable_bytes = 0usize;
+        let mut counted_mask = 0u8;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) else {
+                continue;
+            };
+            if dirty_boot_mask & bit == 0 {
+                continue;
+            }
+            let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                continue;
+            };
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            if dirty == 0 {
+                continue;
+            }
+            let image_len = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
+            let log_len = unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) };
+            if log_len == 0 {
+                continue;
+            }
+            let hive_bytes = image_len.saturating_add(log_len);
+            if hive_bytes == 0 {
+                continue;
+            }
+            boot_hives = boot_hives.saturating_add(1);
+            dirty_cells = dirty_cells.saturating_add(dirty);
+            durable_bytes = durable_bytes.saturating_add(hive_bytes);
+            counted_mask |= bit;
+        }
+
+        if boot_hives != 0 {
+            REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+            REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(durable_bytes as u64, Ordering::Relaxed);
+            print_str(b"[cm-flush] boot hive journal snapshot committed reason=");
+            print_str(reason);
+            print_str(b" pending-records=");
+            print_u64(pending_records as u64);
+            print_str(b" pending-mask=");
+            print_u64(pending_boot_mask as u64);
+            print_str(b" hives=");
+            print_u64(boot_hives as u64);
+            print_str(b" dirty-cells=");
+            print_u64(dirty_cells as u64);
+            print_str(b" bytes=");
+            print_u64(durable_bytes as u64);
+            print_str(b"\n");
+            self.mutable_hive_journal_dirty_boot_mask &= !counted_mask;
+        }
+        self.mutable_hive_journal_pending_records = 0;
+        self.mutable_hive_journal_pending_boot_mask = 0;
     }
 
     fn checkpoint_boot_mutable_hive_preserving_headroom(
@@ -3955,15 +4253,11 @@ impl ExecNtHandler {
             return 0xC000_0008;
         };
         if unsafe { crate::writable_fs::hive_image_len_at(file_path) != 0 } {
-            self.writable_fs_dirty = true;
-            self.writable_fs_commit_required = true;
-            print_str(b"[cm-flush] boot hive journal checkpoint dirty-cells=");
-            print_u64(dirty_cells as u64);
-            print_str(b" pending-records=");
-            print_u64(self.mutable_hive_journal_pending_records as u64);
-            print_str(b" path=");
-            print_ascii_str(file_path);
-            print_str(b"\n");
+            self.note_boot_hive_journal_checkpoint(file_path, dirty_cells);
+            return nt_fs::STATUS_SUCCESS;
+        }
+        if unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) != 0 } {
+            self.note_boot_hive_journal_checkpoint(file_path, dirty_cells);
             return nt_fs::STATUS_SUCCESS;
         }
         let Some(hive) = self.mutable_hives.hive(hive_sel) else {
@@ -3995,6 +4289,49 @@ impl ExecNtHandler {
         self.checkpoint_boot_mutable_hive(hive_sel, dirty_cells)
     }
 
+    fn flush_all_mutable_hives_preserving_headroom(
+        &mut self,
+        min_post_checkpoint_headroom: usize,
+    ) -> u32 {
+        let mut total_dirty = 0usize;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            total_dirty = total_dirty.saturating_add(dirty);
+            let status = self.checkpoint_boot_mutable_hive_preserving_headroom(
+                hive_sel,
+                dirty,
+                min_post_checkpoint_headroom,
+            );
+            if status != nt_fs::STATUS_SUCCESS {
+                return status;
+            }
+        }
+
+        for hive_sel in HIVE_SEL_DYNAMIC {
+            let dirty = self
+                .mutable_hives
+                .hive(hive_sel)
+                .map_or(0, |hive| hive.dirty_count());
+            total_dirty = total_dirty.saturating_add(dirty);
+            let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
+            if status != nt_fs::STATUS_SUCCESS {
+                return status;
+            }
+        }
+
+        REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
+        nt_fs::STATUS_SUCCESS
+    }
+
     pub(crate) fn checkpoint_unseeded_dirty_boot_mutable_hives(&mut self) -> u32 {
         #[derive(Copy, Clone)]
         struct Candidate {
@@ -4003,6 +4340,7 @@ impl ExecNtHandler {
             image_len: usize,
         }
 
+        const MIN_POST_BOOT_HIVE_PRIMARY_SEED_HEADROOM: usize = 0x18_0000;
         const HIVE_SELS: [u32; 5] = [
             HIVE_SEL_SYSTEM,
             HIVE_SEL_SOFTWARE,
@@ -4051,7 +4389,10 @@ impl ExecNtHandler {
                 let Some(candidate) = candidate else {
                     continue;
                 };
-                if candidate.image_len > headroom {
+                let required_headroom = candidate
+                    .image_len
+                    .saturating_add(MIN_POST_BOOT_HIVE_PRIMARY_SEED_HEADROOM);
+                if headroom < required_headroom {
                     continue;
                 }
                 let replace = selected
@@ -4762,6 +5103,30 @@ impl ExecNtHandler {
         self.mutable_hives.resolve_key(full_path)
     }
 
+    fn ensure_mutable_registry_key_by_path_journaled(
+        &mut self,
+        full_path: &str,
+    ) -> Result<nt_hive_core::ResolvedHiveKey, u32> {
+        let canon = self.overlay_canon(full_path);
+        if let Some(key) = self.mutable_registry_key_by_path(&canon) {
+            return Ok(key);
+        }
+        if !self.mutable_hive_owns_path(&canon) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let Some((parent_path, leaf)) = canon.rsplit_once('\\') else {
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        };
+        if parent_path.is_empty() || leaf.is_empty() {
+            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+        }
+        let parent = self.ensure_mutable_registry_key_by_path_journaled(parent_path)?;
+        if let Some(key) = self.mutable_registry_key_by_path(&canon) {
+            return Ok(key);
+        }
+        self.journal_create_mutable_subkey(parent, leaf)
+    }
+
     fn mutable_registry_key(&self, target: KeyRef) -> Option<nt_hive_core::ResolvedHiveKey> {
         if let Some(key) = self.mutable_key_handle(target) {
             return Some(key);
@@ -4955,15 +5320,16 @@ impl ExecNtHandler {
         let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
             return false;
         };
-        let updated = self
-            .mutable_hives
-            .set_value(key, name, value_type, data.to_vec());
-        if updated {
-            self.mark_mutable_hives_dirty_for_services_order_change(
-                Self::registry_services_order_value_write_may_reorder(full_path),
-            );
+        if self
+            .journal_set_mutable_value(key, name, value_type, data)
+            .is_err()
+        {
+            return false;
         }
-        updated
+        self.mark_mutable_hives_dirty_for_services_order_change(
+            Self::registry_services_order_value_write_may_reorder(full_path),
+        );
+        true
     }
 
     fn ensure_mutable_registry_value_by_path(
@@ -18566,11 +18932,11 @@ impl ExecNtHandler {
             },
             // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
             // NT references the key object by handle with no access mask, rejects deleted KCBs, then
-            // calls `CmFlushKey(kcb, FALSE)`. This host now has two live write authorities:
-            // volatile overlay keys, which match `HvSyncHive`'s volatile-hive early return, and
-            // mounted mutable hives. Mutable hives checkpoint through the writable filesystem:
-            // dynamic `NtLoadKey` profile hives write back to their source file, while boot-mounted
-            // hives write to `system32\config`.
+            // calls `CmFlushKey(kcb, FALSE)`. A key in ReactOS' volatile master hive drives
+            // `CmpDoFlushAll(FALSE)`; keys in mounted mutable hives checkpoint through the writable
+            // filesystem. Dynamic `NtLoadKey` profile hives write back to their source file, while
+            // boot-mounted hives write full images or committed journal sidecars under
+            // `system32\config`.
             NativeService::NtFlushKey => {
                 let key = match self.resolve_registry_key(args[0], 0) {
                     Ok(key) => key,
@@ -18580,6 +18946,12 @@ impl ExecNtHandler {
                 if let Some(index) = overlay_key_idx(key) {
                     if self.overlay.is_volatile(index).unwrap_or(false) {
                         REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
+                        let status = self.flush_all_mutable_hives_preserving_headroom(
+                            BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
+                        );
+                        if status != nt_fs::STATUS_SUCCESS {
+                            return status;
+                        }
                     }
                 } else if let Some(mutable_key) = self.mutable_registry_key(key) {
                     REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);

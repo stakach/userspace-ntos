@@ -893,7 +893,7 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     };
     unsafe { allocator::reset_to(snapshot_mark) };
     if snapshot_status == nt_fs::STATUS_SUCCESS {
-        nt_handler.mutable_hive_journal_pending_records = 0;
+        nt_handler.complete_committed_mutable_hive_journal_snapshot(b"quiesce");
     } else {
         print_str(b"[writable-fs-snapshot] quiesce checkpoint status=0x");
         print_hex(snapshot_status);
@@ -8212,7 +8212,8 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     } else {
-                        nt_handler.mutable_hive_journal_pending_records = 0;
+                        nt_handler
+                            .complete_committed_mutable_hive_journal_snapshot(b"service-loop");
                     }
                 }
                 nt_handler.writable_fs_commit_required = false;

@@ -296,7 +296,12 @@ fn parse_rgs_reg_sz(rest: &str, module: &str) -> Option<Vec<u8>> {
     }
 }
 
-trait RgsSeedTarget {
+/// Destination for ReactOS setup registry materialization.
+///
+/// The parser and setup tables in this module are pure data/logic; callers decide whether writes
+/// land in the volatile overlay, a host-test mutable hive set, or the executive's journal-backed
+/// Configuration Manager provider.
+pub trait ReactOsSetupSeedTarget {
     fn create_key(&mut self, path: &str) -> bool;
     fn set_value(
         &mut self,
@@ -319,7 +324,7 @@ struct OverlayRgsSeedTarget<'a> {
     overlay: &'a mut RegistryOverlay,
 }
 
-impl RgsSeedTarget for OverlayRgsSeedTarget<'_> {
+impl ReactOsSetupSeedTarget for OverlayRgsSeedTarget<'_> {
     fn create_key(&mut self, path: &str) -> bool {
         self.overlay.create(path);
         true
@@ -365,7 +370,7 @@ struct MutableHiveRgsSeedTarget<'a> {
     hives: &'a mut MutableHiveSet,
 }
 
-impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
+impl ReactOsSetupSeedTarget for MutableHiveRgsSeedTarget<'_> {
     fn create_key(&mut self, path: &str) -> bool {
         self.hives.create_key(path).is_some()
     }
@@ -407,7 +412,7 @@ impl RgsSeedTarget for MutableHiveRgsSeedTarget<'_> {
     }
 }
 
-fn seed_key_line<T: RgsSeedTarget>(
+fn seed_key_line<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     current: &str,
     line: &str,
@@ -424,7 +429,7 @@ fn seed_key_line<T: RgsSeedTarget>(
     Some(path)
 }
 
-fn seed_rgs_script<T: RgsSeedTarget>(
+fn seed_rgs_script<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     classes_root: &str,
     module: &str,
@@ -485,7 +490,7 @@ fn seed_rgs_script<T: RgsSeedTarget>(
     wrote_anything
 }
 
-fn rgs_script_materialized_expected_class<T: RgsSeedTarget>(
+fn rgs_script_materialized_expected_class<T: ReactOsSetupSeedTarget>(
     target: &T,
     classes_root: &str,
     clsid: &str,
@@ -497,7 +502,7 @@ fn rgs_script_materialized_expected_class<T: RgsSeedTarget>(
         && target.has_value(&inproc_path, "ThreadingModel")
 }
 
-fn seed_reactos_explorer_shell_com_classes_into<T: RgsSeedTarget>(
+pub fn seed_reactos_explorer_shell_com_classes_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     classes_root: &str,
 ) -> u64 {
@@ -511,7 +516,7 @@ fn seed_reactos_explorer_shell_com_classes_into<T: RgsSeedTarget>(
     mask
 }
 
-fn seed_reactos_user_profile_shell_folders_into<T: RgsSeedTarget>(
+pub fn seed_reactos_user_profile_shell_folders_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     user_hive_root: &str,
     profile_path: &str,
@@ -557,7 +562,9 @@ fn seed_reactos_user_profile_shell_folders_into<T: RgsSeedTarget>(
     stats
 }
 
-fn seed_reactos_print_setup_into<T: RgsSeedTarget>(target: &mut T) -> ReactOsPrintSetupSeedStats {
+pub fn seed_reactos_print_setup_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+) -> ReactOsPrintSetupSeedStats {
     const PRINT_ROOT: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Print";
     const ENV_ROOT: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Print\Environments";
     const MONITORS_ROOT: &str =
@@ -651,7 +658,7 @@ pub fn seed_reactos_explorer_shell_com_classes(
     overlay: &mut RegistryOverlay,
     classes_root: &str,
 ) -> u64 {
-    seed_reactos_explorer_shell_com_classes_into(
+    seed_reactos_explorer_shell_com_classes_into_target(
         &mut OverlayRgsSeedTarget { overlay },
         classes_root,
     )
@@ -665,7 +672,7 @@ pub fn seed_reactos_explorer_shell_com_classes_in_mutable_hives(
     hives: &mut MutableHiveSet,
     classes_root: &str,
 ) -> u64 {
-    seed_reactos_explorer_shell_com_classes_into(
+    seed_reactos_explorer_shell_com_classes_into_target(
         &mut MutableHiveRgsSeedTarget { hives },
         classes_root,
     )
@@ -682,7 +689,7 @@ pub fn seed_reactos_user_profile_shell_folders_in_mutable_hives(
     profile_path: &str,
     user_shell_profile_root: &str,
 ) -> ReactOsProfileShellFolderSeedStats {
-    seed_reactos_user_profile_shell_folders_into(
+    seed_reactos_user_profile_shell_folders_into_target(
         &mut MutableHiveRgsSeedTarget { hives },
         user_hive_root,
         profile_path,
@@ -711,7 +718,7 @@ pub fn seed_reactos_default_user_shell_folders_in_mutable_hives(
 pub fn seed_reactos_print_setup_in_mutable_hives(
     hives: &mut MutableHiveSet,
 ) -> ReactOsPrintSetupSeedStats {
-    seed_reactos_print_setup_into(&mut MutableHiveRgsSeedTarget { hives })
+    seed_reactos_print_setup_into_target(&mut MutableHiveRgsSeedTarget { hives })
 }
 
 #[cfg(test)]

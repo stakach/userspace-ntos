@@ -908,6 +908,24 @@ pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> 
     fs.file_bytes(path)
 }
 
+/// Borrow a mounted boot-hive journal sidecar without cloning it into the bump heap.
+///
+/// # Safety
+/// Single-threaded executive; callers must not mutate the writable volume while holding the slice.
+pub(crate) unsafe fn hive_log_bytes_if_mounted(image_path: &str) -> Option<&'static [u8]> {
+    let log_path = alloc::format!("{}.LOG", image_path);
+    file_bytes_if_mounted(&log_path)
+}
+
+/// Return the mounted hive sidecar-log length without cloning the log into the bump heap.
+///
+/// # Safety
+/// Single-threaded executive; callers must not mutate the writable volume while holding any
+/// separately borrowed slices.
+pub(crate) unsafe fn hive_log_len_if_mounted(image_path: &str) -> usize {
+    hive_log_bytes_if_mounted(image_path).map_or(0, |bytes| bytes.len())
+}
+
 /// Consume the one-shot dirty bit set by the lazy writable-volume mount/materialisation.
 pub(crate) fn take_mount_dirty() -> bool {
     WRITABLE_FS_MOUNT_DIRTY.swap(false, Ordering::AcqRel)

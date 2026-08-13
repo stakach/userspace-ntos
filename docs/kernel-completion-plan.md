@@ -4612,3 +4612,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   same-disk boot that mounts seeded primary images plus replayed sidecar logs, preserves the
   account-domain SID/ProfileList state, and reaches Explorer shell chrome without re-provisioning or
   heap growth from boot-hive primary rewrites.
+
+  D4 restored journal proof slice (2026-08-13): the restored same-disk boot exposed that some
+  ReactOS setup-owned registry seeders still wrote directly into `MutableHiveSet`, outside the CM
+  journal. `nt-hive-core` now exposes a generic `ReactOsSetupSeedTarget`, and the executive supplies
+  a journal-backed target that creates keys and sets values through the mutable-hive CM provider.
+  Shell COM, print setup, and default-user shell-folder provisioning now use that target in-kernel;
+  direct mutable-hive seed helpers remain available only for host/test callers. Validation:
+  `cargo fmt --all`, `cargo test -p nt-hive-core`, `cargo test -p nt-fs`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `cd rust-micro && ./scripts/make_image.sh`, and
+  `.tmp/run-headless-journaled-setup-seeds-restored-repacked-20260813.log` with `294/294`
+  executive checks passing. The restored gate reports `NtFlushKey calls=4`, `mutable=3`,
+  `boot-checkpoints=70`, `boot-checkpoint-failures=0`, `exec_reg_flush_key_serviced` green,
+  Explorer shell COM classes opened from the restored registry, and `exec_explorer_shell_chrome_painted`
+  green.
