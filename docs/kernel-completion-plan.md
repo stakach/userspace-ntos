@@ -4984,3 +4984,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   writable-filesystem proof comments were also reworded so the live executive code is not littered
   with obsolete invalid-function history. This is not a gate relaxation: all three gates still
   require their full proof bits plus `STATUS_SUCCESS`.
+
+  ntdll loader-unload cleanup (2026-08-14): `LdrUnloadDll` no longer stops at the old
+  zero-reference `STATUS_NOT_IMPLEMENTED` placeholder. The on-target loader now plans the full
+  import-reference ledger before mutating counts, preserves pinned modules, decrements still-live
+  modules, and tears down zero-count modules in reverse attach order. Real teardown runs TLS and
+  `DllMain(DLL_PROCESS_DETACH)` callouts under the loader callout guard, records
+  `RtlGetUnloadEventTrace` metadata, publishes DLL unload notifications, forgets unloaded static-TLS
+  entries without renumbering published TLS slots, unmaps the image through
+  `NtUnmapViewOfSection(NtCurrentProcess)`, and removes both `PEB->Ldr` and process-local
+  `MODULE_TABLE` entries. Validation: `cargo fmt --all`, `cargo test -p nt-ntdll loader`,
+  `./scripts/build_ntdll_dll.sh`, `git diff --check`, and a target-side not-implemented scan showing
+  no live unload placeholder remains.

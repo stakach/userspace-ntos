@@ -57,6 +57,8 @@ impl<const N: usize> StaticTlsCatalog<N> {
         }
     }
 
+    /// Return the fixed-index catalog backing. Entries whose `module_base` is zero are forgotten
+    /// unload tombstones; callers that walk this slice must skip them.
     pub fn entries(&self) -> &[StaticTlsEntry] {
         &self.entries[..self.len]
     }
@@ -73,6 +75,22 @@ impl<const N: usize> StaticTlsCatalog<N> {
         self.entries()
             .iter()
             .find(|entry| entry.module_base == module_base)
+    }
+
+    /// Forget a module that has been unloaded while preserving all published TLS indexes. Existing
+    /// and future thread TLS vectors stay dense enough for later modules, but the unloaded image's
+    /// raw-data pointers are no longer visited after its view is unmapped.
+    pub fn forget_module_preserving_index(&mut self, module_base: u64) -> Option<StaticTlsEntry> {
+        let index = self
+            .entries()
+            .iter()
+            .position(|entry| entry.module_base == module_base)?;
+        let previous = self.entries[index];
+        self.entries[index] = StaticTlsEntry {
+            index: previous.index,
+            ..StaticTlsEntry::default()
+        };
+        Some(previous)
     }
 
     /// Forget the current process catalog without copying its fixed-capacity backing array.
@@ -228,5 +246,28 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         assert!(catalog.entry_for_module(0x4000).is_none());
         assert_eq!(catalog.entry_for_module(0x1000).unwrap().index, 0);
+    }
+
+    #[test]
+    fn catalog_forgets_modules_without_reusing_or_renumbering_slots() {
+        let mut catalog = StaticTlsCatalog::<3>::new();
+        catalog
+            .add(0x1000, directory(0x2000, 0x2008, 0x3000, 0))
+            .unwrap();
+        catalog
+            .add(0x4000, directory(0x5000, 0x5010, 0x6000, 4))
+            .unwrap();
+
+        let removed = catalog.forget_module_preserving_index(0x1000).unwrap();
+        assert_eq!(removed.index, 0);
+        assert!(catalog.entry_for_module(0x1000).is_none());
+        assert_eq!(catalog.entry_for_module(0x4000).unwrap().index, 1);
+        assert_eq!(
+            catalog
+                .add(0x7000, directory(0x8000, 0x8004, 0x9000, 0))
+                .unwrap()
+                .index,
+            2
+        );
     }
 }

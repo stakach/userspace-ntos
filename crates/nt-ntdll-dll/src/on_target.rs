@@ -45,6 +45,9 @@ const SSN_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 18;
 const SSN_NT_FREE_VIRTUAL_MEMORY: u32 = 87;
 /// `NtProtectVirtualMemory` SSN.
 const SSN_NT_PROTECT_VIRTUAL_MEMORY: u32 = 143;
+/// `NtUnmapViewOfSection` SSN.
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_UNMAP_VIEW_OF_SECTION: u32 = 277;
 
 /// `NtRequestWaitReplyPort` SSN (CSR API message data plane).
 #[cfg(target_arch = "x86_64")]
@@ -356,6 +359,15 @@ pub(crate) unsafe fn nt_release_virtual_memory(base_in: u64) -> u32 {
             0,
         ) as u32
     }
+}
+
+/// Issue `NtUnmapViewOfSection(NtCurrentProcess(), base)` for a mapped image view.
+///
+/// # Safety
+/// On-target hosted-process syscall; `base` must be the base address of a mapped section view.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_unmap_view_of_section(base: u64) -> u32 {
+    unsafe { syscall4(SSN_NT_UNMAP_VIEW_OF_SECTION, NT_CURRENT_PROCESS, base, 0, 0) as u32 }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1592,6 +1604,9 @@ unsafe fn allocate_current_thread_static_tls() -> u32 {
     unsafe { core::ptr::write_bytes(vector.cast::<u8>(), 0, vector_size) };
 
     for entry in catalog.entries() {
+        if entry.module_base == 0 {
+            continue;
+        }
         let block = match unsafe { allocate_static_tls_block(*entry) } {
             Ok(block) => block,
             Err(status) => {
@@ -1709,6 +1724,9 @@ unsafe fn free_static_tls_vector(vector: *mut u64) {
     }
     let catalog = unsafe { &*core::ptr::addr_of!(STATIC_TLS_CATALOG) };
     for entry in catalog.entries() {
+        if entry.module_base == 0 {
+            continue;
+        }
         let block = unsafe { core::ptr::read(vector.add(entry.index as usize)) } as *mut u8;
         if !block.is_null() {
             let _ = unsafe { crate::process_heap_free(block) };
@@ -1726,6 +1744,30 @@ pub unsafe fn free_current_thread_static_tls() {
     let vector = unsafe { (*teb).thread_local_storage_pointer as *mut u64 };
     unsafe { (*teb).thread_local_storage_pointer = 0 };
     unsafe { free_static_tls_vector(vector) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn forget_unloaded_module_static_tls(base: u64) {
+    let removed = unsafe {
+        (&mut *core::ptr::addr_of_mut!(STATIC_TLS_CATALOG))
+            .forget_module_preserving_index(base)
+    };
+    let Some(entry) = removed else {
+        return;
+    };
+    let teb = unsafe { current_teb() };
+    if teb.is_null() {
+        return;
+    }
+    let vector = unsafe { (*teb).thread_local_storage_pointer as *mut u64 };
+    if vector.is_null() {
+        return;
+    }
+    let block = unsafe { core::ptr::read(vector.add(entry.index as usize)) } as *mut u8;
+    if !block.is_null() {
+        unsafe { core::ptr::write(vector.add(entry.index as usize), 0) };
+        let _ = unsafe { crate::process_heap_free(block) };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1851,6 +1893,20 @@ impl ModuleTable {
         if let Some(index) = self.index_by_base(base) {
             self.mods[index].attach_failed = failed;
         }
+    }
+
+    fn remove_base(&mut self, base: u64) -> bool {
+        let Some(index) = self.index_by_base(base) else {
+            return false;
+        };
+        let mut cursor = index + 1;
+        while cursor < self.count {
+            self.mods[cursor - 1] = self.mods[cursor];
+            cursor += 1;
+        }
+        self.count -= 1;
+        self.mods[self.count] = LoadedMod::empty();
+        true
     }
 }
 
@@ -3315,6 +3371,31 @@ unsafe fn add_ldr_module(base: u64, name_lc: &[u8]) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn remove_ldr_module(base: u64) -> bool {
+    let removed = unsafe {
+        let state = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+        let count = state.count.min(LDR_MAX_ENTRIES);
+        let Some(index) = state.entry_vas[..count].iter().position(|entry| {
+            *entry != 0 && core::ptr::read_unaligned((*entry + 0x30) as *const u64) == base
+        }) else {
+            return false;
+        };
+        let mut cursor = index + 1;
+        while cursor < count {
+            state.entry_vas[cursor - 1] = state.entry_vas[cursor];
+            cursor += 1;
+        }
+        state.count = count - 1;
+        state.entry_vas[state.count] = 0;
+        true
+    };
+    if removed && unsafe { (&*core::ptr::addr_of!(LDR_STATE)).ldr_va } != 0 {
+        unsafe { thread_ldr_lists() };
+    }
+    removed
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn add_runtime_ldr_module(base: u64, name_lc: &[u8]) -> u32 {
     if unsafe { (&*core::ptr::addr_of!(LDR_STATE)).ldr_va } == 0 {
         return 0;
@@ -3620,17 +3701,18 @@ pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
     0
 }
 
-/// Release one loader reference from `base` and each loaded import edge it owns. The transaction is
-/// committed only when every count remains nonzero; actual detach/unmap remains a separate path.
+/// Release one loader reference from `base` and each loaded import edge it owns. If the release
+/// drops any module to zero, detach it in reverse attach order, send unload notifications, and
+/// unmap its image view through the real current-process `NtUnmapViewOfSection` service.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
     use nt_ntdll::loader::lifecycle::{ReferenceReleaseLedger, ReferenceReleasePlan};
 
     match unsafe { crate::exports::ldr_plan_module_release(base, 1) } {
         Ok((_, _, ReferenceReleasePlan::Pinned)) => return 0,
-        Ok((_, _, ReferenceReleasePlan::TeardownRequired)) => return 0xC000_0002,
         Ok((_, _, ReferenceReleasePlan::Invalid)) => return 0xC000_000D,
-        Ok((_, _, ReferenceReleasePlan::DecrementTo(_))) => {}
+        Ok((_, _, ReferenceReleasePlan::DecrementTo(_)))
+        | Ok((_, _, ReferenceReleasePlan::TeardownRequired)) => {}
         Err(status) => return status,
     }
     let table = core::ptr::addr_of!(MODULE_TABLE);
@@ -3653,6 +3735,8 @@ pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
 
     let mut count_ptrs = [0u64; MODULE_TABLE_CAP];
     let mut next = [0u16; MODULE_TABLE_CAP];
+    let mut teardown = [0u64; MODULE_TABLE_CAP];
+    let mut teardown_count = 0usize;
     for (index, release) in ledger.as_slice().iter().enumerate() {
         let (count_ptr, current, plan) = match unsafe {
             crate::exports::ldr_plan_module_release(release.base, release.releases)
@@ -3664,7 +3748,14 @@ pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
         match plan {
             ReferenceReleasePlan::Pinned => next[index] = current,
             ReferenceReleasePlan::DecrementTo(value) => next[index] = value,
-            ReferenceReleasePlan::TeardownRequired => return 0xC000_0002,
+            ReferenceReleasePlan::TeardownRequired => {
+                next[index] = 0;
+                if teardown_count == MODULE_TABLE_CAP {
+                    return 0xC000_0017;
+                }
+                teardown[teardown_count] = release.base;
+                teardown_count += 1;
+            }
             ReferenceReleasePlan::Invalid => return 0xC000_000D,
         }
     }
@@ -3676,6 +3767,103 @@ pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
             continue;
         }
         unsafe { core::ptr::write_unaligned(count_ptr, next[index]) };
+    }
+    if teardown_count != 0 {
+        return unsafe { teardown_unreferenced_modules(&teardown[..teardown_count]) };
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn module_list_contains(modules: &[u64], base: u64) -> bool {
+    modules.contains(&base)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn teardown_unreferenced_modules(teardown: &[u64]) -> u32 {
+    let table = core::ptr::addr_of_mut!(MODULE_TABLE);
+    let mut unload_order = [0u64; MODULE_TABLE_CAP];
+    let mut unload_count = 0usize;
+
+    unsafe {
+        let attached = (&*table).attach_order.as_slice();
+        let mut index = attached.len();
+        while index != 0 {
+            index -= 1;
+            let base = attached[index];
+            if module_list_contains(teardown, base) {
+                unload_order[unload_count] = base;
+                unload_count += 1;
+            }
+        }
+    }
+    for &base in teardown {
+        if !module_list_contains(&unload_order[..unload_count], base) {
+            if unload_count == MODULE_TABLE_CAP {
+                return 0xC000_0017;
+            }
+            unload_order[unload_count] = base;
+            unload_count += 1;
+        }
+    }
+
+    for &base in &unload_order[..unload_count] {
+        let status = unsafe { detach_module_for_unload(table, base) };
+        if status != 0 {
+            return status;
+        }
+    }
+    for &base in &unload_order[..unload_count] {
+        let entry = unsafe { ldr_entry_for_base(base) };
+        if entry != 0 {
+            unsafe {
+                crate::exports::ldr_record_unload_event_for_entry(entry);
+                crate::exports::ldr_send_dll_notifications_for_base(base, 2);
+            }
+        }
+        unsafe { forget_unloaded_module_static_tls(base) };
+        let status = unsafe { nt_unmap_view_of_section(base) };
+        if (status as i32) < 0 {
+            return status;
+        }
+        unsafe {
+            remove_ldr_module(base);
+            (&mut *table).remove_base(base);
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn detach_module_for_unload(table: *mut ModuleTable, base: u64) -> u32 {
+    const DLL_PROCESS_DETACH: u32 = 0;
+    let Some(index) = (unsafe { (*table).index_by_base(base) }) else {
+        return 0xC000_0135;
+    };
+    if unsafe { (*table).mods[index].attached } {
+        if unsafe { !is_ntdll_base(&*table, base) && entry_point_rva(base) != 0 } {
+            let mut activation_frame = [0u64; 7];
+            let Ok(_activation_context) =
+                (unsafe { ModuleActivationContextGuard::enter(base, &mut activation_frame) })
+            else {
+                return STATUS_NO_MEMORY as u32;
+            };
+            let _callout = unsafe { crate::exports::enter_loader_callout() };
+            unsafe {
+                call_tls_initializers(base, DLL_PROCESS_DETACH);
+                let _ = call_dll_main(base, DLL_PROCESS_DETACH, 0);
+            }
+        }
+        unsafe { (*table).attach_order.remove(base) };
+    }
+    unsafe {
+        (*table).mods[index].attached = false;
+        (*table).mods[index].attaching = false;
+        (*table).mods[index].imports_ready = false;
+        (*table).mods[index].imports_in_progress = false;
+        (*table).mods[index].imports_failed = true;
+        (*table).mods[index].attach_failed = false;
+        set_ldr_process_attached(base, false);
     }
     0
 }

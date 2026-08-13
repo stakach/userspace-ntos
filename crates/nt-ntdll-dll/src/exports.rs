@@ -7394,6 +7394,7 @@ static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_
     }
 };
     RTL_UNLOAD_EVENT_TRACE_NUMBER];
+static RTL_UNLOAD_EVENT_TRACE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_SIZE: u32 = RTL_UNLOAD_EVENT_TRACE_SIZE;
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_COUNT: u32 = RTL_UNLOAD_EVENT_TRACE_NUMBER as u32;
 
@@ -7704,6 +7705,47 @@ pub(crate) unsafe fn ldr_send_dll_notifications_for_base(base: u64, reason: u32)
     let entry = unsafe { find_ldr_entry_for_base(base) };
     if entry != 0 {
         unsafe { ldr_send_dll_notifications_for_entry(entry, reason) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_record_unload_event_for_entry(entry: u64) {
+    let sequence = RTL_UNLOAD_EVENT_TRACE_SEQUENCE
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let index = sequence.wrapping_sub(1) as usize % RTL_UNLOAD_EVENT_TRACE_NUMBER;
+    let record = unsafe { &mut RTL_UNLOAD_EVENT_TRACE[index] };
+
+    let base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+    let size = unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+    record.base_address = base as *mut c_void;
+    record.size_of_image = size;
+    record.sequence = sequence;
+    record.time_date_stamp = 0;
+    record.check_sum = 0;
+    record.image_name = [0; 32];
+
+    if base >= 0x1_0000 {
+        unsafe {
+            let e_lfanew = core::ptr::read_unaligned((base + 0x3c) as *const u32) as u64;
+            let nt = base + e_lfanew;
+            if core::ptr::read_unaligned(nt as *const u32) == 0x0000_4550 {
+                record.time_date_stamp = core::ptr::read_unaligned((nt + 0x08) as *const u32);
+                record.check_sum = core::ptr::read_unaligned((nt + 0x58) as *const u32);
+            }
+        }
+    }
+
+    let name_length =
+        unsafe { core::ptr::read_unaligned((entry + LDR_BASE_DLL_NAME) as *const u16) } as usize;
+    let name_buffer =
+        unsafe { core::ptr::read_unaligned((entry + LDR_BASE_DLL_NAME + 8) as *const u64) };
+    if name_buffer != 0 {
+        let units = (name_length / 2).min(record.image_name.len());
+        for offset in 0..units {
+            record.image_name[offset] =
+                unsafe { core::ptr::read_unaligned((name_buffer as *const u16).add(offset)) };
+        }
     }
 }
 
@@ -8046,9 +8088,10 @@ pub unsafe extern "system" fn ldr_get_procedure_address_ex(
     unsafe { ldr_get_procedure_address(base_address, name, ordinal, address) }
 }
 
-/// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Pinned and still-referenced modules are handled
-/// transactionally. A release that would require detach/unlink/unmap returns
-/// `STATUS_NOT_IMPLEMENTED` without mutating counts or publishing an unload notification.
+/// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Pinned, still-referenced, and zero-count modules
+/// are handled transactionally by the on-target loader. Zero-count releases run process-detach
+/// callouts, publish unload notifications, remove `PEB->Ldr`/module-table state, and unmap the view
+/// through `NtUnmapViewOfSection`.
 ///
 /// # Safety
 /// `base_address` a previously-loaded module base.
@@ -19259,8 +19302,9 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
 
 /// `RtlGetUnloadEventTrace() -> PRTL_UNLOAD_EVENT_TRACE`.
 ///
-/// ReactOS exposes the process-local unload ring maintained by `LdrpRecordUnloadEvent`. Our loader
-/// keeps DLLs mapped, but `LdrUnloadDll` still records an unload attempt with the module metadata.
+/// ReactOS exposes the process-local unload ring maintained by `LdrpRecordUnloadEvent`. The
+/// on-target loader records the module metadata here just before a zero-count unload unmaps the
+/// image view.
 ///
 /// # Safety
 /// Returns a process-static array pointer.
