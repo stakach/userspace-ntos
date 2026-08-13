@@ -38,18 +38,18 @@ binary or stale branch state. The callback/transport gates now assert live invar
 workload.
 
 Latest accepted desktop proof (2026-08-13):
-`rust-micro/.tmp/run-headless-provision-new-image-20260813-scheduled.log` and
-`rust-micro/.tmp/run-headless-restored-same-image-20260813-scheduled.log` both reach the harness
-sentinel with `294/294` executive-to-isolated-service checks passing. The first boot checkpoints the
-late dirty `SOFTWARE`, `SAM`, and `SECURITY` boot hives before deferring an already-persisted
-`SYSTEM` refresh under tight heap headroom; the second boot restores writable snapshot generation
-`147`, reuses the persisted profile tree and `C:\Profiles\Administrator\ntuser.dat`, mounts the
-profile hive through `NtLoadKey`, proves restored SECURITY/SAM content (`restored-policy=1`,
-`restored-db=1`), then launches real userinit and Explorer. Both runs finish with redirected
-Explorer user callbacks, client WndProc installation, served shell COM classes, real GDI paint
-accounting, and a fully non-background 1024x768 Explorer framebuffer with at least 32 distinct
-non-background colors. The remaining D3 reboot-persistence proof for system hives, profile hives,
-and writable overlay state is therefore closed for the current desktop path.
+`.tmp/run-desktop-profile-proof-refresh-20260813.log` and serial mirror
+`.tmp/run-desktop-20260813-160158.log` reach the harness sentinel with `294/294`
+executive-to-isolated-service checks passing on a visible desktop run. This closes the D2
+registry/profile cleanup proof: `exec_default_user_profile_staged` now observes the live published
+`Default User\ntuser.dat` image (`dirs=45`, `files=32`, `bytes=135989`, `Default User` entries=18,
+`ntuser.dat=130682B`), `NtLoadKey` and `NtFlushKey` stay green, `exec_vm_pool_headroom` stays green,
+and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background
+with at least 32 distinct non-background colors. The restored writable-snapshot proof remains
+`rust-micro/.tmp/run-headless-provision-new-image-20260813-scheduled.log` plus
+`rust-micro/.tmp/run-headless-restored-same-image-20260813-scheduled.log`; both pass `294/294` and
+close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
+the current desktop path.
 
 Completed restored-boot proof hardening (2026-08-13): restored profile, LSA, SAM, and writable
 overlay gates now derive from actual persisted state instead of first-boot counters. The writable
@@ -4705,6 +4705,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   refreshes the live profile-source proof counters when `Default User\ntuser.dat` is published into
   an already-mounted writable volume, and the final profile-source log now includes the provisioned
   hive byte count. Validation so far: `cargo fmt --all` and `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: rerun one
-  serialized desktop proof; expected closure is `exec_default_user_profile_staged` green and a
-  `294/294` summary without changing kernel registry behavior.
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Serialized closure proof:
+  `.tmp/run-desktop-profile-proof-refresh-20260813.log` and serial mirror
+  `.tmp/run-desktop-20260813-160158.log` reach `294/294`, with
+  `exec_default_user_profile_staged`, `exec_vm_pool_headroom`, `NtLoadKey`, `NtFlushKey`, and
+  `exec_explorer_shell_chrome_painted` all green. The final profile-source proof reports
+  `dirs=45`, `files=32`, `bytes=135989`, `Default User` entries=18, and `ntuser.dat=130682B`; the
+  final Explorer framebuffer proof reports all 786432 pixels non-background with at least 32
+  distinct non-background colors. Review adjustment: D2 is closed for the current desktop path;
+  continue to the next open completion-plan item without adding registry/profile fallback machinery.
