@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-13
+Last updated: 2026-08-14
 
 ## Objective
 
@@ -4948,3 +4948,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `nt-syscall` dispatcher contract for unknown services instead of misclassifying it as missing
   kernel code. Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  Native device-control syscall cleanup (2026-08-14): `NtDeviceIoControlFile` no longer falls
+  through the executive's generic `STATUS_NOT_IMPLEMENTED` branch. The service now validates the
+  required IOSB, enforces the same buffered-IOCTL boundary as `nt-io-manager`, resolves the caller's
+  real process handle to a routed `FILE_OBJECT` and owning device, checks the control-code
+  read/write access bits against the handle grant, dispatches `IRP_MJ_DEVICE_CONTROL` through the
+  hosted driver route, copies completed output bytes back to the user buffer, and runs the normal
+  event/IOCP terminal-completion path. Ordinary disk/overlay/root-pipe handles fail with concrete
+  device-request errors, non-file object handles fail as type mismatches, and unsupported transfer
+  methods remain visible as `STATUS_NOT_SUPPORTED`; no success is fabricated. Validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and a registered-native-service scan now showing only
+  `NtCreateThreadEx` still missing an explicit executive arm.

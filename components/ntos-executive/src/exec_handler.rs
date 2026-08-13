@@ -18,6 +18,9 @@ const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
@@ -9469,6 +9472,168 @@ impl ExecNtHandler {
         self.xas_write_buf(iosb, &status.to_le_bytes());
         self.xas_write_buf(iosb + 8, &information.to_le_bytes());
         true
+    }
+
+    unsafe fn nt_device_io_control_file_service(&mut self, args: &[u64]) -> u32 {
+        const DEVICE_CONTROL_BUFFER_CAP: usize = 0x4000;
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const FILE_APPEND_DATA: u32 = 0x0000_0004;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+
+        let iosb = args[4];
+        if iosb == 0 || !self.probe_user_output(iosb, 16) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let ioctl = args[5] as u32;
+        if nt_io_abi::ioctl::method(ioctl) != nt_io_abi::ioctl::METHOD_BUFFERED {
+            self.write_current_iosb(iosb, STATUS_NOT_SUPPORTED, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        if args[2] != 0 {
+            self.write_current_iosb(iosb, STATUS_NOT_SUPPORTED, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        let raw_input_len = args[7] as u32 as usize;
+        let raw_output_len = args[9] as u32 as usize;
+        if raw_input_len > DEVICE_CONTROL_BUFFER_CAP || raw_output_len > DEVICE_CONTROL_BUFFER_CAP
+        {
+            self.write_current_iosb(iosb, STATUS_INVALID_BUFFER_SIZE, 0);
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        if raw_input_len != 0 && args[6] == 0 {
+            self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if raw_output_len != 0 && args[8] == 0 {
+            self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
+            return STATUS_INVALID_HANDLE;
+        };
+        if args[0] > u32::MAX as u64 {
+            self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
+            return STATUS_INVALID_HANDLE;
+        }
+        let handle = args[0] as nt_process::Handle;
+        let access = match self.pm.handle_access(pid, handle) {
+            Some(access) => access,
+            None => {
+                self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+        let route = match self.pm.lookup_handle(pid, handle) {
+            Some(nt_process::HandleObject::RoutedFile { file_id, device_id }) if file_id != 0 => {
+                NpfsFileRoute { file_id, device_id }
+            }
+            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => {
+                let Some(device_id) = driver_launch::device_id_by_name("\\Device\\NamedPipe")
+                else {
+                    self.write_current_iosb(iosb, STATUS_DEVICE_NOT_READY, 0);
+                    return STATUS_DEVICE_NOT_READY;
+                };
+                NpfsFileRoute { file_id, device_id }
+            }
+            Some(nt_process::HandleObject::DiskFile { .. })
+            | Some(nt_process::HandleObject::Directory { .. })
+            | Some(nt_process::HandleObject::OverlayFile(_))
+            | Some(nt_process::HandleObject::BootStatusFile)
+            | Some(nt_process::HandleObject::Opaque(NPFS_ROOT_HANDLE_TAG)) => {
+                self.write_current_iosb(iosb, STATUS_INVALID_DEVICE_REQUEST, 0);
+                return STATUS_INVALID_DEVICE_REQUEST;
+            }
+            Some(_) => {
+                self.write_current_iosb(iosb, STATUS_OBJECT_TYPE_MISMATCH, 0);
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+            None => {
+                self.write_current_iosb(iosb, STATUS_INVALID_HANDLE, 0);
+                return STATUS_INVALID_HANDLE;
+            }
+        };
+
+        let required_access = nt_io_abi::ioctl::access(ioctl);
+        if required_access & nt_io_abi::ioctl::FILE_READ_ACCESS != 0
+            && access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0
+        {
+            self.write_current_iosb(iosb, STATUS_ACCESS_DENIED, 0);
+            return STATUS_ACCESS_DENIED;
+        }
+        if required_access & nt_io_abi::ioctl::FILE_WRITE_ACCESS != 0
+            && access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) == 0
+        {
+            self.write_current_iosb(iosb, STATUS_ACCESS_DENIED, 0);
+            return STATUS_ACCESS_DENIED;
+        }
+
+        let mut input = alloc::vec![0u8; raw_input_len];
+        if raw_input_len != 0 && !self.xas_read(args[6], &mut input) {
+            self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut output = alloc::vec![0u8; raw_output_len];
+        if raw_output_len != 0 && !self.probe_user_output(args[8], raw_output_len) {
+            self.write_current_iosb(iosb, STATUS_ACCESS_VIOLATION, 0);
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let completion_port_suppressed =
+            nt_io_completion::io_event_suppresses_completion_port(args[1]);
+        let event_obj_idx = match self.prepare_io_event_for_request(args[1]) {
+            Ok(Some(index)) => index as u64,
+            Ok(None) => u64::MAX,
+            Err(event_status) => {
+                self.write_current_iosb(iosb, event_status, 0);
+                return event_status;
+            }
+        };
+
+        let mut information = 0u64;
+        let mut status = match self.npfs_route_raw_for(
+            route,
+            major::IRP_MJ_DEVICE_CONTROL as u64,
+            ioctl as u64,
+            &input,
+            &mut output,
+        ) {
+            Ok((driver_status, completed, _)) => {
+                information = completed;
+                driver_status as u32
+            }
+            Err(route_status) => route_status,
+        };
+        if information != 0 && args[8] != 0 {
+            let copy_len = (information as usize).min(output.len());
+            if copy_len != 0 && !self.xas_try_write_buf(args[8], &output[..copy_len]) {
+                status = STATUS_ACCESS_VIOLATION;
+                information = 0;
+            }
+        }
+
+        self.write_current_iosb(iosb, status, information);
+        if route.file_id != 0 && status == STATUS_PENDING {
+            let _ = self.file_completion.set_signaled(route.file_id, false);
+        }
+        if route.file_id != 0 && status != STATUS_PENDING {
+            self.complete_terminal_file_io(
+                route.file_id,
+                event_obj_idx,
+                args[3],
+                status,
+                information,
+                true,
+                completion_port_suppressed,
+            );
+        }
+        status
     }
 
     unsafe fn cancel_retained_file_irps(&mut self, device_id: u64, file_id: u64) -> u64 {
@@ -20317,6 +20482,12 @@ impl ExecNtHandler {
                 NAMED_PIPE_CREATED.fetch_add(1, Ordering::Relaxed);
                 self.pipe_name_wait_redrive = nt_io_manager::pipe_name_hash(&leaf);
                 0 // STATUS_SUCCESS
+            },
+            // NtDeviceIoControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
+            // IoStatusBlock[sp+0x28], IoControlCode[sp+0x30], ...). Dispatch buffered device
+            // controls through the real FILE_OBJECT/device route owned by the process handle table.
+            NativeService::NtDeviceIoControlFile => unsafe {
+                self.nt_device_io_control_file_service(args)
             },
             // NtFsControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
             // IoStatusBlock[sp+0x28], FsControlCode[sp+0x30], ...). Route named-pipe FSCTLs through
