@@ -1117,6 +1117,96 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
     (status, written)
 }
 
+/// Append bytes to a writable-volume file through the same Zw facade hosted callers use.
+///
+/// This is used by the hive journal sidecar. It avoids rebuilding the complete `.LOG` file for
+/// every registry mutation, while still making the append an ordinary writable-volume update that
+/// participates in snapshot persistence.
+pub(crate) unsafe fn append_file(path: &str, data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return nt_fs::STATUS_SUCCESS;
+    }
+    let status = 'append: {
+        let Some(fs) = writable_fs() else {
+            break 'append nt_fs::STATUS_INVALID_HANDLE;
+        };
+        let file = fs.zw_create_file(
+            path,
+            nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA | nt_fs::SYNCHRONIZE,
+            0,
+            0,
+            nt_fs::FILE_OPEN_IF,
+            nt_fs::FILE_NON_DIRECTORY_FILE,
+        );
+        if file.status != nt_fs::STATUS_SUCCESS {
+            break 'append file.status;
+        }
+        let end = match fs.zw_query_standard_information(file.handle) {
+            Some(info) => info.end_of_file,
+            None => {
+                let _ = fs.zw_close(file.handle);
+                break 'append nt_fs::STATUS_INVALID_HANDLE;
+            }
+        };
+        let (write_status, written) = fs.zw_write_file(file.handle, Some(end), data);
+        let flush_status = if write_status == nt_fs::STATUS_SUCCESS && written == data.len() {
+            fs.zw_flush_buffers_file(file.handle)
+        } else if write_status == nt_fs::STATUS_SUCCESS {
+            nt_fs::STATUS_INSUFFICIENT_RESOURCES
+        } else {
+            write_status
+        };
+        let _ = fs.zw_close(file.handle);
+        flush_status
+    };
+    if status == nt_fs::STATUS_SUCCESS {
+        OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
+        OVERLAY_BYTES_WRITTEN.fetch_add(data.len() as u64, Ordering::Relaxed);
+        mark_snapshot_dirty();
+    }
+    status
+}
+
+/// Truncate a writable-volume file to zero bytes without replacing its node.
+pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
+    let mut dirtied = false;
+    let status = 'truncate: {
+        let Some(fs) = writable_fs() else {
+            break 'truncate nt_fs::STATUS_INVALID_HANDLE;
+        };
+        let file = fs.zw_create_file(
+            path,
+            nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+            0,
+            0,
+            nt_fs::FILE_OPEN_IF,
+            nt_fs::FILE_NON_DIRECTORY_FILE,
+        );
+        if file.status != nt_fs::STATUS_SUCCESS {
+            break 'truncate file.status;
+        }
+        let old_len = fs
+            .zw_query_standard_information(file.handle)
+            .map_or(0, |info| info.end_of_file);
+        let eof = 0u64.to_le_bytes();
+        let set_status =
+            fs.zw_set_information_file(file.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
+        let flush_status = if set_status == nt_fs::STATUS_SUCCESS {
+            fs.zw_flush_buffers_file(file.handle)
+        } else {
+            set_status
+        };
+        dirtied = old_len != 0 || file.information == nt_fs::FILE_CREATED;
+        let _ = fs.zw_close(file.handle);
+        flush_status
+    };
+    if status == nt_fs::STATUS_SUCCESS && dirtied {
+        OVERLAY_SET_INFO.fetch_add(1, Ordering::Relaxed);
+        mark_snapshot_dirty();
+    }
+    status
+}
+
 fn rename_information(
     replace_if_exists: bool,
     root_directory: u64,
@@ -1279,15 +1369,11 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
-        let mut log = self.read_log()?;
-        log.extend_from_slice(bytes);
-        hive_io_status(unsafe { write_file_atomic_owned(&self.log_path, log) })
+        hive_io_status(unsafe { append_file(&self.log_path, bytes) })
     }
 
     fn truncate_log(&mut self) -> Result<(), nt_hive_core::HiveIoError> {
-        hive_io_status(unsafe {
-            write_file_atomic_owned(&self.log_path, alloc::vec::Vec::new())
-        })
+        hive_io_status(unsafe { truncate_file(&self.log_path) })
     }
 
     fn flush_image(&mut self) -> Result<(), nt_hive_core::HiveIoError> {

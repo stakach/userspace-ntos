@@ -42,6 +42,7 @@ const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\s
 const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
     r"\registry\machine\system\controlset001\control\servicegrouporder";
 const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
+const MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS: u32 = 64;
 
 fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
     let timeout = if request.timeout_specified {
@@ -2196,6 +2197,7 @@ impl ExecNtHandler {
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hives_dirty, false);
+        write_field!(mutable_hive_journal_pending_records, 0);
         write_field!(boot_hive_checkpoints_refreshed, false);
         write_field!(
             registry_services_order_cache,
@@ -3071,7 +3073,14 @@ impl ExecNtHandler {
         let mut manager = nt_hive_core::HiveManager::for_live_hive(provider, hive);
         manager
             .mutate(hive, op)
-            .map_err(Self::mutable_hive_journal_status)
+            .map_err(Self::mutable_hive_journal_status)?;
+        self.mutable_hive_journal_pending_records = self
+            .mutable_hive_journal_pending_records
+            .saturating_add(1);
+        if self.mutable_hive_journal_pending_records >= MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS {
+            self.writable_fs_dirty = true;
+        }
+        Ok(())
     }
 
     fn journal_create_mutable_subkey(
@@ -3781,8 +3790,12 @@ impl ExecNtHandler {
             return false;
         };
         let mount_path = hive_mount(hive_sel);
-        if let Ok(hive) = nt_hive_core::decode_image(bytes) {
+        let mut manager = nt_hive_core::HiveManager::new(
+            crate::writable_fs::WritableHiveIoProvider::new(file_path),
+        );
+        if let Ok(hive) = manager.boot(hive_kind_for_selector(hive_sel)) {
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
+            let status = nt_hive_core::HiveIoProvider::get_status(manager.provider());
             self.mutable_hives.mount(mount_path, hive_sel, hive);
             self.mutable_hives.clear_hive_dirty(hive_sel);
             if hive_sel == HIVE_SEL_USER_DEFAULT {
@@ -3796,6 +3809,8 @@ impl ExecNtHandler {
             print_u64(bytes.len() as u64);
             print_str(b" root-subkeys=");
             print_u64(root_subkeys);
+            print_str(b" log-bytes=");
+            print_u64(status.log_len as u64);
             print_str(b" format=core\n");
             return true;
         }
@@ -3939,6 +3954,18 @@ impl ExecNtHandler {
         let Some(file_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
             return 0xC000_0008;
         };
+        if unsafe { crate::writable_fs::hive_image_len_at(file_path) != 0 } {
+            self.writable_fs_dirty = true;
+            self.writable_fs_commit_required = true;
+            print_str(b"[cm-flush] boot hive journal checkpoint dirty-cells=");
+            print_u64(dirty_cells as u64);
+            print_str(b" pending-records=");
+            print_u64(self.mutable_hive_journal_pending_records as u64);
+            print_str(b" path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+            return nt_fs::STATUS_SUCCESS;
+        }
         let Some(hive) = self.mutable_hives.hive(hive_sel) else {
             return 0xC000_0008;
         };
@@ -3968,13 +3995,12 @@ impl ExecNtHandler {
         self.checkpoint_boot_mutable_hive(hive_sel, dirty_cells)
     }
 
-    pub(crate) fn checkpoint_dirty_boot_mutable_hives(&mut self) -> u32 {
+    pub(crate) fn checkpoint_unseeded_dirty_boot_mutable_hives(&mut self) -> u32 {
         #[derive(Copy, Clone)]
         struct Candidate {
             hive_sel: u32,
             dirty: usize,
             image_len: usize,
-            checkpointed: bool,
         }
 
         const HIVE_SELS: [u32; 5] = [
@@ -4000,20 +4026,21 @@ impl ExecNtHandler {
             let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
                 continue;
             };
-            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
-                continue;
-            };
-            let image_len = match nt_hive_core::encoded_image_len(hive) {
-                Ok(len) => len,
-                Err(_) => usize::MAX,
-            };
-            candidates[candidate_len] = Some(Candidate {
-                hive_sel,
-                dirty,
-                image_len,
-                checkpointed: unsafe { crate::writable_fs::hive_image_len_at(path) != 0 },
-            });
-            candidate_len += 1;
+            if unsafe { crate::writable_fs::hive_image_len_at(path) == 0 } {
+                let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                    continue;
+                };
+                let image_len = match nt_hive_core::encoded_image_len(hive) {
+                    Ok(len) => len,
+                    Err(_) => usize::MAX,
+                };
+                candidates[candidate_len] = Some(Candidate {
+                    hive_sel,
+                    dirty,
+                    image_len,
+                });
+                candidate_len += 1;
+            }
         }
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
 
@@ -4027,14 +4054,9 @@ impl ExecNtHandler {
                 if candidate.image_len > headroom {
                     continue;
                 }
-                let replace = match selected {
-                    None => true,
-                    Some((_, best)) => {
-                        (!candidate.checkpointed && best.checkpointed)
-                            || (candidate.checkpointed == best.checkpointed
-                                && candidate.image_len > best.image_len)
-                    }
-                };
+                let replace = selected
+                    .map(|(_, best)| candidate.image_len > best.image_len)
+                    .unwrap_or(true);
                 if replace {
                     selected = Some((index, *candidate));
                 }
@@ -4052,9 +4074,12 @@ impl ExecNtHandler {
 
         let remaining_dirty = self.boot_mutable_hive_dirty_cells();
         REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(remaining_dirty as u64, Ordering::Relaxed);
-        if remaining_dirty != 0 {
+        let unseeded_dirty = self.unseeded_boot_mutable_hive_dirty_cells();
+        if unseeded_dirty != 0 {
             self.mutable_hives_dirty = true;
             print_str(b"[cm-flush] quiesce boot hive dirty refresh deferred dirty-cells=");
+            print_u64(unseeded_dirty as u64);
+            print_str(b" total-dirty=");
             print_u64(remaining_dirty as u64);
             print_str(b" heap-headroom=");
             print_u64(crate::allocator::remaining() as u64);
@@ -4079,6 +4104,12 @@ impl ExecNtHandler {
                 .hive(hive_sel)
                 .map_or(0, |hive| hive.dirty_count());
             if dirty < min_dirty_cells {
+                continue;
+            }
+            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                continue;
+            };
+            if unsafe { crate::writable_fs::hive_image_len_at(path) != 0 } {
                 continue;
             }
             let image_len = self
@@ -4108,6 +4139,12 @@ impl ExecNtHandler {
             if dirty < min_dirty_cells {
                 continue;
             }
+            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                continue;
+            };
+            if unsafe { crate::writable_fs::hive_image_len_at(path) != 0 } {
+                continue;
+            }
             let status = self.checkpoint_boot_mutable_hive(hive_sel, dirty);
             REG_FLUSH_KEY_MUTABLE_DIRTY_CELLS.store(total_dirty as u64, Ordering::Relaxed);
             return status;
@@ -4125,6 +4162,30 @@ impl ExecNtHandler {
             HIVE_SEL_SAM,
             HIVE_SEL_USER_DEFAULT,
         ] {
+            total_dirty = total_dirty.saturating_add(
+                self.mutable_hives
+                    .hive(hive_sel)
+                    .map_or(0, |hive| hive.dirty_count()),
+            );
+        }
+        total_dirty
+    }
+
+    pub(crate) fn unseeded_boot_mutable_hive_dirty_cells(&self) -> usize {
+        let mut total_dirty = 0usize;
+        for hive_sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+            HIVE_SEL_USER_DEFAULT,
+        ] {
+            let Some(path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                continue;
+            };
+            if unsafe { crate::writable_fs::hive_image_len_at(path) != 0 } {
+                continue;
+            }
             total_dirty = total_dirty.saturating_add(
                 self.mutable_hives
                     .hive(hive_sel)
@@ -4321,16 +4382,26 @@ impl ExecNtHandler {
             core::slice::from_raw_parts((*core::ptr::addr_of!(USER_HIVE_BUF))[slot].as_ptr(), len);
         let regf_hive = RegfHive::new(bytes);
         let mut core_hive = None;
+        let hive_sel = HIVE_SEL_DYNAMIC[slot];
         let root_subkeys = if let Some(ref hive) = regf_hive {
             hive.subkeys(hive.root()).len() as u64
         } else {
-            match nt_hive_core::decode_image(bytes) {
-                Ok(hive) => {
+            let provider_core_hive =
+                (unsafe { crate::writable_fs::file_bytes_if_mounted(&file_name).is_some() })
+                    .then(|| {
+                        let mut manager = nt_hive_core::HiveManager::new(
+                            crate::writable_fs::WritableHiveIoProvider::new(&file_name),
+                        );
+                        manager.boot(hive_kind_for_selector(hive_sel)).ok()
+                    })
+                    .flatten();
+            match provider_core_hive.or_else(|| nt_hive_core::decode_image(bytes).ok()) {
+                Some(hive) => {
                     let root_subkeys = hive.subkey_count(hive.root()) as u64;
                     core_hive = Some(hive);
                     root_subkeys
                 }
-                Err(_) => {
+                None => {
                     print_str(b"[cm-load] NtLoadKey: not a regf/core hive (");
                     print_u64(len as u64);
                     print_str(b" bytes)\n");
@@ -4339,7 +4410,6 @@ impl ExecNtHandler {
             }
         };
         USER_HIVE_SLOT_USED.fetch_or(1 << slot, Ordering::Relaxed);
-        let hive_sel = HIVE_SEL_DYNAMIC[slot];
         if let Some(ref hive) = regf_hive {
             let imported = {
                 let _import_alloc_ctx =

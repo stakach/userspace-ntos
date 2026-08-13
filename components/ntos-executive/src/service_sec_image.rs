@@ -859,18 +859,31 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
         return nt_fs::STATUS_SUCCESS;
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
-    if dirty_cells == 0 {
+    let unseeded_dirty_cells = nt_handler.unseeded_boot_mutable_hive_dirty_cells();
+    let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
+    if dirty_cells == 0 && pending_journal_records == 0 {
         return nt_fs::STATUS_SUCCESS;
     }
-    print_str(b"[cm-flush] quiesce lazy boot hive sweep dirty-cells=");
-    print_u64(dirty_cells as u64);
-    print_str(b"\n");
-    let status = nt_handler.checkpoint_dirty_boot_mutable_hives();
-    if status != nt_fs::STATUS_SUCCESS {
-        print_str(b"[cm-flush] quiesce boot hive sweep failed status=0x");
-        print_hex(status);
+    if unseeded_dirty_cells != 0 {
+        print_str(b"[cm-flush] quiesce boot hive primary seed dirty-cells=");
+        print_u64(unseeded_dirty_cells as u64);
+        print_str(b" total-dirty=");
+        print_u64(dirty_cells as u64);
         print_str(b"\n");
-        return status;
+        let status = nt_handler.checkpoint_unseeded_dirty_boot_mutable_hives();
+        if status != nt_fs::STATUS_SUCCESS {
+            print_str(b"[cm-flush] quiesce boot hive primary seed failed status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            return status;
+        }
+    }
+    if pending_journal_records != 0 {
+        print_str(b"[cm-flush] quiesce mutable hive journal snapshot records=");
+        print_u64(pending_journal_records as u64);
+        print_str(b" dirty-cells=");
+        print_u64(dirty_cells as u64);
+        print_str(b"\n");
     }
     let snapshot_mark = allocator::mark();
     let snapshot_status = {
@@ -879,7 +892,9 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
         unsafe { crate::writable_fs::checkpoint_dirty_volume() }
     };
     unsafe { allocator::reset_to(snapshot_mark) };
-    if snapshot_status != nt_fs::STATUS_SUCCESS {
+    if snapshot_status == nt_fs::STATUS_SUCCESS {
+        nt_handler.mutable_hive_journal_pending_records = 0;
+    } else {
         print_str(b"[writable-fs-snapshot] quiesce checkpoint status=0x");
         print_hex(snapshot_status);
         print_str(b"\n");
@@ -935,7 +950,7 @@ fn checkpoint_one_boot_hive_if_headroom(
         return status;
     }
     pin_durable_heap_mark(heap_mark);
-    if nt_handler.boot_mutable_hive_dirty_cells() != 0 {
+    if nt_handler.unseeded_boot_mutable_hive_dirty_cells() != 0 {
         nt_handler.mutable_hives_dirty = true;
     }
     status
@@ -8196,6 +8211,8 @@ pub(crate) unsafe fn service_sec_image(
                                 );
                             }
                         }
+                    } else {
+                        nt_handler.mutable_hive_journal_pending_records = 0;
                     }
                 }
                 nt_handler.writable_fs_commit_required = false;

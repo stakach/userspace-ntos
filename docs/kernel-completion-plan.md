@@ -4593,3 +4593,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Review adjustment: rebuild and rerun the serialized first boot; the next
   allocator report must include `scope=...`, and that named owner becomes the implementation target.
+
+  D4 mutable-hive journal-backed flush slice (2026-08-13): the retained D3 full-image checkpoint
+  path was still too eager once boot hives had a seeded primary image in the writable config tree.
+  `WritableHiveIoProvider` now appends hive `.LOG` records in place and truncates logs in place
+  through the writable-volume Zw facade instead of atomically replacing the complete sidecar on every
+  registry mutation. The executive batches mutable-hive journal snapshot commits, replays provider
+  logs when refreshing boot hives or dynamically loaded profile hives, and restricts lazy/quiesce
+  full-image boot-hive checkpointing to unseeded primary images. Seeded boot-hive `NtFlushKey` now
+  makes the journal-bearing writable-volume snapshot commit-required and returns through the same
+  post-dispatch durable commit path, so low headroom for optional primary compaction is no longer
+  reported as a flush failure. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`,
+  `cargo test -p nt-fs`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, `./components/ntos-executive/build.sh`, and
+  `.tmp/run-headless-mutable-journal-flush-20260813.log` with `294/294` executive checks passing,
+  `exec_reg_flush_key_serviced`, `exec_ntloadkey_serviced`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: D4's next proof is a restored
+  same-disk boot that mounts seeded primary images plus replayed sidecar logs, preserves the
+  account-domain SID/ProfileList state, and reaches Explorer shell chrome without re-provisioning or
+  heap growth from boot-hive primary rewrites.

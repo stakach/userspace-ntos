@@ -17450,6 +17450,10 @@ struct ExecNtHandler {
     /// at coarse lazy-writer boundaries. Clean hives are skipped while later
     /// SAM/SECURITY/SOFTWARE mutations still persist before the gate.
     mutable_hives_dirty: bool,
+    /// Mutable-hive journal records appended since the last writable-volume snapshot. The log append
+    /// itself is synchronous in the mounted volume; this counter batches the expensive snapshot
+    /// reserve commit instead of exporting the whole writable volume after every registry value.
+    mutable_hive_journal_pending_records: u32,
     /// Set after the live boot-mounted hives have been refreshed from a restored writable-volume
     /// checkpoint. This is one-shot per boot: later `NtFlushKey` calls update the same files, but CM
     /// must not repeatedly replace live hives while hosted processes are holding key handles.
