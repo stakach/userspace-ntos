@@ -4627,3 +4627,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `boot-checkpoints=70`, `boot-checkpoint-failures=0`, `exec_reg_flush_key_serviced` green,
   Explorer shell COM classes opened from the restored registry, and `exec_explorer_shell_chrome_painted`
   green.
+
+  D4 overlay-shadow volatility cleanup (2026-08-13): the persistent-path audit found two remaining
+  implicit overlay-shadow creation sites that still used the overlay's default volatile create helper:
+  `NtSetValueKey` on an existing non-mutable key and security-descriptor writes that must shadow an
+  existing registry path. Those shadows are not `REG_OPTION_VOLATILE` keys, so the executive now
+  creates them with explicit nonvolatile overlay metadata. `nt-hive-core` has a regression test
+  proving owned shadow paths can be nonvolatile and that reopening them with a volatile create option
+  does not rewrite the key's storage class. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.

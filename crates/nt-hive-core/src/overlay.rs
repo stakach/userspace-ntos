@@ -533,6 +533,29 @@ mod tests {
     }
 
     #[test]
+    fn owned_shadow_paths_can_be_nonvolatile() {
+        let mut ov = RegistryOverlay::new();
+        let (shadow, created) = ov.create_owned_with_volatility(
+            String::from(r"\registry\machine\software\shadow"),
+            false,
+        );
+        assert!(created);
+        assert_eq!(ov.is_volatile(shadow), Some(false));
+        assert_eq!(ov.volatile_len(), 0);
+        assert_eq!(ov.nonvolatile_shadow_len(), 1);
+
+        let (again, created_again) =
+            ov.create_with_volatility(r"\registry\machine\software\shadow", true);
+        assert_eq!(again, shadow);
+        assert!(!created_again);
+        assert_eq!(
+            ov.is_volatile(again),
+            Some(false),
+            "reopening an implicit shadow with REG_OPTION_VOLATILE must not reclassify it"
+        );
+    }
+
+    #[test]
     fn reattached_overlay_slot_gets_new_volatility() {
         let mut ov = RegistryOverlay::new();
         let (idx, created) = ov.create_with_volatility(r"\registry\user\s-1-5-21-1", false);

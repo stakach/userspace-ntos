@@ -5186,7 +5186,7 @@ impl ExecNtHandler {
             return Err(0xC000_009A);
         }
         let canon = self.overlay_canon(&path);
-        let (index, _) = self.overlay.create_owned(canon);
+        let (index, _) = self.overlay.create_owned_with_volatility(canon, false);
         if !self.overlay.set_key_security_descriptor(index, descriptor) {
             return Err(0xC000_0008);
         }
@@ -18918,7 +18918,7 @@ impl ExecNtHandler {
                         Ok(path) => alloc::string::String::from(path),
                         Err(_) => return 0xC000_0033,
                     };
-                    let (index, _) = self.overlay.create_owned(path);
+                    let (index, _) = self.overlay.create_owned_with_volatility(path, false);
                     index
                 };
                 if !self
