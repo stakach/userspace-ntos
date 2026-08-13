@@ -1971,7 +1971,7 @@ enum HostedThreadResumeMode {
 
 #[derive(Clone, Copy)]
 struct HostedThreadSpawnSpec {
-    owner_leaf: &'static [u8],
+    owner_role: nt_exe_image::HostedProcessRole,
     teb: u64,
     badge: u64,
     role: HostedThreadRole,
@@ -1987,7 +1987,7 @@ fn hosted_multiplexed_thread_spawn_for(
 ) -> Option<HostedThreadSpawnSpec> {
     match request {
         HostedThreadSpawnRequest::ServicesListener => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"services.exe",
+            owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
             teb: SVC_LISTENER_TEB_VA,
             badge: SVC_LISTENER_BADGE,
             role: HostedThreadRole::ServicesListener,
@@ -1998,7 +1998,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_suffix: b" (runs into the main multiplex, badge 7)\n",
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 0 } => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"lsass.exe",
+            owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER_TEB_VA,
             badge: LSASS_LISTENER_BADGE,
             role: HostedThreadRole::LsassListener,
@@ -2009,7 +2009,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_suffix: b" (runs into the main multiplex, badge 9)\n",
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 1 } => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"lsass.exe",
+            owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER2_TEB_VA,
             badge: LSASS_LISTENER2_BADGE,
             role: HostedThreadRole::LsassListener2,
@@ -2020,7 +2020,7 @@ fn hosted_multiplexed_thread_spawn_for(
             spawned_suffix: b" (runs into the main multiplex, badge 10)\n",
         }),
         HostedThreadSpawnRequest::LsassListener { slot: 2 } => Some(HostedThreadSpawnSpec {
-            owner_leaf: b"lsass.exe",
+            owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
             teb: LSASS_LISTENER3_TEB_VA,
             badge: LSASS_LISTENER3_BADGE,
             role: HostedThreadRole::LsassListener3,
@@ -18173,7 +18173,7 @@ unsafe fn spawn_requested_multiplexed_thread(
     caller_sp: u64,
     fault_ep: u64,
 ) {
-    let (owner_pi, cid_proc, pml4) = live_process_context(nt_handler, procs, spec.owner_leaf)
+    let (owner_pi, cid_proc, pml4) = live_process_context_for_role(nt_handler, procs, spec.owner_role)
         .expect("hosted EPROCESS missing before multiplexed thread spawn");
     let Some(tid) = nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) else {
         print_str(b"[thread-life] missing reserved runtime role before spawn\n");
@@ -18655,6 +18655,22 @@ fn live_process_context(
     Some((
         pi,
         nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+        procs[pi].pml4,
+    ))
+}
+
+#[inline]
+fn live_process_context_for_role(
+    nt_handler: &ExecNtHandler,
+    procs: &[ProcExec; MAX_PI],
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<(usize, u64, u64)> {
+    let pi = hosted_pi_for_role(nt_handler, role)?;
+    let pid = nt_handler.pm_pid_for_pi(pi)?;
+    nt_handler.pm.process(pid)?;
+    Some((
+        pi,
+        pid as u64,
         procs[pi].pml4,
     ))
 }
