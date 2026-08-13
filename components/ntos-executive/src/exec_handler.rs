@@ -1925,18 +1925,21 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
 
 struct BootstrapProcessManagerSeed {
     pm: nt_process::ProcessManager,
-    pids: [nt_process::ProcessId; 3],
-    main_tids: [nt_process::ThreadId; 3],
-    pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3],
+    pids: [nt_process::ProcessId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
+    main_tids: [nt_process::ThreadId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
+    pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT],
 }
 
 #[inline(never)]
 fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     let mut pm = nt_process::ProcessManager::new();
-    let mut bootstrap_pids: [nt_process::ProcessId; 3] = [0; 3];
-    let mut bootstrap_main_tids: [nt_process::ThreadId; 3] = [0; 3];
-    let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; 3] =
-        [[0; PM_RUNTIME_THREAD_SLOTS]; 3];
+    let mut bootstrap_pids: [nt_process::ProcessId; HOSTED_PROCESS_MANAGER_SEED_COUNT] =
+        [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
+    let mut bootstrap_main_tids: [nt_process::ThreadId; HOSTED_PROCESS_MANAGER_SEED_COUNT] =
+        [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
+    let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS];
+        HOSTED_PROCESS_MANAGER_SEED_COUNT] =
+        [[0; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT];
 
     pm.reserve_modules(64);
     pm.reserve_process_capacity(MAX_PI);
@@ -1955,10 +1958,16 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     PM_HANDLE_CAP_MAX.store(0, Ordering::Relaxed);
     PM_HANDLE_CAP_GROWTHS.store(0, Ordering::Relaxed);
 
-    let smss_pid = pm.create_process("smss.exe", None, None);
-    let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
-    let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
-    bootstrap_pids.copy_from_slice(&[smss_pid, csrss_pid, winlogon_pid]);
+    for pi in 0..HOSTED_PROCESS_MANAGER_SEED_COUNT {
+        let image =
+            hosted_process_manager_seed_image(pi).expect("bootstrap PM seed index is bounded");
+        let parent = if pi == 0 {
+            None
+        } else {
+            Some(bootstrap_pids[0])
+        };
+        bootstrap_pids[pi] = pm.create_process(image.process_name, parent, None);
+    }
     for &pid in &bootstrap_pids {
         pm.reserve_process_threads(pid, 1 + PM_RUNTIME_THREAD_SLOTS);
     }

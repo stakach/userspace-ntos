@@ -995,8 +995,8 @@ before unrelated executive traffic monopolises the receive loop.
   spawning, post-LSA fault containment, LSASS pipe attribution, shell COM routing, and executive
   fault summaries now resolve process identity by hosted role instead of executable leaf names.
   SM/CSR rendezvous CID publication also derives SMSS/CSRSS identity from hosted roles. Remaining
-  name-scoped uses should be limited to requested image admission, diagnostics, historical boot
-  roots, or explicit user-shell proof gates.
+  name-scoped uses should be limited to requested image admission, diagnostics, bootstrap manifest
+  data, or explicit user-shell proof gates.
 - `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
 
@@ -4687,6 +4687,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the hosted-process catalog rather than executable-name matching. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  A4 bootstrap ProcessManager manifest cleanup (2026-08-13): the initial SMSS/CSRSS/winlogon
+  ProcessManager seed no longer hardcodes `create_process("smss.exe")`, `create_process("csrss.exe")`,
+  or `create_process("winlogon.exe")` in `ExecNtHandler`. `hosted_bootstrap.rs` now exposes the
+  first three hosted images as the ProcessManager seed set, and the executive creates those initial
+  EPROCESS/ETHREAD records from the manifest's process name, role, PI, and parent relationship. The
+  boot order is unchanged, but the source of truth is now the hosted bootstrap catalog instead of a
+  second string list. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
   D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found
   that `NtDeleteValueKey` could still fall through to `STATUS_NOT_IMPLEMENTED` after resolving a

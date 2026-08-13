@@ -134,9 +134,24 @@ const HOSTED_BOOTSTRAP_MANIFEST: [HostedBootstrapManifestEntry; 6] = [
 ];
 
 pub(crate) const HOSTED_BOOTSTRAP_LOAD_COUNT: usize = HOSTED_BOOTSTRAP_MANIFEST.len();
+pub(crate) const HOSTED_PROCESS_MANAGER_SEED_COUNT: usize = 3;
 
 pub(crate) fn smss_bootstrap_image() -> nt_exe_image::HostedProcessImageRef<'static> {
     SMSS_BOOTSTRAP_MANIFEST.image(0)
+}
+
+pub(crate) fn hosted_process_manager_seed_image(
+    index: usize,
+) -> Option<nt_exe_image::HostedProcessImageRef<'static>> {
+    if index == 0 {
+        Some(smss_bootstrap_image())
+    } else {
+        HOSTED_BOOTSTRAP_MANIFEST
+            .get(index - 1)
+            .copied()
+            .map(|entry| entry.image(index))
+    }
+    .filter(|image| index < HOSTED_PROCESS_MANAGER_SEED_COUNT && image.pi == index)
 }
 
 pub(crate) fn hosted_bootstrap_load_spec(index: usize) -> Option<HostedBootstrapLoadSpec> {
