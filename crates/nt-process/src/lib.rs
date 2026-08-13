@@ -1045,6 +1045,12 @@ impl ProcessManager {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub fn set_process_session_id(&mut self, pid: ProcessId, session_id: u32) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.session_id = session_id;
+        Ok(())
+    }
+
     pub fn set_process_priority_class(
         &mut self,
         pid: ProcessId,

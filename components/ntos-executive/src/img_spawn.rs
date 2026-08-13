@@ -352,6 +352,10 @@ pub(crate) unsafe fn spawn_pe_thread(
         (env_scratch + 0x1000 + 0xb8) as *mut u32,
         SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u32,
     );
+    core::ptr::write_volatile(
+        (env_scratch + 0x1000 + 0xbc) as *mut u32,
+        NT_GLOBAL_FLAG.load(Ordering::Relaxed),
+    );
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x118) as *mut u32, 6);
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x11c) as *mut u32, 1);
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x120) as *mut u16, 7601);
@@ -757,6 +761,10 @@ pub(crate) unsafe fn spawn_sec_image(
         zero_scratch_page(scr + 0x1000);
         core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
+        core::ptr::write_volatile(
+            (scr + 0x1000 + 0xBC) as *mut u32,
+            NT_GLOBAL_FLAG.load(Ordering::Relaxed),
+        );
         // Heap process-list array (what LdrpInitializeProcess sets up before the first
         // RtlCreateHeap). Without it RtlpAddHeapToProcessList (heapuser.c:38) hits
         // `NumberOfHeaps == MaximumNumberOfHeaps` (0 == 0) → ASSERT(FALSE) and, since we answer

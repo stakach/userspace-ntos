@@ -7,16 +7,21 @@ pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 pub const SYSTEM_FLAGS_INFORMATION_CLASS: u32 = 9;
 pub const SYSTEM_MODULE_INFORMATION_CLASS: u32 = 11;
+pub const SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_CLASS: u32 = 38;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS: u32 = 44;
+pub const SYSTEM_SESSION_CREATE_CLASS: u32 = 47;
+pub const SYSTEM_SESSION_DETACH_CLASS: u32 = 48;
 
 pub const SYSTEM_BASIC_INFORMATION_SIZE: usize = 0x40;
 pub const SYSTEM_PROCESSOR_INFORMATION_SIZE: usize = 0x0c;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 0x30;
 pub const SYSTEM_FLAGS_INFORMATION_SIZE: usize = 0x04;
+pub const SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_SIZE: usize = 0x10;
 pub const RTL_PROCESS_MODULES_HEADER_SIZE: usize = 0x08;
 pub const RTL_PROCESS_MODULE_INFORMATION_SIZE: usize = 0x128;
 pub const RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE: usize = 256;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE: usize = 0xac;
+pub const SYSTEM_SESSION_ID_INFORMATION_SIZE: usize = 0x04;
 
 pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 
@@ -384,6 +389,21 @@ pub struct QueryError {
     pub return_length: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemSetInformationKind {
+    Flags,
+    ExtendServiceTable,
+    CurrentTimeZone,
+    SessionCreate,
+    SessionDetach,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetPlan {
+    pub kind: SystemSetInformationKind,
+    pub copy_length: usize,
+}
+
 /// Applies the ReactOS NT5 query-size rules after the generic syscall buffer probe.
 pub fn query_plan(class: u32, buffer_length: usize) -> Result<QueryPlan, QueryError> {
     match class {
@@ -465,6 +485,56 @@ pub fn set_current_time_zone_plan(buffer_length: usize) -> Result<usize, u32> {
         Err(STATUS_INFO_LENGTH_MISMATCH)
     } else {
         Ok(SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE)
+    }
+}
+
+/// Applies the ReactOS NT5 set-size rules for the system-information classes we implement.
+pub fn set_plan(class: u32, buffer_length: usize) -> Result<SetPlan, u32> {
+    match class {
+        SYSTEM_FLAGS_INFORMATION_CLASS => {
+            if buffer_length != SYSTEM_FLAGS_INFORMATION_SIZE {
+                return Err(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            Ok(SetPlan {
+                kind: SystemSetInformationKind::Flags,
+                copy_length: SYSTEM_FLAGS_INFORMATION_SIZE,
+            })
+        }
+        SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_CLASS => {
+            if buffer_length != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_SIZE {
+                return Err(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            Ok(SetPlan {
+                kind: SystemSetInformationKind::ExtendServiceTable,
+                copy_length: SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_SIZE,
+            })
+        }
+        SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS => {
+            let copy_length = set_current_time_zone_plan(buffer_length)?;
+            Ok(SetPlan {
+                kind: SystemSetInformationKind::CurrentTimeZone,
+                copy_length,
+            })
+        }
+        SYSTEM_SESSION_CREATE_CLASS => {
+            if buffer_length != SYSTEM_SESSION_ID_INFORMATION_SIZE {
+                return Err(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            Ok(SetPlan {
+                kind: SystemSetInformationKind::SessionCreate,
+                copy_length: SYSTEM_SESSION_ID_INFORMATION_SIZE,
+            })
+        }
+        SYSTEM_SESSION_DETACH_CLASS => {
+            if buffer_length != SYSTEM_SESSION_ID_INFORMATION_SIZE {
+                return Err(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            Ok(SetPlan {
+                kind: SystemSetInformationKind::SessionDetach,
+                copy_length: SYSTEM_SESSION_ID_INFORMATION_SIZE,
+            })
+        }
+        _ => Err(STATUS_INVALID_INFO_CLASS),
     }
 }
 
@@ -638,6 +708,10 @@ mod tests {
             let error = query_plan(SYSTEM_FLAGS_INFORMATION_CLASS, length).unwrap_err();
             assert_eq!(error.status, STATUS_INFO_LENGTH_MISMATCH);
             assert_eq!(error.return_length, SYSTEM_FLAGS_INFORMATION_SIZE as u32);
+            assert_eq!(
+                set_plan(SYSTEM_FLAGS_INFORMATION_CLASS, length),
+                Err(STATUS_INFO_LENGTH_MISMATCH)
+            );
         }
         let plan = query_plan(
             SYSTEM_FLAGS_INFORMATION_CLASS,
@@ -647,6 +721,13 @@ mod tests {
         assert_eq!(plan.kind, SystemInformationKind::Flags);
         assert_eq!(plan.copy_length, SYSTEM_FLAGS_INFORMATION_SIZE);
         assert_eq!(plan.return_length, SYSTEM_FLAGS_INFORMATION_SIZE as u32);
+        let set = set_plan(
+            SYSTEM_FLAGS_INFORMATION_CLASS,
+            SYSTEM_FLAGS_INFORMATION_SIZE,
+        )
+        .unwrap();
+        assert_eq!(set.kind, SystemSetInformationKind::Flags);
+        assert_eq!(set.copy_length, SYSTEM_FLAGS_INFORMATION_SIZE);
         assert_eq!(
             SystemFlagsInformation { flags: 0x200 }.encode(),
             0x200u32.to_le_bytes()
@@ -673,6 +754,50 @@ mod tests {
         }
         assert_eq!(set_current_time_zone_plan(172), Ok(172));
         assert_eq!(set_current_time_zone_plan(173), Ok(172));
+        let set = set_plan(SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS, 173).unwrap();
+        assert_eq!(set.kind, SystemSetInformationKind::CurrentTimeZone);
+        assert_eq!(set.copy_length, SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE);
+    }
+
+    #[test]
+    fn session_and_service_table_set_classes_use_reactos_length_rules() {
+        for class in [
+            SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_CLASS,
+            SYSTEM_SESSION_CREATE_CLASS,
+            SYSTEM_SESSION_DETACH_CLASS,
+        ] {
+            assert_eq!(set_plan(class, 0), Err(STATUS_INFO_LENGTH_MISMATCH));
+        }
+
+        let service_table = set_plan(
+            SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_CLASS,
+            SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_SIZE,
+        )
+        .unwrap();
+        assert_eq!(
+            service_table.kind,
+            SystemSetInformationKind::ExtendServiceTable
+        );
+        assert_eq!(
+            service_table.copy_length,
+            SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION_SIZE
+        );
+
+        let create = set_plan(
+            SYSTEM_SESSION_CREATE_CLASS,
+            SYSTEM_SESSION_ID_INFORMATION_SIZE,
+        )
+        .unwrap();
+        assert_eq!(create.kind, SystemSetInformationKind::SessionCreate);
+        assert_eq!(create.copy_length, SYSTEM_SESSION_ID_INFORMATION_SIZE);
+
+        let detach = set_plan(
+            SYSTEM_SESSION_DETACH_CLASS,
+            SYSTEM_SESSION_ID_INFORMATION_SIZE,
+        )
+        .unwrap();
+        assert_eq!(detach.kind, SystemSetInformationKind::SessionDetach);
+        assert_eq!(detach.copy_length, SYSTEM_SESSION_ID_INFORMATION_SIZE);
     }
 
     #[test]
@@ -681,6 +806,7 @@ mod tests {
             query_plan(u32::MAX, 0).unwrap_err().status,
             STATUS_INVALID_INFO_CLASS
         );
+        assert_eq!(set_plan(u32::MAX, 0), Err(STATUS_INVALID_INFO_CLASS));
     }
 
     #[test]

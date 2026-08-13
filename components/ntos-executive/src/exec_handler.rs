@@ -21393,9 +21393,7 @@ impl ExecNtHandler {
                             != effective.bias_100ns as u64
                             || SYSTEM_TIME_ZONE_ID.load(Ordering::Relaxed) != effective.id
                         {
-                            unsafe {
-                                publish_time_zone(&self.time_zone_information, current_time)
-                            };
+                            publish_time_zone(&self.time_zone_information, current_time);
                         }
                         let output = SystemTimeOfDayInformation {
                             boot_time_100ns: NT_SYSTEM_TIME_BOOT_100NS,
@@ -21407,7 +21405,10 @@ impl ExecNtHandler {
                         self.xas_try_write_buf(buf, &output[..plan.copy_length])
                     }
                     SystemInformationKind::Flags => {
-                        let output = SystemFlagsInformation { flags: 0 }.encode();
+                        let output = SystemFlagsInformation {
+                            flags: NT_GLOBAL_FLAG.load(Ordering::Relaxed),
+                        }
+                        .encode();
                         self.xas_try_write_buf(buf, &output)
                     }
                     SystemInformationKind::CurrentTimeZone => {
@@ -23696,48 +23697,127 @@ impl ExecNtHandler {
             },
             NativeService::NtSetSystemInformation => unsafe {
                 use nt_syscall::system_information::{
-                    set_current_time_zone_plan, SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
+                    set_plan, SystemSetInformationKind,
                     SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE,
                 };
 
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
                 let class = args[0] as u32;
-                if class != SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS {
-                    return 0;
-                }
                 let buffer = args[1];
                 let length = args[2] as u32 as usize;
-                if length != 0 && buffer & 3 != 0 {
-                    return STATUS_DATATYPE_MISALIGNMENT;
-                }
-                if length != 0 {
-                    let Some(last) = buffer.checked_add(length as u64 - 1) else {
-                        return STATUS_ACCESS_VIOLATION;
-                    };
-                    if last > 0x0000_07ff_fffe_ffff {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                }
-                let copy_length = match set_current_time_zone_plan(length) {
-                    Ok(copy_length) => copy_length,
+                let plan = match set_plan(class, length) {
+                    Ok(plan) => plan,
                     Err(status) => return status,
                 };
-                let mut encoded = [0u8; SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE];
-                if copy_length != encoded.len() || !self.xas_read(buffer, &mut encoded) {
-                    return STATUS_ACCESS_VIOLATION;
+
+                match plan.kind {
+                    SystemSetInformationKind::Flags => {
+                        if buffer & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut encoded = [0u8; 4];
+                        if buffer == 0 || !self.xas_read(buffer, &mut encoded) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        NT_GLOBAL_FLAG.store(u32::from_le_bytes(encoded), Ordering::Relaxed);
+                        0
+                    }
+                    SystemSetInformationKind::ExtendServiceTable => {
+                        let image_name = match self.read_unicode_string16(buffer) {
+                            Ok(units) => utf16_units_to_string(&units),
+                            Err(status) => return status,
+                        };
+                        if !image_name.eq_ignore_ascii_case(r"\SystemRoot\System32\win32k.sys") {
+                            return STATUS_PRIVILEGE_NOT_HELD;
+                        }
+                        if win32k_subsystem::registered_win32k_service_metadata().is_some() {
+                            0
+                        } else {
+                            STATUS_UNSUCCESSFUL
+                        }
+                    }
+                    SystemSetInformationKind::CurrentTimeZone => {
+                        if buffer & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut encoded = [0u8; SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE];
+                        if plan.copy_length != encoded.len()
+                            || buffer == 0
+                            || !self.xas_read(buffer, &mut encoded)
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        let Some(information) =
+                            nt_kernel_exec::timezone::TimeZoneInformation::decode_prefix(&encoded)
+                        else {
+                            return 0xC000_0004;
+                        };
+                        self.time_zone_information = information;
+                        // The hosted clock is already UTC-backed, so changing timezone metadata
+                        // does not retime a local CMOS clock. Publish the new bias/id to every
+                        // KUSER page instead.
+                        publish_time_zone(&self.time_zone_information, nt_system_time_100ns());
+                        0
+                    }
+                    SystemSetInformationKind::SessionCreate => {
+                        if buffer & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        if buffer == 0 || !self.probe_user_output(buffer, plan.copy_length) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                            return STATUS_INVALID_HANDLE;
+                        };
+                        let session_id = SYSTEM_SESSION_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                        if session_id == 0 {
+                            return STATUS_INSUFFICIENT_RESOURCES;
+                        }
+                        if !self.xas_try_write_buf(buffer, &session_id.to_le_bytes()) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        if let Err(status) = self.pm.set_process_session_id(pid, session_id) {
+                            return status;
+                        }
+                        if session_id < u64::BITS {
+                            SYSTEM_SESSION_ACTIVE_MASK
+                                .fetch_or(1u64 << session_id, Ordering::Relaxed);
+                        }
+                        0
+                    }
+                    SystemSetInformationKind::SessionDetach => {
+                        if buffer & 3 != 0 {
+                            return STATUS_DATATYPE_MISALIGNMENT;
+                        }
+                        let mut encoded = [0u8; 4];
+                        if buffer == 0 || !self.xas_read(buffer, &mut encoded) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        let session_id = u32::from_le_bytes(encoded);
+                        let was_active = if session_id < u64::BITS {
+                            let bit = 1u64 << session_id;
+                            SYSTEM_SESSION_ACTIVE_MASK.fetch_and(!bit, Ordering::Relaxed) & bit != 0
+                        } else {
+                            false
+                        };
+                        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                            return STATUS_INVALID_HANDLE;
+                        };
+                        let current_session = self
+                            .pm
+                            .process(pid)
+                            .map(|process| process.session_id)
+                            .unwrap_or(0);
+                        if current_session != session_id && !was_active {
+                            return STATUS_INVALID_PARAMETER;
+                        }
+                        match self.pm.set_process_session_id(pid, 0) {
+                            Ok(()) => 0,
+                            Err(status) => status,
+                        }
+                    }
                 }
-                let Some(information) =
-                    nt_kernel_exec::timezone::TimeZoneInformation::decode_prefix(&encoded)
-                else {
-                    return 0xC000_0004;
-                };
-                self.time_zone_information = information;
-                // The hosted clock is already UTC-backed, so changing timezone metadata does not
-                // retime a local CMOS clock. Publish the new bias/id to every KUSER page instead.
-                unsafe { publish_time_zone(&self.time_zone_information, nt_system_time_100ns()) };
-                0
             },
             NativeService::NtFreeVirtualMemory => unsafe { self.nt_free_virtual_memory(args) },
             NativeService::NtReadVirtualMemory => unsafe {

@@ -5021,3 +5021,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   size. Validation: `cargo fmt --all`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  Native system-information set cleanup (2026-08-14): `NtSetSystemInformation` no longer returns
+  success for every class except timezone. `nt-syscall` now owns host-tested NT5 set-size planning
+  for `SystemFlagsInformation`, `SystemExtendServiceTableInformation`,
+  `SystemCurrentTimeZoneInformation`, `SystemSessionCreate`, and `SystemSessionDetach`; unsupported
+  classes return `STATUS_INVALID_INFO_CLASS`. The executive persists `NtGlobalFlag`, returns it from
+  `NtQuerySystemInformation(SystemFlagsInformation)`, and seeds new hosted PEBs from that live
+  value. Session create/detach now allocate real session IDs and mutate ProcessManager session state
+  so child processes inherit the attached session. `SystemExtendServiceTableInformation` validates
+  the ReactOS win32k image name and succeeds only after win32k has published real
+  `KeAddSystemServiceTable` SSDT metadata; otherwise it fails visibly instead of acting as a loader
+  placeholder. Validation: `cargo fmt --all`, `cargo test -p nt-syscall`,
+  `cargo test -p nt-process`, `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.

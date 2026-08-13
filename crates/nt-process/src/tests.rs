@@ -1210,6 +1210,24 @@ fn process_query_classes_use_access_checked_state_and_real_times() {
         pm.query_process_session_id(caller, denied as u64),
         Err(STATUS_ACCESS_DENIED)
     );
+    pm.set_process_session_id(target, 3).unwrap();
+    assert_eq!(pm.query_process_session_id(caller, handle as u64), Ok(3));
+    let session_child = pm.create_process("session-child.exe", Some(target), None);
+    let session_child_handle = pm
+        .insert_handle(
+            caller,
+            HandleObject::Process(session_child),
+            PROCESS_QUERY_INFORMATION,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.query_process_session_id(caller, session_child_handle as u64),
+        Ok(3)
+    );
+    assert_eq!(
+        pm.set_process_session_id(0xffff_ffff, 1),
+        Err(STATUS_INVALID_HANDLE)
+    );
     pm.set_process_priority_class(target, PROCESS_PRIORITY_CLASS_ABOVE_NORMAL)
         .unwrap();
     assert_eq!(

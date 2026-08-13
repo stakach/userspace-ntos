@@ -1031,7 +1031,7 @@ static TRANSPORT_IRP_ROUNDTRIP: AtomicBool = AtomicBool::new(false);
 /// driver's assertion is SKIPPED — the historical behaviour. See [`driver_launch::s_ke_bug_check_ex`].
 pub const KEBUGCHECK_BOUND: bool = true;
 /// NtSetSystemInformation — smss sets system-wide config in SmpInit (priority separation, etc.).
-/// We don't model system-info classes → no-op success so bring-up proceeds.
+/// Implemented classes are backed by live executive state; unsupported classes fail visibly.
 pub const SSN_NT_SET_SYSTEM_INFORMATION: u64 = 249;
 /// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
 /// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
@@ -1196,6 +1196,9 @@ pub const PEB_VA: u64 = 0x0000_0100_0058_0000;
 pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
 static SYSTEM_TIME_ZONE_BIAS_100NS: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_TIME_ZONE_ID: AtomicU32 = AtomicU32::new(0);
+static NT_GLOBAL_FLAG: AtomicU32 = AtomicU32::new(0);
+static SYSTEM_SESSION_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static SYSTEM_SESSION_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
 pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 /// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is
 /// resolved to point here, so the PE calls named ntdll functions like real Windows code.
