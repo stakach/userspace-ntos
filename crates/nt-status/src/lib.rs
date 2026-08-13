@@ -103,6 +103,8 @@ statuses! {
     INVALID_DEVICE_REQUEST = 0xC000_0010u32;
     /// The request was cancelled.
     CANCELLED = 0xC000_0120u32;
+    /// The target device/service exists but is not ready to accept requests.
+    DEVICE_NOT_READY = 0xC000_00A3u32;
     /// The device is not connected (e.g. the owning driver peer faulted).
     DEVICE_NOT_CONNECTED = 0xC000_009Du32;
     /// The file has been closed.

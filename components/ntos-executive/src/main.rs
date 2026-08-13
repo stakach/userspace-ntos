@@ -12401,7 +12401,7 @@ pub(crate) unsafe fn object_manager_create_driver_path(
 ) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client
         .create_driver(path, owner_component, owner_local_id, true)
         .map(|id| id.0)
@@ -12414,7 +12414,7 @@ pub(crate) unsafe fn object_manager_create_device_path(
 ) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client
         .create_device(path, owner_component, owner_local_id, true)
         .map(|id| id.0)
@@ -12423,14 +12423,14 @@ pub(crate) unsafe fn object_manager_create_device_path(
 pub(crate) unsafe fn object_manager_delete_path(path: &str) -> Result<(), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client.delete_object(path, true)
 }
 
 pub(crate) unsafe fn object_manager_lookup_path(path: &str) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client.lookup(path, true).map(|id| id.0)
 }
 
@@ -12440,7 +12440,7 @@ pub(crate) unsafe fn object_manager_create_symbolic_link_path(
 ) -> Result<(), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client.create_symbolic_link(link, target, true).map(|_| ())
 }
 
@@ -12458,7 +12458,7 @@ pub(crate) unsafe fn object_manager_create_file_handle(
 ) -> Result<(u64, u64), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client
         .create_file_handle(
             owner_component,
@@ -12475,7 +12475,7 @@ pub(crate) unsafe fn object_manager_reference_file_handle(
 ) -> Result<u64, nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client
         .reference_file_handle(handle, desired_access)
         .map(|id| id.0)
@@ -12486,7 +12486,7 @@ pub(crate) unsafe fn object_manager_close_handle(
 ) -> Result<(), nt_status::NtStatus> {
     let client = OBJECT_CLIENT_PTR
         .as_mut()
-        .ok_or(nt_status::NtStatus::NOT_IMPLEMENTED)?;
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
     client.close_handle(handle)
 }
 
@@ -12505,7 +12505,7 @@ impl nt_config_client::Backend for CmChan<'_> {
 }
 
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
-const CONFIG_STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
     CONFIG_CLIENT_PTR = client as *mut _;
@@ -12514,7 +12514,7 @@ unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static
 pub(crate) unsafe fn config_manager_create_key(path: &str) -> Result<u64, i32> {
     let client = CONFIG_CLIENT_PTR
         .as_mut()
-        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.create_key(path)
 }
 
@@ -12532,7 +12532,7 @@ pub(crate) unsafe fn config_manager_set_dword(
 ) -> Result<(), i32> {
     let client = CONFIG_CLIENT_PTR
         .as_mut()
-        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.set_dword(key_path, name, value)
 }
 
@@ -12544,7 +12544,7 @@ pub(crate) unsafe fn config_manager_set_value(
 ) -> Result<(), i32> {
     let client = CONFIG_CLIENT_PTR
         .as_mut()
-        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.set_value(key_path, name, value_type, data)
 }
 
@@ -12555,7 +12555,7 @@ pub(crate) unsafe fn config_manager_query_value(
 ) -> Result<(u32, usize), i32> {
     let client = CONFIG_CLIENT_PTR
         .as_mut()
-        .ok_or(CONFIG_STATUS_NOT_IMPLEMENTED)?;
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.query_value(key_path, name, out)
 }
 

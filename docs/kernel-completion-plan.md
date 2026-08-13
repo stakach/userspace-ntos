@@ -4900,3 +4900,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the diagnostic counter was renamed from unsupported to invalid-target. Validation: `cargo fmt
   --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  A/B manager-transport status cleanup (2026-08-13): Object Manager and Configuration Manager client
+  wrappers no longer use `STATUS_NOT_IMPLEMENTED` when their service transport has not been installed.
+  `nt-status` now names `STATUS_DEVICE_NOT_READY`, and the executive reports that concrete service
+  readiness failure for missing Object/Config manager clients while preserving real service-returned
+  statuses once the clients are installed. Validation: `cargo fmt --all`,
+  `cargo test -p nt-status --quiet`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
