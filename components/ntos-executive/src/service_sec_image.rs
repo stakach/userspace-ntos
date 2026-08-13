@@ -1753,12 +1753,6 @@ fn hosted_pi_has_role(
     nt_handler.hosted_process_role(pi) == Some(role)
 }
 
-fn hosted_pi_has_leaf(nt_handler: &ExecNtHandler, pi: usize, leaf: &[u8]) -> bool {
-    nt_handler
-        .hosted_process_leaf(pi)
-        .is_some_and(|process_leaf| process_leaf.eq_ignore_ascii_case(leaf))
-}
-
 fn hosted_main_badge_has_role(
     nt_handler: &ExecNtHandler,
     badge: u64,
@@ -1777,11 +1771,6 @@ fn hosted_owner_has_role(
     hosted_main_badge_has_role(nt_handler, owner, role)
 }
 
-fn hosted_main_badge_has_leaf(nt_handler: &ExecNtHandler, badge: u64, leaf: &[u8]) -> bool {
-    hosted_pi_for_top_badge(nt_handler, badge)
-        .is_some_and(|pi| hosted_pi_has_leaf(nt_handler, pi, leaf))
-}
-
 fn hosted_pi_for_mechanism_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
     if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
         return Some(pi);
@@ -1789,21 +1778,18 @@ fn hosted_pi_for_mechanism_badge(nt_handler: &ExecNtHandler, badge: u64) -> Opti
     hosted_pi_for_top_badge(nt_handler, badge)
 }
 
-fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
-    let target_leaf = nt_exe_image::canonical_exe_leaf(leaf)?;
+fn live_hosted_pi_for_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<usize> {
     for pi in 0..MAX_PI {
+        if nt_handler.hosted_process_role(pi) != Some(role) {
+            continue;
+        }
         let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
             continue;
         };
-        let Some(process) = nt_handler.pm.process(pid) else {
-            continue;
-        };
-        let Some(process_leaf) =
-            nt_exe_image::canonical_exe_leaf(process.image_file_name.as_bytes())
-        else {
-            continue;
-        };
-        if process_leaf.eq_ignore_ascii_case(target_leaf) {
+        if nt_handler.pm.process(pid).is_some() {
             return Some(pi);
         }
     }
@@ -1860,7 +1846,10 @@ unsafe fn dump_shell_launch_quiesce(
         && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
         && EXPLORER_IMAGE_OPEN_SUCCESSES.load(Ordering::Relaxed) == 0
     {
-        if let Some(pi) = live_hosted_pi_for_leaf(nt_handler, b"userinit.exe") {
+        if let Some(pi) = live_hosted_pi_for_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::InteractiveShellBootstrap,
+        ) {
             if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(1, Ordering::Relaxed) & 1 == 0 {
                 print_str(b"[shell-launch] userinit spawned but no shell image open attempt; pi=");
                 print_u64(pi as u64);
@@ -1888,7 +1877,10 @@ unsafe fn dump_shell_launch_quiesce(
     if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
         && EXPLORER_CREATE_WINDOW_STRING_CAPTURES.load(Ordering::Relaxed) == 0
     {
-        if let Some(pi) = live_hosted_pi_for_leaf(nt_handler, b"explorer.exe") {
+        if let Some(pi) = live_hosted_pi_for_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::InteractiveShell,
+        ) {
             if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(2, Ordering::Relaxed) & 2 == 0 {
                 print_str(
                     b"[shell-launch] explorer spawned before first captured CreateWindow string; pi=",
@@ -6270,7 +6262,11 @@ pub(crate) unsafe fn service_sec_image(
                     // `DBG_CONTINUE` replies length-0 → the faulting instruction is RETRIED.
                     continue;
                 }
-                if hosted_main_badge_has_leaf(&nt_handler, badge, b"lsass.exe")
+                if hosted_owner_has_role(
+                    &nt_handler,
+                    badge,
+                    nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+                )
                     && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                 {
                     print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
@@ -6942,7 +6938,8 @@ pub(crate) unsafe fn service_sec_image(
             // (`QueueUserWorkItem`, rpc_server.c:591) — i.e. the actual `LsarOpenPolicy` server-stub
             // dispatch. Trace it so the RPC dispatch is visible, not a black box.
             let trace_process_role = nt_handler.hosted_process_role(pi);
-            let trace_is_lsass = hosted_pi_has_leaf(&nt_handler, pi, b"lsass.exe");
+            let trace_is_lsass =
+                trace_process_role == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
             if is_tp_worker && trace_is_lsass {
                 let dn = LSA_TP_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
                 if dn < 64 {
@@ -18101,7 +18098,10 @@ pub(crate) unsafe fn service_sec_image(
     if ntdll.is_some() {
         loader_trace_dump(&reg);
     }
-    if let Some(winlogon_pi) = live_hosted_pi_for_leaf(&nt_handler, b"winlogon.exe") {
+    if let Some(winlogon_pi) = live_hosted_pi_for_role(
+        &nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveLogon,
+    ) {
         WINLOGON_FAULTS.store(procs[winlogon_pi].faults, Ordering::Relaxed);
         print_str(b"[ntos-exec] winlogon (pi ");
         print_u64(winlogon_pi as u64);
@@ -18114,7 +18114,10 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         WINLOGON_FAULTS.store(0, Ordering::Relaxed);
     }
-    if let Some(services_pi) = live_hosted_pi_for_leaf(&nt_handler, b"services.exe") {
+    if let Some(services_pi) = live_hosted_pi_for_role(
+        &nt_handler,
+        nt_exe_image::HostedProcessRole::ServiceControlManager,
+    ) {
         SERVICES_FAULTS.store(procs[services_pi].faults, Ordering::Relaxed);
         print_str(b"[ntos-exec] services (pi ");
         print_u64(services_pi as u64);
@@ -18127,7 +18130,10 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         SERVICES_FAULTS.store(0, Ordering::Relaxed);
     }
-    if let Some(lsass_pi) = live_hosted_pi_for_leaf(&nt_handler, b"lsass.exe") {
+    if let Some(lsass_pi) = live_hosted_pi_for_role(
+        &nt_handler,
+        nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+    ) {
         LSASS_FAULTS.store(procs[lsass_pi].faults, Ordering::Relaxed);
         print_str(b"[ntos-exec] lsass (pi ");
         print_u64(lsass_pi as u64);
@@ -18646,20 +18652,6 @@ fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
 }
 
 #[inline]
-fn live_process_context(
-    nt_handler: &ExecNtHandler,
-    procs: &[ProcExec; MAX_PI],
-    leaf: &[u8],
-) -> Option<(usize, u64, u64)> {
-    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
-    Some((
-        pi,
-        nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
-        procs[pi].pml4,
-    ))
-}
-
-#[inline]
 fn live_process_context_for_role(
     nt_handler: &ExecNtHandler,
     procs: &[ProcExec; MAX_PI],
@@ -18731,8 +18723,12 @@ unsafe fn spawn_requested_local_thread(
                 1 => HostedThreadRole::CsrSbApi,
                 _ => return,
             };
-            let (csrss_pi, pid, pml4) = live_process_context(nt_handler, procs, b"csrss.exe")
-                .expect("csrss.exe EPROCESS missing before CSR thread spawn");
+            let (csrss_pi, pid, pml4) = live_process_context_for_role(
+                nt_handler,
+                procs,
+                nt_exe_image::HostedProcessRole::Win32Subsystem,
+            )
+            .expect("CSRSS EPROCESS missing before CSR thread spawn");
             let Some(tid) = nt_handler.hosted_thread_tid_for_role(csrss_pi, role) else {
                 print_str(b"[csr-thread] missing reserved runtime role before spawn\n");
                 return;
@@ -18790,8 +18786,12 @@ unsafe fn spawn_requested_local_thread(
                 ),
                 _ => return,
             };
-            let (wl_pi, cid_proc, pml4) = live_process_context(nt_handler, procs, b"winlogon.exe")
-                .expect("winlogon.exe EPROCESS missing before worker spawn");
+            let (wl_pi, cid_proc, pml4) = live_process_context_for_role(
+                nt_handler,
+                procs,
+                nt_exe_image::HostedProcessRole::InteractiveLogon,
+            )
+            .expect("winlogon EPROCESS missing before worker spawn");
             let Some(tid) = nt_handler.hosted_thread_tid_for_role(wl_pi, role) else {
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
                 return;
@@ -20826,7 +20826,10 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             // `\lsarpc` to a parked reader, attributed by badge to the per-connection WORKER (the
             // bind / request it must service) or to lsass' main thread as the CLIENT (the bind_ack /
             // response that unblocks `LsaOpenPolicy`). Name-scoped via the fid->pipe-name map.
-            let lsass_pi = live_hosted_pi_for_leaf(nt_handler, b"lsass.exe");
+            let lsass_pi = live_hosted_pi_for_role(
+                nt_handler,
+                nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+            );
             if lsass_pi == Some(w.pi as usize)
                 && output.first() == Some(&5)
                 && pipe_fid_name_hash(w.file_id) == lsarpc_pipe_name_hash()

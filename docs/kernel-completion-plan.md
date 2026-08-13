@@ -991,9 +991,11 @@ before unrelated executive traffic monopolises the receive loop.
 - `[x]` A3: Route SCM start requests through generic process creation or `NtLoadDriver` based on
   service metadata.
 - `[~]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
-  the policy boundary. SCM/LSA multiplexed listener thread spawns now resolve their owner process by
-  hosted process role instead of by `services.exe`/`lsass.exe` leaf names; remaining name-scoped
-  uses should be limited to diagnostics, historical boot roots, or explicit user-shell proof gates.
+  the policy boundary. SCM/LSA multiplexed listener thread spawns, CSR/winlogon local worker
+  spawning, post-LSA fault containment, LSASS pipe attribution, shell COM routing, and executive
+  fault summaries now resolve process identity by hosted role instead of executable leaf names.
+  Remaining name-scoped uses should be limited to requested image admission, diagnostics,
+  historical boot roots, or explicit user-shell proof gates.
 - `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
 
@@ -4665,6 +4667,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   live process context is resolved by role. This keeps SCM/LSA listener startup on hosted process
   identity rather than executable-name policy. Validation: `cargo fmt --all` and `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  A4 role-owned process-control cleanup (2026-08-13): the remaining service-loop control paths that
+  still searched for hosted processes by `winlogon.exe`, `services.exe`, `lsass.exe`, `csrss.exe`,
+  `userinit.exe`, or `explorer.exe` leaves now use hosted process roles. This covers live process
+  context lookup for CSR/winlogon local worker spawns, post-LSA fault containment, LSASS TP-worker
+  tracing and pipe attribution, quiesce dumps, fault summary counters, shell COM HKCR routing, and
+  the current-process predicates in `ExecNtHandler`. Literal executable names remain only where they
+  are the image path being admitted or an explicit proof counter for the ReactOS shell path.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
   D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found
   that `NtDeleteValueKey` could still fall through to `STATUS_NOT_IMPLEMENTED` after resolving a

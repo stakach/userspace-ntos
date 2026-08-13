@@ -3669,7 +3669,7 @@ impl ExecNtHandler {
         oa: u64,
         args: &[u64],
     ) -> Option<u32> {
-        if !self.current_process_is_explorer() {
+        if !self.current_process_is_interactive_shell() {
             return None;
         }
         let name = self.effective_objattr_name(path, oa);
@@ -7328,11 +7328,6 @@ impl ExecNtHandler {
         self.current_hosted_process_role() == Some(role)
     }
 
-    fn current_process_is_hosted_leaf(&self, leaf: &[u8]) -> bool {
-        self.current_hosted_process_image()
-            .is_some_and(|image| image.leaf.eq_ignore_ascii_case(leaf))
-    }
-
     fn current_process_is_noninteractive_service(&self) -> bool {
         self.current_hosted_process_role()
             .is_some_and(nt_exe_image::HostedProcessRole::is_noninteractive_service_class)
@@ -7343,11 +7338,11 @@ impl ExecNtHandler {
     }
 
     fn current_process_is_smss(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"smss.exe")
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::NativeSession)
     }
 
     fn current_process_is_csrss(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"csrss.exe")
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::Win32Subsystem)
     }
 
     fn current_process_is_lsass(&self) -> bool {
@@ -7355,15 +7350,15 @@ impl ExecNtHandler {
     }
 
     fn current_process_is_winlogon(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"winlogon.exe")
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::InteractiveLogon)
     }
 
-    fn current_process_is_userinit(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"userinit.exe")
+    fn current_process_is_shell_bootstrap(&self) -> bool {
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
     }
 
-    fn current_process_is_explorer(&self) -> bool {
-        self.current_process_is_hosted_leaf(b"explorer.exe")
+    fn current_process_is_interactive_shell(&self) -> bool {
+        self.current_process_has_role(nt_exe_image::HostedProcessRole::InteractiveShell)
     }
 
     fn current_process_uses_pe_backed_registry_strings(&self) -> bool {
@@ -17456,7 +17451,10 @@ impl ExecNtHandler {
             }
         }
         let hosted_exe_leaf = hosted_exe_image.map(|image| image.leaf);
-        let userinit_shell_probe = if self.current_process_is_userinit() && !want_dir && !is_sxs {
+        let userinit_shell_probe = if self.current_process_is_shell_bootstrap()
+            && !want_dir
+            && !is_sxs
+        {
             if nb[..nlen].windows(8).any(|w| w == b"explorer") {
                 Some(b"explorer.exe" as &[u8])
             } else if nb[..nlen].windows(3).any(|w| w == b"cmd") {
@@ -17700,7 +17698,7 @@ impl ExecNtHandler {
             return 0xC000_0002;
         };
         let leaf = &leaf[..leaf_len];
-        if self.current_process_is_winlogon() || self.current_process_is_userinit() {
+        if self.current_process_is_winlogon() || self.current_process_is_shell_bootstrap() {
             print_str(if self.current_process_is_winlogon() {
                 b"[wl-createproc] pi=2 sect=0x" as &[u8]
             } else {
@@ -20004,7 +20002,7 @@ impl ExecNtHandler {
                 let key_is_ifeo = key_path
                     .as_deref()
                     .is_some_and(|path| path.contains(r"\image file execution options\"));
-                let shell_com_inproc_bit = if self.current_process_is_hosted_leaf(b"explorer.exe") {
+                let shell_com_inproc_bit = if self.current_process_is_interactive_shell() {
                     key_path
                         .as_deref()
                         .map_or(0, explorer_shell_com_inproc_class_bit_for_path)
