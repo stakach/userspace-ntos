@@ -23746,12 +23746,16 @@ impl ExecNtHandler {
             NativeService::NtWriteVirtualMemory => unsafe {
                 self.nt_copy_virtual_memory(args, false)
             },
-            // NtUnmapViewOfSection(ProcessHandle, BaseAddress). Generic data views are real VADs and
-            // are reclaimed through the VM map; image views still only report Dbgk unloads when the
-            // process manager has a tracked image module at that base.
+            // NtUnmapViewOfSection(ProcessHandle, BaseAddress). Generic data views are real VADs
+            // and are reclaimed through the VM map; image views clear the hosted image mapping and
+            // report Dbgk unloads only when the base names a tracked image view.
             NativeService::NtUnmapViewOfSection => unsafe {
                 const PROCESS_VM_OPERATION: u32 = 0x0008;
+                const STATUS_NOT_MAPPED_VIEW: u32 = 0xC000_0019;
                 let base = args.get(1).copied().unwrap_or(0);
+                if base > 0x0000_07ff_fffe_ffff {
+                    return STATUS_NOT_MAPPED_VIEW;
+                }
                 let (_target_pid, target_pi) =
                     match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
                         Ok(target) => target,
@@ -23830,8 +23834,7 @@ impl ExecNtHandler {
                         }
                     }
                 }
-                self.dbgk_module_unload(target_pi, base);
-                0
+                STATUS_NOT_MAPPED_VIEW
             }
             NativeService::NtTestAlert => match unsafe { self.try_deliver_current_user_apc() } {
                 Ok(true) => 0x0000_00C0,

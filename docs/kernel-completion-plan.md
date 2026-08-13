@@ -4996,3 +4996,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `MODULE_TABLE` entries. Validation: `cargo fmt --all`, `cargo test -p nt-ntdll loader`,
   `./scripts/build_ntdll_dll.sh`, `git diff --check`, and a target-side not-implemented scan showing
   no live unload placeholder remains.
+
+  Memory-manager unmap status cleanup (2026-08-14): `NtUnmapViewOfSection` no longer returns
+  success after a base misses every tracked generic data view and hosted image view. Generic section
+  views still write back dirty data, release their VAD reservation, unregister committed mappings,
+  and drop the section-view record; image views still clear DLL mapped state, unmap private/shared
+  image caps, unregister the committed image allocation, and report Dbgk unloads. A user-mode
+  kernel-space base or an unmapped user base now fails as `STATUS_NOT_MAPPED_VIEW`, matching the NT
+  section contract instead of treating Dbgk's no-event path as a successful unmap. Validation:
+  `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.
