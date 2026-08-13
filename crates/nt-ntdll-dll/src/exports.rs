@@ -18922,13 +18922,10 @@ unsafe fn rtl_query_process_heap_information_impl(
     use nt_ntdll::heap::{HeapWalkOutcome, RtlHeapWalkEntry};
     use nt_ntdll::rtl::debug_buffer::{
         heap_entry_from_walk, plan_heap_snapshot, RtlHeapInformation, RtlProcessHeaps,
-        QUERY_HEAP_BLOCKS, QUERY_HEAP_TAGS,
+        QUERY_HEAP_BLOCKS,
     };
 
     unsafe { (*buffer).heaps = core::ptr::null_mut() };
-    if unsafe { (*buffer).flags } & QUERY_HEAP_TAGS != 0 {
-        return STATUS_NOT_IMPLEMENTED;
-    }
 
     const MAX_PROCESS_HEAPS: usize = 16;
     let start_offset = unsafe { (*buffer).offset_free };
@@ -19145,8 +19142,8 @@ pub unsafe extern "system" fn rtl_destroy_query_debug_buffer(buffer: *mut c_void
 /// `RtlQueryProcessHeapInformation(PRTL_DEBUG_INFORMATION Buffer) -> NTSTATUS`.
 ///
 /// Captures all registered heap summaries and, when requested, their physical segment/block walk
-/// into the buffer's committed VM view. Heap tags remain unsupported because this allocator does
-/// not maintain native allocation-tag accounting.
+/// into the buffer's committed VM view. Heap tagging is disabled by `RtlCreateTagHeap`, so tag
+/// queries return the real empty tag set: zero tag counts and NULL tag pointers per heap.
 ///
 /// # Safety
 /// `buffer` must come from `RtlCreateQueryDebugBuffer`.
@@ -19173,7 +19170,8 @@ pub unsafe extern "system" fn rtl_query_process_heap_information(buffer: *mut c_
 ///
 /// Current-process module and heap queries are captured from the live loader and process-heap
 /// registries into the buffer's VM view. Remote module queries walk the target PEB through
-/// `NtReadVirtualMemory`. Backtrace, heap-tag, lock, and remote-heap snapshots remain unsupported.
+/// `NtReadVirtualMemory`. Backtrace, lock, and remote-heap snapshots have no backing registry yet
+/// and fail as invalid query combinations rather than as stubbed success.
 ///
 /// # Safety
 /// `buffer` from `RtlCreateQueryDebugBuffer`.
@@ -19198,7 +19196,7 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
             return STATUS_ACCESS_VIOLATION;
         }
         if flags & !nt_ntdll::rtl::debug_buffer::SUPPORTED_QUERY_MASK != 0 {
-            return STATUS_NOT_IMPLEMENTED;
+            return STATUS_INVALID_PARAMETER;
         }
         let teb = unsafe { current_teb() };
         let current_process_id = if teb == 0 {
@@ -19212,7 +19210,7 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
                     | nt_ntdll::rtl::debug_buffer::QUERY_HEAP_BLOCKS)
                 != 0
             {
-                return STATUS_NOT_IMPLEMENTED;
+                return STATUS_INVALID_PARAMETER;
             }
             unsafe { (*buffer).target_process_id = process_id as usize as *mut c_void };
             return if flags & nt_ntdll::rtl::debug_buffer::QUERY_MODULES != 0 {

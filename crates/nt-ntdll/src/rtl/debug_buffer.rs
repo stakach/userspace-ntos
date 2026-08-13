@@ -12,10 +12,13 @@ pub const DEBUG_INFORMATION_SIZE: usize = 0xd0;
 pub const DEFAULT_VIEW_SIZE: usize = 0x400000;
 pub const PAGE_SIZE: usize = 0x1000;
 pub const QUERY_MODULES: u32 = 0x01;
+pub const QUERY_BACKTRACES: u32 = 0x02;
 pub const QUERY_HEAPS: u32 = 0x04;
 pub const QUERY_HEAP_TAGS: u32 = 0x08;
 pub const QUERY_HEAP_BLOCKS: u32 = 0x10;
-pub const SUPPORTED_QUERY_MASK: u32 = QUERY_MODULES | QUERY_HEAPS | QUERY_HEAP_BLOCKS;
+pub const QUERY_LOCKS: u32 = 0x20;
+pub const SUPPORTED_QUERY_MASK: u32 =
+    QUERY_MODULES | QUERY_HEAPS | QUERY_HEAP_TAGS | QUERY_HEAP_BLOCKS;
 pub const RTL_PROCESS_MODULES_HEADER_SIZE: usize = 0x08;
 pub const RTL_PROCESS_MODULE_INFORMATION_SIZE: usize = 0x128;
 pub const REMOTE_MODULE_LIMIT: usize = 4096;
@@ -736,6 +739,21 @@ mod tests {
         assert_eq!(core::mem::offset_of!(DebugInformation, offset_free), 0x48);
         assert_eq!(core::mem::offset_of!(DebugInformation, modules), 0x60);
         assert_eq!(core::mem::offset_of!(DebugInformation, reserved), 0xb0);
+    }
+
+    #[test]
+    fn debug_query_mask_tracks_only_backed_sources() {
+        assert_eq!(QUERY_MODULES, 0x01);
+        assert_eq!(QUERY_BACKTRACES, 0x02);
+        assert_eq!(QUERY_HEAPS, 0x04);
+        assert_eq!(QUERY_HEAP_TAGS, 0x08);
+        assert_eq!(QUERY_HEAP_BLOCKS, 0x10);
+        assert_eq!(QUERY_LOCKS, 0x20);
+        assert_eq!(
+            SUPPORTED_QUERY_MASK,
+            QUERY_MODULES | QUERY_HEAPS | QUERY_HEAP_TAGS | QUERY_HEAP_BLOCKS
+        );
+        assert_eq!(SUPPORTED_QUERY_MASK & (QUERY_BACKTRACES | QUERY_LOCKS), 0);
     }
 
     #[test]

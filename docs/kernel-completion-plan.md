@@ -4812,3 +4812,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   it in RTL. Validation: `cargo fmt --all` and `./scripts/build_ntdll_dll.sh` (PE32+ parse,
   complete Nt/Zw export ABI, `LdrpInitialize`, callback exports, and ReactOS import coverage all
   green).
+
+  ntdll process-debug query surface cleanup (2026-08-13): the live Rust ntdll target exports no
+  longer return `STATUS_NOT_IMPLEMENTED` from `RtlQueryProcessHeapInformation` or
+  `RtlQueryProcessDebugInformation`. Heap summaries and heap-block walks remain backed by the real
+  in-process heap registry. Heap-tag requests now return the real empty tag set because
+  `RtlCreateTagHeap` disables native tag accounting for this runtime; no tag records are fabricated.
+  Debug masks that require unimplemented backing registries, such as process backtraces, process
+  lock enumeration, or remote heap snapshots, now fail as concrete invalid query combinations
+  rather than as stub statuses. Validation: `cargo fmt --all`,
+  `cargo test -p nt-ntdll debug_buffer`, `./scripts/build_ntdll_dll.sh`, and a target-side export
+  scan showing no live `STATUS_NOT_IMPLEMENTED` return sites beyond the shared status constant.
