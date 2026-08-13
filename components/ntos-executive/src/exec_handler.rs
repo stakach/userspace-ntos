@@ -19079,7 +19079,7 @@ impl ExecNtHandler {
                 if overlay_key_idx(key).is_some() {
                     return 0xC000_0008;
                 }
-                0xC000_0002
+                0xC000_0022 // STATUS_ACCESS_DENIED: borrowed/virtual registry keys are read-only.
             },
             // NtEnumerateValueKey(KeyHandle[0], Index[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). Enumerate the value at Index from the real hive + copy the

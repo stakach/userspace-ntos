@@ -4637,3 +4637,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   does not rewrite the key's storage class. Validation: `cargo fmt --all`,
   `cargo test -p nt-hive-core`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found
+  that `NtDeleteValueKey` could still fall through to `STATUS_NOT_IMPLEMENTED` after resolving a
+  real value on a borrowed `regf` or virtual read-only registry key. That is not a missing syscall;
+  it is a valid registry key whose current authority is read-only. The executive now returns
+  `STATUS_ACCESS_DENIED` for that case, matching the already-correct borrowed-key `NtDeleteKey`
+  behavior and keeping mutation failures tied to registry authority rather than service coverage.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
