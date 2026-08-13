@@ -4893,3 +4893,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   writable overlay, read-only FAT, NPFS, or explicit device handles before reaching this miss path.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D1 `NtSaveKey` file-target cleanup (2026-08-13): saving a hive to a valid handle that is not a
+  writable-overlay file no longer reports `STATUS_NOT_IMPLEMENTED`. Access checks and invalid-handle
+  checks still run first; wrong file/device targets now fail as `STATUS_INVALID_DEVICE_REQUEST`, and
+  the diagnostic counter was renamed from unsupported to invalid-target. Validation: `cargo fmt
+  --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.

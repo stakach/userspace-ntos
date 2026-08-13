@@ -17267,7 +17267,7 @@ pub(crate) static NT_SAVE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_NO_PRIVILEGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_ROOT_SAVED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NT_SAVE_KEY_BYTES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NT_SAVE_KEY_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NT_SAVE_KEY_INVALID_TARGET: AtomicU64 = AtomicU64::new(0);
 /// Count of winlogon `DefaultPassword` value reads answered by the real Winlogon key.
 pub(crate) static WINLOGON_DEFAULT_PASSWORD_READS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).

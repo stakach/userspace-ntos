@@ -3863,8 +3863,8 @@ impl ExecNtHandler {
         let file_id = match self.overlay_write_file_id_for(file_handle) {
             Ok(file_id) => file_id,
             Err(status) => {
-                if status == nt_fs::STATUS_NOT_IMPLEMENTED {
-                    NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+                if status == nt_fs::STATUS_INVALID_DEVICE_REQUEST {
+                    NT_SAVE_KEY_INVALID_TARGET.fetch_add(1, Ordering::Relaxed);
                 }
                 return status;
             }
@@ -8135,7 +8135,9 @@ impl ExecNtHandler {
             | nt_process::HandleObject::RoutedFile { .. }
             | nt_process::HandleObject::DiskFile { .. }
             | nt_process::HandleObject::Directory { .. }
-            | nt_process::HandleObject::BootStatusFile => Err(nt_fs::STATUS_NOT_IMPLEMENTED),
+            | nt_process::HandleObject::BootStatusFile => {
+                Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+            }
             _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
         }
     }
