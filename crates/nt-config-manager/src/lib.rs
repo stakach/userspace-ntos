@@ -27,6 +27,22 @@ pub use registry::{
     encode_multi_sz, encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType,
 };
 
+/// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
+pub const PNP_ROOT_DEVICE_INSTANCE: &str = r"HTREE\ROOT\0";
+
+/// User-mode PnP dynamic property ordinals (`PNP_PROPERTY_*`, NDK `cmtypes.h`).
+pub mod pnp_property {
+    pub const PHYSICAL_DEVICE_OBJECT_NAME: u32 = 1;
+    pub const ENUMERATOR_NAME: u32 = 9;
+}
+
+/// User-mode PnP relation ordinals (`PNP_GET_*_DEVICE`, NDK `cmtypes.h`).
+pub mod pnp_relation {
+    pub const PARENT: u32 = 1;
+    pub const CHILD: u32 = 2;
+    pub const SIBLING: u32 = 3;
+}
+
 pub const SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
 pub const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 pub const DEVICE_CLASSES_PATH: &str =
@@ -307,6 +323,49 @@ pub struct ServiceDatabaseOrderEntry {
 pub struct PnpDriverBinding {
     pub service: ServiceMetadata,
     pub devnodes: Vec<DevnodeRecord>,
+}
+
+/// Parse a textual GUID (`{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` or without punctuation) into the
+/// in-memory Windows `GUID` byte layout (`Data1/2/3` little-endian, `Data4` byte-order stable).
+pub fn guid_text_to_memory_bytes(guid: &str) -> Option<[u8; 16]> {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let mut text = [0u8; 16];
+    let mut high: Option<u8> = None;
+    let mut n = 0usize;
+    for b in guid.bytes() {
+        if matches!(b, b'{' | b'}' | b'-') {
+            continue;
+        }
+        let digit = hex(b)?;
+        if let Some(h) = high.take() {
+            if n >= text.len() {
+                return None;
+            }
+            text[n] = (h << 4) | digit;
+            n += 1;
+        } else {
+            high = Some(digit);
+        }
+    }
+    if high.is_some() || n != text.len() {
+        return None;
+    }
+    Some([
+        text[3], text[2], text[1], text[0], text[5], text[4], text[7], text[6], text[8], text[9],
+        text[10], text[11], text[12], text[13], text[14], text[15],
+    ])
+}
+
+pub fn guid_text_eq_memory(guid: &str, memory: &[u8; 16]) -> bool {
+    guid_text_to_memory_bytes(guid).is_some_and(|parsed| &parsed == memory)
 }
 
 impl ServiceMetadata {
@@ -1144,6 +1203,119 @@ impl ConfigManager {
             .iter()
             .filter(|i| i.guid.eq_ignore_ascii_case(guid) && (!enabled_only || i.enabled))
             .collect()
+    }
+
+    /// Does user-mode PnP know this device instance? The CM device set includes the NT root-bus
+    /// pseudo-devnode plus every indexed `Enum\<InstanceId>` devnode.
+    pub fn pnp_device_exists(&self, instance_id: &str) -> bool {
+        instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE)
+            || self.devnode(instance_id).is_some()
+    }
+
+    /// The root-bus tree depth projected to user-mode PnP. Current CM metadata models each indexed
+    /// devnode as a direct child of `HTREE\ROOT\0`.
+    pub fn pnp_device_depth(&self, instance_id: &str) -> Option<u32> {
+        if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+            Some(0)
+        } else {
+            self.devnode(instance_id).map(|_| 1)
+        }
+    }
+
+    /// Resolve a parent/child/sibling relation in the CM-backed root-bus tree.
+    pub fn pnp_related_device(&self, instance_id: &str, relation: u32) -> Option<String> {
+        match relation {
+            pnp_relation::PARENT => (!instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE)
+                && self.devnode(instance_id).is_some())
+            .then(|| PNP_ROOT_DEVICE_INSTANCE.into()),
+            pnp_relation::CHILD => {
+                if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+                    self.devnodes
+                        .first()
+                        .map(|devnode| devnode.instance_id.clone())
+                } else {
+                    None
+                }
+            }
+            pnp_relation::SIBLING => {
+                if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+                    return None;
+                }
+                let pos = self
+                    .devnodes
+                    .iter()
+                    .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance_id))?;
+                self.devnodes
+                    .get(pos.saturating_add(1))
+                    .map(|devnode| devnode.instance_id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Bus relations for the current CM root-bus model. Non-bus relation types currently have no
+    /// CM-backed edges, so callers receive an empty list after the device identity is validated.
+    pub fn pnp_bus_relation_instances(&self, instance_id: &str) -> Option<Vec<String>> {
+        if !self.pnp_device_exists(instance_id) {
+            return None;
+        }
+        if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+            Some(
+                self.devnodes
+                    .iter()
+                    .map(|devnode| devnode.instance_id.clone())
+                    .collect(),
+            )
+        } else {
+            Some(Vec::new())
+        }
+    }
+
+    /// Enabled interface symbolic links matching a Windows in-memory GUID. A root instance queries
+    /// all matching interfaces; a concrete devnode filters to interfaces registered to that devnode.
+    pub fn pnp_enabled_interface_links_by_guid_bytes(
+        &self,
+        guid: &[u8; 16],
+        instance_id: &str,
+    ) -> Option<Vec<String>> {
+        if !self.pnp_device_exists(instance_id) {
+            return None;
+        }
+        let devnode_filter = if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+            None
+        } else {
+            Some(self.devnode(instance_id)?.id)
+        };
+        Some(
+            self.interfaces
+                .iter()
+                .filter(|interface| {
+                    interface.enabled
+                        && guid_text_eq_memory(&interface.guid, guid)
+                        && devnode_filter.is_none_or(|id| interface.devnode == id)
+                })
+                .map(|interface| interface.symbolic_link.clone())
+                .collect(),
+        )
+    }
+
+    /// Dynamic properties served by the kernel PnP manager rather than raw enum-key registry values.
+    pub fn pnp_dynamic_property_bytes(&self, instance_id: &str, property: u32) -> Option<Vec<u8>> {
+        if instance_id.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE) {
+            return match property {
+                pnp_property::ENUMERATOR_NAME => Some(encode_sz("HTREE")),
+                _ => None,
+            };
+        }
+        let devnode = self.devnode(instance_id)?;
+        match property {
+            pnp_property::PHYSICAL_DEVICE_OBJECT_NAME => devnode.pdo_name.as_deref().map(encode_sz),
+            pnp_property::ENUMERATOR_NAME => {
+                let enumerator = instance_id.split('\\').next().unwrap_or("");
+                (!enumerator.is_empty()).then(|| encode_sz(enumerator))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2470,5 +2642,129 @@ mod tests {
         cm.set_interface_state(iface, false);
         assert_eq!(cm.interfaces_by_guid(guid, true).len(), 0);
         assert_eq!(cm.interfaces_by_guid(guid, false).len(), 1);
+    }
+
+    #[test]
+    fn guid_text_to_memory_bytes_accepts_nt_forms() {
+        let expected = [
+            0x24, 0x0b, 0x7b, 0x9a, 0x57, 0x6e, 0x51, 0x4c, 0xad, 0x3c, 0x6d, 0x9f, 0x5f, 0x0e,
+            0x00, 0x01,
+        ];
+        assert_eq!(
+            guid_text_to_memory_bytes("{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}"),
+            Some(expected)
+        );
+        assert_eq!(
+            guid_text_to_memory_bytes("9a7b0b246e574c51ad3c6d9f5f0e0001"),
+            Some(expected)
+        );
+        assert!(guid_text_to_memory_bytes("not-a-guid").is_none());
+    }
+
+    #[test]
+    fn pnp_root_bus_tree_projection() {
+        let mut cm = ConfigManager::new();
+        cm.register_devnode(
+            r"ROOT\FIRST\0000",
+            Some("First"),
+            Some(r"\Device\NTPNP_ROOT0001"),
+            &[],
+            &[],
+        );
+        cm.register_devnode(
+            r"ROOT\SECOND\0000",
+            Some("Second"),
+            Some(r"\Device\NTPNP_ROOT0002"),
+            &[],
+            &[],
+        );
+
+        assert!(cm.pnp_device_exists(PNP_ROOT_DEVICE_INSTANCE));
+        assert!(cm.pnp_device_exists(r"root\first\0000"));
+        assert!(!cm.pnp_device_exists(r"ROOT\MISSING\0000"));
+        assert_eq!(cm.pnp_device_depth(PNP_ROOT_DEVICE_INSTANCE), Some(0));
+        assert_eq!(cm.pnp_device_depth(r"ROOT\FIRST\0000"), Some(1));
+        assert_eq!(
+            cm.pnp_related_device(r"ROOT\FIRST\0000", pnp_relation::PARENT)
+                .as_deref(),
+            Some(PNP_ROOT_DEVICE_INSTANCE)
+        );
+        assert_eq!(
+            cm.pnp_related_device(PNP_ROOT_DEVICE_INSTANCE, pnp_relation::CHILD)
+                .as_deref(),
+            Some(r"ROOT\FIRST\0000")
+        );
+        assert_eq!(
+            cm.pnp_related_device(r"ROOT\FIRST\0000", pnp_relation::SIBLING)
+                .as_deref(),
+            Some(r"ROOT\SECOND\0000")
+        );
+        assert!(cm
+            .pnp_related_device(r"ROOT\SECOND\0000", pnp_relation::SIBLING)
+            .is_none());
+        assert_eq!(
+            cm.pnp_bus_relation_instances(PNP_ROOT_DEVICE_INSTANCE)
+                .unwrap(),
+            alloc::vec![
+                String::from(r"ROOT\FIRST\0000"),
+                String::from(r"ROOT\SECOND\0000")
+            ]
+        );
+        assert_eq!(
+            cm.pnp_bus_relation_instances(r"ROOT\FIRST\0000").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pnp_dynamic_properties_and_interface_filtering() {
+        let mut cm = ConfigManager::new();
+        let dn1 = cm.register_devnode(
+            r"ROOT\IFACE\0000",
+            Some("Svc"),
+            Some(r"\Device\NTPNP_ROOT0001"),
+            &[],
+            &[],
+        );
+        let dn2 = cm.register_devnode(
+            r"ROOT\IFACE\0001",
+            Some("Svc"),
+            Some(r"\Device\NTPNP_ROOT0002"),
+            &[],
+            &[],
+        );
+        let guid = "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}";
+        let guid_bytes = guid_text_to_memory_bytes(guid).unwrap();
+        cm.register_interface(dn1, guid, "", true);
+        let disabled = cm.register_interface(dn2, guid, "disabled", false);
+        let other = cm.register_interface(dn2, "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0002}", "", true);
+        assert!(cm.interface(disabled).is_some());
+        assert!(cm.interface(other).is_some());
+
+        assert_eq!(
+            cm.pnp_dynamic_property_bytes(
+                r"ROOT\IFACE\0000",
+                pnp_property::PHYSICAL_DEVICE_OBJECT_NAME
+            )
+            .as_deref(),
+            Some(encode_sz(r"\Device\NTPNP_ROOT0001").as_slice())
+        );
+        assert_eq!(
+            cm.pnp_dynamic_property_bytes(r"ROOT\IFACE\0000", pnp_property::ENUMERATOR_NAME)
+                .as_deref(),
+            Some(encode_sz("ROOT").as_slice())
+        );
+        let root_links = cm
+            .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, PNP_ROOT_DEVICE_INSTANCE)
+            .unwrap();
+        assert_eq!(root_links.len(), 1);
+        assert!(root_links[0].contains("ROOT#IFACE#0000"));
+        let device_links = cm
+            .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\IFACE\0000")
+            .unwrap();
+        assert_eq!(device_links, root_links);
+        assert!(cm
+            .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000")
+            .is_none());
     }
 }

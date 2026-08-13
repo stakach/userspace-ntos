@@ -4867,3 +4867,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   control classes return concrete NT failures; no class returns success without backing state.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  B3 PnP CM projection cleanup (2026-08-13): the user-mode PnP projection is now owned by
+  `nt-config-manager` instead of executive-local helper code. CM exposes host-tested helpers for
+  root-bus identity, device depth, parent/child/sibling relations, bus-relation instance lists,
+  enabled interface filtering by Windows in-memory GUID bytes, and dynamic PDO/enumerator property
+  bytes. The executive now only snapshots CM state, validates user buffers, marshals NT syscall
+  structures, and writes the CM-owned answers back to user mode. Validation: `cargo fmt --all`,
+  `cargo test -p nt-config-manager --quiet`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
