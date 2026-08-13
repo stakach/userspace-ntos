@@ -4843,3 +4843,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   parent directory-entry ownership. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  D1 keyed-event release rendezvous cleanup (2026-08-13): `NtReleaseKeyedEvent` no longer has the
+  old pending-count release-before-wait shortcut or the future-timeout `STATUS_NOT_IMPLEMENTED`
+  branch. Keyed events now have symmetric wait-side and release-side parked waiter tables. A release
+  first wakes a parked `NtWaitForKeyedEvent`; otherwise it parks its own reply cap until a matching
+  wait arrives or its timeout expires. A wait first wakes a parked releaser, then parks on the wait
+  side only if no release is available. The HPET rearm/wake path, thread teardown cancellation, and
+  deadman diagnostics now cover both keyed-event sides, so timed releases are real waiters rather
+  than status remaps or synthetic success paths. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.

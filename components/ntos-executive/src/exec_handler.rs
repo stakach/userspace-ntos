@@ -896,6 +896,8 @@ fn trace_winlogon_post_lsa_native_exit(
     print_u64(handler.wait_park_event as u64);
     print_str(b" keyed_wait=0x");
     print_hex_u64(handler.keyed_wait_key);
+    print_str(b" keyed_release=0x");
+    print_hex_u64(handler.keyed_release_wait_key);
     print_str(b" delay=");
     print_u64(handler.delay_requested as u64);
     print_str(b" io_port=");
@@ -2382,6 +2384,8 @@ impl ExecNtHandler {
         write_field!(wait_deadline_100ns, u64::MAX);
         write_field!(keyed_wait_key, u64::MAX);
         write_field!(keyed_wait_deadline_100ns, u64::MAX);
+        write_field!(keyed_release_wait_key, u64::MAX);
+        write_field!(keyed_release_wait_deadline_100ns, u64::MAX);
         write_field!(delay_requested, false);
         write_field!(delay_interval_100ns, 0);
         write_field!(delay_alertable, false);
@@ -22588,12 +22592,9 @@ impl ExecNtHandler {
                 }
                 0
             },
-            // NtReleaseKeyedEvent(Handle, Key, Alertable, Timeout) — wake one waiter parked by
-            // NtWaitForKeyedEvent on the same raw key. ReactOS condition variables call this with a
-            // zero timeout and retry/skip on STATUS_TIMEOUT. A NULL timeout is the keyed-event
-            // rendezvous path used by RtlRunOnce: if the waiter has published its key but has not yet
-            // entered the syscall, remember one release for that key so the later wait returns
-            // immediately instead of losing the wake.
+            // NtReleaseKeyedEvent(Handle, Key, Alertable, Timeout) — pair with one waiter parked by
+            // NtWaitForKeyedEvent on the same raw key. If no waiter has arrived yet, the release side
+            // parks as the symmetric half of the keyed-event rendezvous and is woken by the later wait.
             NativeService::NtReleaseKeyedEvent => unsafe {
                 let _handle = args[0];
                 let key = args[1];
@@ -22604,37 +22605,38 @@ impl ExecNtHandler {
                     print_hex_u64(key);
                     print_str(b" -> WAKE one\n");
                     0
-                } else if timeout_ptr != 0 {
-                    match self.wait_timeout_due(timeout_ptr) {
-                        Ok(Some(nt_delay_execution::Due::Immediate)) => 0x102,
-                        Ok(Some(nt_delay_execution::Due::Monotonic100ns(_))) => 0xC000_0002,
-                        Ok(None) => 0xC000_0002,
-                        Err(status) => status,
-                    }
-                } else if keyed_release_remember_pending(key) {
-                    print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
-                    print_hex_u64(key);
-                    print_str(b" -> PENDING release\n");
-                    0
                 } else {
-                    0xC000_009A
+                    let due = match self.wait_timeout_due(timeout_ptr) {
+                        Ok(due) => due,
+                        Err(status) => return status,
+                    };
+                    if let Some(due) = due {
+                        match due {
+                            nt_delay_execution::Due::Immediate => return 0x102,
+                            nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                                self.keyed_release_wait_deadline_100ns = deadline;
+                            }
+                        }
+                    }
+                    self.keyed_release_wait_key = key;
+                    0x102
                 }
             },
             // NtWaitForKeyedEvent(Handle, Key, Alertable, Timeout) — park this syscall's reply cap
             // on the key. The service loop performs the actual steal once resume_ip/rsp/rflags are
             // available at the reply site.
-            NativeService::NtWaitForKeyedEvent => {
+            NativeService::NtWaitForKeyedEvent => unsafe {
                 let _handle = args[0];
                 let key = args[1];
                 let _alertable = args[2];
                 let timeout_ptr = args[3];
-                if keyed_release_take_pending(key) {
+                if keyed_release_wake_one(self, key, 0) {
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(key);
-                    print_str(b" -> CONSUME pending release\n");
+                    print_str(b" -> WAKE releaser\n");
                     return 0;
                 }
-        let due = match self.wait_timeout_due(timeout_ptr) {
+                let due = match self.wait_timeout_due(timeout_ptr) {
                     Ok(due) => due,
                     Err(status) => return status,
                 };
