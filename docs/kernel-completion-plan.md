@@ -4940,3 +4940,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   section, or generic section handle now fails as `STATUS_INVALID_HANDLE`. Validation:
   `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  Native syscall miss cleanup (2026-08-14): the SEC_IMAGE service loop no longer treats an SSN absent
+  from the registered native syscall table as a `STATUS_NOT_IMPLEMENTED` execution wall. After the
+  native table, explicit legacy bootstrap services, and registered win32k service range are checked,
+  any remaining SSN is now replied to as `STATUS_INVALID_SYSTEM_SERVICE`, matching the
+  `nt-syscall` dispatcher contract for unknown services instead of misclassifying it as missing
+  kernel code. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.

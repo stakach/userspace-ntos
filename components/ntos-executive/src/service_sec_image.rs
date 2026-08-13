@@ -13819,8 +13819,9 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC0000001;
                 }
             } else {
-                handled = false;
-                result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
+                // SSNs absent from the registered native table are complete dispatcher decisions:
+                // the NT syscall layer rejects them instead of treating them as missing kernel code.
+                result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
             }
             if !handled {
                 // ★ BATCH 43 — winlogon SAS-window MILESTONE park (recv-next-without-reply). winlogon has
