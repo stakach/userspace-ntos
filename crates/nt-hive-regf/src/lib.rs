@@ -72,6 +72,7 @@ pub struct RegfHiveImportStats {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegfHiveImportError {
+    InvalidKey,
     OutOfMemory,
 }
 
@@ -761,17 +762,50 @@ pub fn try_import_regf_into_hive(
     source: &RegfHive<'_>,
     kind: HiveKind,
 ) -> Result<(Hive, RegfHiveImportStats), RegfHiveImportError> {
-    let mut target = Hive::new(kind);
-    let counts = count_regf_key_cells(source, source.root(), 0);
-    let imported_cells = counts.keys.saturating_add(counts.values);
-    let live_cells =
-        imported_cells.saturating_add(live_mutation_cell_headroom(kind, imported_cells));
-    let live_value_blobs = counts
-        .values
-        .saturating_add(live_mutation_value_headroom(kind, counts.values));
+    try_import_regf_key_into_hive(source, source.root(), kind, true)
+}
 
-    // Imported hives become live Configuration Manager authority immediately. Leave measured arena
-    // headroom for early boot mutations without doubling large hives.
+/// Import a selected read-only `regf` key as the root of a mutable hive.
+///
+/// This is used by `NtSaveKey` when the caller asks to save a subtree from a borrowed boot hive:
+/// the selected key's values and descendants become the new hive root, while ancestors and siblings
+/// are intentionally excluded.
+pub fn try_import_regf_subtree_into_hive(
+    source: &RegfHive<'_>,
+    source_key: KeyRef,
+    kind: HiveKind,
+) -> Result<(Hive, RegfHiveImportStats), RegfHiveImportError> {
+    try_import_regf_key_into_hive(source, source_key, kind, false)
+}
+
+fn try_import_regf_key_into_hive(
+    source: &RegfHive<'_>,
+    source_key: KeyRef,
+    kind: HiveKind,
+    reserve_live_mutation_headroom: bool,
+) -> Result<(Hive, RegfHiveImportStats), RegfHiveImportError> {
+    if source.cell_body(source_key).and_then(|b| b.get(0..2)) != Some(&b"nk"[..]) {
+        return Err(RegfHiveImportError::InvalidKey);
+    }
+    let mut target = Hive::new(kind);
+    let counts = count_regf_key_cells(source, source_key, 0);
+    let imported_cells = counts.keys.saturating_add(counts.values);
+    let live_cells = if reserve_live_mutation_headroom {
+        imported_cells.saturating_add(live_mutation_cell_headroom(kind, imported_cells))
+    } else {
+        imported_cells
+    };
+    let live_value_blobs = if reserve_live_mutation_headroom {
+        counts
+            .values
+            .saturating_add(live_mutation_value_headroom(kind, counts.values))
+    } else {
+        counts.values
+    };
+
+    // Full imported hives become live Configuration Manager authority immediately, so they keep
+    // measured arena headroom for early boot mutations. Subtree imports are save/export inputs and
+    // reserve only the exact cells and value blobs they need.
     if !target.reserve_cells(live_cells.saturating_sub(1)) {
         return Err(RegfHiveImportError::OutOfMemory);
     }
@@ -783,7 +817,7 @@ pub fn try_import_regf_into_hive(
         ..RegfHiveImportStats::default()
     };
     let root = target.root();
-    import_regf_key_into_hive(source, source.root(), &mut target, root, &mut stats, 0);
+    import_regf_key_into_hive(source, source_key, &mut target, root, &mut stats, 0);
     target.finish_clean_import();
     Ok((target, stats))
 }
@@ -1443,6 +1477,50 @@ mod tests {
             utf16le_sz(r"system32\drivers\npfs.sys").as_slice()
         );
         assert_eq!(rebooted.dirty_count(), 0);
+    }
+
+    #[test]
+    fn imports_selected_regf_subtree_as_hive_root() {
+        let data = services_test_hive();
+        let source = RegfHive::new(&data).expect("valid test hive");
+        let services = source
+            .open_key(r"ControlSet001\Services")
+            .expect("services key");
+        let (hive, stats) = try_import_regf_subtree_into_hive(&source, services, HiveKind::System)
+            .expect("subtree import");
+
+        assert_eq!(
+            stats,
+            RegfHiveImportStats {
+                keys: 3,
+                values: 5,
+                skipped_values: 0,
+            }
+        );
+        assert!(
+            hive.open_key(r"ControlSet001").is_none(),
+            "ancestors outside the selected subtree must not be imported"
+        );
+        let npfs = hive.open_key(r"Npfs").expect("Npfs child");
+        assert_eq!(
+            hive.query_dword(npfs, "Type"),
+            Some(nt_config_manager::SERVICE_FILE_SYSTEM_DRIVER)
+        );
+        let parameters = hive.open_key(r"Npfs\Parameters").expect("Parameters");
+        assert_eq!(hive.query_dword(parameters, "Answer"), Some(42));
+
+        let image = nt_hive_core::try_encode_image(&hive).expect("encode imported subtree");
+        let decoded = nt_hive_core::decode_image(&image).expect("decode imported subtree");
+        assert!(decoded.open_key(r"ControlSet001").is_none());
+        let decoded_parameters = decoded
+            .open_key(r"Npfs\Parameters")
+            .expect("decoded Parameters");
+        assert_eq!(decoded.query_dword(decoded_parameters, "Answer"), Some(42));
+
+        assert_eq!(
+            try_import_regf_subtree_into_hive(&source, 0xDEAD_BEEF, HiveKind::System).err(),
+            Some(RegfHiveImportError::InvalidKey)
+        );
     }
 
     #[test]

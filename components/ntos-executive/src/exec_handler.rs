@@ -3818,7 +3818,7 @@ impl ExecNtHandler {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+        const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
         const KEY_READ: u32 = 0x0002_0019;
         NT_SAVE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -3884,10 +3884,37 @@ impl ExecNtHandler {
                 None => return STATUS_INVALID_HANDLE,
             };
             if cell != hive.root() {
-                NT_SAVE_KEY_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
-                return STATUS_NOT_IMPLEMENTED;
+                let _alloc_ctx =
+                    crate::allocator::enter_context(crate::allocator::ALLOC_CTX_REGF_IMPORT);
+                let imported = match nt_hive_regf::try_import_regf_subtree_into_hive(
+                    hive,
+                    cell,
+                    hive_kind_for_selector(hive_sel(key)),
+                ) {
+                    Ok((hive, stats)) => {
+                        if stats.skipped_values != 0 {
+                            return STATUS_REGISTRY_CORRUPT;
+                        }
+                        hive
+                    }
+                    Err(nt_hive_regf::RegfHiveImportError::InvalidKey) => {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    Err(nt_hive_regf::RegfHiveImportError::OutOfMemory) => {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                };
+                owned_image = match nt_hive_core::try_encode_image(&imported) {
+                    Ok(image) => image,
+                    Err(nt_hive_core::HiveEncodeError::OutOfMemory)
+                    | Err(nt_hive_core::HiveEncodeError::SizeOverflow) => {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                };
+                owned_image.as_slice()
+            } else {
+                hive.bytes()
             }
-            hive.bytes()
         };
         let image_len = image.len();
 
@@ -4797,6 +4824,15 @@ impl ExecNtHandler {
             };
             let (hive, _stats) = match imported {
                 Ok(imported) => imported,
+                Err(nt_hive_regf::RegfHiveImportError::InvalidKey) => {
+                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                    print_str(b"[cm-load] NtLoadKey: mutable import invalid root key bytes=");
+                    print_u64(len as u64);
+                    print_str(b" target=");
+                    print_ascii_str(&full);
+                    print_str(b"\n");
+                    return STATUS_REGISTRY_CORRUPT;
+                }
                 Err(nt_hive_regf::RegfHiveImportError::OutOfMemory) => {
                     USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
                     print_str(b"[cm-load] NtLoadKey: mutable import out of memory bytes=");

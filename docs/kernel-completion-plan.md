@@ -4791,3 +4791,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `STATUS_INVALID_INFO_CLASS` path rather than a stub. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  D1 borrowed-hive subtree save cleanup (2026-08-13): `NtSaveKey` no longer returns
+  `STATUS_NOT_IMPLEMENTED` for a valid non-root key that still belongs to a borrowed read-only REGF
+  hive. `nt-hive-regf` now has a host-tested selected-subtree import path that maps a borrowed REGF
+  key's values and descendants into a temporary `nt-hive-core::Hive` root, excluding ancestors and
+  siblings; `NtSaveKey` then writes the normal core hive image through the existing writable-overlay
+  file/flush path. Invalid borrowed key references fail as invalid handles or corrupt registry state,
+  and allocation/encode failures stay visible as resource exhaustion. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-regf`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
