@@ -1759,7 +1759,8 @@ unsafe fn pump_result_from_outcome(ch: &PumpChannel, outcome: PumpLoopOutcome) -
 
 /// The DRIVER_OBJECT byte layout a component's `DriverEntry` expects. `component_main` builds a
 /// zeroed DRIVER_OBJECT of `size` with Type=4 @0, Size @2, a DriverExtension pointer at the NT x64
-/// offset, a zero DriverUnload slot, and MajorFunction @`mj`.
+/// offset, a zero DriverUnload slot, and MajorFunction @`mj`. WDM hosts may also seed every major
+/// function slot with the I/O manager's default invalid-device-request dispatch before DriverEntry.
 #[derive(Clone, Copy)]
 pub(crate) struct DriverObjectSpec {
     /// The DRIVER_OBJECT allocation size (bytes reserved from `pool`).
@@ -1786,6 +1787,9 @@ pub(crate) struct DriverObjectSpec {
     pub support_status_off: u64,
     /// Optional shared-frame offset receiving support image verdict bits.
     pub support_verdict_off: u64,
+    /// Component-local WDM default dispatch pointer for unclaimed MajorFunction slots. `0` leaves the
+    /// table zeroed for hosts that do not expose WDM majors, such as win32k's syscall server.
+    pub default_major_function: u64,
 }
 
 /// One dispatched request handed to the component-side `dispatch` callback. For the FSD, `sel` is
@@ -1872,7 +1876,9 @@ pub(crate) unsafe fn component_main(
     if status == 0 {
         v |= crate::driver_launch::V_SUCCESS;
     }
-    if mj_create != 0 {
+    if mj_create != 0
+        && (spec.default_major_function == 0 || mj_create != spec.default_major_function)
+    {
         v |= crate::driver_launch::V_MJ;
     }
     core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, v);
@@ -1953,6 +1959,13 @@ unsafe fn component_driver_entry_context(spec: DriverObjectSpec) -> (u64, u64) {
     .is_err()
     {
         panic!("invalid DriverObjectSpec");
+    }
+    if spec.default_major_function != 0 {
+        let mut off = spec.mj;
+        while off + 8 <= spec.size {
+            core::ptr::write_unaligned((drv + off) as *mut u64, spec.default_major_function);
+            off += 8;
+        }
     }
 
     // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.

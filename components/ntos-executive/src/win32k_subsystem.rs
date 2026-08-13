@@ -8461,6 +8461,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
             support_entry_rva_off: u64::MAX,
             support_status_off: u64::MAX,
             support_verdict_off: u64::MAX,
+            default_major_function: 0,
         },
         SH_REQ_STATUS,      // win32k status offset (0x78)
         W32_DISPATCH_LABEL, // 0x770

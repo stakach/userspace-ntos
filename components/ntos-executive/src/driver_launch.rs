@@ -307,7 +307,7 @@ pub const V_ENTERED: u32 = 1; // host called into DriverEntry
 pub const V_RETURNED: u32 = 2; // DriverEntry returned (did not fault)
 pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_DEVICE: u32 = 8; // IoCreateDevice(control device) succeeded
-pub const V_MJ: u32 = 0x10; // DriverObject->MajorFunction[IRP_MJ_CREATE] is non-null (table filled)
+pub const V_MJ: u32 = 0x10; // DriverEntry replaced MajorFunction[IRP_MJ_CREATE] with a real dispatch
 pub const V_REGFS: u32 = 0x20; // IoRegisterFileSystem was called
 pub const V_NAMED_DEVICE: u32 = 0x40; // IoCreateDevice declared a valid NT DeviceName
 pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/target
@@ -8111,6 +8111,18 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
 
 // --- the FSD component entry -----------------------------------------------------------------
 
+unsafe extern "win64" fn fsd_invalid_device_request(_devobj: u64, irp: u64) -> i32 {
+    const STATUS_INVALID_DEVICE_REQUEST_I32: i32 = 0xC000_0010u32 as i32;
+    if irp != 0 {
+        write_unaligned(
+            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+            STATUS_INVALID_DEVICE_REQUEST_I32,
+        );
+        write_unaligned((irp + 0x38) as *mut u64, 0);
+    }
+    STATUS_INVALID_DEVICE_REQUEST_I32
+}
+
 /// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
 /// DriverEntry-preamble → dispatch-loop shape to [`crate::spawn_hosts::component_main`], plugging the
 /// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
@@ -8146,6 +8158,7 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
             support_entry_rva_off: SH_SUPPORT_ENTRY_RVA,
             support_status_off: SH_SUPPORT_DE_STATUS,
             support_verdict_off: SH_SUPPORT_VERDICT,
+            default_major_function: fsd_invalid_device_request as *const () as u64,
         },
         SH_REQ_STATUS,      // FSD status offset (0x70)
         FSD_DISPATCH_LABEL, // 0x771
@@ -8286,7 +8299,7 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     if handler != 0 {
         run_irp(major, handler)
     } else {
-        (0xC000_0002u32 as i32, 0) // STATUS_NOT_IMPLEMENTED
+        (0xC000_0010u32 as i32, 0) // STATUS_INVALID_DEVICE_REQUEST
     }
 }
 

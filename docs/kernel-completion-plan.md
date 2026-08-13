@@ -4876,3 +4876,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   structures, and writes the CM-owned answers back to user mode. Validation: `cargo fmt --all`,
   `cargo test -p nt-config-manager --quiet`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  B3 hosted WDM default-dispatch cleanup (2026-08-13): hosted WDM `DRIVER_OBJECT` creation now seeds
+  every unclaimed `MajorFunction[]` slot with a component-local invalid-device-request routine before
+  `DriverEntry`, matching NT I/O manager semantics. Drivers still replace supported major functions
+  normally, and the `V_MJ` proof bit now means `DriverEntry` installed a real create dispatch rather
+  than merely inheriting the default table. The component dispatch bridge's zero-slot guard now
+  reports `STATUS_INVALID_DEVICE_REQUEST` as corruption/absence, not `STATUS_NOT_IMPLEMENTED`.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
