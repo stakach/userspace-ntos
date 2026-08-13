@@ -990,13 +990,14 @@ before unrelated executive traffic monopolises the receive loop.
   boot/system driver candidates, without embedding launch policy in the kernel.
 - `[x]` A3: Route SCM start requests through generic process creation or `NtLoadDriver` based on
   service metadata.
-- `[~]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
+- `[x]` A4: Remove remaining executive service-name/executable-name launch decisions once SCM owns
   the policy boundary. SCM/LSA multiplexed listener thread spawns, CSR/winlogon local worker
   spawning, post-LSA fault containment, LSASS pipe attribution, shell COM routing, and executive
   fault summaries now resolve process identity by hosted role instead of executable leaf names.
-  SM/CSR rendezvous CID publication also derives SMSS/CSRSS identity from hosted roles. Remaining
-  name-scoped uses should be limited to requested image admission, diagnostics, bootstrap manifest
-  data, or explicit user-shell proof gates.
+  SM/CSR rendezvous CID publication, bootstrap ProcessManager seeding, and the CSRSS spawn-handle
+  latch also derive identity from hosted roles or the hosted bootstrap catalog. Remaining
+  name-scoped uses are requested image admission, diagnostics, bootstrap manifest data, or explicit
+  proof counters.
 - `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
 
@@ -1152,7 +1153,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
    projection helper. Remaining display debt is hosting real videoprt/miniport instead of the
    boot-framebuffer bridge.
-2. Continue A3/A4 for Win32 service starts. SCM-owned service metadata now produces typed
+2. A3/A4 for Win32 service starts is closed for the current frontier. SCM-owned service metadata now
+   produces typed
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
    catalog/runtime lanes can admit non-bootstrap children dynamically, and services.exe's real
    `CheckForLiveCD`/control-set copy path is no longer corrupting its advapi32 `RegCopyTreeW`
@@ -1170,11 +1172,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    reaching non-bootstrap service children through the ordinary dynamic image path: duplicate
    `svchost.exe` launches admit fresh target-scoped identities, `NtCreateSection(SEC_IMAGE)` and
    `NtCreateProcessEx` run for each, and the old process-parameter invalid-handle wall is gone. A3 is
-   complete. Continue A4 by removing remaining SCM pipe/listener thread special coordination once the
-   generic LPC/pipe/thread model can carry it. The service GUI desktop/winsta assignment has moved onto
-   the real win32k/Ob path; the active A4 validation frontier is generic hosted TP-worker resume
-   identity plus reclaiming win32k session-heap and GDI user-VM allocations for multiple dynamic
-   GUI-capable service clients.
+   complete. A4 now resolves SCM/LSA/SM/CSR/shell control paths by hosted role or hosted bootstrap
+   manifest data instead of executable-name decisions; the remaining executable strings in the audited
+   executive paths are requested image names, diagnostics, manifest data, or proof counters. Further
+   service work should move to generic LPC/pipe/thread scalability, session/GDI resource reclamation
+   for multiple GUI-capable service clients, or missing subsystem behavior exposed by real service
+   traffic, not renewed service-name special cases.
 3. Work the current proof-gate frontier now that genuine explorer shell chrome renders again. The
    SAM/setup bridge is green through real SAM database creation, Administrator token minting,
    profile hive mount/read-back, userinit, genuine explorer launch, served explorer shell COM
@@ -4695,6 +4698,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   EPROCESS/ETHREAD records from the manifest's process name, role, PI, and parent relationship. The
   boot order is unchanged, but the source of truth is now the hosted bootstrap catalog instead of a
   second string list. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  A4 CSRSS spawn-latch closure (2026-08-13): the final service-loop spawn side effect that still
+  compared an executable leaf now uses the resolved spawn spec's hosted role. When the
+  `Win32Subsystem` child is spawned, the loop records the CSRSS process handle exactly as before, but
+  the decision is no longer `request.leaf() == "csrss.exe"`. A follow-up audit found the remaining
+  executable strings in the audited executive files are either hosted bootstrap manifest data,
+  requested image/probe names, comments, diagnostics, or proof counters. A4 is closed for the
+  current frontier. Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
   D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found

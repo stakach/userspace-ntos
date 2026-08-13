@@ -8426,11 +8426,12 @@ pub(crate) unsafe fn service_sec_image(
                 // the address-space descriptor; handle publication and ProcessManager wiring are
                 // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
-                    let is_csrss_spawn = request.leaf().eq_ignore_ascii_case(b"csrss.exe");
                     if let Some(spec) =
                         hosted_exe_spawn_for(request, &*exe_image_catalog, &*hosted_loaded_images)
                     {
                         if spec.spawned.load(Ordering::Relaxed) == 0 {
+                            let is_csrss_spawn =
+                                spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem;
                             match spawn_requested_hosted_exe(
                                 request,
                                 spec,
