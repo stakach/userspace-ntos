@@ -1044,8 +1044,10 @@ before unrelated executive traffic monopolises the receive loop.
   overlay keys, and `NtQuerySecurityObject` returns sized descriptor data instead of relying on a
   no-op success path. The normal-boot `HKLM\SYSTEM\Setup`, `.Default` locale setup writes, and
   explorer HKCR shell COM class seeding now mutate the mounted hives directly instead of creating
-  overlay shadows. Remaining D2 work is a final persistent-path overlay audit before D3
-  flush/reboot proofs.
+  overlay shadows. The persistent-path overlay audit also removed path-based precedence for
+  nonvolatile overlay shadows over mounted mutable hives; remaining overlay authority should be
+  explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Remaining
+  D2 work is a narrow audit of root/virtual registry metadata and subtree serialization behavior.
 - `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
@@ -4646,3 +4648,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   behavior and keeping mutation failures tied to registry authority rather than service coverage.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D2 path-overlay authority cleanup (2026-08-13): path-based registry resolution no longer lets an
+  old nonvolatile overlay shadow outrank a mounted mutable hive. `nt-hive-core` now exposes
+  `RegistryOverlay::find_for_path_authority`, with regressions proving nonvolatile shadows remain
+  usable only when no mutable hive owns the path, while explicit volatile overlay keys still shadow
+  mounted hives. The executive uses that rule for ordinary opens, merged value/subkey/stat queries,
+  parent-existence checks, `NtCreateKey`, and `NtSetValueKey`; direct overlay handles keep their
+  object identity. This removes another durable-path shadow route without adding a fallback success
+  path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`, and `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.

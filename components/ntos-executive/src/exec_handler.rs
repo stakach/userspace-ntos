@@ -5090,10 +5090,21 @@ impl ExecNtHandler {
     }
 
     fn registry_overlay_index(&self, target: KeyRef) -> Option<usize> {
-        overlay_key_idx(target).or_else(|| {
-            self.registry_target_path(target)
-                .and_then(|path| self.overlay.find(&path))
-        })
+        if let Some(index) = overlay_key_idx(target) {
+            return Some(index);
+        }
+        let path = self.registry_target_path(target)?;
+        self.registry_overlay_index_for_path(&path)
+    }
+
+    fn registry_overlay_index_for_path(&self, full_path: &str) -> Option<usize> {
+        let canon = self.overlay_canon(full_path);
+        self.registry_overlay_index_for_canon_path(&canon)
+    }
+
+    fn registry_overlay_index_for_canon_path(&self, canon: &str) -> Option<usize> {
+        self.overlay
+            .find_for_path_authority(canon, self.mutable_hive_owns_path(canon))
     }
 
     fn mutable_registry_key_by_path(
@@ -5278,7 +5289,7 @@ impl ExecNtHandler {
         out: u64,
     ) -> Option<u32> {
         let canon = self.overlay_canon(full_path);
-        if let Some(index) = self.overlay.find(&canon) {
+        if let Some(index) = self.registry_overlay_index_for_canon_path(&canon) {
             if Self::is_dynamic_user_volatile_env_canon(&canon) {
                 USER_VOLATILE_ENV_OPENED.fetch_add(1, Ordering::Relaxed);
             }
@@ -5494,7 +5505,7 @@ impl ExecNtHandler {
         matches!(
             canon,
             r"\" | r"\registry" | r"\registry\machine" | r"\registry\user"
-        ) || self.overlay.find(canon).is_some()
+        ) || self.registry_overlay_index_for_canon_path(canon).is_some()
             || if self.mutable_hive_owns_path(canon) {
                 self.mutable_hives.resolve_key(canon).is_some()
             } else {
@@ -18087,9 +18098,9 @@ impl ExecNtHandler {
                     return status;
                 }
                 // A readable full registry path is resolved through one authority order for every
-                // process: created overlay keys first, then mounted mutable hives, then borrowed
-                // read-only regf only for paths no mutable hive owns. Empty PE-literal names still
-                // fall through to the recovery arms below.
+                // process: explicit volatile overlay keys first, then mounted mutable hives, then
+                // borrowed read-only regf only for paths no mutable hive owns. Empty PE-literal
+                // names still fall through to the recovery arms below.
                 let full_open_path = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut full = alloc::string::String::from(r"\Registry\Machine\");
                     full.push_str(&path);
@@ -18377,14 +18388,19 @@ impl ExecNtHandler {
                 if !self.registry_path_exists(parent) {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                // Disposition/storage split: existing overlay keys keep their overlay identity
-                // because they may be volatile. Existing mounted-hive keys open from the Hive
-                // Manager even when the caller supplied REG_OPTION_VOLATILE; the volatile bit only
-                // controls creation of a new key. Non-volatile new keys owned by a mounted mutable
-                // hive are created in the Hive Manager instead of shadowing through the overlay.
+                // Disposition/storage split: explicit overlay handles keep their overlay identity,
+                // and path-discovered volatile overlay keys shadow mounted hives. Nonvolatile
+                // shadows yield to mounted mutable hives, so existing mounted-hive keys open from
+                // the Hive Manager even when the caller supplied REG_OPTION_VOLATILE. The volatile
+                // bit only controls creation of a new key.
                 let create_options = args[5] as u32;
                 let create_volatile = create_options & 0x1 != 0;
-                let overlay_existing = self.overlay.find(&canon);
+                let root_is_overlay = root_target.and_then(overlay_key_idx).is_some();
+                let overlay_existing = if root_is_overlay {
+                    self.overlay.find(&canon)
+                } else {
+                    self.registry_overlay_index_for_canon_path(&canon)
+                };
                 let mutable_existing = self.mutable_hives.resolve_key(&full);
                 let base_existing = if mutable_existing.is_none()
                     && !self.mutable_hive_owns_path(&full)
@@ -18457,7 +18473,7 @@ impl ExecNtHandler {
                     }
                     return 0;
                 }
-                let mutable_parent = if create_volatile {
+                let mutable_parent = if create_volatile || root_is_overlay {
                     None
                 } else {
                     self.mutable_hives.resolve_key(parent)
@@ -18732,7 +18748,7 @@ impl ExecNtHandler {
                         Some(path) => path,
                         None => return 0xC000_0008,
                     };
-                    if let Some(index) = self.overlay.find(&path) {
+                    if let Some(index) = self.registry_overlay_index_for_path(&path) {
                         Some(index)
                     } else {
                         shadow_path_len = path.len();

@@ -127,6 +127,22 @@ impl RegistryOverlay {
             .position(|k| k.path == canon && !k.detached)
     }
 
+    /// Find a path-based overlay key only when it should remain authoritative over a live mounted
+    /// mutable hive. Explicit volatile keys shadow mounted hives; nonvolatile shadows yield back to
+    /// the mutable hive once that hive owns the path.
+    pub fn find_for_path_authority(
+        &self,
+        canon: &str,
+        mutable_hive_owns_path: bool,
+    ) -> Option<usize> {
+        let index = self.find(canon)?;
+        if self.is_volatile(index).unwrap_or(false) || !mutable_hive_owns_path {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
     /// Whether the slot at `idx` has been detached by [`Self::detach_subtree`].
     pub fn is_detached(&self, idx: usize) -> bool {
         self.keys.get(idx).is_some_and(|k| k.detached)
@@ -552,6 +568,39 @@ mod tests {
             ov.is_volatile(again),
             Some(false),
             "reopening an implicit shadow with REG_OPTION_VOLATILE must not reclassify it"
+        );
+    }
+
+    #[test]
+    fn nonvolatile_shadow_yields_to_mutable_path_authority() {
+        let mut ov = RegistryOverlay::new();
+        let (shadow, created) =
+            ov.create_with_volatility(r"\registry\machine\software\microsoft\setupcopy", false);
+        assert!(created);
+
+        assert_eq!(
+            ov.find_for_path_authority(r"\registry\machine\software\microsoft\setupcopy", false),
+            Some(shadow),
+            "without mounted mutable ownership the shadow remains the only writable authority"
+        );
+        assert_eq!(
+            ov.find_for_path_authority(r"\registry\machine\software\microsoft\setupcopy", true),
+            None,
+            "mounted mutable hives must outrank old nonvolatile overlay shadows"
+        );
+    }
+
+    #[test]
+    fn volatile_overlay_stays_authoritative_over_mutable_path() {
+        let mut ov = RegistryOverlay::new();
+        let (volatile, created) =
+            ov.create_with_volatility(r"\registry\user\s-1-5-21-1\volatile environment", true);
+        assert!(created);
+
+        assert_eq!(
+            ov.find_for_path_authority(r"\registry\user\s-1-5-21-1\volatile environment", true),
+            Some(volatile),
+            "explicit volatile keys still shadow mounted mutable hives"
         );
     }
 
