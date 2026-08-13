@@ -6042,8 +6042,9 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     //     At least one call was on a key that lives in a mounted mutable hive, and that dirty boot
     //     hive was checkpointed into the writable config tree: the ActiveComputerName path is now a
     //     real SYSTEM-hive write, not a registry-overlay shadow or borrowed boot-media save.
-    //     Volatile overlay flushes remain reported separately for the D4 volatile-hive cleanup. The
-    //     counters CANNOT move if the SSN is unserviced: the caller parks instead.
+    //     True volatile overlay flushes remain reported separately for the D4 volatile-hive cleanup.
+    //     Non-volatile overlay shadows do not contribute to that counter. The counters CANNOT move
+    //     if the SSN is unserviced: the caller parks instead.
     let table_ok = nt_syscall_abi::ssn_of("NtFlushKey") == Some(83)
         && nt_syscall_abi::exact_argc_of("NtFlushKey") == Some(1);
     check(

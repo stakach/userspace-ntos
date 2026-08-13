@@ -18300,8 +18300,10 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 REG_FLUSH_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
-                if overlay_key_idx(key).is_some() {
-                    REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
+                if let Some(index) = overlay_key_idx(key) {
+                    if self.overlay.is_volatile(index).unwrap_or(false) {
+                        REG_FLUSH_KEY_VOLATILE.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else if let Some(mutable_key) = self.mutable_registry_key(key) {
                     REG_FLUSH_KEY_MUTABLE.fetch_add(1, Ordering::Relaxed);
                     let dirty = self

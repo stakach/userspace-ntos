@@ -1068,6 +1068,11 @@ before unrelated executive traffic monopolises the receive loop.
   `REG_OPTION_VOLATILE`. Remaining D4 work is volatile hive/query metadata, log replay integration
   for mutable checkpoints, and broader setup/user-profile durability semantics beyond the current
   desktop repeat-boot proof.
+  The follow-up volatility-accounting slice keeps the API boundary aligned with NT5/ReactOS:
+  `NtQueryKey(KeyFlagsInformation)` remains `KcbUserFlags`-shaped rather than pretending that
+  `REG_OPTION_VOLATILE` is a query flag, while `NtFlushKey` now classifies overlay keys through the
+  overlay's first-class volatility bit. Only true volatile overlay keys increment the volatile-flush
+  diagnostic; non-volatile overlay shadows are no longer counted as volatile hive behavior.
 
 ## Immediate Iteration
 
