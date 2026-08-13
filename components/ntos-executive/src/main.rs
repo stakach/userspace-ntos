@@ -1154,9 +1154,9 @@ pub const SSN_NT_QUERY_FULL_ATTRIBUTES_FILE: u64 = 156;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
 pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
-/// PnP manager syscalls imported by umpnpmgr. We export and route them, but the executive has no
-/// PnP device tree/event queue yet, so the handler returns STATUS_NOT_IMPLEMENTED instead of
-/// fabricating hardware/device-manager success.
+/// PnP manager syscalls imported by umpnpmgr. Routed to the executive's CM-backed PnP surface:
+/// devnode install events, root-bus relations, status/property queries, and control acknowledgements
+/// are answered from real registry-indexed device state.
 pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
 pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
 /// Obsolete event-pair object type imported by legacy shell extensions. No event-pair object
@@ -15377,6 +15377,7 @@ const BOOT_DRIVER_OBJECT_PATH_MAX: usize = 96;
 const BOOT_DRIVER_IMAGE_PATH_MAX: usize = 180;
 const BOOT_DRIVER_DEVNODE_PATH_MAX: usize = 128;
 const BOOT_DRIVER_ID_BYTES_MAX: usize = 96;
+const PNP_RUNTIME_STATUS_CAP: usize = 64;
 
 #[derive(Clone, Copy)]
 struct InlineAscii<const N: usize> {
@@ -15411,6 +15412,38 @@ impl<const N: usize> InlineAscii<N> {
 
     fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PnpRuntimeStatusRecord {
+    instance_id: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    status: u32,
+    problem: u32,
+    occupied: bool,
+}
+
+impl PnpRuntimeStatusRecord {
+    const fn empty() -> Self {
+        Self {
+            instance_id: InlineAscii::empty(),
+            status: 0,
+            problem: 0,
+            occupied: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PnpRuntimeStatusTable {
+    records: [PnpRuntimeStatusRecord; PNP_RUNTIME_STATUS_CAP],
+}
+
+impl PnpRuntimeStatusTable {
+    const fn empty() -> Self {
+        Self {
+            records: [PnpRuntimeStatusRecord::empty(); PNP_RUNTIME_STATUS_CAP],
+        }
     }
 }
 
@@ -17814,6 +17847,15 @@ struct ExecNtHandler {
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
+    /// Cursor over the CM-indexed PnP device-install event stream. `NtGetPlugPlayEvent` exposes the
+    /// current devnode until umpnpmgr acknowledges it through `PlugPlayControlUserResponse`.
+    pnp_event_cursor: usize,
+    /// Dispatcher event used to park `NtGetPlugPlayEvent` callers once the CM-backed stream drains.
+    /// Zero means the event has not been allocated yet.
+    pnp_notify_event: u64,
+    /// Runtime `DN_*` / `CM_PROB_*` status owned by PnP control calls. Devnode identity still comes
+    /// from CM; this table only records mutable status overlays requested by umpnpmgr.
+    pnp_status: PnpRuntimeStatusTable,
     /// Authentic CSR accept: when a hosted Win32 client's `NtSecureConnectPort(\Windows\ApiPort)`
     /// leaves the broker connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread

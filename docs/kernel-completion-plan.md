@@ -4854,3 +4854,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   than status remaps or synthetic success paths. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  B3 PnP syscall surface cleanup (2026-08-13): `NtGetPlugPlayEvent` and `NtPlugPlayControl` no
+  longer terminate in the executive's generic `STATUS_NOT_IMPLEMENTED` branch. The PnP manager
+  syscall pair is now TCB-gated and backed by CM-indexed devnodes: `NtGetPlugPlayEvent` exposes
+  real `DeviceInstallEvent` records with `GUID_DEVICE_ENUMERATED`, keeps the current event queued
+  until `PlugPlayControlUserResponse`, and parks drained callers on a dispatcher event instead of
+  returning an empty success. `NtPlugPlayControl` now validates known devnode actions against CM
+  identity, dequeues acknowledged events, reports root-bus parent/child/sibling and bus-relation
+  lists, answers interface-list size/copy requests from CM interfaces, serves dynamic PDO/enumerator
+  properties, and records bounded runtime device status for get/set/clear calls. Unsupported PnP
+  control classes return concrete NT failures; no class returns success without backing state.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.

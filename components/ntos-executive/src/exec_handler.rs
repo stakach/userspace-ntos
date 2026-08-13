@@ -19,7 +19,13 @@ const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_UNHANDLED_EXCEPTION: u32 = 0xC000_0144;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
@@ -44,6 +50,32 @@ const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
     r"\registry\machine\system\controlset001\control\servicegrouporder";
 const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
 const MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS: u32 = 64;
+const PNP_ROOT_DEVICE_INSTANCE: &str = r"HTREE\ROOT\0";
+const PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET: usize = 48;
+const PNP_EVENT_CATEGORY_DEVICE_INSTALL: u32 = 4;
+const PNP_CONTROL_ENUMERATE_DEVICE_LEN: usize = 24;
+const PNP_CONTROL_DEVICE_CONTROL_LEN: usize = 16;
+const PNP_CONTROL_QUERY_REMOVE_LEN: usize = 40;
+const PNP_CONTROL_USER_RESPONSE_LEN: usize = 16;
+const PNP_CONTROL_INTERFACE_LIST_LEN: usize = 48;
+const PNP_CONTROL_PROPERTY_LEN: usize = 40;
+const PNP_CONTROL_RELATED_DEVICE_LEN: usize = 40;
+const PNP_CONTROL_STATUS_LEN: usize = 32;
+const PNP_CONTROL_DEPTH_LEN: usize = 24;
+const PNP_CONTROL_RELATIONS_LEN: usize = 32;
+const PNP_PROPERTY_PHYSICAL_DEVICE_OBJECT_NAME: u32 = 1;
+const PNP_PROPERTY_ENUMERATOR_NAME: u32 = 9;
+const PNP_GET_PARENT_DEVICE: u32 = 1;
+const PNP_GET_CHILD_DEVICE: u32 = 2;
+const PNP_GET_SIBLING_DEVICE: u32 = 3;
+const PNP_GET_DEVICE_STATUS: u32 = 0;
+const PNP_SET_DEVICE_STATUS: u32 = 1;
+const PNP_CLEAR_DEVICE_STATUS: u32 = 2;
+const PNP_BUS_RELATIONS: u32 = 3;
+const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
+    0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05,
+    0x3f,
+];
 
 fn pipe_wait_deadline_100ns(request: &nt_io_manager::PipeWaitRequest) -> Option<u64> {
     let timeout = if request.timeout_specified {
@@ -2419,6 +2451,9 @@ impl ExecNtHandler {
         write_field!(pipe_name_wait_redrive, 0);
         write_field!(pipe_connect_redrive_server_fid, 0);
         write_field!(anon_event_seq, 0);
+        write_field!(pnp_event_cursor, 0);
+        write_field!(pnp_notify_event, 0);
+        write_field!(pnp_status, PnpRuntimeStatusTable::empty());
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
         write_field!(lpc_receive_park_port, 0);
@@ -12928,6 +12963,632 @@ impl ExecNtHandler {
             .is_some_and(|token| token.has_privilege(name))
     }
 
+    fn pnp_config_manager_snapshot() -> Option<nt_config_manager::ConfigManager> {
+        let system = system_hive_config_manager();
+        if system
+            .as_ref()
+            .is_some_and(|cm| cm.devnode_count() != 0)
+        {
+            return system;
+        }
+        let storage = config_hive_config_manager();
+        if storage
+            .as_ref()
+            .is_some_and(|cm| cm.devnode_count() != 0)
+        {
+            return storage;
+        }
+        system.or(storage)
+    }
+
+    fn pnp_is_root_instance(instance: &str) -> bool {
+        instance.eq_ignore_ascii_case(PNP_ROOT_DEVICE_INSTANCE)
+    }
+
+    fn pnp_devnode_exists(cm: &nt_config_manager::ConfigManager, instance: &str) -> bool {
+        Self::pnp_is_root_instance(instance) || cm.devnode(instance).is_some()
+    }
+
+    fn pnp_append_utf16_z(out: &mut alloc::vec::Vec<u8>, s: &str) {
+        append_utf16le(out, s);
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+
+    fn pnp_encode_multi_sz_from_strings(strings: &[alloc::string::String]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        for s in strings {
+            Self::pnp_append_utf16_z(&mut out, s);
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn pnp_encode_device_install_event(instance: &str) -> alloc::vec::Vec<u8> {
+        let total = PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET
+            .saturating_add(utf16le_byte_len(instance))
+            .saturating_add(2);
+        let mut out = alloc::vec![0u8; PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET];
+        out[..GUID_DEVICE_ENUMERATED_BYTES.len()].copy_from_slice(&GUID_DEVICE_ENUMERATED_BYTES);
+        out[16..20].copy_from_slice(&PNP_EVENT_CATEGORY_DEVICE_INSTALL.to_le_bytes());
+        out[36..40].copy_from_slice(&(total as u32).to_le_bytes());
+        Self::pnp_append_utf16_z(&mut out, instance);
+        out
+    }
+
+    fn pnp_event_wait_object(&mut self) -> Result<WaitObject, u32> {
+        if self.pnp_notify_event == 0 {
+            self.pnp_notify_event = self
+                .obj_create_internal_dispatcher_event(true, false)
+                .ok_or(STATUS_DEVICE_NOT_READY)?;
+        }
+        Ok(WaitObject::dispatcher(self.pnp_notify_event as usize))
+    }
+
+    unsafe fn pnp_read_u32(&self, va: u64) -> Result<u32, u32> {
+        let mut bytes = [0u8; 4];
+        if va == 0 || !self.xas_read(va, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    unsafe fn pnp_read_u64(&self, va: u64) -> Result<u64, u32> {
+        let mut bytes = [0u8; 8];
+        if va == 0 || !self.xas_read(va, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    unsafe fn pnp_read_device_instance(&self, control_buffer: u64) -> Result<alloc::string::String, u32> {
+        let name16 = self.read_unicode_string16(control_buffer)?;
+        let instance = utf16_units_to_string(&name16);
+        if instance.is_empty() {
+            Err(STATUS_INVALID_PARAMETER)
+        } else {
+            Ok(instance)
+        }
+    }
+
+    unsafe fn nt_get_plug_play_event(&mut self, args: &[u64]) -> u32 {
+        let reserved1 = args.first().copied().unwrap_or(0);
+        let reserved2 = args.get(1).copied().unwrap_or(0);
+        let buffer = args.get(2).copied().unwrap_or(0);
+        let buffer_size = args.get(3).copied().unwrap_or(0) as usize;
+        if reserved1 != 0 || reserved2 != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if !self.current_token_has_privilege(nt_security::SE_TCB) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            let Ok(object) = self.pnp_event_wait_object() else {
+                return STATUS_DEVICE_NOT_READY;
+            };
+            self.wait_park_event = object.raw() as i64;
+            self.wait_deadline_100ns = u64::MAX;
+            return 0x102;
+        };
+        let Some(devnode) = cm.devnodes().get(self.pnp_event_cursor) else {
+            let Ok(object) = self.pnp_event_wait_object() else {
+                return STATUS_DEVICE_NOT_READY;
+            };
+            self.wait_park_event = object.raw() as i64;
+            self.wait_deadline_100ns = u64::MAX;
+            return 0x102;
+        };
+
+        let event = Self::pnp_encode_device_install_event(&devnode.instance_id);
+        if buffer_size < event.len() {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        if !self.probe_user_output(buffer, event.len()) || !self.xas_try_write_buf(buffer, &event) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if self.pnp_notify_event != 0 {
+            let _ = self.events.reset_existing(self.pnp_notify_event);
+        }
+        0
+    }
+
+    unsafe fn nt_plug_play_control(&mut self, args: &[u64]) -> u32 {
+        let control_class = args.first().copied().unwrap_or(0) as u32;
+        let buffer = args.get(1).copied().unwrap_or(0);
+        let buffer_len = args.get(2).copied().unwrap_or(0) as usize;
+        if !self.current_token_has_privilege(nt_security::SE_TCB) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        if buffer_len != 0 && !self.probe_user_output(buffer, buffer_len) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        match control_class {
+            0 => self.pnp_control_known_device_action(buffer, buffer_len, PNP_CONTROL_ENUMERATE_DEVICE_LEN),
+            3 | 4 | 20 => {
+                self.pnp_control_known_device_action(buffer, buffer_len, PNP_CONTROL_DEVICE_CONTROL_LEN)
+            }
+            6 => self.pnp_control_query_remove(buffer, buffer_len),
+            7 => self.pnp_control_user_response(buffer, buffer_len),
+            9 => self.pnp_control_interface_device_list(buffer, buffer_len),
+            10 => self.pnp_control_property(buffer, buffer_len),
+            12 => self.pnp_control_related_device(buffer, buffer_len),
+            14 => self.pnp_control_device_status(buffer, buffer_len),
+            15 => self.pnp_control_device_depth(buffer, buffer_len),
+            16 => self.pnp_control_device_relations(buffer, buffer_len),
+            _ => STATUS_NOT_SUPPORTED,
+        }
+    }
+
+    unsafe fn pnp_control_known_device_action(
+        &self,
+        buffer: u64,
+        buffer_len: usize,
+        required_len: usize,
+    ) -> u32 {
+        if buffer == 0 || buffer_len < required_len {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        match Self::pnp_config_manager_snapshot() {
+            Some(cm) if Self::pnp_devnode_exists(&cm, &instance) => 0,
+            _ => STATUS_NO_SUCH_DEVICE,
+        }
+    }
+
+    unsafe fn pnp_control_query_remove(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_QUERY_REMOVE_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        match Self::pnp_config_manager_snapshot() {
+            Some(cm) if Self::pnp_devnode_exists(&cm, &instance) => 0,
+            _ => STATUS_NO_SUCH_DEVICE,
+        }
+    }
+
+    unsafe fn pnp_control_user_response(&mut self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_USER_RESPONSE_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        self.pnp_event_cursor = self.pnp_event_cursor.saturating_add(1);
+        if let Some(cm) = Self::pnp_config_manager_snapshot() {
+            if self.pnp_event_cursor < cm.devnode_count() && self.pnp_notify_event != 0 {
+                let _ = self.events.set_existing(self.pnp_notify_event);
+                unsafe { wait_wake_dispatcher_set(self) };
+            }
+        }
+        0
+    }
+
+    unsafe fn pnp_write_sized_output(
+        &self,
+        size_field: u64,
+        output: u64,
+        output_size: usize,
+        data: &[u8],
+    ) -> u32 {
+        if !self.xas_write_u32(size_field, data.len().min(u32::MAX as usize) as u32) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if data.is_empty() {
+            return 0;
+        }
+        if output == 0 || output_size < data.len() {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        if !self.probe_user_output(output, data.len()) || !self.xas_try_write_buf(output, data) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    fn pnp_guid_text_to_memory_bytes(guid: &str) -> Option<[u8; 16]> {
+        fn hex(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let mut text = [0u8; 16];
+        let mut high: Option<u8> = None;
+        let mut n = 0usize;
+        for b in guid.bytes() {
+            if matches!(b, b'{' | b'}' | b'-') {
+                continue;
+            }
+            let digit = hex(b)?;
+            if let Some(h) = high.take() {
+                if n >= text.len() {
+                    return None;
+                }
+                text[n] = (h << 4) | digit;
+                n += 1;
+            } else {
+                high = Some(digit);
+            }
+        }
+        if high.is_some() || n != text.len() {
+            return None;
+        }
+        Some([
+            text[3], text[2], text[1], text[0], text[5], text[4], text[7], text[6], text[8],
+            text[9], text[10], text[11], text[12], text[13], text[14], text[15],
+        ])
+    }
+
+    unsafe fn pnp_control_interface_device_list(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_INTERFACE_LIST_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let filter_guid = match self.pnp_read_u64(buffer + 16) {
+            Ok(ptr) => ptr,
+            Err(status) => return status,
+        };
+        let output = match self.pnp_read_u64(buffer + 32) {
+            Ok(ptr) => ptr,
+            Err(status) => return status,
+        };
+        let output_size = match self.pnp_read_u32(buffer + 40) {
+            Ok(size) => size as usize,
+            Err(status) => return status,
+        };
+        let mut guid = [0u8; 16];
+        if filter_guid == 0 || !self.xas_read(filter_guid, &mut guid) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+
+        let mut list = alloc::vec::Vec::new();
+        for interface in cm.interfaces() {
+            let Some(interface_guid) = Self::pnp_guid_text_to_memory_bytes(&interface.guid) else {
+                continue;
+            };
+            if interface_guid != guid || !interface.enabled {
+                continue;
+            }
+            if !Self::pnp_is_root_instance(&instance) {
+                let Some(devnode) = cm.devnode(&instance) else {
+                    continue;
+                };
+                if interface.devnode != devnode.id {
+                    continue;
+                }
+            }
+            Self::pnp_append_utf16_z(&mut list, &interface.symbolic_link);
+        }
+        list.extend_from_slice(&0u16.to_le_bytes());
+        if !self.xas_write_u32(buffer + 40, list.len().min(u32::MAX as usize) as u32) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if output != 0 && output_size >= list.len() {
+            if !self.probe_user_output(output, list.len()) || !self.xas_try_write_buf(output, &list) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        0
+    }
+
+    fn pnp_dynamic_property_bytes(
+        cm: &nt_config_manager::ConfigManager,
+        instance: &str,
+        property: u32,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        if Self::pnp_is_root_instance(instance) {
+            return match property {
+                PNP_PROPERTY_ENUMERATOR_NAME => Some(registry_sz_bytes("HTREE")),
+                _ => None,
+            };
+        }
+        let devnode = cm.devnode(instance)?;
+        match property {
+            PNP_PROPERTY_PHYSICAL_DEVICE_OBJECT_NAME => {
+                devnode.pdo_name.as_deref().map(registry_sz_bytes)
+            }
+            PNP_PROPERTY_ENUMERATOR_NAME => {
+                let enumerator = instance.split('\\').next().unwrap_or("");
+                (!enumerator.is_empty()).then(|| registry_sz_bytes(enumerator))
+            }
+            _ => None,
+        }
+    }
+
+    unsafe fn pnp_control_property(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_PROPERTY_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let property = match self.pnp_read_u32(buffer + 16) {
+            Ok(property) => property,
+            Err(status) => return status,
+        };
+        let output = match self.pnp_read_u64(buffer + 24) {
+            Ok(ptr) => ptr,
+            Err(status) => return status,
+        };
+        let output_size = match self.pnp_read_u32(buffer + 32) {
+            Ok(size) => size as usize,
+            Err(status) => return status,
+        };
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+        let Some(data) = Self::pnp_dynamic_property_bytes(&cm, &instance, property) else {
+            let _ = self.xas_write_u32(buffer + 32, 0);
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        self.pnp_write_sized_output(buffer + 32, output, output_size, &data)
+    }
+
+    fn pnp_relation_target(
+        cm: &nt_config_manager::ConfigManager,
+        instance: &str,
+        relation: u32,
+    ) -> Option<alloc::string::String> {
+        match relation {
+            PNP_GET_PARENT_DEVICE => {
+                (!Self::pnp_is_root_instance(instance)).then(|| PNP_ROOT_DEVICE_INSTANCE.into())
+            }
+            PNP_GET_CHILD_DEVICE => {
+                if Self::pnp_is_root_instance(instance) {
+                    cm.devnodes().first().map(|devnode| devnode.instance_id.clone())
+                } else {
+                    None
+                }
+            }
+            PNP_GET_SIBLING_DEVICE => {
+                if Self::pnp_is_root_instance(instance) {
+                    return None;
+                }
+                let pos = cm
+                    .devnodes()
+                    .iter()
+                    .position(|devnode| devnode.instance_id.eq_ignore_ascii_case(instance))?;
+                cm.devnodes()
+                    .get(pos.saturating_add(1))
+                    .map(|devnode| devnode.instance_id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    unsafe fn pnp_control_related_device(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_RELATED_DEVICE_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let relation = match self.pnp_read_u32(buffer + 16) {
+            Ok(relation) => relation,
+            Err(status) => return status,
+        };
+        if !matches!(
+            relation,
+            PNP_GET_PARENT_DEVICE | PNP_GET_CHILD_DEVICE | PNP_GET_SIBLING_DEVICE
+        ) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let output = match self.pnp_read_u64(buffer + 24) {
+            Ok(ptr) => ptr,
+            Err(status) => return status,
+        };
+        let output_size = match self.pnp_read_u32(buffer + 32) {
+            Ok(size) => size as usize,
+            Err(status) => return status,
+        };
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+        let Some(related) = Self::pnp_relation_target(&cm, &instance, relation) else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        let mut data = alloc::vec::Vec::new();
+        append_utf16le(&mut data, &related);
+        self.pnp_write_sized_output(buffer + 32, output, output_size, &data)
+    }
+
+    fn pnp_status_slot(&self, instance: &str) -> Option<usize> {
+        self.pnp_status.records.iter().position(|record| {
+            record.occupied && record.instance_id.as_str().eq_ignore_ascii_case(instance)
+        })
+    }
+
+    fn pnp_status_free_slot(&self) -> Option<usize> {
+        self.pnp_status
+            .records
+            .iter()
+            .position(|record| !record.occupied)
+    }
+
+    fn pnp_runtime_status(&self, instance: &str) -> (u32, u32) {
+        self.pnp_status_slot(instance)
+            .map(|slot| {
+                let record = self.pnp_status.records[slot];
+                (record.status, record.problem)
+            })
+            .unwrap_or((0, 0))
+    }
+
+    fn pnp_store_runtime_status(&mut self, instance: &str, status: u32, problem: u32) -> u32 {
+        if status == 0 && problem == 0 {
+            if let Some(slot) = self.pnp_status_slot(instance) {
+                self.pnp_status.records[slot] = PnpRuntimeStatusRecord::empty();
+            }
+            return 0;
+        }
+        let Some(slot) = self
+            .pnp_status_slot(instance)
+            .or_else(|| self.pnp_status_free_slot())
+        else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let mut record = PnpRuntimeStatusRecord::empty();
+        if !record.instance_id.set_str(instance) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        record.status = status;
+        record.problem = problem;
+        record.occupied = true;
+        self.pnp_status.records[slot] = record;
+        0
+    }
+
+    fn pnp_clear_runtime_status(&mut self, instance: &str, status: u32, problem: u32) -> u32 {
+        let (current_status, current_problem) = self.pnp_runtime_status(instance);
+        let next_status = current_status & !status;
+        let next_problem = if problem == 0 || problem == current_problem {
+            0
+        } else {
+            current_problem
+        };
+        self.pnp_store_runtime_status(instance, next_status, next_problem)
+    }
+
+    unsafe fn pnp_control_device_status(&mut self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_STATUS_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let operation = match self.pnp_read_u32(buffer + 16) {
+            Ok(operation) => operation,
+            Err(status) => return status,
+        };
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+        match operation {
+            PNP_GET_DEVICE_STATUS => {
+                let (status, problem) = self.pnp_runtime_status(&instance);
+                if !self.xas_write_u32(buffer + 20, status) || !self.xas_write_u32(buffer + 24, problem) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                0
+            }
+            PNP_SET_DEVICE_STATUS => {
+                let status = match self.pnp_read_u32(buffer + 20) {
+                    Ok(status) => status,
+                    Err(status) => return status,
+                };
+                let problem = match self.pnp_read_u32(buffer + 24) {
+                    Ok(problem) => problem,
+                    Err(status) => return status,
+                };
+                self.pnp_store_runtime_status(&instance, status, problem)
+            }
+            PNP_CLEAR_DEVICE_STATUS => {
+                let status = match self.pnp_read_u32(buffer + 20) {
+                    Ok(status) => status,
+                    Err(status) => return status,
+                };
+                let problem = match self.pnp_read_u32(buffer + 24) {
+                    Ok(problem) => problem,
+                    Err(status) => return status,
+                };
+                self.pnp_clear_runtime_status(&instance, status, problem)
+            }
+            _ => STATUS_INVALID_PARAMETER,
+        }
+    }
+
+    unsafe fn pnp_control_device_depth(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_DEPTH_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+        let depth = if Self::pnp_is_root_instance(&instance) { 0 } else { 1 };
+        if !self.xas_write_u32(buffer + 16, depth) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    unsafe fn pnp_control_device_relations(&self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_RELATIONS_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        let relations = match self.pnp_read_u32(buffer + 16) {
+            Ok(relations) => relations,
+            Err(status) => return status,
+        };
+        let output_size = match self.pnp_read_u32(buffer + 20) {
+            Ok(size) => size as usize,
+            Err(status) => return status,
+        };
+        let output = match self.pnp_read_u64(buffer + 24) {
+            Ok(ptr) => ptr,
+            Err(status) => return status,
+        };
+        if relations > PNP_BUS_RELATIONS {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(cm) = Self::pnp_config_manager_snapshot() else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        if !Self::pnp_devnode_exists(&cm, &instance) {
+            return STATUS_NO_SUCH_DEVICE;
+        }
+
+        let data = if relations == PNP_BUS_RELATIONS && Self::pnp_is_root_instance(&instance) {
+            let ids: alloc::vec::Vec<alloc::string::String> = cm
+                .devnodes()
+                .iter()
+                .map(|devnode| devnode.instance_id.clone())
+                .collect();
+            Self::pnp_encode_multi_sz_from_strings(&ids)
+        } else {
+            alloc::vec::Vec::new()
+        };
+        self.pnp_write_sized_output(buffer + 20, output, output_size, &data)
+    }
+
     unsafe fn write_access_check_privilege_set(
         &self,
         privilege_set: u64,
@@ -23350,9 +24011,8 @@ impl ExecNtHandler {
                     0
                 }
             }
-            // PnP has no executive device tree/event queue yet; fail explicitly rather than
-            // fabricating hardware/device-manager success or blocking on a nonexistent event.
-            NativeService::NtGetPlugPlayEvent | NativeService::NtPlugPlayControl => 0xC000_0002,
+            NativeService::NtGetPlugPlayEvent => unsafe { self.nt_get_plug_play_event(args) },
+            NativeService::NtPlugPlayControl => unsafe { self.nt_plug_play_control(args) },
             NativeService::NtSetSystemPowerState => {
                 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
                 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
