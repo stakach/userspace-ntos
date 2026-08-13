@@ -777,6 +777,76 @@ fn manager_boot_mutate_flush_survives_restart() {
 }
 
 #[test]
+fn manager_replays_deletes_and_key_metadata_after_checkpoint() {
+    let mut mgr = HiveManager::new(MemoryHiveIoProvider::new());
+    let mut hive = mgr.boot(HiveKind::Software).unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"Classes\CLSID\{00000000-0000-0000-0000-000000000001}",
+            name: "Stale",
+            value_type: RegistryValueType::Sz,
+            data: b"remove-me",
+        },
+    )
+    .unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"Classes\DeleteMe",
+            name: "Payload",
+            value_type: RegistryValueType::Binary,
+            data: b"gone",
+        },
+    )
+    .unwrap();
+    mgr.flush(&mut hive).unwrap();
+
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::DeleteValue {
+            path: r"Classes\CLSID\{00000000-0000-0000-0000-000000000001}",
+            name: "Stale",
+        },
+    )
+    .unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetKeyClass {
+            path: r"Classes\CLSID\{00000000-0000-0000-0000-000000000001}",
+            class_name: Some("OleServer"),
+        },
+    )
+    .unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetKeySecurityDescriptor {
+            path: r"Classes\CLSID\{00000000-0000-0000-0000-000000000001}",
+            descriptor: b"sd",
+        },
+    )
+    .unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::DeleteKey {
+            path: r"Classes\DeleteMe",
+        },
+    )
+    .unwrap();
+
+    mgr.provider_mut().crash();
+    let provider = mgr.into_provider();
+    let booted = HiveManager::new(provider).boot(HiveKind::Software).unwrap();
+    let clsid = booted
+        .open_key(r"Classes\CLSID\{00000000-0000-0000-0000-000000000001}")
+        .unwrap();
+    assert!(booted.query_value(clsid, "Stale").is_none());
+    assert_eq!(booted.key_class(clsid), Some("OleServer"));
+    assert_eq!(booted.key_security_descriptor(clsid), Some(&b"sd"[..]));
+    assert!(booted.open_key(r"Classes\DeleteMe").is_none());
+}
+
+#[test]
 fn log_replay_idempotent_and_torn() {
     let mut h = Hive::new(HiveKind::System);
     let rec = encode_log_record(

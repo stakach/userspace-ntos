@@ -1073,6 +1073,12 @@ before unrelated executive traffic monopolises the receive loop.
   `REG_OPTION_VOLATILE` is a query flag, while `NtFlushKey` now classifies overlay keys through the
   overlay's first-class volatility bit. Only true volatile overlay keys increment the volatile-flush
   diagnostic; non-volatile overlay shadows are no longer counted as volatile hive behavior.
+  The log-replay groundwork slice expands `nt-hive-core`'s append-only hive journal to cover the
+  mutable operations the executive already issues: value deletion now replays for real, and key
+  deletion, key class metadata, and key security descriptors have explicit log records with
+  restart/replay tests across a checkpoint boundary. This is still crate-local groundwork; the next
+  D4 step is wiring boot/profile hive mutation paths through a real provider-backed manager rather
+  than direct image-only checkpointing.
 
 ## Immediate Iteration
 

@@ -20,6 +20,9 @@ const LOG_HEADER_LEN: usize = 4 + 2 + 2 + 8 + 4 + 4 + 4; // 28
 const OP_CREATE_KEY: u16 = 1;
 const OP_SET_VALUE: u16 = 2;
 const OP_DELETE_VALUE: u16 = 3;
+const OP_DELETE_KEY: u16 = 4;
+const OP_SET_KEY_CLASS: u16 = 5;
+const OP_SET_KEY_SECURITY_DESCRIPTOR: u16 = 6;
 
 /// Why decoding a hive image/log failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -575,6 +578,17 @@ pub enum HiveLogOp<'a> {
         path: &'a str,
         name: &'a str,
     },
+    DeleteKey {
+        path: &'a str,
+    },
+    SetKeyClass {
+        path: &'a str,
+        class_name: Option<&'a str>,
+    },
+    SetKeySecurityDescriptor {
+        path: &'a str,
+        descriptor: &'a [u8],
+    },
 }
 
 /// Encode one log record (spec §12.3): an `HLR1` header (op + sequence + CRCs) + payload.
@@ -601,6 +615,26 @@ pub fn encode_log_record(op: &HiveLogOp, sequence: u64) -> Vec<u8> {
             p.str16(path);
             p.str16(name);
             OP_DELETE_VALUE
+        }
+        HiveLogOp::DeleteKey { path } => {
+            p.str16(path);
+            OP_DELETE_KEY
+        }
+        HiveLogOp::SetKeyClass { path, class_name } => {
+            p.str16(path);
+            match class_name {
+                Some(class_name) => {
+                    p.u8(1);
+                    p.str16(class_name);
+                }
+                None => p.u8(0),
+            }
+            OP_SET_KEY_CLASS
+        }
+        HiveLogOp::SetKeySecurityDescriptor { path, descriptor } => {
+            p.str16(path);
+            p.blob(descriptor);
+            OP_SET_KEY_SECURITY_DESCRIPTOR
         }
     };
     let payload = p.buf;
@@ -675,8 +709,32 @@ fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) {
             }
         }
         OP_DELETE_VALUE => {
-            if let (Some(_path), Some(_name)) = (r.str16(), r.str16()) {
-                // v0.1: value deletes are logged but not required for the acceptance path.
+            if let (Some(path), Some(name)) = (r.str16(), r.str16()) {
+                if let Some(key) = hive.open_key(&path) {
+                    hive.delete_value(key, &name);
+                }
+            }
+        }
+        OP_DELETE_KEY => {
+            if let Some(path) = r.str16() {
+                if let Some(key) = hive.open_key(&path) {
+                    let _ = hive.delete_key(key);
+                }
+            }
+        }
+        OP_SET_KEY_CLASS => {
+            if let (Some(path), Some(has_class)) = (r.str16(), r.u8()) {
+                let class_name = if has_class != 0 { r.str16() } else { None };
+                if let Some(key) = hive.open_key(&path) {
+                    hive.set_key_class(key, class_name.as_deref());
+                }
+            }
+        }
+        OP_SET_KEY_SECURITY_DESCRIPTOR => {
+            if let (Some(path), Some(descriptor)) = (r.str16(), r.blob()) {
+                if let Some(key) = hive.open_key(&path) {
+                    hive.set_key_security_descriptor(key, &descriptor);
+                }
             }
         }
         _ => {}
