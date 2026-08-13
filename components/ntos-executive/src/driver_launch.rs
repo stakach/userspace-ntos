@@ -335,7 +335,7 @@ const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
-/// FILE_OBJECT must remain available for close. See [`FILE_OBJECTS`].
+/// FILE_OBJECT must remain available for close through the per-open FILE_OBJECT registry.
 const IRP_MJ_CLOSE: u64 = 0x02;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
 
@@ -356,9 +356,8 @@ struct PendingIrp {
     /// This pending IRP completes with bytes for the caller's read/output buffer. `READ` and
     /// `FSCTL_PIPE_TRANSCEIVE` both enter npfs's read queue and are completed by a peer write.
     read_completion: bool,
-    /// Whether THIS IRP owns the FILE_OBJECT block (a transient one, not the per-open object in
-    /// [`FILE_OBJECTS`]). Only a transient FILE_OBJECT may be freed on completion — see
-    /// [`fo_for_open`].
+    /// Whether THIS IRP owns the FILE_OBJECT block. Only a transient FILE_OBJECT may be freed on
+    /// completion; registered per-open FILE_OBJECTs live until cleanup/close.
     owns_fo: bool,
     _pad: [u8; 5],
 }
@@ -1018,9 +1017,7 @@ struct FileObjectSlot {
     fo: u64,
 }
 
-const FILE_OBJECT_CAP: usize = 64;
-static mut FILE_OBJECTS: [FileObjectSlot; FILE_OBJECT_CAP] =
-    [FileObjectSlot { fid: 0, fo: 0 }; FILE_OBJECT_CAP];
+static mut FILE_OBJECTS: Option<Vec<FileObjectSlot>> = None;
 
 /// FILE_OBJECTs created for an open (one per open, not per IRP).
 pub(crate) static FSD_FO_OPENS: AtomicU64 = AtomicU64::new(0);
@@ -1033,15 +1030,29 @@ pub(crate) static FSD_FO_DANGLING: AtomicU64 = AtomicU64::new(0);
 /// …and no longer even CONTAINS a FILE_OBJECT (`Type != IO_TYPE_FILE` / wrong `Size`) — the hard,
 /// non-circular evidence of a use-after-free: the pool recycled the block under npfs' feet.
 pub(crate) static FSD_FO_CORRUPTED: AtomicU64 = AtomicU64::new(0);
-/// Opens rejected because the per-open FILE_OBJECT table was full.
-pub(crate) static FSD_FO_TABLE_FULL: AtomicU64 = AtomicU64::new(0);
+/// Opens rejected because the per-open FILE_OBJECT registry could not grow.
+pub(crate) static FSD_FO_TABLE_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn file_objects_mut() -> &'static mut Vec<FileObjectSlot> {
+    let slot = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn file_objects() -> Option<&'static Vec<FileObjectSlot>> {
+    (*core::ptr::addr_of!(FILE_OBJECTS)).as_ref()
+}
 
 /// The per-open FILE_OBJECT for `fid`, or 0.
 unsafe fn fo_lookup(fid: u64) -> u64 {
     if fid == 0 {
         return 0;
     }
-    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
+    let Some(table) = file_objects() else {
+        return 0;
+    };
     for slot in table.iter() {
         if slot.fid == fid {
             return slot.fo;
@@ -1050,14 +1061,24 @@ unsafe fn fo_lookup(fid: u64) -> u64 {
     0
 }
 
-unsafe fn fo_has_free_slot() -> bool {
-    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
-    table.iter().any(|slot| slot.fid == 0)
+unsafe fn fo_reserve_new_slot() -> bool {
+    let table = file_objects_mut();
+    if table.iter().any(|slot| slot.fid == 0) || table.len() < table.capacity() {
+        return true;
+    }
+    if table.try_reserve(1).is_ok() {
+        true
+    } else {
+        FSD_FO_TABLE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
 }
 
 /// Is `fo` one of the live per-open FILE_OBJECTs?
 unsafe fn fo_is_registered(fo: u64) -> bool {
-    let table = &*core::ptr::addr_of!(FILE_OBJECTS);
+    let Some(table) = file_objects() else {
+        return false;
+    };
     table.iter().any(|slot| slot.fid != 0 && slot.fo == fo)
 }
 
@@ -1067,7 +1088,7 @@ unsafe fn fo_register(fid: u64, fo: u64) -> bool {
     if fid == 0 || fo == 0 {
         return false;
     }
-    let table = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
+    let table = file_objects_mut();
     for slot in table.iter_mut() {
         if slot.fid == fid {
             if slot.fo != fo {
@@ -1084,8 +1105,13 @@ unsafe fn fo_register(fid: u64, fo: u64) -> bool {
             return true;
         }
     }
-    FSD_FO_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
-    false
+    if table.len() == table.capacity() && table.try_reserve(1).is_err() {
+        FSD_FO_TABLE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    table.push(FileObjectSlot { fid, fo });
+    FSD_FO_OPENS.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// Release the per-open FILE_OBJECT for `fid` (CLEANUP/CLOSE — the ONLY place a FILE_OBJECT dies).
@@ -1093,7 +1119,7 @@ unsafe fn fo_release(fid: u64) {
     if fid == 0 {
         return;
     }
-    let table = &mut *core::ptr::addr_of_mut!(FILE_OBJECTS);
+    let table = file_objects_mut();
     for slot in table.iter_mut() {
         if slot.fid == fid {
             pool_free(slot.fo);
@@ -6017,8 +6043,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         pool_free(slot.irp);
         // ★ The FILE_OBJECT is NOT freed here. It OUTLIVES the IRP: it belongs to the OPEN and npfs
         // keeps pointing at it (`Ccb->FileObject[end]`, written through on disconnect/close). Only a
-        // transient FILE_OBJECT — one this IRP itself owns because the per-open table was full — dies
-        // with the request. See [`FILE_OBJECTS`].
+        // transient FILE_OBJECT owned only by this IRP dies with the request.
         if slot.owns_fo {
             pool_free(slot.file_object);
         }
@@ -8385,8 +8410,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         0
     };
     let owns_fo = uses_file_object && existing == 0;
-    if owns_fo && crate::FSD_FILE_OBJECT_PER_OPEN && !fo_has_free_slot() {
-        FSD_FO_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
+    if owns_fo && crate::FSD_FILE_OBJECT_PER_OPEN && !fo_reserve_new_slot() {
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
     let fo = if !uses_file_object {

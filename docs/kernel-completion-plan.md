@@ -5012,3 +5012,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   attempt. The image file handle was already closed by `RtlpMapFile`, and a successful map owns its
   view lifetime through `NtUnmapViewOfSection`; failed maps no longer leak the section handle.
   Validation: `cargo fmt --all`, `./scripts/build_ntdll_dll.sh`, and `git diff --check`.
+
+  B3 hosted FSD FILE_OBJECT registry cleanup (2026-08-14): the per-open FILE_OBJECT lifetime
+  registry used by hosted FSD drivers no longer has the old 64-open static table. It is now
+  `Vec`-backed, reuses holes left by cleanup/close, and fallibly reserves registry storage before a
+  new hosted FILE_OBJECT can be handed to a driver that may retain it. Exhaustion remains a real
+  `STATUS_INSUFFICIENT_RESOURCES` path; successful opens are no longer capped by proof-era table
+  size. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.

@@ -4858,8 +4858,8 @@ IRP and `s_io_complete_request` freed it on every completion, but an FSD keeps t
 `FsContext`(+0x18) / `FsContext2`(+0x20), sets `PrivateCacheMap`(+0x30) = 1) into a block the FSD pool
 had already recycled - and the next consumer of that 0x100 size class is npfs' own
 `NP_DATA_QUEUE_ENTRY`/`NP_CCB`. Now a FILE_OBJECT is allocated once per open, keyed by the `FsContext`
-npfs hands back (`FILE_OBJECTS`, 64 slots), reused by every IRP on that open, and destroyed only at
-CLEANUP/CLOSE. `PendingIrp` also captures its `fid` at ISSUE time instead of re-reading
+npfs hands back in a growable per-open registry, reused by every IRP on that open, and destroyed only
+at CLEANUP/CLOSE. `PendingIrp` also captures its `fid` at ISSUE time instead of re-reading
 `FILE_OBJECT->FsContext` at completion time (npfs NULLs that field on disconnect, so a completion
 racing a disconnect used to key the delivered bytes under fid 0 and never wake the parked reader).
 **Measured: with the old lifetime npfs holds 30 dangling FILE_OBJECT pointers by the end of the npfs

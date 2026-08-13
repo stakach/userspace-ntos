@@ -1017,7 +1017,7 @@ pub const SSN_NT_SAVE_KEY: u64 = 215;
 /// per-IRP object that was freed on every completion — which leaves npfs' stored
 /// `Ccb->FileObject[end]` pointing at a RECYCLED pool block it then writes through
 /// (`NpSetFileObject(…, NULL, NULL, …)` on disconnect), corrupting its own data-queue bookkeeping.
-/// See [`driver_launch::FILE_OBJECTS`].
+/// See the per-open FILE_OBJECT registry in `driver_launch`.
 pub const FSD_FILE_OBJECT_PER_OPEN: bool = true;
 /// The npfs C-i round-trip verdict (three IRPs with mutually distinguishable completions, each of
 /// which returned its OWN result) — the behavioural leg of `exec_irp_transport_call_bound`. The
