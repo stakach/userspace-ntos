@@ -8707,14 +8707,14 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
 /// The caller's TEB is exposed through KPCR.PrcbData.CurrentThread.Teb by `win32k_dispatch` above.
 unsafe fn dispatch_gdi_batch_flush_callout(client_pi: u64, client_teb: u64) -> u64 {
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
-    const STATUS_NOT_IMPLEMENTED: u64 = 0xC000_0002u32 as u64;
+    const STATUS_DEVICE_NOT_READY: u64 = 0xC000_00A3u32 as u64;
 
     if client_pi == 0 || client_teb == 0 {
         return STATUS_INVALID_PARAMETER;
     }
     let routine = read_volatile((WIN32_CALLOUTS + WIN32_CALLOUT_BATCH_FLUSH_OFF) as *const u64);
     if routine == 0 {
-        return STATUS_NOT_IMPLEMENTED;
+        return STATUS_DEVICE_NOT_READY;
     }
 
     let flush: extern "win64" fn() -> i32 = core::mem::transmute(routine as *const ());

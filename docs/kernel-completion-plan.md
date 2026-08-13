@@ -4915,3 +4915,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   filesystem readiness status without fabricating a handle. Validation: `cargo fmt --all`,
   `cargo test -p nt-fs --quiet`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  Win32k GDI callout readiness cleanup (2026-08-13): the private GDI batch-flush callout selector no
+  longer returns `STATUS_NOT_IMPLEMENTED` when ReactOS win32k has not published
+  `WIN32_CALLOUTS_FPNS.BatchFlushRoutine`. Invalid client context still fails as
+  `STATUS_INVALID_PARAMETER`; a missing callout table entry now fails as `STATUS_DEVICE_NOT_READY`.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
