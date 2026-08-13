@@ -1022,9 +1022,9 @@ before unrelated executive traffic monopolises the receive loop.
 - `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
   `NtSaveKey`, writable-overlay `FileRenameInformation`, and file-backed hive atomic image
-  replacement are now real; D2/D4 still own the remaining live-hive authority and durability
-  semantics.
-- `[~]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
+  replacement are now real; D2 is closed for live-hive authority, while D4 still owns the remaining
+  volatile/journal/setup-profile durability semantics.
+- `[x]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
   reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
   mutable-hive key handles for non-volatile keys under mounted hives instead of creating overlay
@@ -1049,8 +1049,10 @@ before unrelated executive traffic monopolises the receive loop.
   explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Mounted
   mutable-hive subkeys now save as standalone subtree hive images; borrowed non-root `regf` keys
   still fail visibly because they are not mutable CM authority. Virtual-root security now belongs to
-  the sentinel key identities instead of overlay shadows; no known D2 class/security mechanism gap
-  remains, but D2 stays open until the next serialized boot validates the combined registry cleanup.
+  the sentinel key identities instead of overlay shadows. The visible desktop proof
+  `.tmp/run-desktop-profile-proof-refresh-20260813.log` validates the combined registry cleanup with
+  `294/294` checks passing, including `exec_default_user_profile_staged` and
+  `exec_explorer_shell_chrome_painted`.
 - `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
