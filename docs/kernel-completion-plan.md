@@ -5075,3 +5075,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   reuse. The reusable raw atom-table behavior is host-tested in `nt-kernel-exec`; integer atom
   add/delete/pin remain no-op success only because NT defines integer atoms as synthesized values
   outside the table.
+
+  Object namespace permanence cleanup (2026-08-14): the hosted executive namespace now models
+  `OBJ_PERMANENT` instead of treating `NtMakeTemporaryObject` as success-only scaffolding. Initial
+  kernel-created directories/links are permanent, caller-created directories, symbolic links, and
+  named dispatcher objects inherit `OBJECT_ATTRIBUTES.Attributes & OBJ_PERMANENT`, and
+  `NtMakeTemporaryObject` now resolves a real object handle with DELETE access before clearing
+  permanence and running the name-delete check. ProcessManager gained a host-tested cross-process
+  handle-object refcount helper so `NtClose` can unlink non-permanent named objects only after the
+  last real handle-table reference disappears. Deleted namespace entries are tombstoned without
+  shifting stable object indices, and path walks, handle resolution, and object queries reject those
+  tombstones instead of reopening stale names.

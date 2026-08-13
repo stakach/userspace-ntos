@@ -3236,6 +3236,22 @@ impl ProcessManager {
             .map(|p| p.handles.iter().filter(|e| e.is_some()).count())
             .unwrap_or(0)
     }
+
+    /// Count live handle-table entries across all processes that reference `object`. Hosts use this
+    /// after removing a handle entry to decide whether the backing NT object has reached its last
+    /// handle without depending on the private table layout.
+    pub fn handle_object_count(&self, object: HandleObject) -> usize {
+        self.processes
+            .values()
+            .map(|process| {
+                process
+                    .handles
+                    .iter()
+                    .filter(|entry| entry.as_ref().is_some_and(|entry| entry.object == object))
+                    .count()
+            })
+            .sum()
+    }
 }
 
 #[cfg(test)]

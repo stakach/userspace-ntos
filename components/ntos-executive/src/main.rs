@@ -17371,12 +17371,14 @@ const DIRECTORY_TRAVERSE_ACCESS: u32 = 0x0002;
 const DIRECTORY_CREATE_OBJECT_ACCESS: u32 = 0x0004;
 const DIRECTORY_CREATE_SUBDIRECTORY_ACCESS: u32 = 0x0008;
 const SYMBOLIC_LINK_QUERY_ACCESS: u32 = 0x0001;
+const OBJ_PERMANENT: u32 = 0x0000_0010;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const TIMER_MODIFY_STATE: u32 = 0x0002;
 const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
 const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const DELETE_ACCESS: u32 = 0x0001_0000;
 
 const OBJ_KIND_DIRECTORY: u8 = 0;
 const OBJ_KIND_SYMBOLIC_LINK: u8 = 1;
@@ -17385,6 +17387,7 @@ const OBJ_KIND_SEMAPHORE: u8 = 3;
 const OBJ_KIND_MUTANT: u8 = 4;
 const OBJ_KIND_LPC_PORT: u8 = 5;
 const OBJ_KIND_TIMER: u8 = 6;
+const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
@@ -17415,13 +17418,15 @@ fn take_object_namespace_growth_dirty() -> bool {
 /// allocation before the next bump-heap reset. NT object leaf names are allowed to be long enough for
 /// BaseNamedObjects mutexes such as userenv's per-profile mutex; `target` is link-only data; `payload`
 /// carries backing object identity for kinds whose state lives outside the namespace, such as LPC
-/// listen port handles.
+/// listen port handles. `permanent` mirrors `OBJ_PERMANENT`; non-permanent named objects are
+/// unlinked from the namespace when their last handle closes.
 #[derive(Clone, Copy)]
 struct ObjEntry {
     name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
     parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
     kind: u8,
+    permanent: bool,
     target: [u8; OBJ_NAME_CAP], // symbolic-link target (kind == 1)
     target_len: u8,
     payload: u64,
@@ -17441,7 +17446,8 @@ impl ObjEntry {
             name: [0; OBJ_NAME_CAP],
             name_len: 0,
             parent: 0,
-            kind: 0,
+            kind: OBJ_KIND_DELETED,
+            permanent: false,
             target: [0; OBJ_NAME_CAP],
             target_len: 0,
             payload: 0,
@@ -17455,11 +17461,13 @@ impl ObjEntry {
         parent: usize,
         kind: u8,
         target: &[u8],
+        permanent: bool,
     ) -> Option<usize> {
         let index = Self::push_zeroed(entries)?;
         let entry = &mut entries[index];
         entry.parent = parent;
         entry.kind = kind;
+        entry.permanent = permanent;
         let n = name.len().min(OBJ_NAME_CAP);
         entry.name[..n].copy_from_slice(&name[..n]);
         entry.name_len = n as u8;
@@ -17471,8 +17479,13 @@ impl ObjEntry {
         Some(index)
     }
 
-    fn push_dir(entries: &mut alloc::vec::Vec<Self>, name: &[u8], parent: usize) -> Option<usize> {
-        Self::push_kind(entries, name, parent, OBJ_KIND_DIRECTORY, &[])
+    fn push_dir(
+        entries: &mut alloc::vec::Vec<Self>,
+        name: &[u8],
+        parent: usize,
+        permanent: bool,
+    ) -> Option<usize> {
+        Self::push_kind(entries, name, parent, OBJ_KIND_DIRECTORY, &[], permanent)
     }
 
     fn push_symlink(
@@ -17480,15 +17493,37 @@ impl ObjEntry {
         name: &[u8],
         parent: usize,
         target: &[u8],
+        permanent: bool,
     ) -> Option<usize> {
-        Self::push_kind(entries, name, parent, OBJ_KIND_SYMBOLIC_LINK, target)
+        Self::push_kind(
+            entries,
+            name,
+            parent,
+            OBJ_KIND_SYMBOLIC_LINK,
+            target,
+            permanent,
+        )
     }
 
+    fn is_live(&self) -> bool {
+        self.kind != OBJ_KIND_DELETED
+    }
     fn name(&self) -> &[u8] {
         &self.name[..self.name_len as usize]
     }
     fn target(&self) -> &[u8] {
         &self.target[..self.target_len as usize]
+    }
+
+    fn unlink(&mut self) {
+        self.name = [0; OBJ_NAME_CAP];
+        self.name_len = 0;
+        self.parent = OBJ_PARENT_ANONYMOUS;
+        self.kind = OBJ_KIND_DELETED;
+        self.permanent = false;
+        self.target = [0; OBJ_NAME_CAP];
+        self.target_len = 0;
+        self.payload = 0;
     }
 }
 

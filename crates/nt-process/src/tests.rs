@@ -1572,6 +1572,27 @@ fn close_by_object_tag() {
 }
 
 #[test]
+fn count_handle_object_references_across_processes() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let object = HandleObject::Opaque(0x4f42_4a4e_0000_0042);
+    let first_handle = pm.insert_handle(first, object, 0).unwrap();
+    let second_handle = pm.insert_handle(second, object, 0).unwrap();
+    let other_handle = pm
+        .insert_handle(second, HandleObject::Opaque(0x4f42_4a4e_0000_0043), 0)
+        .unwrap();
+
+    assert_eq!(pm.handle_object_count(object), 2);
+    pm.close_handle(first, first_handle).unwrap();
+    assert_eq!(pm.handle_object_count(object), 1);
+    pm.close_handle(second, other_handle).unwrap();
+    assert_eq!(pm.handle_object_count(object), 1);
+    pm.close_handle(second, second_handle).unwrap();
+    assert_eq!(pm.handle_object_count(object), 0);
+}
+
+#[test]
 fn image_section_load_and_run_entry() {
     // Stage 1 (spec §20): load a PE with no imports, get a valid entry point.
     let mut pm = ProcessManager::new();

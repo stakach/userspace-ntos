@@ -1921,7 +1921,7 @@ unsafe fn publish_time_zone(
 #[inline(never)]
 fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     let mut v = alloc::vec::Vec::with_capacity(192);
-    ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT).expect("object namespace root"); // 0 = root "\"
+    ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT, true).expect("object namespace root"); // 0 = root "\"
     for d in [
         b"??".as_slice(),
         b"device",
@@ -1936,13 +1936,13 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"filesystem",
         b"security",
     ] {
-        ObjEntry::push_dir(&mut v, d, 0).expect("initial object directory");
+        ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
     let windows = v
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"windows")
         .expect("pre-created Windows object directory");
-    ObjEntry::push_dir(&mut v, b"windowstations", windows)
+    ObjEntry::push_dir(&mut v, b"windowstations", windows, true)
         .expect("initial WindowStations directory");
     let bno = v
         .iter()
@@ -1952,18 +1952,24 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         .iter()
         .position(|entry| entry.parent == 0 && entry.name() == b"sessions")
         .expect("pre-created Sessions object directory");
-    ObjEntry::push_dir(&mut v, b"bnolinks", sessions).expect("initial BnoLinks directory");
+    ObjEntry::push_dir(&mut v, b"bnolinks", sessions, true).expect("initial BnoLinks directory");
     let session0 = v.len();
-    ObjEntry::push_dir(&mut v, b"0", sessions).expect("initial Session 0 directory");
-    ObjEntry::push_symlink(&mut v, b"basenamedobjects", session0, b"\\basenamedobjects")
+    ObjEntry::push_dir(&mut v, b"0", sessions, true).expect("initial Session 0 directory");
+    ObjEntry::push_symlink(
+        &mut v,
+        b"basenamedobjects",
+        session0,
+        b"\\basenamedobjects",
+        true,
+    )
         .expect("initial BaseNamedObjects link");
-    ObjEntry::push_symlink(&mut v, b"global", bno, b"\\basenamedobjects")
+    ObjEntry::push_symlink(&mut v, b"global", bno, b"\\basenamedobjects", true)
         .expect("initial Global link");
-    ObjEntry::push_symlink(&mut v, b"local", bno, b"\\basenamedobjects")
+    ObjEntry::push_symlink(&mut v, b"local", bno, b"\\basenamedobjects", true)
         .expect("initial Local link");
-    ObjEntry::push_symlink(&mut v, b"session", bno, b"\\sessions\\bnolinks")
+    ObjEntry::push_symlink(&mut v, b"session", bno, b"\\sessions\\bnolinks", true)
         .expect("initial Session link");
-    ObjEntry::push_dir(&mut v, b"restricted", bno).expect("initial Restricted directory");
+    ObjEntry::push_dir(&mut v, b"restricted", bno, true).expect("initial Restricted directory");
     v
 }
 
@@ -2573,7 +2579,9 @@ impl ExecNtHandler {
                 print_str(b"[srm-init] \\SeLsaInitEvent name collision with non-event object\n");
             }
             None => {
-                if let Some(index) = self.obj_create(SELSA_INIT_EVENT, 0, OBJ_KIND_EVENT, &[]) {
+                if let Some(index) =
+                    self.obj_create(SELSA_INIT_EVENT, 0, OBJ_KIND_EVENT, &[], false)
+                {
                     self.events
                         .initialize(index as u64, EventKind::Notification, false);
                     print_str(b"[srm-init] provisioned \\SeLsaInitEvent obj=");
@@ -7896,6 +7904,21 @@ impl ExecNtHandler {
         }
     }
 
+    fn opaque_object_namespace_index(tag: u64) -> Option<(u8, usize)> {
+        let tag_kind = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG {
+            Some(OBJ_KIND_EVENT)
+        } else if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG {
+            Some(OBJ_KIND_SEMAPHORE)
+        } else if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG {
+            Some(OBJ_KIND_MUTANT)
+        } else if tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG {
+            Some(OBJ_KIND_TIMER)
+        } else {
+            Self::object_namespace_tag_kind(tag)
+        }?;
+        Some((tag_kind, (tag & 0xFFFF_FFFF) as usize))
+    }
+
     fn object_namespace_mapped_access(kind: u8, desired_access: u32) -> Option<u32> {
         match kind {
             OBJ_KIND_DIRECTORY => Some(Self::map_directory_object_access(desired_access)),
@@ -7906,6 +7929,9 @@ impl ExecNtHandler {
 
     fn mint_object_namespace_handle(&mut self, index: usize, desired_access: u32) -> Option<u64> {
         let entry = self.obj_ns.get(index)?;
+        if !entry.is_live() {
+            return None;
+        }
         let tag = Self::object_namespace_handle_tag(entry.kind, index)?;
         let access = Self::object_namespace_mapped_access(entry.kind, desired_access)?;
         let pid = self.pm_pid_for_pi(self.pi)?;
@@ -7926,6 +7952,9 @@ impl ExecNtHandler {
         if handle >= OBJ_HANDLE_BASE {
             let index = (handle - OBJ_HANDLE_BASE) as usize;
             let entry = self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
+            if !entry.is_live() {
+                return Err(STATUS_INVALID_HANDLE);
+            }
             if required_kind.is_some_and(|kind| entry.kind != kind) {
                 return Err(STATUS_OBJECT_TYPE_MISMATCH);
             }
@@ -7954,7 +7983,7 @@ impl ExecNtHandler {
         }
         let index = (tag & 0xFFFF_FFFF) as usize;
         let entry = self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
-        if entry.kind != tag_kind {
+        if !entry.is_live() || entry.kind != tag_kind {
             return Err(STATUS_INVALID_HANDLE);
         }
         Ok(index)
@@ -12201,24 +12230,21 @@ impl ExecNtHandler {
         direct_index: Option<usize>,
     ) -> Option<usize> {
         if let Some(index) = direct_index {
-            return self.obj_ns.get(index).map(|_| index);
+            return self
+                .obj_ns
+                .get(index)
+                .filter(|entry| entry.is_live())
+                .map(|_| index);
         }
         let tag = match object {
             nt_process::HandleObject::Opaque(tag) => tag,
             _ => return None,
         };
-        let index = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG
-            || tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG
-            || tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG
-            || tag & TIMER_HANDLE_TAG_MASK == TIMER_HANDLE_TAG
-            || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == DIRECTORY_OBJECT_HANDLE_TAG
-            || tag & OBJECT_NAMESPACE_HANDLE_TAG_MASK == SYMBOLIC_LINK_HANDLE_TAG
-        {
-            (tag & 0xFFFF_FFFF) as usize
-        } else {
-            return None;
-        };
-        self.obj_ns.get(index).map(|_| index)
+        let (kind, index) = Self::opaque_object_namespace_index(tag)?;
+        self.obj_ns
+            .get(index)
+            .filter(|entry| entry.is_live() && entry.kind == kind)
+            .map(|_| index)
     }
 
     fn query_object_resolve(
@@ -12246,7 +12272,10 @@ impl ExecNtHandler {
         }
         if handle >= OBJ_HANDLE_BASE {
             let index = (handle - OBJ_HANDLE_BASE) as usize;
-            self.obj_ns.get(index).ok_or(STATUS_INVALID_HANDLE)?;
+            self.obj_ns
+                .get(index)
+                .filter(|entry| entry.is_live())
+                .ok_or(STATUS_INVALID_HANDLE)?;
             return Ok((
                 nt_process::HandleObject::Opaque(handle),
                 PSEUDO_GRANTED_ACCESS,
@@ -12288,12 +12317,15 @@ impl ExecNtHandler {
         let mut count = 0usize;
         let mut cur = Some(index);
         while let Some(i) = cur {
-            if count == chain.len() || self.obj_ns.get(i).is_none() {
+            let Some(entry) = self.obj_ns.get(i) else {
+                break;
+            };
+            if count == chain.len() || !entry.is_live() {
                 break;
             }
             chain[count] = i;
             count += 1;
-            let parent = self.obj_ns[i].parent;
+            let parent = entry.parent;
             cur = if parent == OBJ_PARENT_ROOT {
                 None
             } else {
@@ -14370,6 +14402,9 @@ impl ExecNtHandler {
                     unsafe { self.dbgk_clear_peb_marks_for_object(object) };
                     self.pm.destroy_debug_object(object);
                 }
+            }
+            nt_process::HandleObject::Opaque(tag) => {
+                self.release_opaque_namespace_reference(tag);
             }
             _ => {}
         }
@@ -16618,6 +16653,80 @@ impl ExecNtHandler {
             self.obj_ns.pop();
         }
     }
+
+    fn obj_delete_name_check(&mut self, index: usize) {
+        let Some(entry) = self.obj_ns.get(index) else {
+            return;
+        };
+        if !entry.is_live()
+            || entry.permanent
+            || entry.name_len == 0
+            || entry.parent == OBJ_PARENT_ROOT
+            || entry.parent == OBJ_PARENT_ANONYMOUS
+        {
+            return;
+        }
+        match entry.kind {
+            OBJ_KIND_DIRECTORY | OBJ_KIND_SYMBOLIC_LINK | OBJ_KIND_LPC_PORT => {}
+            OBJ_KIND_EVENT => {
+                self.events.remove_existing(index as u64);
+            }
+            OBJ_KIND_TIMER => {
+                self.events.remove_existing(index as u64);
+                self.user_timer_remove(index as u64);
+            }
+            OBJ_KIND_SEMAPHORE => {
+                self.semaphores.remove(index as u64);
+            }
+            OBJ_KIND_MUTANT => {
+                self.mutants.remove(index as u64);
+            }
+            _ => return,
+        }
+        self.obj_ns[index].unlink();
+    }
+
+    fn release_opaque_namespace_reference(&mut self, tag: u64) {
+        let Some((kind, index)) = Self::opaque_object_namespace_index(tag) else {
+            return;
+        };
+        let Some(entry) = self.obj_ns.get(index) else {
+            return;
+        };
+        if !entry.is_live() || entry.kind != kind {
+            return;
+        }
+        if self
+            .pm
+            .handle_object_count(nt_process::HandleObject::Opaque(tag))
+            == 0
+        {
+            self.obj_delete_name_check(index);
+        }
+    }
+
+    fn nt_make_temporary_object(&mut self, handle: u64) -> u32 {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        let (object, granted_access, direct_index) = match self.query_object_resolve(handle) {
+            Ok(resolved) => resolved,
+            Err(status) => return status,
+        };
+        if handle < OBJ_HANDLE_BASE && granted_access & DELETE_ACCESS != DELETE_ACCESS {
+            return STATUS_ACCESS_DENIED;
+        }
+        let Some(index) = self.query_object_namespace_index(object, direct_index) else {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        };
+        if let Some(entry) = self.obj_ns.get_mut(index) {
+            if !entry.is_live() {
+                return 0xC000_0008;
+            }
+            entry.permanent = false;
+        }
+        self.obj_delete_name_check(index);
+        0
+    }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
     /// or a relative `ntsvcs`) to npfs's leaf form `\ntsvcs` (UTF-16, leading backslash). npfs's
     /// NpFsdCreate strips the device prefix; the leaf is what the VCB prefix tree keys on.
@@ -17618,11 +17727,15 @@ impl ExecNtHandler {
         let mut hops = 0u32;
 
         while index < components.len() {
-            if self.obj_ns.get(cur)?.kind != OBJ_KIND_DIRECTORY {
+            let cur_entry = self.obj_ns.get(cur)?;
+            if !cur_entry.is_live() || cur_entry.kind != OBJ_KIND_DIRECTORY {
                 return None;
             }
             let child = self.obj_child(cur, &components[index])?;
             let entry = self.obj_ns.get(child)?;
+            if !entry.is_live() {
+                return None;
+            }
             let final_component = index + 1 == components.len();
             if entry.kind == OBJ_KIND_SYMBOLIC_LINK && (!final_component || follow_final_link) {
                 hops += 1;
@@ -17662,7 +17775,7 @@ impl ExecNtHandler {
     pub(crate) fn obj_child(&self, parent: usize, leaf: &[u8]) -> Option<usize> {
         self.obj_ns
             .iter()
-            .position(|e| e.parent == parent && e.name() == leaf)
+            .position(|e| e.is_live() && e.parent == parent && e.name() == leaf)
     }
     /// Insert a child (dir or symlink) under `parent`, or return the existing one (OPENIF/name
     /// collision → reuse). Returns the index, or None if the table is at capacity.
@@ -17672,11 +17785,12 @@ impl ExecNtHandler {
         leaf: &[u8],
         kind: u8,
         target: &[u8],
+        permanent: bool,
     ) -> Option<usize> {
         if let Some(i) = self.obj_child(parent, leaf) {
             return Some(i);
         }
-        ObjEntry::push_kind(&mut self.obj_ns, leaf, parent, kind, target)
+        ObjEntry::push_kind(&mut self.obj_ns, leaf, parent, kind, target, permanent)
     }
 
     pub(crate) fn lpc_port_handle_by_ascii(&self, path: &[u8]) -> Option<u64> {
@@ -17724,7 +17838,9 @@ impl ExecNtHandler {
             self.obj_ns[index].payload = handle;
             return Ok(index);
         }
-        let Some(index) = self.obj_create(&nbuf[..nlen], root_idx, OBJ_KIND_LPC_PORT, &[]) else {
+        let Some(index) =
+            self.obj_create(&nbuf[..nlen], root_idx, OBJ_KIND_LPC_PORT, &[], false)
+        else {
             return Err(STATUS_OBJECT_PATH_NOT_FOUND);
         };
         self.obj_ns[index].payload = handle;
@@ -17757,6 +17873,7 @@ impl ExecNtHandler {
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_EVENT,
             &[],
+            false,
         )?;
         if !self.events.try_initialize(
             index as u64,
@@ -17788,6 +17905,7 @@ impl ExecNtHandler {
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_TIMER,
             &[],
+            false,
         )?;
         if !self.events.try_initialize(
             index as u64,
@@ -17986,6 +18104,7 @@ impl ExecNtHandler {
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_SEMAPHORE,
             &[],
+            false,
         )?;
         if self
             .semaphores
@@ -18013,6 +18132,7 @@ impl ExecNtHandler {
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_MUTANT,
             &[],
+            false,
         )?;
         self.mutants.initialize(index as u64, initial_owner);
         Some(index)
@@ -18026,6 +18146,7 @@ impl ExecNtHandler {
         root_idx: usize,
         kind: u8,
         target: &[u8],
+        permanent: bool,
     ) -> Option<usize> {
         let (parent_path, leaf) = match path.iter().rposition(|&c| c == b'\\') {
             Some(p) => (&path[..p], &path[p + 1..]),
@@ -18047,7 +18168,7 @@ impl ExecNtHandler {
         if leaf.is_empty() {
             return Some(parent);
         }
-        self.obj_insert(parent, leaf, kind, target)
+        self.obj_insert(parent, leaf, kind, target, permanent)
     }
     /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a key node in the SYSTEM hive:
     /// apply the CurrentControlSet alias (the hive has ControlSet001, not the kernel-synthesized
@@ -22809,8 +22930,8 @@ impl ExecNtHandler {
                         );
                         return 0;
                     }
-                    let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                        Ok((root, _attributes, Some(name))) => (root, name),
+                    let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
+                        Ok((root, attributes, Some(name))) => (root, attributes, name),
                         Ok((_root, _attributes, None)) => {
                             let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                                 return 0xC000_009A;
@@ -22828,6 +22949,7 @@ impl ExecNtHandler {
                         }
                         Err(status) => return status,
                     };
+                    let permanent = attributes & OBJ_PERMANENT != 0;
                     let path = match Self::event_object_path(&name16) {
                         Ok(path) => path,
                         Err(status) => return status,
@@ -22841,7 +22963,7 @@ impl ExecNtHandler {
                         return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                     }
                     let existed = existing.is_some();
-                    match self.obj_create(path, root_idx, 2, &[]) {
+                    match self.obj_create(path, root_idx, 2, &[], permanent) {
                         Some(i) => {
                             if !existed {
                                 self.events.initialize(
@@ -23184,13 +23306,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
+                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, attributes, Some(name))) => (root, attributes, name),
                     Ok((_root, _attributes, None)) => {
                         return create_anonymous(self).unwrap_or_else(|status| status);
                     }
                     Err(status) => return status,
                 };
+                let permanent = attributes & OBJ_PERMANENT != 0;
                 let path = match Self::event_object_path(&name16) {
                     Ok(path) => path,
                     Err(status) => return status,
@@ -23204,7 +23327,8 @@ impl ExecNtHandler {
                     return 0xC000_0024;
                 }
                 let existed = existing.is_some();
-                let Some(index) = self.obj_create(path, root_idx, OBJ_KIND_TIMER, &[]) else {
+                let Some(index) = self.obj_create(path, root_idx, OBJ_KIND_TIMER, &[], permanent)
+                else {
                     return 0xC000_009A;
                 };
                 if !existed {
@@ -23417,13 +23541,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
+                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, attributes, Some(name))) => (root, attributes, name),
                     Ok((_root, _attributes, None)) => {
                         return create_anonymous(self).unwrap_or_else(|status| status);
                     }
                     Err(status) => return status,
                 };
+                let permanent = attributes & OBJ_PERMANENT != 0;
                 let path = match Self::event_object_path(&name16) {
                     Ok(path) => path,
                     Err(status) => return status,
@@ -23437,7 +23562,7 @@ impl ExecNtHandler {
                     return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                 }
                 let existed = existing.is_some();
-                let Some(index) = self.obj_create(path, root_idx, 3, &[]) else {
+                let Some(index) = self.obj_create(path, root_idx, 3, &[], permanent) else {
                     return 0xC000_009A;
                 };
                 if !existed
@@ -23616,13 +23741,14 @@ impl ExecNtHandler {
                 if oa == 0 {
                     return create_anonymous(self).unwrap_or_else(|status| status);
                 }
-                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
-                    Ok((root, _attributes, Some(name))) => (root, name),
+                let (root_dir, attributes, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, attributes, Some(name))) => (root, attributes, name),
                     Ok((_root, _attributes, None)) => {
                         return create_anonymous(self).unwrap_or_else(|status| status);
                     }
                     Err(status) => return status,
                 };
+                let permanent = attributes & OBJ_PERMANENT != 0;
                 let path = match Self::event_object_path(&name16) {
                     Ok(path) => path,
                     Err(status) => return status,
@@ -23636,7 +23762,7 @@ impl ExecNtHandler {
                     return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                 }
                 let existed = existing.is_some();
-                let Some(index) = self.obj_create(path, root_idx, 4, &[]) else {
+                let Some(index) = self.obj_create(path, root_idx, 4, &[], permanent) else {
                     return 0xC000_009A;
                 };
                 let initialized = self.mutants.contains(index as u64);
@@ -23749,9 +23875,9 @@ impl ExecNtHandler {
             NativeService::NtResumeThread => unsafe {
                 self.nt_resume_thread_with_user_memory(args, SyscallUserMemory::CurrentProcess)
             },
-            // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
-            // track permanence. Success no-op.
-            NativeService::NtMakeTemporaryObject => 0,
+            // NtMakeTemporaryObject(ObjectHandle): reference the object with DELETE access, clear
+            // OBJ_PERMANENT, and run the normal name-delete check.
+            NativeService::NtMakeTemporaryObject => self.nt_make_temporary_object(args[0]),
             // NtCreateKeyedEvent(*OutHandle, AccessMask, ObjectAttributes, Flags). ReactOS'
             // RtlpInitializeKeyedEvent ignores the returned status and later asserts that its
             // process-global keyed-event handle is non-NULL, so success must publish a real handle.
@@ -24976,10 +25102,11 @@ impl ExecNtHandler {
                 if !self.probe_event_output(out, 8) {
                     return 0xC000_0005;
                 }
-                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa) {
+                let (root_dir, attributes, path) = match self.read_named_object_path_attributes(oa) {
                     Ok(values) => values,
                     Err(status) => return status,
                 };
+                let permanent = attributes & OBJ_PERMANENT != 0;
                 let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
@@ -24991,7 +25118,13 @@ impl ExecNtHandler {
                         Some(_) => {
                             return 0xC000_0024;
                         } // STATUS_OBJECT_TYPE_MISMATCH
-                        None => match self.obj_create(path, root_idx, OBJ_KIND_DIRECTORY, &[]) {
+                        None => match self.obj_create(
+                            path,
+                            root_idx,
+                            OBJ_KIND_DIRECTORY,
+                            &[],
+                            permanent,
+                        ) {
                             Some(index) => {
                                 created = true;
                                 index
@@ -25063,7 +25196,7 @@ impl ExecNtHandler {
                 // Collect this directory's children (by insertion index) beyond `start`.
                 let mut children: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
                 for (i, e) in self.obj_ns.iter().enumerate() {
-                    if e.parent == dir_idx && i != dir_idx {
+                    if e.is_live() && e.parent == dir_idx && i != dir_idx {
                         children.push(i);
                     }
                 }
@@ -25191,10 +25324,11 @@ impl ExecNtHandler {
                 if !self.probe_event_output(out, 8) {
                     return 0xC000_0005;
                 }
-                let (root_dir, _attributes, path) = match self.read_named_object_path_attributes(oa) {
+                let (root_dir, attributes, path) = match self.read_named_object_path_attributes(oa) {
                     Ok(values) => values,
                     Err(status) => return status,
                 };
+                let permanent = attributes & OBJ_PERMANENT != 0;
                 let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
                     Ok(resolved) => resolved,
                     Err(status) => return status,
@@ -25228,8 +25362,13 @@ impl ExecNtHandler {
                         0
                     }
                     Some(_) => 0xC000_0024,
-                    None => match self.obj_create(path, root_idx, OBJ_KIND_SYMBOLIC_LINK, &tbuf[..tl])
-                    {
+                    None => match self.obj_create(
+                        path,
+                        root_idx,
+                        OBJ_KIND_SYMBOLIC_LINK,
+                        &tbuf[..tl],
+                        permanent,
+                    ) {
                         Some(index) => {
                             let Some(handle) =
                                 self.mint_object_namespace_handle(index, args[1] as u32)
