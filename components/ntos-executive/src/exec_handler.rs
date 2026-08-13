@@ -27533,6 +27533,7 @@ impl ExecNtHandler {
             // section, or the named NLS section into csrss's VSpace; the fault router demand-pages
             // the DLL/anon views and the NLS frames are mapped eagerly here.
             NativeService::NtMapViewOfSection => unsafe {
+                const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let dll_pes = ctx.dll_pes();
@@ -27626,13 +27627,13 @@ impl ExecNtHandler {
                         loader_trace_record(
                             self.pi,
                             LoaderOp::MapViewOfSection,
-                            0xC0000002,
+                            STATUS_INVALID_IMAGE_FORMAT,
                             Some(i),
                             sect,
                             0,
                             b"",
                         );
-                        0xC0000002
+                        STATUS_INVALID_IMAGE_FORMAT
                     }
                 } else if self.current_process_is_csrss()
                     && *ctx.csrss_anon_section_handle != 0
@@ -27939,13 +27940,13 @@ impl ExecNtHandler {
                     loader_trace_record(
                         self.pi,
                         LoaderOp::MapViewOfSection,
-                        0xC0000002,
+                        nt_process::STATUS_INVALID_HANDLE,
                         None,
                         sect,
                         0,
                         b"",
                     );
-                    0xC0000002
+                    nt_process::STATUS_INVALID_HANDLE
                 }
             },
             // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],

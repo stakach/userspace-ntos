@@ -4932,3 +4932,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   handles, or user buffers return concrete NT failures. Validation: `cargo fmt --all`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  Memory-manager map-view status cleanup (2026-08-14): `NtMapViewOfSection` no longer reports
+  `STATUS_NOT_IMPLEMENTED` for section-object failures after the supported map paths are checked. A
+  registered image-section slot whose parsed PE is absent now fails as `STATUS_INVALID_IMAGE_FORMAT`
+  and records that status in the loader trace; a handle that is not a live hosted image, CSR/NLS
+  section, or generic section handle now fails as `STATUS_INVALID_HANDLE`. Validation:
+  `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
