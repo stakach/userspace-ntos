@@ -5517,6 +5517,97 @@ impl ExecNtHandler {
         self.registry_value_with(target, name, |ty, data| (ty, data.to_vec()))
     }
 
+    fn registry_immediate_child_name<'a>(full_path: &'a str, parent_path: &str) -> Option<&'a str> {
+        let mut full = full_path.split('\\').filter(|part| !part.is_empty());
+        for parent in parent_path.split('\\').filter(|part| !part.is_empty()) {
+            let current = full.next()?;
+            if !current.eq_ignore_ascii_case(parent) {
+                return None;
+            }
+        }
+        let child = full.next()?;
+        if full.next().is_some() {
+            return None;
+        }
+        Some(child)
+    }
+
+    fn push_registry_mount_child(
+        out: &mut alloc::vec::Vec<alloc::string::String>,
+        parent_path: &str,
+        mount_path: &str,
+    ) {
+        let Some(child) = Self::registry_immediate_child_name(mount_path, parent_path) else {
+            return;
+        };
+        if out.iter().any(|seen| seen.eq_ignore_ascii_case(child)) {
+            return;
+        }
+        out.push(alloc::string::String::from(child));
+    }
+
+    fn registry_mounted_hive_subkeys(
+        &self,
+        parent_path: &str,
+    ) -> alloc::vec::Vec<alloc::string::String> {
+        let mut subkeys = alloc::vec::Vec::new();
+        for sel in [
+            HIVE_SEL_SYSTEM,
+            HIVE_SEL_SOFTWARE,
+            HIVE_SEL_SECURITY,
+            HIVE_SEL_SAM,
+        ] {
+            let mount_path = hive_mount(sel);
+            if self.mutable_hives.owns_path(mount_path) {
+                Self::push_registry_mount_child(&mut subkeys, parent_path, mount_path);
+            }
+        }
+        for mount in &self.hive_mounts {
+            if self.mutable_hives.owns_path(&mount.mount) {
+                Self::push_registry_mount_child(&mut subkeys, parent_path, &mount.mount);
+            }
+        }
+        subkeys
+    }
+
+    fn registry_subkey_exists_in_materialized_authority(
+        &self,
+        mutable_base: Option<ResolvedHiveKey>,
+        base_key: Option<KeyRef>,
+        name: &str,
+    ) -> bool {
+        mutable_base
+            .and_then(|key| {
+                self.mutable_hives
+                    .hive(key.hive)?
+                    .open_subkey(key.key, name)
+                    .map(|_| ())
+            })
+            .or_else(|| {
+                base_key.and_then(|key| {
+                    let (hive, base) = self.base_hive(key)?;
+                    hive.open_subkey(base, name).map(|_| ())
+                })
+            })
+            .is_some()
+    }
+
+    fn registry_child_path(parent_path: &str, child_name: &str) -> alloc::string::String {
+        let mut path = alloc::string::String::from(parent_path);
+        if !path.ends_with('\\') {
+            path.push('\\');
+        }
+        path.push_str(child_name);
+        path
+    }
+
+    fn registry_overlay_subkey_is_authoritative(&self, parent_path: &str, child_name: &str) -> bool {
+        let child_path = Self::registry_child_path(parent_path, child_name);
+        let canon = self.overlay_canon(&child_path);
+        self.registry_overlay_index_for_canon_path(&canon).is_some()
+            || !self.mutable_hive_owns_path(&canon)
+    }
+
     fn registry_value_by_index_with<R>(
         &self,
         target: KeyRef,
@@ -5722,26 +5813,37 @@ impl ExecNtHandler {
                 }
             }
         }
+        let mount_subkeys = path
+            .as_deref()
+            .map(|path| self.registry_mounted_hive_subkeys(path))
+            .unwrap_or_default();
+        for name in &mount_subkeys {
+            if !self.registry_subkey_exists_in_materialized_authority(
+                mutable_base,
+                base_key,
+                name,
+            ) {
+                stats.add_subkey(name.encode_utf16().count().saturating_mul(2), 0);
+            }
+        }
         if let Some(path) = path.as_deref() {
             for index in 0..self.overlay.subkeys_len(path) {
                 let Some(name) = self.overlay.subkey_by_index(path, index) else {
                     continue;
                 };
-                let exists_in_base = mutable_base
-                    .and_then(|key| {
-                        self.mutable_hives
-                            .hive(key.hive)?
-                            .open_subkey(key.key, name)
-                            .map(|_| ())
-                    })
-                    .or_else(|| {
-                        base_key.and_then(|key| {
-                            let (hive, base) = self.base_hive(key)?;
-                            hive.open_subkey(base, name).map(|_| ())
-                        })
-                    })
-                    .is_some();
-                if !exists_in_base {
+                let exists_in_base =
+                    self.registry_subkey_exists_in_materialized_authority(
+                        mutable_base,
+                        base_key,
+                        name,
+                    );
+                let exists_as_mount = mount_subkeys
+                    .iter()
+                    .any(|mounted| mounted.eq_ignore_ascii_case(name));
+                if !exists_in_base
+                    && !exists_as_mount
+                    && self.registry_overlay_subkey_is_authoritative(path, name)
+                {
                     stats.add_subkey(name.encode_utf16().count().saturating_mul(2), 0);
                 }
             }
@@ -5852,26 +5954,38 @@ impl ExecNtHandler {
                 visible_index += 1;
             }
         }
+        let mount_subkeys = path
+            .as_deref()
+            .map(|path| self.registry_mounted_hive_subkeys(path))
+            .unwrap_or_default();
+        for name in &mount_subkeys {
+            if self.registry_subkey_exists_in_materialized_authority(mutable_base, base_key, name) {
+                continue;
+            }
+            if visible_index == requested_index {
+                return Some(name.clone());
+            }
+            visible_index += 1;
+        }
         if let Some(path) = path.as_deref() {
             for index in 0..self.overlay.subkeys_len(path) {
                 let Some(name) = self.overlay.subkey_by_index(path, index) else {
                     continue;
                 };
-                let exists_in_base = mutable_base
-                    .and_then(|key| {
-                        self.mutable_hives
-                            .hive(key.hive)?
-                            .open_subkey(key.key, name)
-                            .map(|_| ())
-                    })
-                    .or_else(|| {
-                        base_key.and_then(|key| {
-                            let (hive, base) = self.base_hive(key)?;
-                            hive.open_subkey(base, name).map(|_| ())
-                        })
-                    })
-                    .is_some();
-                if exists_in_base {
+                if self.registry_subkey_exists_in_materialized_authority(
+                    mutable_base,
+                    base_key,
+                    name,
+                ) {
+                    continue;
+                }
+                if mount_subkeys
+                    .iter()
+                    .any(|mounted| mounted.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                if !self.registry_overlay_subkey_is_authoritative(path, name) {
                     continue;
                 }
                 if visible_index == requested_index {

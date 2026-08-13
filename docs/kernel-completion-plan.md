@@ -1022,8 +1022,8 @@ before unrelated executive traffic monopolises the receive loop.
 - `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
   `NtSaveKey`, writable-overlay `FileRenameInformation`, and file-backed hive atomic image
-  replacement are now real; D2/D3 still own live hive authority plus explicit system/user flush and
-  reboot persistence proofs.
+  replacement are now real; D2/D4 still own the remaining live-hive authority and durability
+  semantics.
 - `[~]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
   reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
@@ -1047,7 +1047,8 @@ before unrelated executive traffic monopolises the receive loop.
   overlay shadows. The persistent-path overlay audit also removed path-based precedence for
   nonvolatile overlay shadows over mounted mutable hives; remaining overlay authority should be
   explicit volatile state, direct overlay handles, or paths with no mounted hive backing. Remaining
-  D2 work is a narrow audit of root/virtual registry metadata and subtree serialization behavior.
+  D2 work is subtree serialization behavior plus any residual virtual-root security/class edge
+  cases.
 - `[x]` D3: Implement explicit flush and reboot persistence proofs for system hive, user profile
   hive, and writable filesystem overlay changes. Dynamic `NtLoadKey` profile hives now checkpoint on
   `NtFlushKey` through an atomic writable-overlay replace and remount from that checkpoint after
@@ -4658,3 +4659,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   object identity. This removes another durable-path shadow route without adding a fallback success
   path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`, and `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  D2 virtual-root mount metadata cleanup (2026-08-13): `HKLM` and `HKU` sentinel keys now enumerate
+  mounted hive roots through the same CM namespace instead of only seeing overlay-created children.
+  Registry key stats and `NtEnumerateKey` compose mounted boot hives, `.Default`, and dynamic
+  `NtLoadKey` user hives with real mutable/base subkeys, then apply the filtered overlay authority
+  rule so old nonvolatile shadows under mounted hives do not materialize duplicate root children.
+  This makes virtual registry containers reflect mounted hive identity without hardcoding shell or
+  service paths. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
