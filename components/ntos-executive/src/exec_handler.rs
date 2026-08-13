@@ -17855,7 +17855,7 @@ impl ExecNtHandler {
         };
         let Some((slot_index, leaf, leaf_len, target)) = slot_info else {
             self.stop = true;
-            return 0xC000_0002;
+            return nt_process::STATUS_INVALID_HANDLE;
         };
         let leaf = &leaf[..leaf_len];
         if self.current_process_is_winlogon() || self.current_process_is_shell_bootstrap() {
@@ -17873,7 +17873,7 @@ impl ExecNtHandler {
         let image = if let Some(target) = target {
             let Some(image) = catalog.get_by_pi(target.pi) else {
                 self.stop = true;
-                return 0xC000_0002;
+                return nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
             };
             if !image.leaf.eq_ignore_ascii_case(leaf)
                 || nt_exe_image::SpawnTarget::from_image(image) != target
@@ -17885,7 +17885,7 @@ impl ExecNtHandler {
         } else {
             let Some(image) = catalog.get_by_leaf(leaf) else {
                 self.stop = true;
-                return 0xC000_0002;
+                return nt_fs::STATUS_OBJECT_NAME_NOT_FOUND;
             };
             image
         };

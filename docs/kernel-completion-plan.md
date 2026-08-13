@@ -4691,6 +4691,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
 
+  process-create image-section status cleanup (2026-08-13): `NtCreateProcess[Ex]` no longer reports
+  `STATUS_NOT_IMPLEMENTED` when the caller supplies a section handle that is not registered as a
+  hosted image section or when a previously registered executable-image slot no longer resolves in
+  the dynamic image catalog. Those cases now return concrete NT failures (`STATUS_INVALID_HANDLE`
+  for the bad section handle and `STATUS_OBJECT_NAME_NOT_FOUND` for stale catalog identity) while
+  preserving the existing stop-on-corrupt-control-flow guard. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
+
   A4 bootstrap ProcessManager manifest cleanup (2026-08-13): the initial SMSS/CSRSS/winlogon
   ProcessManager seed no longer hardcodes `create_process("smss.exe")`, `create_process("csrss.exe")`,
   or `create_process("winlogon.exe")` in `ExecNtHandler`. `hosted_bootstrap.rs` now exposes the
