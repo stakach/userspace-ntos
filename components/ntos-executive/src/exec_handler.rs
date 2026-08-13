@@ -7236,6 +7236,24 @@ impl ExecNtHandler {
         self.set_pool_thread_suspended(self.pi, pool_slot, false);
     }
 
+    fn abandon_created_hosted_thread_for(
+        &mut self,
+        owner_pi: usize,
+        pool_slot: usize,
+        tid: u64,
+        caller_pid: nt_process::ProcessId,
+        handle: u64,
+    ) {
+        let _ = self.release_hosted_thread_runtime(tid);
+        let _ = self.close_process_handle(caller_pid, handle);
+        let thread = tid as nt_process::ThreadId;
+        let _ = self
+            .pm
+            .set_thread_state(thread, nt_process::ThreadState::Initialized);
+        self.release_pool_usage_slot(owner_pi, pool_slot);
+        self.set_pool_thread_suspended(owner_pi, pool_slot, false);
+    }
+
     fn reserve_created_hosted_thread_role(
         &mut self,
         pool_slot: usize,
@@ -9988,6 +10006,173 @@ impl ExecNtHandler {
         print_hex(start.rcx as u32);
         print_str(b" suspended=");
         print_u64(create_suspended as u64);
+        print_str(b"\n");
+        0
+    }
+
+    fn create_hosted_worker_thread_from_start(
+        &mut self,
+        owner_pi: usize,
+        caller_pid: nt_process::ProcessId,
+        desired_access: u32,
+        start: nt_thread_start::Amd64ThreadContext,
+        create_suspended: bool,
+        hide_from_debugger: bool,
+    ) -> Result<(usize, u64, u64), u32> {
+        if owner_pi >= MAX_PI || start.rip == 0 {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let worker_slot = self
+            .first_free_hosted_tp_worker_slot(owner_pi)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let (pool_slot, tid) = self
+            .claim_pool_thread(owner_pi, start.rip, create_suspended)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let thread = tid as nt_process::ThreadId;
+        let handle = match self.insert_process_handle(
+            caller_pid,
+            nt_process::HandleObject::Thread(thread),
+            desired_access,
+        ) {
+            Ok(handle) => handle as u64,
+            Err(status) => {
+                let _ = self
+                    .pm
+                    .set_thread_state(thread, nt_process::ThreadState::Initialized);
+                self.release_pool_usage_slot(owner_pi, pool_slot);
+                self.set_pool_thread_suspended(owner_pi, pool_slot, false);
+                return Err(status);
+            }
+        };
+        if !self.set_pool_thread_suspended(owner_pi, pool_slot, create_suspended)
+            || !self.reserve_hosted_tp_worker_slot(owner_pi, worker_slot, tid)
+        {
+            self.abandon_created_hosted_thread_for(
+                owner_pi, pool_slot, tid, caller_pid, handle,
+            );
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if hide_from_debugger {
+            if let Err(status) = self.pm.set_thread_hide_from_debugger(thread) {
+                self.abandon_created_hosted_thread_for(
+                    owner_pi, pool_slot, tid, caller_pid, handle,
+                );
+                return Err(status);
+            }
+        }
+        self.pm.set_thread_teb(thread, tp_worker_teb_va(worker_slot));
+        let _ = self
+            .pm
+            .set_thread_create_time(thread, nt_system_time_100ns() as i64);
+        PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+        Ok((worker_slot, tid, handle))
+    }
+
+    unsafe fn nt_create_thread_ex_service(&mut self, args: &[u64]) -> u32 {
+        const PROCESS_CREATE_THREAD: u32 = 0x0002;
+        const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u64 = 0x0000_0001;
+        const THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER: u64 = 0x0000_0004;
+        const SUPPORTED_THREAD_CREATE_FLAGS: u64 =
+            THREAD_CREATE_FLAGS_CREATE_SUSPENDED | THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
+
+        let thread_handle_out = args[0];
+        if thread_handle_out == 0 || !self.probe_user_output(thread_handle_out, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let start = nt_thread_start::Amd64ThreadContext {
+            rip: args[4],
+            rsp: 0,
+            rcx: args[5],
+            rdx: 0,
+        };
+        if start.rip == 0 {
+            self.queue_write(thread_handle_out, 0);
+            return STATUS_INVALID_PARAMETER;
+        }
+        let create_flags = args[6];
+        if create_flags & !SUPPORTED_THREAD_CREATE_FLAGS != 0 {
+            self.queue_write(thread_handle_out, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        // The hosted worker-window stack is fixed and owned by the kernel thread mechanism. Do not
+        // accept caller stack geometry until NtCreateThreadEx can honor it exactly.
+        if args[7] != 0 || args[8] != 0 || args[9] != 0 || args[10] != 0 {
+            self.queue_write(thread_handle_out, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => {
+                self.queue_write(thread_handle_out, 0);
+                return nt_process::STATUS_INVALID_HANDLE;
+            }
+        };
+        let (target_pid, target_pi) =
+            match self.resolve_process_for_access(args[3], PROCESS_CREATE_THREAD) {
+                Ok(resolved) => resolved,
+                Err(status) => {
+                    self.queue_write(thread_handle_out, 0);
+                    return status;
+                }
+            };
+        if self.pm.process(target_pid).is_some_and(|process| {
+            matches!(
+                process.state,
+                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
+            )
+        }) {
+            self.queue_write(thread_handle_out, 0);
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+        if self.hosted_process_vspace(target_pi).is_none() {
+            self.queue_write(thread_handle_out, 0);
+            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+        }
+
+        let create_suspended = create_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED != 0;
+        let hide_from_debugger = create_flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER != 0;
+        let (slot, tid, handle) = match self.create_hosted_worker_thread_from_start(
+            target_pi,
+            caller_pid,
+            args[1] as u32,
+            start,
+            create_suspended,
+            hide_from_debugger,
+        ) {
+            Ok(created) => created,
+            Err(status) => {
+                self.queue_write(thread_handle_out, 0);
+                return status;
+            }
+        };
+        self.queue_write(thread_handle_out, handle);
+        self.thread_spawn_request = Some(HostedThreadSpawnRequest::ThreadEx {
+            pi: target_pi,
+            slot,
+            start,
+        });
+
+        print_str(b"[thread-ex] create caller_pi=");
+        print_u64(self.pi as u64);
+        print_str(b" target_pi=");
+        print_u64(target_pi as u64);
+        print_str(b" slot=");
+        print_u64(slot as u64);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" entry=0x");
+        print_hex((start.rip >> 32) as u32);
+        print_hex(start.rip as u32);
+        print_str(b" param=0x");
+        print_hex((start.rcx >> 32) as u32);
+        print_hex(start.rcx as u32);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
+        print_str(b" hide-debug=");
+        print_u64(hide_from_debugger as u64);
+        print_str(b" handle=0x");
+        print_hex(handle as u32);
         print_str(b"\n");
         0
     }
@@ -21480,6 +21665,12 @@ impl ExecNtHandler {
                 }
                 0
             },
+            // NtCreateThreadEx(*ThreadHandle, DesiredAccess, *ObjectAttributes, ProcessHandle,
+            // StartRoutine, Argument, CreateFlags, ZeroBits, StackSize, MaximumStackSize,
+            // *AttributeList). Direct native thread creation uses the same ETHREAD pool, typed handle
+            // table, hosted worker window, loader trampoline, and NtResumeThread suspend state as the
+            // existing NtCreateThread plane.
+            NativeService::NtCreateThreadEx => unsafe { self.nt_create_thread_ex_service(args) },
             // SM/CSR worker threads + semaphores. ★ OUT-PARAM FIX (path-B prep): the fake handle now
             // goes to the x64 out-arg0 *Handle = R10 = args[0] via the out-writer queue (was RCX =
             // get_recv_mr(2), which at UnknownSyscall-fault holds the syscall RETURN IP, so the handle
@@ -28478,8 +28669,6 @@ impl ExecNtHandler {
                     Err(status) => status,
                 }
             }
-
-            _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
 }

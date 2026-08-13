@@ -4959,5 +4959,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   device-request errors, non-file object handles fail as type mismatches, and unsupported transfer
   methods remain visible as `STATUS_NOT_SUPPORTED`; no success is fabricated. Validation:
   `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`, `git diff --check`, and a registered-native-service scan now showing only
-  `NtCreateThreadEx` still missing an explicit executive arm.
+  x86_64-unknown-none`, `git diff --check`, and a registered-native-service scan that reduced the
+  remaining explicit-arm gap to `NtCreateThreadEx`.
+
+  Native thread-create-ex cleanup (2026-08-14): `NtCreateThreadEx` now has an explicit executive
+  service backed by the same real thread machinery as `NtCreateThread`: access-checked process-handle
+  resolution, process liveness/vspace checks, pool ETHREAD claim, typed thread-handle publication in
+  the caller's EPROCESS table, hosted worker-window reservation, TEB publication, hide-from-debugger
+  state, `CreateSuspended` integration with the existing `NtResumeThread` path, and seL4 TCB spawn
+  through the loader trampoline. The spawn request can now carry a direct `Amd64ThreadContext` for
+  APIs whose start routine and argument are native syscall arguments instead of a caller-built
+  CONTEXT record on the stack. Unsupported `NtCreateThreadEx` features that the kernel cannot honor
+  yet, such as caller-specified stack geometry or `PS_ATTRIBUTE_LIST`, return
+  `STATUS_NOT_SUPPORTED` rather than being ignored. After this slice, the registered native syscall
+  table has no missing explicit executive arms and the old unreachable
+  `_ => STATUS_NOT_IMPLEMENTED` match arm was removed. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and the registered-native-service scan returning empty.

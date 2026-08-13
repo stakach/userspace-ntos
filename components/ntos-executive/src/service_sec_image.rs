@@ -18935,6 +18935,20 @@ unsafe fn spawn_requested_local_thread(
                     procs[pi].pml4,
                     caller_sp,
                     fault_ep,
+                    None,
+                );
+            }
+        }
+        HostedThreadSpawnRequest::ThreadEx { pi, slot, start } => {
+            if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
+                spawn_requested_tp_worker(
+                    nt_handler,
+                    pi,
+                    slot,
+                    procs[pi].pml4,
+                    caller_sp,
+                    fault_ep,
+                    Some(start),
                 );
             }
         }
@@ -18950,17 +18964,20 @@ unsafe fn spawn_requested_tp_worker(
     pml4: u64,
     caller_sp: u64,
     fault_ep: u64,
+    explicit_start: Option<nt_thread_start::Amd64ThreadContext>,
 ) {
     let badge = tp_worker_badge(pi, worker_slot);
     if nt_handler.hosted_thread_tcb_for_badge(badge).is_some() {
         return;
     }
 
-    let context_va = smss_stack_read(caller_sp + 0x30);
-    let start = nt_thread_start::Amd64ThreadContext::read(
-        |address| unsafe { smss_stack_read(address) },
-        context_va,
-    );
+    let start = explicit_start.unwrap_or_else(|| {
+        let context_va = smss_stack_read(caller_sp + 0x30);
+        nt_thread_start::Amd64ThreadContext::read(
+            |address| unsafe { smss_stack_read(address) },
+            context_va,
+        )
+    });
     let Some(tid) = nt_handler.hosted_thread_tid_for_badge(badge) else {
         return;
     };

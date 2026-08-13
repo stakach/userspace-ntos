@@ -17595,6 +17595,11 @@ enum HostedThreadSpawnRequest {
     ServicesListener,
     LsassListener { slot: usize },
     TpWorker { pi: usize, slot: usize },
+    ThreadEx {
+        pi: usize,
+        slot: usize,
+        start: nt_thread_start::Amd64ThreadContext,
+    },
 }
 
 #[derive(Clone, Copy)]
