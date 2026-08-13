@@ -4780,3 +4780,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   final Explorer framebuffer proof reports all 786432 pixels non-background with at least 32
   distinct non-background colors. Review adjustment: D2 is closed for the current desktop path;
   continue to the next open completion-plan item without adding registry/profile fallback machinery.
+
+  D1 object-query surface cleanup (2026-08-13): `NtQueryObject` no longer has the old
+  `STATUS_NOT_IMPLEMENTED` branch for valid object-manager information classes. The generic
+  `ObjectTypesInformation` query now returns an NT x64 `OBJECT_ALL_TYPES_INFORMATION` catalogue for
+  the object types the kernel can currently publish (`Directory`, `SymbolicLink`, dispatcher
+  objects, process/thread/section/file/IOCP/key/token/debug/keyed-event, and opaque object handles),
+  with inline UTF-16 type names and 8-byte aligned records. `ObjectSessionInformation` is query-side
+  unsupported in the NT5/ReactOS contract, so it now reaches the normal handle-validation and
+  `STATUS_INVALID_INFO_CLASS` path rather than a stub. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.

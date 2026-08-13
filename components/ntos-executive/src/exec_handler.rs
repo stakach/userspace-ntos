@@ -11645,6 +11645,45 @@ impl ExecNtHandler {
         n
     }
 
+    fn query_object_type_catalog() -> &'static [&'static [u8]] {
+        &[
+            b"Directory",
+            b"SymbolicLink",
+            b"Event",
+            b"Semaphore",
+            b"Mutant",
+            b"Timer",
+            b"Process",
+            b"Thread",
+            b"Section",
+            b"File",
+            b"IoCompletion",
+            b"Key",
+            b"Token",
+            b"DebugObject",
+            b"KeyedEvent",
+            b"Object",
+        ]
+    }
+
+    fn align_query_object_offset(value: usize) -> Option<usize> {
+        value.checked_add(7).map(|v| v & !7)
+    }
+
+    fn query_object_type_record_size(type_name: &[u8]) -> Option<usize> {
+        const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
+        let bytes = type_name.len().checked_mul(2)?.checked_add(2)?;
+        Self::align_query_object_offset(OBJECT_TYPE_INFORMATION_SIZE.checked_add(bytes)?)
+    }
+
+    fn query_object_all_types_size() -> Option<usize> {
+        let mut size = Self::align_query_object_offset(4)?;
+        for type_name in Self::query_object_type_catalog() {
+            size = size.checked_add(Self::query_object_type_record_size(type_name)?)?;
+        }
+        Some(size)
+    }
+
     unsafe fn write_query_object_return_length(
         &self,
         memory: SyscallUserMemory,
@@ -11660,6 +11699,68 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    unsafe fn write_query_object_type_record(
+        &self,
+        memory: SyscallUserMemory,
+        record_va: u64,
+        type_name: &[u8],
+        total_objects: u32,
+        total_handles: u32,
+    ) -> bool {
+        const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
+        let type_bytes = type_name.len() * 2;
+        let Some(record_len) = Self::query_object_type_record_size(type_name) else {
+            return false;
+        };
+        let mut output = [0u8; 160];
+        if record_len > output.len() {
+            return false;
+        }
+        let string_va = record_va + OBJECT_TYPE_INFORMATION_SIZE as u64;
+        output[0..2].copy_from_slice(&(type_bytes as u16).to_le_bytes());
+        output[2..4].copy_from_slice(&((type_bytes + 2) as u16).to_le_bytes());
+        output[8..16].copy_from_slice(&string_va.to_le_bytes());
+        output[16..20].copy_from_slice(&total_objects.to_le_bytes());
+        output[20..24].copy_from_slice(&total_handles.to_le_bytes());
+        output[84..88].copy_from_slice(&0x001F_FFFFu32.to_le_bytes());
+        output[89] = 1; // MaintainHandleCount
+        Self::write_ascii_utf16le(type_name, &mut output[OBJECT_TYPE_INFORMATION_SIZE..]);
+        self.user_memory_write(memory, record_va, &output[..record_len])
+    }
+
+    unsafe fn write_query_object_all_types(
+        &self,
+        memory: SyscallUserMemory,
+        information: u64,
+    ) -> bool {
+        let type_names = Self::query_object_type_catalog();
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&(type_names.len() as u32).to_le_bytes());
+        if !self.user_memory_write(memory, information, &header) {
+            return false;
+        }
+        let mut offset = 8usize;
+        for type_name in type_names {
+            if !self.write_query_object_type_record(
+                memory,
+                information + offset as u64,
+                type_name,
+                0,
+                0,
+            ) {
+                return false;
+            }
+            let Some(record_len) = Self::query_object_type_record_size(type_name) else {
+                return false;
+            };
+            let Some(next) = offset.checked_add(record_len) else {
+                return false;
+            };
+            offset = next;
+        }
+        true
+    }
+
     pub(crate) unsafe fn nt_query_object_with_user_memory(
         &self,
         args: &[u64],
@@ -11668,7 +11769,6 @@ impl ExecNtHandler {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
         const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
-        const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
         const OBJECT_BASIC_INFORMATION_SIZE: usize = 56;
         const OBJECT_NAME_INFORMATION_SIZE: usize = 16;
         const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
@@ -11683,13 +11783,27 @@ impl ExecNtHandler {
         if return_length != 0 && !self.user_memory_probe_output(memory, return_length, 4) {
             return STATUS_ACCESS_VIOLATION;
         }
-        if class == 3 || class == 5 {
-            let _ = self.write_query_object_return_length(
-                memory,
-                return_length,
-                length.min(u32::MAX as usize) as u32,
-            );
-            return STATUS_NOT_IMPLEMENTED;
+        if class == 3 {
+            let Some(needed) = Self::query_object_all_types_size() else {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            };
+            if self
+                .write_query_object_return_length(
+                    memory,
+                    return_length,
+                    needed.min(u32::MAX as usize) as u32,
+                )
+                .is_err()
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if length < needed || !self.user_memory_probe_output(memory, information, needed) {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if self.write_query_object_all_types(memory, information) {
+                return 0;
+            }
+            return STATUS_ACCESS_VIOLATION;
         }
 
         let (object, granted_access, namespace_index) = match self.query_object_resolve(handle) {
@@ -11798,9 +11912,10 @@ impl ExecNtHandler {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let mut output = [0u8; OBJECT_TYPE_INFORMATION_SIZE + 64];
+                let string_va = information + OBJECT_TYPE_INFORMATION_SIZE as u64;
                 output[0..2].copy_from_slice(&(type_bytes as u16).to_le_bytes());
                 output[2..4].copy_from_slice(&((type_bytes + 2) as u16).to_le_bytes());
-                output[8..16].copy_from_slice(&(information + 104).to_le_bytes());
+                output[8..16].copy_from_slice(&string_va.to_le_bytes());
                 output[16..20].copy_from_slice(&1u32.to_le_bytes()); // TotalNumberOfObjects
                 output[20..24].copy_from_slice(&1u32.to_le_bytes()); // TotalNumberOfHandles
                 output[84..88].copy_from_slice(&0x001F_FFFFu32.to_le_bytes());
