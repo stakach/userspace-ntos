@@ -43,40 +43,37 @@ unsafe fn rendezvous_recv_full_r12(
     }
 }
 
-fn live_hosted_pi_for_leaf(nt_handler: &ExecNtHandler, leaf: &[u8]) -> Option<usize> {
-    let target_leaf = nt_exe_image::canonical_exe_leaf(leaf)?;
+fn live_hosted_pi_for_role(
+    nt_handler: &ExecNtHandler,
+    role: nt_exe_image::HostedProcessRole,
+) -> Option<usize> {
     for pi in 0..MAX_PI {
+        if nt_handler.hosted_process_role(pi) != Some(role) {
+            continue;
+        }
         let Some(pid) = nt_handler.pm_pid_for_pi(pi) else {
             continue;
         };
-        let Some(process) = nt_handler.pm.process(pid) else {
-            continue;
-        };
-        let Some(process_leaf) =
-            nt_exe_image::canonical_exe_leaf(process.image_file_name.as_bytes())
-        else {
-            continue;
-        };
-        if process_leaf.eq_ignore_ascii_case(target_leaf) {
+        if nt_handler.pm.process(pid).is_some() {
             return Some(pi);
         }
     }
     None
 }
 
-fn live_hosted_pid_for_leaf(
+fn live_hosted_pid_for_role(
     nt_handler: &ExecNtHandler,
-    leaf: &[u8],
+    role: nt_exe_image::HostedProcessRole,
 ) -> Option<nt_process::ProcessId> {
-    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    let pi = live_hosted_pi_for_role(nt_handler, role)?;
     nt_handler.pm_pid_for_pi(pi)
 }
 
-fn live_hosted_main_tid_for_leaf(
+fn live_hosted_main_tid_for_role(
     nt_handler: &ExecNtHandler,
-    leaf: &[u8],
+    role: nt_exe_image::HostedProcessRole,
 ) -> Option<nt_process::ThreadId> {
-    let pi = live_hosted_pi_for_leaf(nt_handler, leaf)?;
+    let pi = live_hosted_pi_for_role(nt_handler, role)?;
     nt_handler.pm_main_tid_for_pi(pi)
 }
 
@@ -997,7 +994,11 @@ pub(crate) unsafe fn sm_rendezvous(
                     if class == 0 {
                         sm_stack_write(
                             buf + 0x20,
-                            live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64,
+                            live_hosted_pid_for_role(
+                                nt_handler,
+                                nt_exe_image::HostedProcessRole::NativeSession,
+                            )
+                            .unwrap_or(0) as u64,
                         );
                     } else if class == 24 {
                         sm_stack_write32(buf, 0); // ProcessSessionInformation: session 0
@@ -1206,8 +1207,12 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
         SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return false;
     }
-    let smss_pid = live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
-    let smss_tid = live_hosted_main_tid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
+    let smss_pid =
+        live_hosted_pid_for_role(nt_handler, nt_exe_image::HostedProcessRole::NativeSession)
+            .unwrap_or(0) as u64;
+    let smss_tid =
+        live_hosted_main_tid_for_role(nt_handler, nt_exe_image::HostedProcessRole::NativeSession)
+            .unwrap_or(0) as u64;
     request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
     request[8..16].copy_from_slice(&smss_pid.to_le_bytes());
     request[16..24].copy_from_slice(&smss_tid.to_le_bytes());
@@ -3489,8 +3494,12 @@ unsafe fn csr_sb_api_request_rendezvous(
         CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
         return false;
     }
-    let smss_pid = live_hosted_pid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
-    let smss_tid = live_hosted_main_tid_for_leaf(nt_handler, b"smss.exe").unwrap_or(0) as u64;
+    let smss_pid =
+        live_hosted_pid_for_role(nt_handler, nt_exe_image::HostedProcessRole::NativeSession)
+            .unwrap_or(0) as u64;
+    let smss_tid =
+        live_hosted_main_tid_for_role(nt_handler, nt_exe_image::HostedProcessRole::NativeSession)
+            .unwrap_or(0) as u64;
     request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
     request[8..16].copy_from_slice(&smss_pid.to_le_bytes());
     request[16..24].copy_from_slice(&smss_tid.to_le_bytes());
@@ -3848,7 +3857,9 @@ pub(crate) unsafe fn csr_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
-    let csrss_pid = live_hosted_pid_for_leaf(nt_handler, b"csrss.exe").unwrap_or(0) as u64;
+    let csrss_pid =
+        live_hosted_pid_for_role(nt_handler, nt_exe_image::HostedProcessRole::Win32Subsystem)
+            .unwrap_or(0) as u64;
     let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
         if CSR_API_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
             let recvmsg = CSR_API_RECVMSG.load(Ordering::Relaxed);

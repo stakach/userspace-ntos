@@ -994,8 +994,9 @@ before unrelated executive traffic monopolises the receive loop.
   the policy boundary. SCM/LSA multiplexed listener thread spawns, CSR/winlogon local worker
   spawning, post-LSA fault containment, LSASS pipe attribution, shell COM routing, and executive
   fault summaries now resolve process identity by hosted role instead of executable leaf names.
-  Remaining name-scoped uses should be limited to requested image admission, diagnostics,
-  historical boot roots, or explicit user-shell proof gates.
+  SM/CSR rendezvous CID publication also derives SMSS/CSRSS identity from hosted roles. Remaining
+  name-scoped uses should be limited to requested image admission, diagnostics, historical boot
+  roots, or explicit user-shell proof gates.
 - `[x]` A5: Add boot gates proving the first auto-start service and demand-start service are selected
   dynamically from registry state.
 
@@ -4677,6 +4678,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   are the image path being admitted or an explicit proof counter for the ReactOS shell path.
   Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+  A4 role-owned SM/CSR rendezvous cleanup (2026-08-13): the rendezvous glue no longer re-parses
+  `smss.exe` or `csrss.exe` from ProcessManager image names when publishing LPC message CIDs.
+  `sm_rendezvous`, `sm_api_request_rendezvous`, `csr_sb_api_request_rendezvous`, and
+  `csr_rendezvous` now look up `NativeSession` and `Win32Subsystem` hosted roles, then read the live
+  ProcessManager PID/TID from that role-owned process. This keeps SM/CSR IPC identity attached to
+  the hosted-process catalog rather than executable-name matching. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
 
   D2 delete-value read-only authority cleanup (2026-08-13): the persistent-path audit also found
   that `NtDeleteValueKey` could still fall through to `STATUS_NOT_IMPLEMENTED` after resolving a
