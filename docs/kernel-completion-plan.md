@@ -39,20 +39,21 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-headless-current-20260815-082827.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after rebuilding ntdll, the executive, rust-micro, and
-the disk image. This retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live
-`Default User\ntuser.dat` image is staged and copied into the profile, `NtLoadKey` mounts the
-profile hive, `NtFlushKey` checkpoints mutable hives, provider-backed hive boot failures stay
-non-synthetic, dynamic regf profile hives replay their writable `.LOG` sidecars, and
-`exec_vm_pool_headroom` stays green. The shell path is fully live: `WlxActivateUserShell` reads the
-real `Userinit` registry value, `userinit.exe` and `explorer.exe` spawn through ordinary
-section/process creation, Explorer opens shell COM classes, redirects real api0 callbacks, installs
-client WndProcs, flushes GDI user batches, and `exec_explorer_shell_chrome_painted` reports the full
-1024x768 framebuffer as non-background with at least 32 distinct non-background colors. The prior
-visible proof remains `.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
-`.tmp/run-desktop-20260814-125406.log`, which also closes the Dbgk hardware-breakpoint context
-proof: `NtSetContextThread` programs `DR0`/`DR7` into the live TCB breakpoint slot,
+`.tmp/run-desktop-b3-cleanup-20260815-085258.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3 PnP cleanup. This retains the
+D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is
+staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints
+mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf profile hives
+replay their writable `.LOG` sidecars, and `exec_vm_pool_headroom` stays green. The shell path is
+fully live: `WlxActivateUserShell` reads the real `Userinit` registry value, `userinit.exe` and
+`explorer.exe` spawn through ordinary section/process creation, Explorer opens shell COM classes,
+redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches, and
+`exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with at
+least 32 distinct non-background colors. The preceding headless proof remains
+`.tmp/run-headless-current-20260815-082827.log`, and the prior visible Dbgk proof remains
+`.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
+`.tmp/run-desktop-20260814-125406.log`, which closes the Dbgk hardware-breakpoint context proof:
+`NtSetContextThread` programs `DR0`/`DR7` into the live TCB breakpoint slot,
 `NtGetContextThread` reads the slot back, the target reports a real instruction-breakpoint
 `STATUS_SINGLE_STEP`, and the debugger clears `DR7` before resuming. The restored writable-snapshot
 proof remains
@@ -3310,6 +3311,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   raw-frame `write_cm_resource_list` helper. Registry-selected PCI/root devnode grant builders return
   owned `CM_RESOURCE_LIST` bytes through the same `nt-pnp::assignment_to_cm_list` path consumed by
   hosted-driver START dispatch, so there is one resource-list construction boundary.
+
+- B3 desktop validation after PnP cleanup (2026-08-15). Serialized `./run.sh --desktop` proof
+  `.tmp/run-desktop-b3-cleanup-20260815-085258.log` reaches the harness sentinel with `296/296`
+  checks passing. The proof keeps registry/profile gates, real `userinit.exe`/`explorer.exe`
+  process creation, GDI user-batch flushes, redirected Explorer api0 callbacks, client WndProc
+  install, shell COM class service, and `exec_explorer_shell_chrome_painted` green. The final
+  framebuffer is fully non-background (`786432/786432`) with at least 32 distinct non-background
+  colors, so the B3 cleanup did not regress the desktop/icon frontier.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
