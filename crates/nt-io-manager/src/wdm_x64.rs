@@ -63,6 +63,8 @@ pub struct WdmOpenDeviceProjectionInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmIrpInit {
+    pub mdl_address: u64,
+    pub flags: u32,
     pub system_buffer: u64,
     pub user_buffer: u64,
     /// `IRP.Tail.Overlay.Thread`; NPFS uses this for client-security capture.
@@ -213,6 +215,8 @@ pub fn write_wdm_open_device_projection(
 pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayoutError> {
     require(bytes, WDM_X64_IRP_SIZE)?;
     zero(bytes);
+    put_u64(bytes, 0x08, init.mdl_address);
+    put_u32(bytes, 0x10, init.flags);
     put_u64(bytes, 0x18, init.system_buffer);
     put_u8(bytes, 0x42, init.stack_count);
     put_u8(bytes, 0x43, init.current_location);

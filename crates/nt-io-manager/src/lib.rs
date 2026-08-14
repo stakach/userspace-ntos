@@ -2178,6 +2178,8 @@ mod tests {
         write_wdm_irp(
             &mut irp,
             WdmIrpInit {
+                mdl_address: 0xAAAA,
+                flags: 0x55AA,
                 system_buffer: 0x1111,
                 user_buffer: 0x2222,
                 thread: 0x4444,
@@ -2187,6 +2189,8 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(le_u64(&irp, 0x08), 0xAAAA);
+        assert_eq!(le_u32(&irp, 0x10), 0x55AA);
         assert_eq!(le_u64(&irp, 0x18), 0x1111);
         assert_eq!(irp[0x42], 1);
         assert_eq!(irp[0x43], 1);

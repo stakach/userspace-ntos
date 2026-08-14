@@ -2,7 +2,7 @@
 //!
 //! `CTL_CODE(DeviceType, Function, Method, Access)` packs a 32-bit control code:
 //! `DeviceType` in bits 16..32, `Access` in bits 14..16, `Function` in bits
-//! 2..14, `Method` in bits 0..2. v0.1 implements `METHOD_BUFFERED` only.
+//! 2..14, `Method` in bits 0..2.
 
 /// Transfer method — low 2 bits of a control code.
 pub const METHOD_BUFFERED: u32 = 0;

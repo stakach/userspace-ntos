@@ -55,6 +55,20 @@ restored writable-snapshot proof remains
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
 the current desktop path.
 
+Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
+`NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
+handle routes to the hosted ReactOS driver path. The component-side WDM IRP projection now carries
+the NT5 transfer shape for all control methods: buffered controls use
+`AssociatedIrp.SystemBuffer`, direct controls use a buffered input plus a request-owned nonpaged MDL
+for the output buffer, and neither controls use `Type3InputBuffer`/`UserBuffer`. Pending control IRPs
+with output now retain and free their output buffer/MDL through the same completion table as pending
+reads, and the WDM layout writer has host tests for `IRP.MdlAddress` and `IRP.Flags`. The generic
+`nt-io-manager` convenience `device_control` API remains explicitly buffered-only until its backend
+projection can represent separate SystemBuffer/MDL/UserBuffer storage without collapsing methods.
+Local validation: `cargo fmt --all`, `cargo test -p nt-io-manager`, executive `cargo check
+--manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`.
+
 Completed restored-boot proof hardening (2026-08-13): restored profile, LSA, SAM, and writable
 overlay gates now derive from actual persisted state instead of first-boot counters. The writable
 overlay records restored profile-source tree stats by enumerating the real restored `\Profiles`

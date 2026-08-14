@@ -10243,10 +10243,6 @@ impl ExecNtHandler {
         }
 
         let ioctl = args[5] as u32;
-        if nt_io_abi::ioctl::method(ioctl) != nt_io_abi::ioctl::METHOD_BUFFERED {
-            self.write_current_iosb(iosb, STATUS_NOT_SUPPORTED, 0);
-            return STATUS_NOT_SUPPORTED;
-        }
         let raw_input_len = args[7] as u32 as usize;
         let raw_output_len = args[9] as u32 as usize;
         if raw_input_len > DEVICE_CONTROL_BUFFER_CAP || raw_output_len > DEVICE_CONTROL_BUFFER_CAP

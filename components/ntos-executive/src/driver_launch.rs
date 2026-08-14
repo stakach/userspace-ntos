@@ -29,7 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
 use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
-use nt_io_abi::major;
+use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
     DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext,
@@ -331,6 +331,8 @@ const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
 const IRP_MJ_QUERY_INFORMATION: u64 = major::IRP_MJ_QUERY_INFORMATION as u64;
 const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u64 = major::IRP_MJ_FILE_SYSTEM_CONTROL as u64;
+const IRP_MJ_DEVICE_CONTROL: u64 = major::IRP_MJ_DEVICE_CONTROL as u64;
+const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64;
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
@@ -338,6 +340,9 @@ const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// FILE_OBJECT must remain available for close through the per-open FILE_OBJECT registry.
 const IRP_MJ_CLOSE: u64 = 0x02;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const IRP_BUFFERED_IO: u32 = 0x0000_0010;
+const IRP_DEALLOCATE_BUFFER: u32 = 0x0000_0020;
+const IRP_INPUT_OPERATION: u32 = 0x0000_0040;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -346,6 +351,8 @@ struct PendingIrp {
     iosl: u64,
     file_object: u64,
     data: u64,
+    aux_data: u64,
+    mdl: u64,
     /// The npfs `FsContext` (opaque file id) this IRP was issued on, captured at ISSUE time.
     /// ★ Must NOT be re-read from `FILE_OBJECT->FsContext` at completion time: npfs NULLs that
     /// field through `NpSetFileObject(fo, NULL, NULL, …)` when a pipe end disconnects
@@ -398,10 +405,89 @@ static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 static FSD_CANCEL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-fn pending_irp_returns_read_bytes(major: u64, fsctl: u64) -> bool {
+fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
+    if major == IRP_MJ_FILE_SYSTEM_CONTROL
+        || major == IRP_MJ_DEVICE_CONTROL
+        || major == IRP_MJ_INTERNAL_DEVICE_CONTROL
+    {
+        Some(ioctl::method(code as u32))
+    } else {
+        None
+    }
+}
+
+fn pending_irp_returns_read_bytes(major: u64, fsctl: u64, output_len: u64) -> bool {
     major == IRP_MJ_READ
         || major == IRP_MJ_QUERY_INFORMATION
         || major == IRP_MJ_FILE_SYSTEM_CONTROL && fsctl == FSCTL_PIPE_TRANSCEIVE
+        || control_transfer_method(major, fsctl).is_some() && output_len != 0
+}
+
+unsafe fn pool_alloc_zeroed(size: u64) -> u64 {
+    let capacity = (size.max(1) + 7) & !7;
+    let ptr = pool_alloc(capacity);
+    if ptr != 0 {
+        zero(ptr, capacity);
+    }
+    ptr
+}
+
+unsafe fn pool_copy_from_arg(dst: u64, len: u64) {
+    let mut index = 0u64;
+    while index < len {
+        let byte = read_volatile((FSD_ARG_VADDR + index) as *const u8);
+        write_volatile((dst + index) as *mut u8, byte);
+        index += 1;
+    }
+}
+
+unsafe fn pool_free_request_buffers(data: u64, aux_data: u64, mdl: u64) {
+    if mdl != 0 {
+        pool_free(mdl);
+    }
+    if aux_data != 0 && aux_data != data {
+        pool_free(aux_data);
+    }
+    if data != 0 {
+        pool_free(data);
+    }
+}
+
+unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
+    if virtual_address == 0 || length == 0 || length > u32::MAX as u64 {
+        return 0;
+    }
+    let mdl = pool_alloc_zeroed(nt_mdl::MDL_SIZE as u64);
+    if mdl == 0 {
+        return 0;
+    }
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
+        nt_mdl::MDL_SIZE as i16,
+    );
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+        nt_mdl::MDL_MAPPED_TO_SYSTEM_VA
+            | nt_mdl::MDL_PAGES_LOCKED
+            | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL,
+    );
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
+        virtual_address,
+    );
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
+        virtual_address & !0xFFF,
+    );
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
+        length as u32,
+    );
+    write_unaligned(
+        (mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
+        (virtual_address & 0xFFF) as u32,
+    );
+    mdl
 }
 
 // BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
@@ -461,6 +547,8 @@ const EMPTY_PENDING_IRP: PendingIrp = PendingIrp {
     iosl: 0,
     file_object: 0,
     data: 0,
+    aux_data: 0,
+    mdl: 0,
     fid: 0,
     major: 0,
     read_completion: false,
@@ -6038,7 +6126,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         }
         // The FSD pool exists only in the component VSpace. No graph pointer may escape this
         // callback for root-side reclamation.
-        pool_free(slot.data);
+        pool_free_request_buffers(slot.data, slot.aux_data, slot.mdl);
         pool_free(slot.iosl);
         pool_free(slot.irp);
         // ★ The FILE_OBJECT is NOT freed here. It OUTLIVES the IRP: it belongs to the OPEN and npfs
@@ -8366,13 +8454,14 @@ pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
     (reply_info >> 12, m0, m1, m2, m3)
 }
 
-/// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke the FSD's
+/// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT and invoke the FSD's
 /// `MajorFunction[major]` handler. The pipe/file name (UTF-16) rides in the ARG frame ([SH_REQ_INLEN]
 /// bytes); the FILE_OBJECT's FileName points at it. Returns (status, information).
 ///
 /// x64 layouts (references/nt5 io.h): FILE_OBJECT { DeviceObject@8, FsContext@0x18, FsContext2@0x20,
-/// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { IoStatus@0x30, CurrentLocation
-/// (CCHAR)@0x42, StackCount@0x43, AssociatedIrp.SystemBuffer@0x18, UserBuffer@0x70,
+/// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { MdlAddress@0x08, Flags@0x10,
+/// AssociatedIrp.SystemBuffer@0x18, IoStatus@0x30, CurrentLocation (CCHAR)@0x42,
+/// StackCount@0x43, UserBuffer@0x70,
 /// Tail.Overlay.CurrentStackLocation@0xb8 }. IO_STACK_LOCATION { Major@0, Minor@1, Parameters(union)
 /// @0x08, DeviceObject@0x28, FileObject@0x30 }.
 unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
@@ -8446,24 +8535,97 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         FSD_FO_REUSED.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Give every request its own buffered-I/O storage. The ARG frame is transport scratch and is
+    // Give every request its own WDM-visible storage. The ARG frame is transport scratch and is
     // overwritten by the next dispatch, so it cannot back an IRP retained in an npfs data queue.
-    let data_len = inlen.max(outlen).max(1);
-    let data_capacity = (data_len + 7) & !7;
-    let data = pool_alloc(data_capacity);
+    //
+    // For control IRPs, mirror NT's transfer-method fields:
+    // - METHOD_BUFFERED: AssociatedIrp.SystemBuffer owns input and receives output.
+    // - METHOD_{IN,OUT}_DIRECT: SystemBuffer owns input; MdlAddress maps the output buffer.
+    // - METHOD_NEITHER: Type3InputBuffer carries input; Irp->UserBuffer carries output.
+    let control_method = control_transfer_method(major, fsctl);
+    let output_is_separate = matches!(
+        control_method,
+        Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
+    ) && outlen != 0;
+    let data_len = if output_is_separate {
+        outlen
+    } else if matches!(
+        control_method,
+        Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT)
+    ) {
+        inlen
+    } else {
+        inlen.max(outlen)
+    }
+    .max(1);
+    let data = pool_alloc_zeroed(data_len);
     if data == 0 {
         if owns_fo {
             pool_free(fo);
         }
         return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
     }
-    zero(data, data_capacity);
-    let mut data_index = 0u64;
-    while data_index < inlen {
-        let byte = read_volatile((FSD_ARG_VADDR + data_index) as *const u8);
-        write_volatile((data + data_index) as *mut u8, byte);
-        data_index += 1;
+    let mut aux_data = 0u64;
+    let input_data = if output_is_separate && inlen != 0 {
+        aux_data = pool_alloc_zeroed(inlen);
+        if aux_data == 0 {
+            pool_free_request_buffers(data, 0, 0);
+            if owns_fo {
+                pool_free(fo);
+            }
+            return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+        }
+        aux_data
+    } else {
+        data
+    };
+    if inlen != 0 {
+        pool_copy_from_arg(input_data, inlen);
     }
+    let mut mdl = 0u64;
+    if matches!(
+        control_method,
+        Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT)
+    ) && outlen != 0
+    {
+        mdl = allocate_nonpaged_mdl(data, outlen);
+        if mdl == 0 {
+            pool_free_request_buffers(data, aux_data, 0);
+            if owns_fo {
+                pool_free(fo);
+            }
+            return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+        }
+    }
+    let (system_buffer, user_buffer, type3_input_buffer, irp_flags) = match control_method {
+        Some(ioctl::METHOD_BUFFERED) => {
+            let flags = if inlen != 0 || outlen != 0 {
+                IRP_BUFFERED_IO
+                    | IRP_DEALLOCATE_BUFFER
+                    | if outlen != 0 { IRP_INPUT_OPERATION } else { 0 }
+            } else {
+                0
+            };
+            (data, if outlen != 0 { data } else { 0 }, 0, flags)
+        }
+        Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT) => (
+            if inlen != 0 { input_data } else { 0 },
+            0,
+            0,
+            if inlen != 0 {
+                IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER
+            } else {
+                0
+            },
+        ),
+        Some(ioctl::METHOD_NEITHER) => (
+            0,
+            if outlen != 0 { data } else { 0 },
+            if inlen != 0 { input_data } else { 0 },
+            0,
+        ),
+        _ => (data, data, data, 0),
+    };
 
     // IO_STACK_LOCATION. Parameters union @ +0x08:
     // Create/CreatePipe: SecurityContext@+0x08, Options@+0x10, ShareAccess@+0x1a, Parameters@+0x20.
@@ -8477,7 +8639,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     };
     let iosl = pool_alloc(iosl_len);
     if iosl == 0 {
-        pool_free(data);
+        pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
         }
@@ -8552,19 +8714,21 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             length: inlen as u32,
             information_class: fsctl as u32,
         },
-        0xd | 0xe => WdmIoStackParameters::DeviceControl {
-            output_buffer_length: outlen as u32,
-            input_buffer_length: inlen as u32,
-            io_control_code: fsctl as u32,
-            type3_input_buffer: data,
-        },
+        IRP_MJ_FILE_SYSTEM_CONTROL | IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => {
+            WdmIoStackParameters::DeviceControl {
+                output_buffer_length: outlen as u32,
+                input_buffer_length: inlen as u32,
+                io_control_code: fsctl as u32,
+                type3_input_buffer,
+            }
+        }
         IRP_MJ_PNP if minor == IRP_MN_START_DEVICE => {
             if inlen != 0 {
                 let pnp_resource_capacity = (inlen + 7) & !7;
                 pnp_resource_list = pool_alloc(pnp_resource_capacity);
                 if pnp_resource_list == 0 {
                     pool_free(iosl);
-                    pool_free(data);
+                    pool_free_request_buffers(data, aux_data, mdl);
                     if owns_fo {
                         pool_free(fo);
                     }
@@ -8603,7 +8767,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             pool_free(pnp_resource_list);
         }
         pool_free(iosl);
-        pool_free(data);
+        pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
         }
@@ -8618,7 +8782,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             pool_free(pnp_resource_list);
         }
         pool_free(iosl);
-        pool_free(data);
+        pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
         }
@@ -8628,8 +8792,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     if write_wdm_irp(
         irp_bytes,
         WdmIrpInit {
-            system_buffer: data,
-            user_buffer: data,
+            mdl_address: mdl,
+            flags: irp_flags,
+            system_buffer,
+            user_buffer,
             thread: s_current_process(),
             stack_count: if major == IRP_MJ_PNP { 2 } else { 1 },
             current_location: if major == IRP_MJ_PNP { 2 } else { 1 },
@@ -8643,7 +8809,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             pool_free(pnp_resource_list);
         }
         pool_free(iosl);
-        pool_free(data);
+        pool_free_request_buffers(data, aux_data, mdl);
         if owns_fo {
             pool_free(fo);
         }
@@ -8657,7 +8823,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, data);
     write_volatile(
         (FSD_SHARED_VADDR + SH_ACTIVE_DATA_CAP) as *mut u64,
-        data_capacity,
+        data_len,
     );
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_FILE_OBJECT) as *mut u64, fo);
 
@@ -8738,7 +8904,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         fo_registered = false;
     }
     let irp_owns_fo = owns_fo && !fo_registered;
-    let read_completion = pending_irp_returns_read_bytes(major, fsctl);
+    let read_completion = pending_irp_returns_read_bytes(major, fsctl, outlen);
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
@@ -8775,7 +8941,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             st as u32,
             info,
             pipe_rw_before,
-            data,
+            input_data,
             inlen,
         );
     }
@@ -8785,6 +8951,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             iosl,
             file_object: fo,
             data,
+            aux_data,
+            mdl,
             // Capture the caller's open identity NOW: npfs may normalize or later NULL
             // `FILE_OBJECT->FsContext`, but executive waiters are parked on the exact endpoint fid
             // carried in this request.
@@ -8795,7 +8963,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             _pad: [0; 5],
         });
         if !inserted {
-            pool_free(data);
+            pool_free_request_buffers(data, aux_data, mdl);
             if pnp_resource_list != 0 {
                 pool_free(pnp_resource_list);
             }
@@ -8816,7 +8984,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 index += 1;
             }
         }
-        pool_free(data);
+        pool_free_request_buffers(data, aux_data, mdl);
         if pnp_resource_list != 0 {
             pool_free(pnp_resource_list);
         }
@@ -12463,8 +12631,9 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 /// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop
 /// (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP lands
 /// on its fault EP → demand-map + resume), then read back the completion. Returns `(status,
-/// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame
-/// (buffered I/O); `out` receives the driver's output. Returns `None` if `inst` isn't ready.
+/// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame and
+/// then projected into the WDM transfer-method fields by the component-side IRP builder; `out`
+/// receives the driver's output. Returns `None` if `inst` isn't ready.
 ///
 /// This is the private component transport engine. Public callers route through driver/device ids.
 unsafe fn dispatch_irp_for_instance(
@@ -12484,7 +12653,8 @@ unsafe fn dispatch_irp_for_instance(
     let ep = d.fault_ep;
     let pml4 = d.pml4;
     let sh = d.exec_shared_va;
-    // buffered I/O: copy input into the instance's ARG frame (mapped RW in both AS).
+    // Copy input into the instance's ARG frame (mapped RW in both AS); the component-side builder
+    // moves it into SystemBuffer, Type3InputBuffer, or the read/write buffer as required.
     let arg = d.exec_arg_va;
     let inlen = in_data.len().min((FSD_ARG_FRAMES * 0x1000) as usize);
     for i in 0..inlen {
@@ -12607,7 +12777,7 @@ unsafe fn dispatch_irp_for_instance(
     let st = pr.status;
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
-    // copy the driver's output back out (buffered I/O).
+    // Copy the driver's projected output bytes back out.
     let outlen = (info as usize).min(out.len());
     for i in 0..outlen {
         out[i] = read_volatile((arg + i as u64) as *const u8);
