@@ -1065,13 +1065,14 @@ before unrelated executive traffic monopolises the receive loop.
 
 ### D. Registry And Filesystem Durability
 
-- `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
+- `[x]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
   `NtSaveKey`, writable-overlay `FileRenameInformation`, and file-backed hive atomic image
   replacement are now real. Writable-overlay delete disposition now also covers
   `FileDispositionInformationEx` with NT delete flags, validates readonly/non-empty-directory cases
-  before setting delete-pending, and keeps hard links visibly unsupported until the filesystem owns a
-  real link-count/parent-entry model. D2 is closed for live-hive authority, while D4 still owns the
+  before setting delete-pending, cross-volume renames fail explicitly with `STATUS_NOT_SAME_DEVICE`,
+  and hard links are classified as a valid but unsupported operation until the filesystem owns a real
+  link-count/parent-entry model. D1 is closed for the listed audit surfaces; D4 still owns the
   remaining volatile/journal/setup-profile durability semantics.
 - `[x]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
@@ -3250,6 +3251,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   because MemFs still has a single parent entry per node and no link-count model. Review adjustment:
   hard-link semantics remain the known unsupported file namespace operation; otherwise D1 should now
   follow live service traffic rather than inventing speculative file-information classes.
+
+- D1 current audit closed (2026-08-15). The mutable registry and writable filesystem audit surfaces
+  named in D1 now have real mechanisms or explicit failure boundaries: `NtSaveKey`, `NtLoadKey`,
+  `NtUnloadKey`, `NtFlushKey`, profile hive usage, writable file writeback, rename, delete
+  disposition, cross-volume rename refusal, and file-backed hive atomic replacement. The workstream
+  status is now `[x]`; D4 remains open for volatile-key, journal replay, setup-state, and
+  user-profile durability semantics.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
