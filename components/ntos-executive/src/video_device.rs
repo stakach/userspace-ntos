@@ -8,8 +8,7 @@
 //! Manager and retained in this route state so hosted win32k import shims can answer the same
 //! values without crossing into executive-only service-ring clients.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::ptr::{read_unaligned, write_unaligned};
 
 use nt_io_abi::major;
@@ -27,10 +26,7 @@ use nt_video_miniport::{
 
 pub(crate) use nt_video_miniport::VideoModeSpec;
 
-const VIDEO_DRIVER_NAME_CAP: usize = 32;
 const VIDEO_DRIVER_OBJECT_PATH_PREFIX: &[u8] = b"\\Driver\\";
-const VIDEO_DRIVER_OBJECT_PATH_CAP: usize =
-    VIDEO_DRIVER_OBJECT_PATH_PREFIX.len() + VIDEO_DRIVER_NAME_CAP;
 const VIDEO_SUPPORTED_MAJORS: [u8; 5] = [
     major::IRP_MJ_CREATE,
     major::IRP_MJ_CLEANUP,
@@ -38,7 +34,6 @@ const VIDEO_SUPPORTED_MAJORS: [u8; 5] = [
     major::IRP_MJ_DEVICE_CONTROL,
     major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
 ];
-const VIDEO_SERVICE_PATH_CAP: usize = 128;
 const VIDEO_DEVICE_PATH_STR: &str = "\\Device\\Video0";
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
 const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
@@ -59,15 +54,15 @@ pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) allocate_projection: unsafe fn(u64) -> u64,
 }
 
+struct VideoRegistrationMetadata {
+    driver_name: Vec<u8>,
+    service_registry_path: Vec<u8>,
+}
+
 static mut VIDEO_DRIVER_OBJECT: u64 = 0;
 static mut VIDEO_DEVICE_OBJECT: u64 = 0;
 static mut VIDEO_FILE_OBJECT: u64 = 0;
-static mut VIDEO_DRIVER_OBJECT_PATH: [u8; VIDEO_DRIVER_OBJECT_PATH_CAP] =
-    [0; VIDEO_DRIVER_OBJECT_PATH_CAP];
-static mut VIDEO_DRIVER_NAME: [u8; VIDEO_DRIVER_NAME_CAP] = [0; VIDEO_DRIVER_NAME_CAP];
-static mut VIDEO_DRIVER_NAME_LEN: u8 = 0;
-static mut VIDEO_SERVICE_PATH: [u8; VIDEO_SERVICE_PATH_CAP] = [0; VIDEO_SERVICE_PATH_CAP];
-static mut VIDEO_SERVICE_PATH_LEN: u8 = 0;
+static mut VIDEO_REGISTRATION_METADATA: Option<VideoRegistrationMetadata> = None;
 static mut VIDEO_MINIPORT: Option<BootFramebufferMiniport> = None;
 static mut VIDEO_DRIVER_ID: u64 = 0;
 static mut VIDEO_DEVICE_ID: u64 = 0;
@@ -81,13 +76,12 @@ static mut VIDEO_DEVICE_READY: bool = false;
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     reg: &VideoDeviceRegistration<'_>,
 ) -> bool {
-    if !ascii_component_is_safe(reg.driver_name)
-        || reg.driver_name.len() > VIDEO_DRIVER_NAME_CAP
-        || reg.service_registry_path.is_empty()
-        || reg.service_registry_path.len() > VIDEO_SERVICE_PATH_CAP
-    {
+    if !ascii_component_is_safe(reg.driver_name) || reg.service_registry_path.is_empty() {
         return false;
     }
+    let Some(metadata) = video_registration_metadata_from(reg) else {
+        return false;
+    };
     if !ensure_video_objects(reg.allocate_projection) {
         return false;
     }
@@ -98,13 +92,13 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         VIDEO_MINIPORT = None;
         return false;
     }
-    if !publish_video_device_map(reg.service_registry_path) {
+    if !publish_video_device_map(&metadata.service_registry_path) {
         teardown_video_io_route();
         VIDEO_MINIPORT = None;
         return false;
     }
 
-    copy_video_registration_metadata(reg);
+    *core::ptr::addr_of_mut!(VIDEO_REGISTRATION_METADATA) = Some(metadata);
     VIDEO_DEVICE_READY = true;
     true
 }
@@ -129,23 +123,42 @@ unsafe fn install_video_miniport(
     true
 }
 
-#[inline(never)]
-unsafe fn copy_video_registration_metadata(reg: &VideoDeviceRegistration<'_>) {
-    let driver_name = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_NAME);
-    driver_name.fill(0);
-    driver_name[..reg.driver_name.len()].copy_from_slice(reg.driver_name);
-    VIDEO_DRIVER_NAME_LEN = reg.driver_name.len() as u8;
-    let path = &mut *core::ptr::addr_of_mut!(VIDEO_SERVICE_PATH);
-    path.fill(0);
-    path[..reg.service_registry_path.len()].copy_from_slice(reg.service_registry_path);
-    VIDEO_SERVICE_PATH_LEN = reg.service_registry_path.len() as u8;
+fn video_registration_metadata_from(
+    reg: &VideoDeviceRegistration<'_>,
+) -> Option<VideoRegistrationMetadata> {
+    let mut driver_name = Vec::new();
+    driver_name.try_reserve_exact(reg.driver_name.len()).ok()?;
+    driver_name.extend_from_slice(reg.driver_name);
+
+    let mut service_registry_path = Vec::new();
+    service_registry_path
+        .try_reserve_exact(reg.service_registry_path.len())
+        .ok()?;
+    service_registry_path.extend_from_slice(reg.service_registry_path);
+
+    Some(VideoRegistrationMetadata {
+        driver_name,
+        service_registry_path,
+    })
+}
+
+unsafe fn video_registration_metadata() -> Option<&'static VideoRegistrationMetadata> {
+    (&*core::ptr::addr_of!(VIDEO_REGISTRATION_METADATA)).as_ref()
+}
+
+unsafe fn video_registration_metadata_ready() -> bool {
+    match video_registration_metadata() {
+        Some(metadata) => {
+            !metadata.driver_name.is_empty() && !metadata.service_registry_path.is_empty()
+        }
+        None => false,
+    }
 }
 
 pub(crate) fn video_device_map_ready() -> bool {
     unsafe {
         VIDEO_DEVICE_READY
-            && VIDEO_DRIVER_NAME_LEN != 0
-            && VIDEO_SERVICE_PATH_LEN != 0
+            && video_registration_metadata_ready()
             && VIDEO_DRIVER_OBJECT != 0
             && VIDEO_DEVICE_OBJECT != 0
             && VIDEO_FILE_OBJECT != 0
@@ -155,14 +168,17 @@ pub(crate) fn video_device_map_ready() -> bool {
 }
 
 pub(crate) fn video_device_map_published() -> bool {
-    unsafe { VIDEO_DEVICE_READY && VIDEO_SERVICE_PATH_LEN != 0 }
+    unsafe { VIDEO_DEVICE_READY && video_registration_metadata_ready() }
 }
 
 pub(crate) unsafe fn query_video_device_map_value(
     name: &[u8],
     out: &mut [u8],
 ) -> Result<(u32, usize), i32> {
-    if !video_device_map_published() {
+    let Some(metadata) = video_registration_metadata() else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    if !VIDEO_DEVICE_READY {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     if ascii_eq_ignore_case(name, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE.as_bytes()) {
@@ -174,9 +190,8 @@ pub(crate) unsafe fn query_video_device_map_value(
         return Ok((REG_DWORD, data.len()));
     }
     if ascii_eq_ignore_case(name, VIDEO_DEVICE_PATH) {
-        let path_len = VIDEO_SERVICE_PATH_LEN as usize;
-        let path = &(&*core::ptr::addr_of!(VIDEO_SERVICE_PATH))[..path_len];
-        let Some(data_len) = utf16le_nul_from_ascii_into(path, out) else {
+        let Some(data_len) = utf16le_nul_from_ascii_into(&metadata.service_registry_path, out)
+        else {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         };
         return Ok((REG_SZ, data_len));
@@ -249,8 +264,7 @@ unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
     .is_ok()
 }
 
-#[inline(never)]
-unsafe fn video_driver_object_path(driver_name: &[u8]) -> Option<&'static str> {
+fn video_driver_object_path(driver_name: &[u8]) -> Option<Vec<u8>> {
     if !ascii_component_is_safe(driver_name) {
         return None;
     }
@@ -260,18 +274,11 @@ unsafe fn video_driver_object_path(driver_name: &[u8]) -> Option<&'static str> {
     else {
         return None;
     };
-    if len > VIDEO_DRIVER_OBJECT_PATH_CAP {
-        return None;
-    }
-    let path = &mut *core::ptr::addr_of_mut!(VIDEO_DRIVER_OBJECT_PATH);
-    path.fill(0);
-    path[..VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()].copy_from_slice(VIDEO_DRIVER_OBJECT_PATH_PREFIX);
-    path[VIDEO_DRIVER_OBJECT_PATH_PREFIX.len()..len].copy_from_slice(driver_name);
-    let bytes: &'static [u8] = core::slice::from_raw_parts(
-        core::ptr::addr_of!(VIDEO_DRIVER_OBJECT_PATH) as *const u8,
-        len,
-    );
-    Some(core::str::from_utf8_unchecked(bytes))
+    let mut path = Vec::new();
+    path.try_reserve_exact(len).ok()?;
+    path.extend_from_slice(VIDEO_DRIVER_OBJECT_PATH_PREFIX);
+    path.extend_from_slice(driver_name);
+    Some(path)
 }
 
 #[inline(never)]
@@ -319,6 +326,7 @@ unsafe fn video_io_route_ids_present() -> bool {
 #[inline(never)]
 unsafe fn register_video_driver_route(driver_name: &[u8]) -> Option<u64> {
     let driver_path = video_driver_object_path(driver_name)?;
+    let driver_path = core::str::from_utf8(&driver_path).ok()?;
     crate::driver_launch::register_kernel_io_driver_with_majors(
         driver_path,
         Box::new(BootVideoDriverBackend),
@@ -392,8 +400,7 @@ unsafe fn video_io_route_ready() -> bool {
 
 unsafe fn projected_video_route_ready() -> bool {
     VIDEO_DEVICE_READY
-        && VIDEO_DRIVER_NAME_LEN != 0
-        && VIDEO_SERVICE_PATH_LEN != 0
+        && video_registration_metadata_ready()
         && VIDEO_DRIVER_OBJECT != 0
         && VIDEO_DEVICE_OBJECT != 0
         && VIDEO_FILE_OBJECT != 0

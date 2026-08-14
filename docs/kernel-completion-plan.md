@@ -1049,7 +1049,9 @@ before unrelated executive traffic monopolises the receive loop.
   semantics between the direct win32k EngDeviceIoControl shim and the I/O Manager backend. Remaining
   display debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge. Loaded
   GDI/display driver image records also grow in component-visible win32k pool storage, so win32k's
-  hosted trampolines never depend on executive-only heap pointers.
+  hosted trampolines never depend on executive-only heap pointers. The temporary Video0 bridge still
+  publishes one boot-framebuffer-backed device, but its registry-selected driver/service metadata is
+  now owned data rather than 32/128 byte static buffers.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -3345,6 +3347,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `.tmp/run-desktop-gdi-record-pool-20260815-091205.log` reaches the sentinel with `296/296` checks
   passing and `exec_explorer_shell_chrome_painted` green. This removes another display-route cap
   before the larger videoprt/miniport hosting work.
+
+- B3 Video0 metadata cap cleanup (2026-08-15). The temporary boot-framebuffer bridge no longer
+  rejects registry-selected display driver names or service registry paths because they exceed the
+  old 32/128 byte static buffers. `video_device.rs` now stores the published driver/service metadata
+  in owned vectors, builds the `\Driver\<service>` route path from checked allocation, and treats
+  allocation failure as a real registration failure. Validation: `cargo fmt --all` and `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
