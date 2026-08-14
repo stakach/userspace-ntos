@@ -1583,6 +1583,19 @@ fn writable_volume_set_information_and_delete() {
         fs.zw_set_information_file(
             f.handle,
             FILE_RENAME_INFORMATION,
+            &rename_information(r"\??\D:\elsewhere.txt", 0, false),
+        ),
+        STATUS_NOT_SAME_DEVICE
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\nested.txt"),
+        Some(&b"0123"[..])
+    );
+    assert!(fs.query_attributes(r"\??\D:\elsewhere.txt").is_none());
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_RENAME_INFORMATION,
             &rename_information("collision.txt", dir.handle, true),
         ),
         STATUS_SUCCESS

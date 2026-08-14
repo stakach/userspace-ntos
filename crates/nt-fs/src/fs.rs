@@ -2360,7 +2360,7 @@ impl FileSystem {
             return Ok(rel);
         }
         if target.starts_with('\\') {
-            return Ok(String::from(target));
+            return Err(STATUS_NOT_SAME_DEVICE);
         }
         Err(STATUS_OBJECT_PATH_NOT_FOUND)
     }

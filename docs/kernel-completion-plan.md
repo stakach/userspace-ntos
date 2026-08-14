@@ -3208,9 +3208,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo test -p nt-fs`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Review adjustment: D1 delete semantics are stronger; remaining filesystem
-  durability audit is now hard-link semantics, cross-volume rename/link refusal, and any writable
-  file-information classes real service traffic exposes, while D4 still owns registry journal/setup
-  durability.
+  durability audit is now hard-link semantics and any writable file-information classes real service
+  traffic exposes, while D4 still owns registry journal/setup durability.
+
+- D1 cross-volume rename refusal slice (2026-08-15). Writable-overlay rename target resolution now
+  rejects absolute targets outside the mounted writable volume with `STATUS_NOT_SAME_DEVICE` instead
+  of treating the NT object path as a bogus volume-relative name and failing by incidental parent
+  lookup. The host regression proves the source file remains in place and no destination appears on
+  the other DOS device. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: hard-link semantics remain the known unsupported file
+  namespace operation because they require a real link-count/parent-entry model; otherwise D1 should
+  now follow live service traffic rather than inventing speculative file-information classes.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
