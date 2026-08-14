@@ -7369,7 +7369,7 @@ impl ExecNtHandler {
     unsafe fn nt_raise_exception(&mut self, args: &[u64]) -> u32 {
         let record_ptr = args[0];
         let context_ptr = args[1];
-        let first_chance = args[2] != 0;
+        let first_chance = nt_boolean_arg(args[2]);
         if record_ptr == 0 || context_ptr == 0 {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -15468,7 +15468,7 @@ impl ExecNtHandler {
         const TOKEN_QUERY: u32 = 0x0008;
         const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
 
-        let disable_all = args[1] != 0;
+        let disable_all = nt_boolean_arg(args[1]);
         let new_state = args[2];
         let buffer_length = args[3] as u32 as usize;
         let previous_state = args[4];
@@ -23191,7 +23191,7 @@ impl ExecNtHandler {
                 // LSAP_LOGON_CONTEXT it just built). No override, no fabricated handle.
                 let lsa_conn = LSA_PENDING_CONN.load(Ordering::Relaxed);
                 if self.current_process_is_lsass() && lsa_conn != 0 {
-                    let accept = args[3] != 0;
+                    let accept = nt_boolean_arg(args[3]);
                     let port_context = args[1];
                     let server_handle = lpc_client()
                         .and_then(|c| c.accept_connect(lsa_conn, accept, port_context).ok())
@@ -23218,7 +23218,7 @@ impl ExecNtHandler {
                     Ok(conn_id) => conn_id,
                     Err(status) => return status,
                 };
-                let accept = args[3] != 0;
+                let accept = nt_boolean_arg(args[3]);
                 let port_context = args[1];
                 match lpc_client().and_then(|c| c.accept_connect(conn_id, accept, port_context).ok()) {
                     Some(server_handle) => {
@@ -23277,7 +23277,8 @@ impl ExecNtHandler {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
                     // EventType=args[3], InitialState=args[4].
-                    if args[3] > 1 {
+                    let event_type = args[3] as u32;
+                    if event_type > 1 {
                         return 0xC000_000D; // STATUS_INVALID_PARAMETER
                     }
                     if out == 0 {
@@ -23289,8 +23290,8 @@ impl ExecNtHandler {
                     if !self.probe_event_output(out, 8) {
                         return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                     }
-                    let auto_reset = args[3] == 1;
-                    let init_state = args[4] & 1 != 0;
+                    let auto_reset = event_type == 1;
+                    let init_state = nt_boolean_arg(args[4]);
                     if oa == 0 {
                         let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                             return 0xC000_009A;
@@ -23825,7 +23826,7 @@ impl ExecNtHandler {
                 let due_time_ptr = args[1];
                 let apc_routine = args[2];
                 let apc_context = args[3];
-                let wake_timer = args[4] != 0;
+                let wake_timer = nt_boolean_arg(args[4]);
                 let period = args[5] as u32 as i32;
                 let previous_state = args[6];
                 if period < 0 {
@@ -24111,7 +24112,7 @@ impl ExecNtHandler {
             NativeService::NtCreateMutant => unsafe {
                 let out = args[0];
                 let oa = args[2];
-                let initial_owner = args[3] != 0;
+                let initial_owner = nt_boolean_arg(args[3]);
                 if out == 0 {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
@@ -25177,7 +25178,7 @@ impl ExecNtHandler {
             }
             NativeService::NtInitializeRegistry => self.nt_initialize_registry(args[0] as u32),
             NativeService::NtSetDefaultLocale => {
-                self.nt_set_default_locale(args[0] != 0, args[1] as u32)
+                self.nt_set_default_locale(nt_boolean_arg(args[0]), args[1] as u32)
             }
             NativeService::NtSetDefaultUILanguage => {
                 if args[0] > u16::MAX as u64 {
@@ -25430,7 +25431,7 @@ impl ExecNtHandler {
             // handles must resolve through `wait_object_for_handle`.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
-                let alertable = args[1] as u8 != 0;
+                let alertable = nt_boolean_arg(args[1]);
                 match self.wait_object_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(object) => {
                         let timeout_ptr = args[2];
@@ -25573,8 +25574,8 @@ impl ExecNtHandler {
                 let dir_handle = args[0];
                 let buf = args[1];
                 let length = args[2] as u32 as u64;
-                let return_single = args[3] as u8 != 0;
-                let restart_scan = args[4] as u8 != 0;
+                let return_single = nt_boolean_arg(args[3]);
+                let restart_scan = nt_boolean_arg(args[4]);
                 let context_ptr = args[5];
                 let retlen_ptr = args[6];
                 let dir_idx = match self.object_namespace_index_for_handle(
@@ -25840,7 +25841,7 @@ impl ExecNtHandler {
                 0
             }
             NativeService::NtDelayExecution => {
-                let alertable = args[0] & 0xff != 0;
+                let alertable = nt_boolean_arg(args[0]);
                 let interval_ptr = args[1];
                 let mut bytes = [0u8; 8];
                 if interval_ptr == 0 || !unsafe { self.xas_read(interval_ptr, &mut bytes) } {
@@ -26029,8 +26030,8 @@ impl ExecNtHandler {
                     _ => return STATUS_INSUFFICIENT_RESOURCES,
                 };
                 let information_class = args[7] as u32;
-                let return_single_entry = args[8] as u8 != 0;
-                let restart_scan = args[10] as u8 != 0;
+                let return_single_entry = nt_boolean_arg(args[8]);
+                let restart_scan = nt_boolean_arg(args[10]);
                 if iosb == 0 || output == 0 {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -28582,7 +28583,7 @@ impl ExecNtHandler {
                 if out == 0 || out & 3 != 0 {
                     return if out == 0 { 0xC000_0005 } else { 0x8000_0002 };
                 }
-                let value = if args[0] != 0 {
+                let value = if nt_boolean_arg(args[0]) {
                     NT_SESSION_DEFAULT_LOCALE.load(Ordering::Relaxed)
                 } else {
                     NT_SYSTEM_DEFAULT_LOCALE.load(Ordering::Relaxed)

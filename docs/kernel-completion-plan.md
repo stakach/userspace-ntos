@@ -1412,9 +1412,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    four-byte writable tail. The registered-service slice now removes the old raw register/stack
    argument rereads from the executive handler for the main create/open/thread/LPC/file/section
    services and consumes only the dispatcher-normalized `args[]` contract, including NT low-byte
-   `BOOLEAN` semantics for `NtCreateThread(CreateSuspended)`. The next slices should continue the
-   ABI-width audit at service bodies that still need typed truncation/probing while the shell frontier
-   moves to real resource capacity instead of path-status failures.
+   `BOOLEAN` semantics for `NtCreateThread(CreateSuspended)`. The next low-risk `BOOLEAN` slice now
+   uses that same low-byte interpretation for exception, privilege, LPC accept, event/timer/mutant,
+   locale, wait, delay, and directory-enumeration flags. The next slices should continue the ABI-width
+   audit at service bodies that still need typed truncation/probing while the shell frontier moves to
+   real resource capacity instead of path-status failures.
 
 ## Review Log
 
@@ -5211,3 +5213,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation: `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`; the focused grep for old raw argument
   rereads in `exec_handler.rs` returns no matches.
+
+  Native syscall BOOLEAN width cleanup (2026-08-14): low-risk native `BOOLEAN` parameters in the
+  executive handler now consistently use the NT low-byte contract instead of whole-word truth tests.
+  The slice covers `NtRaiseException(FirstChance)`, `NtAdjustPrivilegesToken(DisableAllPrivileges)`,
+  `NtAcceptConnectPort(AcceptConnection)`, `NtCreateEvent(InitialState)`, `NtSetTimer(WakeTimer)`,
+  `NtCreateMutant(InitialOwner)`, `NtSetDefaultLocale(UserProfile)`,
+  `NtWaitForSingleObject(Alertable)`, `NtDelayExecution(Alertable)`,
+  `NtQueryDefaultLocale(UserProfile)`, and the directory-enumeration `ReturnSingleEntry` /
+  `RestartScan` flags. `NtCreateEvent(EventType)` is also truncated to the declared 32-bit enum before
+  validation. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.
