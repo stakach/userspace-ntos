@@ -277,6 +277,14 @@ as Vista+ stubs are now real in our ntdll: `RtlOwnerAcesPresent` scans for Owner
 `RtlSidEqualLevel` compare mandatory integrity label SIDs. They are exported, gate-verified, and
 covered by focused pure security tests where the model is host-testable.
 
+**Completed pickup (2026-08-14):** `ThreadHideFromDebugger` now affects Dbgk per-thread live
+notifications. `NtSetInformationThread(ThreadHideFromDebugger)` already set
+`ETHREAD.HideFromDebugger`; the `nt-process` Dbgk queue path now consults that flag before posting
+notifications whose source is an explicit reporting thread. Hidden threads suppress exception,
+mapped-image load/unload, and thread-exit messages while preserving the kernel's mapped-image
+tracking. Covered by focused host tests including
+`dbgk_thread_hide_from_debugger_suppresses_live_thread_reports`.
+
 1. **Remaining Tier-2/3 `Rtl*` breadth — low value, do on demand.** The named Tier-2 security list is
    closed. The wider measured spec tail in §2.4 is remaining breadth. **None is imported by anything we
    host.** The rule that governs all of it:
@@ -297,9 +305,6 @@ covered by focused pure security tests where the model is host-testable.
      module list is only maintained while a debug object is alive, and that gate is exactly what keeps
      the extremely load-bearing `NtMapViewOfSection` path byte-identical. Closing it means recording
      IMAGE views unconditionally — deliberately not taken.
-   * **`Thread->HideFromDebugger` is not consulted.** The ETHREAD flag **does exist** and is settable
-     via `NtSetInformationThread` class 17 (`crates/nt-process/src/lib.rs:429/994`), but `dbgk.rs`
-     never reads it, so every thread reports. (The log claims the flag does not exist — see §7.)
    * **A remote create posts no `DbgKmCreateThreadApi`** — `create_remote_thread` draws from the
      target's pre-created ETHREAD pool instead of `ProcessManager::create_thread`, bypassing the poster.
    * **The loop-side multiplex for a remote thread created into a LIVE process is wired but not
@@ -793,7 +798,7 @@ authoritative values.
 | §E.5/§F: "1303 spec names, 194 still unexported, 26 of them `Rtl*`/`Ldr*`" | **not reproducible; understated** | `ntdll.spec` minus `-arch=i386` rows = **1882** names; **564** unexported (185 `Nt*`, 179 `Zw*`, 107 `Rtl*`, 23 `Rtlp*`, 42 `Tp*`, 6 `Ldr*`, 22 other), 289 of which ReactOS `-stub`s too. I could not derive 1303/194 from the spec under any filter and cannot verify where it came from. |
 | §E.5: "add the ~26 spec `Zw*` aliases that already have an `Nt*` twin" | **wrong, now closed** | the only five unexported `Zw*` names with exported `Nt*` twins were the Dbgk aliases, and the 2026-07-30 alias pickup exported them. Everything else would need its `Nt*` twin *and* an executive service first. |
 | §D: for the 5 dbgk SSNs, "`Zw*` aliases + `NT_ARGC` rows added alongside" | **now true** | originally only added to `ZW_ALIASES`; the 2026-07-30 alias pickup exported all five Dbgk `Zw*` names and added a verifier gate over the complete alias table. |
-| §D: "`Thread->HideFromDebugger` — we have no such flag" | **false** | the flag exists (`crates/nt-process/src/lib.rs:429`), is set through `NtSetInformationThread` class 17 (`exec_handler.rs:2155`) and is queryable (class 17 read at `lib.rs:940`). What is true is that `dbgk.rs` never consults it. |
+| §D: "`Thread->HideFromDebugger` — we have no such flag" | **false; fixed 2026-08-14** | the flag exists (`crates/nt-process/src/lib.rs:429`), is set through `NtSetInformationThread` class 17 (`exec_handler.rs:2155`) and is queryable (class 17 read at `lib.rs:940`). Dbgk per-thread live event posting now consults it before queueing reporting-thread notifications. |
 | §E.5: "`RtlCompactHeap` (⇒ 0) already matches ReactOS's `@unimplemented`" | **stale** | it now has a real body (`heap_compact`: coalesce + return the largest free payload extent), with an `INVALID_PARAMETER` error path. |
 | §E.0: "546 distinct `ntdll` imports across the live-loaded set (38 binaries)" | **consistent, different population** | my 42-binary live list gives **554**; the whole-`system32` figure (**593**) reproduces exactly. Both are **0-missing**, which is the load-bearing claim. |
 | §A/§E: `CsrClientCallServer`/`CsrGetProcessId` are NOT_IMPLEMENTED stubs | **stale** | both are real bodies; §E.0 already corrected this. |

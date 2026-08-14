@@ -5086,3 +5086,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   last real handle-table reference disappears. Deleted namespace entries are tombstoned without
   shifting stable object indices, and path walks, handle resolution, and object queries reject those
   tombstones instead of reopening stale names.
+
+  Dbgk ThreadHideFromDebugger fidelity cleanup (2026-08-14): the `ETHREAD.HideFromDebugger` flag is
+  now part of the per-thread live Dbgk event boundary instead of being a stored-but-unused thread
+  attribute. `ProcessManager::report_debug_message` consults the reporting thread before queueing
+  explicit per-thread debug events, which suppresses hidden-thread exception, mapped-image load/unload,
+  and thread-exit notifications without suppressing the kernel's own mapped-image tracking or
+  process-level teardown events that this layer does not receive with a current reporting-thread
+  identity. The behavior is covered by focused `nt-process` host tests.

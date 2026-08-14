@@ -2177,6 +2177,80 @@ fn dbgk_thread_create_and_exit_generate_real_events() {
 }
 
 #[test]
+fn dbgk_thread_hide_from_debugger_suppresses_live_thread_reports() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    let worker = pm.create_thread(target, 0x3000, 0, false).unwrap();
+    let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(created.state, dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+    assert_eq!(created.client_id.unique_thread, worker);
+    pm.debug_continue(object, created.client_id, dbgk::DBG_CONTINUE)
+        .unwrap();
+    assert!(pm.debug_object(object).unwrap().is_empty());
+
+    pm.set_thread_hide_from_debugger(worker).unwrap();
+
+    let record = dbgk::ExceptionRecord::access_violation(0x7FFE_1000, 0, 0x10);
+    assert_eq!(pm.report_exception(target, worker, record, true), None);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+
+    const DLL_BASE: u64 = 0x0000_0000_8000_0000;
+    assert_eq!(
+        pm.report_module_load(target, worker, module_at(DLL_BASE, 0)),
+        None
+    );
+    assert_eq!(
+        pm.module_count(target),
+        1,
+        "hidden reporting suppresses Dbgk notification, not mapped-image tracking"
+    );
+    assert!(pm.debug_object(object).unwrap().is_empty());
+
+    assert_eq!(pm.report_module_unload(target, worker, DLL_BASE), None);
+    assert_eq!(pm.module_count(target), 0);
+    assert!(pm.debug_object(object).unwrap().is_empty());
+
+    pm.exit_thread(worker, 0x1234).unwrap();
+    assert!(pm.debug_object(object).unwrap().is_empty());
+    assert!(pm.wait_for_debug_event(object, debugger).unwrap().is_none());
+}
+
+#[test]
+fn dbgk_thread_hide_from_debugger_does_not_hide_process_exit_by_main_thread_proxy() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    pm.set_thread_hide_from_debugger(main).unwrap();
+    pm.terminate_process(target, 0x1234).unwrap();
+
+    let exited = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(exited.state, dbgk::DBG_EXIT_PROCESS_STATE_CHANGE);
+    assert_eq!(exited.client_id.unique_process, target);
+    assert_eq!(exited.client_id.unique_thread, main);
+}
+
+#[test]
 fn dbgk_continue_serialises_multiple_events_for_one_process() {
     let mut pm = ProcessManager::new();
     let (target, main, debugger, object) = attach_debugger(&mut pm);
