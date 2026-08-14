@@ -139,17 +139,3 @@ pub(crate) fn assign_devnode_root_dma_resources(
         resource_list,
     })
 }
-
-/// Write a `CM_RESOURCE_LIST` for `assign` into the resource frame at `reslist_va` — the exact bytes
-/// a WDK driver reads at `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; use
-/// the translated physical address for drivers that call `MmMapIoSpace`.
-pub(crate) unsafe fn write_cm_resource_list(
-    reslist_va: u64,
-    bus_number: u32,
-    assign: &ResourceAssignment,
-    memory_start: u64,
-    mmio_len: u32,
-) {
-    let buf = core::slice::from_raw_parts_mut(reslist_va as *mut u8, ASSIGNMENT_CM_LIST_MAX_SIZE);
-    let _ = assignment_to_cm_list(buf, bus_number, assign, memory_start, mmio_len);
-}

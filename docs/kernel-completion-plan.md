@@ -3306,6 +3306,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   after storage is available. This keeps the one-NIC QEMU bootstrap path intact while making the
   multi-NIC boundary fail closed instead of binding by incidental bus order.
 
+- B3 resource-list writer cleanup (2026-08-15). The executive PnP broker no longer carries the dead
+  raw-frame `write_cm_resource_list` helper. Registry-selected PCI/root devnode grant builders return
+  owned `CM_RESOURCE_LIST` bytes through the same `nt-pnp::assignment_to_cm_list` path consumed by
+  hosted-driver START dispatch, so there is one resource-list construction boundary.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported
