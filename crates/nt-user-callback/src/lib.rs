@@ -1293,6 +1293,8 @@ pub struct ActiveCallbackFrame {
     redirected: bool,
     callback_window: Option<ClientCallbackWindowState>,
     dispatch_context: DispatchContext,
+    arg_snapshot_len: u32,
+    arg_snapshot: [u8; DISPATCH_ARG_SNAPSHOT_BYTES],
     /// The executive-bridged `CLIENTINFO.CallbackWnd` triple published for THIS frame
     /// (`hWnd`, client `PWND`, `pActCtx`); `[0]  == 0` means nothing was bridged.
     bridged_window: [u64; 3],
@@ -1308,6 +1310,8 @@ impl ActiveCallbackFrame {
             redirected: false,
             callback_window: None,
             dispatch_context: DispatchContext::EMPTY,
+            arg_snapshot_len: 0,
+            arg_snapshot: [0; DISPATCH_ARG_SNAPSHOT_BYTES],
             bridged_window: [0; 3],
         }
     }
@@ -1338,6 +1342,8 @@ impl ActiveCallbackFrame {
         self.dispatch_context.ssn = 0;
         self.dispatch_context.args.fill(0);
         self.dispatch_context.caller_sp = 0;
+        self.arg_snapshot_len = 0;
+        self.arg_snapshot.fill(0);
         self.bridged_window.fill(0);
     }
 
@@ -1399,6 +1405,14 @@ impl ActiveCallbackFrame {
 
     pub const fn dispatch_context(&self) -> &DispatchContext {
         &self.dispatch_context
+    }
+
+    pub const fn arg_snapshot_len(&self) -> u32 {
+        self.arg_snapshot_len
+    }
+
+    pub const fn arg_snapshot(&self) -> &[u8; DISPATCH_ARG_SNAPSHOT_BYTES] {
+        &self.arg_snapshot
     }
 
     pub const fn bridged_window(&self) -> &[u64; 3] {
@@ -1577,6 +1591,8 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             redirected: false,
             callback_window: None,
             dispatch_context: DispatchContext::EMPTY,
+            arg_snapshot_len: 0,
+            arg_snapshot: [0; DISPATCH_ARG_SNAPSHOT_BYTES],
             bridged_window: [0; 3],
         };
         self.len += 1;
@@ -1626,6 +1642,25 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             return Err(ValidationError::Correlation);
         }
         self.frames[index].dispatch_context = context;
+        Ok(())
+    }
+
+    /// Preserve per-dispatch marshaled argument state owned by this callback frame. This covers
+    /// in/out syscall buffers staged through a shared dispatch scratch page while win32k is parked
+    /// behind `KeUserModeCallback`.
+    pub fn record_arg_snapshot(
+        &mut self,
+        correlation: CallbackCorrelation,
+        snapshot: &[u8],
+    ) -> Result<(), ValidationError> {
+        let index = self.correlated_index(&correlation)?;
+        if snapshot.is_empty() || snapshot.len() > DISPATCH_ARG_SNAPSHOT_BYTES {
+            return Err(ValidationError::State);
+        }
+        let frame = &mut self.frames[index];
+        frame.arg_snapshot_len = snapshot.len() as u32;
+        frame.arg_snapshot[..snapshot.len()].copy_from_slice(snapshot);
+        frame.arg_snapshot[snapshot.len()..].fill(0);
         Ok(())
     }
 
@@ -1779,6 +1814,7 @@ pub const USER_CONTEXT_R15: usize = 17;
 pub const USER_CONTEXT_FS_BASE: usize = 18;
 pub const USER_CONTEXT_GS_BASE: usize = 19;
 pub const X64_SYSCALL_INSTRUCTION_LEN: u64 = 2;
+pub const DISPATCH_ARG_SNAPSHOT_BYTES: usize = 0x400;
 
 /// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
 /// path. The dispatcher takes its arguments from the `UCALLOUT_FRAME` on RSP, so the kernel-facing

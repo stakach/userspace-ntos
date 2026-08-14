@@ -98,6 +98,49 @@ pub(crate) struct CompletedWin32kDispatch {
     pub args: [u64; 4],
     pub caller_sp: u64,
     pub status: u64,
+    pub arg_snapshot_len: u32,
+    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+}
+
+pub(crate) const COMPLETED_ARG_SNAPSHOT_BYTES: usize =
+    nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES;
+
+impl CompletedWin32kDispatch {
+    pub(crate) const fn new(ssn: u64, args: [u64; 4], caller_sp: u64, status: u64) -> Self {
+        Self {
+            ssn,
+            args,
+            caller_sp,
+            status,
+            arg_snapshot_len: 0,
+            arg_snapshot: [0; COMPLETED_ARG_SNAPSHOT_BYTES],
+        }
+    }
+
+    pub(crate) unsafe fn capture_arg_snapshot(&mut self, len: u64) -> bool {
+        if len == 0 || len as usize > COMPLETED_ARG_SNAPSHOT_BYTES {
+            self.arg_snapshot_len = 0;
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(
+            win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+            self.arg_snapshot.as_mut_ptr(),
+            len as usize,
+        );
+        self.arg_snapshot_len = len as u32;
+        true
+    }
+
+    pub(crate) fn set_arg_snapshot(&mut self, snapshot: &[u8]) -> bool {
+        if snapshot.is_empty() || snapshot.len() > COMPLETED_ARG_SNAPSHOT_BYTES {
+            self.arg_snapshot_len = 0;
+            return false;
+        }
+        self.arg_snapshot_len = snapshot.len() as u32;
+        self.arg_snapshot[..snapshot.len()].copy_from_slice(snapshot);
+        self.arg_snapshot[snapshot.len()..].fill(0);
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -964,6 +1007,51 @@ unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -
         .is_ok()
 }
 
+fn staged_userconnect_u64(offset: u64) -> u64 {
+    unsafe {
+        core::ptr::read_unaligned(
+            (win32k_subsystem::WIN32K_ARG_VADDR + offset) as *const u64,
+        )
+    }
+}
+
+fn staged_userconnect_has_sharedinfo(len: u64) -> bool {
+    len >= win32k_subsystem::UC_SI_DELTA + 8
+        && staged_userconnect_u64(win32k_subsystem::UC_SI_PSI) != 0
+        && staged_userconnect_u64(win32k_subsystem::UC_SI_AHELIST) != 0
+}
+
+/// If the dispatch currently parked behind this callback has already materialized an in/out
+/// USERCONNECT buffer, bind that buffer to the callback frame before a nested win32k dispatch can
+/// reuse `WIN32K_ARG_VADDR`.
+unsafe fn remember_active_dispatch_arg_snapshot(
+    request: &nt_user_callback::CallbackHeader,
+) -> bool {
+    let context = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    if context.ssn != win32k_subsystem::SSN_NT_USER_INITIALIZE {
+        return true;
+    }
+    let len = context
+        .args[2]
+        .min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+    if len == 0 || len as usize > nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES {
+        return false;
+    }
+    if !staged_userconnect_has_sharedinfo(len) {
+        return true;
+    }
+    let snapshot = core::slice::from_raw_parts(
+        win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+        len as usize,
+    );
+    (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
+        .record_arg_snapshot(
+            nt_user_callback::CallbackCorrelation::from_request(request),
+            snapshot,
+        )
+        .is_ok()
+}
+
 fn winlogon_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     let winlogon_pi = callback_client_owner_pi(client)?;
     if !callback_client_is_winlogon(client) || client.tid == 0 {
@@ -1652,7 +1740,9 @@ pub(crate) unsafe fn service_user_callback() -> Option<UserCallbackDisposition> 
             && dispatcher != 0
             && begin_controlled_continuation(request, client)
         {
-            if !remember_active_dispatch(&request) {
+            if !remember_active_dispatch(&request)
+                || !remember_active_dispatch_arg_snapshot(&request)
+            {
                 abort_controlled_user_callbacks();
                 return None;
             }
@@ -2880,13 +2970,23 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     print_str(b"[user-callback] B completed; restored A with result in RAX depth=");
     print_u64(active.len() as u64);
     print_str(b"\n");
+    let mut outer_dispatch = CompletedWin32kDispatch::new(
+        dispatch_context.ssn,
+        dispatch_context.args,
+        dispatch_context.caller_sp,
+        component.result,
+    );
+    if dispatch_context.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && component.result == 0 {
+        let frame_snapshot_len = completed_frame.arg_snapshot_len() as usize;
+        if frame_snapshot_len != 0 {
+            let snapshot = &completed_frame.arg_snapshot()[..frame_snapshot_len];
+            let _ = outer_dispatch.set_arg_snapshot(snapshot);
+        } else {
+            let _ = outer_dispatch.capture_arg_snapshot(dispatch_context.args[2]);
+        }
+    }
     Some(CompletedUserCallback {
-        outer_dispatch: Some(CompletedWin32kDispatch {
-            ssn: dispatch_context.ssn,
-            args: dispatch_context.args,
-            caller_sp: dispatch_context.caller_sp,
-            status: component.result,
-        }),
+        outer_dispatch: Some(outer_dispatch),
     })
 }
 

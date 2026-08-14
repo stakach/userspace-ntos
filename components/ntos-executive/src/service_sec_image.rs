@@ -388,17 +388,37 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_pml4: u64,
     completion_badge: u64,
     completion_tid: u64,
-    dispatch: win32k_glue::CompletedWin32kDispatch,
+    mut dispatch: win32k_glue::CompletedWin32kDispatch,
     completion_filled_pages: &mut [u64; 512],
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
     if dispatch.ssn == win32k_subsystem::SSN_NT_USER_INITIALIZE && dispatch.status == 0 {
+        let blen = dispatch.args[2]
+            .min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+        if dispatch.arg_snapshot_len as u64 != blen {
+            let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if failures < 8 {
+                print_str(b"[win32k-svc] NtUserProcessConnect callback USERCONNECT snapshot missing pi=");
+                print_u64(completion_pi as u64);
+                print_str(b" badge=");
+                print_u64(completion_badge);
+                print_str(b" tid=");
+                print_u64(completion_tid);
+                print_str(b" expected=");
+                print_u64(blen);
+                print_str(b" got=");
+                print_u64(dispatch.arg_snapshot_len as u64);
+                print_str(b"\n");
+            }
+            return false;
+        }
+        let userconnect = &mut dispatch.arg_snapshot[..blen as usize];
         if complete_ntuser_process_connect_copyout(
             completion_pi,
             completion_pml4,
             dispatch.args[1],
-            dispatch.args[2],
+            userconnect,
             completion_filled_pages,
             completion_faults,
             completion_scratch_base,
@@ -2307,14 +2327,14 @@ unsafe fn complete_ntuser_process_connect_copyout(
     pi: usize,
     pml4: u64,
     client_buffer: u64,
-    buffer_len: u64,
+    buffer: &mut [u8],
     filled_pages: &[u64],
     faults: usize,
     scratch_base: u64,
 ) -> bool {
-    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
-    let blen = buffer_len.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
-    if client_buffer == 0 || blen == 0 {
+    let blen = buffer.len();
+    let min_sharedinfo_len = (win32k_subsystem::UC_SI_DELTA + 8) as usize;
+    if client_buffer == 0 || blen == 0 || blen < min_sharedinfo_len {
         let failures = USERCONNECT_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
         if failures < 8 {
             print_str(b"[win32k-svc] NtUserProcessConnect USERCONNECT copy-out invalid target pi=");
@@ -2322,7 +2342,7 @@ unsafe fn complete_ntuser_process_connect_copyout(
             print_str(b" buffer=0x");
             print_hex_u64(client_buffer);
             print_str(b" bytes=");
-            print_u64(blen);
+            print_u64(blen as u64);
             print_str(b"\n");
         }
         return false;
@@ -2343,11 +2363,9 @@ unsafe fn complete_ntuser_process_connect_copyout(
     };
     let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
     let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
-    let handler_delta =
-        core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *const u64);
-    let psi_client = core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_PSI) as *const u64);
-    let ahe_client =
-        core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_AHELIST) as *const u64);
+    let handler_delta = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_DELTA);
+    let psi_client = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_PSI);
+    let ahe_client = userconnect_read_u64(buffer, win32k_subsystem::UC_SI_AHELIST);
     let psi_server = psi_client.wrapping_add(handler_delta);
     let ahe_server = ahe_client.wrapping_add(handler_delta);
     if psi_client == 0
@@ -2376,22 +2394,23 @@ unsafe fn complete_ntuser_process_connect_copyout(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_AHELIST) as *mut u64,
         ahe_server,
     );
-    core::ptr::write_volatile(
-        (arg + win32k_subsystem::UC_SI_PSI) as *mut u64,
+    userconnect_write_u64(
+        buffer,
+        win32k_subsystem::UC_SI_PSI,
         psi_server.wrapping_sub(delta),
     );
-    core::ptr::write_volatile(
-        (arg + win32k_subsystem::UC_SI_AHELIST) as *mut u64,
+    userconnect_write_u64(
+        buffer,
+        win32k_subsystem::UC_SI_AHELIST,
         ahe_server.wrapping_sub(delta),
     );
-    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *mut u64, delta);
-    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_PDISPINFO) as *mut u64, 0);
+    userconnect_write_u64(buffer, win32k_subsystem::UC_SI_DELTA, delta);
+    userconnect_write_u64(buffer, win32k_subsystem::UC_SI_PDISPINFO, 0);
 
-    let output = core::slice::from_raw_parts(arg as *const u8, blen as usize);
     if !img_spawn::client_write_mapped(
         pi as u64,
         client_buffer,
-        output,
+        buffer,
         filled_pages,
         faults,
         scratch_base,
@@ -2403,13 +2422,32 @@ unsafe fn complete_ntuser_process_connect_copyout(
             print_str(b" buffer=0x");
             print_hex_u64(client_buffer);
             print_str(b" bytes=");
-            print_u64(blen);
+            print_u64(blen as u64);
             print_str(b"\n");
         }
         return false;
     }
 
     true
+}
+
+fn userconnect_read_u64(buffer: &[u8], offset: u64) -> u64 {
+    let offset = offset as usize;
+    u64::from_le_bytes([
+        buffer[offset],
+        buffer[offset + 1],
+        buffer[offset + 2],
+        buffer[offset + 3],
+        buffer[offset + 4],
+        buffer[offset + 5],
+        buffer[offset + 6],
+        buffer[offset + 7],
+    ])
+}
+
+fn userconnect_write_u64(buffer: &mut [u8], offset: u64, value: u64) {
+    let offset = offset as usize;
+    buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 unsafe fn observe_winlogon_completed_dispatch(
@@ -13658,11 +13696,15 @@ pub(crate) unsafe fn service_sec_image(
                     observe_winlogon_natural_switch_desktop(st);
                 }
                 if has_buf && ok && st == 0 && !redirected_user_callback {
+                    let userconnect = core::slice::from_raw_parts_mut(
+                        win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
+                        blen as usize,
+                    );
                     if complete_ntuser_process_connect_copyout(
                         pi,
                         pml4,
                         a1,
-                        blen,
+                        userconnect,
                         filled_pages,
                         faults as usize,
                         scratch_base,
@@ -13779,12 +13821,12 @@ pub(crate) unsafe fn service_sec_image(
                     result = st; // pointer-width NtUser/NtGdi return value back to the caller
                     if winlogon_gui_client && m0 == 0x1077 && st != 0 {
                         observe_winlogon_completed_dispatch(
-                            win32k_glue::CompletedWin32kDispatch {
-                                ssn: m0,
-                                args: [a0, a1, a2, a3],
-                                caller_sp: sp,
-                                status: st,
-                            },
+                            win32k_glue::CompletedWin32kDispatch::new(
+                                m0,
+                                [a0, a1, a2, a3],
+                                sp,
+                                st,
+                            ),
                             filled_pages,
                             faults as usize,
                             scratch_base,
