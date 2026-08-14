@@ -25,6 +25,13 @@ pub enum HiveFlushError {
     Encode(HiveEncodeError),
 }
 
+/// Why a manager boot failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HiveBootError {
+    Io(HiveIoError),
+    Decode(HiveDecodeError),
+}
+
 /// Which backend a provider is (spec §10.2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HiveIoProviderKind {
@@ -227,13 +234,17 @@ impl<P: HiveIoProvider> HiveManager<P> {
 
     /// Boot a hive (spec §16): load + validate the primary image (or a fresh hive of `kind` if
     /// none), then replay the log after the image's sequence. Returns the mounted hive.
-    pub fn boot(&mut self, kind: HiveKind) -> Result<Hive, HiveDecodeError> {
-        let mut hive = match self.provider.read_primary_image().ok().flatten() {
-            Some(bytes) => decode_image(&bytes)?,
+    pub fn boot(&mut self, kind: HiveKind) -> Result<Hive, HiveBootError> {
+        let mut hive = match self
+            .provider
+            .read_primary_image()
+            .map_err(HiveBootError::Io)?
+        {
+            Some(bytes) => decode_image(&bytes).map_err(HiveBootError::Decode)?,
             None => Hive::new(kind),
         };
         let base = hive.sequence;
-        let log = self.provider.read_log().unwrap_or_default();
+        let log = self.provider.read_log().map_err(HiveBootError::Io)?;
         let last = replay_log(&mut hive, &log, base);
         self.next_log_sequence = last + 1;
         hive.clear_dirty();

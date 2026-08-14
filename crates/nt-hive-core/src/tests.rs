@@ -913,6 +913,99 @@ fn manager_replays_deletes_and_key_metadata_after_checkpoint() {
     assert!(booted.open_key(r"Classes\DeleteMe").is_none());
 }
 
+struct ReadFaultHiveIoProvider {
+    image: Option<Vec<u8>>,
+    log: Vec<u8>,
+    fail_primary_read: bool,
+    fail_log_read: bool,
+}
+
+impl ReadFaultHiveIoProvider {
+    fn fail_primary_read() -> Self {
+        Self {
+            image: None,
+            log: Vec::new(),
+            fail_primary_read: true,
+            fail_log_read: false,
+        }
+    }
+
+    fn fail_log_read(image: Vec<u8>) -> Self {
+        Self {
+            image: Some(image),
+            log: Vec::new(),
+            fail_primary_read: false,
+            fail_log_read: true,
+        }
+    }
+}
+
+impl HiveIoProvider for ReadFaultHiveIoProvider {
+    fn provider_kind(&self) -> HiveIoProviderKind {
+        HiveIoProviderKind::FaultInjection
+    }
+
+    fn read_primary_image(&mut self) -> Result<Option<Vec<u8>>, HiveIoError> {
+        if self.fail_primary_read {
+            return Err(HiveIoError::Io);
+        }
+        Ok(self.image.clone())
+    }
+
+    fn write_primary_image_atomic(&mut self, bytes: &[u8]) -> Result<(), HiveIoError> {
+        self.image = Some(bytes.to_vec());
+        Ok(())
+    }
+
+    fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError> {
+        if self.fail_log_read {
+            return Err(HiveIoError::Io);
+        }
+        Ok(self.log.clone())
+    }
+
+    fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), HiveIoError> {
+        self.log.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn truncate_log(&mut self) -> Result<(), HiveIoError> {
+        self.log.clear();
+        Ok(())
+    }
+
+    fn flush_image(&mut self) -> Result<(), HiveIoError> {
+        Ok(())
+    }
+
+    fn flush_log(&mut self) -> Result<(), HiveIoError> {
+        Ok(())
+    }
+
+    fn get_status(&self) -> HiveIoStatus {
+        HiveIoStatus {
+            image_present: self.image.is_some(),
+            log_len: self.log.len(),
+        }
+    }
+}
+
+#[test]
+fn manager_boot_reports_provider_read_faults() {
+    let mut primary_fault = HiveManager::new(ReadFaultHiveIoProvider::fail_primary_read());
+    assert!(matches!(
+        primary_fault.boot(HiveKind::System),
+        Err(HiveBootError::Io(HiveIoError::Io))
+    ));
+
+    let image = encode_image(&Hive::new(HiveKind::System));
+    let mut log_fault = HiveManager::new(ReadFaultHiveIoProvider::fail_log_read(image));
+    assert!(matches!(
+        log_fault.boot(HiveKind::System),
+        Err(HiveBootError::Io(HiveIoError::Io))
+    ));
+}
+
 #[test]
 fn live_hive_managers_continue_log_sequence_across_calls() {
     let provider = MemoryHiveIoProvider::new();

@@ -5061,14 +5061,23 @@ impl ExecNtHandler {
             hive.subkeys(hive.root()).len() as u64
         } else {
             let provider_core_hive =
-                (unsafe { crate::writable_fs::file_bytes_if_mounted(&file_name).is_some() })
-                    .then(|| {
-                        let mut manager = nt_hive_core::HiveManager::new(
-                            crate::writable_fs::WritableHiveIoProvider::new(&file_name),
-                        );
-                        manager.boot(hive_kind_for_selector(hive_sel)).ok()
-                    })
-                    .flatten();
+                if unsafe { crate::writable_fs::file_bytes_if_mounted(&file_name).is_some() } {
+                    let mut manager = nt_hive_core::HiveManager::new(
+                        crate::writable_fs::WritableHiveIoProvider::new(&file_name),
+                    );
+                    match manager.boot(hive_kind_for_selector(hive_sel)) {
+                        Ok(hive) => Some(hive),
+                        Err(nt_hive_core::HiveBootError::Io(_)) => {
+                            print_str(b"[cm-load] NtLoadKey: core hive provider I/O failed for ");
+                            print_ascii_str(&file_name);
+                            print_str(b"\n");
+                            return STATUS_UNSUCCESSFUL;
+                        }
+                        Err(nt_hive_core::HiveBootError::Decode(_)) => None,
+                    }
+                } else {
+                    None
+                };
             match provider_core_hive.or_else(|| nt_hive_core::decode_image(bytes).ok()) {
                 Some(hive) => {
                     let root_subkeys = hive.subkey_count(hive.root()) as u64;

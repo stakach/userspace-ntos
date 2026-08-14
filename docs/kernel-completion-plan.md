@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
 ## Objective
 
@@ -1136,6 +1136,13 @@ before unrelated executive traffic monopolises the receive loop.
   journal mounted mutable-hive create-key, set-value, delete-key, delete-value, key-class, and key
   security-descriptor mutations through the writable provider before applying them. Import/mount and
   clean-baseline paths remain direct because they are not runtime mutations.
+  The no-fallback hive-boot slice makes `HiveManager::boot` return typed `HiveBootError` failures:
+  provider primary-image and log read failures now surface as I/O errors instead of silently booting
+  a fresh hive or ignoring the log. `NtLoadKey` now preserves that boundary for writable-provider
+  core hives: provider I/O failure returns `STATUS_UNSUCCESSFUL`, while decode failure remains a real
+  corrupt/non-core-hive path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`,
+  `cargo test -p nt-fs`, and executive `cargo check` for `components/ntos-executive` on
+  `x86_64-unknown-none`.
 
 ## Immediate Iteration
 
