@@ -5149,3 +5149,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo test -p nt-syscall`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`; a serialized desktop/selftest run is still required for the runtime
   gate.
+
+  Dbgk live proof and Explorer shell-chrome frontier closure (2026-08-14): the runtime Dbgk
+  trap-flag proof now registers the throwaway debuggee thread with the hosted-thread runtime table so
+  `NtGetContextThread` / `NtSetContextThread` operate on the same live TCB path used by normal
+  hosted threads, while still releasing that registration before the next selftest. The remote
+  break-in proof now handles the real `DbgCreateThreadStateChange` that can precede the `int3`
+  breakpoint by continuing the lifecycle event and then retrieving the breakpoint report. The
+  Explorer quiesce frontier now treats shell `RegisterWindowMessage`, direct Explorer GDI returns,
+  `BeginPaint`, and Explorer GDI batch flushes as real forward progress, and the winlogon/post-logon
+  quiesce paths defer only while a live shell process still has a runnable top-level owner before
+  those chrome milestones. This removes the race that could gate after Explorer spawned but before
+  shell message registration or `BeginPaint`, without adding fallback rendering. Validation:
+  `cargo fmt --all`, `cargo test -p nt-process`, `cargo test -p nt-syscall`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop run
+  `.tmp/run-desktop-20260814-123131.log`: `exec_dbgk_continue_resumes_target`,
+  `exec_dbgk_context_edit_single_steps_target`, `exec_dbgk_terminate_status_enforced`,
+  `exec_dbgk_remote_breakin_reports_breakpoint`, `exec_explorer_register_window_messages_captured`,
+  and `exec_explorer_shell_chrome_painted` all pass; final summary is `295/295`. Remaining
+  debugger-control gap: non-zero DR0-DR7 programming still returns `STATUS_NOT_SUPPORTED` until the
+  seL4 hardware-breakpoint backend is wired.

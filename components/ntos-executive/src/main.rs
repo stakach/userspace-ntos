@@ -8964,6 +8964,7 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
         EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
         EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
+        bump_progress();
     }
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
     GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);
@@ -18427,6 +18428,7 @@ enum HostedThreadRole {
     LsassListener,
     LsassListener2,
     LsassListener3,
+    DbgkSelftestTarget,
 }
 
 impl HostedThreadRole {

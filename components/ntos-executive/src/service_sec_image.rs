@@ -35,6 +35,7 @@ struct SecImageForwardPolicy {
 static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
 static SHELL_LAUNCH_QUIESCE_DUMPED: AtomicU64 = AtomicU64::new(0);
+static SHELL_CHROME_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -1854,6 +1855,61 @@ fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
     None
 }
 
+unsafe fn interactive_shell_chrome_frontier_pending(
+    nt_handler: &ExecNtHandler,
+    crash_parked: u64,
+    wait_parked: u64,
+) -> bool {
+    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    if EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed) >= 1
+        && EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed) >= 1
+    {
+        return false;
+    }
+    let Some(pi) = live_hosted_pi_for_role(
+        nt_handler,
+        nt_exe_image::HostedProcessRole::InteractiveShell,
+    ) else {
+        return false;
+    };
+    let Some(owner) = nt_handler.hosted_process_top_badge(pi) else {
+        return false;
+    };
+    if owner >= 64 {
+        return false;
+    }
+    let owner_bit = 1u64 << owner;
+    if crash_parked & owner_bit != 0 {
+        return false;
+    }
+    (live_top_badges(nt_handler) & !(crash_parked | wait_parked)) != 0
+}
+
+unsafe fn defer_quiesce_for_interactive_shell_chrome(
+    nt_handler: &ExecNtHandler,
+    crash_parked: u64,
+    wait_parked: u64,
+) -> bool {
+    if !interactive_shell_chrome_frontier_pending(nt_handler, crash_parked, wait_parked) {
+        return false;
+    }
+    let n = SHELL_CHROME_QUIESCE_DEFER_TRACE.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        print_str(b"[quiesce] deferring while Explorer shell chrome frontier is live: register-window-messages=");
+        print_u64(EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed));
+        print_str(b" begin-paints=");
+        print_u64(EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed));
+        print_str(b" direct-gdi=");
+        print_u64(EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed));
+        print_str(b" gdi-batches=");
+        print_u64(EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+    true
+}
+
 unsafe fn dump_shell_launch_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
@@ -1915,6 +1971,40 @@ unsafe fn dump_shell_launch_quiesce(
                 print_str(b"\n");
                 dump_hosted_main_thread_quiesce(
                     b"explorer-quiesce",
+                    pi,
+                    nt_handler,
+                    loaded_images,
+                    reg,
+                    ntdll,
+                    procs,
+                    pfilled,
+                );
+            }
+        }
+    }
+
+    if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 0
+        && (EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed) == 0
+            || EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed) == 0)
+    {
+        if let Some(pi) = live_hosted_pi_for_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::InteractiveShell,
+        ) {
+            if SHELL_LAUNCH_QUIESCE_DUMPED.fetch_or(4, Ordering::Relaxed) & 4 == 0 {
+                print_str(b"[shell-launch] explorer spawned before shell chrome milestones; pi=");
+                print_u64(pi as u64);
+                print_str(b" register-window-messages=");
+                print_u64(EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed));
+                print_str(b" begin-paints=");
+                print_u64(EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed));
+                print_str(b" direct-gdi=");
+                print_u64(EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed));
+                print_str(b" gdi-batches=");
+                print_u64(EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed));
+                print_str(b"\n");
+                dump_hosted_main_thread_quiesce(
+                    b"explorer-chrome",
                     pi,
                     nt_handler,
                     loaded_images,
@@ -4506,7 +4596,7 @@ pub(crate) unsafe fn service_sec_image(
     // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
     // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
     thread_wait_state_reset();
-    let mut wait_parked: u64;
+    let mut wait_parked: u64 = 0;
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
     // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
@@ -4742,6 +4832,12 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_t = now;
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
                 if defer_quiesce_for_active_user_callbacks(b"progress-stall") {
+                    last_progress_t = now;
+                } else if defer_quiesce_for_interactive_shell_chrome(
+                    &nt_handler,
+                    crash_parked,
+                    wait_parked,
+                ) {
                     last_progress_t = now;
                 } else {
                     dump_interactive_shell_frontier_quiesce(
@@ -9805,6 +9901,7 @@ pub(crate) unsafe fn service_sec_image(
                         if explorer_gui_client {
                             EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
                                 .fetch_add(1, Ordering::Relaxed);
+                            bump_progress();
                         }
                     }
                 } else if m0 == 0x101b && sp != 0 {
@@ -12965,6 +13062,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if explorer_direct_gdi_draw && r.1 {
                         EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed);
+                        bump_progress();
                     }
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
@@ -13343,6 +13441,7 @@ pub(crate) unsafe fn service_sec_image(
                         match m0 {
                             NTUSER_BEGIN_PAINT_SSN => {
                                 EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
+                                bump_progress();
                             }
                             NTUSER_END_PAINT_SSN => {
                                 EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
@@ -13898,8 +13997,14 @@ pub(crate) unsafe fn service_sec_image(
                     crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
                     let userinit_shell_pending =
                         userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
+                    let explorer_chrome_pending = interactive_shell_chrome_frontier_pending(
+                        &nt_handler,
+                        crash_parked,
+                        wait_parked,
+                    );
                     if !wl_park_defer_quiesce
                         && !userinit_shell_pending
+                        && !explorer_chrome_pending
                         && WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
                         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                         && !defer_quiesce_for_active_user_callbacks(b"winlogon-milestone")
@@ -13909,6 +14014,8 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     } else if userinit_shell_pending {
                         print_str(b"[quiesce] winlogon milestone parked; deferring gate until userinit attempts its shell image\n");
+                    } else if explorer_chrome_pending {
+                        print_str(b"[quiesce] winlogon milestone parked; deferring gate until Explorer reaches shell chrome paint\n");
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -13949,8 +14056,13 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled[pi] = *filled_pages;
                     WINLOGON_POST_LOGON_MILESTONE_PARK.store(m0, Ordering::Relaxed);
                     WINLOGON_POST_LOGON_MILESTONE_CR2.store(m0, Ordering::Relaxed);
-                    if (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
-                        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                    if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                        || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
+                        && !interactive_shell_chrome_frontier_pending(
+                            &nt_handler,
+                            crash_parked,
+                            wait_parked,
+                        )
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                         stop = m0;
@@ -16665,6 +16777,7 @@ pub(crate) unsafe fn service_sec_image(
             const CONTEXT_AMD64_CONTROL: u32 = 0x0010_0000 | 0x0000_0001;
             const EFLAGS_TF: u32 = 0x0000_0100;
             const BLK_TEST_PI: usize = MAX_PI - 1;
+            const BLK_TEST_RUNTIME_BADGE: u64 = 0xDB6B_0001;
             // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
             // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
             let write_scratch_t = SMSS_SCRATCH_BASE + 3010 * 0x1000;
@@ -16716,7 +16829,7 @@ pub(crate) unsafe fn service_sec_image(
             let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
             nt_handler.current_tid = debugger_tid as u64;
             let client_args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
-                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE])
                 && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
 
             // Throwaway caps: the client's shared marker frame, the `#PF` fixup frame, the reply
@@ -16806,6 +16919,14 @@ pub(crate) unsafe fn service_sec_image(
                         &mut slots,
                         &mut nslots,
                     );
+                    let client_runtime_registered = main_tid != 0
+                        && nt_handler.register_hosted_thread_tcb(
+                            BLK_TEST_PI,
+                            main_tid as u64,
+                            client_tcb,
+                            BLK_TEST_RUNTIME_BADGE,
+                            HostedThreadRole::DbgkSelftestTarget,
+                        );
                     // 0x0001 — setup: attach BY SSN + drain the fake create message BY SSN. The
                     // FIRST recv also proves the client thread really ran (marker 1) and really
                     // faulted (its `#PF` on the deliberately-unmapped page).
@@ -17039,6 +17160,7 @@ pub(crate) unsafe fn service_sec_image(
                             && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE;
                         let tf_flags_written = read2
                             && no_progress2
+                            && client_runtime_registered
                             && debuggee_thread_handle != 0
                             && img_spawn::smss_copyout(
                                 A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
@@ -17093,13 +17215,6 @@ pub(crate) unsafe fn service_sec_image(
                             wait2 as u64,
                             cont2 as u64,
                             woke2 as u64,
-                        );
-                        dbgk_blk_trace(
-                            b"tf",
-                            getctx_tf as u64,
-                            setctx_tf as u64,
-                            debuggee_thread_handle,
-                            original_eflags as u64,
                         );
                         if !woke2 {
                             let _ = nt_handler.dbgk_release_all_blocked_reporters();
@@ -17205,13 +17320,6 @@ pub(crate) unsafe fn service_sec_image(
                             wait_step as u64,
                             cont_step as u64,
                             woke_step as u64,
-                        );
-                        dbgk_blk_trace(
-                            b"tf0",
-                            getctx_clear as u64,
-                            setctx_clear as u64,
-                            clear_eflags as u64,
-                            marker_t(),
                         );
                         if step_fault
                             && no_progress_step
@@ -17524,6 +17632,9 @@ pub(crate) unsafe fn service_sec_image(
                     // the next post-loop selftest starts.
                     let _ = tcb_suspend_r(client_tcb);
                     let _ = tcb_suspend_r(dbg_tcb);
+                    if client_runtime_registered {
+                        let _ = nt_handler.release_hosted_thread_runtime(main_tid as u64);
+                    }
                     for index in (0..nslots).rev() {
                         let s = slots[index];
                         if s == 0
@@ -17805,7 +17916,7 @@ pub(crate) unsafe fn service_sec_image(
                 .unwrap_or(0);
 
             let args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
-                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE])
                 && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
             let setup_ok = peb_win_ok
                 && mark_win_ok
@@ -18057,8 +18168,10 @@ pub(crate) unsafe fn service_sec_image(
                             // ── 0x0020 — ★ IT HIT THE BREAKPOINT, and the debugger sees it.
                             // The byte it read is the write-through; the `int3` (DebugException,
                             // label 4) is forwarded through the live fault-loop entry and its reporter
-                            // parked, then retrieved BY SSN as DbgBreakpointStateChange carrying the
-                            // BREAK-IN THREAD's CLIENT_ID.
+                            // parked. A real debugger may first receive the remote thread's
+                            // DbgCreateThreadStateChange, because `NtCreateThread` queued it before
+                            // the thread ran to `int3`; continue that lifecycle event, then retrieve
+                            // the breakpoint BY SSN carrying the BREAK-IN THREAD's CLIENT_ID.
                             let is_breakpoint = (f1_mi >> 12) == 4 && marker(0x10) == 1;
                             let forwarded = is_breakpoint
                                 && nt_handler.dbgk_forward_exception(
@@ -18079,12 +18192,46 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     0,
                                 );
-                            let waited = parked
-                                && sysc!(
+                            let mut waited = false;
+                            if parked {
+                                let first_wait = sysc!(
                                     SSN_NT_WAIT_FOR_DEBUG_EVENT,
                                     &[dbg_handle, 0, A_TIMEOUT, A_STATE]
-                                ) == 0
-                                && img_spawn::smss_copyin(A_STATE, &mut sc);
+                                );
+                                if first_wait == 0 && img_spawn::smss_copyin(A_STATE, &mut sc) {
+                                    let selected_state = sc_u32!(0x00);
+                                    let selected_tid =
+                                        u64::from_le_bytes(sc[0x10..0x18].try_into().unwrap());
+                                    if selected_state == dbgk::DBG_CREATE_THREAD_STATE_CHANGE
+                                        && u64::from_le_bytes(
+                                            sc[0x08..0x10].try_into().unwrap(),
+                                        ) == target as u64
+                                        && selected_tid == breakin_tid
+                                    {
+                                        let mut lifecycle_cid = [0u8; 16];
+                                        lifecycle_cid.copy_from_slice(&sc[0x08..0x18]);
+                                        if img_spawn::smss_copyout(A_CLIENT_ID, &lifecycle_cid)
+                                            && sysc!(
+                                                SSN_NT_DEBUG_CONTINUE,
+                                                &[
+                                                    dbg_handle,
+                                                    A_CLIENT_ID,
+                                                    dbgk::DBG_CONTINUE as u64
+                                                ]
+                                            ) == 0
+                                        {
+                                            let second_wait = sysc!(
+                                                SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                                &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                                            );
+                                            waited = second_wait == 0
+                                                && img_spawn::smss_copyin(A_STATE, &mut sc);
+                                        }
+                                    } else {
+                                        waited = true;
+                                    }
+                                }
+                            }
                             let reported = waited
                                 && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE
                                 && u64::from_le_bytes(sc[0x08..0x10].try_into().unwrap())
