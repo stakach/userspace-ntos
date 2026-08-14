@@ -23,9 +23,13 @@ use crate::IrpId;
 /// The transport to a driver peer: dispatch/cancel, poll reverse-ring
 /// completions, report faults (spec §16.1–16.2).
 pub trait DriverPeerTransport {
-    /// Send `IODRV_OP_DISPATCH_IRP` with `request` + the shared `buffer` (write
-    /// input / read output), returning the peer's immediate dispatch response.
-    fn dispatch(&mut self, request: &IrpDispatchRequest, buffer: &mut [u8]) -> DispatchOutcome;
+    /// Send `IODRV_OP_DISPATCH_IRP` with `request` + transfer buffers, returning
+    /// the peer's immediate dispatch response.
+    fn dispatch(
+        &mut self,
+        request: &IrpDispatchRequest,
+        buffers: PeerTransferBuffers<'_>,
+    ) -> DispatchOutcome;
     /// Send `IODRV_OP_CANCEL_IRP` for `irp_id`.
     fn cancel(&mut self, irp_id: IrpId);
     /// Poll the reverse ring for a peer's final `IODRV_OP_COMPLETE_IRP`.
@@ -34,9 +38,68 @@ pub trait DriverPeerTransport {
     fn is_faulted(&self) -> bool;
 }
 
+/// Transfer buffers passed to a driver peer. `system` is the
+/// `AssociatedIrp.SystemBuffer` staging area; the optional buffers model direct
+/// I/O and neither I/O without collapsing them into `system`.
+pub struct PeerTransferBuffers<'a> {
+    pub system: &'a mut [u8],
+    pub direct: Option<&'a mut [u8]>,
+    pub type3_input: Option<&'a mut [u8]>,
+    pub user: Option<&'a mut [u8]>,
+}
+
+impl<'a> PeerTransferBuffers<'a> {
+    pub fn new(system: &'a mut [u8]) -> Self {
+        Self {
+            system,
+            direct: None,
+            type3_input: None,
+            user: None,
+        }
+    }
+}
+
+fn segment(cursor: &mut u32, len: usize) -> Result<(u32, u32), NtStatus> {
+    let len = u32::try_from(len).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    if len == 0 {
+        return Ok((0, 0));
+    }
+    let offset = *cursor;
+    *cursor = cursor.checked_add(len).ok_or(NtStatus::INVALID_PARAMETER)?;
+    Ok((offset, len))
+}
+
 /// Build the wire dispatch request for a projection (spec §16.4).
-fn build_dispatch_request(irp: &IrpProjection, buffer_len: u32) -> IrpDispatchRequest {
-    IrpDispatchRequest {
+fn build_dispatch_request(
+    irp: &IrpProjection,
+    ctx: &DispatchContext<'_>,
+) -> Result<IrpDispatchRequest, NtStatus> {
+    let mut cursor = u32::try_from(core::mem::size_of::<IrpDispatchRequest>())
+        .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    let (buffer_offset, buffer_len) = segment(&mut cursor, ctx.system_buffer.len())?;
+    let (direct_buffer_offset, direct_buffer_len) = segment(
+        &mut cursor,
+        ctx.direct_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
+    )?;
+    let (type3_input_offset, type3_input_len) = segment(
+        &mut cursor,
+        ctx.type3_input_buffer
+            .as_ref()
+            .map(|b| b.len())
+            .unwrap_or(0),
+    )?;
+    let (user_buffer_offset, user_buffer_len) = segment(
+        &mut cursor,
+        ctx.user_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
+    )?;
+    let (ioctl_code, input_len, output_len) = match &irp.parameters {
+        crate::irp::IoParameters::DeviceControl(p)
+        | crate::irp::IoParameters::InternalDeviceControl(p) => {
+            (p.ioctl_code, p.input_len, p.output_len)
+        }
+        _ => (0, 0, 0),
+    };
+    Ok(IrpDispatchRequest {
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
         major: irp.major,
         minor: irp.minor,
@@ -45,12 +108,22 @@ fn build_dispatch_request(irp: &IrpProjection, buffer_len: u32) -> IrpDispatchRe
         device_id: irp.device_id.0,
         file_id: irp.file_id.map(|f| f.0).unwrap_or(0),
         buffer_id: irp.buffer.map(|b| b.buffer_id).unwrap_or(0),
-        buffer_offset: 0,
+        buffer_offset: buffer_offset as u64,
         buffer_len,
+        direct_buffer_offset,
+        direct_buffer_len,
+        type3_input_offset,
+        type3_input_len,
+        user_buffer_offset,
+        user_buffer_len,
+        input_len,
+        output_len,
+        ioctl_code,
         parameter_offset: 0,
         parameter_len: 0,
         _reserved: 0,
-    }
+        _reserved2: 0,
+    })
 }
 
 /// A `DriverDispatchBackend` that dispatches to an isolated driver peer over `T`.
@@ -81,25 +154,16 @@ impl<T: DriverPeerTransport> DriverDispatchBackend for DriverPeerBackend<T> {
                 status: NtStatus::DEVICE_NOT_CONNECTED,
             });
         }
-        if ctx.has_nonbuffered_transfer()
-            && matches!(
-                irp.major,
-                major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
-            )
-            && match &irp.parameters {
-                crate::irp::IoParameters::DeviceControl(p)
-                | crate::irp::IoParameters::InternalDeviceControl(p) => {
-                    ioctl::method(p.ioctl_code) != ioctl::METHOD_BUFFERED
-                }
-                _ => true,
-            }
-        {
-            return Ok(DispatchOutcome::Failed {
-                status: NtStatus::NOT_SUPPORTED,
-            });
-        }
-        let request = build_dispatch_request(irp, ctx.system_buffer.len() as u32);
-        Ok(self.transport.dispatch(&request, ctx.system_buffer))
+        let request = build_dispatch_request(irp, &ctx)?;
+        Ok(self.transport.dispatch(
+            &request,
+            PeerTransferBuffers {
+                system: ctx.system_buffer,
+                direct: ctx.direct_buffer,
+                type3_input: ctx.type3_input_buffer,
+                user: ctx.user_buffer,
+            },
+        ))
     }
 
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
@@ -183,7 +247,11 @@ pub struct MockDriverPeer {
 }
 
 impl DriverPeerTransport for MockDriverPeer {
-    fn dispatch(&mut self, request: &IrpDispatchRequest, buffer: &mut [u8]) -> DispatchOutcome {
+    fn dispatch(
+        &mut self,
+        request: &IrpDispatchRequest,
+        mut buffers: PeerTransferBuffers<'_>,
+    ) -> DispatchOutcome {
         let mut s = self.state.borrow_mut();
         if s.faulted {
             return DispatchOutcome::Failed {
@@ -210,6 +278,7 @@ impl DriverPeerTransport for MockDriverPeer {
         match request.major {
             major::IRP_MJ_CREATE => DispatchOutcome::from_status(s.create_status, 0),
             major::IRP_MJ_READ => {
+                let buffer = &mut buffers.system;
                 let n = s.read_data.len().min(buffer.len());
                 buffer[..n].copy_from_slice(&s.read_data[..n]);
                 DispatchOutcome::Completed {
@@ -218,8 +287,8 @@ impl DriverPeerTransport for MockDriverPeer {
                 }
             }
             major::IRP_MJ_WRITE => {
-                let n = (request.buffer_len as usize).min(buffer.len());
-                s.written = buffer[..n].to_vec();
+                let n = (request.buffer_len as usize).min(buffers.system.len());
+                s.written = buffers.system[..n].to_vec();
                 s.read_data = s.written.clone(); // loopback
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
@@ -227,10 +296,34 @@ impl DriverPeerTransport for MockDriverPeer {
                 }
             }
             major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
-                // Buffered echo: the input already occupies the system buffer.
+                let method = ioctl::method(request.ioctl_code);
+                let mut input_copy = Vec::new();
+                match method {
+                    ioctl::METHOD_NEITHER => {
+                        let input = buffers.type3_input.as_deref().unwrap_or(&[]);
+                        let input_len = (request.input_len as usize).min(input.len());
+                        input_copy.extend_from_slice(&input[..input_len]);
+                    }
+                    _ => {
+                        let input_len = (request.input_len as usize).min(buffers.system.len());
+                        input_copy.extend_from_slice(&buffers.system[..input_len]);
+                    }
+                };
+                let output = match method {
+                    ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                        buffers.direct.as_deref_mut().unwrap_or(&mut [])
+                    }
+                    ioctl::METHOD_NEITHER => buffers.user.as_deref_mut().unwrap_or(&mut []),
+                    _ => buffers.system,
+                };
+                let n = input_copy
+                    .len()
+                    .min(request.output_len as usize)
+                    .min(output.len());
+                output[..n].copy_from_slice(&input_copy[..n]);
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
-                    information: buffer.len() as u64,
+                    information: n as u64,
                 }
             }
             major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE | major::IRP_MJ_FLUSH_BUFFERS => {

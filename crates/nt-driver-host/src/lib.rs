@@ -22,7 +22,7 @@ pub use call::Win64Gate;
 pub use call::{
     DispatchInvoke, DriverDispatchGate, DriverEntryGate, EntryContext, MockDispatchGate, MockGate,
 };
-pub use dispatch::{DhCompletion, DispatchRequest, DispatchResult};
+pub use dispatch::{DhCompletion, DispatchBuffers, DispatchRequest, DispatchResult};
 pub use services::{
     BridgeCreateDevice, BridgeDeviceIds, DriverServices, IoManagerBridge, NullBridge,
 };

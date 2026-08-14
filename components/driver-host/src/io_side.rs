@@ -2,11 +2,12 @@
 //! Manager) and dispatches driver work to the **isolated driver peer** over SURT.
 //!
 //! `SurtPeerTransport` implements `DriverPeerTransport`: it stages the
-//! `IrpDispatchRequest` + the system buffer into the shared data frame, pushes an
-//! `IODRV_OP_DISPATCH_IRP` `SurtSqe`, wakes the peer, blocks for the peer's
-//! dispatch `SurtCqe`, then copies the peer's output back and maps it to a
-//! `DispatchOutcome`. Every open/read/write/IOCTL the io-side runs on its own
-//! `IoManager` therefore crosses an address-space boundary into the driver peer.
+//! `IrpDispatchRequest` plus transfer-method-specific buffer segments into the
+//! shared data frame, pushes an `IODRV_OP_DISPATCH_IRP` `SurtSqe`, wakes the
+//! peer, blocks for the peer's dispatch `SurtCqe`, then copies the peer's output
+//! segments back and maps it to a `DispatchOutcome`. Every open/read/write/IOCTL
+//! the io-side runs on its own `IoManager` therefore crosses an address-space
+//! boundary into the driver peer.
 
 use crate::*;
 
@@ -19,6 +20,7 @@ use nt_io_manager::{
     CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, DispatchOutcome,
     DriverCompletion, DriverPeerBackend, DriverPeerTransport, IoManager, IrpId,
     ObjectManagerLibraryPort, ShareAccess,
+    PeerTransferBuffers,
 };
 use nt_object_manager::ComponentId;
 use nt_status::NtStatus;
@@ -37,23 +39,63 @@ struct SurtPeerTransport<'a> {
 }
 
 impl DriverPeerTransport for SurtPeerTransport<'_> {
-    fn dispatch(&mut self, request: &IrpDispatchRequest, buffer: &mut [u8]) -> DispatchOutcome {
-        let hdr = size_of::<IrpDispatchRequest>();
-        // Stage [IrpDispatchRequest][buffer] into the shared data frame.
+    fn dispatch(
+        &mut self,
+        request: &IrpDispatchRequest,
+        mut buffers: PeerTransferBuffers<'_>,
+    ) -> DispatchOutcome {
+        let total_len = match staged_len(request) {
+            Some(len) if len <= REQ_DATA_LEN => len,
+            _ => {
+                return DispatchOutcome::Failed {
+                    status: NtStatus::INVALID_PARAMETER,
+                }
+            }
+        };
+        if !segment_matches(request.buffer_offset, request.buffer_len, buffers.system.len())
+            || !optional_segment_matches(
+                request.direct_buffer_offset,
+                request.direct_buffer_len,
+                buffers.direct.as_ref().map(|b| b.len()).unwrap_or(0),
+            )
+            || !optional_segment_matches(
+                request.type3_input_offset,
+                request.type3_input_len,
+                buffers.type3_input.as_ref().map(|b| b.len()).unwrap_or(0),
+            )
+            || !optional_segment_matches(
+                request.user_buffer_offset,
+                request.user_buffer_len,
+                buffers.user.as_ref().map(|b| b.len()).unwrap_or(0),
+            )
+        {
+            return DispatchOutcome::Failed {
+                status: NtStatus::INVALID_PARAMETER,
+            };
+        }
+
+        // Stage [IrpDispatchRequest][system][direct][type3][user] into the shared data frame.
         unsafe {
             let base = REQ_DATA_VADDR as *mut u8;
             for (i, b) in bytemuck::bytes_of(request).iter().enumerate() {
                 core::ptr::write_volatile(base.add(i), *b);
             }
-            for (i, b) in buffer.iter().enumerate() {
-                core::ptr::write_volatile(base.add(hdr + i), *b);
+            write_segment(request.buffer_offset, &*buffers.system);
+            if let Some(direct) = buffers.direct.as_deref() {
+                write_segment(request.direct_buffer_offset as u64, direct);
+            }
+            if let Some(type3) = buffers.type3_input.as_deref() {
+                write_segment(request.type3_input_offset as u64, type3);
+            }
+            if let Some(user) = buffers.user.as_deref() {
+                write_segment(request.user_buffer_offset as u64, user);
             }
         }
         let id = self.next_id;
         self.next_id += 1;
         let sqe = SurtSqe {
             opcode: IODRV_OP_DISPATCH_IRP,
-            len: (hdr + buffer.len()) as u32,
+            len: total_len as u32,
             request_id: id,
             offset: 0,
             ..Default::default()
@@ -76,12 +118,14 @@ impl DriverPeerTransport for SurtPeerTransport<'_> {
             }
         });
 
-        // Copy the peer's output payload back into the caller's buffer.
-        let n = (information as usize).min(buffer.len());
+        // Copy the peer's output segments back into the caller's buffers.
         unsafe {
-            let base = REQ_DATA_VADDR as *const u8;
-            for (i, slot) in buffer.iter_mut().enumerate().take(n) {
-                *slot = core::ptr::read_volatile(base.add(hdr + i));
+            read_segment(request.buffer_offset, &mut *buffers.system);
+            if let Some(direct) = buffers.direct.as_deref_mut() {
+                read_segment(request.direct_buffer_offset as u64, direct);
+            }
+            if let Some(user) = buffers.user.as_deref_mut() {
+                read_segment(request.user_buffer_offset as u64, user);
             }
         }
         DispatchOutcome::from_status(NtStatus(status), information)
@@ -95,6 +139,61 @@ impl DriverPeerTransport for SurtPeerTransport<'_> {
 
     fn is_faulted(&self) -> bool {
         false
+    }
+}
+
+fn segment_end(offset: u64, len: u32) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    let offset = usize::try_from(offset).ok()?;
+    let len = len as usize;
+    offset.checked_add(len)
+}
+
+fn staged_len(request: &IrpDispatchRequest) -> Option<usize> {
+    [
+        segment_end(0, size_of::<IrpDispatchRequest>() as u32)?,
+        segment_end(request.buffer_offset, request.buffer_len)?,
+        segment_end(
+            request.direct_buffer_offset as u64,
+            request.direct_buffer_len,
+        )?,
+        segment_end(request.type3_input_offset as u64, request.type3_input_len)?,
+        segment_end(request.user_buffer_offset as u64, request.user_buffer_len)?,
+    ]
+    .into_iter()
+    .max()
+}
+
+fn segment_matches(offset: u64, len: u32, actual_len: usize) -> bool {
+    len as usize == actual_len
+        && ((len == 0 && offset == 0) || (len != 0 && offset >= size_of::<IrpDispatchRequest>() as u64))
+}
+
+fn optional_segment_matches(offset: u32, len: u32, actual_len: usize) -> bool {
+    len as usize == actual_len
+        && ((len == 0 && offset == 0)
+            || (len != 0 && offset as usize >= size_of::<IrpDispatchRequest>()))
+}
+
+unsafe fn write_segment(offset: u64, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let base = (REQ_DATA_VADDR + offset) as *mut u8;
+    for (i, b) in data.iter().enumerate() {
+        core::ptr::write_volatile(base.add(i), *b);
+    }
+}
+
+unsafe fn read_segment(offset: u64, data: &mut [u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let base = (REQ_DATA_VADDR + offset) as *const u8;
+    for (i, slot) in data.iter_mut().enumerate() {
+        *slot = core::ptr::read_volatile(base.add(i));
     }
 }
 

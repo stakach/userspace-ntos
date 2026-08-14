@@ -66,6 +66,7 @@ pub const SCRATCH_VADDR: u64 = 0x0000_0100_005F_C000; // broker-only (its own VS
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
+pub const REQ_DATA_LEN: usize = 4096;
 
 /// Read/write **non-executable** — the rights for the component's data
 /// regions (stack, heap, rings, buffers); only legitimate code is executable.

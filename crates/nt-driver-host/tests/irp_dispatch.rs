@@ -6,11 +6,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use nt_driver_host::{
-    BridgeCreateDevice, BridgeDeviceIds, DispatchInvoke, DispatchRequest, DispatchResult,
-    DriverHost, DriverServices, EntryContext, IoManagerBridge, MockDispatchGate, MockGate,
-    NullBridge,
+    BridgeCreateDevice, BridgeDeviceIds, DispatchBuffers, DispatchInvoke, DispatchRequest,
+    DispatchResult, DriverHost, DriverServices, EntryContext, IoManagerBridge, MockDispatchGate,
+    MockGate, NullBridge,
 };
 use nt_driver_test_fixtures::pe_importing;
+use nt_io_abi::ioctl;
 use nt_io_manager::{
     CreateOptions, DeviceCharacteristics, DeviceFlags, DeviceType, DispatchContext,
     DispatchOutcome, DriverDispatchBackend, DriverId, IoManager, IoParameters, IrpId,
@@ -94,6 +95,67 @@ fn dispatch_echo(inv: &DispatchInvoke, s: &mut DriverServices) -> i32 {
             s.io_complete_request(inv.irp)
         }
     }
+}
+
+fn read_guest_u64(s: &DriverServices, addr: GuestAddr, offset: usize) -> u64 {
+    let bytes = s
+        .runtime()
+        .arena()
+        .slice(GuestAddr(addr.0 + offset as u64), 8)
+        .unwrap();
+    u64::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn copy_guest_bytes(s: &mut DriverServices, src: GuestAddr, dst: GuestAddr, len: usize) {
+    let bytes = s.runtime().arena().slice(src, len).unwrap().to_vec();
+    s.runtime_mut().arena_mut().write_bytes(dst, &bytes);
+}
+
+/// A dispatch routine that writes IOCTL output through the method-specific NT
+/// fields rather than assuming METHOD_BUFFERED.
+fn dispatch_echo_transfer(inv: &DispatchInvoke, s: &mut DriverServices) -> i32 {
+    let sl_addr = s.io_get_current_irp_stack_location(inv.irp);
+    let sl: IoStackLocation = s.runtime().arena().read(sl_addr).unwrap();
+    if sl.major_function != major::IRP_MJ_DEVICE_CONTROL {
+        set_iostatus(s, inv.irp, 0xC000_0010u32 as i32, 0);
+        return s.io_complete_request(inv.irp);
+    }
+
+    let irp: Irp = s.runtime().arena().read(inv.irp).unwrap();
+    let p = sl.device_io_control();
+    let n = p.input_buffer_length.min(p.output_buffer_length) as usize;
+    match ioctl::method(p.io_control_code) {
+        ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+            assert!(!irp.associated_irp_system_buffer.is_null());
+            assert!(!irp.mdl_address.is_null());
+            assert_eq!(p.type3_input_buffer, GuestAddr::NULL);
+            let mapped = GuestAddr(read_guest_u64(
+                s,
+                irp.mdl_address,
+                nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA as usize,
+            ));
+            let byte_count = s
+                .runtime()
+                .arena()
+                .slice(GuestAddr(irp.mdl_address.0 + nt_mdl::MDL_OFF_BYTE_COUNT), 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .unwrap();
+            assert!(byte_count as usize >= p.output_buffer_length as usize);
+            copy_guest_bytes(s, irp.associated_irp_system_buffer, mapped, n);
+        }
+        ioctl::METHOD_NEITHER => {
+            assert!(irp.associated_irp_system_buffer.is_null());
+            assert!(irp.mdl_address.is_null());
+            assert!(!p.type3_input_buffer.is_null());
+            assert!(!irp.user_buffer.is_null());
+            copy_guest_bytes(s, p.type3_input_buffer, irp.user_buffer, n);
+        }
+        _ => {
+            assert!(!irp.associated_irp_system_buffer.is_null());
+        }
+    }
+    set_iostatus(s, inv.irp, 0, n as u64);
+    s.io_complete_request(inv.irp)
 }
 
 // --- a bridge that assigns a fixed DeviceId ----------------------------------
@@ -206,6 +268,69 @@ fn dispatch_reaches_driver_and_buffered_echo_works() {
 }
 
 #[test]
+fn dispatch_projects_direct_and_neither_ioctl_buffers() {
+    let mut host = started_host(100);
+    let gate = MockDispatchGate(dispatch_echo_transfer);
+    let mut nb = NullBridge;
+
+    let mut system = *b"ping";
+    let mut direct = [0u8; 8];
+    let r = host.dispatch_irp_with_buffers(
+        &gate,
+        &mut nb,
+        DispatchRequest {
+            irp_id: 10,
+            device_id: 100,
+            major: major::IRP_MJ_DEVICE_CONTROL,
+            minor: 0,
+            ioctl_code: ioctl::ctl_code(
+                0x22,
+                0x801,
+                ioctl::METHOD_OUT_DIRECT,
+                ioctl::FILE_ANY_ACCESS,
+            ),
+            input_len: 4,
+            output_len: 8,
+        },
+        DispatchBuffers::with_transfer_buffers(&mut system, Some(&mut direct), None, None),
+    );
+    assert_eq!(
+        r,
+        DispatchResult::Completed {
+            status: 0,
+            information: 4
+        }
+    );
+    assert_eq!(&direct[..4], b"ping");
+
+    let mut empty = [];
+    let mut type3 = *b"pong";
+    let mut user = [0u8; 8];
+    let r = host.dispatch_irp_with_buffers(
+        &gate,
+        &mut nb,
+        DispatchRequest {
+            irp_id: 11,
+            device_id: 100,
+            major: major::IRP_MJ_DEVICE_CONTROL,
+            minor: 0,
+            ioctl_code: ioctl::ctl_code(0x22, 0x802, ioctl::METHOD_NEITHER, ioctl::FILE_ANY_ACCESS),
+            input_len: 4,
+            output_len: 8,
+        },
+        DispatchBuffers::with_transfer_buffers(&mut empty, None, Some(&mut type3), Some(&mut user)),
+    );
+    assert_eq!(
+        r,
+        DispatchResult::Completed {
+            status: 0,
+            information: 4
+        }
+    );
+    assert_eq!(&user[..4], b"pong");
+}
+
+#[test]
 fn completion_is_exactly_once() {
     let mut host = started_host(100);
     let mut nb = NullBridge;
@@ -309,10 +434,17 @@ impl DriverDispatchBackend for DriverHostBackend {
         };
         let gate = MockDispatchGate(dispatch_echo);
         let mut nb = NullBridge;
-        let result = self
-            .host
-            .borrow_mut()
-            .dispatch_irp(&gate, &mut nb, req, ctx.system_buffer);
+        let result = self.host.borrow_mut().dispatch_irp_with_buffers(
+            &gate,
+            &mut nb,
+            req,
+            DispatchBuffers::with_transfer_buffers(
+                ctx.system_buffer,
+                ctx.direct_buffer,
+                ctx.type3_input_buffer,
+                ctx.user_buffer,
+            ),
+        );
         Ok(match result {
             DispatchResult::Completed {
                 status,

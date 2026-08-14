@@ -77,6 +77,9 @@ pub struct IoCancelRequest {
 
 /// `IODRV_OP_DISPATCH_IRP` payload — an IRP projection for a driver peer (§16.4).
 /// Variable parameters live after this header in the registered payload buffer.
+/// `buffer_*` names the `AssociatedIrp.SystemBuffer` segment. The direct,
+/// Type3, and user segments are optional transfer-method-specific buffers for
+/// IOCTLs; offset zero with length zero means absent.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct IrpDispatchRequest {
@@ -90,9 +93,19 @@ pub struct IrpDispatchRequest {
     pub buffer_id: u64,
     pub buffer_offset: u64,
     pub buffer_len: u32,
+    pub direct_buffer_offset: u32,
+    pub direct_buffer_len: u32,
+    pub type3_input_offset: u32,
+    pub type3_input_len: u32,
+    pub user_buffer_offset: u32,
+    pub user_buffer_len: u32,
+    pub input_len: u32,
+    pub output_len: u32,
+    pub ioctl_code: u32,
     pub parameter_offset: u32,
     pub parameter_len: u32,
     pub _reserved: u32,
+    pub _reserved2: u32,
 }
 
 /// A generic I/O completion (spec §19). Mirrors the SURT CQE fields: `status` is
@@ -118,7 +131,7 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 64);
+    assert!(size_of::<IrpDispatchRequest>() == 104);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

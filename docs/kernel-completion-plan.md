@@ -65,11 +65,16 @@ with output now retain and free their output buffer/MDL through the same complet
 reads, and the WDM layout writer has host tests for `IRP.MdlAddress` and `IRP.Flags`. The generic
 `nt-io-manager` dispatch model now also carries separate SystemBuffer, direct-output, Type3 input,
 and UserBuffer slices for host-testable in-process drivers, so buffered, direct, and neither IOCTLs
-round-trip without method collapse. The peer-driver wire backend still fails non-buffered controls
-closed with `STATUS_NOT_SUPPORTED` until that ABI grows explicit split-buffer fields. Local
-validation: `cargo fmt --all`, `cargo test -p nt-io-manager`, `cargo test -p nt-driver-host`,
-executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
---target x86_64-unknown-none`, and `git diff --check`.
+round-trip without method collapse. Follow-up peer-wire cleanup moved the driver-peer ABI to version
+2 and stages `[header][SystemBuffer][direct][Type3][UserBuffer]` segments through the SURT shared
+frame. The peer mock, isolated peer component, and crate-level Driver Host now project the same
+method-specific buffers; direct IOCTLs get a nonpaged MDL with `MappedSystemVa`, and neither IOCTLs
+use `Type3InputBuffer` plus `Irp->UserBuffer`. Inconsistent split-buffer requests fail before
+dispatch instead of building null placeholders. Local validation: `cargo fmt --all`,
+`cargo test -p nt-io-manager`, `cargo test -p nt-driver-host`, component `cargo check
+--manifest-path components/driver-host/Cargo.toml --target x86_64-unknown-none`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`.
 
 Completed restored-boot proof hardening (2026-08-13): restored profile, LSA, SAM, and writable
 overlay gates now derive from actual persisted state instead of first-boot counters. The writable

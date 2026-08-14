@@ -47,7 +47,9 @@ pub use driver::{
     DriverUnloadState, MajorFunctionTable, MockDispatchId,
 };
 pub use driver_host::{DriverHostRoutine, MvpStatus};
-pub use driver_peer::{DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl};
+pub use driver_peer::{
+    DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl, PeerTransferBuffers,
+};
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
@@ -1876,16 +1878,23 @@ mod tests {
     }
 
     #[test]
-    fn peer_nonbuffered_ioctl_rejected_until_wire_has_split_buffers() {
+    fn peer_direct_and_neither_ioctls_round_trip_split_buffers() {
         let ctrl = MockPeerControl::new();
         let (mut om, client, handle) =
             peer_device(&ctrl, AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE);
-        let code = any_ioctl(0x801, ioctl::METHOD_OUT_DIRECT);
-        let mut io_out = [0u8; 4];
-        assert_eq!(
-            om.device_control(client, handle, code, b"ping", &mut io_out),
-            Err(NtStatus::NOT_SUPPORTED)
-        );
+        for method in [
+            ioctl::METHOD_IN_DIRECT,
+            ioctl::METHOD_OUT_DIRECT,
+            ioctl::METHOD_NEITHER,
+        ] {
+            let code = any_ioctl(0x801 + method, method);
+            let mut io_out = [0u8; 8];
+            let n = om
+                .device_control(client, handle, code, b"ping", &mut io_out)
+                .unwrap();
+            assert_eq!(n, 4);
+            assert_eq!(&io_out[..n as usize], b"ping");
+        }
     }
 
     #[test]
