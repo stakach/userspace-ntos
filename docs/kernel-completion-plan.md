@@ -3355,6 +3355,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   allocation failure as a real registration failure. Validation: `cargo fmt --all` and `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
+- A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
+  authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
+  records now live in component-visible win32k pool storage, grow on demand, and keep the same
+  update-by-authentication-id semantics without depending on executive heap pointers from hosted
+  win32k import code. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported

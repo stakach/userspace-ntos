@@ -2870,13 +2870,68 @@ unsafe fn current_token_authentication_id() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy)]
+struct ServiceWinstaRecord {
+    token_authentication_id: u64,
+    handle: u64,
+}
+
+unsafe fn service_winsta_record_ptr(base: u64, index: u64) -> *mut ServiceWinstaRecord {
+    (base + index * core::mem::size_of::<ServiceWinstaRecord>() as u64)
+        as *mut ServiceWinstaRecord
+}
+
+unsafe fn ensure_service_winsta_record_capacity(required: u64) -> bool {
+    let cap = WIN32K_SERVICE_WINSTA_RECORDS_CAP.load(Ordering::Relaxed);
+    if cap >= required {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        WIN32K_SERVICE_WINSTA_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let next = new_cap.saturating_mul(2);
+        if next <= new_cap {
+            return false;
+        }
+        new_cap = next;
+    }
+    let Some(bytes) = (core::mem::size_of::<ServiceWinstaRecord>() as u64).checked_mul(new_cap)
+    else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+    let old_base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
+    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
+    if old_base != 0 {
+        for index in 0..len {
+            let rec = read_volatile(service_winsta_record_ptr(old_base, index));
+            write_volatile(service_winsta_record_ptr(new_base, index), rec);
+        }
+    }
+    WIN32K_SERVICE_WINSTA_RECORDS_PTR.store(new_base, Ordering::Relaxed);
+    WIN32K_SERVICE_WINSTA_RECORDS_CAP.store(new_cap, Ordering::Relaxed);
+    true
+}
+
 unsafe fn service_winsta_index_for_auth(token_authentication_id: u64) -> Option<usize> {
     if token_authentication_id == 0 {
         return None;
     }
-    for index in 0..WIN32K_SERVICE_WINSTA_CAP {
-        if WIN32K_SERVICE_WINSTA_AUTHS[index].load(Ordering::Relaxed) == token_authentication_id {
-            return Some(index);
+    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
+    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    for index in 0..len {
+        let rec = read_volatile(service_winsta_record_ptr(base, index));
+        if rec.token_authentication_id == token_authentication_id {
+            return Some(index as usize);
         }
     }
     None
@@ -2888,23 +2943,49 @@ unsafe fn record_service_window_station(handle: u64) {
         return;
     }
     if let Some(index) = service_winsta_index_for_auth(token_authentication_id) {
-        WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
+        let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
+        if base != 0 {
+            write_volatile(
+                service_winsta_record_ptr(base, index as u64),
+                ServiceWinstaRecord {
+                    token_authentication_id,
+                    handle,
+                },
+            );
+        }
         return;
     }
-    for index in 0..WIN32K_SERVICE_WINSTA_CAP {
-        if WIN32K_SERVICE_WINSTA_AUTHS[index].load(Ordering::Relaxed) == 0 {
-            WIN32K_SERVICE_WINSTA_AUTHS[index].store(token_authentication_id, Ordering::Relaxed);
-            WIN32K_SERVICE_WINSTA_HANDLES[index].store(handle, Ordering::Relaxed);
-            return;
-        }
+    let len = WIN32K_SERVICE_WINSTA_RECORDS_LEN.load(Ordering::Relaxed);
+    let Some(required) = len.checked_add(1) else {
+        return;
+    };
+    if !ensure_service_winsta_record_capacity(required) {
+        return;
     }
+    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    write_volatile(
+        service_winsta_record_ptr(base, len),
+        ServiceWinstaRecord {
+            token_authentication_id,
+            handle,
+        },
+    );
+    WIN32K_SERVICE_WINSTA_RECORDS_LEN.store(required, Ordering::Relaxed);
 }
 
 unsafe fn service_window_station_handle_for_current_token() -> u64 {
     let token_authentication_id = current_token_authentication_id();
-    service_winsta_index_for_auth(token_authentication_id)
-        .map(|index| WIN32K_SERVICE_WINSTA_HANDLES[index].load(Ordering::Relaxed))
-        .unwrap_or(0)
+    let Some(index) = service_winsta_index_for_auth(token_authentication_id) else {
+        return 0;
+    };
+    let base = WIN32K_SERVICE_WINSTA_RECORDS_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return 0;
+    }
+    read_volatile(service_winsta_record_ptr(base, index as u64)).handle
 }
 
 /// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,
@@ -4788,11 +4869,10 @@ static WIN32K_WALL_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_PENDING_OB_UNCACHED_WINSTA: AtomicU64 = AtomicU64::new(0);
-const WIN32K_SERVICE_WINSTA_CAP: usize = 8;
-static WIN32K_SERVICE_WINSTA_AUTHS: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
-static WIN32K_SERVICE_WINSTA_HANDLES: [AtomicU64; WIN32K_SERVICE_WINSTA_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_SERVICE_WINSTA_CAP];
+const WIN32K_SERVICE_WINSTA_INITIAL_CAP: u64 = 4;
+static WIN32K_SERVICE_WINSTA_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
+static WIN32K_SERVICE_WINSTA_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_SERVICE_WINSTA_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STARTUP_DESKTOP_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_INHERITED_WINSTA_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_NONINTERACTIVE_WINSTA_RESOLVES: AtomicU64 = AtomicU64::new(0);
