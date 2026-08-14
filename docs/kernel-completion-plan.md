@@ -1049,8 +1049,12 @@ before unrelated executive traffic monopolises the receive loop.
   `NtProtectVirtualMemory`, `NtMapViewOfSection`, and fault handling with `nt-address-space`.
 - `[~]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
   decommit, release, protect, query, and unmap semantics.
-- `[~]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
-  and dirty writeback.
+- `[x]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
+  and dirty writeback. This is closed for the current frontier: committed mapping ownership covers
+  main images, ntdll, SEC_IMAGE DLLs, and generic data-section views; image and mapped-section
+  faults require committed-view ownership before fill; overlay-backed mapped data views dirty and
+  write back through the writable filesystem; mapped/image writecopy faults promote into private
+  frames without modifying shared sources; and unmap tears down committed-view ownership.
 - `[x]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
   `MEM_TOP_DOWN`, guard/no-access faults, and view teardown. The current C4 matrix is closed:
   host-side tests and live gates now cover private partial release/decommit, protected-page override
@@ -3181,6 +3185,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   placement/query behavior. The workstream status is now `[x]` for the current frontier. Future VM
   discoveries should open a new specific C4 sub-slice instead of keeping the whole matrix marked
   in-progress.
+
+- C3 current mapped/image view ownership closed (2026-08-15). Reviewing the accumulated C3 slices
+  shows both mapped data-section and image-section ownership are now routed through the committed
+  mapping authority before page fill: generic section views own `MEM_MAPPED` query/protect/fault
+  state, dirty overlay-backed pages write back on unmap, image views publish section-granular
+  `MEM_IMAGE` runs, image faults consult committed ownership before shared cache/private fill,
+  writecopy image and mapped-data faults promote to private pages, and allocation-base unmap removes
+  the committed records. The workstream status is now `[x]` for the current frontier. New mapped-file
+  issues should be tracked as specific C3 follow-up slices rather than keeping the whole view
+  ownership task open.
 
 - D1 `NtSaveKey` root-hive save slice. The owned ntdll ABI already exported `NtSaveKey`, but the
   typed native dispatcher and executive table did not model SSN 215. `NativeService::NtSaveKey` now
