@@ -3335,6 +3335,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   handle range, and returns the existing no-memory path if another handle cannot be reserved. This
   keeps the remaining Video0 bridge limited by real memory pressure rather than a fixed shim cap.
 
+- B3 GDI driver registration cleanup (2026-08-15). The hosted win32k
+  `SystemLoadGdiDriverInformation` path no longer stores loaded display/GDI DLL images in a fixed
+  eight-record table. GDI driver records now grow on demand, preserve duplicate-leaf replacement
+  semantics, and fail registration only on invalid metadata or real allocation failure. This removes
+  another display-route cap before the larger videoprt/miniport hosting work.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported

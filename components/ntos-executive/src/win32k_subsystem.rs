@@ -6632,7 +6632,6 @@ unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
     true
 }
 
-const GDI_DRIVER_RECORD_CAP: usize = 8;
 const GDI_DRIVER_LEAF_CAP: usize = 24;
 
 #[derive(Clone, Copy)]
@@ -6660,8 +6659,7 @@ impl GdiDriverRecord {
     }
 }
 
-static mut GDI_DRIVER_RECORDS: [GdiDriverRecord; GDI_DRIVER_RECORD_CAP] =
-    [GdiDriverRecord::EMPTY; GDI_DRIVER_RECORD_CAP];
+static mut GDI_DRIVER_RECORDS: Option<Vec<GdiDriverRecord>> = None;
 
 fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -6675,6 +6673,20 @@ fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+fn gdi_driver_records_mut() -> &'static mut Vec<GdiDriverRecord> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(GDI_DRIVER_RECORDS);
+        if slot.is_none() {
+            *slot = Some(Vec::new());
+        }
+        slot.as_mut().expect("initialized above")
+    }
+}
+
+fn gdi_driver_records() -> Option<&'static Vec<GdiDriverRecord>> {
+    unsafe { (&*core::ptr::addr_of!(GDI_DRIVER_RECORDS)).as_ref() }
+}
+
 fn register_gdi_driver_image(
     leaf: &[u8],
     image: u64,
@@ -6685,25 +6697,20 @@ fn register_gdi_driver_image(
     if leaf.is_empty() || leaf.len() > GDI_DRIVER_LEAF_CAP || image == 0 || image_len == 0 {
         return false;
     }
-    unsafe {
-        let records = &mut *core::ptr::addr_of_mut!(GDI_DRIVER_RECORDS);
-        let mut empty = None;
-        for (idx, rec) in records.iter().enumerate() {
-            if rec.leaf_len == 0 {
-                empty.get_or_insert(idx);
-                continue;
-            }
-            if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-                records[idx] = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
-                return true;
-            }
-        }
-        let Some(idx) = empty else {
-            return false;
-        };
-        records[idx] = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
-        true
+    let records = gdi_driver_records_mut();
+    let record = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
+    if let Some(rec) = records
+        .iter_mut()
+        .find(|rec| ascii_eq_ignore_case(rec.leaf_bytes(), leaf))
+    {
+        *rec = record;
+        return true;
     }
+    if records.try_reserve(1).is_err() {
+        return false;
+    }
+    records.push(record);
+    true
 }
 
 fn registered_gdi_driver_record(
@@ -6729,11 +6736,8 @@ unsafe fn registered_gdi_driver_for_name(
     name_buf: u64,
     name_len: usize,
 ) -> Option<GdiDriverRecord> {
-    let records = &*core::ptr::addr_of!(GDI_DRIVER_RECORDS);
+    let records = gdi_driver_records()?;
     for rec in records.iter() {
-        if rec.leaf_len == 0 {
-            continue;
-        }
         if wname_ends_with(name_buf, name_len, rec.leaf_bytes()) {
             return Some(*rec);
         }
@@ -6742,9 +6746,9 @@ unsafe fn registered_gdi_driver_for_name(
 }
 
 fn registered_gdi_driver_for_leaf(leaf: &[u8]) -> Option<GdiDriverRecord> {
-    let records = unsafe { &*core::ptr::addr_of!(GDI_DRIVER_RECORDS) };
+    let records = gdi_driver_records()?;
     for rec in records.iter() {
-        if rec.leaf_len != 0 && ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
+        if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
             return Some(*rec);
         }
     }
