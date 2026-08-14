@@ -29,6 +29,7 @@
 //! The trampolines are compiled into the executive's image (mapped RWX-shared into the component),
 //! so the component calls them at the same VA.
 
+use alloc::vec::Vec;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::{
     ssdt::{
@@ -6866,7 +6867,6 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
-const WIN32K_REG_HANDLE_CAP: usize = 16;
 const WIN32K_REG_PATH_CAP: usize = 192;
 const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
 const WIN32K_REG_VALUE_DATA_CAP: usize = 512;
@@ -6892,8 +6892,7 @@ impl Win32kRegHandle {
     };
 }
 
-static mut WIN32K_REG_HANDLES: [Win32kRegHandle; WIN32K_REG_HANDLE_CAP] =
-    [Win32kRegHandle::EMPTY; WIN32K_REG_HANDLE_CAP];
+static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
 
 pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) service_name: &'a [u8],
@@ -6919,45 +6918,57 @@ fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
     ascii_eq_ignore_case(a, b)
 }
 
+fn win32k_reg_handles_mut() -> &'static mut Vec<Win32kRegHandle> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
+        if slot.is_none() {
+            *slot = Some(Vec::new());
+        }
+        slot.as_mut().expect("initialized above")
+    }
+}
+
+fn win32k_reg_handles() -> Option<&'static Vec<Win32kRegHandle>> {
+    unsafe { (&*core::ptr::addr_of!(WIN32K_REG_HANDLES)).as_ref() }
+}
+
 fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Option<u64> {
     if matches!(target, Win32kRegHandleTarget::Empty) {
         return None;
     }
-    unsafe {
-        let handles = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
-        for (idx, entry) in handles.iter().enumerate() {
-            if matches!(entry.target, Win32kRegHandleTarget::Empty) {
-                let handle = WIN32K_REG_HANDLE_BASE + idx as u64;
-                handles[idx] = Win32kRegHandle { handle, target };
-                return Some(handle);
-            }
+    let handles = win32k_reg_handles_mut();
+    for (idx, entry) in handles.iter_mut().enumerate() {
+        if matches!(entry.target, Win32kRegHandleTarget::Empty) {
+            let handle = WIN32K_REG_HANDLE_BASE.checked_add(idx as u64)?;
+            *entry = Win32kRegHandle { handle, target };
+            return Some(handle);
         }
-        None
     }
+    let handle = WIN32K_REG_HANDLE_BASE.checked_add(handles.len() as u64)?;
+    handles.try_reserve(1).ok()?;
+    handles.push(Win32kRegHandle { handle, target });
+    Some(handle)
 }
 
 fn lookup_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
-    unsafe {
-        (&*core::ptr::addr_of!(WIN32K_REG_HANDLES))
-            .iter()
-            .find(|entry| {
-                entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
-            })
-            .map(|entry| entry.target)
-    }
+    win32k_reg_handles()?
+        .iter()
+        .find(|entry| {
+            entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
+        })
+        .map(|entry| entry.target)
 }
 
 fn close_win32k_reg_handle(handle: u64) -> bool {
-    unsafe {
-        let handles = &mut *core::ptr::addr_of_mut!(WIN32K_REG_HANDLES);
-        if let Some(entry) = handles.iter_mut().find(|entry| {
-            entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
-        }) {
-            *entry = Win32kRegHandle::EMPTY;
-            true
-        } else {
-            false
-        }
+    let handles = win32k_reg_handles_mut();
+    if let Some(entry) = handles
+        .iter_mut()
+        .find(|entry| entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty))
+    {
+        *entry = Win32kRegHandle::EMPTY;
+        true
+    } else {
+        false
     }
 }
 

@@ -3329,6 +3329,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the kernel `DriverDispatchBackend` path to those helpers. This does not close the larger
   videoprt/miniport hosting item, but it removes one semantic fork from the current bridge.
 
+- B3 win32k display-registry handle cleanup (2026-08-15). The win32k display registry import shim no
+  longer has an arbitrary 16-handle table for `ZwOpenKey`/`ZwQueryValueKey` during display-device
+  discovery. Handles now live in a growable table that reuses closed slots, mints the same opaque
+  handle range, and returns the existing no-memory path if another handle cannot be reserved. This
+  keeps the remaining Video0 bridge limited by real memory pressure rather than a fixed shim cap.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported
