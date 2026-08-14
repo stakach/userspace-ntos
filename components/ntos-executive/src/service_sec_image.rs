@@ -16775,6 +16775,7 @@ pub(crate) unsafe fn service_sec_image(
             const AMD64_CONTEXT_FLAGS_OFFSET: u64 = 0x30;
             const AMD64_CONTEXT_EFLAGS_OFFSET: u64 = 0x44;
             const CONTEXT_AMD64_CONTROL: u32 = 0x0010_0000 | 0x0000_0001;
+            const CONTEXT_AMD64_DEBUG_REGISTERS: u32 = 0x0010_0000 | 0x0000_0010;
             const EFLAGS_TF: u32 = 0x0000_0100;
             const BLK_TEST_PI: usize = MAX_PI - 1;
             const BLK_TEST_RUNTIME_BADGE: u64 = 0xDB6B_0001;
@@ -16854,6 +16855,7 @@ pub(crate) unsafe fn service_sec_image(
             let shared_d = make(OBJ_X86_4K_PAGE, PAGING_BITS);
             let fixup_frame = make(OBJ_X86_4K_PAGE, PAGING_BITS);
             let reply_a = make(OBJ_REPLY, 0);
+            let reply_hw = make(OBJ_REPLY, 0);
             let reply_b = make(OBJ_REPLY, 0);
             let reply_step = make(OBJ_REPLY, 0);
             let reply_c = make(OBJ_REPLY, 0);
@@ -17061,17 +17063,81 @@ pub(crate) unsafe fn service_sec_image(
                             parked as u64,
                             nt_handler.pm.blocked_reporter_count(object) as u64,
                         );
-                        if forwarded
+                        let no_progress1 = forwarded
                             && parked
                             && DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed) == blocked_before + 1
                             && nt_handler.pm.blocked_reporter_count(object) == 1
-                            && marker_t() == 1
-                        {
+                            && marker_t() == 1;
+                        if no_progress1 {
                             bk_ok |= 0x0002;
                         }
                         if !parked {
                             break; // nothing holds the client's reply cap — never recv again
                         }
+                        // 0x0200 — real hardware breakpoint context path. Arm DR0 against the
+                        // target's next `int3` address while the thread is parked on the page fault.
+                        // Continuing the page fault should run marker 2 and then trap with a seL4
+                        // instruction-breakpoint DebugException before the software int3 executes.
+                        let hw_breakpoint_ip =
+                            selftests::DBGK_CLIENT_CODE + selftests::DBGK_TARGET_INT3_OFFSET;
+                        let hw_dr7 = nt_thread_start::AMD64_DR7_RESERVED_ONE | 1;
+                        let hw_context_written = no_progress1
+                            && client_runtime_registered
+                            && debuggee_thread_handle != 0
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT,
+                                &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE],
+                            )
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+                            )
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + nt_thread_start::CONTEXT_DR0_OFFSET,
+                                &hw_breakpoint_ip.to_le_bytes(),
+                            )
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + nt_thread_start::CONTEXT_DR7_OFFSET,
+                                &hw_dr7.to_le_bytes(),
+                            );
+                        let setctx_hw = if hw_context_written {
+                            sysc!(
+                                SSN_NT_SET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let getctx_hw_ready = setctx_hw == 0
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT,
+                                &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE],
+                            )
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+                            );
+                        let getctx_hw = if getctx_hw_ready {
+                            sysc!(
+                                SSN_NT_GET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let mut hw_dr0_buf = [0u8; 8];
+                        let mut hw_dr7_buf = [0u8; 8];
+                        let hw_breakpoint_armed = getctx_hw == 0
+                            && img_spawn::smss_copyin(
+                                A_CONTEXT + nt_thread_start::CONTEXT_DR0_OFFSET,
+                                &mut hw_dr0_buf,
+                            )
+                            && img_spawn::smss_copyin(
+                                A_CONTEXT + nt_thread_start::CONTEXT_DR7_OFFSET,
+                                &mut hw_dr7_buf,
+                            )
+                            && u64::from_le_bytes(hw_dr0_buf) == hw_breakpoint_ip
+                            && u64::from_le_bytes(hw_dr7_buf) == hw_dr7;
                         // 0x0004 — ★ THE CONTINUE RESUMES IT. The debugger retrieves the exception,
                         // maps the page the client faulted on (a real debugger's fixup), and
                         // continues: `DbgkpWakeTarget` replies with the VMFault shape (length 0, no
@@ -17108,6 +17174,132 @@ pub(crate) unsafe fn service_sec_image(
                             // and do NOT recv (the client can no longer produce an event).
                             let _ = nt_handler.dbgk_release_all_blocked_reporters();
                             break;
+                        }
+                        if hw_breakpoint_armed {
+                            let (_fb, f2hw_mi, f2hw_m0, f2hw_m1, f2hw_m2, f2hw_m3) =
+                                recv_full_r12(client_ep, reply_hw);
+                            dbgk_blk_trace(b"f2hw", f2hw_mi, f2hw_m0, f2hw_m1, marker_t());
+                            let hw_fault = mapped
+                                && read1
+                                && cont1 == 0
+                                && (f2hw_mi >> 12) == 4
+                                && f2hw_m0 == hw_breakpoint_ip
+                                && f2hw_m1 == dbgk::SEL4_DEBUG_REASON_INSTRUCTION_BREAKPOINT
+                                && f2hw_m2 == hw_breakpoint_ip
+                                && f2hw_m3 == 0
+                                && marker_t() == 2;
+                            let forwarded_hw = hw_fault
+                                && nt_handler.dbgk_forward_exception(
+                                    BLK_TEST_PI,
+                                    main_tid as u64,
+                                    dbgk::ExceptionRecord::new(dbgk::STATUS_SINGLE_STEP, f2hw_m0),
+                                    true,
+                                );
+                            let blocked_hw = forwarded_hw
+                                && nt_handler.dbgk_block_reporter(
+                                    BLK_TEST_PI,
+                                    main_tid as u64,
+                                    0,
+                                    dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                                    reply_hw,
+                                    f2hw_m0,
+                                    f2hw_m2,
+                                    f2hw_m3,
+                                    0,
+                                );
+                            let no_progress_hw = blocked_hw
+                                && nt_handler.pm.blocked_reporter_count(object) == 1
+                                && marker_t() == 2;
+                            let resumed_before_hw =
+                                DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                            let wait_hw = if blocked_hw {
+                                sysc!(
+                                    SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                    &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                                )
+                            } else {
+                                u32::MAX
+                            };
+                            let read_hw = wait_hw == 0
+                                && img_spawn::smss_copyin(A_STATE, &mut sc)
+                                && sc_u32!(0x00) == dbgk::DBG_SINGLE_STEP_STATE_CHANGE;
+                            let clear_hw_context_written = read_hw
+                                && img_spawn::smss_copyout(
+                                    A_CONTEXT,
+                                    &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE],
+                                )
+                                && img_spawn::smss_copyout(
+                                    A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                    &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+                                );
+                            let setctx_hw_clear = if clear_hw_context_written {
+                                sysc!(
+                                    SSN_NT_SET_CONTEXT_THREAD,
+                                    &[debuggee_thread_handle, A_CONTEXT]
+                                )
+                            } else {
+                                u32::MAX
+                            };
+                            let getctx_hw_clear_ready = setctx_hw_clear == 0
+                                && img_spawn::smss_copyout(
+                                    A_CONTEXT,
+                                    &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE],
+                                )
+                                && img_spawn::smss_copyout(
+                                    A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                    &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+                                );
+                            let getctx_hw_clear = if getctx_hw_clear_ready {
+                                sysc!(
+                                    SSN_NT_GET_CONTEXT_THREAD,
+                                    &[debuggee_thread_handle, A_CONTEXT]
+                                )
+                            } else {
+                                u32::MAX
+                            };
+                            let mut hw_clear_dr7_buf = [0u8; 8];
+                            let hw_breakpoint_cleared = getctx_hw_clear == 0
+                                && img_spawn::smss_copyin(
+                                    A_CONTEXT + nt_thread_start::CONTEXT_DR7_OFFSET,
+                                    &mut hw_clear_dr7_buf,
+                                )
+                                && u64::from_le_bytes(hw_clear_dr7_buf)
+                                    == nt_thread_start::AMD64_DR7_RESERVED_ONE;
+                            let cont_hw =
+                                if read_hw && setctx_hw_clear == 0 && hw_breakpoint_cleared {
+                                    sysc!(
+                                        SSN_NT_DEBUG_CONTINUE,
+                                        &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                                    )
+                                } else {
+                                    u32::MAX
+                                };
+                            let woke_hw = DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed)
+                                == resumed_before_hw + 1;
+                            dbgk_blk_trace(
+                                b"c2hw",
+                                no_progress_hw as u64,
+                                wait_hw as u64,
+                                cont_hw as u64,
+                                woke_hw as u64,
+                            );
+                            if hw_fault
+                                && no_progress_hw
+                                && read_hw
+                                && hw_breakpoint_cleared
+                                && cont_hw == 0
+                                && woke_hw
+                            {
+                                bk_ok |= 0x0200;
+                            }
+                            if !woke_hw {
+                                let _ = crate::win32k_glue::tcb_unset_breakpoint(client_tcb, 0);
+                                if !blocked_hw {
+                                    client_reply_on(reply_hw, 0, 0, 0, 0, 0);
+                                }
+                                let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                                break;
+                            }
                         }
                         // ═══ FAULT 2 — DebugException (int3) ══════════════════════════════
                         let (_fb, f2_mi, f2_m0, f2_m1, _f2m2, _f2m3) =

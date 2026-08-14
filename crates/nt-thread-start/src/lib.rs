@@ -24,6 +24,12 @@ pub const CONTEXT_P1_HOME_OFFSET: u64 = 0x00;
 pub const CONTEXT_P2_HOME_OFFSET: u64 = 0x08;
 pub const CONTEXT_P3_HOME_OFFSET: u64 = 0x10;
 pub const CONTEXT_P4_HOME_OFFSET: u64 = 0x18;
+pub const CONTEXT_DR0_OFFSET: u64 = 0x48;
+pub const CONTEXT_DR1_OFFSET: u64 = 0x50;
+pub const CONTEXT_DR2_OFFSET: u64 = 0x58;
+pub const CONTEXT_DR3_OFFSET: u64 = 0x60;
+pub const CONTEXT_DR6_OFFSET: u64 = 0x68;
+pub const CONTEXT_DR7_OFFSET: u64 = 0x70;
 
 const CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const CONTEXT_MXCSR_OFFSET: usize = 0x34;
@@ -48,6 +54,22 @@ pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
 pub const CALL_TRAMPOLINE_LEN: usize = 34;
 pub const LOADER_TRAMPOLINE_LEN: usize = 85;
+pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
+pub const AMD64_DR6_INITIAL: u64 = 0xFFFF_0FF0;
+pub const AMD64_DR7_RESERVED_ONE: u64 = 0x0000_0400;
+pub const DEBUG_BREAKPOINT_DATA: u64 = 0;
+pub const DEBUG_BREAKPOINT_INSTRUCTION: u64 = 1;
+pub const DEBUG_ACCESS_READ: u64 = 0;
+pub const DEBUG_ACCESS_WRITE: u64 = 1;
+pub const DEBUG_ACCESS_READWRITE: u64 = 2;
+
+const AMD64_DR7_ENABLE_MASK: u64 = 0x0000_00ff;
+const AMD64_DR7_EXACT_MASK: u64 = 0x0000_0300;
+const AMD64_DR7_SLOT_CONTROL_MASK: u64 = 0xffff_0000;
+const AMD64_DR7_SUPPORTED_MASK: u64 = AMD64_DR7_ENABLE_MASK
+    | AMD64_DR7_EXACT_MASK
+    | AMD64_DR7_RESERVED_ONE
+    | AMD64_DR7_SLOT_CONTROL_MASK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Amd64ThreadContext {
@@ -118,6 +140,164 @@ impl Amd64ThreadContext {
         emit(&[0xff, 0xe0]); // jmp rax
         debug_assert_eq!(at, LOADER_TRAMPOLINE_LEN);
         code
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Amd64DebugBreakpoint {
+    pub address: u64,
+    pub breakpoint_type: u64,
+    pub size: u64,
+    pub access: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Amd64DebugRegisterState {
+    pub dr: [u64; AMD64_HW_BREAKPOINT_SLOTS],
+    pub dr6: u64,
+    pub dr7: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Amd64DebugRegisterError {
+    UnsupportedControlBits,
+    UnsupportedIoBreakpoint,
+    InvalidBreakpointType,
+    InvalidBreakpointAccess,
+    InvalidDataBreakpointSize,
+    UnalignedDataBreakpoint,
+}
+
+/// Convert an NT AMD64 DR0-DR3/DR7 tuple into seL4-style hardware-breakpoint slot operations.
+///
+/// NT exposes raw architectural DR7. The microkernel backend exposes four breakpoint slots. We
+/// accept either local or global enable bits for each slot, ignore stale type/length fields on
+/// disabled slots, reject control bits the slot API cannot represent, and clamp enabled breakpoint
+/// addresses above the supplied user ceiling the same way ReactOS does before writing a trap frame.
+pub fn plan_amd64_debug_registers(
+    dr: [u64; AMD64_HW_BREAKPOINT_SLOTS],
+    dr7: u64,
+    highest_user_address: u64,
+) -> Result<[Option<Amd64DebugBreakpoint>; AMD64_HW_BREAKPOINT_SLOTS], Amd64DebugRegisterError> {
+    if dr7 & !AMD64_DR7_SUPPORTED_MASK != 0 {
+        return Err(Amd64DebugRegisterError::UnsupportedControlBits);
+    }
+
+    let mut slots = [None; AMD64_HW_BREAKPOINT_SLOTS];
+    for slot in 0..AMD64_HW_BREAKPOINT_SLOTS {
+        if ((dr7 >> (slot * 2)) & 0x3) == 0 {
+            continue;
+        }
+        let arch_type = (dr7 >> (16 + slot * 4)) & 0x3;
+        let arch_len = (dr7 >> (18 + slot * 4)) & 0x3;
+        let (breakpoint_type, access) = match arch_type {
+            0 => (DEBUG_BREAKPOINT_INSTRUCTION, DEBUG_ACCESS_READ),
+            1 => (DEBUG_BREAKPOINT_DATA, DEBUG_ACCESS_WRITE),
+            3 => (DEBUG_BREAKPOINT_DATA, DEBUG_ACCESS_READWRITE),
+            _ => return Err(Amd64DebugRegisterError::UnsupportedIoBreakpoint),
+        };
+        let size = if breakpoint_type == DEBUG_BREAKPOINT_INSTRUCTION {
+            0
+        } else {
+            match arch_len {
+                0 => 1,
+                1 => 2,
+                2 => 8,
+                _ => 4,
+            }
+        };
+        let address = if dr[slot] > highest_user_address {
+            0
+        } else {
+            dr[slot]
+        };
+        let breakpoint = Amd64DebugBreakpoint {
+            address,
+            breakpoint_type,
+            size,
+            access,
+        };
+        validate_amd64_debug_breakpoint(breakpoint)?;
+        slots[slot] = Some(breakpoint);
+    }
+    Ok(slots)
+}
+
+/// Synthesize the NT-visible debug-register image from seL4-style breakpoint slots.
+pub fn synthesize_amd64_debug_registers(
+    slots: &[Option<Amd64DebugBreakpoint>; AMD64_HW_BREAKPOINT_SLOTS],
+) -> Result<Amd64DebugRegisterState, Amd64DebugRegisterError> {
+    let mut state = Amd64DebugRegisterState {
+        dr: [0; AMD64_HW_BREAKPOINT_SLOTS],
+        dr6: AMD64_DR6_INITIAL,
+        dr7: AMD64_DR7_RESERVED_ONE,
+    };
+    for (slot, maybe_breakpoint) in slots.iter().copied().enumerate() {
+        let Some(breakpoint) = maybe_breakpoint else {
+            continue;
+        };
+        validate_amd64_debug_breakpoint(breakpoint)?;
+        state.dr[slot] = breakpoint.address;
+        state.dr7 |= 1u64 << (slot * 2);
+        state.dr7 |= amd64_dr7_type_bits(breakpoint)? << (16 + slot * 4);
+        state.dr7 |= amd64_dr7_len_bits(breakpoint)? << (18 + slot * 4);
+    }
+    Ok(state)
+}
+
+fn validate_amd64_debug_breakpoint(
+    breakpoint: Amd64DebugBreakpoint,
+) -> Result<(), Amd64DebugRegisterError> {
+    match breakpoint.breakpoint_type {
+        DEBUG_BREAKPOINT_INSTRUCTION => {
+            if breakpoint.access != DEBUG_ACCESS_READ {
+                return Err(Amd64DebugRegisterError::InvalidBreakpointAccess);
+            }
+            if breakpoint.size != 0 {
+                return Err(Amd64DebugRegisterError::InvalidDataBreakpointSize);
+            }
+        }
+        DEBUG_BREAKPOINT_DATA => {
+            if breakpoint.access != DEBUG_ACCESS_WRITE
+                && breakpoint.access != DEBUG_ACCESS_READWRITE
+                && breakpoint.access != DEBUG_ACCESS_READ
+            {
+                return Err(Amd64DebugRegisterError::InvalidBreakpointAccess);
+            }
+            if !matches!(breakpoint.size, 1 | 2 | 4 | 8) {
+                return Err(Amd64DebugRegisterError::InvalidDataBreakpointSize);
+            }
+            if breakpoint.address & (breakpoint.size - 1) != 0 {
+                return Err(Amd64DebugRegisterError::UnalignedDataBreakpoint);
+            }
+        }
+        _ => return Err(Amd64DebugRegisterError::InvalidBreakpointType),
+    }
+    Ok(())
+}
+
+fn amd64_dr7_type_bits(breakpoint: Amd64DebugBreakpoint) -> Result<u64, Amd64DebugRegisterError> {
+    match breakpoint.breakpoint_type {
+        DEBUG_BREAKPOINT_INSTRUCTION => Ok(0),
+        DEBUG_BREAKPOINT_DATA => match breakpoint.access {
+            DEBUG_ACCESS_WRITE => Ok(1),
+            DEBUG_ACCESS_READ | DEBUG_ACCESS_READWRITE => Ok(3),
+            _ => Err(Amd64DebugRegisterError::InvalidBreakpointAccess),
+        },
+        _ => Err(Amd64DebugRegisterError::InvalidBreakpointType),
+    }
+}
+
+fn amd64_dr7_len_bits(breakpoint: Amd64DebugBreakpoint) -> Result<u64, Amd64DebugRegisterError> {
+    if breakpoint.breakpoint_type == DEBUG_BREAKPOINT_INSTRUCTION {
+        return Ok(0);
+    }
+    match breakpoint.size {
+        1 => Ok(0),
+        2 => Ok(1),
+        8 => Ok(2),
+        4 => Ok(3),
+        _ => Err(Amd64DebugRegisterError::InvalidDataBreakpointSize),
     }
 }
 
@@ -341,6 +521,86 @@ mod tests {
         assert_eq!(decoded.rcx, 0xfeed_beef);
         assert_eq!(decoded.rsp, 0x7000_ffc8);
         assert!(bytes[0x100..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn debug_register_plan_accepts_instruction_breakpoint() {
+        let plan = plan_amd64_debug_registers([0x401000, 0, 0, 0], 1, 0x7fff_ffff)
+            .expect("instruction breakpoint");
+        assert_eq!(
+            plan[0],
+            Some(Amd64DebugBreakpoint {
+                address: 0x401000,
+                breakpoint_type: DEBUG_BREAKPOINT_INSTRUCTION,
+                size: 0,
+                access: DEBUG_ACCESS_READ,
+            })
+        );
+        let state = synthesize_amd64_debug_registers(&plan).expect("synthesize");
+        assert_eq!(state.dr[0], 0x401000);
+        assert_eq!(state.dr6, AMD64_DR6_INITIAL);
+        assert_eq!(state.dr7, AMD64_DR7_RESERVED_ONE | 1);
+    }
+
+    #[test]
+    fn debug_register_plan_accepts_global_data_write_watchpoint() {
+        let slot = 2usize;
+        let dr7 = (1u64 << (slot * 2 + 1)) | (1u64 << (16 + slot * 4)) | (3u64 << (18 + slot * 4));
+        let plan = plan_amd64_debug_registers([0, 0, 0x402000, 0], dr7, 0x7fff_ffff)
+            .expect("data watchpoint");
+        assert_eq!(
+            plan[slot],
+            Some(Amd64DebugBreakpoint {
+                address: 0x402000,
+                breakpoint_type: DEBUG_BREAKPOINT_DATA,
+                size: 4,
+                access: DEBUG_ACCESS_WRITE,
+            })
+        );
+        let state = synthesize_amd64_debug_registers(&plan).expect("synthesize");
+        assert_eq!(state.dr[slot], 0x402000);
+        assert_eq!(
+            state.dr7,
+            AMD64_DR7_RESERVED_ONE
+                | (1u64 << (slot * 2))
+                | (1u64 << (16 + slot * 4))
+                | (3u64 << (18 + slot * 4))
+        );
+    }
+
+    #[test]
+    fn debug_register_plan_ignores_disabled_stale_slot_fields() {
+        let stale_io_slot = 2u64 << 16;
+        let plan = plan_amd64_debug_registers([0x401000, 0, 0, 0], stale_io_slot, 0x7fff_ffff)
+            .expect("disabled stale fields are inert");
+        assert_eq!(plan, [None, None, None, None]);
+    }
+
+    #[test]
+    fn debug_register_plan_clamps_kernel_addresses_like_reactos() {
+        let plan = plan_amd64_debug_registers([0x8000_0000, 0, 0, 0], 1, 0x7fff_ffff)
+            .expect("clamped instruction breakpoint");
+        assert_eq!(plan[0].unwrap().address, 0);
+    }
+
+    #[test]
+    fn debug_register_plan_rejects_unmodelled_or_invalid_slots() {
+        assert_eq!(
+            plan_amd64_debug_registers([0; 4], 1u64 << 13, 0x7fff_ffff),
+            Err(Amd64DebugRegisterError::UnsupportedControlBits)
+        );
+        assert_eq!(
+            plan_amd64_debug_registers([0x401000, 0, 0, 0], 1 | (2u64 << 16), 0x7fff_ffff),
+            Err(Amd64DebugRegisterError::UnsupportedIoBreakpoint)
+        );
+        assert_eq!(
+            plan_amd64_debug_registers(
+                [0x401003, 0, 0, 0],
+                1 | (1u64 << 16) | (3u64 << 18),
+                0x7fff_ffff
+            ),
+            Err(Amd64DebugRegisterError::UnalignedDataBreakpoint)
+        );
     }
 
     #[test]

@@ -1887,6 +1887,84 @@ pub(crate) unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: b
     reply_info >> 12
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TcbBreakpoint {
+    pub(crate) vaddr: u64,
+    pub(crate) breakpoint_type: u64,
+    pub(crate) size: u64,
+    pub(crate) access: u64,
+    pub(crate) enabled: bool,
+}
+
+pub(crate) unsafe fn tcb_set_breakpoint(
+    tcb: u64,
+    bp_num: u64,
+    vaddr: u64,
+    breakpoint_type: u64,
+    size: u64,
+    access: u64,
+) -> u64 {
+    set_reply_mr(4, access);
+    let reply_info: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") (LBL_TCB_SET_BREAKPOINT << 12) | 5 => reply_info,
+        inout("r10") bp_num => _,
+        inout("r8") vaddr => _,
+        inout("r9") breakpoint_type => _,
+        inout("r15") size => _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply_info >> 12
+}
+
+pub(crate) unsafe fn tcb_get_breakpoint(tcb: u64, bp_num: u64) -> Option<TcbBreakpoint> {
+    let reply_info: u64;
+    let (vaddr, breakpoint_type, size, access): (u64, u64, u64, u64);
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") (LBL_TCB_GET_BREAKPOINT << 12) | 1 => reply_info,
+        inout("r10") bp_num => vaddr,
+        lateout("r8") breakpoint_type,
+        lateout("r9") size,
+        lateout("r15") access,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    if reply_info >> 12 != 0 {
+        return None;
+    }
+    Some(TcbBreakpoint {
+        vaddr,
+        breakpoint_type,
+        size,
+        access,
+        enabled: crate::get_recv_mr(4) != 0,
+    })
+}
+
+pub(crate) unsafe fn tcb_unset_breakpoint(tcb: u64, bp_num: u64) -> u64 {
+    let reply_info: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") (LBL_TCB_UNSET_BREAKPOINT << 12) | 1 => reply_info,
+        inout("r10") bp_num => _,
+        lateout("r8") _,
+        lateout("r9") _,
+        lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply_info >> 12
+}
+
 /// Repoint a thread blocked on a fault without resuming it. The subsequent fault reply remains the
 /// authority that clears `pending_fault` and makes the thread runnable.
 pub(crate) unsafe fn rewind_fault_ip(tcb: u64, rip: u64) -> bool {

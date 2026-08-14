@@ -20665,6 +20665,10 @@ static DBGK_MODULE_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///          production `wait_park` steals its reply capability — does not progress, and a
 ///          queue-side post WAKES it through `wait_wake_dispatcher_set`; its marker and its next
 ///          syscall are the proof it really resumed
+///   0x0200 debugger hardware-breakpoint edit: the debugger uses `NtSetContextThread` to program
+///          DR0/DR7 on the blocked target, `NtGetContextThread` reads the live TCB slot back, the
+///          continued target reports a real instruction-breakpoint `STATUS_SINGLE_STEP`, and the
+///          debugger clears DR7 before resuming into the software-breakpoint stage
 static DBGK_BLOCK_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// **Dbgk REMOTE BREAK-IN self-test result** (post-loop) — `DbgUiIssueRemoteBreakin` end to end
 /// against a throwaway debuggee whose address space, PEB page and marker page are all real:
@@ -26220,6 +26224,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_dbgk_context_edit_single_steps_target",
                         dbgk_blk & 0x0010 == 0x0010,
+                        &mut passed,
+                    );
+                    // The debugger can also program real hardware breakpoint slots through the
+                    // context syscalls: DR0/DR7 are applied to the live TCB, read back through the
+                    // same path, and a real instruction-breakpoint #DB is reported through Dbgk.
+                    check(
+                        b"exec_dbgk_context_edit_hw_breakpoints_target",
+                        dbgk_blk & 0x0200 == 0x0200,
                         &mut passed,
                     );
                     // DBG_TERMINATE_THREAD is ENFORCED (the reporting ETHREAD really dies and is

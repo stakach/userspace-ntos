@@ -202,8 +202,11 @@ pub(crate) fn xview_reader_code(view: u64) -> alloc::vec::Vec<u8> {
 //                  later `page_map` there succeeds: that is how DBG_CONTINUE's instruction RETRY
 //                  is proven to make progress)
 pub(crate) const DBGK_CLIENT_VIEW: u64 = 0x0000_0000_4000_0000;
+pub(crate) const DBGK_CLIENT_CODE: u64 = DBGK_CLIENT_VIEW + 0x10000;
 /// The `#PF` target: mapped by the test only after the reporter has been proven blocked.
 pub(crate) const DBGK_CLIENT_FIXUP: u64 = DBGK_CLIENT_VIEW + 0x2000;
+const DBGK_TARGET_STORE_LEN: u64 = 17;
+pub(crate) const DBGK_TARGET_INT3_OFFSET: u64 = DBGK_TARGET_STORE_LEN * 3;
 
 /// `mov qword [imm64], imm32` — writes `value` to the absolute address `at` (via RCX).
 fn emit_store(t: &mut alloc::vec::Vec<u8>, at: u64, value: u32) {
@@ -342,7 +345,7 @@ pub(crate) unsafe fn dbgk_client_spawn(
     n: &mut usize,
 ) -> (u64, u64, u64) {
     const VIEW: u64 = DBGK_CLIENT_VIEW;
-    const CODE: u64 = VIEW + 0x10000;
+    const CODE: u64 = DBGK_CLIENT_CODE;
     const STK: u64 = VIEW + 0x20000;
     const IPC: u64 = VIEW + 0x30000;
     let mut push = |s: u64| {

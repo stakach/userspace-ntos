@@ -35,6 +35,7 @@ const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 const STATUS_CANCELLED: u32 = 0xC000_0120;
+const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const AMD64_CONTEXT_SEG_CS_OFFSET: usize = 0x38;
 const AMD64_CONTEXT_SEG_DS_OFFSET: usize = 0x3A;
@@ -331,6 +332,67 @@ fn write_le_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
 #[inline]
 fn write_le_u64_at(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn debug_register_error_status(error: nt_thread_start::Amd64DebugRegisterError) -> u32 {
+    match error {
+        nt_thread_start::Amd64DebugRegisterError::UnsupportedControlBits
+        | nt_thread_start::Amd64DebugRegisterError::UnsupportedIoBreakpoint => {
+            STATUS_NOT_SUPPORTED
+        }
+        nt_thread_start::Amd64DebugRegisterError::InvalidBreakpointType
+        | nt_thread_start::Amd64DebugRegisterError::InvalidBreakpointAccess
+        | nt_thread_start::Amd64DebugRegisterError::InvalidDataBreakpointSize
+        | nt_thread_start::Amd64DebugRegisterError::UnalignedDataBreakpoint => {
+            STATUS_INVALID_PARAMETER
+        }
+    }
+}
+
+unsafe fn read_amd64_debug_register_state(
+    tcb: u64,
+) -> Result<nt_thread_start::Amd64DebugRegisterState, u32> {
+    let mut slots = [None; nt_thread_start::AMD64_HW_BREAKPOINT_SLOTS];
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let Some(breakpoint) = crate::win32k_glue::tcb_get_breakpoint(tcb, index as u64) else {
+            return Err(STATUS_UNSUCCESSFUL);
+        };
+        if breakpoint.enabled {
+            *slot = Some(nt_thread_start::Amd64DebugBreakpoint {
+                address: breakpoint.vaddr,
+                breakpoint_type: breakpoint.breakpoint_type,
+                size: breakpoint.size,
+                access: breakpoint.access,
+            });
+        }
+    }
+    nt_thread_start::synthesize_amd64_debug_registers(&slots)
+        .map_err(|_| STATUS_UNSUCCESSFUL)
+}
+
+unsafe fn apply_amd64_debug_register_plan(
+    tcb: u64,
+    plan: &[Option<nt_thread_start::Amd64DebugBreakpoint>;
+        nt_thread_start::AMD64_HW_BREAKPOINT_SLOTS],
+) -> u32 {
+    for (index, breakpoint) in plan.iter().copied().enumerate() {
+        let status = if let Some(breakpoint) = breakpoint {
+            crate::win32k_glue::tcb_set_breakpoint(
+                tcb,
+                index as u64,
+                breakpoint.address,
+                breakpoint.breakpoint_type,
+                breakpoint.size,
+                breakpoint.access,
+            )
+        } else {
+            crate::win32k_glue::tcb_unset_breakpoint(tcb, index as u64)
+        };
+        if status != 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7068,16 +7130,16 @@ impl ExecNtHandler {
             );
         }
         if context_flags & CONTEXT_DEBUG_REGISTERS != 0 {
-            for offset in [
-                AMD64_CONTEXT_DR0_OFFSET,
-                AMD64_CONTEXT_DR1_OFFSET,
-                AMD64_CONTEXT_DR2_OFFSET,
-                AMD64_CONTEXT_DR3_OFFSET,
-                AMD64_CONTEXT_DR6_OFFSET,
-                AMD64_CONTEXT_DR7_OFFSET,
-            ] {
-                write_le_u64_at(&mut context, offset, 0);
-            }
+            let debug = match read_amd64_debug_register_state(tcb) {
+                Ok(debug) => debug,
+                Err(status) => return status,
+            };
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR0_OFFSET, debug.dr[0]);
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR1_OFFSET, debug.dr[1]);
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR2_OFFSET, debug.dr[2]);
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR3_OFFSET, debug.dr[3]);
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR6_OFFSET, debug.dr6);
+            write_le_u64_at(&mut context, AMD64_CONTEXT_DR7_OFFSET, debug.dr7);
         }
         if !self.xas_try_write_buf(context_ptr, &context) {
             return STATUS_ACCESS_VIOLATION;
@@ -7107,20 +7169,23 @@ impl ExecNtHandler {
         if context_flags & CONTEXT_AMD64 == 0 {
             return STATUS_INVALID_PARAMETER;
         }
-        if context_flags & CONTEXT_DEBUG_REGISTERS != 0
-            && [
-                AMD64_CONTEXT_DR0_OFFSET,
-                AMD64_CONTEXT_DR1_OFFSET,
-                AMD64_CONTEXT_DR2_OFFSET,
-                AMD64_CONTEXT_DR3_OFFSET,
-                AMD64_CONTEXT_DR6_OFFSET,
-                AMD64_CONTEXT_DR7_OFFSET,
-            ]
-            .iter()
-            .any(|&offset| read_le_u64_at(&context, offset) != 0)
-        {
-            return STATUS_NOT_SUPPORTED;
-        }
+        let debug_register_plan = if context_flags & CONTEXT_DEBUG_REGISTERS != 0 {
+            match nt_thread_start::plan_amd64_debug_registers(
+                [
+                    read_le_u64_at(&context, AMD64_CONTEXT_DR0_OFFSET),
+                    read_le_u64_at(&context, AMD64_CONTEXT_DR1_OFFSET),
+                    read_le_u64_at(&context, AMD64_CONTEXT_DR2_OFFSET),
+                    read_le_u64_at(&context, AMD64_CONTEXT_DR3_OFFSET),
+                ],
+                read_le_u64_at(&context, AMD64_CONTEXT_DR7_OFFSET),
+                HIGHEST_USER_ADDRESS,
+            ) {
+                Ok(plan) => Some(plan),
+                Err(error) => return debug_register_error_status(error),
+            }
+        } else {
+            None
+        };
 
         let mut registers = [0u64; 20];
         crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
@@ -7176,6 +7241,12 @@ impl ExecNtHandler {
 
         if crate::win32k_glue::tcb_write_regs20(tcb, &registers, false) != 0 {
             return STATUS_UNSUCCESSFUL;
+        }
+        if let Some(plan) = debug_register_plan {
+            let status = apply_amd64_debug_register_plan(tcb, &plan);
+            if status != 0 {
+                return status;
+            }
         }
         if reporter_ip.is_some() || reporter_sp.is_some() || reporter_flags.is_some() {
             if let Some(process_id) = self.pm.thread(tid).map(|thread| thread.process_id) {

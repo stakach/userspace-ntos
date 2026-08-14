@@ -5168,5 +5168,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `exec_dbgk_context_edit_single_steps_target`, `exec_dbgk_terminate_status_enforced`,
   `exec_dbgk_remote_breakin_reports_breakpoint`, `exec_explorer_register_window_messages_captured`,
   and `exec_explorer_shell_chrome_painted` all pass; final summary is `295/295`. Remaining
-  debugger-control gap: non-zero DR0-DR7 programming still returns `STATUS_NOT_SUPPORTED` until the
-  seL4 hardware-breakpoint backend is wired.
+  debugger-control gap at this point was non-zero DR0-DR7 programming; the next slice closes that
+  through the seL4 hardware-breakpoint backend.
+
+  Dbgk hardware-breakpoint context cleanup (2026-08-14): `NtGetContextThread` and
+  `NtSetContextThread` now wire the AMD64 `CONTEXT_DEBUG_REGISTERS` surface to live seL4 TCB
+  hardware-breakpoint slots instead of rejecting all non-zero `DR0`-`DR7` input. The shared
+  `nt-thread-start` planner translates NT `DR0`-`DR3`/`DR7` tuples into bounded slot operations,
+  accepts local or global enables, ignores disabled stale slot fields, clamps enabled user-mode
+  breakpoints above `MmHighestUserAddress`, and returns explicit unsupported/invalid status for
+  control shapes that the hardware backend cannot represent. The executive applies and clears those
+  slots through real TCB invocations, and `NtGetContextThread` synthesizes the NT-visible
+  `DR0`-`DR3`/`DR7` view from live slot state. The target-block selftest now arms `DR0` while the
+  debuggee is parked on its first exception, reads the live slot back through `NtGetContextThread`,
+  continues the target into a real instruction-breakpoint `#DB`, reports it through Dbgk as
+  `STATUS_SINGLE_STEP`, clears `DR7`, and then resumes into the existing software-breakpoint and
+  trap-flag proof path. Validation: `cargo fmt --all`, `cargo test -p nt-thread-start`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop run
+  `.tmp/run-desktop-hw-breakpoints-20260814.log`: `exec_dbgk_context_edit_single_steps_target`,
+  `exec_dbgk_context_edit_hw_breakpoints_target`, and `exec_explorer_shell_chrome_painted` all
+  pass; final summary is `296/296`. Remaining exactness gap: `DR6` is still synthesized as the
+  architecture's initial/status-only value, because exact raw `DR6` read/write needs a microkernel
+  debug-status extension rather than another executive-side shim.
