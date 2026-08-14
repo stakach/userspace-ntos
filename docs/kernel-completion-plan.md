@@ -1053,7 +1053,9 @@ before unrelated executive traffic monopolises the receive loop.
   publishes one boot-framebuffer-backed device, but its registry-selected driver/service metadata is
   now component-visible owned data rather than 32/128 byte static buffers. Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
-  static table.
+  static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
+  storage from the number of registry-selected candidates instead of truncating at an eight-entry
+  inline array.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -1238,8 +1240,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    allocation classified as the generic compatibility harness that calls real `DriverEntry`, and moved
    boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
    projection helper. Root-bus proof profiles now come from a host-tested growable `nt-pnp`
-   `RootBusResourceCatalog` rather than a one-entry executive array. Remaining display debt is
-   hosting real videoprt/miniport instead of the boot-framebuffer bridge.
+   `RootBusResourceCatalog` rather than a one-entry executive array. Boot/system driver launch plans
+   also no longer have an eight-service snapshot cap: the executive counts accepted registry
+   candidates under a reclaimable heap mark, reserves persistent plan storage, and then fills the
+   plan under a second reclaimable mark so Config Manager scratch state is still released. Remaining
+   launch-plan cleanup is the per-service devnode/ID/path inline capture bounds. Remaining display
+   debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge.
 2. A3/A4 for Win32 service starts is closed for the current frontier. SCM-owned service metadata now
    produces typed
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
@@ -3387,6 +3393,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   preserving the current root-DMA proof device. Validation: `cargo fmt --all`,
   `cargo test -p nt-pnp`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`.
+
+- B3 boot/system driver launch-plan entry cleanup (2026-08-15). The executive no longer snapshots
+  registry-selected boot/system driver launch candidates into an eight-entry inline plan. Both the
+  generated config-hive PnP launch plan and the live SYSTEM-hive driver plan now keep persistent
+  growable `Vec<InlineDriverLaunchSpec>` storage, built with a two-pass count/reserve/fill sequence
+  so Config Manager scratch allocation remains reclaimable and the fill path cannot reallocate under
+  the temporary heap mark. Plan-entry allocation failure now leaves a visible
+  `[driver-launch] ... reserve failed` trace rather than silently truncating the plan. Validation:
+  `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Remaining B3 launch-plan cleanup is the per-service devnode count and
+  hardware/compatible-ID/path capture bounds.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`

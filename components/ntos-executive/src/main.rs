@@ -15414,7 +15414,6 @@ pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
 
-const BOOT_DRIVER_PLAN_MAX: usize = 8;
 const BOOT_DRIVER_DEVNODE_MAX: usize = 2;
 const BOOT_DRIVER_ID_MAX: usize = 4;
 const BOOT_DRIVER_SERVICE_NAME_MAX: usize = 64;
@@ -15594,36 +15593,61 @@ fn inline_launch_spec_has_pci_devnode(spec: &InlineDriverLaunchSpec) -> bool {
     false
 }
 
-#[derive(Clone, Copy)]
 struct InlineDriverLaunchPlan {
-    specs: [InlineDriverLaunchSpec; BOOT_DRIVER_PLAN_MAX],
-    len: usize,
+    specs: alloc::vec::Vec<InlineDriverLaunchSpec>,
 }
 
 impl InlineDriverLaunchPlan {
-    const fn empty() -> Self {
+    fn new() -> Self {
         Self {
-            specs: [InlineDriverLaunchSpec::empty(); BOOT_DRIVER_PLAN_MAX],
-            len: 0,
+            specs: alloc::vec::Vec::new(),
         }
     }
 
+    fn clear(&mut self) {
+        self.specs.clear();
+    }
+
+    fn reserve_len(&mut self, len: usize) -> bool {
+        if self.specs.capacity() >= len {
+            return true;
+        }
+        self.specs
+            .try_reserve_exact(len - self.specs.capacity())
+            .is_ok()
+    }
+
     fn push(&mut self, spec: InlineDriverLaunchSpec) -> bool {
-        if self.len >= BOOT_DRIVER_PLAN_MAX {
+        if self.specs.len() >= self.specs.capacity() {
             return false;
         }
-        self.specs[self.len] = spec;
-        self.len += 1;
+        self.specs.push(spec);
         true
     }
 
     fn as_slice(&self) -> &[InlineDriverLaunchSpec] {
-        &self.specs[..self.len]
+        self.specs.as_slice()
     }
 }
 
-static mut SYSTEM_BOOT_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLaunchPlan::empty();
-static mut CONFIG_BOOT_PNP_DRIVER_PLAN: InlineDriverLaunchPlan = InlineDriverLaunchPlan::empty();
+static mut SYSTEM_BOOT_DRIVER_PLAN: Option<InlineDriverLaunchPlan> = None;
+static mut CONFIG_BOOT_PNP_DRIVER_PLAN: Option<InlineDriverLaunchPlan> = None;
+
+unsafe fn system_boot_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
+    let slot = &mut *core::ptr::addr_of_mut!(SYSTEM_BOOT_DRIVER_PLAN);
+    if slot.is_none() {
+        *slot = Some(InlineDriverLaunchPlan::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn config_boot_pnp_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
+    let slot = &mut *core::ptr::addr_of_mut!(CONFIG_BOOT_PNP_DRIVER_PLAN);
+    if slot.is_none() {
+        *slot = Some(InlineDriverLaunchPlan::new());
+    }
+    slot.as_mut().unwrap()
+}
 
 const WIN32_SERVICE_PROCESS_KIND_NONE: u8 = 0;
 const WIN32_SERVICE_PROCESS_KIND_OWN: u8 = 1;
@@ -16478,16 +16502,43 @@ fn config_hive_boot_system_driver_launch_spec(
     })
 }
 
-fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+fn count_config_hive_boot_system_pnp_driver_launch_specs() -> usize {
     let heap_mark = allocator::mark();
-    let plan = unsafe { &mut *core::ptr::addr_of_mut!(CONFIG_BOOT_PNP_DRIVER_PLAN) };
-    *plan = InlineDriverLaunchPlan::empty();
+    let mut count = 0usize;
+    if let Some(cm) = config_hive_config_manager() {
+        for binding in cm.boot_system_pnp_driver_bindings() {
+            if let Some(spec) =
+                inline_driver_launch_spec_from_pnp_binding(&cm, binding, SERVICE_SYSTEM_START)
+            {
+                let _ = spec;
+                count += 1;
+            }
+        }
+    }
+    unsafe { allocator::reset_to(heap_mark) };
+    count
+}
+
+fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+    let required = count_config_hive_boot_system_pnp_driver_launch_specs();
+    let plan = unsafe { config_boot_pnp_driver_plan_mut() };
+    plan.clear();
+    if !plan.reserve_len(required) {
+        print_str(b"[driver-launch] config PnP launch plan reserve failed count=");
+        print_u64(required as u64);
+        print_str(b"\n");
+        return plan;
+    }
+    let heap_mark = allocator::mark();
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
             if let Some(spec) =
                 inline_driver_launch_spec_from_pnp_binding(&cm, binding, SERVICE_SYSTEM_START)
             {
                 if !plan.push(spec) {
+                    print_str(b"[driver-launch] config PnP launch plan capacity raced count=");
+                    print_u64(required as u64);
+                    print_str(b"\n");
                     break;
                 }
             }
@@ -16607,24 +16658,50 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
     report
 }
 
-fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+fn count_system_hive_boot_driver_launch_specs() -> usize {
     let heap_mark = allocator::mark();
-    let plan = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_BOOT_DRIVER_PLAN) };
-    *plan = InlineDriverLaunchPlan::empty();
-    {
-        if let Some(cm) = system_hive_config_manager() {
-            for service in cm.boot_system_driver_candidates() {
-                if !current_driver_host_can_boot_launch(&cm, &service) {
-                    continue;
-                }
-                if let Some(spec) = inline_driver_launch_spec_from_service_metadata(
-                    &cm,
-                    &service,
-                    SERVICE_SYSTEM_START,
-                ) {
-                    if !plan.push(spec) {
-                        break;
-                    }
+    let mut count = 0usize;
+    if let Some(cm) = system_hive_config_manager() {
+        for service in cm.boot_system_driver_candidates() {
+            if !current_driver_host_can_boot_launch(&cm, &service) {
+                continue;
+            }
+            if let Some(spec) =
+                inline_driver_launch_spec_from_service_metadata(&cm, &service, SERVICE_SYSTEM_START)
+            {
+                let _ = spec;
+                count += 1;
+            }
+        }
+    }
+    unsafe { allocator::reset_to(heap_mark) };
+    count
+}
+
+fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+    let required = count_system_hive_boot_driver_launch_specs();
+    let plan = unsafe { system_boot_driver_plan_mut() };
+    plan.clear();
+    if !plan.reserve_len(required) {
+        print_str(b"[driver-launch] system boot driver launch plan reserve failed count=");
+        print_u64(required as u64);
+        print_str(b"\n");
+        return plan;
+    }
+    let heap_mark = allocator::mark();
+    if let Some(cm) = system_hive_config_manager() {
+        for service in cm.boot_system_driver_candidates() {
+            if !current_driver_host_can_boot_launch(&cm, &service) {
+                continue;
+            }
+            if let Some(spec) =
+                inline_driver_launch_spec_from_service_metadata(&cm, &service, SERVICE_SYSTEM_START)
+            {
+                if !plan.push(spec) {
+                    print_str(b"[driver-launch] system boot driver launch plan capacity raced count=");
+                    print_u64(required as u64);
+                    print_str(b"\n");
+                    break;
                 }
             }
         }
