@@ -3362,6 +3362,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   win32k import code. Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
+- A4/B3 win32k token pseudo-handle cleanup (2026-08-15). The hosted win32k token query path no
+  longer stores `ZwOpenProcessToken` pseudo-handles in a fixed 16-slot table. Pseudo-handle slots now
+  live in component-visible win32k pool storage, grow on demand, reuse closed holes, and reject
+  misaligned pseudo-handle values instead of rounding them down to a slot. Validation: `cargo fmt
+  --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported

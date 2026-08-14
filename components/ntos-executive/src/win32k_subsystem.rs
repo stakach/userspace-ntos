@@ -958,7 +958,7 @@ const TOKEN_USER_SID_OFF: u64 = 0x28;
 const TOKEN_INFORMATION_CLASS_USER: u64 = 1;
 const TOKEN_QUERY_ACCESS: u64 = 0x0008;
 const WIN32K_TOKEN_HANDLE_BASE: u64 = 0x0000_0000_5E70_0000;
-const WIN32K_TOKEN_HANDLE_CAP: usize = 16;
+const WIN32K_TOKEN_HANDLE_INITIAL_CAP: u64 = 8;
 const SECURITY_DESCRIPTOR_REVISION_U64: u64 = 1;
 const SECURITY_DESCRIPTOR_ABSOLUTE_BYTES: usize = 0x28;
 const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 0x14;
@@ -1143,28 +1143,93 @@ unsafe fn primary_token_user_sid(
     Some(len)
 }
 
-unsafe fn token_handle_slot(handle: u64) -> Option<usize> {
-    let index = handle.checked_sub(WIN32K_TOKEN_HANDLE_BASE)? / 4;
-    (index < WIN32K_TOKEN_HANDLE_CAP as u64).then_some(index as usize)
+unsafe fn token_handle_slot_ptr(base: u64, index: u64) -> *mut u64 {
+    (base + index * core::mem::size_of::<u64>() as u64) as *mut u64
+}
+
+unsafe fn ensure_token_handle_capacity(required: u64) -> bool {
+    let cap = WIN32K_TOKEN_HANDLE_CAPACITY.load(Ordering::Relaxed);
+    if cap >= required {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        WIN32K_TOKEN_HANDLE_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let next = new_cap.saturating_mul(2);
+        if next <= new_cap {
+            return false;
+        }
+        new_cap = next;
+    }
+    let Some(bytes) = (core::mem::size_of::<u64>() as u64).checked_mul(new_cap) else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+    let old_base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Relaxed);
+    let len = WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed);
+    if old_base != 0 {
+        for index in 0..len {
+            let token = read_volatile(token_handle_slot_ptr(old_base, index));
+            write_volatile(token_handle_slot_ptr(new_base, index), token);
+        }
+    }
+    WIN32K_TOKEN_HANDLE_SLOTS_PTR.store(new_base, Ordering::Relaxed);
+    WIN32K_TOKEN_HANDLE_CAPACITY.store(new_cap, Ordering::Relaxed);
+    true
+}
+
+unsafe fn token_handle_slot(handle: u64) -> Option<u64> {
+    let offset = handle.checked_sub(WIN32K_TOKEN_HANDLE_BASE)?;
+    if offset % 4 != 0 {
+        return None;
+    }
+    let index = offset / 4;
+    (index < WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed)).then_some(index)
 }
 
 unsafe fn register_token_handle(token: u64) -> u64 {
     if token_context_index(token).is_none() {
         return 0;
     }
-    for index in 0..WIN32K_TOKEN_HANDLE_CAP {
-        if WIN32K_TOKEN_HANDLE_TOKENS[index].load(Ordering::Relaxed) == 0 {
-            let handle = WIN32K_TOKEN_HANDLE_BASE + (index as u64) * 4;
-            WIN32K_TOKEN_HANDLE_TOKENS[index].store(token, Ordering::Relaxed);
-            return handle;
+    let len = WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed);
+    let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Relaxed);
+    if base != 0 {
+        for index in 0..len {
+            if read_volatile(token_handle_slot_ptr(base, index)) == 0 {
+                let handle = WIN32K_TOKEN_HANDLE_BASE + index * 4;
+                write_volatile(token_handle_slot_ptr(base, index), token);
+                return handle;
+            }
         }
     }
-    0
+    let Some(required) = len.checked_add(1) else {
+        return 0;
+    };
+    if !ensure_token_handle_capacity(required) {
+        return 0;
+    }
+    let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return 0;
+    }
+    write_volatile(token_handle_slot_ptr(base, len), token);
+    WIN32K_TOKEN_HANDLE_LEN.store(required, Ordering::Relaxed);
+    WIN32K_TOKEN_HANDLE_BASE + len * 4
 }
 
 unsafe fn token_for_handle(handle: u64) -> Option<u64> {
     let slot = token_handle_slot(handle)?;
-    let token = WIN32K_TOKEN_HANDLE_TOKENS[slot].load(Ordering::Relaxed);
+    let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    let token = read_volatile(token_handle_slot_ptr(base, slot));
     (token_context_index(token).is_some()).then_some(token)
 }
 
@@ -1172,7 +1237,17 @@ unsafe fn close_token_handle(handle: u64) -> bool {
     let Some(slot) = token_handle_slot(handle) else {
         return false;
     };
-    WIN32K_TOKEN_HANDLE_TOKENS[slot].swap(0, Ordering::Relaxed) != 0
+    let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return false;
+    }
+    let ptr = token_handle_slot_ptr(base, slot);
+    let token = read_volatile(ptr);
+    if token == 0 {
+        return false;
+    }
+    write_volatile(ptr, 0);
+    true
 }
 
 fn round_up4(value: usize) -> Option<usize> {
@@ -4843,8 +4918,9 @@ static WIN32K_PROCESS_CTX_TOKEN_AUTH: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
 static WIN32K_PROCESS_CTX_PRIMARY_TOKEN: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_TOKEN_HANDLE_TOKENS: [AtomicU64; WIN32K_TOKEN_HANDLE_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_TOKEN_HANDLE_CAP];
+static WIN32K_TOKEN_HANDLE_SLOTS_PTR: AtomicU64 = AtomicU64::new(0);
+static WIN32K_TOKEN_HANDLE_LEN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_TOKEN_HANDLE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static WIN32K_THREAD_CTX_TIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
     [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
 static WIN32K_THREAD_CTX_PIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
