@@ -31,21 +31,25 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Current serialized frontier (2026-08-13): the real desktop/icon path is past shell launch and paint
-scaffolding again on the Rust ntdll. The executive no longer contains live `[w32-slip]` or
-`[cb-inject]` post-quiesce callback probes; any run that still emits those tags is using a stale
-binary or stale branch state. The callback/transport gates now assert live invariants from the real
-workload.
+Current serialized frontier (2026-08-14): the real desktop/icon path is past shell launch and paint
+scaffolding again on the Rust ntdll, with Dbgk debugger-control proofing now covering live context
+edits, trap-flag single-step, and seL4-backed hardware breakpoints. The executive no longer contains
+live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that still emits those tags
+is using a stale binary or stale branch state. The callback/transport gates now assert live
+invariants from the real workload.
 
-Latest accepted desktop proof (2026-08-13):
-`.tmp/run-desktop-profile-proof-refresh-20260813.log` and serial mirror
-`.tmp/run-desktop-20260813-160158.log` reach the harness sentinel with `294/294`
-executive-to-isolated-service checks passing on a visible desktop run. This closes the D2
-registry/profile cleanup proof: `exec_default_user_profile_staged` now observes the live published
-`Default User\ntuser.dat` image (`dirs=45`, `files=32`, `bytes=135989`, `Default User` entries=18,
-`ntuser.dat=130682B`), `NtLoadKey` and `NtFlushKey` stay green, `exec_vm_pool_headroom` stays green,
-and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background
-with at least 32 distinct non-background colors. The restored writable-snapshot proof remains
+Latest accepted desktop proof (2026-08-14):
+`.tmp/run-desktop-hw-breakpoints-20260814.log` and serial mirror
+`.tmp/run-desktop-20260814-125406.log` reach the harness sentinel with `296/296`
+executive-to-isolated-service checks passing on a visible desktop run. This retains the D2/D3
+registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is staged
+and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints mutable
+hives, `exec_vm_pool_headroom` stays green, and `exec_explorer_shell_chrome_painted` reports the full
+1024x768 framebuffer as non-background with at least 32 distinct non-background colors. It also
+closes the Dbgk hardware-breakpoint context proof: `NtSetContextThread` programs `DR0`/`DR7` into
+the live TCB breakpoint slot, `NtGetContextThread` reads the slot back, the target reports a real
+instruction-breakpoint `STATUS_SINGLE_STEP`, and the debugger clears `DR7` before resuming. The
+restored writable-snapshot proof remains
 `rust-micro/.tmp/run-headless-provision-new-image-20260813-scheduled.log` plus
 `rust-micro/.tmp/run-headless-restored-same-image-20260813-scheduled.log`; both pass `294/294` and
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
