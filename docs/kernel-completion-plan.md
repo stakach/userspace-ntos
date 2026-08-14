@@ -1051,8 +1051,13 @@ before unrelated executive traffic monopolises the receive loop.
   decommit, release, protect, query, and unmap semantics.
 - `[~]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
   and dirty writeback.
-- `[~]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
-  `MEM_TOP_DOWN`, guard/no-access faults, and view teardown.
+- `[x]` C4: Add regression gates for overlapping VADs, partial decommit, protection changes,
+  `MEM_TOP_DOWN`, guard/no-access faults, and view teardown. The current C4 matrix is closed:
+  host-side tests and live gates now cover private partial release/decommit, protected-page override
+  cleanup, private/mapped protect rollback, mapped/image writecopy COW, execute/guard/no-access
+  fault verdicts, committed-view range teardown, top-down placement, cross-authority overlap
+  rejection, and bounded auto-placement retry around fixed authorities. Reopen C4 only for a newly
+  observed VM semantic gap.
 
 ### D. Registry And Filesystem Durability
 
@@ -3167,6 +3172,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Review adjustment: C4 overlap/placement is now guarded host-side and live; resume A4 SCM
   pipe/listener cleanup, B3 real video miniport hosting, or D1/D2 mutable registry/filesystem
   authority.
+
+- C4 current regression matrix closed (2026-08-15). Reviewing the accumulated C4 slices shows the
+  named matrix is now covered by committed host tests and live gates: overlapping VAD/fixed-authority
+  rejection, auto-placement retry, partial `MEM_RELEASE`, partial `MEM_DECOMMIT`, stale protection
+  override cleanup, private and mapped protect rollback, mapped and image writecopy COW isolation,
+  guard/no-access/execute fault verdicts, committed-view range teardown, and `MEM_TOP_DOWN`
+  placement/query behavior. The workstream status is now `[x]` for the current frontier. Future VM
+  discoveries should open a new specific C4 sub-slice instead of keeping the whole matrix marked
+  in-progress.
 
 - D1 `NtSaveKey` root-hive save slice. The owned ntdll ABI already exported `NtSaveKey`, but the
   typed native dispatcher and executive table did not model SSN 215. `NativeService::NtSaveKey` now
