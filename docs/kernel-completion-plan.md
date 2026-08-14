@@ -31,25 +31,31 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Current serialized frontier (2026-08-14): the real desktop/icon path is past shell launch and paint
+Current serialized frontier (2026-08-15): the real desktop/icon path is past shell launch and paint
 scaffolding again on the Rust ntdll, with Dbgk debugger-control proofing now covering live context
 edits, trap-flag single-step, and seL4-backed hardware breakpoints. The executive no longer contains
 live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that still emits those tags
 is using a stale binary or stale branch state. The callback/transport gates now assert live
 invariants from the real workload.
 
-Latest accepted desktop proof (2026-08-14):
-`.tmp/run-desktop-hw-breakpoints-20260814.log` and serial mirror
-`.tmp/run-desktop-20260814-125406.log` reach the harness sentinel with `296/296`
-executive-to-isolated-service checks passing on a visible desktop run. This retains the D2/D3
-registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is staged
-and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints mutable
-hives, `exec_vm_pool_headroom` stays green, and `exec_explorer_shell_chrome_painted` reports the full
-1024x768 framebuffer as non-background with at least 32 distinct non-background colors. It also
-closes the Dbgk hardware-breakpoint context proof: `NtSetContextThread` programs `DR0`/`DR7` into
-the live TCB breakpoint slot, `NtGetContextThread` reads the slot back, the target reports a real
-instruction-breakpoint `STATUS_SINGLE_STEP`, and the debugger clears `DR7` before resuming. The
-restored writable-snapshot proof remains
+Latest accepted desktop proof (2026-08-15):
+`.tmp/run-headless-current-20260815-082827.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after rebuilding ntdll, the executive, rust-micro, and
+the disk image. This retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live
+`Default User\ntuser.dat` image is staged and copied into the profile, `NtLoadKey` mounts the
+profile hive, `NtFlushKey` checkpoints mutable hives, provider-backed hive boot failures stay
+non-synthetic, dynamic regf profile hives replay their writable `.LOG` sidecars, and
+`exec_vm_pool_headroom` stays green. The shell path is fully live: `WlxActivateUserShell` reads the
+real `Userinit` registry value, `userinit.exe` and `explorer.exe` spawn through ordinary
+section/process creation, Explorer opens shell COM classes, redirects real api0 callbacks, installs
+client WndProcs, flushes GDI user batches, and `exec_explorer_shell_chrome_painted` reports the full
+1024x768 framebuffer as non-background with at least 32 distinct non-background colors. The prior
+visible proof remains `.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
+`.tmp/run-desktop-20260814-125406.log`, which also closes the Dbgk hardware-breakpoint context
+proof: `NtSetContextThread` programs `DR0`/`DR7` into the live TCB breakpoint slot,
+`NtGetContextThread` reads the slot back, the target reports a real instruction-breakpoint
+`STATUS_SINGLE_STEP`, and the debugger clears `DR7` before resuming. The restored writable-snapshot
+proof remains
 `rust-micro/.tmp/run-headless-provision-new-image-20260813-scheduled.log` plus
 `rust-micro/.tmp/run-headless-restored-same-image-20260813-scheduled.log`; both pass `294/294` and
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
@@ -1150,7 +1156,11 @@ before unrelated executive traffic monopolises the receive loop.
   provider-backed core-image boot behavior. Host coverage in `nt-hive-regf` proves regf import plus
   sidecar replay preserves imported values and applies the journal from sequence zero. Validation:
   `cargo fmt --all`, `cargo test -p nt-hive-regf`, and executive `cargo check` for
-  `components/ntos-executive` on `x86_64-unknown-none`.
+  `components/ntos-executive` on `x86_64-unknown-none`. Serialized runtime validation
+  `.tmp/run-headless-current-20260815-082827.log` reaches the desktop sentinel with `296/296` checks:
+  `exec_ntloadkey_serviced`, `exec_profile_ntuser_dat_present`, `exec_winlogon_user_shell_activated`,
+  `exec_userinit_process_spawned`, and `exec_explorer_shell_chrome_painted` all pass while mutable
+  hive flush/checkpoint gates remain green.
 
 ## Immediate Iteration
 
