@@ -39,17 +39,17 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-video-metadata-pool-20260815-093243.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3 display registration cleanup. This retains the
-D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is
-staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints
-mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf profile hives
-replay their writable `.LOG` sidecars, and `exec_vm_pool_headroom` stays green. The shell path is
-fully live: `WlxActivateUserShell` reads the real `Userinit` registry value, `userinit.exe` and
-`explorer.exe` spawn through ordinary section/process creation, Explorer opens shell COM classes,
-redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches, and
-`exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with at
-least 32 distinct non-background colors. The preceding headless proof remains
+`.tmp/run-desktop-pnp-grow-cleanups-20260815-094938.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3 display/PnP growable-state cleanup. This
+retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
+image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
+checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
+profile hives replay their writable `.LOG` sidecars, and `exec_vm_pool_headroom` stays green. The
+shell path is fully live: `WlxActivateUserShell` reads the real `Userinit` registry value,
+`userinit.exe` and `explorer.exe` spawn through ordinary section/process creation, Explorer opens
+shell COM classes, redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches,
+and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with
+at least 32 distinct non-background colors. The preceding headless proof remains
 `.tmp/run-headless-current-20260815-082827.log`, and the prior visible Dbgk proof remains
 `.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
 `.tmp/run-desktop-20260814-125406.log`, which closes the Dbgk hardware-breakpoint context proof:
@@ -3413,6 +3413,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   keyed by CM-backed devnode instance ID, `SET` replaces the overlay, `CLEAR` masks it, and all-zero
   state removes the record. Validation: `cargo fmt --all` and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
+- B3 combined desktop validation after growable PnP cleanup (2026-08-15). Serialized
+  `./run.sh --desktop` proof `.tmp/run-desktop-pnp-grow-cleanups-20260815-094938.log` reaches the
+  sentinel with `296/296` checks, no launch-plan reserve/capacity failures, no PnP status growth
+  failures, `userinit.exe` and `explorer.exe` shell gates green, `exec_explorer_shell_chrome_painted`
+  green, and the final framebuffer fully non-background.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
