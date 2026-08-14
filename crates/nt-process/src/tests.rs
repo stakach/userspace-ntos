@@ -2953,6 +2953,24 @@ fn dbgk_trap_vectors_map_to_the_ntstatus_kidispatchexception_reports() {
         d::exception_code_for_trap(17),
         d::STATUS_DATATYPE_MISALIGNMENT
     );
+    assert_eq!(
+        d::exception_code_for_debug_exception_reason(d::SEL4_DEBUG_REASON_SOFTWARE_BREAK_REQUEST),
+        d::STATUS_BREAKPOINT
+    );
+    for reason in [
+        d::SEL4_DEBUG_REASON_DATA_BREAKPOINT,
+        d::SEL4_DEBUG_REASON_INSTRUCTION_BREAKPOINT,
+        d::SEL4_DEBUG_REASON_SINGLE_STEP,
+    ] {
+        assert_eq!(
+            d::exception_code_for_debug_exception_reason(reason),
+            d::STATUS_SINGLE_STEP
+        );
+    }
+    assert_eq!(
+        d::exception_code_for_debug_exception_reason(0xff),
+        d::STATUS_BREAKPOINT
+    );
     // Unclassified vectors report the generic user-fault code, never panic.
     assert_eq!(d::exception_code_for_trap(0xFF), d::STATUS_ACCESS_VIOLATION);
     // The record builders clamp at EXCEPTION_MAXIMUM_PARAMETERS.

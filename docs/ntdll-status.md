@@ -312,9 +312,13 @@ Covered by focused host tests for both ordering cases.
    > than forwarding to `NtGetCurrentProcessorNumber` (not in our table, not serviced), and why
    > `NtContinue`/`NtRaiseException` have no stubs.
 2. **Dbgk deferred event sources / fidelity gaps** — each real, none blocking:
-   * **`#DB` single-step.** The mapping exists and is host-tested (trap 1 → `STATUS_SINGLE_STEP` →
-     `DbgSingleStepStateChange`) but **nothing sets `EFLAGS.TF`** anywhere in the tree, so a `#DB` is
-     never generated. Needs the continue path to honour a debugger-set TF + vector-1 classification.
+   * **Debugger-driven `#DB` single-step.** The Dbgk mapping exists and is host-tested (trap 1 →
+     `STATUS_SINGLE_STEP` → `DbgSingleStepStateChange`), and the live seL4 `DebugException`
+     boundary now classifies `ExceptionReason` so `int3` remains `STATUS_BREAKPOINT` while
+     single-step / hardware breakpoint `#DB` reports `STATUS_SINGLE_STEP`. The remaining missing
+     mechanism is the debugger API surface that arms TF dynamically: add `NtGetContextThread` /
+     `NtSetContextThread` to the native service table and have `NtDebugContinue` resume a blocked
+     reporter with the updated context.
    * **Executive-internal fault walls never forward** (`fault-cap`, `win32k-spin`,
      `unhandled-syscall`, `image-map-resource`, `wl-stack-growth`, `other-fault`) — they are executive
      walls, not user exceptions, so they neither forward nor block. Which (if any) should become user

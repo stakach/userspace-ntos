@@ -5344,12 +5344,15 @@ pub(crate) unsafe fn service_sec_image(
             // Unhandled CPU exception (label 3) at a non-skippable site — a real crash. Park+log.
             park_and_log!(pi, b"cpu-exception(3)", fip, fip);
         }
-        // DebugException (label 4 = int3 / #BP). OUR ntdll's `RtlRaiseException` / `RtlRaiseStatus`
-        // seams issue int3. Decode WHAT exception the caller is raising: recover winlogon's full GPRs
-        // (RCX = PEXCEPTION_RECORD arg, RSP), read the EXCEPTION_RECORD from its demand-faulted memory,
-        // and walk the stack for the raise site. m1 = fault_ip for a DebugException fault.
+        // DebugException (label 4 = seL4's #DB/#BP bucket). The microkernel payload is
+        // m0=FaultIP, m1=ExceptionReason, m2=TriggerAddress, m3=BreakpointNumber. OUR ntdll's
+        // `RtlRaiseException` / `RtlRaiseStatus` seams issue int3, so software-break requests also
+        // decode WHAT exception the caller is raising: recover winlogon's full GPRs (RCX =
+        // PEXCEPTION_RECORD arg, RSP), read the EXCEPTION_RECORD from its demand-faulted memory, and
+        // walk the stack for the raise site.
         if (mi >> 12) == 4 {
-            let bp_ip = m1;
+            let debug_ip = m0;
+            let debug_reason = m1;
             let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
             if tcb != 0 && ntdll.is_some() {
                 let mut regs = [0u64; 20];
@@ -5489,23 +5492,38 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 print_str(b"\n");
             }
-            // DbgkForwardException: an int3 is THE event a debugger exists for — it reports as
-            // `DbgBreakpointStateChange` (`DbgUiRemoteBreakin`'s break-in lands here). No-op when
+            let exception_code =
+                nt_process::dbgk::exception_code_for_debug_exception_reason(debug_reason);
+            let dbg_trace = DBGK_DEBUG_EXCEPTION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+            if dbg_trace < 16 {
+                print_str(b"[dbgk-debug-exception] pi=");
+                print_u64(pi as u64);
+                print_str(b" ip=0x");
+                print_hex_u64(debug_ip);
+                print_str(b" reason=");
+                print_u64(debug_reason);
+                print_str(b" code=0x");
+                print_hex(exception_code);
+                print_str(b"\n");
+            }
+            // DbgkForwardException: software int3 reports as `DbgBreakpointStateChange`, while #DB
+            // single-step and hardware breakpoints report as `DbgSingleStepStateChange`. No-op when
             // nothing debugs this process.
             if dbgk_forward_exception!(
                 pi,
-                nt_process::dbgk::ExceptionRecord::new(nt_process::dbgk::STATUS_BREAKPOINT, bp_ip)
+                nt_process::dbgk::ExceptionRecord::new(exception_code, debug_ip)
             ) && dbgk_block_and_park!(
                 pi,
                 nt_process::dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
-                bp_ip,
+                debug_ip,
                 m2,
                 m3
             ) {
                 continue;
             }
-            // Unhandled int3/#BP (a RtlRaiseException the loader/process can't recover) — a crash. Park+log.
-            park_and_log!(pi, b"debug-exception(4)", bp_ip, bp_ip);
+            // Unhandled #DB/#BP (a RtlRaiseException the loader/process can't recover, or a
+            // debugger-declined single-step) — a crash. Park+log.
+            park_and_log!(pi, b"debug-exception(4)", debug_ip, debug_ip);
         }
         if (mi >> 12) == 6 {
             let addr = m1;

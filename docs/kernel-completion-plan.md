@@ -5112,3 +5112,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   checked after `NtDebugContinue` removes an event and after process-handle close, including the
   executive's typed handle-release path, so both possible orderings converge without dropping the
   final exit notification.
+
+  Dbgk live debug-exception classification cleanup (2026-08-14): the hosted fault loop no longer
+  treats every seL4 `DebugException` as an `int3`. The live boundary now consumes the real
+  microkernel payload (`FaultIP`, `ExceptionReason`, trigger address, breakpoint number), reports
+  software break requests as `STATUS_BREAKPOINT`, and reports trap-flag / hardware `#DB` cases as
+  `STATUS_SINGLE_STEP`, which flows through the existing `DbgSingleStepStateChange` encoder. The
+  pure `nt-process` classifier is host-tested, and the executive no-std check covers the live
+  service-loop wiring. Remaining debugger single-step work is the real `NtGetContextThread` /
+  `NtSetContextThread` service-table and blocked-reporter context handoff, not the fault label
+  classifier.

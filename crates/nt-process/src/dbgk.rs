@@ -184,6 +184,15 @@ pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 /// `STATUS_SINGLE_STEP` — reports as `DbgSingleStepStateChange`.
 pub const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 
+/// seL4 `DebugException` reason: data/watchpoint breakpoint.
+pub const SEL4_DEBUG_REASON_DATA_BREAKPOINT: u64 = 0;
+/// seL4 `DebugException` reason: instruction breakpoint.
+pub const SEL4_DEBUG_REASON_INSTRUCTION_BREAKPOINT: u64 = 1;
+/// seL4 `DebugException` reason: trap-flag single-step.
+pub const SEL4_DEBUG_REASON_SINGLE_STEP: u64 = 2;
+/// seL4 `DebugException` reason: software `int3` breakpoint.
+pub const SEL4_DEBUG_REASON_SOFTWARE_BREAK_REQUEST: u64 = 3;
+
 // --- Trap-vector → NTSTATUS (the exception code a fault reports to a debugger) -------------------
 
 /// `STATUS_DATATYPE_MISALIGNMENT`.
@@ -228,6 +237,21 @@ pub fn exception_code_for_trap(vector: u32) -> u32 {
         17 => STATUS_DATATYPE_MISALIGNMENT, // #AC
         19 => STATUS_FLOAT_DIVIDE_BY_ZERO,  // #XM (the reported MXCSR status refines this)
         _ => STATUS_ACCESS_VIOLATION,
+    }
+}
+
+/// The NTSTATUS exception code a seL4 x86 `DebugException` reason reports to Dbgk.
+///
+/// seL4 folds `#DB` and `#BP` into the same fault label and carries the distinction in
+/// `ExceptionReason`. NT debuggers see `int3` as `STATUS_BREAKPOINT`; trap-flag and hardware
+/// breakpoint/watchpoint `#DB` delivery is reported as `STATUS_SINGLE_STEP`.
+pub fn exception_code_for_debug_exception_reason(reason: u64) -> u32 {
+    match reason {
+        SEL4_DEBUG_REASON_SOFTWARE_BREAK_REQUEST => STATUS_BREAKPOINT,
+        SEL4_DEBUG_REASON_DATA_BREAKPOINT
+        | SEL4_DEBUG_REASON_INSTRUCTION_BREAKPOINT
+        | SEL4_DEBUG_REASON_SINGLE_STEP => STATUS_SINGLE_STEP,
+        _ => STATUS_BREAKPOINT,
     }
 }
 

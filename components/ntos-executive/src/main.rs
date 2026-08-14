@@ -20491,6 +20491,9 @@ static DBGK_EXCEPTIONS_FORWARDED: AtomicU64 = AtomicU64::new(0);
 /// so they stay **0** on a plain boot and the mapping path is byte-identical.
 static DBGK_MODULE_LOADS: AtomicU64 = AtomicU64::new(0);
 static DBGK_MODULE_UNLOADS: AtomicU64 = AtomicU64::new(0);
+/// Live seL4 DebugException classifications (#BP versus #DB) performed at the hosted fault
+/// boundary before Dbgk queues the user-visible exception event.
+static DBGK_DEBUG_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// **TARGET-SIDE BLOCKING counters** (`DbgkpQueueMessage`'s wait on `DebugEvent->ContinueEvent` +
 /// `DbgkpWakeTarget`). A reporting thread whose process IS being debugged is parked on the event it
 /// just queued — its seL4 Reply capability is stolen into the `DEBUG_EVENT` — and `NtDebugContinue`
