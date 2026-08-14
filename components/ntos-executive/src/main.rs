@@ -22636,8 +22636,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
     let (mut storage_dev, mut storage_func) = (0u8, 0u8);
-    let (mut nic_irq, mut found_nic) = (0u32, false);
-    let (mut nic_dev, mut nic_func) = (0u8, 0u8);
+    let mut network_device_count = 0u64;
+    let (mut pre_hive_nic_irq, mut pre_hive_nic_dev, mut pre_hive_nic_func) = (0u32, 0u8, 0u8);
     for d in &pci_devices {
         count += 1;
         let (dev, func) = (d.dev, d.func);
@@ -22667,13 +22667,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             storage_dev = dev;
             storage_func = func;
         }
-        // A network controller (class 0x02) — the e1000e NIC whose MMIO BAR and
-        // interrupt line are published through the hosted PCI grant path below.
+        // Pre-hive bootstrap can only pick a network function when the bus has one candidate.
+        // Once multiple NICs are present, the later registry-devnode path owns selection.
         if d.base_class() == nt_pnp::PCI_CLASS_NETWORK {
-            found_nic = true;
-            nic_irq = irq;
-            nic_dev = dev;
-            nic_func = func;
+            network_device_count = network_device_count.saturating_add(1);
+            if network_device_count == 1 {
+                pre_hive_nic_irq = irq;
+                pre_hive_nic_dev = dev;
+                pre_hive_nic_func = func;
+            }
         }
     }
     print_str(b"[ntos-exec] PCI devices on bus 0 = ");
@@ -22693,10 +22695,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
-    // Register a pre-storage PCI grant for the enumerated network device. This runs before AHCI so
-    // the first VT-d device context is installed without depending on the storage host, but it does
-    // not drive e1000 registers directly. Later registry-selected launch-plan discovery validates
-    // that this existing grant belongs to the service/devnode selected from the real hives.
+    // Register a pre-storage PCI grant only when the pre-hive bus scan has exactly one network
+    // function. This runs before AHCI so the first VT-d device context is installed without
+    // depending on the storage host, but it does not drive e1000 registers directly. Multiple NICs
+    // are deliberately deferred to the later registry-selected launch-plan discovery; class-code
+    // selection cannot know which devnode/service owns the grant.
     let mut kmdf_nic_bar_base = 0u64; // the real NIC BAR caps, handed to the KMDF fixture below.
     let mut nic_bar_pages = 0u64;
     let mut hosted_pci_hardware_grants = Vec::new();
@@ -22704,21 +22707,29 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut hosted_pci_existing_grant_failures = 0u64;
     let mut hosted_pci_dma_grants = 0u64;
     let mut hosted_pci_dma_grant_failures = 0u64;
-    if found_nic {
-        if let Some(device) = hosted_pci_device_by_location(&pci_devices, 0, nic_dev, nic_func) {
+    let pre_hive_network_grant_required = network_device_count == 1;
+    if network_device_count > 1 {
+        print_str(b"[driver-launch] pre-storage hosted PCI grant deferred: network-candidates=");
+        print_u64(network_device_count);
+        print_str(b" (registry devnode selection required)\n");
+    }
+    if pre_hive_network_grant_required {
+        if let Some(device) =
+            hosted_pci_device_by_location(&pci_devices, 0, pre_hive_nic_dev, pre_hive_nic_func)
+        {
             if let Some(mem_bar) = device.first_memory_bar() {
                 let nic_mmio = mem_bar.base;
                 nic_bar_pages = mem_bar.size.div_ceil(0x1000).max(1);
                 print_str(b"[driver-launch] pre-storage hosted PCI grant bus=0 dev=");
-                print_u64(nic_dev as u64);
+                print_u64(pre_hive_nic_dev as u64);
                 print_str(b" func=");
-                print_u64(nic_func as u64);
+                print_u64(pre_hive_nic_func as u64);
                 print_str(b" mmio=");
                 print_hex(nic_mmio as u32);
                 print_str(b" pages=");
                 print_u64(nic_bar_pages);
                 print_str(b" (irq ");
-                print_u64(nic_irq as u64);
+                print_u64(pre_hive_nic_irq as u64);
                 print_str(b")\n");
                 let nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, nic_bar_pages);
                 if nic_bar_base != 0 {
@@ -22775,12 +22786,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(
         b"exec_hosted_pci_existing_grant_brokered",
-        !found_nic || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
+        !pre_hive_network_grant_required
+            || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
         &mut passed,
     );
     check(
         b"exec_hosted_pci_dma_grant_iommu_brokered",
-        !found_nic || (hosted_pci_dma_grants != 0 && hosted_pci_dma_grant_failures == 0),
+        !pre_hive_network_grant_required
+            || (hosted_pci_dma_grants != 0 && hosted_pci_dma_grant_failures == 0),
         &mut passed,
     );
     publish_hosted_pnp_resource_context(&pci_devices, &[], &[]);

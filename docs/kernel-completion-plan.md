@@ -1042,8 +1042,10 @@ before unrelated executive traffic monopolises the receive loop.
   drivers create device objects/interfaces through I/O Manager mechanisms. The reusable PnP broker
   no longer exposes the old class-code driver binding helper; PCI resource selection for hosted
   drivers now uses registry devnode ID matching. The only remaining class-code scan is the local
-  pre-hive bootstrap grant used before storage hives are available. Remaining display debt is
-  hosting real videoprt/miniport instead of the boot-framebuffer bridge.
+  pre-hive bootstrap grant used before storage hives are available, and that path grants only when
+  exactly one network-class function exists; multiple NICs defer selection to the later
+  registry-devnode path. Remaining display debt is hosting real videoprt/miniport instead of the
+  boot-framebuffer bridge.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -3296,6 +3298,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   using registry-style hardware/compatible IDs, and the executive PnP broker dropped its unused
   `assign_nic` wrapper. The reusable PnP boundary is therefore registry-devnode matching plus
   resource assignment; the remaining early class-code scan is local pre-hive bootstrap only.
+
+- B3 multi-NIC pre-hive bootstrap cleanup (2026-08-15). The early PCI scan no longer picks the last
+  network-class function arbitrarily. Before hives are loaded it registers the bootstrap hosted PCI
+  grant only when there is exactly one network-class device; if more than one NIC is present, it
+  logs the ambiguity and defers grant selection to the normal registry devnode launch-plan discovery
+  after storage is available. This keeps the one-NIC QEMU bootstrap path intact while making the
+  multi-NIC boundary fail closed instead of binding by incidental bus order.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
