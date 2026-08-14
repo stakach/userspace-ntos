@@ -6659,7 +6659,10 @@ impl GdiDriverRecord {
     }
 }
 
-static mut GDI_DRIVER_RECORDS: Option<Vec<GdiDriverRecord>> = None;
+const GDI_DRIVER_RECORD_INITIAL_CAP: u64 = 4;
+static GDI_DRIVER_RECORDS_PTR: AtomicU64 = AtomicU64::new(0);
+static GDI_DRIVER_RECORDS_LEN: AtomicU64 = AtomicU64::new(0);
+static GDI_DRIVER_RECORDS_CAP: AtomicU64 = AtomicU64::new(0);
 
 fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -6673,18 +6676,45 @@ fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-fn gdi_driver_records_mut() -> &'static mut Vec<GdiDriverRecord> {
-    unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(GDI_DRIVER_RECORDS);
-        if slot.is_none() {
-            *slot = Some(Vec::new());
-        }
-        slot.as_mut().expect("initialized above")
-    }
+unsafe fn gdi_driver_record_ptr(base: u64, index: u64) -> *mut GdiDriverRecord {
+    (base + index * core::mem::size_of::<GdiDriverRecord>() as u64) as *mut GdiDriverRecord
 }
 
-fn gdi_driver_records() -> Option<&'static Vec<GdiDriverRecord>> {
-    unsafe { (&*core::ptr::addr_of!(GDI_DRIVER_RECORDS)).as_ref() }
+unsafe fn ensure_gdi_driver_record_capacity(required: u64) -> bool {
+    let cap = GDI_DRIVER_RECORDS_CAP.load(Ordering::Relaxed);
+    if cap >= required {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        GDI_DRIVER_RECORD_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let next = new_cap.saturating_mul(2);
+        if next <= new_cap {
+            return false;
+        }
+        new_cap = next;
+    }
+    let Some(bytes) = (core::mem::size_of::<GdiDriverRecord>() as u64).checked_mul(new_cap) else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+    let old_base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
+    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
+    if old_base != 0 {
+        for index in 0..len {
+            let rec = read_volatile(gdi_driver_record_ptr(old_base, index));
+            write_volatile(gdi_driver_record_ptr(new_base, index), rec);
+        }
+    }
+    GDI_DRIVER_RECORDS_PTR.store(new_base, Ordering::Relaxed);
+    GDI_DRIVER_RECORDS_CAP.store(new_cap, Ordering::Relaxed);
+    true
 }
 
 fn register_gdi_driver_image(
@@ -6697,20 +6727,34 @@ fn register_gdi_driver_image(
     if leaf.is_empty() || leaf.len() > GDI_DRIVER_LEAF_CAP || image == 0 || image_len == 0 {
         return false;
     }
-    let records = gdi_driver_records_mut();
     let record = registered_gdi_driver_record(leaf, image, entry, expdir, image_len);
-    if let Some(rec) = records
-        .iter_mut()
-        .find(|rec| ascii_eq_ignore_case(rec.leaf_bytes(), leaf))
-    {
-        *rec = record;
-        return true;
+    unsafe {
+        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
+        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
+        if base != 0 {
+            for index in 0..len {
+                let ptr = gdi_driver_record_ptr(base, index);
+                let rec = read_volatile(ptr);
+                if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
+                    write_volatile(ptr, record);
+                    return true;
+                }
+            }
+        }
+        let Some(required) = len.checked_add(1) else {
+            return false;
+        };
+        if !ensure_gdi_driver_record_capacity(required) {
+            return false;
+        }
+        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
+        if base == 0 {
+            return false;
+        }
+        write_volatile(gdi_driver_record_ptr(base, len), record);
+        GDI_DRIVER_RECORDS_LEN.store(required, Ordering::Relaxed);
+        true
     }
-    if records.try_reserve(1).is_err() {
-        return false;
-    }
-    records.push(record);
-    true
 }
 
 fn registered_gdi_driver_record(
@@ -6736,20 +6780,32 @@ unsafe fn registered_gdi_driver_for_name(
     name_buf: u64,
     name_len: usize,
 ) -> Option<GdiDriverRecord> {
-    let records = gdi_driver_records()?;
-    for rec in records.iter() {
+    let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
+    let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    for index in 0..len {
+        let rec = read_volatile(gdi_driver_record_ptr(base, index));
         if wname_ends_with(name_buf, name_len, rec.leaf_bytes()) {
-            return Some(*rec);
+            return Some(rec);
         }
     }
     None
 }
 
 fn registered_gdi_driver_for_leaf(leaf: &[u8]) -> Option<GdiDriverRecord> {
-    let records = gdi_driver_records()?;
-    for rec in records.iter() {
-        if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
-            return Some(*rec);
+    unsafe {
+        let base = GDI_DRIVER_RECORDS_PTR.load(Ordering::Relaxed);
+        let len = GDI_DRIVER_RECORDS_LEN.load(Ordering::Relaxed);
+        if base == 0 {
+            return None;
+        }
+        for index in 0..len {
+            let rec = read_volatile(gdi_driver_record_ptr(base, index));
+            if ascii_eq_ignore_case(rec.leaf_bytes(), leaf) {
+                return Some(rec);
+            }
         }
     }
     None

@@ -39,8 +39,8 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-b3-cleanup-20260815-085258.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3 PnP cleanup. This retains the
+`.tmp/run-desktop-gdi-record-pool-20260815-091205.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3 display registration cleanup. This retains the
 D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is
 staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints
 mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf profile hives
@@ -1047,7 +1047,9 @@ before unrelated executive traffic monopolises the receive loop.
   exactly one network-class function exists; multiple NICs defer selection to the later
   registry-devnode path. The boot-framebuffer Video0 bridge now shares host-tested video-port IOCTL
   semantics between the direct win32k EngDeviceIoControl shim and the I/O Manager backend. Remaining
-  display debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge.
+  display debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge. Loaded
+  GDI/display driver image records also grow in component-visible win32k pool storage, so win32k's
+  hosted trampolines never depend on executive-only heap pointers.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -3337,9 +3339,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
 - B3 GDI driver registration cleanup (2026-08-15). The hosted win32k
   `SystemLoadGdiDriverInformation` path no longer stores loaded display/GDI DLL images in a fixed
-  eight-record table. GDI driver records now grow on demand, preserve duplicate-leaf replacement
-  semantics, and fail registration only on invalid metadata or real allocation failure. This removes
-  another display-route cap before the larger videoprt/miniport hosting work.
+  eight-record table or in executive-only heap memory. GDI driver records now grow on demand in the
+  component-visible win32k pool, preserve duplicate-leaf replacement semantics, and fail
+  registration only on invalid metadata or real allocation failure. Serialized desktop validation
+  `.tmp/run-desktop-gdi-record-pool-20260815-091205.log` reaches the sentinel with `296/296` checks
+  passing and `exec_explorer_shell_chrome_painted` green. This removes another display-route cap
+  before the larger videoprt/miniport hosting work.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
