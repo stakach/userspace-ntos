@@ -2324,6 +2324,80 @@ fn dbgk_destroying_the_object_detaches_every_debuggee() {
 }
 
 #[test]
+fn dbgk_deleted_process_debug_port_waits_for_exit_event_continue() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+    pm.close_handle(debugger, created.handle_to_process)
+        .unwrap();
+    let process_handle = pm
+        .insert_handle(debugger, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+
+    pm.terminate_process(target, 0x99).unwrap();
+    assert_eq!(pm.process_debug_port(target), Some(object));
+    pm.close_handle(debugger, process_handle).unwrap();
+    assert_eq!(
+        pm.process_debug_port(target),
+        Some(object),
+        "the queued ExitProcess event still references the process"
+    );
+
+    let exited = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(exited.state, dbgk::DBG_EXIT_PROCESS_STATE_CHANGE);
+    pm.debug_continue(object, exited.client_id, dbgk::DBG_CONTINUE)
+        .unwrap();
+    assert_eq!(pm.process_debug_port(target), None);
+    assert!(!pm.is_process_being_debugged(target));
+    assert!(pm.debug_object(object).unwrap().is_empty());
+}
+
+#[test]
+fn dbgk_deleted_process_debug_port_waits_for_last_process_handle() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+    pm.close_handle(debugger, created.handle_to_process)
+        .unwrap();
+    let process_handle = pm
+        .insert_handle(debugger, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+
+    pm.terminate_process(target, 0x99).unwrap();
+    let exited = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(exited.state, dbgk::DBG_EXIT_PROCESS_STATE_CHANGE);
+    pm.debug_continue(object, exited.client_id, dbgk::DBG_CONTINUE)
+        .unwrap();
+    assert_eq!(
+        pm.process_debug_port(target),
+        Some(object),
+        "a process handle still references the terminated debuggee"
+    );
+
+    pm.close_handle(debugger, process_handle).unwrap();
+    assert_eq!(pm.process_debug_port(target), None);
+    assert!(!pm.is_process_being_debugged(target));
+}
+
+#[test]
 fn dbgk_undebugged_processes_queue_nothing() {
     let mut pm = ProcessManager::new();
     let mut pm_object = ProcessManager::new();

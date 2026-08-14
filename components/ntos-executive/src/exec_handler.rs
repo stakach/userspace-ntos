@@ -14391,6 +14391,11 @@ impl ExecNtHandler {
                 unsafe { crate::writable_fs::close(file_id) };
                 self.writable_fs_dirty = true;
             }
+            nt_process::HandleObject::Process(pid) => {
+                let _ = self
+                    .pm
+                    .clear_deleted_process_debug_object_if_unreferenced(pid);
+            }
             // DbgkpCloseObject: the debugger's last handle went away — mark the object inactive,
             // detach every debuggee, and drop it.
             nt_process::HandleObject::DebugObject(object) => {

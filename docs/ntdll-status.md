@@ -295,6 +295,14 @@ tests including
 `dbgk_attach_does_not_report_initialized_pool_threads` and
 `dbgk_existing_thread_create_reports_claimed_pool_thread`.
 
+**Completed pickup (2026-08-14):** process-object debug-port deletion cleanup now mirrors
+`DbgkClearProcessDebugObject(Process, NULL)` at the model boundary. A terminated debuggee keeps its
+`EPROCESS.DebugPort` long enough for the debugger to retrieve and continue the final
+`DbgKmExitProcessApi` event, then clears `DebugPort`/`BeingDebugged` once no process handles and no
+queued debug events still reference that process. The check runs after `NtDebugContinue` removes an
+event and after process-handle close in both `nt-process` and the executive's handle-release path.
+Covered by focused host tests for both ordering cases.
+
 1. **Remaining Tier-2/3 `Rtl*` breadth — low value, do on demand.** The named Tier-2 security list is
    closed. The wider measured spec tail in §2.4 is remaining breadth. **None is imported by anything we
    host.** The rule that governs all of it:
@@ -319,9 +327,6 @@ tests including
      live-exercised** — `spawn_requested_remote_thread` badges it onto the main fault EP and
      `mirror_ctx_for` already sub-selects it; nothing hosted issues `RtlCreateUserThread` against
      another live process, so the only proof is the self-test's private-endpoint client.
-   * **`DbgkClearProcessDebugObject` on process-object *deletion*** — we clear only on explicit
-     `NtRemoveProcessDebug` / debug-object destruction, so a terminated debuggee keeps its port and the
-     debugger can still retrieve the final `ExitProcess` event.
    * **Nothing hosted drives any of this** — no binary in the current set issues the five debug
      syscalls; all 21 `exec_dbgk_*` specs are self-test-driven.
 3. **`DBG_EXCEPTION_NOT_HANDLED` at a fault is a bookkeeping difference.** The reporter is left

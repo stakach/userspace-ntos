@@ -5103,3 +5103,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   thread object, client id, handle, TEB, and create-time policy have succeeded, before the loop/spawn
   mechanism takes over. This closes the old pool-thread bypass of `DbgKmCreateThreadApi` without
   adding a special remote-thread debug path.
+
+  Dbgk process deletion debug-port cleanup (2026-08-14): terminated debuggees now clear
+  `EPROCESS.DebugPort`/`PEB.BeingDebugged` at the process-object lifetime boundary rather than only
+  through explicit detach or debugger-object destruction. `nt-process` preserves the final
+  `DbgKmExitProcessApi` event until it is retrieved and continued, then clears the port once no
+  process handles and no queued debug events still reference the terminated process. The predicate is
+  checked after `NtDebugContinue` removes an event and after process-handle close, including the
+  executive's typed handle-release path, so both possible orderings converge without dropping the
+  final exit notification.

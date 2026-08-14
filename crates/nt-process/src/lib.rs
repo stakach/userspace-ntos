@@ -2999,10 +2999,13 @@ impl ProcessManager {
         client_id: ClientId,
         continue_status: u32,
     ) -> Result<DebugEvent, u32> {
-        match self.dbgk.get_mut(object) {
+        let event = match self.dbgk.get_mut(object) {
             Some(o) => o.continue_event(client_id, continue_status),
             None => Err(STATUS_INVALID_HANDLE),
-        }
+        }?;
+        let _ =
+            self.clear_deleted_process_debug_object_if_unreferenced(event.client_id.unique_process);
+        Ok(event)
     }
 
     /// Queue a `DBGKM_MSG` against `pid`'s debug port, if it has one. Returns the debug object the
@@ -3041,6 +3044,39 @@ impl ProcessManager {
             .get_mut(object)
             .is_some_and(|o| o.queue(event).is_ok())
             .then_some(object)
+    }
+
+    /// `DbgkClearProcessDebugObject` from process-object deletion: once a terminated process has no
+    /// process handles and no queued debug events keeping it visible, clear `EPROCESS.DebugPort` and
+    /// `PEB.BeingDebugged`. Termination itself deliberately does not call this, so the debugger can
+    /// still retrieve and continue the final `DbgKmExitProcessApi` event.
+    pub fn clear_deleted_process_debug_object_if_unreferenced(
+        &mut self,
+        pid: ProcessId,
+    ) -> Option<usize> {
+        let object = {
+            let process = self.processes.get(&pid)?;
+            if process.state != ProcessState::Terminated
+                || self.handle_object_count(HandleObject::Process(pid)) != 0
+            {
+                return None;
+            }
+            process.debug_port?
+        };
+        if self
+            .dbgk
+            .get(object)
+            .is_some_and(|debug| debug.events().iter().any(|event| event.process_id() == pid))
+        {
+            return None;
+        }
+        let process = self.processes.get_mut(&pid)?;
+        if process.debug_port != Some(object) {
+            return None;
+        }
+        process.debug_port = None;
+        process.being_debugged = false;
+        Some(0)
     }
 
     /// `DbgkForwardException` — report a user-mode exception taken by `tid` in `pid` to that
@@ -3211,7 +3247,11 @@ impl ProcessManager {
     }
     /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
     pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
-        self.take_handle_for_close(pid, handle).map(|_| ())
+        let object = self.take_handle_for_close(pid, handle)?;
+        if let HandleObject::Process(target) = object {
+            let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+        }
+        Ok(())
     }
     /// Remove one arbitrary handle from `pid`. Hosts use this during process teardown to release
     /// backing-object references owned outside the process manager.
@@ -3236,6 +3276,9 @@ impl ProcessManager {
             .position(|e| e.as_ref().is_some_and(|h| h.object == object))
         {
             proc.handles[slot] = None;
+            if let HandleObject::Process(target) = object {
+                let _ = self.clear_deleted_process_debug_object_if_unreferenced(target);
+            }
             true
         } else {
             false
