@@ -1791,6 +1791,19 @@ impl ProcessManager {
     ) -> Result<ThreadId, u32> {
         let tid =
             self.resolve_thread_handle(caller_pid, current_tid, thread_handle, THREAD_SET_CONTEXT)?;
+        self.queue_user_apc_to_thread(tid, apc)?;
+        Ok(tid)
+    }
+
+    /// Queue a user APC from kernel-owned completion machinery that already resolved the issuing
+    /// thread. This bypasses user handle access checks, but still applies the same lifetime,
+    /// system-thread, and bounded-queue rules as `NtQueueApcThread`.
+    pub fn queue_kernel_user_apc(&mut self, tid: ThreadId, apc: UserApc) -> Result<ThreadId, u32> {
+        self.queue_user_apc_to_thread(tid, apc)?;
+        Ok(tid)
+    }
+
+    fn queue_user_apc_to_thread(&mut self, tid: ThreadId, apc: UserApc) -> Result<(), u32> {
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         if thread.is_system_thread {
             return Err(STATUS_INVALID_HANDLE);
@@ -1805,7 +1818,7 @@ impl ProcessManager {
             % THREAD_USER_APC_QUEUE_CAP;
         thread.user_apc_queue[tail] = apc;
         thread.user_apc_len += 1;
-        Ok(tid)
+        Ok(())
     }
 
     pub fn has_user_apc(&self, tid: ThreadId) -> bool {

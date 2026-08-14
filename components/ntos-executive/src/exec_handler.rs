@@ -181,6 +181,7 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
 ];
 
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static FILE_USER_APC_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_CONTINUE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -2621,6 +2622,7 @@ impl ExecNtHandler {
         write_field!(pipe_park_buffer_va, 0);
         write_field!(pipe_park_buffer_len, 0);
         write_field!(pipe_park_iosb_va, 0);
+        write_field!(pipe_park_apc_routine, 0);
         write_field!(pipe_park_apc_context, 0);
         write_field!(pipe_park_completion_port_suppressed, false);
         write_field!(pipe_park_event_obj_idx, u64::MAX);
@@ -10010,16 +10012,79 @@ impl ExecNtHandler {
         }
     }
 
+    pub(crate) fn queue_file_user_apc(
+        &mut self,
+        tid: u64,
+        apc_routine: u64,
+        apc_context: u64,
+        iosb: u64,
+    ) -> u32 {
+        if apc_routine == 0 {
+            return nt_fs::STATUS_SUCCESS;
+        }
+        let Ok(tid) = nt_process::ThreadId::try_from(tid) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let apc = nt_process::UserApc {
+            routine: apc_routine,
+            normal_context: apc_context,
+            system_argument1: iosb,
+            system_argument2: 0,
+        };
+        match self.pm.queue_kernel_user_apc(tid, apc) {
+            Ok(target_tid) => {
+                let trace = FILE_USER_APC_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 32 {
+                    print_str(b"[file-apc] queued tid=");
+                    print_u64(target_tid as u64);
+                    print_str(b" routine=0x");
+                    print_hex_u64(apc_routine);
+                    print_str(b" context=0x");
+                    print_hex_u64(apc_context);
+                    print_str(b" iosb=0x");
+                    print_hex_u64(iosb);
+                    print_str(b"\n");
+                }
+                nt_fs::STATUS_SUCCESS
+            }
+            Err(status) => {
+                let trace = FILE_USER_APC_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 32 {
+                    print_str(b"[file-apc] queue failed tid=");
+                    print_u64(tid as u64);
+                    print_str(b" routine=0x");
+                    print_hex_u64(apc_routine);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+                status
+            }
+        }
+    }
+
     pub(crate) fn complete_terminal_file_io(
         &mut self,
         file_id: u64,
         event_obj_idx: u64,
+        tid: u64,
+        apc_routine: u64,
         apc_context: u64,
+        iosb: u64,
         status: u32,
         information: u64,
         completed_inline: bool,
         completion_port_suppressed: bool,
     ) {
+        let apc_status = self.queue_file_user_apc(tid, apc_routine, apc_context, iosb);
+        let (status, information) = if apc_status == nt_fs::STATUS_SUCCESS {
+            (status, information)
+        } else {
+            (apc_status, 0)
+        };
+        unsafe {
+            let _ = self.write_current_iosb(iosb, status, information);
+        }
         if file_id != 0 {
             self.post_file_completion(
                 file_id,
@@ -10142,11 +10207,6 @@ impl ExecNtHandler {
             self.write_current_iosb(iosb, STATUS_NOT_SUPPORTED, 0);
             return STATUS_NOT_SUPPORTED;
         }
-        if args[2] != 0 {
-            self.write_current_iosb(iosb, STATUS_NOT_SUPPORTED, 0);
-            return STATUS_NOT_SUPPORTED;
-        }
-
         let raw_input_len = args[7] as u32 as usize;
         let raw_output_len = args[9] as u32 as usize;
         if raw_input_len > DEVICE_CONTROL_BUFFER_CAP || raw_output_len > DEVICE_CONTROL_BUFFER_CAP
@@ -10275,7 +10335,10 @@ impl ExecNtHandler {
             self.complete_terminal_file_io(
                 route.file_id,
                 event_obj_idx,
+                self.current_tid,
+                args[2],
                 args[3],
+                iosb,
                 status,
                 information,
                 true,
@@ -10330,14 +10393,26 @@ impl ExecNtHandler {
 
     unsafe fn complete_cancelled_pipe_waiter(&mut self, waiter: nt_io_manager::PipeWaiter) {
         let _ = self.cancel_retained_file_irps(waiter.device_id, waiter.file_id);
+        let mut status = STATUS_CANCELLED;
+        let mut information = 0u64;
+        let apc_status = self.queue_file_user_apc(
+            waiter.tid,
+            waiter.apc_routine,
+            waiter.apc_context,
+            waiter.iosb_va,
+        );
+        if apc_status != nt_fs::STATUS_SUCCESS {
+            status = apc_status;
+            information = 0;
+        }
         if waiter.iosb_va != 0 {
-            let _ = self.write_current_iosb(waiter.iosb_va, STATUS_CANCELLED, 0);
+            let _ = self.write_current_iosb(waiter.iosb_va, status, information);
         }
         self.post_file_completion(
             waiter.file_id,
             waiter.apc_context,
-            STATUS_CANCELLED,
-            0,
+            status,
+            information,
             false,
             waiter.completion_port_suppressed,
         );
@@ -10348,7 +10423,7 @@ impl ExecNtHandler {
             set_reply_mr(15, waiter.resume_ip);
             set_reply_mr(16, waiter.resume_sp);
             set_reply_mr(17, waiter.resume_flags);
-            client_reply_on(waiter.reply_cap, 18, STATUS_CANCELLED as u64, 0, 0, 0);
+            client_reply_on(waiter.reply_cap, 18, status as u64, 0, 0, 0);
             release_reply_pool_cap(waiter.reply_cap);
             thread_wait_state_clear_badge_ready(self, waiter.badge);
         }
@@ -10357,14 +10432,26 @@ impl ExecNtHandler {
 
     unsafe fn complete_cancelled_pipe_listen(&mut self, listen: nt_io_manager::AsyncListen) {
         let _ = self.cancel_retained_file_irps(listen.device_id, listen.server_file_id);
+        let mut status = STATUS_CANCELLED;
+        let mut information = 0u64;
+        let apc_status = self.queue_file_user_apc(
+            listen.tid,
+            listen.apc_routine,
+            listen.apc_context,
+            listen.iosb_va,
+        );
+        if apc_status != nt_fs::STATUS_SUCCESS {
+            status = apc_status;
+            information = 0;
+        }
         if listen.iosb_va != 0 {
-            let _ = self.write_current_iosb(listen.iosb_va, STATUS_CANCELLED, 0);
+            let _ = self.write_current_iosb(listen.iosb_va, status, information);
         }
         self.post_file_completion(
             listen.server_file_id,
             listen.apc_context,
-            STATUS_CANCELLED,
-            0,
+            status,
+            information,
             false,
             listen.completion_port_suppressed,
         );
@@ -18521,6 +18608,7 @@ impl ExecNtHandler {
             due_100ns: u64::MAX,
             period_100ns: 0,
             active: false,
+            apc_tid: 0,
             apc_routine: 0,
             apc_context: 0,
         });
@@ -18573,6 +18661,7 @@ impl ExecNtHandler {
         object_index: u64,
         due_100ns: u64,
         period_ms: u32,
+        apc_tid: u64,
         apc_routine: u64,
         apc_context: u64,
     ) -> Result<bool, u32> {
@@ -18584,6 +18673,7 @@ impl ExecNtHandler {
             due_100ns,
             period_100ns,
             active: due_100ns != u64::MAX,
+            apc_tid,
             apc_routine,
             apc_context,
         };
@@ -18601,6 +18691,7 @@ impl ExecNtHandler {
             }
             let object_index = self.user_timers[pos].object_index;
             let period = self.user_timers[pos].period_100ns;
+            let apc_tid = self.user_timers[pos].apc_tid;
             let apc_routine = self.user_timers[pos].apc_routine;
             let apc_context = self.user_timers[pos].apc_context;
             if period == 0 {
@@ -18613,17 +18704,35 @@ impl ExecNtHandler {
                 fired += 1;
             }
             if apc_routine != 0 {
+                let status = match nt_process::ThreadId::try_from(apc_tid) {
+                    Ok(tid) => self
+                        .pm
+                        .queue_kernel_user_apc(
+                            tid,
+                            nt_process::UserApc {
+                                routine: apc_routine,
+                                normal_context: apc_context,
+                                system_argument1: now_100ns & 0xffff_ffff,
+                                system_argument2: (now_100ns >> 32) & 0xffff_ffff,
+                            },
+                        )
+                        .map(|_| nt_fs::STATUS_SUCCESS)
+                        .unwrap_or_else(|status| status),
+                    Err(_) => STATUS_INVALID_HANDLE,
+                };
                 let trace = USER_TIMER_APC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace < 16 {
                     print_str(b"[timer] due object=");
                     print_u64(object_index);
+                    print_str(b" tid=");
+                    print_u64(apc_tid);
                     print_str(b" apc=0x");
                     print_hex_u64(apc_routine);
                     print_str(b" context=0x");
                     print_hex_u64(apc_context);
-                    print_str(
-                        b" -> dispatcher signaled; APC delivery pending user-APC integration\n",
-                    );
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
                 }
             }
         }
@@ -21856,6 +21965,7 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_va = args[8];
                         self.pipe_park_buffer_len = args[9] as u32;
                         self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_routine = args[2];
                         self.pipe_park_apc_context = args[3];
                         self.pipe_park_completion_port_suppressed =
                             completion_port_suppressed;
@@ -21871,6 +21981,7 @@ impl ExecNtHandler {
                             buffer_va: args[8],
                             buffer_len: args[9] as u32,
                             iosb_va: iosb,
+                            apc_routine: args[2],
                             apc_context: args[3],
                             completion_port_suppressed,
                             event_obj_idx,
@@ -21921,6 +22032,7 @@ impl ExecNtHandler {
                                 tid: self.current_tid,
                                 badge: self.current_badge,
                                 iosb_va: iosb,
+                                apc_routine: args[2],
                                 apc_context: args[3],
                                 completion_port_suppressed,
                                 // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
@@ -21980,7 +22092,10 @@ impl ExecNtHandler {
                     self.complete_terminal_file_io(
                         fid,
                         event_obj_idx,
+                        self.current_tid,
+                        args[2],
                         args[3],
+                        iosb,
                         status as u32,
                         information,
                         true,
@@ -23817,6 +23932,7 @@ impl ExecNtHandler {
                                     index as u64,
                                     deadline,
                                     period_ms,
+                                    self.current_tid,
                                     apc_routine,
                                     apc_context,
                                 )
@@ -23833,6 +23949,7 @@ impl ExecNtHandler {
                                 index as u64,
                                 deadline,
                                 period as u32,
+                                self.current_tid,
                                 apc_routine,
                                 apc_context,
                             )
@@ -25944,7 +26061,6 @@ impl ExecNtHandler {
             NativeService::NtQueryDirectoryFile => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
-                const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
                 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
                 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
                 const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
@@ -25963,18 +26079,6 @@ impl ExecNtHandler {
                     args[6] as u32 as usize,
                     args[7],
                 );
-                if args[2] != 0 {
-                    crate::writable_fs::trace_dir_refusal(
-                        b"REFUSED apc-unsupported",
-                        self.pi,
-                        args[0],
-                        iosb,
-                        output,
-                        args[6] as u32 as usize,
-                        args[7],
-                    );
-                    return STATUS_NOT_SUPPORTED;
-                }
                 // `Length` is a ULONG and `ReturnSingleEntry` / `RestartScan` are BOOLEANs. They
                 // often live in stack slots whose high halves still contain older pointer data, so
                 // the ABI boundary must truncate them before validation for every filesystem path.
@@ -26080,13 +26184,23 @@ impl ExecNtHandler {
                         {
                             return STATUS_ACCESS_VIOLATION;
                         }
+                        let apc_status =
+                            self.queue_file_user_apc(self.current_tid, args[2], args[3], iosb);
+                        let status = if apc_status == nt_fs::STATUS_SUCCESS {
+                            result.status
+                        } else {
+                            let mut apc_iosb = [0u8; 16];
+                            apc_iosb[..4].copy_from_slice(&apc_status.to_le_bytes());
+                            let _ = self.xas_try_write_buf(iosb, &apc_iosb);
+                            apc_status
+                        };
                         if let Some(index) = event_index {
                             if self.events.set_existing(index as u64).is_none() {
                                 return nt_fs::STATUS_INVALID_HANDLE;
                             }
                             let _ = wait_wake_dispatcher(self, None);
                         }
-                        return result.status;
+                        return status;
                     }
                     Some(_) => {
                         crate::writable_fs::trace_dir_refusal(
@@ -26172,13 +26286,22 @@ impl ExecNtHandler {
                     }
                     return STATUS_ACCESS_VIOLATION;
                 }
+                let apc_status = self.queue_file_user_apc(self.current_tid, args[2], args[3], iosb);
+                let status = if apc_status == nt_fs::STATUS_SUCCESS {
+                    result.status
+                } else {
+                    let mut apc_iosb = [0u8; 16];
+                    apc_iosb[..4].copy_from_slice(&apc_status.to_le_bytes());
+                    let _ = self.xas_try_write_buf(iosb, &apc_iosb);
+                    apc_status
+                };
                 if let Some(index) = event_index {
                     if self.events.set_existing(index as u64).is_none() {
                         return nt_fs::STATUS_INVALID_HANDLE;
                     }
                     let _ = wait_wake_dispatcher(self, None);
                 }
-                result.status
+                status
             }
             // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
             // FileInformationClass). Resolve process-local ownership here; nt-fs owns the ABI layout.
@@ -27322,24 +27445,18 @@ impl ExecNtHandler {
                 let mut pending_write_device_id = 0u64;
                 let mut pending_write_fid = 0u64;
                 let mut async_file_retained = false;
+                let mut io_request_prepared = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if !payload_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if apc_routine != 0 {
-                    let file_id = self.npfs_file_id_for(fh);
-                    if file_id != 0 && self.file_completion.binding(file_id).is_some() {
-                        0xC000_000D // STATUS_INVALID_PARAMETER
-                    } else {
-                        // No executive user-APC queue exists yet; do not pretend the callback ran.
-                        0xC000_00BB // STATUS_NOT_SUPPORTED
-                    }
                 } else {
                     match self.prepare_io_event_for_request(event) {
                         Err(event_status) => event_status,
                         Ok(event_index) => {
+                            io_request_prepared = true;
                             completion_event_index = event_index;
                             if self.boot_status_handle_access(fh).is_ok() {
                                 match self.boot_status_write_file(fh, buffer, len, byte_offset) {
@@ -27463,6 +27580,14 @@ impl ExecNtHandler {
                 if async_file_retained && pending_write_fid == 0 {
                     self.release_file_reference(completion_file_id);
                 }
+                if io_request_prepared && pending_write_fid == 0 && status != 0x0000_0103 {
+                    let apc_status =
+                        self.queue_file_user_apc(self.current_tid, apc_routine, apc_context, iosb);
+                    if apc_status != nt_fs::STATUS_SUCCESS {
+                        status = apc_status;
+                        information = 0;
+                    }
+                }
                 if pending_write_fid != 0 {
                     let _ = self.file_completion.set_signaled(pending_write_fid, false);
                     let synchronous = self
@@ -27477,6 +27602,7 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_va = 0;
                         self.pipe_park_buffer_len = 0;
                         self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_routine = apc_routine;
                         self.pipe_park_apc_context = apc_context;
                         self.pipe_park_completion_port_suppressed =
                             completion_port_suppressed;
@@ -27493,6 +27619,7 @@ impl ExecNtHandler {
                             buffer_va: 0,
                             buffer_len: 0,
                             iosb_va: iosb,
+                            apc_routine,
                             apc_context,
                             completion_port_suppressed,
                             event_obj_idx,
@@ -27694,6 +27821,7 @@ impl ExecNtHandler {
                 let mut npfs_route_fid = 0u64;
                 let mut completion_event_index = None;
                 let mut completion_event_trace = Ok(None);
+                let mut io_request_prepared = false;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !matches!(disk_file, Ok(Some(_)))
@@ -27705,13 +27833,6 @@ impl ExecNtHandler {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if apc_routine != 0 {
-                    let file_id = self.npfs_file_id_for(fh);
-                    if file_id != 0 && self.file_completion.binding(file_id).is_some() {
-                        0xC000_000D // STATUS_INVALID_PARAMETER
-                    } else {
-                        0xC000_00BB // STATUS_NOT_SUPPORTED
-                    }
                 } else if let Err(handle_status) = disk_file {
                     handle_status
                 } else {
@@ -27721,6 +27842,7 @@ impl ExecNtHandler {
                             event_status
                         }
                         Ok(event_index) => {
+                            io_request_prepared = true;
                             completion_event_trace = Ok(event_index);
                             completion_event_index = event_index;
                             if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
@@ -27923,6 +28045,14 @@ impl ExecNtHandler {
                 if async_file_retained && pending_read_fid == 0 {
                     self.release_file_reference(completion_file_id);
                 }
+                if io_request_prepared && pending_read_fid == 0 && status != 0x0000_0103 {
+                    let apc_status =
+                        self.queue_file_user_apc(self.current_tid, apc_routine, apc_context, iosb);
+                    if apc_status != nt_fs::STATUS_SUCCESS {
+                        status = apc_status;
+                        information = 0;
+                    }
+                }
                 if pending_read_fid != 0 {
                     let _ = self.file_completion.set_signaled(pending_read_fid, false);
                     let synchronous = self
@@ -27937,6 +28067,7 @@ impl ExecNtHandler {
                         self.pipe_park_buffer_va = buffer;
                         self.pipe_park_buffer_len = len as u32;
                         self.pipe_park_iosb_va = iosb;
+                        self.pipe_park_apc_routine = apc_routine;
                         self.pipe_park_apc_context = apc_context;
                         self.pipe_park_completion_port_suppressed =
                             completion_port_suppressed;
@@ -27952,6 +28083,7 @@ impl ExecNtHandler {
                             buffer_va: buffer,
                             buffer_len: len as u32,
                             iosb_va: iosb,
+                            apc_routine,
                             apc_context,
                             completion_port_suppressed,
                             event_obj_idx,

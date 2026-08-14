@@ -709,6 +709,8 @@ pub struct PipeWaiter {
     pub buffer_len: u32,
     /// User IO_STATUS_BLOCK VA (status + information written on completion).
     pub iosb_va: u64,
+    /// Optional user APC normal routine to queue when the IRP completes.
+    pub apc_routine: u64,
     /// Caller APC/OVERLAPPED context copied into an associated completion-port packet.
     pub apc_context: u64,
     /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
@@ -1139,6 +1141,8 @@ pub struct AsyncListen {
     pub badge: u64,
     /// The listen IO_STATUS_BLOCK VA (filled `{Status=SUCCESS, Information=0}` on completion).
     pub iosb_va: u64,
+    /// Optional user APC normal routine to queue when the listen completes.
+    pub apc_routine: u64,
     /// The I/O completion key/APC context passed to NtFsControlFile.
     pub apc_context: u64,
     /// Whether the initiating operation tagged its event handle to suppress IOCP notification.
@@ -1539,6 +1543,7 @@ mod tests {
             buffer_va: 0x1000 + file_id,
             buffer_len: 256,
             iosb_va: 0x2000 + file_id,
+            apc_routine: 0,
             apc_context: 0,
             completion_port_suppressed: false,
             event_obj_idx: u64::MAX,
@@ -2223,6 +2228,7 @@ mod tests {
             tid: 77,
             badge: 7,
             iosb_va: 0x9000 + server_file_id,
+            apc_routine: 0,
             apc_context: 0,
             completion_port_suppressed: false,
             name_hash: 0,

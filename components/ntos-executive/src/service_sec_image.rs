@@ -7712,6 +7712,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_pipe_buffer_va: u64 = 0;
             let mut park_pipe_buffer_len: u32 = 0;
             let mut park_pipe_iosb_va: u64 = 0;
+            let mut park_pipe_apc_routine: u64 = 0;
             let mut park_pipe_apc_context: u64 = 0;
             let mut park_pipe_completion_port_suppressed = false;
             let mut park_pipe_event_obj_idx: u64 = u64::MAX;
@@ -7825,6 +7826,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_buffer_va = 0;
                 nt_handler.pipe_park_buffer_len = 0;
                 nt_handler.pipe_park_iosb_va = 0;
+                nt_handler.pipe_park_apc_routine = 0;
                 nt_handler.pipe_park_apc_context = 0;
                 nt_handler.pipe_park_completion_port_suppressed = false;
                 nt_handler.pipe_park_event_obj_idx = u64::MAX;
@@ -8541,6 +8543,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
                     park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
+                    park_pipe_apc_routine = nt_handler.pipe_park_apc_routine;
                     park_pipe_apc_context = nt_handler.pipe_park_apc_context;
                     park_pipe_completion_port_suppressed =
                         nt_handler.pipe_park_completion_port_suppressed;
@@ -14689,6 +14692,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_va,
                     park_pipe_buffer_len,
                     park_pipe_iosb_va,
+                    park_pipe_apc_routine,
                     park_pipe_apc_context,
                     park_pipe_completion_port_suppressed,
                     park_pipe_event_obj_idx,
@@ -21234,6 +21238,7 @@ unsafe fn pipe_wait_park(
     buffer_va: u64,
     buffer_len: u32,
     iosb_va: u64,
+    apc_routine: u64,
     apc_context: u64,
     completion_port_suppressed: bool,
     event_obj_idx: u64,
@@ -21261,6 +21266,7 @@ unsafe fn pipe_wait_park(
         buffer_va,
         buffer_len,
         iosb_va,
+        apc_routine,
         apc_context,
         completion_port_suppressed,
         event_obj_idx,
@@ -21527,9 +21533,20 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 print_str(b"\n");
             }
         }
+        let mut completion_status = status;
+        let mut completion_information = completed;
+        let apc_status =
+            nt_handler.queue_file_user_apc(w.tid, w.apc_routine, w.apc_context, w.iosb_va);
+        if apc_status != nt_fs::STATUS_SUCCESS {
+            completion_status = apc_status;
+            completion_information = 0;
+        }
         if w.iosb_va != 0 {
-            nt_handler.xas_write_buf(w.iosb_va, &status.to_le_bytes());
-            nt_handler.xas_write_buf(w.iosb_va + 8, &(completed as u64).to_le_bytes());
+            nt_handler.xas_write_buf(w.iosb_va, &completion_status.to_le_bytes());
+            nt_handler.xas_write_buf(
+                w.iosb_va + 8,
+                &(completion_information as u64).to_le_bytes(),
+            );
         }
         if w.event_obj_idx != u64::MAX {
             let _ = nt_handler.events.set_existing(w.event_obj_idx);
@@ -21538,8 +21555,8 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         nt_handler.post_file_completion(
             w.file_id,
             w.apc_context,
-            status,
-            completed,
+            completion_status,
+            completion_information,
             false,
             w.completion_port_suppressed,
         );
@@ -21553,7 +21570,7 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             set_reply_mr(15, w.resume_ip);
             set_reply_mr(16, w.resume_sp);
             set_reply_mr(17, w.resume_flags);
-            client_reply_on(cap, 18, status as u64, 0, 0, 0);
+            client_reply_on(cap, 18, completion_status as u64, 0, 0, 0);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, w.badge);
         }
@@ -21635,10 +21652,18 @@ unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server
         ACTIVE_CLIENT_PI.store(l.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = l.pi as usize;
+        let mut status = 0u32;
+        let mut information = 0u64;
+        let apc_status =
+            nt_handler.queue_file_user_apc(l.tid, l.apc_routine, l.apc_context, l.iosb_va);
+        if apc_status != nt_fs::STATUS_SUCCESS {
+            status = apc_status;
+            information = 0;
+        }
         // Fill the listen IO_STATUS_BLOCK: {Status=STATUS_SUCCESS, Information=0}.
         if l.iosb_va != 0 {
-            nt_handler.xas_write_buf(l.iosb_va, &0u32.to_le_bytes());
-            nt_handler.xas_write_buf(l.iosb_va + 8, &0u64.to_le_bytes());
+            nt_handler.xas_write_buf(l.iosb_va, &status.to_le_bytes());
+            nt_handler.xas_write_buf(l.iosb_va + 8, &information.to_le_bytes());
         }
         // NT file objects are waitable, and files associated with an I/O completion port receive a
         // completion packet. Use the shared file-completion path so success and cancellation expose
@@ -21646,8 +21671,8 @@ unsafe fn pipe_listen_complete_server_fid(nt_handler: &mut ExecNtHandler, server
         nt_handler.post_file_completion(
             l.server_file_id,
             l.apc_context,
-            0,
-            0,
+            status,
+            information,
             false,
             l.completion_port_suppressed,
         );

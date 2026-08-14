@@ -17652,6 +17652,7 @@ struct UserTimerRecord {
     due_100ns: u64,
     period_100ns: u64,
     active: bool,
+    apc_tid: u64,
     apc_routine: u64,
     apc_context: u64,
 }
@@ -17885,6 +17886,7 @@ struct ExecNtHandler {
     pipe_park_buffer_va: u64,
     pipe_park_buffer_len: u32,
     pipe_park_iosb_va: u64,
+    pipe_park_apc_routine: u64,
     pipe_park_apc_context: u64,
     pipe_park_completion_port_suppressed: bool,
     pipe_park_event_obj_idx: u64,

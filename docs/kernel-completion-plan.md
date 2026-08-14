@@ -5279,3 +5279,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   that policy now lives in data rather than duplicated executable-specific control flow. Remaining
   pipe/listener debt is in the data plane: scalable named-pipe listener/client coordination and
   generic RPC worker attribution beyond the current SCM/LSA proof gates.
+
+  Native user-APC completion cleanup (2026-08-14): kernel-owned APC queueing is now a real
+  ProcessManager operation instead of being tied to a caller-supplied thread handle. User
+  `NtQueueApcThread` still resolves the target handle with `THREAD_SET_CONTEXT`, while file, pipe,
+  directory, and timer completion machinery queues to the issuing thread identity it already owns.
+  The native I/O services no longer reject `ApcRoutine` for `NtReadFile`, `NtWriteFile`,
+  `NtDeviceIoControlFile`, `NtFsControlFile`, or `NtQueryDirectoryFile` terminal completions. Pending
+  named-pipe read/write/transceive/listen records now carry both the APC routine and context through
+  cancellation, synchronous reply-cap parking, overlapped completion, and pipe redrive; the APC
+  routine receives the NT file-I/O argument shape `(ApcContext, IoStatusBlock, 0)`. User timers now
+  remember the setting thread and queue their APC routine on expiry with
+  `(TimerContext, TimerLowValue, TimerHighValue)`. Remaining A4 pipe/listener debt stays focused on
+  scalable named-pipe listener/client coordination and generic RPC worker attribution, not missing
+  APC completion transport. Validation: `cargo fmt --all`, `cargo test -p nt-process`,
+  `cargo test -p nt-io-manager`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.

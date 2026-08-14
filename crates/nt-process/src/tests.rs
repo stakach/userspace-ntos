@@ -365,6 +365,32 @@ fn queue_user_apc_supports_current_thread_pseudo_handle() {
 }
 
 #[test]
+fn kernel_user_apc_targets_resolved_thread_without_user_handle() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("kernel-apc.exe", None, None);
+    let user = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let system = pm.create_thread(pid, 0x2000, 0, true).unwrap();
+    let apc = UserApc {
+        routine: 0x1110,
+        normal_context: 0x2220,
+        system_argument1: 0x3330,
+        system_argument2: 0x4440,
+    };
+
+    assert_eq!(pm.queue_kernel_user_apc(user, apc), Ok(user));
+    assert_eq!(pm.take_user_apc(user), Some(apc));
+    assert_eq!(
+        pm.queue_kernel_user_apc(system, apc),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    pm.terminate_thread(user, 0).unwrap();
+    assert_eq!(
+        pm.queue_kernel_user_apc(user, apc),
+        Err(STATUS_UNSUCCESSFUL)
+    );
+}
+
+#[test]
 fn user_apc_queue_is_fifo_and_bounded() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("fifo.exe", None, None);
