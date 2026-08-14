@@ -598,6 +598,7 @@ pub enum HandleObject {
     DiskFile {
         first_cluster: u32,
         size: u32,
+        object_id: u32,
     },
     /// A directory on the executive's mounted FAT volume.
     Directory {

@@ -630,7 +630,7 @@ fn trace_scm_worker_read_io(
     apc_routine: u64,
     apc_context: u64,
     completion_event: Result<Option<usize>, u32>,
-    disk_file: Result<Option<(u32, u32)>, u32>,
+    disk_file: Result<Option<(u32, u32, u32)>, u32>,
     overlay_file: Option<u64>,
     route_status: u32,
     route_fid: u64,
@@ -687,7 +687,7 @@ fn trace_scm_worker_read_io(
     }
     print_str(b" disk_status=0x");
     match disk_file {
-        Ok(Some((_cluster, size))) => {
+        Ok(Some((_cluster, size, _object_id))) => {
             print_hex(0);
             print_str(b" disk_size=");
             print_u64(size as u64);
@@ -2616,6 +2616,7 @@ impl ExecNtHandler {
         write_field!(io_completion_ports, ExecIoCompletionPorts::reset());
         write_field!(file_completion, ExecFileCompletion::reset());
         write_field!(directory_opens, ExecDirectoryOpens::reset());
+        write_field!(readonly_file_opens, ExecReadOnlyFileOpens::reset());
         write_field!(pi, 0);
         write_field!(current_tid, 0);
         write_field!(current_badge, 0);
@@ -8543,16 +8544,22 @@ impl ExecNtHandler {
         access: u32,
     ) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self
-            .insert_process_handle(
-                pid,
-                nt_process::HandleObject::DiskFile {
-                    first_cluster,
-                    size,
-                },
-                access,
-            )
-            .ok()?;
+        let object_id = self.readonly_file_opens.create(first_cluster, size).ok()?;
+        let handle = match self.insert_process_handle(
+            pid,
+            nt_process::HandleObject::DiskFile {
+                first_cluster,
+                size,
+                object_id,
+            },
+            access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = self.readonly_file_opens.release(object_id);
+                return None;
+            }
+        };
         Some(handle as u64)
     }
 
@@ -8678,7 +8685,7 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
-    fn disk_file_for(&self, handle: u64) -> Result<Option<(u32, u32)>, u32> {
+    fn disk_file_for(&self, handle: u64) -> Result<Option<(u32, u32, u32)>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const FILE_READ_DATA: u32 = 0x0000_0001;
@@ -8694,6 +8701,7 @@ impl ExecNtHandler {
             nt_process::HandleObject::DiskFile {
                 first_cluster,
                 size,
+                object_id,
             } => {
                 let access = self
                     .pm
@@ -8702,7 +8710,11 @@ impl ExecNtHandler {
                 if access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0 {
                     return Err(STATUS_ACCESS_DENIED);
                 }
-                Ok(Some((first_cluster, size)))
+                let open = self.readonly_file_opens.get(object_id)?;
+                if open.first_cluster != first_cluster || open.size != size {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                Ok(Some((first_cluster, size, object_id)))
             }
             _ => Ok(None),
         }
@@ -15038,6 +15050,9 @@ impl ExecNtHandler {
             nt_process::HandleObject::Directory { object_id, .. } => {
                 let _ = self.directory_opens.release(object_id);
             }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                let _ = self.readonly_file_opens.release(object_id);
+            }
             nt_process::HandleObject::Section(section) => {
                 if let Some(loop_ctx) = self.loop_ctx {
                     unsafe {
@@ -15155,6 +15170,9 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::Directory { object_id, .. } => {
                 self.directory_opens.retain(object_id)
+            }
+            nt_process::HandleObject::DiskFile { object_id, .. } => {
+                self.readonly_file_opens.retain(object_id)
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 self.writable_fs_dirty = true;
@@ -26484,16 +26502,30 @@ impl ExecNtHandler {
                     Some(object) => object,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
-                let size_and_directory = match object {
-                    nt_process::HandleObject::DiskFile { size, .. } => Some((size as u64, false)),
-                    nt_process::HandleObject::Directory { .. } => Some((0, true)),
+                let size_directory_and_position = match object {
+                    nt_process::HandleObject::DiskFile {
+                        first_cluster,
+                        size,
+                        object_id,
+                    } => {
+                        let open = match self.readonly_file_opens.get(object_id) {
+                            Ok(open) => open,
+                            Err(status) => return status,
+                        };
+                        if open.first_cluster != first_cluster || open.size != size {
+                            return nt_fs::STATUS_INVALID_HANDLE;
+                        }
+                        Some((size as u64, false, open.current_offset))
+                    }
+                    nt_process::HandleObject::Directory { .. } => Some((0, true, 0)),
                     // ★ THE WRITABLE FILESYSTEM OVERLAY: the size/kind the volume really holds.
                     nt_process::HandleObject::OverlayFile(file_id) => {
+                        let offset = crate::writable_fs::current_offset(file_id).unwrap_or(0);
                         crate::writable_fs::standard_information(file_id)
-                            .map(|info| (info.end_of_file, info.is_directory))
+                            .map(|info| (info.end_of_file, info.is_directory, offset))
                     }
                     nt_process::HandleObject::BootStatusFile => {
-                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false))
+                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false, 0))
                     }
                     nt_process::HandleObject::Opaque(_) => {
                         let ctx = match self.loop_ctx {
@@ -26504,13 +26536,13 @@ impl ExecNtHandler {
                         if let Some(index) = reg.index_for_file(self.pi, args[0]) {
                             ctx.dll_pes()[index]
                                 .as_ref()
-                                .map(|pe| (pe.bytes().len() as u64, false))
+                                .map(|pe| (pe.bytes().len() as u64, false, 0))
                         } else if let Some(index) =
                             (&*ctx.exe_images).index_for_file(self.pi, args[0])
                         {
                             (&*ctx.exe_images)
                                 .get(index)
-                                .map(|slot| (slot.metadata.file_size, false))
+                                .map(|slot| (slot.metadata.file_size, false, 0))
                         } else {
                             None
                         }
@@ -26521,13 +26553,14 @@ impl ExecNtHandler {
                     }
                     _ => return 0xC000_0024, // STATUS_OBJECT_TYPE_MISMATCH
                 };
-                let (size, directory) = match size_and_directory {
+                let (size, directory, current_byte_offset) = match size_directory_and_position {
                     Some(metadata) => metadata,
                     None => return nt_fs::STATUS_INVALID_HANDLE,
                 };
                 let metadata = nt_fs::QueryMetadata {
                     allocation_size: size.saturating_add(0xFFF) & !0xFFF,
                     end_of_file: size,
+                    current_byte_offset,
                     number_of_links: 1,
                     delete_pending: false,
                     directory,
@@ -27876,18 +27909,43 @@ impl ExecNtHandler {
                             io_request_prepared = true;
                             completion_event_trace = Ok(event_index);
                             completion_event_index = event_index;
-                            if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
+                            if let Some((first_cluster, file_size, object_id)) =
+                                disk_file.unwrap_or(None)
+                            {
                                 if len == 0 {
                                     nt_fs::STATUS_SUCCESS
-                                } else if byte_offset == 0 {
-                                    0xC000_000D // STATUS_INVALID_PARAMETER: implicit positions are not modeled yet
                                 } else {
-                                    let mut offset_bytes = [0u8; 8];
-                                    if !self.xas_read(byte_offset, &mut offset_bytes) {
-                                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                    let mut explicit_offset = None;
+                                    let mut offset_status = nt_fs::STATUS_SUCCESS;
+                                    if byte_offset != 0 {
+                                        let mut offset_bytes = [0u8; 8];
+                                        if !self.xas_read(byte_offset, &mut offset_bytes) {
+                                            offset_status = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                                        } else {
+                                            let raw_offset = u64::from_le_bytes(offset_bytes);
+                                            if raw_offset != u64::MAX {
+                                                let signed_offset =
+                                                    i64::from_le_bytes(offset_bytes);
+                                                if signed_offset < 0 || raw_offset > u32::MAX as u64
+                                                {
+                                                    offset_status = 0xC000_000D;
+                                                } else {
+                                                    explicit_offset = Some(raw_offset);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if offset_status != nt_fs::STATUS_SUCCESS {
+                                        offset_status
                                     } else {
-                                        let offset = i64::from_le_bytes(offset_bytes);
-                                        if offset < 0 || offset > u32::MAX as i64 {
+                                        let offset = match explicit_offset {
+                                            Some(offset) => offset,
+                                            None => match self.readonly_file_opens.get(object_id) {
+                                                Ok(open) => open.current_offset,
+                                                Err(status) => return status,
+                                            },
+                                        };
+                                        if offset > u32::MAX as u64 {
                                             0xC000_000D // STATUS_INVALID_PARAMETER
                                         } else if offset as u32 >= file_size {
                                             0xC000_0011 // STATUS_END_OF_FILE
@@ -27901,6 +27959,18 @@ impl ExecNtHandler {
                                             ) {
                                                 Ok(read) => {
                                                     information = read as u64;
+                                                    if explicit_offset.is_none() {
+                                                        match self
+                                                            .readonly_file_opens
+                                                            .get_mut(object_id)
+                                                        {
+                                                            Ok(open) => {
+                                                                open.current_offset = offset
+                                                                    .saturating_add(read as u64);
+                                                            }
+                                                            Err(status) => return status,
+                                                        }
+                                                    }
                                                     nt_fs::STATUS_SUCCESS
                                                 }
                                                 Err(status) => status,
@@ -28334,6 +28404,42 @@ impl ExecNtHandler {
                     if status == nt_fs::STATUS_SUCCESS {
                         self.writable_fs_dirty = true;
                     }
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                    return status;
+                }
+                if information_class == nt_fs::FILE_POSITION_INFORMATION {
+                    let status = if length < 8 {
+                        0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+                    } else if args[2] == 0 || !payload_ok {
+                        0xC000_0005 // STATUS_ACCESS_VIOLATION
+                    } else {
+                        let pid = match self.pm_pid_for_pi(self.pi) {
+                            Some(pid) => pid,
+                            None => return nt_fs::STATUS_INVALID_HANDLE,
+                        };
+                        match self
+                            .pm
+                            .lookup_handle(pid, args[0] as nt_process::Handle)
+                        {
+                            Some(nt_process::HandleObject::DiskFile {
+                                first_cluster,
+                                size,
+                                object_id,
+                            }) => match self.readonly_file_opens.get_mut(object_id) {
+                                Ok(open)
+                                    if open.first_cluster == first_cluster && open.size == size =>
+                                {
+                                    open.current_offset =
+                                        u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                                    nt_fs::STATUS_SUCCESS
+                                }
+                                _ => nt_fs::STATUS_INVALID_HANDLE,
+                            },
+                            Some(_) => 0xC000_0008, // STATUS_INVALID_HANDLE
+                            None => nt_fs::STATUS_INVALID_HANDLE,
+                        }
+                    };
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
                     return status;
@@ -28891,7 +28997,7 @@ impl ExecNtHandler {
                 } else {
                     match self.disk_file_for(sec_file) {
                         Err(status) => return status,
-                        Ok(Some((first_cluster, file_size))) => {
+                        Ok(Some((first_cluster, file_size, _object_id))) => {
                             let size = if maxsize == 0 {
                                 file_size as u64
                             } else {

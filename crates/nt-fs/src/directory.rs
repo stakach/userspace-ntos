@@ -247,6 +247,120 @@ impl<const SLOTS: usize> Default for DirectoryOpenTable<SLOTS> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadOnlyFileOpen {
+    pub first_cluster: u32,
+    pub size: u32,
+    pub current_offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ReadOnlyFileOpenSlot {
+    occupied: bool,
+    references: u16,
+    open: ReadOnlyFileOpen,
+}
+
+impl ReadOnlyFileOpenSlot {
+    const fn empty() -> Self {
+        Self {
+            occupied: false,
+            references: 0,
+            open: ReadOnlyFileOpen {
+                first_cluster: 0,
+                size: 0,
+                current_offset: 0,
+            },
+        }
+    }
+}
+
+pub struct ReadOnlyFileOpenTable<const SLOTS: usize> {
+    slots: [ReadOnlyFileOpenSlot; SLOTS],
+}
+
+impl<const SLOTS: usize> ReadOnlyFileOpenTable<SLOTS> {
+    pub const fn new() -> Self {
+        assert!(SLOTS > 0);
+        Self {
+            slots: [ReadOnlyFileOpenSlot::empty(); SLOTS],
+        }
+    }
+
+    pub fn create(&mut self, first_cluster: u32, size: u32) -> Result<u32, u32> {
+        let (index, slot) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| !slot.occupied)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        *slot = ReadOnlyFileOpenSlot {
+            occupied: true,
+            references: 1,
+            open: ReadOnlyFileOpen {
+                first_cluster,
+                size,
+                current_offset: 0,
+            },
+        };
+        Ok(index as u32)
+    }
+
+    pub fn get(&self, id: u32) -> Result<&ReadOnlyFileOpen, u32> {
+        self.slots
+            .get(id as usize)
+            .filter(|slot| slot.occupied)
+            .map(|slot| &slot.open)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn get_mut(&mut self, id: u32) -> Result<&mut ReadOnlyFileOpen, u32> {
+        self.slots
+            .get_mut(id as usize)
+            .filter(|slot| slot.occupied)
+            .map(|slot| &mut slot.open)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn retain(&mut self, id: u32) -> Result<(), u32> {
+        let slot = self
+            .slots
+            .get_mut(id as usize)
+            .filter(|slot| slot.occupied)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        slot.references = slot
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_QUOTA_EXCEEDED)?;
+        Ok(())
+    }
+
+    pub fn release(&mut self, id: u32) -> Result<(), u32> {
+        let slot = self
+            .slots
+            .get_mut(id as usize)
+            .filter(|slot| slot.occupied)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        slot.references -= 1;
+        if slot.references == 0 {
+            *slot = ReadOnlyFileOpenSlot::empty();
+        }
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        for slot in &mut self.slots {
+            *slot = ReadOnlyFileOpenSlot::empty();
+        }
+    }
+}
+
+impl<const SLOTS: usize> Default for ReadOnlyFileOpenTable<SLOTS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryQueryResult {
     pub status: u32,
     pub information: usize,
@@ -754,5 +868,35 @@ mod tests {
         assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.create(99).unwrap(), 0);
         assert_eq!(table.create(100).unwrap(), 1);
+    }
+
+    #[test]
+    fn readonly_file_open_references_share_position() {
+        let mut table = ReadOnlyFileOpenTable::<2>::new();
+        let shared = table.create(41, 64).unwrap();
+        let independent = table.create(41, 64).unwrap();
+        table.retain(shared).unwrap();
+        table.get_mut(shared).unwrap().current_offset = 17;
+        assert_eq!(table.get(shared).unwrap().current_offset, 17);
+        assert_eq!(table.get(independent).unwrap().current_offset, 0);
+        table.release(shared).unwrap();
+        assert_eq!(table.get(shared).unwrap().first_cluster, 41);
+        table.release(shared).unwrap();
+        assert_eq!(table.get(shared), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.create(99, 128).unwrap(), shared);
+    }
+
+    #[test]
+    fn readonly_file_open_table_clear_reuses_fixed_storage() {
+        let mut table = ReadOnlyFileOpenTable::<2>::new();
+        let first = table.create(41, 64).unwrap();
+        table.retain(first).unwrap();
+        table.create(42, 128).unwrap();
+
+        table.clear();
+
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.create(99, 1).unwrap(), 0);
+        assert_eq!(table.create(100, 2).unwrap(), 1);
     }
 }

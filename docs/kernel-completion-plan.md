@@ -5309,3 +5309,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   attribution. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  Native file-position FILE_OBJECT cleanup (2026-08-14): read-only FAT file handles now own a real
+  shared FILE_OBJECT record rather than just a backing extent. The record carries the current byte
+  offset, is retained across `NtDuplicateObject`, released on close/teardown, and is used by
+  `NtReadFile` when callers pass a NULL `ByteOffset` or the `FILE_USE_FILE_POINTER_POSITION`
+  sentinel. `NtQueryInformationFile(FilePositionInformation)` now reports the live offset through the
+  common file-information encoder for read-only FAT and writable-overlay files, and
+  `NtSetInformationFile(FilePositionInformation)` moves read-only FAT file objects instead of
+  falling into the pipe-only information-class path. This removes the old explicit
+  `STATUS_INVALID_PARAMETER` shim for implicit read positions and keeps duplicated handles sharing
+  one cursor, matching the NT FILE_OBJECT boundary. Validation: `cargo fmt --all`,
+  `cargo test -p nt-fs`, `cargo test -p nt-process`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.

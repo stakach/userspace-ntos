@@ -3,7 +3,10 @@
 /// `FILE_BASIC_INFORMATION` is the class `kernel32!CreateDirectoryExW` queries on its TEMPLATE
 /// directory handle (`dll/win32/kernel32/client/file/dir.c:246`) before it can create the copy —
 /// the same class `NtSetInformationFile` already accepted, so it is shared from `status`.
-use crate::{FILE_BASIC_INFORMATION, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
+use crate::{
+    FILE_BASIC_INFORMATION, FILE_POSITION_INFORMATION, STATUS_INFO_LENGTH_MISMATCH,
+    STATUS_INVALID_INFO_CLASS,
+};
 
 pub const FILE_STANDARD_INFORMATION: u32 = 5;
 /// `FileEaInformation` — the second class `CreateDirectoryExW` queries (`dir.c:381`), to size the
@@ -19,6 +22,7 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 pub struct QueryMetadata {
     pub allocation_size: u64,
     pub end_of_file: u64,
+    pub current_byte_offset: u64,
     pub number_of_links: u32,
     pub delete_pending: bool,
     pub directory: bool,
@@ -33,6 +37,7 @@ pub fn encode_query_information(
         FILE_BASIC_INFORMATION => 40,
         FILE_STANDARD_INFORMATION => 24,
         FILE_EA_INFORMATION => 4,
+        FILE_POSITION_INFORMATION => 8,
         _ => return Err(STATUS_INVALID_INFO_CLASS),
     };
     if output.len() < required {
@@ -64,6 +69,10 @@ pub fn encode_query_information(
         // attributes, so 0 is the true answer — and it is what makes `CreateDirectoryExW` skip its
         // `NtQueryEaFile` loop entirely rather than fail.
         FILE_EA_INFORMATION => {}
+        // FILE_POSITION_INFORMATION { LARGE_INTEGER CurrentByteOffset }.
+        FILE_POSITION_INFORMATION => {
+            output[0..8].copy_from_slice(&metadata.current_byte_offset.to_le_bytes());
+        }
         _ => unreachable!(),
     }
     Ok(required)

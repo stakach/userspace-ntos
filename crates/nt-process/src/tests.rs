@@ -1812,6 +1812,7 @@ fn disk_file_handles_preserve_backing_extent() {
     let object = HandleObject::DiskFile {
         first_cluster: 0x1234,
         size: 0x5678,
+        object_id: 9,
     };
     let handle = pm.insert_handle(pid, object, 0x0012_0089).unwrap();
     assert_eq!(pm.lookup_handle(pid, handle), Some(object));

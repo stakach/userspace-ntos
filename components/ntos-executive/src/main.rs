@@ -6932,6 +6932,12 @@ static mut FILLED_WORK: [u64; 512] = [0u64; 512];
 /// successive handler instance.
 static mut DIRECTORY_OPEN_WORK: nt_fs::DirectoryOpenTable<64> = nt_fs::DirectoryOpenTable::new();
 
+/// Persistent read-only FAT FILE_OBJECT state. Read-only file data stays on the boot FAT volume,
+/// but synchronous `NtReadFile(NULL ByteOffset)`, `FilePositionInformation`, and duplicated handles
+/// still need a shared FILE_OBJECT current byte offset.
+static mut READONLY_FILE_OPEN_WORK: nt_fs::ReadOnlyFileOpenTable<64> =
+    nt_fs::ReadOnlyFileOpenTable::new();
+
 fn try_alloc_slot() -> Option<u64> {
     if let Some(slot) = try_recycled_root_slot() {
         return Some(slot);
@@ -17767,6 +17773,9 @@ struct ExecNtHandler {
     /// Shared FILE_OBJECT-style state for FAT directory handles, including enumeration cursors.
     /// The backing table lives in BSS to keep it off the bounded rootserver stack.
     directory_opens: ExecDirectoryOpens,
+    /// Shared FILE_OBJECT-style state for read-only FAT file handles, including current byte
+    /// offsets used by synchronous implicit-position reads.
+    readonly_file_opens: ExecReadOnlyFileOpens,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -18375,6 +18384,46 @@ impl ExecDirectoryOpens {
     }
 
     fn get_mut(&mut self, id: u32) -> Result<&mut nt_fs::DirectoryOpen, u32> {
+        // SAFETY: mutable access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&mut *self.table).get_mut(id) }
+    }
+
+    fn retain(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).retain(id) }
+    }
+
+    fn release(&mut self, id: u32) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release(id) }
+    }
+}
+
+/// Exclusive pointer to the serialized executive's fixed read-only file-open table.
+struct ExecReadOnlyFileOpens {
+    table: *mut nt_fs::ReadOnlyFileOpenTable<64>,
+}
+
+impl ExecReadOnlyFileOpens {
+    fn reset() -> Self {
+        let table = core::ptr::addr_of_mut!(READONLY_FILE_OPEN_WORK);
+        // SAFETY: service_sec_image is serialized. A previous handler has been
+        // dropped before a new one is constructed, so no other table reference exists.
+        unsafe { (&mut *table).clear() };
+        Self { table }
+    }
+
+    fn create(&mut self, first_cluster: u32, size: u32) -> Result<u32, u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).create(first_cluster, size) }
+    }
+
+    fn get(&self, id: u32) -> Result<&nt_fs::ReadOnlyFileOpen, u32> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get(id) }
+    }
+
+    fn get_mut(&mut self, id: u32) -> Result<&mut nt_fs::ReadOnlyFileOpen, u32> {
         // SAFETY: mutable access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&mut *self.table).get_mut(id) }
     }

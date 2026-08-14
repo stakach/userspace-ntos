@@ -73,6 +73,7 @@ fn query_information_encodes_standard_layout() {
     let metadata = QueryMetadata {
         allocation_size: 0x2000,
         end_of_file: 0x1234,
+        current_byte_offset: 0,
         number_of_links: 2,
         delete_pending: true,
         directory: false,
@@ -159,6 +160,28 @@ fn query_information_encodes_zero_ea_size() {
             QueryMetadata::default(),
             &mut output[..3]
         ),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+}
+
+#[test]
+fn query_information_encodes_file_position() {
+    let mut output = [0xCC; 16];
+    let metadata = QueryMetadata {
+        current_byte_offset: 0x1122_3344_5566_7788,
+        ..QueryMetadata::default()
+    };
+    assert_eq!(
+        encode_query_information(FILE_POSITION_INFORMATION, metadata, &mut output),
+        Ok(8)
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[0..8].try_into().unwrap()),
+        0x1122_3344_5566_7788
+    );
+    assert_eq!(&output[8..], &[0xCC; 8]);
+    assert_eq!(
+        encode_query_information(FILE_POSITION_INFORMATION, metadata, &mut output[..7]),
         Err(STATUS_INFO_LENGTH_MISMATCH)
     );
 }
