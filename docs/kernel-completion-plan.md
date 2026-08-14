@@ -1419,7 +1419,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    real resource capacity instead of path-status failures. The following low-risk `ULONG` slices now
    truncate native class/length arguments before validation in event/semaphore query,
    process/thread/object information setter, object/token/section query, PnP event, and security
-   descriptor query paths.
+   descriptor query paths. The thread/VM follow-on now truncates `NtCreateThreadEx(CreateFlags)` and
+   `NtQueryVirtualMemory(MemoryInformationClass)` while preserving pointer-width stack and `SIZE_T`
+   fields.
 
 ## Review Log
 
@@ -5248,3 +5250,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   four-byte `ULONG`. Validation: `cargo fmt --all`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, `git diff --check`, and the targeted grep for stale query width patterns.
+
+  Native syscall flag/class width cleanup (2026-08-14): `NtCreateThreadEx` now treats
+  `CreateFlags` as the declared 32-bit flag word before unsupported-flag validation and suspended /
+  hide-from-debugger decisions. `NtQueryVirtualMemory` now truncates `MemoryInformationClass` to the
+  native enum width while leaving `MemoryInformationLength` and `ReturnLength` as pointer-sized
+  `SIZE_T` fields.

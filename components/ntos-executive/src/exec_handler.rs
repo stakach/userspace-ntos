@@ -10644,9 +10644,9 @@ impl ExecNtHandler {
 
     unsafe fn nt_create_thread_ex_service(&mut self, args: &[u64]) -> u32 {
         const PROCESS_CREATE_THREAD: u32 = 0x0002;
-        const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u64 = 0x0000_0001;
-        const THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER: u64 = 0x0000_0004;
-        const SUPPORTED_THREAD_CREATE_FLAGS: u64 =
+        const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
+        const THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER: u32 = 0x0000_0004;
+        const SUPPORTED_THREAD_CREATE_FLAGS: u32 =
             THREAD_CREATE_FLAGS_CREATE_SUSPENDED | THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
 
         let thread_handle_out = args[0];
@@ -10663,7 +10663,7 @@ impl ExecNtHandler {
             self.queue_write(thread_handle_out, 0);
             return STATUS_INVALID_PARAMETER;
         }
-        let create_flags = args[6];
+        let create_flags = args[6] as u32;
         if create_flags & !SUPPORTED_THREAD_CREATE_FLAGS != 0 {
             self.queue_write(thread_handle_out, 0);
             return STATUS_NOT_SUPPORTED;
@@ -13653,7 +13653,7 @@ impl ExecNtHandler {
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
         let process_handle = args.first().copied().unwrap_or(0);
         let base = args.get(1).copied().unwrap_or(0);
-        let info_class = args.get(2).copied().unwrap_or(u64::MAX);
+        let info_class = args.get(2).copied().unwrap_or(u64::MAX) as u32;
         let buffer = args.get(3).copied().unwrap_or(0);
         let length = args.get(4).copied().unwrap_or(0);
         let return_length = args.get(5).copied().unwrap_or(0);
