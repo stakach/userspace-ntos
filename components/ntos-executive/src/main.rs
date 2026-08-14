@@ -20646,16 +20646,19 @@ static DBGK_MODULE_SELFTEST: AtomicU64 = AtomicU64::new(0);
 ///          next fault with marker 2
 ///   0x0008 the **DebugException** flavour: an `int3` blocks the reporter and `DBG_CONTINUE` resumes
 ///          it PAST the int3 (marker 3)
-///   0x0010 the **SYSCALL** flavour: a `DbgkMapViewOfSection` load-dll event posted from a SYSCALL
+///   0x0010 debugger context edit: the debugger uses `NtGetContextThread` / `NtSetContextThread`
+///          on the blocked debuggee thread, sets `EFLAGS.TF`, continues the breakpoint, observes a
+///          real `STATUS_SINGLE_STEP` debug event, clears TF, and resumes into the next stage
+///   0x0020 the **SYSCALL** flavour: a `DbgkMapViewOfSection` load-dll event posted from a SYSCALL
 ///          blocks its reporter and `DBG_CONTINUE` resumes it with the syscall reply shape (status
 ///          in MR0 + resume context in MR15/16/17) — marker 4
-///   0x0020 ★ `DBG_TERMINATE_THREAD` **ENFORCED**: a `ud2` UserException blocks the reporter; the
+///   0x0040 ★ `DBG_TERMINATE_THREAD` **ENFORCED**: a `ud2` UserException blocks the reporter; the
 ///          continue really terminates its ETHREAD (`DBGK_TERMINATES_ENFORCED` moves) and it is
 ///          NEVER resumed — the marker stays 4, i.e. the instruction after the `ud2` never ran
-///   0x0040 ★ THE ESCAPE HATCH: a reporter left blocked is RELEASED by the debug-object teardown
+///   0x0080 ★ THE ESCAPE HATCH: a reporter left blocked is RELEASED by the debug-object teardown
 ///          (`NtClose` → `DbgkpCloseObject`), `DBGK_REPORTERS_RELEASED` moves and nothing stays
 ///          parked — a debugger that dies or never continues can never wedge the boot
-///   0x0080 ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT: a second real client thread
+///   0x0100 ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT: a second real client thread
 ///          blocks inside `NtWaitForDebugEvent` on the executive's REAL fault endpoint — the
 ///          production `wait_park` steals its reply capability — does not progress, and a
 ///          queue-side post WAKES it through `wait_wake_dispatcher_set`; its marker and its next
@@ -26206,7 +26209,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // int3) and the syscall shape (status + resume context) — and it CONTINUES.
                     check(
                         b"exec_dbgk_continue_resumes_target",
-                        dbgk_blk & (0x0004 | 0x0008 | 0x0010) == (0x0004 | 0x0008 | 0x0010),
+                        dbgk_blk & (0x0004 | 0x0008 | 0x0020) == (0x0004 | 0x0008 | 0x0020),
+                        &mut passed,
+                    );
+                    // A debugger can edit the blocked target thread's live context before
+                    // continuing it. This proves the new context syscalls against a real trap-flag
+                    // single-step event, rather than only against a parked model object.
+                    check(
+                        b"exec_dbgk_context_edit_single_steps_target",
+                        dbgk_blk & 0x0010 == 0x0010,
                         &mut passed,
                     );
                     // DBG_TERMINATE_THREAD is ENFORCED (the reporting ETHREAD really dies and is
@@ -26214,7 +26225,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // debug object is destroyed — so a debugger that dies cannot wedge the boot.
                     check(
                         b"exec_dbgk_terminate_status_enforced",
-                        dbgk_blk & (0x0020 | 0x0040) == (0x0020 | 0x0040),
+                        dbgk_blk & (0x0040 | 0x0080) == (0x0040 | 0x0080),
                         &mut passed,
                     );
                     // The DEBUGGER side: a LIVE client blocked inside NtWaitForDebugEvent — its
@@ -26222,7 +26233,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // queue-side post and observably resumes.
                     check(
                         b"exec_dbgk_debugger_wait_blocks_and_wakes",
-                        dbgk_blk & 0x0080 == 0x0080,
+                        dbgk_blk & 0x0100 == 0x0100,
                         &mut passed,
                     );
                     // ---- `DbgUiIssueRemoteBreakin` END TO END. The last unconditional ntdll stub,

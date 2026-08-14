@@ -16659,6 +16659,11 @@ pub(crate) unsafe fn service_sec_image(
             const A_CLIENT_ID: u64 = STACK_BASE + 0x188;
             const A_TIMEOUT: u64 = STACK_BASE + 0x198;
             const A_STATE: u64 = STACK_BASE + 0x1A0;
+            const A_CONTEXT: u64 = STACK_BASE + 0x280;
+            const AMD64_CONTEXT_FLAGS_OFFSET: u64 = 0x30;
+            const AMD64_CONTEXT_EFLAGS_OFFSET: u64 = 0x44;
+            const CONTEXT_AMD64_CONTROL: u32 = 0x0010_0000 | 0x0000_0001;
+            const EFLAGS_TF: u32 = 0x0000_0100;
             const BLK_TEST_PI: usize = MAX_PI - 1;
             // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
             // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
@@ -16701,11 +16706,17 @@ pub(crate) unsafe fn service_sec_image(
                     u32::from_le_bytes(sc[$o..$o + 4].try_into().unwrap())
                 };
             }
+            macro_rules! sc_u64 {
+                ($o:expr) => {
+                    u64::from_le_bytes(sc[$o..$o + 8].try_into().unwrap())
+                };
+            }
 
             let debugger_pid = nt_handler.pm_pid_for_pi(0).unwrap_or(0);
             let debugger_tid = nt_handler.pm.main_thread(debugger_pid).unwrap_or(0);
             nt_handler.current_tid = debugger_tid as u64;
             let client_args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
+                && img_spawn::smss_copyout(A_CONTEXT, &[0u8; 0x100])
                 && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
 
             // Throwaway caps: the client's shared marker frame, the `#PF` fixup frame, the reply
@@ -16731,6 +16742,7 @@ pub(crate) unsafe fn service_sec_image(
             let fixup_frame = make(OBJ_X86_4K_PAGE, PAGING_BITS);
             let reply_a = make(OBJ_REPLY, 0);
             let reply_b = make(OBJ_REPLY, 0);
+            let reply_step = make(OBJ_REPLY, 0);
             let reply_c = make(OBJ_REPLY, 0);
             let reply_d = make(OBJ_REPLY, 0);
             let reply_spare = make(OBJ_REPLY, 0);
@@ -16808,6 +16820,7 @@ pub(crate) unsafe fn service_sec_image(
                     // leave the queue genuinely empty before the client's first fault is reported.
                     let mut drained = 0u64;
                     let mut first_state = 0u32;
+                    let mut debuggee_thread_handle = 0u64;
                     while attach_ok && drained < 8 {
                         if sysc!(
                             SSN_NT_WAIT_FOR_DEBUG_EVENT,
@@ -16819,6 +16832,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                         if drained == 0 {
                             first_state = sc_u32!(0x00);
+                            debuggee_thread_handle = sc_u64!(0x20);
                         }
                         let mut cid = [0u8; 16];
                         cid[0..8].copy_from_slice(&sc[0x08..0x10]);
@@ -16975,21 +16989,22 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                         // ═══ FAULT 2 — DebugException (int3) ══════════════════════════════
-                        let (_fb, f2_mi, f2_m0, _f2m1, _f2m2, _f2m3) =
+                        let (_fb, f2_mi, f2_m0, f2_m1, _f2m2, _f2m3) =
                             recv_full_r12(client_ep, reply_b);
-                        dbgk_blk_trace(b"f2", f2_mi, f2_m0, 0, marker_t());
+                        dbgk_blk_trace(b"f2", f2_mi, f2_m0, f2_m1, marker_t());
                         if mapped
                             && read1
                             && cont1 == 0
                             && nt_handler.pm.blocked_reporter_count(object) == 0
                             && (f2_mi >> 12) == 4
+                            && f2_m1 == dbgk::SEL4_DEBUG_REASON_SOFTWARE_BREAK_REQUEST
                             && marker_t() == 2
                         {
                             bk_ok |= 0x0004;
                         }
                         // 0x0008 — the DebugException flavour: forward the int3, BLOCK its reporter,
-                        // prove no progress, continue — the client resumes PAST the int3 and its
-                        // next fault carries marker 3.
+                        // prove no progress, then let the debugger edit the real target context
+                        // before continuing it.
                         let forwarded2 = nt_handler.dbgk_forward_exception(
                             BLK_TEST_PI,
                             main_tid as u64,
@@ -17022,7 +17037,47 @@ pub(crate) unsafe fn service_sec_image(
                         let read2 = wait2 == 0
                             && img_spawn::smss_copyin(A_STATE, &mut sc)
                             && sc_u32!(0x00) == dbgk::DBG_BREAKPOINT_STATE_CHANGE;
-                        let cont2 = if read2 {
+                        let tf_flags_written = read2
+                            && no_progress2
+                            && debuggee_thread_handle != 0
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                &CONTEXT_AMD64_CONTROL.to_le_bytes(),
+                            );
+                        let getctx_tf = if tf_flags_written {
+                            sysc!(
+                                SSN_NT_GET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let mut eflags_buf = [0u8; 4];
+                        let eflags_read = getctx_tf == 0
+                            && img_spawn::smss_copyin(
+                                A_CONTEXT + AMD64_CONTEXT_EFLAGS_OFFSET,
+                                &mut eflags_buf,
+                            );
+                        let original_eflags = if eflags_read {
+                            u32::from_le_bytes(eflags_buf)
+                        } else {
+                            0
+                        };
+                        let tf_eflags = original_eflags | EFLAGS_TF;
+                        let tf_eflags_written = eflags_read
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_EFLAGS_OFFSET,
+                                &tf_eflags.to_le_bytes(),
+                            );
+                        let setctx_tf = if tf_eflags_written {
+                            sysc!(
+                                SSN_NT_SET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let cont2 = if read2 && setctx_tf == 0 {
                             sysc!(
                                 SSN_NT_DEBUG_CONTINUE,
                                 &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
@@ -17039,7 +17094,135 @@ pub(crate) unsafe fn service_sec_image(
                             cont2 as u64,
                             woke2 as u64,
                         );
+                        dbgk_blk_trace(
+                            b"tf",
+                            getctx_tf as u64,
+                            setctx_tf as u64,
+                            debuggee_thread_handle,
+                            original_eflags as u64,
+                        );
                         if !woke2 {
+                            let _ = nt_handler.dbgk_release_all_blocked_reporters();
+                            break;
+                        }
+                        // 0x0010 — context edit proof. The debugger-set TF must produce a real
+                        // single-step `#DB` after the one-byte nop, before marker 3 is written.
+                        let (_fb, f2s_mi, f2s_m0, f2s_m1, _f2s_m2, _f2s_m3) =
+                            recv_full_r12(client_ep, reply_step);
+                        dbgk_blk_trace(b"f2s", f2s_mi, f2s_m0, f2s_m1, marker_t());
+                        let step_fault = no_progress2
+                            && cont2 == 0
+                            && setctx_tf == 0
+                            && (f2s_mi >> 12) == 4
+                            && f2s_m1 == dbgk::SEL4_DEBUG_REASON_SINGLE_STEP
+                            && marker_t() == 2;
+                        let forwarded_step = step_fault
+                            && nt_handler.dbgk_forward_exception(
+                                BLK_TEST_PI,
+                                main_tid as u64,
+                                dbgk::ExceptionRecord::new(dbgk::STATUS_SINGLE_STEP, f2s_m0),
+                                true,
+                            );
+                        let blocked_step = forwarded_step
+                            && nt_handler.dbgk_block_reporter(
+                                BLK_TEST_PI,
+                                main_tid as u64,
+                                0,
+                                dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
+                                reply_step,
+                                f2s_m0,
+                                0,
+                                0,
+                                0,
+                            );
+                        let no_progress_step = blocked_step
+                            && nt_handler.pm.blocked_reporter_count(object) == 1
+                            && marker_t() == 2;
+                        let resumed_before_step =
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed);
+                        let wait_step = if blocked_step {
+                            sysc!(
+                                SSN_NT_WAIT_FOR_DEBUG_EVENT,
+                                &[dbg_handle, 0, A_TIMEOUT, A_STATE]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let read_step = wait_step == 0
+                            && img_spawn::smss_copyin(A_STATE, &mut sc)
+                            && sc_u32!(0x00) == dbgk::DBG_SINGLE_STEP_STATE_CHANGE;
+                        let clear_flags_written = read_step
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_FLAGS_OFFSET,
+                                &CONTEXT_AMD64_CONTROL.to_le_bytes(),
+                            );
+                        let getctx_clear = if clear_flags_written {
+                            sysc!(
+                                SSN_NT_GET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let mut clear_buf = [0u8; 4];
+                        let clear_read = getctx_clear == 0
+                            && img_spawn::smss_copyin(
+                                A_CONTEXT + AMD64_CONTEXT_EFLAGS_OFFSET,
+                                &mut clear_buf,
+                            );
+                        let clear_eflags = if clear_read {
+                            u32::from_le_bytes(clear_buf) & !EFLAGS_TF
+                        } else {
+                            0
+                        };
+                        let clear_written = clear_read
+                            && img_spawn::smss_copyout(
+                                A_CONTEXT + AMD64_CONTEXT_EFLAGS_OFFSET,
+                                &clear_eflags.to_le_bytes(),
+                            );
+                        let setctx_clear = if clear_written {
+                            sysc!(
+                                SSN_NT_SET_CONTEXT_THREAD,
+                                &[debuggee_thread_handle, A_CONTEXT]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let cont_step = if read_step && setctx_clear == 0 {
+                            sysc!(
+                                SSN_NT_DEBUG_CONTINUE,
+                                &[dbg_handle, A_CLIENT_ID, dbgk::DBG_CONTINUE as u64]
+                            )
+                        } else {
+                            u32::MAX
+                        };
+                        let woke_step =
+                            DBGK_REPORTERS_RESUMED.load(Ordering::Relaxed)
+                                == resumed_before_step + 1;
+                        dbgk_blk_trace(
+                            b"c2s",
+                            no_progress_step as u64,
+                            wait_step as u64,
+                            cont_step as u64,
+                            woke_step as u64,
+                        );
+                        dbgk_blk_trace(
+                            b"tf0",
+                            getctx_clear as u64,
+                            setctx_clear as u64,
+                            clear_eflags as u64,
+                            marker_t(),
+                        );
+                        if step_fault
+                            && no_progress_step
+                            && read_step
+                            && setctx_clear == 0
+                            && cont_step == 0
+                            && woke_step
+                        {
+                            bk_ok |= 0x0010;
+                        }
+                        if !woke_step {
                             let _ = nt_handler.dbgk_release_all_blocked_reporters();
                             break;
                         }
@@ -17054,13 +17237,14 @@ pub(crate) unsafe fn service_sec_image(
                         dbgk_blk_trace(b"f3", f3_mi, f3_m0, 0, marker_t());
                         if no_progress2
                             && cont2 == 0
+                            && woke_step
                             && (f3_mi >> 12) == 2
                             && f3_m0 == 0xDB
                             && marker_t() == 3
                         {
                             bk_ok |= 0x0008;
                         }
-                        // 0x0010 — the SYSCALL flavour. A real `DbgkMapViewOfSection` load-dll event
+                        // 0x0020 — the SYSCALL flavour. A real `DbgkMapViewOfSection` load-dll event
                         // posted from a SYSCALL blocks its reporter (NT queues it with flags 0), and
                         // DBG_CONTINUE resumes it with the SYSCALL reply shape — status in MR0,
                         // resume context in MR15/16/17 — so the syscall returns and the client runs
@@ -17124,9 +17308,9 @@ pub(crate) unsafe fn service_sec_image(
                             recv_full_r12(client_ep, reply_d);
                         dbgk_blk_trace(b"f4", f4_mi, f4_m0, 0, marker_t());
                         if no_progress3 && cont3 == 0 && (f4_mi >> 12) == 3 && marker_t() == 4 {
-                            bk_ok |= 0x0010;
+                            bk_ok |= 0x0020;
                         }
-                        // 0x0020 — ★ DBG_TERMINATE_THREAD **ENFORCED**. Block the `ud2` reporter,
+                        // 0x0040 — ★ DBG_TERMINATE_THREAD **ENFORCED**. Block the `ud2` reporter,
                         // then continue with DBG_TERMINATE_THREAD: the reporting ETHREAD is really
                         // terminated and it is NEVER resumed — the marker stays 4, i.e. the
                         // instruction after the `ud2` never executed. (Before this batch the status
@@ -17179,12 +17363,12 @@ pub(crate) unsafe fn service_sec_image(
                                 .is_some_and(|t| t.state == nt_process::ThreadState::Terminated)
                             && marker_t() == 4
                         {
-                            bk_ok |= 0x0020;
+                            bk_ok |= 0x0040;
                         }
                         break;
                     }
 
-                    // ═══ 0x0080 — ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT ═══════
+                    // ═══ 0x0100 — ★ THE DEBUGGER-SIDE BLOCKING WAIT, with a LIVE CLIENT ═══════
                     // A second real client thread issues a syscall the test services as
                     // `NtWaitForDebugEvent` with an EMPTY queue. Its fault is received on the
                     // executive's REAL fault endpoint bound to REPLY_MAIN, so the PRODUCTION
@@ -17304,11 +17488,11 @@ pub(crate) unsafe fn service_sec_image(
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         dbgk_blk_trace(b"dw2", w2_mi, w2_m0, 0, marker_d());
                         if (w2_mi >> 12) == 2 && w2_m0 == 0xD2 && marker_d() == 1 {
-                            bk_ok |= 0x0080;
+                            bk_ok |= 0x0100;
                         }
                     }
 
-                    // 0x0040 — ★ THE ESCAPE HATCH. Leave a reporter blocked and destroy the debug
+                    // 0x0080 — ★ THE ESCAPE HATCH. Leave a reporter blocked and destroy the debug
                     // object (`NtClose` → `DbgkpCloseObject`, i.e. the debugger died holding the
                     // event): every blocked target is RELEASED, so nothing can stay parked forever.
                     let released_before = DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed);
@@ -17330,7 +17514,7 @@ pub(crate) unsafe fn service_sec_image(
                         && nt_handler.pm.debug_object(object).is_none()
                         && !nt_handler.pm.is_process_being_debugged(target)
                     {
-                        bk_ok |= 0x0040;
+                        bk_ok |= 0x0080;
                     }
 
                     // Reclaim: suspend both throwaway client threads, then delete every cap this

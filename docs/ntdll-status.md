@@ -318,8 +318,11 @@ Covered by focused host tests for both ordering cases.
      single-step / hardware breakpoint `#DB` reports `STATUS_SINGLE_STEP`. `NtGetContextThread` /
      `NtSetContextThread` are now native-table services backed by the hosted TCB, and
      `NtSetContextThread` updates a parked Dbgk reporter so `NtDebugContinue` resumes with the
-     debugger-edited control context. Remaining work: live-exercise a debugger-set TF step and add
-     non-zero hardware debug-register programming instead of returning `STATUS_NOT_SUPPORTED`.
+     debugger-edited control context. The Dbgk target-block selftest now uses the debugger's real
+     create-process thread handle to call those services, sets `EFLAGS.TF` while the target is
+     blocked on an `int3` event, expects a live `STATUS_SINGLE_STEP` report after a one-byte `nop`,
+     clears TF, and resumes into the syscall leg. Remaining work: non-zero hardware debug-register
+     programming instead of returning `STATUS_NOT_SUPPORTED`.
    * **Executive-internal fault walls never forward** (`fault-cap`, `win32k-spin`,
      `unhandled-syscall`, `image-map-resource`, `wl-stack-growth`, `other-fault`) — they are executive
      walls, not user exceptions, so they neither forward nor block. Which (if any) should become user

@@ -223,7 +223,7 @@ fn emit_store(t: &mut alloc::vec::Vec<u8>, at: u64, value: u32) {
 /// | marker = 1 | `mov [VIEW],1` | — | it is running |
 /// | | `mov [FIXUP],0xAA` | **VMFault** (label 6) | block → prove marker still 1 → map the page → `DBG_CONTINUE` ⇒ the instruction is RETRIED and succeeds |
 /// | marker = 2 | `mov [VIEW],2` | — | proof it resumed AND continued |
-/// | | `int3` | **DebugException** (label 4) | block → `DBG_CONTINUE` ⇒ resumes past the int3 |
+/// | | `int3; nop` | **DebugException** (label 4), then optional **single-step** (label 4) | block → set TF → `DBG_CONTINUE` ⇒ resumes past the int3 and traps after the nop |
 /// | marker = 3 | `mov [VIEW],3` | — | proof |
 /// | | `mov rax,0xDB; syscall` | **UnknownSyscall** (label 2) | the SYSCALL flavour: block → `DBG_CONTINUE` ⇒ resumed with the syscall reply shape |
 /// | marker = 4 | `mov [VIEW],4` | — | proof |
@@ -238,6 +238,7 @@ pub(crate) fn dbgk_target_client_code() -> alloc::vec::Vec<u8> {
     t.extend_from_slice(&[0x48, 0xC7, 0x02, 0xAA, 0x00, 0x00, 0x00]); // mov qword [rdx], 0xAA
     emit_store(&mut t, DBGK_CLIENT_VIEW, 2);
     t.push(0xCC); // int3          → DebugException
+    t.push(0x90); // nop           → optional TF single-step proof before marker 3
     emit_store(&mut t, DBGK_CLIENT_VIEW, 3);
     t.extend_from_slice(&[0x48, 0xB8]);
     t.extend_from_slice(&0xDBu64.to_le_bytes()); // movabs rax, 0xDB

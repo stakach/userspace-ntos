@@ -5133,3 +5133,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the DR backend is wired. Validation: `cargo fmt --all`, `cargo test -p nt-process`,
   `cargo test -p nt-syscall`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`.
+
+  Dbgk trap-flag live-proof cleanup (2026-08-14): the target-block selftest now exercises the
+  debugger context syscalls against a real blocked debuggee thread instead of stopping at host tests.
+  The attach-time `DbgCreateProcessStateChange` handle opened by `DbgkpOpenHandles` is retained as
+  the debugger's `THREAD_ALL_ACCESS` handle, the target bytecode includes a deterministic one-byte
+  `nop` after `int3`, and the debugger path calls `NtGetContextThread` / `NtSetContextThread` to set
+  `EFLAGS.TF` before `NtDebugContinue`. The next live `DebugException` must be seL4 reason
+  `SingleStep`, must report through Dbgk as `DbgSingleStepStateChange`, must leave the progress
+  marker before marker 3 while parked, then TF is cleared through the same context syscalls and the
+  client proceeds into the syscall/load-dll blocking leg. The summary has a separate
+  `exec_dbgk_context_edit_single_steps_target` gate for this proof. Remaining Dbgk debugger-control
+  gap: non-zero DR0-DR7 programming is still `STATUS_NOT_SUPPORTED` pending a real seL4 breakpoint
+  backend. Validation so far: `cargo fmt --all`, `cargo test -p nt-process`,
+  `cargo test -p nt-syscall`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`; a serialized desktop/selftest run is still required for the runtime
+  gate.
