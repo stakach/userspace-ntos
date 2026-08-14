@@ -1416,7 +1416,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    uses that same low-byte interpretation for exception, privilege, LPC accept, event/timer/mutant,
    locale, wait, delay, and directory-enumeration flags. The next slices should continue the ABI-width
    audit at service bodies that still need typed truncation/probing while the shell frontier moves to
-   real resource capacity instead of path-status failures.
+   real resource capacity instead of path-status failures. The following low-risk `ULONG` slice now
+   truncates native class/length arguments before validation in event/semaphore query and process/thread
+   information setter paths.
 
 ## Review Log
 
@@ -5223,5 +5225,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `NtQueryDefaultLocale(UserProfile)`, and the directory-enumeration `ReturnSingleEntry` /
   `RestartScan` flags. `NtCreateEvent(EventType)` is also truncated to the declared 32-bit enum before
   validation. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.
+
+  Native syscall ULONG class/length cleanup (2026-08-14): event and semaphore query services now
+  truncate `EventInformationClass` / `SemaphoreInformationClass` and `Length` to the declared
+  `ULONG` width before validation instead of comparing whole captured machine words. The process and
+  thread information setter paths now do the same for their `ProcessInformationLength` /
+  `ThreadInformationLength` checks, including the `ProcessAccessToken` and thread impersonation-token
+  helper paths. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.

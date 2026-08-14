@@ -14698,7 +14698,7 @@ impl ExecNtHandler {
         const PROCESS_SET_INFORMATION: u32 = 0x0200;
         const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
 
-        if args[3] != 16 {
+        if args[3] as u32 as usize != 16 {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
         let mut captured = [0u8; 16];
@@ -15363,7 +15363,7 @@ impl ExecNtHandler {
         const THREAD_SET_THREAD_TOKEN: u32 = 0x0080;
         const TOKEN_IMPERSONATE: u32 = 0x0004;
 
-        if args[3] != 8 {
+        if args[3] as u32 as usize != 8 {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
         let mut captured = [0u8; 8];
@@ -23469,11 +23469,13 @@ impl ExecNtHandler {
                 }
             }
             NativeService::NtQueryEvent => {
-                const EVENT_BASIC_INFORMATION_SIZE: u64 = 8;
-                if args[1] != 0 {
+                const EVENT_BASIC_INFORMATION_SIZE: u32 = 8;
+                let information_class = args[1] as u32;
+                let information_length = args[3] as u32;
+                if information_class != 0 {
                     return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
                 }
-                if args[3] != EVENT_BASIC_INFORMATION_SIZE {
+                if information_length != EVENT_BASIC_INFORMATION_SIZE {
                     return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
                 }
                 if args[2] == 0 {
@@ -23503,7 +23505,7 @@ impl ExecNtHandler {
                         }
                         if args[4] != 0 {
                             if !unsafe {
-                                self.xas_write_u32(args[4], EVENT_BASIC_INFORMATION_SIZE as u32)
+                                self.xas_write_u32(args[4], EVENT_BASIC_INFORMATION_SIZE)
                             } {
                                 return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                             }
@@ -24035,11 +24037,13 @@ impl ExecNtHandler {
                 0
             },
             NativeService::NtQuerySemaphore => {
-                const SEMAPHORE_BASIC_INFORMATION_SIZE: u64 = 8;
-                if args[1] != 0 {
+                const SEMAPHORE_BASIC_INFORMATION_SIZE: u32 = 8;
+                let information_class = args[1] as u32;
+                let information_length = args[3] as u32;
+                if information_class != 0 {
                     return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
                 }
-                if args[3] != SEMAPHORE_BASIC_INFORMATION_SIZE {
+                if information_length != SEMAPHORE_BASIC_INFORMATION_SIZE {
                     return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
                 }
                 if args[2] == 0 {
@@ -24066,9 +24070,7 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 if args[4] != 0
-                    && !unsafe {
-                        self.xas_write_u32(args[4], SEMAPHORE_BASIC_INFORMATION_SIZE as u32)
-                    }
+                    && !unsafe { self.xas_write_u32(args[4], SEMAPHORE_BASIC_INFORMATION_SIZE) }
                 {
                     return 0xC000_0005;
                 }
@@ -24373,7 +24375,9 @@ impl ExecNtHandler {
             // Model process information setters through real EPROCESS state. Unsupported classes fail
             // visibly so new callers add the missing mechanism instead of relying on fallback success.
             NativeService::NtSetInformationProcess => unsafe {
-                if args[1] == 9 {
+                let information_class = args[1] as u32;
+                let information_length = args[3] as u32 as usize;
+                if information_class == 9 {
                     return self.nt_set_process_access_token(args);
                 }
                 const PROCESS_SET_INFORMATION: u32 = 0x0200;
@@ -24390,9 +24394,9 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
 
-                match args[1] as u32 {
+                match information_class {
                     5 => {
-                        if args[3] != 4 {
+                        if information_length != 4 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         if args[2] & 3 != 0 {
@@ -24421,7 +24425,7 @@ impl ExecNtHandler {
                             .map_or_else(|status| status, |()| 0)
                     }
                     8 => {
-                        if args[3] != 8 {
+                        if information_length != 8 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         if args[2] & 7 != 0 {
@@ -24448,7 +24452,7 @@ impl ExecNtHandler {
                             .map_or_else(|status| status, |()| 0)
                     }
                     12 => {
-                        if args[3] != 4 {
+                        if information_length != 4 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         if args[2] & 3 != 0 {
@@ -24466,7 +24470,7 @@ impl ExecNtHandler {
                             .map_or_else(|status| status, |()| 0)
                     }
                     18 => {
-                        if args[3] != 2 {
+                        if information_length != 2 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         let mut value = [0u8; 2];
@@ -24490,7 +24494,7 @@ impl ExecNtHandler {
                         }
                     }
                     24 => {
-                        if args[3] != 4 {
+                        if information_length != 4 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         if args[2] & 3 != 0 {
@@ -24508,7 +24512,7 @@ impl ExecNtHandler {
                             .map_or_else(|status| status, |()| 0)
                     }
                     25 => {
-                        if args[3] != 1 {
+                        if information_length != 1 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         let mut value = [0u8; 1];
@@ -24520,7 +24524,7 @@ impl ExecNtHandler {
                             .map_or_else(|status| status, |()| 0)
                     }
                     29 => {
-                        if args[3] != 4 {
+                        if information_length != 4 {
                             return nt_process::STATUS_INFO_LENGTH_MISMATCH;
                         }
                         if args[2] & 3 != 0 {
