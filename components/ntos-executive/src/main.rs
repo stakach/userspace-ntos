@@ -15422,7 +15422,6 @@ const BOOT_DRIVER_OBJECT_PATH_MAX: usize = 96;
 const BOOT_DRIVER_IMAGE_PATH_MAX: usize = 180;
 const BOOT_DRIVER_DEVNODE_PATH_MAX: usize = 128;
 const BOOT_DRIVER_ID_BYTES_MAX: usize = 96;
-const PNP_RUNTIME_STATUS_CAP: usize = 64;
 
 #[derive(Clone, Copy)]
 struct InlineAscii<const N: usize> {
@@ -15479,15 +15478,14 @@ impl PnpRuntimeStatusRecord {
     }
 }
 
-#[derive(Clone, Copy)]
 struct PnpRuntimeStatusTable {
-    records: [PnpRuntimeStatusRecord; PNP_RUNTIME_STATUS_CAP],
+    records: alloc::vec::Vec<PnpRuntimeStatusRecord>,
 }
 
 impl PnpRuntimeStatusTable {
-    const fn empty() -> Self {
+    fn new() -> Self {
         Self {
-            records: [PnpRuntimeStatusRecord::empty(); PNP_RUNTIME_STATUS_CAP],
+            records: alloc::vec::Vec::new(),
         }
     }
 }

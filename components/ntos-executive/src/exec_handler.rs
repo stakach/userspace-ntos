@@ -2676,7 +2676,7 @@ impl ExecNtHandler {
         write_field!(anon_event_seq, 0);
         write_field!(pnp_event_cursor, 0);
         write_field!(pnp_notify_event, 0);
-        write_field!(pnp_status, PnpRuntimeStatusTable::empty());
+        write_field!(pnp_status, PnpRuntimeStatusTable::new());
         write_field!(lpc_rendezvous_conn, 0);
         write_field!(lpc_rendezvous_out, 0);
         write_field!(lpc_receive_park_port, 0);
@@ -14678,6 +14678,25 @@ impl ExecNtHandler {
             .position(|record| !record.occupied)
     }
 
+    fn pnp_status_alloc_slot(&mut self) -> Option<usize> {
+        if let Some(slot) = self.pnp_status_free_slot() {
+            return Some(slot);
+        }
+        if self.pnp_status.records.len() == self.pnp_status.records.capacity() {
+            let additional = self.pnp_status.records.capacity().max(16);
+            if self.pnp_status.records.try_reserve(additional).is_err() {
+                print_str(b"[pnp-status] failed to grow runtime status table\n");
+                return None;
+            }
+            print_str(b"[pnp-status] grew runtime status table capacity=");
+            print_u64(self.pnp_status.records.capacity() as u64);
+            print_str(b"\n");
+        }
+        let slot = self.pnp_status.records.len();
+        self.pnp_status.records.push(PnpRuntimeStatusRecord::empty());
+        Some(slot)
+    }
+
     fn pnp_runtime_status(&self, instance: &str) -> (u32, u32) {
         self.pnp_status_slot(instance)
             .map(|slot| {
@@ -14694,11 +14713,14 @@ impl ExecNtHandler {
             }
             return 0;
         }
-        let Some(slot) = self
-            .pnp_status_slot(instance)
-            .or_else(|| self.pnp_status_free_slot())
-        else {
-            return STATUS_INSUFFICIENT_RESOURCES;
+        let slot = match self.pnp_status_slot(instance) {
+            Some(slot) => slot,
+            None => {
+                let Some(slot) = self.pnp_status_alloc_slot() else {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                };
+                slot
+            }
         };
         let mut record = PnpRuntimeStatusRecord::empty();
         if !record.instance_id.set_str(instance) {

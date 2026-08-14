@@ -1055,7 +1055,8 @@ before unrelated executive traffic monopolises the receive loop.
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
   storage from the number of registry-selected candidates instead of truncating at an eight-entry
-  inline array.
+  inline array. Runtime PnP device-status overlays now use a growable cache rather than a 64-entry
+  table.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -3404,6 +3405,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Remaining B3 launch-plan cleanup is the per-service devnode count and
   hardware/compatible-ID/path capture bounds.
+
+- B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
+  longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a
+  growable vector, reuses cleared holes, and reports `STATUS_INSUFFICIENT_RESOURCES` only on real
+  allocation failure. The externally visible behavior is unchanged: status/problem values remain
+  keyed by CM-backed devnode instance ID, `SET` replaces the overlay, `CLEAR` masks it, and all-zero
+  state removes the record. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
