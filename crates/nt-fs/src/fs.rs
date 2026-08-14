@@ -1414,6 +1414,22 @@ impl MemFs {
         self.rename_into_parent(source, parent, leaf, replace_if_exists)
     }
 
+    fn can_mark_delete_pending(&self, id: u64, ignore_readonly: bool) -> u32 {
+        let Some(node) = self.node(id) else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if id == 0 {
+            return STATUS_ACCESS_DENIED;
+        }
+        if !ignore_readonly && node.attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            return STATUS_CANNOT_DELETE;
+        }
+        if node.is_dir && !node.children.is_empty() {
+            return STATUS_DIRECTORY_NOT_EMPTY;
+        }
+        STATUS_SUCCESS
+    }
+
     /// Create every missing directory along `path`, returning the leaf directory's id.
     fn ensure_dir(&mut self, path: &str) -> u64 {
         let mut cur = 0;
@@ -2328,6 +2344,17 @@ impl FileSystem {
         ))
     }
 
+    fn decode_disposition_ex_flags(data: &[u8]) -> Result<u32, u32> {
+        if data.len() < 4 {
+            return Err(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let flags = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if flags & !FILE_DISPOSITION_VALID_FLAGS != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(flags)
+    }
+
     fn rename_target_relative(&self, target: &str) -> Result<String, u32> {
         if let Some(rel) = self.to_relative(target) {
             return Ok(rel);
@@ -2593,7 +2620,7 @@ impl FileSystem {
     }
 
     /// `ZwSetInformationFile` (spec §19) for the classes a writable volume must serve:
-    /// `FileBasicInformation` (attributes), `FileDispositionInformation` (delete-on-close),
+    /// `FileBasicInformation` (attributes), disposition classes (delete-on-close),
     /// `FilePositionInformation`, and `FileEndOfFileInformation` / `FileAllocationInformation`
     /// (truncate/extend). Returns the NTSTATUS; unhandled classes are reported honestly.
     pub fn zw_set_information_file(&mut self, handle: u64, class: u32, data: &[u8]) -> u32 {
@@ -2624,7 +2651,32 @@ impl FileSystem {
                 if data.is_empty() {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
-                self.obj_mut(handle).unwrap().delete_pending = data[0] != 0;
+                let delete = data[0] != 0;
+                if delete {
+                    let status = self.volume.can_mark_delete_pending(node_id, false);
+                    if status != STATUS_SUCCESS {
+                        return status;
+                    }
+                }
+                self.obj_mut(handle).unwrap().delete_pending = delete;
+                STATUS_SUCCESS
+            }
+            FILE_DISPOSITION_INFORMATION_EX => {
+                let flags = match Self::decode_disposition_ex_flags(data) {
+                    Ok(flags) => flags,
+                    Err(status) => return status,
+                };
+                let delete = flags & FILE_DISPOSITION_DELETE != 0;
+                if delete {
+                    let status = self.volume.can_mark_delete_pending(
+                        node_id,
+                        flags & FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0,
+                    );
+                    if status != STATUS_SUCCESS {
+                        return status;
+                    }
+                }
+                self.obj_mut(handle).unwrap().delete_pending = delete;
                 STATUS_SUCCESS
             }
             FILE_POSITION_INFORMATION => {

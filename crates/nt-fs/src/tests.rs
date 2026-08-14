@@ -1215,6 +1215,10 @@ fn rename_information(path: &str, root_directory: u64, replace: bool) -> alloc::
     data
 }
 
+fn disposition_ex(flags: u32) -> [u8; 4] {
+    flags.to_le_bytes()
+}
+
 #[test]
 fn writable_mount_covers_a_prefix_subtree_only() {
     const PREFIXES: &[&[u8]] = &[b"profiles"];
@@ -1610,6 +1614,117 @@ fn writable_volume_set_information_and_delete() {
     // The directory itself survived, and is still a directory.
     let d = fs.query_attributes(r"\??\C:\profiles").unwrap();
     assert!(d.is_directory && d.attributes & FILE_ATTRIBUTE_DIRECTORY != 0);
+}
+
+#[test]
+fn writable_volume_disposition_ex_controls_delete_pending() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\??\C:\profiles"));
+
+    let f = fs.zw_create_file(
+        r"\??\C:\profiles\scratch.tmp",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(f.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(f.handle, None, b"scratch"),
+        (STATUS_SUCCESS, 7)
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(FILE_DISPOSITION_DELETE | FILE_DISPOSITION_ON_CLOSE),
+        ),
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(FILE_DISPOSITION_ON_CLOSE),
+        ),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(f.handle);
+    assert!(fs
+        .query_attributes(r"\??\C:\profiles\scratch.tmp")
+        .is_some());
+
+    let f = fs.zw_create_file(
+        r"\??\C:\profiles\readonly.tmp",
+        FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_READONLY,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(f.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(FILE_DISPOSITION_DELETE),
+        ),
+        STATUS_CANNOT_DELETE
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            f.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(
+                FILE_DISPOSITION_DELETE
+                    | FILE_DISPOSITION_POSIX_SEMANTICS
+                    | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+            ),
+        ),
+        STATUS_SUCCESS
+    );
+    fs.zw_close(f.handle);
+    assert!(fs
+        .query_attributes(r"\??\C:\profiles\readonly.tmp")
+        .is_none());
+}
+
+#[test]
+fn writable_volume_disposition_rejects_invalid_and_nonempty_directory_delete() {
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_file(r"\??\C:\profiles\dir\child.txt", b"child"));
+    let dir = fs.zw_create_file(
+        r"\??\C:\profiles\dir",
+        FILE_WRITE_DATA,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(dir.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_set_information_file(
+            dir.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(FILE_DISPOSITION_DELETE),
+        ),
+        STATUS_DIRECTORY_NOT_EMPTY
+    );
+    assert_eq!(
+        fs.zw_set_information_file(
+            dir.handle,
+            FILE_DISPOSITION_INFORMATION_EX,
+            &disposition_ex(0x8000_0000),
+        ),
+        STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(
+        fs.zw_set_information_file(dir.handle, FILE_DISPOSITION_INFORMATION_EX, &[1, 0, 0]),
+        STATUS_INFO_LENGTH_MISMATCH
+    );
+    fs.zw_close(dir.handle);
+    assert!(fs.query_attributes(r"\??\C:\profiles\dir").is_some());
 }
 
 #[test]

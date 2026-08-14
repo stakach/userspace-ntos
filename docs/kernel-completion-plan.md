@@ -1059,8 +1059,11 @@ before unrelated executive traffic monopolises the receive loop.
 - `[~]` D1: Audit mutable registry and writable filesystem paths: `NtFlushKey`, `NtSaveKey`,
   `NtLoadKey`, `NtUnloadKey`, file writeback, rename/delete, and profile hive usage. Root-hive
   `NtSaveKey`, writable-overlay `FileRenameInformation`, and file-backed hive atomic image
-  replacement are now real; D2 is closed for live-hive authority, while D4 still owns the remaining
-  volatile/journal/setup-profile durability semantics.
+  replacement are now real. Writable-overlay delete disposition now also covers
+  `FileDispositionInformationEx` with NT delete flags, validates readonly/non-empty-directory cases
+  before setting delete-pending, and keeps hard links visibly unsupported until the filesystem owns a
+  real link-count/parent-entry model. D2 is closed for live-hive authority, while D4 still owns the
+  remaining volatile/journal/setup-profile durability semantics.
 - `[x]` D2: Make the Configuration Manager/Hive Manager the live authority for mutable hives rather
   than executive-local mirrors. Mounted boot/user hives are mirrored into `MutableHiveSet`, registry
   reads prefer that authority, and `NtCreateKey`/`NtSetValueKey`/`NtDeleteValueKey` now use
@@ -3192,6 +3195,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Review adjustment: D1's rename/delete/writeback audit is now materially smaller; continue D2/D3
   by moving mutable hive state into the CM/Hive Manager authority and adding explicit flush/reboot
   persistence proofs, or resume A4/B3 structural cleanup.
+
+- D1 writable-overlay disposition-ex slice (2026-08-15). `nt-fs` now models
+  `FileDispositionInformationEx` instead of treating class 64 as an invalid information class for
+  writable overlay file objects. The implementation decodes the NT delete flag word, rejects unknown
+  bits, sets or clears the FILE_OBJECT delete-pending state, accepts POSIX/FORCE/ON_CLOSE flag
+  combinations through the same cleanup-time delete mechanism, and honors
+  `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE` for readonly files. Classic and extended disposition
+  now both validate readonly files, non-empty directories, and the volume root before marking a file
+  for deletion. `FileLinkInformation` remains an honest unsupported class because MemFs still has a
+  single parent entry per node and no link-count model. Validation: `cargo fmt --all`,
+  `cargo test -p nt-fs`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: D1 delete semantics are stronger; remaining filesystem
+  durability audit is now hard-link semantics, cross-volume rename/link refusal, and any writable
+  file-information classes real service traffic exposes, while D4 still owns registry journal/setup
+  durability.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
