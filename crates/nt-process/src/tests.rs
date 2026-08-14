@@ -3039,6 +3039,46 @@ fn dbgk_reporter_block_rides_on_the_debug_event_and_comes_back_from_continue() {
 }
 
 #[test]
+fn dbgk_set_context_updates_a_blocked_reporter_resume_context() {
+    let mut pm = ProcessManager::new();
+    let (target, main, debugger, object) = attach_debugger(&mut pm);
+    let client = ClientId {
+        unique_process: target,
+        unique_thread: main,
+    };
+    let _ = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
+
+    assert_eq!(
+        pm.report_exception(
+            target,
+            main,
+            dbgk::ExceptionRecord::new(dbgk::STATUS_SINGLE_STEP, 0x401000),
+            true
+        ),
+        Some(object)
+    );
+    let block = reporter(dbgk::DBGK_BLOCK_USER_EXCEPTION, main, 0xC0DE);
+    assert!(pm.block_reporter(object, client, block));
+    assert!(pm.update_blocked_reporter_context(
+        client,
+        Some(0x402000),
+        Some(0x7000_1000),
+        Some(0x302),
+    ));
+
+    let _ = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    let resolved = pm
+        .debug_continue(object, client, dbgk::DBG_CONTINUE)
+        .unwrap();
+    let updated = resolved.reporter_block().unwrap();
+    assert_eq!(updated.resume_ip, 0x402000);
+    assert_eq!(updated.resume_sp, 0x7000_1000);
+    assert_eq!(updated.resume_flags, 0x302);
+}
+
+#[test]
 fn dbgk_wake_action_maps_every_continue_status_for_both_flavours() {
     let fault = reporter(dbgk::DBGK_BLOCK_USER_EXCEPTION, 9, 1);
     let syscall = reporter(dbgk::DBGK_BLOCK_SYSCALL, 9, 1);

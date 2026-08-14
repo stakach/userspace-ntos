@@ -315,10 +315,11 @@ Covered by focused host tests for both ordering cases.
    * **Debugger-driven `#DB` single-step.** The Dbgk mapping exists and is host-tested (trap 1 →
      `STATUS_SINGLE_STEP` → `DbgSingleStepStateChange`), and the live seL4 `DebugException`
      boundary now classifies `ExceptionReason` so `int3` remains `STATUS_BREAKPOINT` while
-     single-step / hardware breakpoint `#DB` reports `STATUS_SINGLE_STEP`. The remaining missing
-     mechanism is the debugger API surface that arms TF dynamically: add `NtGetContextThread` /
-     `NtSetContextThread` to the native service table and have `NtDebugContinue` resume a blocked
-     reporter with the updated context.
+     single-step / hardware breakpoint `#DB` reports `STATUS_SINGLE_STEP`. `NtGetContextThread` /
+     `NtSetContextThread` are now native-table services backed by the hosted TCB, and
+     `NtSetContextThread` updates a parked Dbgk reporter so `NtDebugContinue` resumes with the
+     debugger-edited control context. Remaining work: live-exercise a debugger-set TF step and add
+     non-zero hardware debug-register programming instead of returning `STATUS_NOT_SUPPORTED`.
    * **Executive-internal fault walls never forward** (`fault-cap`, `win32k-spin`,
      `unhandled-syscall`, `image-map-resource`, `wl-stack-growth`, `other-fault`) — they are executive
      walls, not user exceptions, so they neither forward nor block. Which (if any) should become user

@@ -5122,3 +5122,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   service-loop wiring. Remaining debugger single-step work is the real `NtGetContextThread` /
   `NtSetContextThread` service-table and blocked-reporter context handoff, not the fault label
   classifier.
+
+  Dbgk context syscall cleanup (2026-08-14): `NtGetContextThread` and `NtSetContextThread` are now
+  registered as real Win7 native services (SSNs 89 and 221) and dispatched by the executive instead
+  of falling through as missing ntdll imports. The handlers resolve real thread handles with
+  `THREAD_GET_CONTEXT` / `THREAD_SET_CONTEXT`, reject system-thread or non-hosted targets, read/write
+  the live hosted TCB control/integer/segment context, and keep any parked Dbgk reporter's resume
+  context synchronized so `NtDebugContinue` observes debugger edits. `CONTEXT_CONTROL` can now carry
+  `EFLAGS.TF`; non-zero hardware debug-register setup is still explicit `STATUS_NOT_SUPPORTED` until
+  the DR backend is wired. Validation: `cargo fmt --all`, `cargo test -p nt-process`,
+  `cargo test -p nt-syscall`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`.

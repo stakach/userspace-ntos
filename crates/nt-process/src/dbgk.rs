@@ -750,6 +750,41 @@ impl DebugObject {
         false
     }
 
+    /// Update a blocked reporter's stored resume context.
+    ///
+    /// A debugger can call `NtSetContextThread` while the debuggee is parked on the event returned
+    /// by `NtWaitForDebugEvent`. The host also updates the live TCB, but fault-flavoured resumes
+    /// that transfer registers (`UserException`) must receive the same edited context when
+    /// `NtDebugContinue` wakes the reporter.
+    pub fn update_reporter_context(
+        &mut self,
+        client_id: ClientId,
+        resume_ip: Option<u64>,
+        resume_sp: Option<u64>,
+        resume_flags: Option<u64>,
+    ) -> bool {
+        for event in self.events.iter_mut().rev() {
+            if event.client_id != client_id {
+                continue;
+            }
+            let Some(mut block) = event.reporter.filter(|block| block.is_blocked()) else {
+                continue;
+            };
+            if let Some(ip) = resume_ip {
+                block.resume_ip = ip;
+            }
+            if let Some(sp) = resume_sp {
+                block.resume_sp = sp;
+            }
+            if let Some(flags) = resume_flags {
+                block.resume_flags = flags;
+            }
+            event.reporter = Some(block);
+            return true;
+        }
+        false
+    }
+
     /// Take the blocked reporter off every event of this object (optionally only those belonging to
     /// `pid`), returning them.
     ///

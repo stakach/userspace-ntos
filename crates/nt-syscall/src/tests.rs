@@ -373,6 +373,8 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtOpenThreadTokenEx, 136),
         (NativeService::NtOpenProcess, 128),
         (NativeService::NtOpenThread, 134),
+        (NativeService::NtGetContextThread, 89),
+        (NativeService::NtSetContextThread, 221),
         (NativeService::NtQueryInformationThread, 162),
         (NativeService::NtOpenProcessTokenEx, 130),
         (NativeService::NtDuplicateToken, 72),
@@ -396,6 +398,16 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtOpenProcess.name(), "NtOpenProcess");
     assert_eq!(NativeService::NtOpenProcess.arg_count(), (4, 4));
     assert_eq!(NativeService::NtOpenThread.name(), "NtOpenThread");
+    assert_eq!(
+        NativeService::NtGetContextThread.name(),
+        "NtGetContextThread"
+    );
+    assert_eq!(NativeService::NtGetContextThread.arg_count(), (2, 2));
+    assert_eq!(
+        NativeService::NtSetContextThread.name(),
+        "NtSetContextThread"
+    );
+    assert_eq!(NativeService::NtSetContextThread.arg_count(), (2, 2));
     assert_eq!(NativeService::NtCancelIoFile.name(), "NtCancelIoFile");
     assert_eq!(NativeService::NtCancelIoFile.arg_count(), (2, 2));
     assert_eq!(NativeService::NtOpenThread.arg_count(), (4, 4));

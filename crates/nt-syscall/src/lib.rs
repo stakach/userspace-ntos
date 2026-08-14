@@ -117,6 +117,8 @@ pub enum NativeService {
     NtSuspendProcess,
     NtOpenProcess,
     NtOpenThread,
+    NtGetContextThread,
+    NtSetContextThread,
     NtQueryInformationThread,
     NtIsProcessInJob,
     NtQueueApcThread,
@@ -308,6 +310,8 @@ impl NativeService {
             NtSuspendProcess => "NtSuspendProcess",
             NtOpenProcess => "NtOpenProcess",
             NtOpenThread => "NtOpenThread",
+            NtGetContextThread => "NtGetContextThread",
+            NtSetContextThread => "NtSetContextThread",
             NtQueryInformationThread => "NtQueryInformationThread",
             NtIsProcessInJob => "NtIsProcessInJob",
             NtQueueApcThread => "NtQueueApcThread",
@@ -567,6 +571,8 @@ impl NativeService {
         NativeService::NtQueryDefaultUILanguage,
         NativeService::NtQueryInstallUILanguage,
         NativeService::NtSetDefaultUILanguage,
+        NativeService::NtGetContextThread,
+        NativeService::NtSetContextThread,
     ];
 }
 

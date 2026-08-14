@@ -1108,6 +1108,8 @@ pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 /// (`references/reactos/dll/win32/lsasrv/authpackage.c:1655`). THIRTEEN arguments: 4 in registers,
 /// nine off the caller's stack, and six of them point at variable-length `TOKEN_*` structures.
 pub const SSN_NT_CREATE_TOKEN: u64 = 57;
+pub const SSN_NT_GET_CONTEXT_THREAD: u64 = 89;
+pub const SSN_NT_SET_CONTEXT_THREAD: u64 = 221;
 pub const SSN_NT_OPEN_THREAD: u64 = 134;
 pub const SSN_NT_QUERY_INFORMATION_THREAD: u64 = 162;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
@@ -19112,6 +19114,14 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtOpenProcess, SSN_NT_OPEN_PROCESS as u32),
             (NativeService::NtOpenThread, SSN_NT_OPEN_THREAD as u32),
+            (
+                NativeService::NtGetContextThread,
+                SSN_NT_GET_CONTEXT_THREAD as u32,
+            ),
+            (
+                NativeService::NtSetContextThread,
+                SSN_NT_SET_CONTEXT_THREAD as u32,
+            ),
             (
                 NativeService::NtQueryInformationThread,
                 SSN_NT_QUERY_INFORMATION_THREAD as u32,

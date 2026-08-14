@@ -36,10 +36,27 @@ const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 const STATUS_CANCELLED: u32 = 0xC000_0120;
 const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
+const AMD64_CONTEXT_SEG_CS_OFFSET: usize = 0x38;
+const AMD64_CONTEXT_SEG_DS_OFFSET: usize = 0x3A;
+const AMD64_CONTEXT_SEG_ES_OFFSET: usize = 0x3C;
+const AMD64_CONTEXT_SEG_FS_OFFSET: usize = 0x3E;
+const AMD64_CONTEXT_SEG_GS_OFFSET: usize = 0x40;
+const AMD64_CONTEXT_SEG_SS_OFFSET: usize = 0x42;
 const AMD64_CONTEXT_EFLAGS_OFFSET: usize = 0x44;
+const AMD64_CONTEXT_DR0_OFFSET: usize = 0x48;
+const AMD64_CONTEXT_DR1_OFFSET: usize = 0x50;
+const AMD64_CONTEXT_DR2_OFFSET: usize = 0x58;
+const AMD64_CONTEXT_DR3_OFFSET: usize = 0x60;
+const AMD64_CONTEXT_DR6_OFFSET: usize = 0x68;
+const AMD64_CONTEXT_DR7_OFFSET: usize = 0x70;
 const CONTEXT_AMD64: u32 = 0x0010_0000;
 const CONTEXT_CONTROL: u32 = 0x0000_0001;
 const CONTEXT_INTEGER: u32 = 0x0000_0002;
+const CONTEXT_SEGMENTS: u32 = 0x0000_0004;
+const CONTEXT_DEBUG_REGISTERS: u32 = 0x0000_0010;
+const USER_CODE_SELECTOR: u16 = 0x33;
+const USER_DATA_SELECTOR: u16 = 0x2B;
+const USER_CMTEB_SELECTOR: u16 = 0x53;
 const EXCEPTION_RECORD_SIZE: usize = 0x98;
 const EXCEPTION_RECORD_CODE_OFFSET: usize = 0x00;
 const EXCEPTION_RECORD_FLAGS_OFFSET: usize = 0x04;
@@ -299,6 +316,21 @@ fn read_le_u32_at(bytes: &[u8], offset: usize) -> u32 {
 #[inline]
 fn read_le_u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+#[inline]
+fn write_le_u16_at(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn write_le_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn write_le_u64_at(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6881,6 +6913,285 @@ impl ExecNtHandler {
             print_str(b"\n");
         }
         Ok(true)
+    }
+
+    fn resolve_user_thread_for_context(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<nt_process::ThreadId, u32> {
+        let caller_pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let current_tid = nt_process::ThreadId::try_from(self.current_tid)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        let tid = self
+            .pm
+            .resolve_thread_handle(caller_pid, current_tid, handle, required_access)?;
+        let thread = self
+            .pm
+            .thread(tid)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if thread.is_system_thread {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        Ok(tid)
+    }
+
+    unsafe fn nt_get_context_thread(&mut self, args: &[u64]) -> u32 {
+        let thread_handle = args[0];
+        let context_ptr = args[1];
+        if context_ptr == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let tid = match self.resolve_user_thread_for_context(thread_handle, nt_process::THREAD_GET_CONTEXT)
+        {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let Some(tcb) = self.hosted_thread_tcb(tid as u64).filter(|tcb| *tcb > 1) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+        if !self.xas_read(context_ptr, &mut context) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
+        if context_flags & CONTEXT_AMD64 == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut registers = [0u64; 20];
+        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
+        if context_flags & CONTEXT_CONTROL != 0 {
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_CS_OFFSET, USER_CODE_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_SS_OFFSET, USER_DATA_SELECTOR);
+            write_le_u32_at(
+                &mut context,
+                AMD64_CONTEXT_EFLAGS_OFFSET,
+                registers[nt_user_callback::USER_CONTEXT_RFLAGS] as u32,
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RSP_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RSP],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RIP_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RIP],
+            );
+        }
+        if context_flags & CONTEXT_SEGMENTS != 0 {
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_CS_OFFSET, USER_CODE_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_DS_OFFSET, USER_DATA_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_ES_OFFSET, USER_DATA_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_FS_OFFSET, USER_CMTEB_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_GS_OFFSET, USER_DATA_SELECTOR);
+            write_le_u16_at(&mut context, AMD64_CONTEXT_SEG_SS_OFFSET, USER_DATA_SELECTOR);
+        }
+        if context_flags & CONTEXT_INTEGER != 0 {
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RAX_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RAX],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RBX_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RBX],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RCX_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RCX],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RDX_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RDX],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RSI_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RSI],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RDI_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RDI],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_RBP_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_RBP],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R8_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R8],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R9_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R9],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R10_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R10],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R11_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R11],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R12_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R12],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R13_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R13],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R14_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R14],
+            );
+            write_le_u64_at(
+                &mut context,
+                nt_thread_start::CONTEXT_R15_OFFSET as usize,
+                registers[nt_user_callback::USER_CONTEXT_R15],
+            );
+        }
+        if context_flags & CONTEXT_DEBUG_REGISTERS != 0 {
+            for offset in [
+                AMD64_CONTEXT_DR0_OFFSET,
+                AMD64_CONTEXT_DR1_OFFSET,
+                AMD64_CONTEXT_DR2_OFFSET,
+                AMD64_CONTEXT_DR3_OFFSET,
+                AMD64_CONTEXT_DR6_OFFSET,
+                AMD64_CONTEXT_DR7_OFFSET,
+            ] {
+                write_le_u64_at(&mut context, offset, 0);
+            }
+        }
+        if !self.xas_try_write_buf(context_ptr, &context) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    unsafe fn nt_set_context_thread(&mut self, args: &[u64]) -> u32 {
+        let thread_handle = args[0];
+        let context_ptr = args[1];
+        if context_ptr == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let tid = match self.resolve_user_thread_for_context(thread_handle, nt_process::THREAD_SET_CONTEXT)
+        {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let Some(tcb) = self.hosted_thread_tcb(tid as u64).filter(|tcb| *tcb > 1) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+        if !self.xas_read(context_ptr, &mut context) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
+        if context_flags & CONTEXT_AMD64 == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if context_flags & CONTEXT_DEBUG_REGISTERS != 0
+            && [
+                AMD64_CONTEXT_DR0_OFFSET,
+                AMD64_CONTEXT_DR1_OFFSET,
+                AMD64_CONTEXT_DR2_OFFSET,
+                AMD64_CONTEXT_DR3_OFFSET,
+                AMD64_CONTEXT_DR6_OFFSET,
+                AMD64_CONTEXT_DR7_OFFSET,
+            ]
+            .iter()
+            .any(|&offset| read_le_u64_at(&context, offset) != 0)
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        let mut registers = [0u64; 20];
+        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
+        let mut reporter_ip = None;
+        let mut reporter_sp = None;
+        let mut reporter_flags = None;
+        if context_flags & CONTEXT_CONTROL != 0 {
+            let rip = read_le_u64_at(&context, nt_thread_start::CONTEXT_RIP_OFFSET as usize);
+            let rsp = read_le_u64_at(&context, nt_thread_start::CONTEXT_RSP_OFFSET as usize);
+            let flags = read_le_u32_at(&context, AMD64_CONTEXT_EFLAGS_OFFSET) as u64;
+            if rip == 0 || rsp == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            registers[nt_user_callback::USER_CONTEXT_RIP] = rip;
+            registers[nt_user_callback::USER_CONTEXT_RSP] = rsp;
+            registers[nt_user_callback::USER_CONTEXT_RFLAGS] = flags;
+            reporter_ip = Some(rip);
+            reporter_sp = Some(rsp);
+            reporter_flags = Some(flags);
+        }
+        if context_flags & CONTEXT_INTEGER != 0 {
+            registers[nt_user_callback::USER_CONTEXT_RAX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RAX_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RBX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBX_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RCX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RCX_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RDX] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDX_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RSI] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSI_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RDI] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDI_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_RBP] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBP_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R8] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R8_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R9] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R9_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R10] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R10_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R11] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R11_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R12] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R12_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R13] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R13_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R14] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R14_OFFSET as usize);
+            registers[nt_user_callback::USER_CONTEXT_R15] =
+                read_le_u64_at(&context, nt_thread_start::CONTEXT_R15_OFFSET as usize);
+        }
+
+        if crate::win32k_glue::tcb_write_regs20(tcb, &registers, false) != 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        if reporter_ip.is_some() || reporter_sp.is_some() || reporter_flags.is_some() {
+            if let Some(process_id) = self.pm.thread(tid).map(|thread| thread.process_id) {
+                let client_id = nt_process::ClientId {
+                    unique_process: process_id,
+                    unique_thread: tid,
+                };
+                let _ = self.pm.update_blocked_reporter_context(
+                    client_id,
+                    reporter_ip,
+                    reporter_sp,
+                    reporter_flags,
+                );
+            }
+        }
+        0
     }
 
     unsafe fn nt_continue(&mut self, args: &[u64]) -> u32 {
@@ -19349,6 +19660,8 @@ impl ExecNtHandler {
             NativeService::NtOpenThread => unsafe {
                 self.nt_open_thread(args[0], args[1] as u32, args[2], args[3])
             },
+            NativeService::NtGetContextThread => unsafe { self.nt_get_context_thread(args) },
+            NativeService::NtSetContextThread => unsafe { self.nt_set_context_thread(args) },
             NativeService::NtQueueApcThread => {
                 let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
                     return nt_process::STATUS_INVALID_HANDLE;

@@ -51,6 +51,7 @@ pub const THREAD_GENERIC_READ: u32 = 0x0002_0048;
 pub const THREAD_GENERIC_WRITE: u32 = 0x0002_0037;
 pub const THREAD_GENERIC_EXECUTE: u32 = 0x0012_0000;
 pub const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+pub const THREAD_GET_CONTEXT: u32 = 0x0008;
 pub const THREAD_SET_CONTEXT: u32 = 0x0010;
 pub const PROCESS_PRIORITY_CLASS_INVALID: u8 = 0;
 pub const PROCESS_PRIORITY_CLASS_IDLE: u8 = 1;
@@ -2950,6 +2951,26 @@ impl ProcessManager {
         self.dbgk
             .get_mut(object)
             .is_some_and(|o| o.attach_reporter(client_id, block))
+    }
+
+    /// Update the resume context attached to a blocked Dbgk reporter after a debugger changes the
+    /// thread context with `NtSetContextThread`.
+    pub fn update_blocked_reporter_context(
+        &mut self,
+        client_id: ClientId,
+        resume_ip: Option<u64>,
+        resume_sp: Option<u64>,
+        resume_flags: Option<u64>,
+    ) -> bool {
+        let Some(object) = self
+            .process(client_id.unique_process)
+            .and_then(|process| process.debug_port())
+        else {
+            return false;
+        };
+        self.dbgk.get_mut(object).is_some_and(|o| {
+            o.update_reporter_context(client_id, resume_ip, resume_sp, resume_flags)
+        })
     }
 
     /// Release every blocked reporter on `object` (optionally only those of `pid`) — the escape
