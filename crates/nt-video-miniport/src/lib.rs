@@ -13,11 +13,14 @@ pub const IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES: u32 = 0x0023_0404;
 pub const IOCTL_VIDEO_QUERY_CURRENT_MODE: u32 = 0x0023_0408;
 pub const IOCTL_VIDEO_SET_CURRENT_MODE: u32 = 0x0023_040C;
 pub const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u32 = 0x0023_0458;
+pub const IOCTL_VIDEO_INIT_WIN32K_CALLBACKS: u32 = 0x0023_001C;
+pub const IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: u32 = 0x0023_045C;
 
 pub const VIDEO_NUM_MODES_SIZE: usize = 8;
 pub const VIDEO_MODE_INFORMATION_SIZE: usize = 80;
 pub const VIDEO_MEMORY_SIZE_X64: usize = 8;
 pub const VIDEO_MEMORY_INFORMATION_SIZE_X64: usize = 32;
+pub const VIDEO_WIN32K_CALLBACKS_SIZE_X64: usize = 40;
 
 pub const VIDEO_MODE_COLOR: u32 = 0x0001;
 pub const VIDEO_MODE_GRAPHICS: u32 = 0x0002;
@@ -199,6 +202,82 @@ impl BootFramebufferMiniport {
     }
 }
 
+/// Dispatch the video-port control surface exposed for the boot framebuffer-backed display route.
+///
+/// This covers the win32k/videoprt-facing controls around the miniport's ordinary `ntddvdeo.h`
+/// IOCTLs. Keeping this logic in the crate means the executive's EngDeviceIoControl shim and its
+/// I/O Manager backend share one tested semantic boundary.
+pub fn dispatch_boot_video_io_control(
+    miniport: &BootFramebufferMiniport,
+    ioctl: u32,
+    input: &[u8],
+    output: &mut [u8],
+    video_device_object: u64,
+) -> Result<usize, VideoMiniportError> {
+    match ioctl {
+        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+            write_win32k_callbacks(input, output, video_device_object)
+        }
+        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+        _ => miniport.dispatch_io_control(ioctl, input, output),
+    }
+}
+
+/// Dispatch the same boot-video controls through a buffered I/O `SystemBuffer`.
+pub fn dispatch_boot_video_buffered_io_control(
+    miniport: &BootFramebufferMiniport,
+    ioctl: u32,
+    system_buffer: &mut [u8],
+    input_len: usize,
+    output_len: usize,
+    video_device_object: u64,
+) -> Result<usize, VideoMiniportError> {
+    if input_len > system_buffer.len() {
+        return Err(VideoMiniportError::BufferTooSmall { needed: input_len });
+    }
+    if output_len > system_buffer.len() {
+        return Err(VideoMiniportError::BufferTooSmall { needed: output_len });
+    }
+    match ioctl {
+        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+            let input = &system_buffer[..input_len];
+            let phys_disp = read_u64(input, 0)?;
+            let callout = read_u64(input, 8)?;
+            let output = &mut system_buffer[..output_len];
+            write_win32k_callbacks_from_parts(output, phys_disp, callout, video_device_object)
+        }
+        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+        _ => miniport.dispatch_buffered_io_control(ioctl, system_buffer, input_len, output_len),
+    }
+}
+
+fn write_win32k_callbacks(
+    input: &[u8],
+    output: &mut [u8],
+    video_device_object: u64,
+) -> Result<usize, VideoMiniportError> {
+    require_input(input, 16)?;
+    let phys_disp = read_u64(input, 0)?;
+    let callout = read_u64(input, 8)?;
+    write_win32k_callbacks_from_parts(output, phys_disp, callout, video_device_object)
+}
+
+fn write_win32k_callbacks_from_parts(
+    output: &mut [u8],
+    phys_disp: u64,
+    callout: u64,
+    video_device_object: u64,
+) -> Result<usize, VideoMiniportError> {
+    require_output(output, VIDEO_WIN32K_CALLBACKS_SIZE_X64)?;
+    output[..VIDEO_WIN32K_CALLBACKS_SIZE_X64].fill(0);
+    write_u64(output, 0, phys_disp);
+    write_u64(output, 8, callout);
+    write_u32(output, 16, 0);
+    write_u64(output, 24, video_device_object);
+    write_u32(output, 32, 0);
+    Ok(VIDEO_WIN32K_CALLBACKS_SIZE_X64)
+}
+
 fn validate_mapping(
     mapping: FramebufferMapping,
     mode: VideoModeSpec,
@@ -262,6 +341,13 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&input[offset..offset + 4]);
     u32::from_le_bytes(bytes)
+}
+
+fn read_u64(input: &[u8], offset: usize) -> Result<u64, VideoMiniportError> {
+    require_input(input, offset + 8)?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&input[offset..offset + 8]);
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -436,6 +522,65 @@ mod tests {
             .unwrap();
         assert_eq!(written, VIDEO_MEMORY_INFORMATION_SIZE_X64);
         assert_eq!(u64_at(&sys, 16), 0x0000_0100_0900_0000);
+    }
+
+    #[test]
+    fn boot_video_control_initializes_win32k_callbacks() {
+        let mut input = [0u8; 16];
+        input[..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        input[8..16].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        let mut out = [0xCCu8; VIDEO_WIN32K_CALLBACKS_SIZE_X64];
+        let written = dispatch_boot_video_io_control(
+            &miniport(),
+            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
+            &input,
+            &mut out,
+            0x9999_AAAA_BBBB_CCCCu64,
+        )
+        .unwrap();
+        assert_eq!(written, VIDEO_WIN32K_CALLBACKS_SIZE_X64);
+        assert_eq!(u64_at(&out, 0), 0x1111_2222_3333_4444);
+        assert_eq!(u64_at(&out, 8), 0x5555_6666_7777_8888);
+        assert_eq!(u32_at(&out, 16), 0);
+        assert_eq!(u64_at(&out, 24), 0x9999_AAAA_BBBB_CCCC);
+        assert_eq!(u32_at(&out, 32), 0);
+        assert_eq!(u32_at(&out, 36), 0);
+    }
+
+    #[test]
+    fn buffered_boot_video_control_uses_system_buffer_for_callbacks() {
+        let mut sys = [0u8; VIDEO_WIN32K_CALLBACKS_SIZE_X64];
+        sys[..8].copy_from_slice(&0x1010_2020_3030_4040u64.to_le_bytes());
+        sys[8..16].copy_from_slice(&0x5050_6060_7070_8080u64.to_le_bytes());
+        let written = dispatch_boot_video_buffered_io_control(
+            &miniport(),
+            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
+            &mut sys,
+            16,
+            VIDEO_WIN32K_CALLBACKS_SIZE_X64,
+            0x9090_A0A0_B0B0_C0C0u64,
+        )
+        .unwrap();
+        assert_eq!(written, VIDEO_WIN32K_CALLBACKS_SIZE_X64);
+        assert_eq!(u64_at(&sys, 0), 0x1010_2020_3030_4040);
+        assert_eq!(u64_at(&sys, 8), 0x5050_6060_7070_8080);
+        assert_eq!(u64_at(&sys, 24), 0x9090_A0A0_B0B0_C0C0);
+    }
+
+    #[test]
+    fn boot_video_control_unmap_is_a_visible_success_noop() {
+        let mut out = [0xCCu8; 8];
+        assert_eq!(
+            dispatch_boot_video_io_control(
+                &miniport(),
+                IOCTL_VIDEO_UNMAP_VIDEO_MEMORY,
+                &[],
+                &mut out,
+                0x1234,
+            ),
+            Ok(0)
+        );
+        assert_eq!(out, [0xCCu8; 8]);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use nt_io_manager::{
 };
 use nt_status::NtStatus;
 use nt_video_miniport::{
+    dispatch_boot_video_buffered_io_control, dispatch_boot_video_io_control,
     BootFramebufferMiniport, FramebufferMapping, VideoMiniportError, IOCTL_VIDEO_MAP_VIDEO_MEMORY,
 };
 
@@ -42,9 +43,6 @@ const VIDEO_DEVICE_PATH_STR: &str = "\\Device\\Video0";
 const VIDEO_DEVICE_PATH: &[u8] = b"\\Device\\Video0";
 const VIDEO_DEVICE_MAP_KEY_STR: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
 const VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE: &str = "MaxObjectNumber";
-const IOCTL_VIDEO_INIT_WIN32K_CALLBACKS: u32 = 0x0023_001C;
-const IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: u32 = 0x0023_045C;
-const VIDEO_WIN32K_CALLBACKS_SIZE_X64: u64 = 40;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const REG_SZ: u32 = 1;
@@ -459,11 +457,13 @@ impl DriverDispatchBackend for BootVideoDriverBackend {
                         });
                     }
                 };
-                match miniport.dispatch_buffered_io_control(
+                match dispatch_boot_video_buffered_io_control(
+                    &miniport,
                     ioctl,
                     ctx.system_buffer,
                     input_len,
                     output_len,
+                    unsafe { VIDEO_DEVICE_OBJECT },
                 ) {
                     Ok(information) => Ok(DispatchOutcome::Completed {
                         status: NtStatus::SUCCESS,
@@ -634,24 +634,6 @@ pub(crate) unsafe fn video_device_io_control(
             write_unaligned(bytes_ret, n);
         }
     };
-    if ioctl as u32 == IOCTL_VIDEO_INIT_WIN32K_CALLBACKS {
-        if in_buf == 0 || out_buf == 0 || in_len < 16 || out_len < VIDEO_WIN32K_CALLBACKS_SIZE_X64 {
-            return 1;
-        }
-        let phys_disp = read_unaligned(in_buf as *const u64);
-        let callout = read_unaligned((in_buf + 8) as *const u64);
-        write_unaligned(out_buf as *mut u64, phys_disp);
-        write_unaligned((out_buf + 8) as *mut u64, callout);
-        write_unaligned((out_buf + 16) as *mut u32, 0);
-        write_unaligned((out_buf + 24) as *mut u64, VIDEO_DEVICE_OBJECT);
-        write_unaligned((out_buf + 32) as *mut u32, 0);
-        set_ret(VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u32);
-        return 0;
-    }
-    if ioctl as u32 == IOCTL_VIDEO_UNMAP_VIDEO_MEMORY {
-        set_ret(0);
-        return 0;
-    }
     let input = if in_len == 0 {
         &[]
     } else if in_buf != 0 {
@@ -669,7 +651,13 @@ pub(crate) unsafe fn video_device_io_control(
     let Some(miniport) = core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)) else {
         return 1;
     };
-    match miniport.dispatch_io_control(ioctl as u32, input, output) {
+    match dispatch_boot_video_io_control(
+        &miniport,
+        ioctl as u32,
+        input,
+        output,
+        VIDEO_DEVICE_OBJECT,
+    ) {
         Ok(information) if information <= u32::MAX as usize => {
             set_ret(information as u32);
             if ioctl as u32 == IOCTL_VIDEO_MAP_VIDEO_MEMORY {

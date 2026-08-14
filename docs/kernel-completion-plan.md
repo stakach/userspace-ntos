@@ -1045,8 +1045,9 @@ before unrelated executive traffic monopolises the receive loop.
   drivers now uses registry devnode ID matching. The only remaining class-code scan is the local
   pre-hive bootstrap grant used before storage hives are available, and that path grants only when
   exactly one network-class function exists; multiple NICs defer selection to the later
-  registry-devnode path. Remaining display debt is hosting real videoprt/miniport instead of the
-  boot-framebuffer bridge.
+  registry-devnode path. The boot-framebuffer Video0 bridge now shares host-tested video-port IOCTL
+  semantics between the direct win32k EngDeviceIoControl shim and the I/O Manager backend. Remaining
+  display debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -3319,6 +3320,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   install, shell COM class service, and `exec_explorer_shell_chrome_painted` green. The final
   framebuffer is fully non-background (`786432/786432`) with at least 32 distinct non-background
   colors, so the B3 cleanup did not regress the desktop/icon frontier.
+
+- B3 video IOCTL bridge cleanup (2026-08-15). The boot-framebuffer Video0 route no longer keeps
+  win32k callback/unmap IOCTL semantics as executive-only code beside a different I/O Manager
+  backend path. `nt-video-miniport` now exposes host-tested boot-video control dispatch helpers that
+  cover `IOCTL_VIDEO_INIT_WIN32K_CALLBACKS`, `IOCTL_VIDEO_UNMAP_VIDEO_MEMORY`, and the existing
+  mode/map-memory controls; `video_device.rs` delegates both the direct EngDeviceIoControl shim and
+  the kernel `DriverDispatchBackend` path to those helpers. This does not close the larger
+  videoprt/miniport hosting item, but it removes one semantic fork from the current bridge.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
