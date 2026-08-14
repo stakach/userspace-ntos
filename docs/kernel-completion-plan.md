@@ -1039,16 +1039,27 @@ before unrelated executive traffic monopolises the receive loop.
 - `[x]` B2: Order boot/system drivers by `Start`, group, and tag metadata instead of compiled-in
   driver lists.
 - `[~]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
-  drivers create device objects/interfaces through I/O Manager mechanisms.
+  drivers create device objects/interfaces through I/O Manager mechanisms. The reusable PnP broker
+  no longer exposes the old class-code driver binding helper; PCI resource selection for hosted
+  drivers now uses registry devnode ID matching. The only remaining class-code scan is the local
+  pre-hive bootstrap grant used before storage hives are available. Remaining display debt is
+  hosting real videoprt/miniport instead of the boot-framebuffer bridge.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
 ### C. Memory Manager And VAD Correctness
 
-- `[~]` C1: Compare live executive `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`,
-  `NtProtectVirtualMemory`, `NtMapViewOfSection`, and fault handling with `nt-address-space`.
-- `[~]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
-  decommit, release, protect, query, and unmap semantics.
+- `[x]` C1: Compare live executive `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`,
+  `NtProtectVirtualMemory`, `NtMapViewOfSection`, and fault handling with `nt-address-space`. The
+  current live handlers use `VmRegionMap` for private reserve/commit/decommit/release/protect/query,
+  `VmCommittedRangeTable` for mapped/image views, and shared host-tested fault verdicts for private,
+  mapped, and image access.
+- `[x]` C2: Move process address-space state onto a host-tested VAD model with reserve, commit,
+  decommit, release, protect, query, and unmap semantics. Process private state is now represented
+  by the per-process `VmRegionMap`; non-private committed mappings live in the committed-view table;
+  old static/query-only bootstrap catalogs and mapped-view query branches are removed. The remaining
+  kernel mappings outside this model are explicit fixed authorities such as KUSER, registered
+  client frames, and the pre-hive/device bootstrap windows tracked by separate mechanisms.
 - `[x]` C3: Wire image and data section views into the VAD/fault path so mapped files own page fill
   and dirty writeback. This is closed for the current frontier: committed mapping ownership covers
   main images, ntdll, SEC_IMAGE DLLs, and generic data-section views; image and mapped-section
@@ -1116,7 +1127,7 @@ before unrelated executive traffic monopolises the receive loop.
   boots reuse persisted `SOFTWARE`, `SECURITY`, `SAM`, profile hive, and writable-profile directory
   state, then reach genuine userinit/Explorer shell chrome without first-boot-only evidence. Further
   storage work moves to D4 semantics and real-device hardening rather than D3 proof closure.
-- `[~]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
+- `[x]` D4: Complete volatile-key, transaction/log replay, setup-state, and user-profile durability
   behavior needed for repeat boots. The first D4 slice gives the volatile registry overlay
   first-class key volatility metadata and pins NT create semantics host-side: `REG_OPTION_VOLATILE`
   controls only creation of a new key, reopening an existing key keeps the original key identity and
@@ -1173,7 +1184,9 @@ before unrelated executive traffic monopolises the receive loop.
   `.tmp/run-headless-current-20260815-082827.log` reaches the desktop sentinel with `296/296` checks:
   `exec_ntloadkey_serviced`, `exec_profile_ntuser_dat_present`, `exec_winlogon_user_shell_activated`,
   `exec_userinit_process_spawned`, and `exec_explorer_shell_chrome_painted` all pass while mutable
-  hive flush/checkpoint gates remain green.
+  hive flush/checkpoint gates remain green. The current D4 frontier is closed for repeat-boot
+  registry/profile durability; future work should open a new storage-specific D item if real-device
+  crash consistency exposes a narrower gap.
 
 ## Immediate Iteration
 
@@ -3258,6 +3271,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   disposition, cross-volume rename refusal, and file-backed hive atomic replacement. The workstream
   status is now `[x]`; D4 remains open for volatile-key, journal replay, setup-state, and
   user-profile durability semantics.
+
+- C1/C2 current VM model audit closed (2026-08-15). The executive VM service handlers now use the
+  host-tested `nt-address-space` authorities across the named surfaces: private
+  `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtProtectVirtualMemory`, and
+  `NtQueryVirtualMemory` route through the per-process `VmRegionMap`; mapped/image
+  `NtMapViewOfSection`, `NtUnmapViewOfSection`, query, protect, and fault ownership route through
+  `VmCommittedRangeTable`; and fault access decisions consume the shared private/mapped/image
+  verdict helpers. Explicit non-VAD authorities remain visible as fixed authorities instead of
+  hidden shims. C1 and C2 are closed for the current frontier; future VM discoveries should open a
+  specific follow-up item.
+
+- D4 repeat-boot durability closed (2026-08-15). The volatile overlay metadata, public key query
+  metadata, provider-backed `HiveManager::try_flush`, mutation journal append/truncate, boot-hive
+  and dynamic profile-hive replay, setup seeding through journaled targets, no-fallback provider
+  boot errors, and regf profile sidecar replay now cover the repeat-boot path. The accepted
+  `.tmp/run-headless-current-20260815-082827.log` desktop proof keeps `NtLoadKey`, profile hive
+  presence, mutable flush/checkpoint gates, userinit, Explorer, and shell chrome green. D4 is closed
+  for registry/profile durability on the current storage boundary.
+
+- B3 class-binding cleanup slice (2026-08-15). The host-tested `nt-pnp` crate no longer exposes the
+  old `DriverClass` / `bind_driver` / `find_device_for_class` shortcut that selected devices by PCI
+  base class. Resource assignment tests now choose the NIC through `find_pci_device_for_devnode`
+  using registry-style hardware/compatible IDs, and the executive PnP broker dropped its unused
+  `assign_nic` wrapper. The reusable PnP boundary is therefore registry-devnode matching plus
+  resource assignment; the remaining early class-code scan is local pre-hive bootstrap only.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`

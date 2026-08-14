@@ -12,7 +12,7 @@
 //! This crate is the *broker's brain*: it
 //!   1. **enumerates** PCI config space (vendor/device/class, each BAR's base + SIZE via the
 //!      canonical write-all-ones probe, the IRQ line) into a device list,
-//!   2. **binds** an enumerated device to a driver class (by class code / vendor+device), and
+//!   2. **resolves** registry `Enum`/service devnodes to enumerated bus functions, and
 //!   3. **assigns resources** — builds the `CM_RESOURCE_LIST` (via `nt-cm-resources`) that
 //!      names the exact MMIO BAR + interrupt the executive then mints caps for.
 //!
@@ -232,36 +232,6 @@ where
         }
     }
     out
-}
-
-/// A driver class the PnP Manager can bind a device to. In the real system this comes from the
-/// `Enum`/`Services` registry (already read from the SYSTEM hive); a simple class match is enough
-/// for the first device (the NIC). Binding by registry `HardwareID` → service is a follow-on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DriverClass {
-    /// A network function driver (e.g. the e1000 NIC host).
-    Network,
-    /// A mass-storage function driver (AHCI/SATA).
-    Storage,
-    /// A display/GPU function driver.
-    Display,
-}
-
-/// Bind an enumerated device to a driver class by its PCI base class. Returns `None` for a class
-/// with no bound driver. (The registry-`HardwareID`-keyed binding is a documented follow-on; this
-/// class match is the same "network controller → NIC host" rule the executive used inline.)
-pub fn bind_driver(device: &PciDevice) -> Option<DriverClass> {
-    match device.base_class() {
-        PCI_CLASS_NETWORK => Some(DriverClass::Network),
-        PCI_CLASS_STORAGE => Some(DriverClass::Storage),
-        PCI_CLASS_DISPLAY => Some(DriverClass::Display),
-        _ => None,
-    }
-}
-
-/// Find the first enumerated device the PnP Manager would bind to `class`.
-pub fn find_device_for_class(devices: &[PciDevice], class: DriverClass) -> Option<&PciDevice> {
-    devices.iter().find(|d| bind_driver(d) == Some(class))
 }
 
 /// A parsed PCI registry ID constraint, such as `PCI\VEN_8086&DEV_100E` or `PCI\CC_020000`.
@@ -742,20 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn binds_network_class_to_nic_driver() {
-        let m = nic_mock();
-        let devs = enumerate_bus(
-            0,
-            |d, f, o| m.read(d, f, o),
-            |d, f, o, v| m.write(d, f, o, v),
-        );
-        assert_eq!(bind_driver(&devs[0]), Some(DriverClass::Network));
-        let nic = find_device_for_class(&devs, DriverClass::Network).unwrap();
-        assert_eq!(nic.device, 0x100E);
-        assert!(find_device_for_class(&devs, DriverClass::Storage).is_none());
-    }
-
-    #[test]
     fn parses_pci_registry_id_patterns() {
         assert_eq!(
             parse_pci_id_pattern(r"PCI\VEN_8086&DEV_100E&SUBSYS_00008086&REV_02"),
@@ -899,7 +855,13 @@ mod tests {
             |d, f, o| m.read(d, f, o),
             |d, f, o, v| m.write(d, f, o, v),
         );
-        let nic = find_device_for_class(&devs, DriverClass::Network).unwrap();
+        let nic = find_pci_device_for_devnode(
+            &devs,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[r"PCI\CC_020000"],
+        )
+        .unwrap();
         let assign = assign_resources(nic, 5, true, 1, 0x1000).unwrap();
         assert_eq!(assign.mmio_phys, 0xFEBC_0000);
         assert_eq!(assign.mmio_len, 0x2_0000);

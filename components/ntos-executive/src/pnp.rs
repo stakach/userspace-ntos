@@ -1,7 +1,7 @@
 //! `pnp` — the executive-side PnP cap-minting BROKER (the MECHANISM half of
 //! capability-secure PnP; the POLICY lives in the host-tested `nt-pnp` crate).
 //!
-//! `nt-pnp` decides *what* a device is granted (enumerate PCI → bind a driver →
+//! `nt-pnp` decides *what* a device is granted (enumerate PCI plus registry devnode matching →
 //! `CM_RESOURCE_LIST`); this module, running in the trusted root task where the
 //! privileged seL4 caps live, performs the grant by MINTING exactly the caps that
 //! resource list describes — the device's MMIO BAR frame caps, its IRQ notification,
@@ -10,11 +10,11 @@
 //! `project_driver_model.md`, effort 2, and `feedback_implement_kernel_api_for_real`).
 //!
 //! Scope this increment: enumerate the real PCI bus through `nt-pnp` over the
-//! executive's `pci_read32`/`pci_write32` closures, bind the NIC, and build its
-//! `CM_RESOURCE_LIST` from the enumerated BAR + assigned interrupt vector. The BAR
-//! frame caps + IRQ ntfn + DMA frame are minted by the executive's existing device
-//! primitives (`claim_device_pages`, `make_object`, `untyped_retype`) — driven here
-//! from the enumerated resource list rather than hand-authored constants.
+//! executive's `pci_read32`/`pci_write32` closures, resolve registry-selected devnodes, and build
+//! `CM_RESOURCE_LIST` bytes from the enumerated BARs + assigned interrupt vectors. The BAR frame
+//! caps + IRQ ntfn + DMA frames are minted by the executive's existing device primitives
+//! (`claim_device_pages`, `make_object`, `untyped_retype`) — driven here from the enumerated
+//! resource list rather than hand-authored constants.
 #![allow(clippy::all)]
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use crate::*;
 use nt_pnp::{
     assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
-    find_device_for_class, DriverClass, PciDevice, ResourceAssignment, RootBusResourceProfile,
-    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    PciDevice, ResourceAssignment, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
+    ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static ROOT_BUS_RESOURCE_PROFILES: [RootBusResourceProfile; 1] = [ROOT_DMA_TEST_RESOURCE_PROFILE];
@@ -39,35 +39,6 @@ pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevic
         |dev, func, off| pci_read32(pci_io, 0, dev, func, off),
         |dev, func, off, v| pci_write32(pci_io, 0, dev, func, off, v),
     )
-}
-
-/// The PnP resource assignment + minted caps for one device the broker granted.
-pub(crate) struct GrantedDevice {
-    /// The bound device (bus/dev/func + decoded BARs/IRQ from enumeration).
-    // Documentation-of-record: only the resource `assignment` is consumed downstream; the bound
-    // device identity is recorded for a future device-driver granting path (per-device caps).
-    #[allow(dead_code)]
-    pub device: PciDevice,
-    /// The abstract resource assignment (MMIO phys+len, interrupt vector, DMA len).
-    pub assignment: ResourceAssignment,
-}
-
-/// Bind + assign resources to the network device on bus 0: find the NIC (`nt-pnp` binds the
-/// network class to the NIC driver), then assign it its MMIO BAR + the given translated interrupt
-/// vector (+ a `dma_len`-byte common buffer). Returns `None` if no bindable NIC is present. This is
-/// the PnP arbitration step — the executive then mints the caps `assignment` names.
-pub(crate) fn assign_nic(
-    devices: &[PciDevice],
-    int_vector: u32,
-    int_latched: bool,
-    dma_len: u64,
-) -> Option<GrantedDevice> {
-    let nic = find_device_for_class(devices, DriverClass::Network)?;
-    let assignment = assign_resources(nic, int_vector, int_latched, /*affinity=*/ 1, dma_len)?;
-    Some(GrantedDevice {
-        device: nic.clone(),
-        assignment,
-    })
 }
 
 /// The PCI function and translated START resource bytes selected for one registry devnode.
