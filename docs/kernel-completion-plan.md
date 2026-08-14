@@ -1409,9 +1409,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    now consumes dispatcher-captured `ShareAccess`/`OpenOptions` instead of rereading stack slots.
    `NtFreeVirtualMemory` now probes the `PSIZE_T RegionSize` argument as a full eight-byte SIZE_T
    before reading and writing it, matching the existing x64 return path instead of accepting a
-   four-byte writable tail. The next slices should continue auditing remaining native stack
-   arguments while the shell frontier moves to real resource capacity instead of path-status
-   failures.
+   four-byte writable tail. The registered-service slice now removes the old raw register/stack
+   argument rereads from the executive handler for the main create/open/thread/LPC/file/section
+   services and consumes only the dispatcher-normalized `args[]` contract, including NT low-byte
+   `BOOLEAN` semantics for `NtCreateThread(CreateSuspended)`. The next slices should continue the
+   ABI-width audit at service bodies that still need typed truncation/probing while the shell frontier
+   moves to real resource capacity instead of path-status failures.
 
 ## Review Log
 
@@ -5195,3 +5198,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   pass; final summary is `296/296`. Remaining exactness gap: `DR6` is still synthesized as the
   architecture's initial/status-only value, because exact raw `DR6` read/write needs a microkernel
   debug-status extension rather than another executive-side shim.
+
+  Native syscall argument capture cleanup (2026-08-14): the registered native service handlers no
+  longer reread already-marshalled x64 arguments from `get_recv_mr(7..9)` or `smss_stack_read(sp+...)`
+  in `components/ntos-executive/src/exec_handler.rs`. `NtCreateThread`, `NtCreateProcess`,
+  `NtOpenFile`, `NtCreateNamedPipeFile`, `NtCreateFile`, `NtSecureConnectPort`, `NtConnectPort`,
+  `NtReadFile`, `NtWriteFile`, `NtQuerySection`, `NtCreateSection`, and `NtMapViewOfSection` now use
+  the dispatcher-captured `args[]` positions for both former register and stack parameters, and
+  `NtCreateThread(CreateSuspended)` applies NT `BOOLEAN` low-byte interpretation instead of treating
+  the whole captured machine word as a boolean. The touched comments were normalized to the same
+  captured-argument contract so the handler no longer documents obsolete stack-slot rereads.
+  Validation: `cargo fmt --all`, `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`; the focused grep for old raw argument
+  rereads in `exec_handler.rs` returns no matches.

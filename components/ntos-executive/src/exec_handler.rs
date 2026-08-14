@@ -36,6 +36,10 @@ const STATUS_ILLEGAL_FUNCTION: u32 = 0xC000_00AF;
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 const STATUS_CANCELLED: u32 = 0xC000_0120;
 const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
+const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
+const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
+const NT_CREATE_THREAD_INITIAL_TEB_ARG: usize = 6;
+const NT_CREATE_THREAD_CREATE_SUSPENDED_ARG: usize = 7;
 const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const AMD64_CONTEXT_SEG_CS_OFFSET: usize = 0x38;
 const AMD64_CONTEXT_SEG_DS_OFFSET: usize = 0x3A;
@@ -332,6 +336,10 @@ fn write_le_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
 #[inline]
 fn write_le_u64_at(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn nt_boolean_arg(value: u64) -> bool {
+    (value as u8) != 0
 }
 
 fn debug_register_error_status(error: nt_thread_start::Amd64DebugRegisterError) -> u32 {
@@ -10472,10 +10480,8 @@ impl ExecNtHandler {
                 nt_process::STATUS_PROCESS_IS_TERMINATING
             );
         };
-        // The caller's remaining NtCreateThread arguments live on its stack (x64: 5th..8th).
-        let sp = unsafe { get_recv_mr(16) };
-        let cid_ptr = unsafe { smss_stack_read(sp + 0x28) };
-        let ctx_va = unsafe { smss_stack_read(sp + 0x30) };
+        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
+        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
         if ctx_va == 0 {
             reject!(b"null-thread-context", STATUS_INVALID_PARAMETER);
         }
@@ -10486,14 +10492,14 @@ impl ExecNtHandler {
         if start.rip == 0 {
             reject!(b"null-start-address", STATUS_INVALID_PARAMETER);
         }
-        let initial_teb_va = unsafe { smss_stack_read(sp + 0x38) };
+        let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
         let initial_teb = (initial_teb_va != 0).then(|| {
             nt_thread_start::InitialTeb64::read(
                 |address| unsafe { smss_stack_read(address) },
                 initial_teb_va,
             )
         });
-        let create_suspended = unsafe { smss_stack_read(sp + 0x40) } != 0;
+        let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
         // workers — one window per extra thread of that process.
         let Some(slot) = self.first_free_hosted_tp_worker_slot(target_pi) else {
@@ -10879,15 +10885,17 @@ impl ExecNtHandler {
         args: &[u64],
         ntdll_pool_worker_only: bool,
     ) -> Option<u32> {
-        if args.len() <= 3 || args[3] != u64::MAX || self.pi >= MAX_PI {
+        if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG
+            || args[3] != u64::MAX
+            || self.pi >= MAX_PI
+        {
             return None;
         }
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let sp = get_recv_mr(16);
-        let ctx_va = smss_stack_read(sp + 0x30);
+        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
         let start =
             nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
-        let initial_teb_va = smss_stack_read(sp + 0x38);
+        let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
         let initial_teb = (initial_teb_va != 0).then(|| {
             nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va)
         });
@@ -10911,7 +10919,8 @@ impl ExecNtHandler {
         } else {
             None
         };
-        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+        let create_suspended =
+            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         if self.pi == 6 {
             let n = EXPLORER_TP_CREATE_TRACE_N.fetch_add(1, Ordering::Relaxed);
             if n < 96 {
@@ -11053,7 +11062,7 @@ impl ExecNtHandler {
         self.pm
             .set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
         self.queue_write(args[0], handle);
-        let cid_ptr = smss_stack_read(sp + 0x28);
+        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
         if cid_ptr != 0 {
             self.queue_write(cid_ptr, pid as u64);
             self.queue_write(cid_ptr + 8, tid);
@@ -15083,12 +15092,11 @@ impl ExecNtHandler {
     /// `ExpirationTime, TokenUser, TokenGroups, TokenPrivileges, TokenOwner, TokenPrimaryGroup,`
     /// `TokenDefaultDacl, TokenSource)` — `ntoskrnl/se/tokenlif.c:1559`.
     ///
-    /// The **widest** service the executive hosts by argument-*meaning*: thirteen arguments, of
-    /// which the first four ride in `r10/rdx/r8/r9` and args 5..13 come off the caller's stack. The
-    /// dispatcher's generic marshaller already gathers them (arity 13 from the shared
-    /// `nt_syscall_abi` table, read at `[rsp+0x28 + 8*i]` through the client mirror), so this
-    /// handler receives a flat `args[0..13]` — but it must NOT assume it: a short vector means the
-    /// stack copy-in failed and the call fails closed.
+    /// The **widest** service the executive hosts by argument-*meaning*: thirteen arguments, all
+    /// normalized by the dispatcher's generic marshaller (arity 13 from the shared
+    /// `nt_syscall_abi` table) before this handler runs. The handler receives a flat `args[0..13]`
+    /// — but it must NOT assume it: a short vector means the copy-in failed and the call fails
+    /// closed.
     ///
     /// Six of the thirteen arguments point at **variable-length structures in the caller's address
     /// space**, several of which are themselves arrays of pointers to SIDs. That capture is the
@@ -18927,9 +18935,9 @@ impl ExecNtHandler {
         let ctx = self.loop_ctx.unwrap();
         let reg = &mut *ctx.reg;
         const FILE_DIRECTORY_FILE: u64 = 0x01;
-        let file_handle_out = get_recv_mr(9);
+        let file_handle_out = args[0];
         {
-            let oa_probe = get_recv_mr(7);
+            let oa_probe = args[2];
             let nm = self.read_objattr_name_pe(oa_probe);
             if boot_status_path_matches(&nm) {
                 let options = args[5] as u32;
@@ -18949,7 +18957,7 @@ impl ExecNtHandler {
                 } else {
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     let info = if status == nt_fs::STATUS_SUCCESS {
@@ -18976,7 +18984,7 @@ impl ExecNtHandler {
         // Named-pipe client open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
         // npfs (IRP_MJ_CREATE = client connect -> finds the FCB via the real prefix tree).
         {
-            let oa_probe = get_recv_mr(7);
+            let oa_probe = args[2];
             let nm = self.read_objattr_name_pe(oa_probe);
             let lc: alloc::vec::Vec<u8> =
                 nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
@@ -19007,7 +19015,7 @@ impl ExecNtHandler {
                 } else {
                     0
                 };
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
@@ -19079,7 +19087,7 @@ impl ExecNtHandler {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
                         }
                         let info = if status == 0 { 1u64 } else { 0 };
-                        let iosb = get_recv_mr(8);
+                        let iosb = args[3];
                         if iosb != 0 {
                             self.xas_write_buf(iosb, &status.to_le_bytes());
                             self.xas_write_buf(iosb + 8, &info.to_le_bytes());
@@ -19110,7 +19118,7 @@ impl ExecNtHandler {
                     }
                     Err(status) => {
                         self.write_nt_open_file_handle_out(file_handle_out, 0);
-                        let iosb = get_recv_mr(8);
+                        let iosb = args[3];
                         if iosb != 0 {
                             self.xas_write_buf(iosb, &status.to_le_bytes());
                             self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
@@ -19136,7 +19144,7 @@ impl ExecNtHandler {
         }
         // Read through the hosted process address space: activation-context filenames may live on
         // ntdll's process heap, not in the legacy boot mirror.
-        let name16 = self.read_objattr_name_pe(get_recv_mr(7));
+        let name16 = self.read_objattr_name_pe(args[2]);
         let mut nb = [0u8; 96];
         let nlen = {
             let mut n = 0;
@@ -19174,7 +19182,7 @@ impl ExecNtHandler {
                 if opened_handle == 0 {
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     let info = if status == nt_fs::STATUS_SUCCESS {
@@ -19220,7 +19228,7 @@ impl ExecNtHandler {
                 if opened_handle == 0 {
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     let info = if status == nt_fs::STATUS_SUCCESS {
@@ -19410,7 +19418,7 @@ impl ExecNtHandler {
                 };
                 let Some(h) = h else {
                     let status = 0xC000_009A;
-                    let iosb = get_recv_mr(8);
+                    let iosb = args[3];
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                     if iosb != 0 {
                         smss_stack_write32(iosb, status);
@@ -19441,7 +19449,7 @@ impl ExecNtHandler {
                             print_str(b"\n");
                         }
                         self.write_nt_open_file_handle_out(file_handle_out, 0);
-                        let iosb = get_recv_mr(8);
+                        let iosb = args[3];
                         if iosb != 0 {
                             smss_stack_write32(iosb, status);
                             smss_stack_write(iosb + 8, 0);
@@ -19462,7 +19470,7 @@ impl ExecNtHandler {
                 if let Some(i) = dll_i {
                     reg.set_file_handle(self.pi, i, h);
                 }
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     smss_stack_write32(iosb, 0);
                     smss_stack_write(iosb + 8, 1);
@@ -19480,7 +19488,7 @@ impl ExecNtHandler {
                     status = 0xC000_009A;
                     self.write_nt_open_file_handle_out(file_handle_out, 0);
                 }
-                let iosb = get_recv_mr(8);
+                let iosb = args[3];
                 if iosb != 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(
@@ -19533,8 +19541,7 @@ impl ExecNtHandler {
     #[inline(never)]
     unsafe fn nt_create_process_service(&mut self, args: &[u64]) -> u32 {
         let ctx = self.loop_ctx.unwrap();
-        let sp = get_recv_mr(16);
-        let sect = smss_stack_read(sp + 0x30);
+        let sect = args[5];
         let slot_info = {
             let table = &*ctx.exe_images;
             table.index_for_section(self.pi, sect).and_then(|index| {
@@ -19603,7 +19610,7 @@ impl ExecNtHandler {
             self.pi,
             sect,
             args[1] as u32,
-            get_recv_mr(9),
+            args[0],
         ) {
             Ok(request) => {
                 self.exe_spawn_request = Some(request);
@@ -20330,10 +20337,12 @@ impl ExecNtHandler {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
-            // NtCreateKey(*KeyHandle[0], DesiredAccess[1], *ObjectAttributes[2], TitleIndex, *Class,
-            // CreateOptions, *Disposition[sp+0x38]). Persistent mounted-hive keys are created/opened
-            // in `MutableHiveSet`; explicitly volatile keys and paths outside mounted hives stay in
-            // the volatile overlay until D4 gives volatile keys first-class hive ownership.
+            // NtCreateKey captured args: *KeyHandle=args[0], DesiredAccess=args[1],
+            // *ObjectAttributes=args[2], TitleIndex=args[3], *Class=args[4],
+            // CreateOptions=args[5], *Disposition=args[6]. Persistent mounted-hive keys are
+            // created/opened in `MutableHiveSet`; explicitly volatile keys and paths outside mounted
+            // hives stay in the volatile overlay until D4 gives volatile keys first-class hive
+            // ownership.
             NativeService::NtCreateKey => unsafe {
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
                     return 0xC000_0005;
@@ -20731,9 +20740,9 @@ impl ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS
             },
-            // NtSetValueKey(KeyHandle[0], *ValueName[1], TitleIndex, Type[3], Data[sp+0x28],
-            // DataSize[sp+0x30]). Mounted-hive keys write into `MutableHiveSet`; overlay handles
-            // keep using the volatile overlay.
+            // NtSetValueKey captured args: KeyHandle=args[0], *ValueName=args[1],
+            // TitleIndex=args[2], Type=args[3], Data=args[4], DataSize=args[5]. Mounted-hive keys
+            // write into `MutableHiveSet`; overlay handles keep using the volatile overlay.
             NativeService::NtSetValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -21348,9 +21357,9 @@ impl ExecNtHandler {
             // `NpFsdCreateNamedPipe` allocates the FCB/CCB + FILE_OBJECT identity that later
             // `FSCTL_PIPE_LISTEN`, read, write, and transceive calls route back to.
             NativeService::NtCreateNamedPipeFile => unsafe {
-                let file_handle_out = get_recv_mr(9); // R10 = *FileHandle
-                let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
-                let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
+                let file_handle_out = args[0];
+                let iosb = args[3];
+                let oa = args[2];
                 let name16 = self.read_objattr_name_pe(oa);
                 let leaf = Self::pipe_leaf16(&name16);
                 let info: u64 = nt_fs::FILE_CREATED as u64;
@@ -21460,15 +21469,17 @@ impl ExecNtHandler {
                 self.pipe_name_wait_redrive = nt_io_manager::pipe_name_hash(&leaf);
                 0 // STATUS_SUCCESS
             },
-            // NtDeviceIoControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // IoStatusBlock[sp+0x28], IoControlCode[sp+0x30], ...). Dispatch buffered device
-            // controls through the real FILE_OBJECT/device route owned by the process handle table.
+            // NtDeviceIoControlFile captured args: FileHandle=args[0], Event=args[1],
+            // ApcRoutine=args[2], ApcContext=args[3], IoStatusBlock=args[4],
+            // IoControlCode=args[5], ... Dispatch buffered device controls through the real
+            // FILE_OBJECT/device route owned by the process handle table.
             NativeService::NtDeviceIoControlFile => unsafe {
                 self.nt_device_io_control_file_service(args)
             },
-            // NtFsControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // IoStatusBlock[sp+0x28], FsControlCode[sp+0x30], ...). Route named-pipe FSCTLs through
-            // live NPFS state; unsupported handles fail rather than manufacturing pipe progress.
+            // NtFsControlFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
+            // ApcContext=args[3], IoStatusBlock=args[4], FsControlCode=args[5], ... Route
+            // named-pipe FSCTLs through live NPFS state; unsupported handles fail rather than
+            // manufacturing pipe progress.
             NativeService::NtFsControlFile => unsafe {
                 let iosb = args[4];
                 // Hosted pipe clients route FSCTLs (LISTEN/WAIT/TRANSCEIVE) to npfs for tracked pipe
@@ -22484,9 +22495,9 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30);
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
@@ -22511,7 +22522,7 @@ impl ExecNtHandler {
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
-                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
@@ -22569,8 +22580,8 @@ impl ExecNtHandler {
                             Some(tid) => tid,
                             None => return 0xC000_0008,
                         };
-                        let sp = get_recv_mr(16);
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         let handle = match self.insert_process_handle(
                             caller_pid,
                             nt_process::HandleObject::Thread(tid),
@@ -22580,7 +22591,7 @@ impl ExecNtHandler {
                             Err(status) => return status,
                         };
                         self.queue_write(args[0], handle);
-                        let cid_ptr = smss_stack_read(sp + 0x28);
+                        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                         if cid_ptr != 0 {
                             self.queue_write(cid_ptr, target_pid as u64);
                             self.queue_write(cid_ptr + 8, tid as u64);
@@ -22641,15 +22652,15 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let cid_ptr = smss_stack_read(sp + 0x28);
-                        let ctx_va = smss_stack_read(sp + 0x30);
-                        let initial_teb = smss_stack_read(sp + 0x38);
+                        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
+                        let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
                         let initial_stack = nt_thread_start::InitialTeb64::read(
                             |address| smss_stack_read(address),
                             initial_teb,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
@@ -22750,13 +22761,13 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
@@ -22773,7 +22784,7 @@ impl ExecNtHandler {
                                 .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
@@ -22796,13 +22807,13 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
@@ -22819,7 +22830,7 @@ impl ExecNtHandler {
                                 .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
@@ -22844,13 +22855,13 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
@@ -22866,7 +22877,7 @@ impl ExecNtHandler {
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
-                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
@@ -22887,13 +22898,13 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
@@ -22912,14 +22923,14 @@ impl ExecNtHandler {
                             );
                             let pid = self.current_pm_pid().unwrap_or(0);
                             self.queue_write(args[0], handle);
-                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64);
                                 self.queue_write(cid_ptr + 8, tid);
                             }
                             self.thread_spawn_request =
                                 Some(HostedThreadSpawnRequest::LsassListener { slot: 2 });
-                            let initial_teb = smss_stack_read(sp + 0x38);
+                            let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
                             print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
                             print_hex(args[3] as u32);
                             print_str(b" slot=2 start=0x");
@@ -22958,13 +22969,13 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let sp = get_recv_mr(16);
-                        let context = smss_stack_read(sp + 0x30);
+                        let context = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let start = nt_thread_start::Amd64ThreadContext::read(
                             |address| smss_stack_read(address),
                             context,
                         );
-                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let create_suspended =
+                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
                             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
@@ -22980,7 +22991,7 @@ impl ExecNtHandler {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SM_TEB_VA);
                             self.queue_write(args[0], handle);
-                            let client_id = smss_stack_read(sp + 0x28);
+                            let client_id = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
                             if client_id != 0 {
                                 self.queue_write(
                                     client_id,
@@ -23016,15 +23027,14 @@ impl ExecNtHandler {
             // connect is completed by the real CsrApiRequestThread rendezvous; the executive fills
             // CSR_API_CONNECTINFO (SharedSection pointers + BASE_STATIC_SERVER_DATA) and the LpcWrite
             // PORT_VIEW because that connect payload is not carried by the isolated broker yet.
-            // x64 ABI: PortHandle=R10=args[0], PortName=RDX=args[1], SecurityQos=R8, ClientView=R9,
-            // ServerSid=[sp+0x28], ServerView=[sp+0x30], MaxMsgLen=[sp+0x38], ConnInfo=[sp+0x40],
-            // ConnInfoLen=[sp+0x48].
+            // Captured ABI args: PortHandle=args[0], PortName=args[1], SecurityQos=args[2],
+            // ClientView=args[3], ServerSid=args[4], ServerView=args[5], MaxMsgLen=args[6],
+            // ConnInfo=args[7], ConnInfoLen=args[8].
             NativeService::NtSecureConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
-                let sp = get_recv_mr(16);
-                let porthandle_ptr = get_recv_mr(9); // R10 = *PortHandle (&CsrApiPort, ntdll .data)
-                let clientview_ptr = get_recv_mr(8); // R9 = *ClientView (PORT_VIEW, stack local)
-                let conninfo_ptr = smss_stack_read(sp + 0x40); // arg8 = *ConnectionInformation (stack)
+                let porthandle_ptr = args[0];
+                let clientview_ptr = args[3];
+                let conninfo_ptr = args[7];
                 self.csr_client_connect(&name16, porthandle_ptr, clientview_ptr, conninfo_ptr)
             },
             // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
@@ -23074,9 +23084,8 @@ impl ExecNtHandler {
             // via sm_rendezvous. This is what unblocks csrss's SmConnectToSm.
             NativeService::NtConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
-                let sp = get_recv_mr(16);
-                let conn_info_ptr = smss_stack_read(sp + 0x38);
-                let conn_info_len_ptr = smss_stack_read(sp + 0x40);
+                let conn_info_ptr = args[6];
+                let conn_info_len_ptr = args[7];
                 let mut conn_info = [0u8; 0xF4];
                 let mut conn_info_len = 0usize;
                 if conn_info_ptr != 0 && conn_info_len_ptr != 0 {
@@ -23267,7 +23276,7 @@ impl ExecNtHandler {
                 unsafe {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
-                    // EventType[R9]=args[3], InitialState=args[4] from stack [sp+0x28].
+                    // EventType=args[3], InitialState=args[4].
                     if args[3] > 1 {
                         return 0xC000_000D; // STATUS_INVALID_PARAMETER
                     }
@@ -25551,9 +25560,9 @@ impl ExecNtHandler {
                 }
                 0
             },
-            // NtQueryDirectoryObject(DirectoryHandle[R10]=args[0], Buffer[RDX]=args[1],
-            // Length[R8]=args[2], ReturnSingleEntry[R9]=args[3], RestartScan[sp+0x28],
-            // *Context[sp+0x30], *ReturnLength[sp+0x38]). ntdll's named-object path enumerates
+            // NtQueryDirectoryObject captured args: DirectoryHandle=args[0], Buffer=args[1],
+            // Length=args[2], ReturnSingleEntry=args[3], RestartScan=args[4], *Context=args[5],
+            // *ReturnLength=args[6]. ntdll's named-object path enumerates
             // \BaseNamedObjects. Enumerate the target directory's children as
             // OBJECT_DIRECTORY_INFORMATION records (x64: {UNICODE_STRING Name; UNICODE_STRING
             // TypeName;} = 0x20 bytes each), terminated by a zero record, followed by the UTF-16
@@ -26850,15 +26859,16 @@ impl ExecNtHandler {
                 self.xas_write_buf(args[2], &depth.to_le_bytes());
                 nt_io_completion::STATUS_SUCCESS
             },
-            // NtCreateFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
-            // *IoStatusBlock[R9], AllocationSize[sp+0x28], FileAttributes[sp+0x30],
-            // ShareAccess[sp+0x38], CreateDisposition[sp+0x40], CreateOptions[sp+0x48], ...).
+            // NtCreateFile captured args: *FileHandle=args[0], DesiredAccess=args[1],
+            // *OBJECT_ATTRIBUTES=args[2], *IoStatusBlock=args[3], AllocationSize=args[4],
+            // FileAttributes=args[5], ShareAccess=args[6], CreateDisposition=args[7],
+            // CreateOptions=args[8], EaBuffer=args[9], EaLength=args[10].
             // Route named-pipe client opens through the isolated npfs FSD for every hosted process.
             // Other file namespaces remain unsupported rather than receiving a fake handle.
             NativeService::NtCreateFile => unsafe {
-                let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
+                let oa = args[2];
                 let name16 = self.read_objattr_name_pe(oa);
-                let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
+                let iosb = args[3];
                 if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
                     print_str(b"[nt-create-file-frontier] pi=");
                     print_u64(self.pi as u64);
@@ -27292,18 +27302,18 @@ impl ExecNtHandler {
             // their own IOSBs/events/file objects with STATUS_CANCELLED; this syscall's IOSB reports
             // the cancel request itself as STATUS_SUCCESS, matching ReactOS IoMgr.
             NativeService::NtCancelIoFile => unsafe { self.nt_cancel_io_file_service(args) },
-            // NtWriteFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ByteOffset[sp+0x40],
-            // Key[sp+0x48]). Route typed named-pipe handles through isolated npfs with the caller's
-            // actual bytes. The shared FSD transport is four pages, so reject an over-sized request
-            // rather than silently truncating it. Driver status + Information are returned verbatim.
+            // NtWriteFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
+            // ApcContext=args[3], *IoStatusBlock=args[4], Buffer=args[5], Length=args[6],
+            // ByteOffset=args[7], Key=args[8]. Route typed named-pipe handles through isolated npfs
+            // with the caller's actual bytes. The shared FSD transport is four pages, so reject an
+            // over-sized request rather than silently truncating it. Driver status + Information are
+            // returned verbatim.
             NativeService::NtWriteFile => unsafe {
-                let sp = get_recv_mr(16);
-                let iosb = smss_stack_read(sp + 0x28);
-                let buffer = smss_stack_read(sp + 0x30);
-                let len = smss_stack_read(sp + 0x38) as u32 as usize;
-                let byte_offset = smss_stack_read(sp + 0x40);
-                let key = smss_stack_read(sp + 0x48);
+                let iosb = args[4];
+                let buffer = args[5];
+                let len = args[6] as u32 as usize;
+                let byte_offset = args[7];
+                let key = args[8];
                 let fh = args[0]; // R10 = FileHandle
                 let event = args[1];
                 let apc_routine = args[2];
@@ -27682,15 +27692,15 @@ impl ExecNtHandler {
                 }
                 status
             },
-            // NtReadFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). Route a typed pipe
-            // through npfs with output capacity (not input bytes), then copy synchronous data back.
+            // NtReadFile captured args: FileHandle=args[0], Event=args[1], ApcRoutine=args[2],
+            // ApcContext=args[3], *IoStatusBlock=args[4], Buffer=args[5], Length=args[6],
+            // ByteOffset=args[7], Key=args[8]. Route a typed pipe through npfs with output capacity
+            // (not input bytes), then copy synchronous data back.
             NativeService::NtReadFile => unsafe {
-                let sp = get_recv_mr(16);
-                let iosb = smss_stack_read(sp + 0x28);
-                let buffer = smss_stack_read(sp + 0x30);
-                let len = smss_stack_read(sp + 0x38) as u32 as usize;
-                let byte_offset = smss_stack_read(sp + 0x40);
+                let iosb = args[4];
+                let buffer = args[5];
+                let len = args[6] as u32 as usize;
+                let byte_offset = args[7];
                 let fh = args[0];
                 let event = args[1];
                 let apc_routine = args[2];
@@ -28090,10 +28100,11 @@ impl ExecNtHandler {
                 }
                 status
             },
-            // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
-            // Length[R9], FileInformationClass[sp+0x28]). FilePipeInformation is a normal
-            // named-pipe handle operation; route it by typed FILE_OBJECT context so dynamically
-            // launched services use the same NPFS path as bootstrap system processes.
+            // NtSetInformationFile captured args: FileHandle=args[0], *IoStatusBlock=args[1],
+            // FileInformation=args[2], Length=args[3], FileInformationClass=args[4].
+            // FilePipeInformation is a normal named-pipe handle operation; route it by typed
+            // FILE_OBJECT context so dynamically launched services use the same NPFS path as bootstrap
+            // system processes.
             NativeService::NtSetInformationFile => unsafe {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
                 let information_class = args[4] as u32;
@@ -28413,8 +28424,9 @@ impl ExecNtHandler {
                 }
                 status
             },
-            // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
-            // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
+            // NtOpenFile captured args: *FileHandle=args[0], DesiredAccess=args[1],
+            // *OBJECT_ATTRIBUTES=args[2], *IoStatusBlock=args[3], ShareAccess=args[4],
+            // OpenOptions=args[5].
             // SmpCreateInitialSession opens %SystemRoot%\system32 as a DIRECTORY
             // (FILE_DIRECTORY_FILE) before creating the KnownDllPath symlink + looping KnownDLLs.
             // Hand back a directory handle so it proceeds; a plain FILE open (an individual
@@ -28425,7 +28437,8 @@ impl ExecNtHandler {
                 ));
                 service(self as *mut ExecNtHandler, args.as_ptr(), args.len())
             },
-            // NtQuerySection(SectionHandle[R10], class[RDX]=args[1], buf[R8], len[R9], *ResultLen[sp+0x28]).
+            // NtQuerySection captured args: SectionHandle=args[0], class=args[1], buf=args[2],
+            // len=args[3], *ResultLen=args[4].
             // ReactOS accepts SectionBasicInformation for every valid section and
             // SectionImageInformation only for SEC_IMAGE sections. Data/file-backed mappings must
             // therefore report their real basic geometry instead of falling off the hosted-image path.
@@ -28437,12 +28450,11 @@ impl ExecNtHandler {
                 const STATUS_SECTION_NOT_IMAGE: u32 = 0xC000_0049;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
-                let class = args[1]; // RDX
-                let buf = get_recv_mr(7); // R8
-                let len = get_recv_mr(8); // R9
-                let sect = get_recv_mr(9); // R10 = SectionHandle
-                let sp = get_recv_mr(16);
-                let result_len = smss_stack_read(sp + 0x28);
+                let sect = args[0];
+                let class = args[1];
+                let buf = args[2];
+                let len = args[3];
+                let result_len = args[4];
                 let required = match class {
                     SECTION_BASIC_INFORMATION => SECTION_BASIC_INFORMATION_SIZE,
                     SECTION_IMAGE_INFORMATION => SECTION_IMAGE_INFORMATION_SIZE,
@@ -28600,8 +28612,9 @@ impl ExecNtHandler {
                     STATUS_ACCESS_VIOLATION
                 }
             },
-            // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
-            // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
+            // NtCreateSection captured args: *SectionHandle=args[0], access=args[1], *OA=args[2],
+            // *MaxSize=args[3], PageProtection=args[4], AllocationAttributes=args[5],
+            // FileHandle=args[6].
             // Unlike the other creates, smss USES the section handle (NtCreateProcess), so write it to
             // the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record the handle
             // so NtCreateProcess can spawn the real csrss image from it.
@@ -28615,9 +28628,8 @@ impl ExecNtHandler {
                 let dll_pes = ctx.dll_pes();
                 let filled_pages = &mut *ctx.filled_pages;
                 let faults = &mut *ctx.faults;
-                let sp = get_recv_mr(16);
-                let out = get_recv_mr(9); // R10 = *SectionHandle
-                let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
+                let out = args[0];
+                let maxsize_ptr = args[3];
                 let mut maxsize = 0u64;
                 if maxsize_ptr != 0 {
                     let mut bytes = [0u8; 8];
@@ -28626,9 +28638,9 @@ impl ExecNtHandler {
                     }
                     maxsize = u64::from_le_bytes(bytes);
                 }
-                let page_protection = smss_stack_read(sp + 0x28) as u32;
-                let allocation_attrs = smss_stack_read(sp + 0x30) as u32;
-                let sec_file = smss_stack_read(sp + 0x38);
+                let page_protection = args[4] as u32;
+                let allocation_attrs = args[5] as u32;
+                let sec_file = args[6];
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
                 if allocation_attrs & SEC_IMAGE != 0 {
@@ -28861,8 +28873,10 @@ impl ExecNtHandler {
                 );
                 0
             },
-            // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
-            // ZeroBits[R9], CommitSize[sp+0x28], *SectionOffset[sp+0x30], *ViewSize[sp+0x38], …).
+            // NtMapViewOfSection captured args: SectionHandle=args[0], ProcessHandle=args[1],
+            // *BaseAddress=args[2], ZeroBits=args[3], CommitSize=args[4],
+            // *SectionOffset=args[5], *ViewSize=args[6], InheritDisposition=args[7],
+            // AllocationType=args[8], Win32Protect=args[9].
             // Map a registry DLL SEC_IMAGE at its (fixed) registry base, the anonymous CSR shared
             // section, or the named NLS section into csrss's VSpace; the fault router demand-pages
             // the DLL/anon views and the NLS frames are mapped eagerly here.
@@ -28875,8 +28889,7 @@ impl ExecNtHandler {
                 let faults = &mut *ctx.faults;
                 let pml4 = ctx.pml4;
                 let scratch_base = ctx.scratch_base;
-                let sp = get_recv_mr(16);
-                let sect = get_recv_mr(9);
+                let sect = args[0];
                 if let Some(i) = reg.index_for_section(self.pi, sect) {
                     // Reserve every 2 MiB PT window touched by this DLL's compact VA range. Compact
                     // neighbors may share a PT and large images may span several.
@@ -28916,8 +28929,8 @@ impl ExecNtHandler {
                             let _ = reg.clear_mapped(self.pi, i);
                             return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                         }
-                        csrss_out_write(self.pi as u64, get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
-                        let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                        csrss_out_write(self.pi as u64, args[2], dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                        let vs_ptr = args[6];
                         if vs_ptr != 0 {
                             csrss_out_write(self.pi as u64, vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                         }
@@ -29011,8 +29024,8 @@ impl ExecNtHandler {
                     }
                     // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
                     // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
-                    csrss_out_write(self.pi as u64, get_recv_mr(7), *ctx.csrss_anon_base, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
-                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    csrss_out_write(self.pi as u64, args[2], *ctx.csrss_anon_base, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                    let vs_ptr = args[6];
                     if vs_ptr != 0 {
                         csrss_out_write(self.pi as u64, vs_ptr, *ctx.csrss_anon_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     }
@@ -29045,8 +29058,8 @@ impl ExecNtHandler {
                     for i in 0..npages {
                         let _ = page_map(copy_cap(nls_start + i), NLS_SECTION_CSRSS_VA + i * 0x1000, RW_NX, pml4);
                     }
-                    csrss_out_write(self.pi as u64, get_recv_mr(7), NLS_SECTION_CSRSS_VA, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
-                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    csrss_out_write(self.pi as u64, args[2], NLS_SECTION_CSRSS_VA, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                    let vs_ptr = args[6];
                     if vs_ptr != 0 {
                         csrss_out_write(self.pi as u64, vs_ptr, nls_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     }
@@ -29093,8 +29106,8 @@ impl ExecNtHandler {
                     }) {
                         return nt_process::STATUS_PROCESS_IS_TERMINATING;
                     }
-                    let base_ptr = get_recv_mr(7); // R8 = *BaseAddress
-                    let view_size_ptr = smss_stack_read(sp + 0x38);
+                    let base_ptr = args[2];
+                    let view_size_ptr = args[6];
                     if base_ptr == 0
                         || view_size_ptr == 0
                         || !self.probe_user_output(base_ptr, 8)
@@ -29111,7 +29124,7 @@ impl ExecNtHandler {
                         return STATUS_ACCESS_VIOLATION;
                     }
                     let view_size_in = u64::from_le_bytes(word);
-                    let section_offset_ptr = smss_stack_read(sp + 0x30);
+                    let section_offset_ptr = args[5];
                     let mut section_offset = 0u64;
                     if section_offset_ptr != 0 {
                         if !self.xas_read(section_offset_ptr, &mut word) {
@@ -29137,7 +29150,7 @@ impl ExecNtHandler {
                     if map_size == 0 {
                         return STATUS_INVALID_VIEW_SIZE;
                     }
-                    let zero_bits = get_recv_mr(8);
+                    let zero_bits = args[3];
                     if zero_bits > 53 {
                         return nt_address_space::STATUS_INVALID_PARAMETER_3;
                     }
@@ -29150,8 +29163,8 @@ impl ExecNtHandler {
                     } else {
                         PRIVATE_VM_LIMIT
                     };
-                    let allocation_type = smss_stack_read(sp + 0x48) as u32;
-                    let win32_protect = smss_stack_read(sp + 0x50) as u32;
+                    let allocation_type = args[8] as u32;
+                    let win32_protect = args[9] as u32;
                     let view_protection = if win32_protect == 0 {
                         section.protection
                     } else {
@@ -29283,10 +29296,11 @@ impl ExecNtHandler {
                     nt_process::STATUS_INVALID_HANDLE
                 }
             },
-            // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
-            // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Control-flow case: validate the
-            // SectionHandle through the executable image table, reserve the process publication, then
-            // let the loop build the seL4 mechanism from the same SpawnRequest used by Win32 children.
+            // NtCreateProcess captured args: *ProcessHandle=args[0], access=args[1], *OA=args[2],
+            // ParentProcess=args[3], InheritHandles=args[4], SectionHandle=args[5].
+            // Control-flow case: validate the SectionHandle through the executable image table, reserve
+            // the process publication, then let the loop build the seL4 mechanism from the same
+            // SpawnRequest used by Win32 children.
             NativeService::NtCreateProcess => unsafe {
                 let service = core::ptr::read_volatile(core::ptr::addr_of!(
                     NT_CREATE_PROCESS_SERVICE_ENTRY
