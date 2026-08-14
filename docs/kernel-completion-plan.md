@@ -39,7 +39,7 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-gdi-record-pool-20260815-091205.log` reaches the harness sentinel with `296/296`
+`.tmp/run-desktop-video-metadata-pool-20260815-093243.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the B3 display registration cleanup. This retains the
 D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat` image is
 staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey` checkpoints
@@ -3350,10 +3350,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
 - B3 Video0 metadata cap cleanup (2026-08-15). The temporary boot-framebuffer bridge no longer
   rejects registry-selected display driver names or service registry paths because they exceed the
-  old 32/128 byte static buffers. `video_device.rs` now stores the published driver/service metadata
-  in owned vectors, builds the `\Driver\<service>` route path from checked allocation, and treats
-  allocation failure as a real registration failure. Validation: `cargo fmt --all` and `cargo check
-  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  old 32/128 byte static buffers. `video_device.rs` now copies the published driver/service metadata
+  into component-visible projection storage allocated through the same imported win32k allocator as
+  the projected WDM objects, so hosted win32k registry shims never dereference executive-only heap
+  pointers. The route path is built from checked allocation, allocation failure remains a real
+  registration failure, and the rejected intermediate owned-vector form is not retained because it
+  prevented `framebuf.dll` discovery from hosted win32k. Validation: `cargo fmt --all`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and serialized
+  desktop proof `.tmp/run-desktop-video-metadata-pool-20260815-093243.log`, which reaches `296/296`
+  with `exec_video_device_objects_registered`, `PDEVOBJ_lChangeDisplaySettings`, and
+  `exec_explorer_shell_chrome_painted` green.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The

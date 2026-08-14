@@ -55,8 +55,26 @@ pub(crate) struct VideoDeviceRegistration<'a> {
 }
 
 struct VideoRegistrationMetadata {
-    driver_name: Vec<u8>,
-    service_registry_path: Vec<u8>,
+    driver_name_ptr: u64,
+    driver_name_len: usize,
+    service_registry_path_ptr: u64,
+    service_registry_path_len: usize,
+}
+
+impl VideoRegistrationMetadata {
+    fn ready(&self) -> bool {
+        self.driver_name_ptr != 0
+            && self.driver_name_len != 0
+            && self.service_registry_path_ptr != 0
+            && self.service_registry_path_len != 0
+    }
+
+    unsafe fn service_registry_path(&self) -> &[u8] {
+        core::slice::from_raw_parts(
+            self.service_registry_path_ptr as *const u8,
+            self.service_registry_path_len,
+        )
+    }
 }
 
 static mut VIDEO_DRIVER_OBJECT: u64 = 0;
@@ -79,9 +97,6 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
     if !ascii_component_is_safe(reg.driver_name) || reg.service_registry_path.is_empty() {
         return false;
     }
-    let Some(metadata) = video_registration_metadata_from(reg) else {
-        return false;
-    };
     if !ensure_video_objects(reg.allocate_projection) {
         return false;
     }
@@ -92,7 +107,12 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         VIDEO_MINIPORT = None;
         return false;
     }
-    if !publish_video_device_map(&metadata.service_registry_path) {
+    let Some(metadata) = video_registration_metadata_from(reg) else {
+        teardown_video_io_route();
+        VIDEO_MINIPORT = None;
+        return false;
+    };
+    if !publish_video_device_map(reg.service_registry_path) {
         teardown_video_io_route();
         VIDEO_MINIPORT = None;
         return false;
@@ -123,22 +143,33 @@ unsafe fn install_video_miniport(
     true
 }
 
-fn video_registration_metadata_from(
+unsafe fn video_registration_metadata_from(
     reg: &VideoDeviceRegistration<'_>,
 ) -> Option<VideoRegistrationMetadata> {
-    let mut driver_name = Vec::new();
-    driver_name.try_reserve_exact(reg.driver_name.len()).ok()?;
-    driver_name.extend_from_slice(reg.driver_name);
-
-    let mut service_registry_path = Vec::new();
-    service_registry_path
-        .try_reserve_exact(reg.service_registry_path.len())
-        .ok()?;
-    service_registry_path.extend_from_slice(reg.service_registry_path);
+    let driver_name_len = reg.driver_name.len();
+    let service_registry_path_len = reg.service_registry_path.len();
+    let total_len = driver_name_len.checked_add(service_registry_path_len)?;
+    let total_len_u64 = total_len as u64;
+    if total_len_u64 as usize != total_len {
+        return None;
+    }
+    let base = (reg.allocate_projection)(total_len_u64);
+    if base == 0 {
+        return None;
+    }
+    for (idx, &byte) in reg.driver_name.iter().enumerate() {
+        write_unaligned((base + idx as u64) as *mut u8, byte);
+    }
+    let service_registry_path_ptr = base + driver_name_len as u64;
+    for (idx, &byte) in reg.service_registry_path.iter().enumerate() {
+        write_unaligned((service_registry_path_ptr + idx as u64) as *mut u8, byte);
+    }
 
     Some(VideoRegistrationMetadata {
-        driver_name,
-        service_registry_path,
+        driver_name_ptr: base,
+        driver_name_len,
+        service_registry_path_ptr,
+        service_registry_path_len,
     })
 }
 
@@ -148,9 +179,7 @@ unsafe fn video_registration_metadata() -> Option<&'static VideoRegistrationMeta
 
 unsafe fn video_registration_metadata_ready() -> bool {
     match video_registration_metadata() {
-        Some(metadata) => {
-            !metadata.driver_name.is_empty() && !metadata.service_registry_path.is_empty()
-        }
+        Some(metadata) => metadata.ready(),
         None => false,
     }
 }
@@ -190,8 +219,7 @@ pub(crate) unsafe fn query_video_device_map_value(
         return Ok((REG_DWORD, data.len()));
     }
     if ascii_eq_ignore_case(name, VIDEO_DEVICE_PATH) {
-        let Some(data_len) = utf16le_nul_from_ascii_into(&metadata.service_registry_path, out)
-        else {
+        let Some(data_len) = utf16le_nul_from_ascii_into(metadata.service_registry_path(), out) else {
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         };
         return Ok((REG_SZ, data_len));
