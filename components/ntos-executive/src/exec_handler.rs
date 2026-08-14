@@ -10160,6 +10160,7 @@ impl ExecNtHandler {
         let _ = self
             .pm
             .set_thread_create_time(thread, nt_system_time_100ns() as i64);
+        let _ = self.pm.report_existing_thread_create(thread);
         PM_REMOTE_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         self.queue_write(args[0], handle);
         if cid_ptr != 0 {
@@ -10248,6 +10249,7 @@ impl ExecNtHandler {
         let _ = self
             .pm
             .set_thread_create_time(thread, nt_system_time_100ns() as i64);
+        let _ = self.pm.report_existing_thread_create(thread);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok((worker_slot, tid, handle))
     }
@@ -10485,6 +10487,7 @@ impl ExecNtHandler {
             self.release_pool_usage_slot(self.pi, slot);
             return None;
         }
+        let _ = self.pm.report_existing_thread_create(t);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
     }

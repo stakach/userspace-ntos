@@ -5094,3 +5094,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   and thread-exit notifications without suppressing the kernel's own mapped-image tracking or
   process-level teardown events that this layer does not receive with a current reporting-thread
   identity. The behavior is covered by focused `nt-process` host tests.
+
+  Dbgk runtime thread create-event cleanup (2026-08-14): dormant hosted ETHREAD pool slots are no
+  longer visible to attach-time fake create enumeration while they remain `Initialized`, and claiming a
+  pool slot as a real hosted user thread now reports through the shared `nt-process`
+  `report_existing_thread_create` path. The executive's local runtime-thread helpers, cross-VSpace
+  `NtCreateThread` policy path, and CSR worker-create helper all call that reporter after the NT
+  thread object, client id, handle, TEB, and create-time policy have succeeded, before the loop/spawn
+  mechanism takes over. This closes the old pool-thread bypass of `DbgKmCreateThreadApi` without
+  adding a special remote-thread debug path.

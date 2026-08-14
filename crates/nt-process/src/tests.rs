@@ -2576,6 +2576,92 @@ fn dbgk_attach_posts_fake_module_messages_after_the_thread_messages() {
 }
 
 #[test]
+fn dbgk_attach_does_not_report_initialized_pool_threads() {
+    let mut pm = ProcessManager::new();
+    let object = pm.create_debug_object(0).unwrap();
+    let debugger = pm.create_process("dbg.exe", None, None);
+    let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
+    let target = pm.create_process("target.exe", None, None);
+    let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
+    let dormant = pm.create_thread(target, 0, 0, false).unwrap();
+    pm.set_thread_state(dormant, ThreadState::Initialized)
+        .unwrap();
+
+    assert_eq!(
+        pm.debug_active_process(
+            target,
+            object,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: dbg_thread,
+            },
+        )
+        .unwrap(),
+        1
+    );
+
+    let events = pm.debug_object(object).unwrap().events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].message.state(),
+        dbgk::DBG_CREATE_PROCESS_STATE_CHANGE
+    );
+    assert_eq!(events[0].client_id.unique_thread, main);
+}
+
+#[test]
+fn dbgk_existing_thread_create_reports_claimed_pool_thread() {
+    let mut pm = ProcessManager::new();
+    let object = pm.create_debug_object(0).unwrap();
+    let debugger = pm.create_process("dbg.exe", None, None);
+    let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
+    let target = pm.create_process("target.exe", None, None);
+    let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
+    let dormant = pm.create_thread(target, 0, 0, false).unwrap();
+    pm.set_thread_state(dormant, ThreadState::Initialized)
+        .unwrap();
+
+    assert_eq!(
+        pm.debug_active_process(
+            target,
+            object,
+            ClientId {
+                unique_process: debugger,
+                unique_thread: dbg_thread,
+            },
+        )
+        .unwrap(),
+        1
+    );
+    pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    pm.debug_continue(
+        object,
+        ClientId {
+            unique_process: target,
+            unique_thread: main,
+        },
+        dbgk::DBG_CONTINUE,
+    )
+    .unwrap();
+
+    assert_eq!(pm.report_existing_thread_create(dormant), None);
+
+    const START: u64 = 0x0000_0001_7000_4321;
+    assert!(pm.set_thread_start_address(dormant, START));
+    pm.set_thread_state(dormant, ThreadState::Running).unwrap();
+    assert_eq!(pm.report_existing_thread_create(dormant), Some(object));
+
+    let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();
+    assert_eq!(created.state, dbgk::DBG_CREATE_THREAD_STATE_CHANGE);
+    assert_eq!(created.client_id.unique_process, target);
+    assert_eq!(created.client_id.unique_thread, dormant);
+    assert_eq!(
+        u64::from_le_bytes(created.state_change[0x28..0x30].try_into().unwrap()),
+        START
+    );
+}
+
+#[test]
 fn dbgk_module_tracking_is_inert_without_a_debug_object() {
     // ★ THE LIVE-BOOT SHAPE. With no DEBUG_OBJECT in the system the map/unmap reporting path
     // records nothing and posts nothing, so a host's section-mapping path is untouched.

@@ -1340,42 +1340,59 @@ impl ProcessManager {
                 user_apc_len: 0,
             },
         );
-        // Dbgk event source: a thread create in a debugged process reports DbgKmCreateThreadApi —
-        // unless this is the first reported thread of the process, which reports
-        // DbgKmCreateProcessApi (`PSF_CREATE_REPORTED_BIT`, cleared until either an attach or the
-        // first create reports it).
-        if self
+        let _ = self.report_existing_thread_create(tid);
+        Ok(tid)
+    }
+
+    /// A preallocated ETHREAD has transitioned into a real user thread. This is the Dbgk-visible
+    /// half of hosted runtime/remote thread activation; dormant `Initialized` pool slots are not NT
+    /// threads yet for debugger purposes.
+    pub fn report_existing_thread_create(&mut self, tid: ThreadId) -> Option<DebugObjectId> {
+        let (pid, start_address) = self.threads.get(&tid).and_then(|thread| {
+            Self::thread_is_debug_reportable(thread)
+                .then_some((thread.process_id, thread.start_address))
+        })?;
+        self.report_thread_create_message(pid, tid, start_address)
+    }
+
+    fn report_thread_create_message(
+        &mut self,
+        pid: ProcessId,
+        tid: ThreadId,
+        start_address: u64,
+    ) -> Option<DebugObjectId> {
+        if !self
             .processes
             .get(&pid)
             .is_some_and(|p| p.debug_port.is_some())
         {
-            let (reported, image_base) = self
-                .processes
-                .get(&pid)
-                .map(|p| (p.create_reported, p.image_base))
-                .unwrap_or((true, 0));
-            let message = if reported {
-                DbgKmMessage::CreateThread {
-                    sub_system_key: 0,
-                    start_address,
-                }
-            } else {
-                if let Some(p) = self.processes.get_mut(&pid) {
-                    p.create_reported = true;
-                }
-                DbgKmMessage::CreateProcess {
-                    sub_system_key: 0,
-                    file_handle: 0,
-                    base_of_image: image_base,
-                    debug_info_file_offset: 0,
-                    debug_info_size: 0,
-                    initial_thread_sub_system_key: 0,
-                    initial_thread_start_address: start_address,
-                }
-            };
-            let _ = self.report_debug_message(pid, tid, message);
+            return None;
         }
-        Ok(tid)
+        let (reported, image_base) = self
+            .processes
+            .get(&pid)
+            .map(|p| (p.create_reported, p.image_base))
+            .unwrap_or((true, 0));
+        let message = if reported {
+            DbgKmMessage::CreateThread {
+                sub_system_key: 0,
+                start_address,
+            }
+        } else {
+            if let Some(p) = self.processes.get_mut(&pid) {
+                p.create_reported = true;
+            }
+            DbgKmMessage::CreateProcess {
+                sub_system_key: 0,
+                file_handle: 0,
+                base_of_image: image_base,
+                debug_info_file_offset: 0,
+                debug_info_size: 0,
+                initial_thread_sub_system_key: 0,
+                initial_thread_start_address: start_address,
+            }
+        };
+        self.report_debug_message(pid, tid, message)
     }
 
     // --- kernel/win32k per-process/thread context slots (spec §7.4) ----------
@@ -1728,6 +1745,13 @@ impl ProcessManager {
         self.threads
             .get(&tid)
             .is_some_and(|thread| thread.process_id == pid && thread.hide_from_debugger)
+    }
+
+    fn thread_is_debug_reportable(thread: &NtThread) -> bool {
+        !matches!(
+            thread.state,
+            ThreadState::Initialized | ThreadState::Terminated
+        )
     }
 
     pub fn set_thread_name(&mut self, tid: ThreadId, name: &[u16]) -> Result<(), u32> {
@@ -2671,7 +2695,7 @@ impl ProcessManager {
             .find(|tid| {
                 self.threads
                     .get(tid)
-                    .is_some_and(|t| t.state != ThreadState::Terminated)
+                    .is_some_and(Self::thread_is_debug_reportable)
             })
             .ok_or(STATUS_UNSUCCESSFUL)?;
 
@@ -2686,7 +2710,7 @@ impl ProcessManager {
                 continue;
             };
             let Some(start_address) = self.threads.get(&tid).and_then(|thread| {
-                (thread.state != ThreadState::Terminated).then_some(thread.start_address)
+                Self::thread_is_debug_reportable(thread).then_some(thread.start_address)
             }) else {
                 continue;
             };

@@ -245,6 +245,7 @@ unsafe fn csr_api_worker_create_thread(
         let _ = nt_handler
             .pm
             .set_thread_create_time(tid_id, nt_system_time_100ns() as i64);
+        let _ = nt_handler.pm.report_existing_thread_create(tid_id);
         nt_handler.register_hosted_thread_spawn(
             target_pi,
             tid,

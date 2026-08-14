@@ -285,6 +285,16 @@ mapped-image load/unload, and thread-exit messages while preserving the kernel's
 tracking. Covered by focused host tests including
 `dbgk_thread_hide_from_debugger_suppresses_live_thread_reports`.
 
+**Completed pickup (2026-08-14):** hosted runtime thread activation now reports through Dbgk.
+Precreated `Initialized` ETHREAD pool slots are no longer included in attach-time fake create
+messages, and once a dormant slot is claimed as a real running/suspended user thread it can post the
+same `DbgKmCreateThreadApi` message as `ProcessManager::create_thread`. The executive's local
+runtime-thread paths, cross-VSpace `NtCreateThread` path, and CSR worker-create helper all call the
+shared `nt-process` reporter after successful NT thread-object policy setup. Covered by focused host
+tests including
+`dbgk_attach_does_not_report_initialized_pool_threads` and
+`dbgk_existing_thread_create_reports_claimed_pool_thread`.
+
 1. **Remaining Tier-2/3 `Rtl*` breadth — low value, do on demand.** The named Tier-2 security list is
    closed. The wider measured spec tail in §2.4 is remaining breadth. **None is imported by anything we
    host.** The rule that governs all of it:
@@ -305,8 +315,6 @@ tracking. Covered by focused host tests including
      module list is only maintained while a debug object is alive, and that gate is exactly what keeps
      the extremely load-bearing `NtMapViewOfSection` path byte-identical. Closing it means recording
      IMAGE views unconditionally — deliberately not taken.
-   * **A remote create posts no `DbgKmCreateThreadApi`** — `create_remote_thread` draws from the
-     target's pre-created ETHREAD pool instead of `ProcessManager::create_thread`, bypassing the poster.
    * **The loop-side multiplex for a remote thread created into a LIVE process is wired but not
      live-exercised** — `spawn_requested_remote_thread` badges it onto the main fault EP and
      `mirror_ctx_for` already sub-selects it; nothing hosted issues `RtlCreateUserThread` against
