@@ -1143,6 +1143,14 @@ before unrelated executive traffic monopolises the receive loop.
   corrupt/non-core-hive path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`,
   `cargo test -p nt-fs`, and executive `cargo check` for `components/ntos-executive` on
   `x86_64-unknown-none`.
+  The dynamic-hive regf replay slice closes the crash window where `NtLoadKey` mounted a profile
+  source that was still in ReactOS `regf` format while its runtime mutations lived in the writable
+  `<source>.LOG` sidecar. The regf import path now replays that sidecar from the clean import
+  sequence before mounting the mutable hive and marks the replayed state clean, matching
+  provider-backed core-image boot behavior. Host coverage in `nt-hive-regf` proves regf import plus
+  sidecar replay preserves imported values and applies the journal from sequence zero. Validation:
+  `cargo fmt --all`, `cargo test -p nt-hive-regf`, and executive `cargo check` for
+  `components/ntos-executive` on `x86_64-unknown-none`.
 
 ## Immediate Iteration
 

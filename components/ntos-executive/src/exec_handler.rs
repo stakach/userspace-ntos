@@ -5057,7 +5057,7 @@ impl ExecNtHandler {
         let regf_hive = RegfHive::new(bytes);
         let mut core_hive = None;
         let hive_sel = HIVE_SEL_DYNAMIC[slot];
-        let root_subkeys = if let Some(ref hive) = regf_hive {
+        let mut root_subkeys = if let Some(ref hive) = regf_hive {
             hive.subkeys(hive.root()).len() as u64
         } else {
             let provider_core_hive =
@@ -5099,7 +5099,7 @@ impl ExecNtHandler {
                     crate::allocator::enter_context(crate::allocator::ALLOC_CTX_REGF_IMPORT);
                 nt_hive_regf::try_import_regf_into_hive(hive, hive_kind_for_selector(hive_sel))
             };
-            let (hive, _stats) = match imported {
+            let (mut hive, _stats) = match imported {
                 Ok(imported) => imported,
                 Err(nt_hive_regf::RegfHiveImportError::InvalidKey) => {
                     USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
@@ -5120,7 +5120,24 @@ impl ExecNtHandler {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
             };
+            let log_bytes =
+                unsafe { crate::writable_fs::hive_log_bytes_if_mounted(&file_name) }.unwrap_or(&[]);
+            if !log_bytes.is_empty() {
+                let base_sequence = hive.sequence;
+                let last_sequence = nt_hive_core::replay_log(&mut hive, log_bytes, base_sequence);
+                print_str(b"[cm-load] NtLoadKey replayed source hive journal bytes=");
+                print_u64(log_bytes.len() as u64);
+                print_str(b" sequence=");
+                print_u64(base_sequence);
+                print_str(b"..");
+                print_u64(last_sequence);
+                print_str(b" source=");
+                print_ascii_str(&file_name);
+                print_str(b"\n");
+            }
+            root_subkeys = hive.subkey_count(hive.root()) as u64;
             self.mutable_hives.mount(&full, hive_sel, hive);
+            self.mutable_hives.clear_hive_dirty(hive_sel);
         } else if let Some(hive) = core_hive {
             self.mutable_hives.mount(&full, hive_sel, hive);
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);

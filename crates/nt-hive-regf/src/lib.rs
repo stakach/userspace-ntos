@@ -1480,6 +1480,33 @@ mod tests {
     }
 
     #[test]
+    fn imported_regf_hive_replays_sidecar_journal_from_clean_baseline() {
+        let data = services_test_hive();
+        let source = RegfHive::new(&data).expect("valid test hive");
+        let (mut hive, _) = import_regf_into_hive(&source, HiveKind::System);
+        assert_eq!(hive.sequence, 0);
+        assert_eq!(hive.dirty_count(), 0);
+
+        let record = nt_hive_core::encode_log_record(
+            &nt_hive_core::HiveLogOp::SetValue {
+                path: r"ControlSet001\Services\Npfs\Parameters",
+                name: "Journaled",
+                value_type: nt_hive_core::RegistryValueType::Dword,
+                data: &7u32.to_le_bytes(),
+            },
+            1,
+        );
+        let base_sequence = hive.sequence;
+        let last_sequence = nt_hive_core::replay_log(&mut hive, &record, base_sequence);
+        let params = hive
+            .open_key(r"ControlSet001\Services\Npfs\Parameters")
+            .expect("parameters key");
+        assert_eq!(last_sequence, 1);
+        assert_eq!(hive.query_dword(params, "Answer"), Some(42));
+        assert_eq!(hive.query_dword(params, "Journaled"), Some(7));
+    }
+
+    #[test]
     fn imports_selected_regf_subtree_as_hive_root() {
         let data = services_test_hive();
         let source = RegfHive::new(&data).expect("valid test hive");
