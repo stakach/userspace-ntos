@@ -1612,7 +1612,7 @@ fn writable_volume_set_information_and_delete() {
             FILE_LINK_INFORMATION,
             &rename_information("alias.txt", dir.handle, false),
         ),
-        STATUS_INVALID_INFO_CLASS
+        STATUS_NOT_SUPPORTED
     );
     assert!(fs.query_attributes(r"\??\C:\profiles\alias.txt").is_none());
     // FileDispositionInformation deletes at close.

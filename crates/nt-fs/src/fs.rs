@@ -2722,6 +2722,7 @@ impl FileSystem {
                         .rename_relative_to_dir(node_id, root_id, &target, replace_if_exists)
                 }
             }
+            FILE_LINK_INFORMATION => STATUS_NOT_SUPPORTED,
             _ => STATUS_INVALID_INFO_CLASS,
         }
     }

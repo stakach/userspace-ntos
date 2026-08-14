@@ -3245,9 +3245,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   lookup. The host regression proves the source file remains in place and no destination appears on
   the other DOS device. Validation: `cargo fmt --all`, `cargo test -p nt-fs`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`. Review adjustment: hard-link semantics remain the known unsupported file
-  namespace operation because they require a real link-count/parent-entry model; otherwise D1 should
-  now follow live service traffic rather than inventing speculative file-information classes.
+  x86_64-unknown-none`. Follow-up: `FileLinkInformation` is now classified as the valid NT
+  information class it is, but returns `STATUS_NOT_SUPPORTED` instead of `STATUS_INVALID_INFO_CLASS`
+  because MemFs still has a single parent entry per node and no link-count model. Review adjustment:
+  hard-link semantics remain the known unsupported file namespace operation; otherwise D1 should now
+  follow live service traffic rather than inventing speculative file-information classes.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
