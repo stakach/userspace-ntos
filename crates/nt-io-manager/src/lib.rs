@@ -1496,15 +1496,22 @@ mod tests {
     }
 
     #[test]
-    fn ioctl_unsupported_method_rejected() {
+    fn ioctl_direct_and_neither_methods_round_trip() {
         let (mut om, client, handle) =
             open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
-        let code = any_ioctl(0x801, ioctl::METHOD_IN_DIRECT);
-        let mut out = [0u8; 8];
-        assert_eq!(
-            om.device_control(client, handle, code, b"x", &mut out),
-            Err(NtStatus::NOT_SUPPORTED)
-        );
+        for method in [
+            ioctl::METHOD_IN_DIRECT,
+            ioctl::METHOD_OUT_DIRECT,
+            ioctl::METHOD_NEITHER,
+        ] {
+            let code = any_ioctl(0x801 + method, method);
+            let mut out = [0u8; 8];
+            let n = om
+                .device_control(client, handle, code, b"pong", &mut out)
+                .unwrap();
+            assert_eq!(n, 4);
+            assert_eq!(&out[..n as usize], b"pong");
+        }
     }
 
     #[test]
@@ -1866,6 +1873,19 @@ mod tests {
             .unwrap();
         assert_eq!(&io_out[..n as usize], b"ping");
         assert_eq!(om.irp_count(), 0);
+    }
+
+    #[test]
+    fn peer_nonbuffered_ioctl_rejected_until_wire_has_split_buffers() {
+        let ctrl = MockPeerControl::new();
+        let (mut om, client, handle) =
+            peer_device(&ctrl, AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE);
+        let code = any_ioctl(0x801, ioctl::METHOD_OUT_DIRECT);
+        let mut io_out = [0u8; 4];
+        assert_eq!(
+            om.device_control(client, handle, code, b"ping", &mut io_out),
+            Err(NtStatus::NOT_SUPPORTED)
+        );
     }
 
     #[test]

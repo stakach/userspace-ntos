@@ -1,11 +1,10 @@
 //! Device-control (IOCTL) requests (spec §14.3, §17.4).
 //!
-//! v0.1 supports the buffered model (`METHOD_BUFFERED`) only: the input occupies
-//! the `SystemBuffer`, the driver writes its output into it, and the result is
-//! copied back to the caller's output buffer. Other transfer methods return
-//! `STATUS_NOT_SUPPORTED`.
+//! Buffered controls use `SystemBuffer`, direct controls use buffered input plus
+//! an MDL-style direct output buffer, and neither controls use a Type3 input
+//! buffer plus `UserBuffer`. Backends whose transport cannot carry separate
+//! buffers must fail closed instead of collapsing methods.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use nt_io_abi::{ioctl, major};
@@ -65,20 +64,32 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
         internal: bool,
     ) -> Result<u64, NtStatus> {
-        // v0.1: buffered method only.
-        if ioctl::method(ioctl_code) != ioctl::METHOD_BUFFERED {
-            return Err(NtStatus::NOT_SUPPORTED);
-        }
         validate_transfer(input.len())?;
         validate_transfer(output.len())?;
 
         let (file_id, device_id) =
             self.reference_open_file(client, handle, ioctl_required_access(ioctl_code))?;
 
-        // Buffered: one SystemBuffer holds the input, then receives the output.
-        let cap = input.len().max(output.len());
-        let mut sysbuf: Vec<u8> = vec![0u8; cap];
-        sysbuf[..input.len()].copy_from_slice(input);
+        let method = ioctl::method(ioctl_code);
+        let mut sysbuf: Vec<u8> = Vec::new();
+        let mut direct: Vec<u8> = Vec::new();
+        let mut type3: Vec<u8> = Vec::new();
+        let mut user: Vec<u8> = Vec::new();
+        match method {
+            ioctl::METHOD_BUFFERED => {
+                sysbuf.resize(input.len().max(output.len()), 0);
+                sysbuf[..input.len()].copy_from_slice(input);
+            }
+            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                sysbuf.extend_from_slice(input);
+                direct.resize(output.len(), 0);
+            }
+            ioctl::METHOD_NEITHER => {
+                type3.extend_from_slice(input);
+                user.resize(output.len(), 0);
+            }
+            _ => unreachable!("CTL_CODE method is two bits"),
+        }
 
         let dc = DeviceControlParameters {
             ioctl_code,
@@ -97,16 +108,32 @@ impl<P: ObjectManagerPort> IoManager<P> {
             )
         };
 
-        let info = self.build_and_dispatch_sync(
+        let direct_buffer = matches!(method, ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT)
+            .then_some(direct.as_mut_slice());
+        let type3_input_buffer = (method == ioctl::METHOD_NEITHER).then_some(type3.as_mut_slice());
+        let user_buffer = (method == ioctl::METHOD_NEITHER).then_some(user.as_mut_slice());
+        let info = self.build_and_dispatch_sync_with_transfer_buffers(
             client,
             device_id,
             Some(file_id),
             fn_major,
             params,
+            input.len().min(u32::MAX as usize) as u32,
+            output.len().min(u32::MAX as usize) as u32,
             &mut sysbuf,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
         )?;
         let n = (info as usize).min(output.len());
-        output[..n].copy_from_slice(&sysbuf[..n]);
+        match method {
+            ioctl::METHOD_BUFFERED => output[..n].copy_from_slice(&sysbuf[..n]),
+            ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {
+                output[..n].copy_from_slice(&direct[..n])
+            }
+            ioctl::METHOD_NEITHER => output[..n].copy_from_slice(&user[..n]),
+            _ => unreachable!("CTL_CODE method is two bits"),
+        }
         Ok(info)
     }
 }

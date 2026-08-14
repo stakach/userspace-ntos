@@ -21,6 +21,9 @@ pub struct DispatchContext<'a> {
     pub driver_id: DriverId,
     pub client_id: ClientId,
     pub system_buffer: &'a mut [u8],
+    pub direct_buffer: Option<&'a mut [u8]>,
+    pub type3_input_buffer: Option<&'a mut [u8]>,
+    pub user_buffer: Option<&'a mut [u8]>,
 }
 
 impl<'a> DispatchContext<'a> {
@@ -29,7 +32,51 @@ impl<'a> DispatchContext<'a> {
             driver_id,
             client_id,
             system_buffer,
+            direct_buffer: None,
+            type3_input_buffer: None,
+            user_buffer: None,
         }
+    }
+
+    pub fn with_transfer_buffers(
+        driver_id: DriverId,
+        client_id: ClientId,
+        system_buffer: &'a mut [u8],
+        direct_buffer: Option<&'a mut [u8]>,
+        type3_input_buffer: Option<&'a mut [u8]>,
+        user_buffer: Option<&'a mut [u8]>,
+    ) -> Self {
+        Self {
+            driver_id,
+            client_id,
+            system_buffer,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
+        }
+    }
+
+    pub fn ioctl_input_buffer(&self, method: u32) -> &[u8] {
+        match method {
+            nt_io_abi::ioctl::METHOD_NEITHER => self.type3_input_buffer.as_deref().unwrap_or(&[]),
+            _ => self.system_buffer,
+        }
+    }
+
+    pub fn ioctl_output_buffer_mut(&mut self, method: u32) -> &mut [u8] {
+        match method {
+            nt_io_abi::ioctl::METHOD_IN_DIRECT | nt_io_abi::ioctl::METHOD_OUT_DIRECT => {
+                self.direct_buffer.as_deref_mut().unwrap_or(&mut [])
+            }
+            nt_io_abi::ioctl::METHOD_NEITHER => self.user_buffer.as_deref_mut().unwrap_or(&mut []),
+            _ => self.system_buffer,
+        }
+    }
+
+    pub fn has_nonbuffered_transfer(&self) -> bool {
+        self.direct_buffer.is_some()
+            || self.type3_input_buffer.is_some()
+            || self.user_buffer.is_some()
     }
 }
 

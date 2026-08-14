@@ -63,11 +63,13 @@ the NT5 transfer shape for all control methods: buffered controls use
 for the output buffer, and neither controls use `Type3InputBuffer`/`UserBuffer`. Pending control IRPs
 with output now retain and free their output buffer/MDL through the same completion table as pending
 reads, and the WDM layout writer has host tests for `IRP.MdlAddress` and `IRP.Flags`. The generic
-`nt-io-manager` convenience `device_control` API remains explicitly buffered-only until its backend
-projection can represent separate SystemBuffer/MDL/UserBuffer storage without collapsing methods.
-Local validation: `cargo fmt --all`, `cargo test -p nt-io-manager`, executive `cargo check
---manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
-`git diff --check`.
+`nt-io-manager` dispatch model now also carries separate SystemBuffer, direct-output, Type3 input,
+and UserBuffer slices for host-testable in-process drivers, so buffered, direct, and neither IOCTLs
+round-trip without method collapse. The peer-driver wire backend still fails non-buffered controls
+closed with `STATUS_NOT_SUPPORTED` until that ABI grows explicit split-buffer fields. Local
+validation: `cargo fmt --all`, `cargo test -p nt-io-manager`, `cargo test -p nt-driver-host`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+--target x86_64-unknown-none`, and `git diff --check`.
 
 Completed restored-boot proof hardening (2026-08-13): restored profile, LSA, SAM, and writable
 overlay gates now derive from actual persisted state instead of first-boot counters. The writable

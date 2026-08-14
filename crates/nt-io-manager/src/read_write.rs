@@ -166,18 +166,54 @@ impl<P: ObjectManagerPort> IoManager<P> {
         params: IoParameters,
         system_buffer: &mut [u8],
     ) -> Result<u64, NtStatus> {
+        let (input_len, output_len) = params.buffered_lengths(system_buffer.len());
+        self.build_and_dispatch_sync_with_transfer_buffers(
+            client,
+            device_id,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            system_buffer,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn build_and_dispatch_sync_with_transfer_buffers(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        major: u8,
+        params: IoParameters,
+        input_len: u32,
+        output_len: u32,
+        system_buffer: &mut [u8],
+        direct_buffer: Option<&mut [u8]>,
+        type3_input_buffer: Option<&mut [u8]>,
+        user_buffer: Option<&mut [u8]>,
+    ) -> Result<u64, NtStatus> {
         let mut irp = IrpRecord::new(client, device_id, file_id, major);
         let mut sl = IoStackLocation::new(major, device_id, file_id);
         sl.parameters = params;
         irp.stack.push(sl);
-        let (input_len, output_len) = irp
-            .current_stack()
-            .map(|s| s.parameters.buffered_lengths(system_buffer.len()))
-            .unwrap_or((0, 0));
+        let buffer_len = [
+            system_buffer.len(),
+            direct_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
+            type3_input_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
+            user_buffer.as_ref().map(|b| b.len()).unwrap_or(0),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+        .min(u32::MAX as usize) as u32;
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,
-            len: system_buffer.len() as u32,
+            len: buffer_len,
             input_len,
             output_len,
             access: BufferAccess::ReadWrite,
@@ -189,7 +225,16 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.irp_mut(irp_id)
             .unwrap()
             .transition(IrpState::Dispatched);
-        let outcome = self.dispatch(irp_id, system_buffer);
+        let outcome = self.dispatch_to_driver_with_transfer_buffers(
+            self.device(device_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id,
+            irp_id,
+            system_buffer,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
+        );
         self.complete_sync(irp_id, outcome)
     }
 

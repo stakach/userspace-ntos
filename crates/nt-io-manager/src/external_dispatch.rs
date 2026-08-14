@@ -128,6 +128,25 @@ impl<P> IoManager<P> {
         irp_id: IrpId,
         system_buffer: &mut [u8],
     ) -> Result<DispatchOutcome, NtStatus> {
+        self.dispatch_to_driver_with_transfer_buffers(
+            driver_id,
+            irp_id,
+            system_buffer,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn dispatch_to_driver_with_transfer_buffers(
+        &mut self,
+        driver_id: DriverId,
+        irp_id: IrpId,
+        system_buffer: &mut [u8],
+        direct_buffer: Option<&mut [u8]>,
+        type3_input_buffer: Option<&mut [u8]>,
+        user_buffer: Option<&mut [u8]>,
+    ) -> Result<DispatchOutcome, NtStatus> {
         let (major_fn, client) = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
             (irp.major, irp.client_id)
@@ -154,7 +173,14 @@ impl<P> IoManager<P> {
             .get_mut(idx)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
         backend.dispatch_irp(
-            DispatchContext::new(driver_id, client, system_buffer),
+            DispatchContext::with_transfer_buffers(
+                driver_id,
+                client,
+                system_buffer,
+                direct_buffer,
+                type3_input_buffer,
+                user_buffer,
+            ),
             &proj,
         )
     }

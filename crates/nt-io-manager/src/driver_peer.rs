@@ -12,7 +12,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use nt_io_abi::{major, IrpDispatchRequest};
+use nt_io_abi::{ioctl, major, IrpDispatchRequest};
 use nt_status::NtStatus;
 
 use crate::dispatch::{
@@ -79,6 +79,23 @@ impl<T: DriverPeerTransport> DriverDispatchBackend for DriverPeerBackend<T> {
         if self.transport.is_faulted() {
             return Ok(DispatchOutcome::Failed {
                 status: NtStatus::DEVICE_NOT_CONNECTED,
+            });
+        }
+        if ctx.has_nonbuffered_transfer()
+            && matches!(
+                irp.major,
+                major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+            )
+            && match &irp.parameters {
+                crate::irp::IoParameters::DeviceControl(p)
+                | crate::irp::IoParameters::InternalDeviceControl(p) => {
+                    ioctl::method(p.ioctl_code) != ioctl::METHOD_BUFFERED
+                }
+                _ => true,
+            }
+        {
+            return Ok(DispatchOutcome::Failed {
+                status: NtStatus::NOT_SUPPORTED,
             });
         }
         let request = build_dispatch_request(irp, ctx.system_buffer.len() as u32);

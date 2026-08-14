@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use nt_io_abi::major;
+use nt_io_abi::{ioctl, major};
 use nt_status::NtStatus;
 
 use crate::dispatch::{
@@ -131,7 +131,7 @@ fn fill(dst: &mut [u8], src: &[u8], want: usize) -> u64 {
 impl DriverDispatchBackend for MockDriverBackend {
     fn dispatch_irp(
         &mut self,
-        ctx: DispatchContext<'_>,
+        mut ctx: DispatchContext<'_>,
         irp: &IrpProjection,
     ) -> Result<DispatchOutcome, NtStatus> {
         if let Some(status) = self.inject_error {
@@ -192,16 +192,22 @@ impl DriverDispatchBackend for MockDriverBackend {
             major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
                 match self.ioctl {
                     IoctlBehavior::Echo => {
-                        // Buffered echo: input already occupies the system buffer, so
-                        // the output is those same bytes (bounded by output length).
-                        let (input_len, output_len) = match &irp.parameters {
+                        let (method, input_len, output_len) = match &irp.parameters {
                             IoParameters::DeviceControl(p)
-                            | IoParameters::InternalDeviceControl(p) => {
-                                (p.input_len as usize, p.output_len as usize)
-                            }
-                            _ => (0, 0),
+                            | IoParameters::InternalDeviceControl(p) => (
+                                ioctl::method(p.ioctl_code),
+                                p.input_len as usize,
+                                p.output_len as usize,
+                            ),
+                            _ => (ioctl::METHOD_BUFFERED, 0, 0),
                         };
-                        let n = input_len.min(output_len).min(ctx.system_buffer.len());
+                        let input = ctx.ioctl_input_buffer(method);
+                        let input_copy_len = input_len.min(input.len());
+                        let mut input_copy = Vec::new();
+                        input_copy.extend_from_slice(&input[..input_copy_len]);
+                        let output = ctx.ioctl_output_buffer_mut(method);
+                        let n = input_copy.len().min(output_len).min(output.len());
+                        output[..n].copy_from_slice(&input_copy[..n]);
                         DispatchOutcome::Completed {
                             status: NtStatus::SUCCESS,
                             information: n as u64,
