@@ -1421,7 +1421,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    process/thread/object information setter, object/token/section query, PnP event, and security
    descriptor query paths. The thread/VM follow-on now truncates `NtCreateThreadEx(CreateFlags)` and
    `NtQueryVirtualMemory(MemoryInformationClass)` while preserving pointer-width stack and `SIZE_T`
-   fields.
+   fields. The PnP follow-on now also truncates `NtPlugPlayControl(BufferLength)` before all CM-backed
+   PnP control buffer validation.
 
 ## Review Log
 
@@ -5256,3 +5257,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   hide-from-debugger decisions. `NtQueryVirtualMemory` now truncates `MemoryInformationClass` to the
   native enum width while leaving `MemoryInformationLength` and `ReturnLength` as pointer-sized
   `SIZE_T` fields.
+
+  Native syscall PnP control width cleanup (2026-08-14): `NtPlugPlayControl` now truncates
+  `BufferLength` to the declared `ULONG` width before probing and before dispatching to the generic
+  CM-backed PnP control handlers. This keeps the PnP surface aligned with the adjacent
+  `NtGetPlugPlayEvent` buffer-length cleanup.

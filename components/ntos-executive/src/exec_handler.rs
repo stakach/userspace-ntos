@@ -14143,7 +14143,7 @@ impl ExecNtHandler {
     unsafe fn nt_plug_play_control(&mut self, args: &[u64]) -> u32 {
         let control_class = args.first().copied().unwrap_or(0) as u32;
         let buffer = args.get(1).copied().unwrap_or(0);
-        let buffer_len = args.get(2).copied().unwrap_or(0) as usize;
+        let buffer_len = args.get(2).copied().unwrap_or(0) as u32 as usize;
         if !self.current_token_has_privilege(nt_security::SE_TCB) {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
