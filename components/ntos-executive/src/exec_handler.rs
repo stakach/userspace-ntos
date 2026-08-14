@@ -119,6 +119,67 @@ pub(crate) struct NpfsFileRoute {
     device_id: u64,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RoleOwnedLocalThreadTrace {
+    None,
+    LsassThird,
+}
+
+#[derive(Clone, Copy)]
+struct RoleOwnedLocalThreadSpec {
+    owner_role: nt_exe_image::HostedProcessRole,
+    creator_role: Option<HostedThreadRole>,
+    previous_role: Option<HostedThreadRole>,
+    role: HostedThreadRole,
+    badge: u64,
+    teb: u64,
+    request: HostedThreadSpawnRequest,
+    trace: RoleOwnedLocalThreadTrace,
+}
+
+const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
+    RoleOwnedLocalThreadSpec {
+        owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
+        creator_role: Some(HostedThreadRole::Main),
+        previous_role: None,
+        role: HostedThreadRole::ServicesListener,
+        badge: SVC_LISTENER_BADGE,
+        teb: SVC_LISTENER_TEB_VA,
+        request: HostedThreadSpawnRequest::ServicesListener,
+        trace: RoleOwnedLocalThreadTrace::None,
+    },
+    RoleOwnedLocalThreadSpec {
+        owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+        creator_role: None,
+        previous_role: None,
+        role: HostedThreadRole::LsassListener,
+        badge: LSASS_LISTENER_BADGE,
+        teb: LSASS_LISTENER_TEB_VA,
+        request: HostedThreadSpawnRequest::LsassListener { slot: 0 },
+        trace: RoleOwnedLocalThreadTrace::None,
+    },
+    RoleOwnedLocalThreadSpec {
+        owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+        creator_role: None,
+        previous_role: Some(HostedThreadRole::LsassListener),
+        role: HostedThreadRole::LsassListener2,
+        badge: LSASS_LISTENER2_BADGE,
+        teb: LSASS_LISTENER2_TEB_VA,
+        request: HostedThreadSpawnRequest::LsassListener { slot: 1 },
+        trace: RoleOwnedLocalThreadTrace::None,
+    },
+    RoleOwnedLocalThreadSpec {
+        owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+        creator_role: None,
+        previous_role: Some(HostedThreadRole::LsassListener2),
+        role: HostedThreadRole::LsassListener3,
+        badge: LSASS_LISTENER3_BADGE,
+        teb: LSASS_LISTENER3_TEB_VA,
+        request: HostedThreadSpawnRequest::LsassListener { slot: 2 },
+        trace: RoleOwnedLocalThreadTrace::LsassThird,
+    },
+];
+
 static USER_APC_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_CONTINUE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -8053,10 +8114,6 @@ impl ExecNtHandler {
         self.current_hosted_thread_role() == Some(role)
     }
 
-    fn current_thread_is_main_process_thread(&self) -> bool {
-        self.current_thread_has_role(HostedThreadRole::Main)
-    }
-
     pub(crate) fn refresh_process_manager_gates(&self) {
         let mut process_count = 0u64;
         let mut identity_ok = 0u64;
@@ -10878,6 +10935,100 @@ impl ExecNtHandler {
         let _ = self.pm.report_existing_thread_create(t);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
+    }
+
+    fn next_role_owned_local_thread_spec(&self) -> Option<RoleOwnedLocalThreadSpec> {
+        let process_role = self.current_hosted_process_role()?;
+        for spec in ROLE_OWNED_LOCAL_THREAD_SPECS {
+            if spec.owner_role != process_role {
+                continue;
+            }
+            if spec
+                .creator_role
+                .is_some_and(|role| !self.current_thread_has_role(role))
+            {
+                continue;
+            }
+            if spec
+                .previous_role
+                .is_some_and(|role| self.hosted_thread_tid_for_role(self.pi, role).is_none())
+            {
+                continue;
+            }
+            if self.hosted_thread_tid_for_role(self.pi, spec.role).is_none() {
+                return Some(spec);
+            }
+        }
+        None
+    }
+
+    unsafe fn create_role_owned_local_thread(
+        &mut self,
+        args: &[u64],
+        spec: RoleOwnedLocalThreadSpec,
+    ) -> u32 {
+        if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG || args[3] != u64::MAX {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
+        let start =
+            nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
+        let create_suspended =
+            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
+        let Some((slot, tid, handle)) =
+            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+        else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        if !self.reserve_created_hosted_thread_role(slot, tid, handle, spec.badge, spec.role) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        self.pm.set_thread_teb(tid as nt_process::ThreadId, spec.teb);
+        let pid = self.current_pm_pid().unwrap_or(0);
+        self.queue_write(args[0], handle);
+        let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
+        if cid_ptr != 0 {
+            self.queue_write(cid_ptr, pid as u64);
+            self.queue_write(cid_ptr + 8, tid);
+        }
+        self.thread_spawn_request = Some(spec.request);
+        self.trace_role_owned_local_thread_create(args, spec, start, handle, tid);
+        0
+    }
+
+    unsafe fn trace_role_owned_local_thread_create(
+        &self,
+        args: &[u64],
+        spec: RoleOwnedLocalThreadSpec,
+        start: nt_thread_start::Amd64ThreadContext,
+        handle: u64,
+        tid: u64,
+    ) {
+        if spec.trace != RoleOwnedLocalThreadTrace::LsassThird {
+            return;
+        }
+        let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
+        print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
+        print_hex(args[3] as u32);
+        print_str(b" slot=2 start=0x");
+        print_hex((start.rip >> 32) as u32);
+        print_hex(start.rip as u32);
+        print_str(b" teb=0x");
+        print_hex((spec.teb >> 32) as u32);
+        print_hex(spec.teb as u32);
+        print_str(b" initial_teb=0x");
+        print_hex(initial_teb as u32);
+        print_str(b" stack_base=0x");
+        print_hex(smss_stack_read(initial_teb + 0x10) as u32);
+        print_str(b" stack_limit=0x");
+        print_hex(smss_stack_read(initial_teb + 0x18) as u32);
+        print_str(b" alloc_base=0x");
+        print_hex(smss_stack_read(initial_teb + 0x20) as u32);
+        print_str(b" handle=0x");
+        print_hex(handle as u32);
+        print_str(b" tid=");
+        print_u64(tid);
+        print_str(b" status=0\n");
     }
 
     unsafe fn create_generic_local_tp_worker_thread(
@@ -22749,211 +22900,9 @@ impl ExecNtHandler {
                     print_str(b"[thread-life] create caller=winlogon badge=4 status=c000009a (runtime thread pool exhausted)\n");
                     return 0xC000_009A;
                 }
-                // ★ N-threads multiplex: services.exe's FIRST NtCreateThread = the SCM's RPC listener
-                // (ScmStartRpcServer → rpcrt4 io_thread). Route it through the REAL ETHREAD lifecycle
-                // like winlogon's, but the LOOP spawns it RESUMED with a badged fault EP (it runs into
-                // the main multiplex). Its faults sub-select by SVC_LISTENER_BADGE.
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_services()
-                    && self.current_thread_is_main_process_thread()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
-                        .is_none()
-                {
-                    unsafe {
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                SVC_LISTENER_BADGE,
-                                HostedThreadRole::ServicesListener,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm
-                                .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::ServicesListener);
-                            return 0;
-                        }
-                    }
-                }
-                // ★ N-threads multiplex: lsass.exe's FIRST NtCreateThread = an LSA server thread
-                // (LsapInitDatabase → StartAuthenticationPort / LsapRmServerThread). Route it through the
-                // REAL ETHREAD lifecycle + have the LOOP spawn it RESUMED with a badged fault EP, so it
-                // runs into the main multiplex; its faults sub-select to the LSA listener by
-                // LSASS_LISTENER_BADGE (its own stack mirror / TEB, distinct from lsass' main thread).
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_lsass()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener)
-                        .is_none()
-                {
-                    unsafe {
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                LSASS_LISTENER_BADGE,
-                                HostedThreadRole::LsassListener,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm
-                                .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle); // *ThreadHandle
-                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::LsassListener { slot: 0 });
-                            return 0;
-                        }
-                    }
-                }
-                // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, its own badge +
-                // its own TEB/stack (LSASS_LISTENER2). Uses the SECOND pool ETHREAD. Without a real,
-                // mapped TEB the subsequent NtQueryInformationThread(162) → kernel32 ActCtx copy
-                // (mov [newTEB+0x1728]) writes to a stale stack pointer and faults.
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_lsass()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener)
-                        .is_some()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener2)
-                        .is_none()
-                {
-                    unsafe {
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                LSASS_LISTENER2_BADGE,
-                                HostedThreadRole::LsassListener2,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle);
-                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::LsassListener { slot: 1 });
-                            return 0;
-                        }
-                    }
-                }
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.current_process_is_lsass()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener2)
-                        .is_some()
-                    && self
-                        .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
-                        .is_none()
-                {
-                    unsafe {
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
-                        let create_suspended =
-                            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
-                        {
-                            if !self.reserve_created_hosted_thread_role(
-                                slot,
-                                tid,
-                                handle,
-                                LSASS_LISTENER3_BADGE,
-                                HostedThreadRole::LsassListener3,
-                            ) {
-                                return 0xC000_009A;
-                            }
-                            self.pm.set_thread_teb(
-                                tid as nt_process::ThreadId,
-                                LSASS_LISTENER3_TEB_VA,
-                            );
-                            let pid = self.current_pm_pid().unwrap_or(0);
-                            self.queue_write(args[0], handle);
-                            let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                            if cid_ptr != 0 {
-                                self.queue_write(cid_ptr, pid as u64);
-                                self.queue_write(cid_ptr + 8, tid);
-                            }
-                            self.thread_spawn_request =
-                                Some(HostedThreadSpawnRequest::LsassListener { slot: 2 });
-                            let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
-                            print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
-                            print_hex(args[3] as u32);
-                            print_str(b" slot=2 start=0x");
-                            print_hex((start.rip >> 32) as u32);
-                            print_hex(start.rip as u32);
-                            print_str(b" teb=0x");
-                            print_hex((LSASS_LISTENER3_TEB_VA >> 32) as u32);
-                            print_hex(LSASS_LISTENER3_TEB_VA as u32);
-                            print_str(b" initial_teb=0x");
-                            print_hex(initial_teb as u32);
-                            print_str(b" stack_base=0x");
-                            print_hex(smss_stack_read(initial_teb + 0x10) as u32);
-                            print_str(b" stack_limit=0x");
-                            print_hex(smss_stack_read(initial_teb + 0x18) as u32);
-                            print_str(b" alloc_base=0x");
-                            print_hex(smss_stack_read(initial_teb + 0x20) as u32);
-                            print_str(b" handle=0x");
-                            print_hex(handle as u32);
-                            print_str(b" tid=");
-                            print_u64(tid);
-                            print_str(b" status=0\n");
-                            return 0;
-                        }
+                if matches!(ctx.service, NativeService::NtCreateThread) {
+                    if let Some(spec) = self.next_role_owned_local_thread_spec() {
+                        return unsafe { self.create_role_owned_local_thread(args, spec) };
                     }
                 }
                 // SCM per-connection RPC workers are now handled by the dynamic hosted worker

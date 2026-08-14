@@ -1334,7 +1334,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    shell-paint scaffolding. The latest host-side C4 regression slice now pins middle
    `MEM_RELEASE` behavior: right-side VAD rebasing, free-gap query reporting, reuse of the released
    hole, zero-size release of the rebased survivor, and failed split state preservation under
-   bounded VAD capacity. Continue with A4's SCM pipe/listener special coordination, B3's real
+   bounded VAD capacity. Continue with SCM/LSA named-pipe data-plane scalability, B3's real
    video/driver binding, broader C4 private/mapped protect, partial decommit, overlap, and
    `MEM_TOP_DOWN`. The latest private-access slice also makes `NtReadVirtualMemory`-style checks
    reject private execute-only and guarded pages through the shared `VmRegionMap` permission helper,
@@ -1349,8 +1349,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    The latest overlap-authority slices add host-tested committed-range overlap selection, bounded
    lower/upper private VAD auto-placement, executive retry around committed mappings, KUSER aliases,
    or unowned registered frames before private allocation/generic data-section map-view publication,
-   and a live boot gate for cross-authority placement retry. Continue with A4 SCM pipe/listener
-   cleanup, B3 real video miniport hosting, or D1/D2 mutable registry/filesystem authority.
+   and a live boot gate for cross-authority placement retry. Continue with remaining SCM/LSA
+   pipe/listener data-plane cleanup, B3 real video miniport hosting, or D1/D2 mutable
+   registry/filesystem authority.
 4. Keep reducing registry/filesystem debt while doing that work. The executive no longer duplicates
    mounted base/user-profile hives into the overlay just to open existing keys, and `NtQueryKey`
    now computes merged key counts/max lengths with length-only indexed reads and returns
@@ -5267,3 +5268,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Native syscall keyed-event flag cleanup (2026-08-14): `NtCreateKeyedEvent` now truncates its
   `Flags` argument to the declared `ULONG` width before the required zero-flags validation, matching
   the native prototype instead of letting stale high bits force `STATUS_INVALID_PARAMETER`.
+
+  A4 role-owned local listener thread cleanup (2026-08-14): the `NtCreateThread` path no longer
+  carries separate inline services/LSASS listener reservation branches. Role-owned local listener
+  slots are described by `RoleOwnedLocalThreadSpec` metadata keyed by
+  `HostedProcessRole::ServiceControlManager` and `HostedProcessRole::LocalSecurityAuthority`, then a
+  single helper claims the real ETHREAD, publishes the typed thread handle/ClientId, installs the
+  role TEB, and queues the existing hosted spawn request. The SCM listener still requires the SCM
+  main thread as creator, and LSA listener slots still require their ordered predecessor roles, but
+  that policy now lives in data rather than duplicated executable-specific control flow. Remaining
+  pipe/listener debt is in the data plane: scalable named-pipe listener/client coordination and
+  generic RPC worker attribution beyond the current SCM/LSA proof gates.
