@@ -5296,3 +5296,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo test -p nt-io-manager`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  A4 RPC worker attribution cleanup (2026-08-14): same-process RPC worker creation now derives from
+  `RpcWorkerSourceSpec` metadata instead of inline `services.exe`/`lsass.exe` branching in
+  `NtCreateThread`. The spec table binds an owner process role, listener thread role, worker kind,
+  route gate, trace prefix, and optional proof counters; the common thread-creation path selects the
+  spec, claims a dynamic worker window slot, and asks `HostedRpcWorkerKind` to produce the typed
+  worker role. The service-loop spawn trace also derives its `role=scm-rpc` / `role=lsa-rpc` label
+  from the role's generic RPC worker kind, and the old `current_process_is_services` helper was
+  removed with the branch it served. Remaining A4 data-plane cleanup is now the broader named-pipe
+  listener/client coordination and residual LSA self-RPC diagnostics, not hardcoded RPC worker slot
+  attribution. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.

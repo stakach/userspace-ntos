@@ -19628,10 +19628,9 @@ unsafe fn spawn_requested_tp_worker(
     print_u64(tid);
     print_str(b" tcb=0x");
     print_hex(spawned.tcb() as u32);
-    if role.is_scm_rpc_worker() {
-        print_str(b" role=scm-rpc");
-    } else if role.is_lsa_rpc_worker() {
-        print_str(b" role=lsa-rpc");
+    if let Some(kind) = role.rpc_worker_kind() {
+        print_str(b" role=");
+        print_str(kind.trace_role());
     }
     if worker_slot != 0 {
         print_str(b" slot=");

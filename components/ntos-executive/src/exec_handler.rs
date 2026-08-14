@@ -137,6 +137,17 @@ struct RoleOwnedLocalThreadSpec {
     trace: RoleOwnedLocalThreadTrace,
 }
 
+#[derive(Clone, Copy)]
+struct RpcWorkerSourceSpec {
+    owner_role: nt_exe_image::HostedProcessRole,
+    listener_role: HostedThreadRole,
+    worker_kind: HostedRpcWorkerKind,
+    requires_lsa_worker_route: bool,
+    request_counter: Option<&'static AtomicU64>,
+    slot_claim_counter: Option<&'static AtomicU64>,
+    claim_trace_prefix: &'static [u8],
+}
+
 const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
     RoleOwnedLocalThreadSpec {
         owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
@@ -177,6 +188,27 @@ const ROLE_OWNED_LOCAL_THREAD_SPECS: [RoleOwnedLocalThreadSpec; 4] = [
         teb: LSASS_LISTENER3_TEB_VA,
         request: HostedThreadSpawnRequest::LsassListener { slot: 2 },
         trace: RoleOwnedLocalThreadTrace::LsassThird,
+    },
+];
+
+const RPC_WORKER_SOURCE_SPECS: [RpcWorkerSourceSpec; 2] = [
+    RpcWorkerSourceSpec {
+        owner_role: nt_exe_image::HostedProcessRole::ServiceControlManager,
+        listener_role: HostedThreadRole::ServicesListener,
+        worker_kind: HostedRpcWorkerKind::Scm,
+        requires_lsa_worker_route: false,
+        request_counter: None,
+        slot_claim_counter: None,
+        claim_trace_prefix: b"[scm-worker] additional \\ntsvcs connection: ",
+    },
+    RpcWorkerSourceSpec {
+        owner_role: nt_exe_image::HostedProcessRole::LocalSecurityAuthority,
+        listener_role: HostedThreadRole::LsassListener3,
+        worker_kind: HostedRpcWorkerKind::Lsa,
+        requires_lsa_worker_route: true,
+        request_counter: Some(&LSA_RPC_NEW_CLIENT_REQUESTS),
+        slot_claim_counter: Some(&LSA_RPC_EXTRA_WORKERS_CLAIMED),
+        claim_trace_prefix: b"[lsa-worker] additional \\lsarpc connection: ",
     },
 ];
 
@@ -8048,10 +8080,6 @@ impl ExecNtHandler {
             .is_some_and(nt_exe_image::HostedProcessRole::is_noninteractive_service_class)
     }
 
-    fn current_process_is_services(&self) -> bool {
-        self.current_process_has_role(nt_exe_image::HostedProcessRole::ServiceControlManager)
-    }
-
     fn current_process_is_smss(&self) -> bool {
         self.current_process_has_role(nt_exe_image::HostedProcessRole::NativeSession)
     }
@@ -11049,6 +11077,28 @@ impl ExecNtHandler {
         None
     }
 
+    fn current_rpc_worker_source_spec(&self) -> Option<RpcWorkerSourceSpec> {
+        let process_role = self.current_hosted_process_role()?;
+        for spec in RPC_WORKER_SOURCE_SPECS {
+            if spec.requires_lsa_worker_route && !crate::LSA_WORKER_ROUTE_ENABLED {
+                continue;
+            }
+            if spec.owner_role != process_role {
+                continue;
+            }
+            if !self.current_thread_has_role(spec.listener_role) {
+                continue;
+            }
+            if self
+                .hosted_thread_tid_for_role(self.pi, spec.listener_role)
+                .is_some()
+            {
+                return Some(spec);
+            }
+        }
+        None
+    }
+
     unsafe fn create_role_owned_local_thread(
         &mut self,
         args: &[u64],
@@ -11198,29 +11248,16 @@ impl ExecNtHandler {
         if ntdll_pool_worker_only && preferred_slot.is_none() {
             return None;
         }
-        let rpc_worker_kind = if !ntdll_pool_worker_only && preferred_slot.is_none() {
-            if self.current_process_is_services()
-                && self.current_thread_has_role(HostedThreadRole::ServicesListener)
-                && self
-                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::ServicesListener)
-                    .is_some()
-            {
-                Some(1u8)
-            } else if crate::LSA_WORKER_ROUTE_ENABLED
-                && self.current_process_is_lsass()
-                && self.current_thread_has_role(HostedThreadRole::LsassListener3)
-                && self
-                    .hosted_thread_tid_for_role(self.pi, HostedThreadRole::LsassListener3)
-                    .is_some()
-            {
-                LSA_RPC_NEW_CLIENT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                Some(2u8)
-            } else {
-                None
-            }
+        let rpc_worker_source = if !ntdll_pool_worker_only && preferred_slot.is_none() {
+            self.current_rpc_worker_source_spec()
         } else {
             None
         };
+        if let Some(spec) = rpc_worker_source {
+            if let Some(counter) = spec.request_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let preferred_slot_free = preferred_slot.and_then(|slot| {
             Self::tp_worker_slot_bit(slot)
                 .filter(|bit| self.hosted_tp_worker_window_mask(self.pi) & *bit == 0)
@@ -11228,14 +11265,11 @@ impl ExecNtHandler {
         });
         let tp_slot = preferred_slot_free.or_else(|| {
             let slot = self.first_free_hosted_tp_worker_slot(self.pi);
-            if let Some(kind) = rpc_worker_kind {
-                let prefix: &[u8] = if kind == 1 {
-                    b"[scm-worker] additional \\ntsvcs connection: "
-                } else {
-                    crate::LSA_RPC_EXTRA_WORKERS_CLAIMED.fetch_add(1, Ordering::Relaxed);
-                    b"[lsa-worker] additional \\lsarpc connection: "
-                };
-                print_str(prefix);
+            if let Some(spec) = rpc_worker_source {
+                if let Some(counter) = spec.slot_claim_counter {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                print_str(spec.claim_trace_prefix);
                 print_str(if slot.is_some() {
                     b"claiming dynamic worker slot\n"
                 } else {
@@ -11279,11 +11313,9 @@ impl ExecNtHandler {
             print_str(b"\n");
             return Some(0xC000_009A);
         };
-        let hosted_role = match rpc_worker_kind {
-            Some(1) => HostedThreadRole::ScmWorkerSlot { slot: tp_slot },
-            Some(2) => HostedThreadRole::LsaWorkerSlot { slot: tp_slot },
-            _ => HostedThreadRole::TpWorker { slot: tp_slot },
-        };
+        let hosted_role = rpc_worker_source
+            .map(|spec| spec.worker_kind.worker_role(tp_slot))
+            .unwrap_or(HostedThreadRole::TpWorker { slot: tp_slot });
 
         let Some((pool_slot, tid, handle)) =
             self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
@@ -11320,10 +11352,9 @@ impl ExecNtHandler {
         print_hex(start.rip as u32);
         print_str(b" suspended=");
         print_u64(create_suspended as u64);
-        if hosted_role.is_scm_rpc_worker() {
-            print_str(b" role=scm-rpc");
-        } else if hosted_role.is_lsa_rpc_worker() {
-            print_str(b" role=lsa-rpc");
+        if let Some(kind) = hosted_role.rpc_worker_kind() {
+            print_str(b" role=");
+            print_str(kind.trace_role());
         }
         if tp_slot != 0 {
             print_str(b" slot=");

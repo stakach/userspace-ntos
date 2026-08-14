@@ -18433,6 +18433,28 @@ enum HostedThreadRole {
     DbgkSelftestTarget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedRpcWorkerKind {
+    Scm,
+    Lsa,
+}
+
+impl HostedRpcWorkerKind {
+    const fn worker_role(self, slot: usize) -> HostedThreadRole {
+        match self {
+            Self::Scm => HostedThreadRole::ScmWorkerSlot { slot },
+            Self::Lsa => HostedThreadRole::LsaWorkerSlot { slot },
+        }
+    }
+
+    const fn trace_role(self) -> &'static [u8] {
+        match self {
+            Self::Scm => b"scm-rpc",
+            Self::Lsa => b"lsa-rpc",
+        }
+    }
+}
+
 impl HostedThreadRole {
     const fn worker_window_slot(self) -> Option<usize> {
         match self {
@@ -18443,12 +18465,20 @@ impl HostedThreadRole {
         }
     }
 
+    const fn rpc_worker_kind(self) -> Option<HostedRpcWorkerKind> {
+        match self {
+            Self::ScmWorkerSlot { .. } => Some(HostedRpcWorkerKind::Scm),
+            Self::LsaWorkerSlot { .. } => Some(HostedRpcWorkerKind::Lsa),
+            _ => None,
+        }
+    }
+
     const fn is_scm_rpc_worker(self) -> bool {
-        matches!(self, Self::ScmWorkerSlot { .. })
+        matches!(self.rpc_worker_kind(), Some(HostedRpcWorkerKind::Scm))
     }
 
     const fn is_lsa_rpc_worker(self) -> bool {
-        matches!(self, Self::LsaWorkerSlot { .. })
+        matches!(self.rpc_worker_kind(), Some(HostedRpcWorkerKind::Lsa))
     }
 
     const fn can_raw_resume_from_nt_resume_thread(self) -> bool {
