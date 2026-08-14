@@ -24293,7 +24293,7 @@ impl ExecNtHandler {
                 let out_handle = args[0];
                 let desired_access = args[1] as u32;
                 let _object_attributes = args[2];
-                let flags = args[3];
+                let flags = args[3] as u32;
                 if flags != 0 {
                     return STATUS_INVALID_PARAMETER;
                 }

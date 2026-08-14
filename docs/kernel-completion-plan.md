@@ -1422,7 +1422,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    descriptor query paths. The thread/VM follow-on now truncates `NtCreateThreadEx(CreateFlags)` and
    `NtQueryVirtualMemory(MemoryInformationClass)` while preserving pointer-width stack and `SIZE_T`
    fields. The PnP follow-on now also truncates `NtPlugPlayControl(BufferLength)` before all CM-backed
-   PnP control buffer validation.
+   PnP control buffer validation. `NtCreateKeyedEvent(Flags)` now uses the same declared `ULONG`
+   boundary before rejecting non-zero flag bits.
 
 ## Review Log
 
@@ -5262,3 +5263,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `BufferLength` to the declared `ULONG` width before probing and before dispatching to the generic
   CM-backed PnP control handlers. This keeps the PnP surface aligned with the adjacent
   `NtGetPlugPlayEvent` buffer-length cleanup.
+
+  Native syscall keyed-event flag cleanup (2026-08-14): `NtCreateKeyedEvent` now truncates its
+  `Flags` argument to the declared `ULONG` width before the required zero-flags validation, matching
+  the native prototype instead of letting stale high bits force `STATUS_INVALID_PARAMETER`.
