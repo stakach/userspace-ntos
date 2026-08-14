@@ -1416,9 +1416,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    uses that same low-byte interpretation for exception, privilege, LPC accept, event/timer/mutant,
    locale, wait, delay, and directory-enumeration flags. The next slices should continue the ABI-width
    audit at service bodies that still need typed truncation/probing while the shell frontier moves to
-   real resource capacity instead of path-status failures. The following low-risk `ULONG` slice now
-   truncates native class/length arguments before validation in event/semaphore query and process/thread
-   information setter paths.
+   real resource capacity instead of path-status failures. The following low-risk `ULONG` slices now
+   truncate native class/length arguments before validation in event/semaphore query,
+   process/thread/object information setter, object/token/section query, PnP event, and security
+   descriptor query paths.
 
 ## Review Log
 
@@ -5236,3 +5237,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   helper paths. Validation: `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  Native syscall query buffer-width cleanup (2026-08-14): the width audit now covers the adjacent
+  object/security query surface. `NtQueryObject` and `NtSetInformationObject` truncate `Length` to
+  `ULONG`; `NtQueryInformationToken` truncates `TokenInformationClass` before validation/matching;
+  `NtQuerySecurityObject` hoists its descriptor buffer `Length` once and applies the same truncated
+  value across process/thread/win32k/registry descriptor answers; `NtGetPlugPlayEvent` truncates its
+  event buffer length; and the remaining `NtQuerySection` body truncates both
+  `SectionInformationClass` and `SectionInformationLength` while probing/writing `ResultLength` as a
+  four-byte `ULONG`. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and the targeted grep for stale query width patterns.

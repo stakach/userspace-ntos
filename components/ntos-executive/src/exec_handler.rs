@@ -12900,7 +12900,7 @@ impl ExecNtHandler {
         let handle = args.first().copied().unwrap_or(0);
         let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
         let information = args.get(2).copied().unwrap_or(0);
-        let length = args.get(3).copied().unwrap_or(0) as usize;
+        let length = args.get(3).copied().unwrap_or(0) as u32 as usize;
         let return_length = args.get(4).copied().unwrap_or(0);
 
         if return_length != 0 && !self.user_memory_probe_output(memory, return_length, 4) {
@@ -13104,7 +13104,7 @@ impl ExecNtHandler {
         let handle = args.first().copied().unwrap_or(0);
         let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
         let information = args.get(2).copied().unwrap_or(0);
-        let length = args.get(3).copied().unwrap_or(0) as usize;
+        let length = args.get(3).copied().unwrap_or(0) as u32 as usize;
 
         match class {
             OBJECT_HANDLE_FLAG_INFORMATION => {
@@ -14102,7 +14102,7 @@ impl ExecNtHandler {
         let reserved1 = args.first().copied().unwrap_or(0);
         let reserved2 = args.get(1).copied().unwrap_or(0);
         let buffer = args.get(2).copied().unwrap_or(0);
-        let buffer_size = args.get(3).copied().unwrap_or(0) as usize;
+        let buffer_size = args.get(3).copied().unwrap_or(0) as u32 as usize;
         if reserved1 != 0 || reserved2 != 0 {
             return STATUS_INVALID_PARAMETER;
         }
@@ -24817,6 +24817,7 @@ impl ExecNtHandler {
                     | nt_security::DACL_SECURITY_INFORMATION
                     | nt_security::SACL_SECURITY_INFORMATION;
                 let security_information = args[1] as u32;
+                let buffer_length = args[3] as u32 as usize;
                 if security_information & !QUERY_MASK != 0 {
                     return 0xC000_000D;
                 }
@@ -24857,7 +24858,7 @@ impl ExecNtHandler {
                         {
                             return STATUS_ACCESS_VIOLATION;
                         }
-                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                        if args[2] == 0 || buffer_length < descriptor.len() {
                             return STATUS_BUFFER_TOO_SMALL;
                         }
                         if !self.probe_user_output(args[2], descriptor.len())
@@ -24892,7 +24893,7 @@ impl ExecNtHandler {
                         {
                             return STATUS_ACCESS_VIOLATION;
                         }
-                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                        if args[2] == 0 || buffer_length < descriptor.len() {
                             return STATUS_BUFFER_TOO_SMALL;
                         }
                         if !self.probe_user_output(args[2], descriptor.len())
@@ -24939,7 +24940,7 @@ impl ExecNtHandler {
                         {
                             return STATUS_ACCESS_VIOLATION;
                         }
-                        if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                        if args[2] == 0 || buffer_length < descriptor.len() {
                             return STATUS_BUFFER_TOO_SMALL;
                         }
                         if !self.probe_user_output(args[2], descriptor.len())
@@ -24970,7 +24971,7 @@ impl ExecNtHandler {
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if args[2] == 0 || (args[3] as u32 as usize) < descriptor.len() {
+                if args[2] == 0 || buffer_length < descriptor.len() {
                     return STATUS_BUFFER_TOO_SMALL;
                 }
                 if !self.probe_user_output(args[2], descriptor.len())
@@ -25294,7 +25295,7 @@ impl ExecNtHandler {
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
                 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
                 const TOKEN_QUERY: u32 = 0x0008;
-                let class = args[1];
+                let class = args[1] as u32;
                 let buf = args[2];
                 let len = args[3] as u32 as usize;
                 let retlen_ptr = args[4];
@@ -28448,30 +28449,30 @@ impl ExecNtHandler {
             // SectionImageInformation only for SEC_IMAGE sections. Data/file-backed mappings must
             // therefore report their real basic geometry instead of falling off the hosted-image path.
             NativeService::NtQuerySection => unsafe {
-                const SECTION_BASIC_INFORMATION: u64 = 0;
-                const SECTION_IMAGE_INFORMATION: u64 = 1;
+                const SECTION_BASIC_INFORMATION: u32 = 0;
+                const SECTION_IMAGE_INFORMATION: u32 = 1;
                 const SECTION_BASIC_INFORMATION_SIZE: usize = 24;
                 const SECTION_IMAGE_INFORMATION_SIZE: usize = 64;
                 const STATUS_SECTION_NOT_IMAGE: u32 = 0xC000_0049;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
                 let sect = args[0];
-                let class = args[1];
+                let class = args[1] as u32;
                 let buf = args[2];
-                let len = args[3];
+                let len = args[3] as u32 as usize;
                 let result_len = args[4];
                 let required = match class {
                     SECTION_BASIC_INFORMATION => SECTION_BASIC_INFORMATION_SIZE,
                     SECTION_IMAGE_INFORMATION => SECTION_IMAGE_INFORMATION_SIZE,
                     _ => return nt_syscall::STATUS_INVALID_INFO_CLASS,
                 };
-                if len < required as u64 {
+                if len < required {
                     return nt_syscall::STATUS_INFO_LENGTH_MISMATCH;
                 }
                 if !self.probe_user_output(buf, required) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if result_len != 0 && !self.probe_user_output(result_len, 8) {
+                if result_len != 0 && !self.probe_user_output(result_len, 4) {
                     return STATUS_ACCESS_VIOLATION;
                 }
 
@@ -28572,9 +28573,7 @@ impl ExecNtHandler {
                 if !self.xas_try_write_buf(buf, output) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                if result_len != 0
-                    && !self.xas_try_write_buf(result_len, &(written as u64).to_le_bytes())
-                {
+                if result_len != 0 && !self.xas_write_u32(result_len, written as u32) {
                     return STATUS_ACCESS_VIOLATION;
                 }
                 0
