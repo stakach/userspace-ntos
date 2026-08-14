@@ -458,6 +458,70 @@ pub const ROOT_DMA_TEST_RESOURCE_PROFILE: RootBusResourceProfile = RootBusResour
     mmio_len: 0x1000,
 };
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RootBusResourceCatalogError {
+    EmptyDeviceId,
+    EmptyResource,
+    DuplicateDeviceId,
+    OutOfMemory,
+}
+
+/// Growable broker catalog for root-bus resource profiles.
+///
+/// Registry devnodes still select devices by instance/hardware/compatible IDs. This catalog only
+/// records which root-enumerated resource profiles the trusted broker is currently prepared to mint.
+#[derive(Clone, Debug, Default)]
+pub struct RootBusResourceCatalog {
+    profiles: Vec<RootBusResourceProfile>,
+}
+
+impl RootBusResourceCatalog {
+    pub fn new() -> Self {
+        Self {
+            profiles: Vec::new(),
+        }
+    }
+
+    pub fn profiles(&self) -> &[RootBusResourceProfile] {
+        &self.profiles
+    }
+
+    pub fn register(
+        &mut self,
+        profile: RootBusResourceProfile,
+    ) -> Result<(), RootBusResourceCatalogError> {
+        if profile.device_id.is_empty() {
+            return Err(RootBusResourceCatalogError::EmptyDeviceId);
+        }
+        if profile.mmio_phys == 0 || profile.mmio_len == 0 {
+            return Err(RootBusResourceCatalogError::EmptyResource);
+        }
+        if self
+            .profiles
+            .iter()
+            .any(|existing| existing.device_id.eq_ignore_ascii_case(profile.device_id))
+        {
+            return Err(RootBusResourceCatalogError::DuplicateDeviceId);
+        }
+        self.profiles
+            .try_reserve(1)
+            .map_err(|_| RootBusResourceCatalogError::OutOfMemory)?;
+        self.profiles.push(profile);
+        Ok(())
+    }
+
+    pub fn find_for_devnode(
+        &self,
+        instance_id: &str,
+        hardware_ids: &[&str],
+        compatible_ids: &[&str],
+    ) -> Option<RootBusResourceProfile> {
+        self.profiles.iter().copied().find(|profile| {
+            devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
+        })
+    }
+}
+
 fn devnode_device_id(instance_id: &str) -> &str {
     match instance_id.rfind('\\') {
         Some(pos) => &instance_id[..pos],
@@ -948,6 +1012,58 @@ mod tests {
             0x1000,
         )
         .is_none());
+    }
+
+    #[test]
+    fn root_bus_catalog_selects_from_multiple_profiles() {
+        let second = RootBusResourceProfile {
+            device_id: r"ROOT\USERSPACE_NTOS_SECOND",
+            mmio_phys: 0x1001_0000,
+            mmio_len: 0x2000,
+        };
+        let mut catalog = RootBusResourceCatalog::new();
+        catalog.register(ROOT_DMA_TEST_RESOURCE_PROFILE).unwrap();
+        catalog.register(second).unwrap();
+
+        assert_eq!(catalog.profiles().len(), 2);
+        assert_eq!(
+            catalog.find_for_devnode(r"ROOT\USERSPACE_NTOS_SECOND\0001", &[], &[]),
+            Some(second),
+        );
+        assert_eq!(
+            catalog.find_for_devnode(r"ROOT\OTHER\0001", &[], &[r"ROOT\USERSPACE_NTOS_DMA"],),
+            Some(ROOT_DMA_TEST_RESOURCE_PROFILE),
+        );
+    }
+
+    #[test]
+    fn root_bus_catalog_rejects_invalid_or_duplicate_profiles() {
+        let mut catalog = RootBusResourceCatalog::new();
+        assert_eq!(
+            catalog.register(RootBusResourceProfile {
+                device_id: "",
+                mmio_phys: 0x1000,
+                mmio_len: 0x1000,
+            }),
+            Err(RootBusResourceCatalogError::EmptyDeviceId),
+        );
+        assert_eq!(
+            catalog.register(RootBusResourceProfile {
+                device_id: r"ROOT\ZERO",
+                mmio_phys: 0,
+                mmio_len: 0x1000,
+            }),
+            Err(RootBusResourceCatalogError::EmptyResource),
+        );
+        catalog.register(ROOT_DMA_TEST_RESOURCE_PROFILE).unwrap();
+        assert_eq!(
+            catalog.register(RootBusResourceProfile {
+                device_id: r"root\userspace_ntos_dma",
+                mmio_phys: 0x2000_0000,
+                mmio_len: 0x1000,
+            }),
+            Err(RootBusResourceCatalogError::DuplicateDeviceId),
+        );
     }
 
     #[test]

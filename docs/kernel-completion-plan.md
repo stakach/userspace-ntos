@@ -1051,7 +1051,9 @@ before unrelated executive traffic monopolises the receive loop.
   GDI/display driver image records also grow in component-visible win32k pool storage, so win32k's
   hosted trampolines never depend on executive-only heap pointers. The temporary Video0 bridge still
   publishes one boot-framebuffer-backed device, but its registry-selected driver/service metadata is
-  now owned data rather than 32/128 byte static buffers.
+  now component-visible owned data rather than 32/128 byte static buffers. Root-bus proof resource
+  profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
+  static table.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -1235,8 +1237,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    audit found no object-service driver construction, kept hosted-driver/win32k `DRIVER_OBJECT`
    allocation classified as the generic compatibility harness that calls real `DriverEntry`, and moved
    boot-video `Video0` projected driver/device/file bodies behind a generic `nt-io-manager` WDM
-   projection helper. Remaining display debt is hosting real videoprt/miniport instead of the
-   boot-framebuffer bridge.
+   projection helper. Root-bus proof profiles now come from a host-tested growable `nt-pnp`
+   `RootBusResourceCatalog` rather than a one-entry executive array. Remaining display debt is
+   hosting real videoprt/miniport instead of the boot-framebuffer bridge.
 2. A3/A4 for Win32 service starts is closed for the current frontier. SCM-owned service metadata now
    produces typed
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
@@ -3374,6 +3377,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   misaligned pseudo-handle values instead of rounding them down to a slot. Validation: `cargo fmt
   --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+- B3 root-bus resource profile catalog cleanup (2026-08-15). The executive PnP broker no longer
+  stores broker-backed root-bus resource profiles in a one-entry static array. `nt-pnp` now owns a
+  host-tested growable `RootBusResourceCatalog` with duplicate/invalid-profile rejection and
+  devnode-ID lookup across any registered profile. The executive lazily seeds the current
+  `ROOT\USERSPACE_NTOS_DMA` proof profile through that catalog and passes copied profile values
+  across the hosted root-window path, removing the old `'static` array-element coupling while
+  preserving the current root-DMA proof device. Validation: `cargo fmt --all`,
+  `cargo test -p nt-pnp`, and `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`

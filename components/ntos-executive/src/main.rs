@@ -11774,7 +11774,7 @@ unsafe fn grant_hosted_devnode_resources(
     {
         let Some(window) = root_windows
             .iter()
-            .find(|window| window.matches_profile(profile))
+            .find(|window| window.matches_profile(&profile))
         else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
@@ -16158,7 +16158,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                 report.selected_root_devnodes += 1;
                 if root_windows
                     .iter()
-                    .any(|window| window.matches_profile(profile))
+                    .any(|window| window.matches_profile(&profile))
                 {
                     continue;
                 }
@@ -16181,7 +16181,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     continue;
                 }
                 let Some(window) = HostedPnpRootResourceWindow::new(
-                    profile,
+                    &profile,
                     mmio_frame,
                     profile.mmio_len.div_ceil(0x1000).max(1),
                     mmio_va,

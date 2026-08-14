@@ -196,7 +196,7 @@ pub(crate) struct HostedPnpRootResourceWindow {
 impl HostedPnpRootResourceWindow {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        profile: &'static nt_pnp::RootBusResourceProfile,
+        profile: &nt_pnp::RootBusResourceProfile,
         mmio_frame_base: u64,
         mmio_pages: u64,
         mmio_va: u64,
