@@ -3546,7 +3546,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   removing the old fixed service/path/value caps from this bridge. Validation:
   `cargo test -p nt-video-miniport -- --nocapture`, `cargo fmt --all`, `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
-  `git diff --check`. Review adjustment: the next B3 display slice should host the real
+  `git diff --check`. Serialized desktop proof
+  `.tmp/run-desktop-b3-video-identity-20260816.log` reaches `296/296` with
+  `exec_video_device_objects_registered`, `exec_win32k_desktop_painted`,
+  `exec_gdi_user_batch_flushed`, `exec_profile_ntuser_dat_present`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: the next B3 display slice should
+  host the real
   `videoprt.sys` export/initialization surface
   (`VideoPortInitialize`, saved `VIDEO_HW_INITIALIZATION_DATA`, `HwFindAdapter`, `HwInitialize`, and
   `HwStartIO`) behind this boundary, then replace the current boot-framebuffer adapter with a real
