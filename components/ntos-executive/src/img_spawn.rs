@@ -570,7 +570,7 @@ pub(crate) unsafe fn spawn_sec_image(
     }
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
-    map_tp_worker_slot1_pt(pml4);
+    map_tp_worker_target_lane_pts(pml4);
     if setup_env {
         map_hosted_client_env_pt(pml4);
     }

@@ -453,24 +453,26 @@ pub const LSASS_LISTENER3_BADGE: u64 = 14;
 
 // --- Generic hosted same-process worker threads ----------------------------------------------
 // The established SM/CSR/RPC roles retain their specialized layouts. An NtCreateThread whose
-// target is the current process can use this generic layout at the same target VAs in each process
-// (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
+// target is the current process can use this generic high-lane layout at the same target VAs in
+// each process (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
 pub const TP_WORKER_PI_COUNT: usize = 5;
 pub const TP_WORKER_LEGACY_SLOT_COUNT: usize = 2;
 pub const TP_WORKER_SLOT_COUNT: usize = PM_RUNTIME_THREAD_SLOTS;
 pub const TP_WORKER_BADGE_BASE: u64 = 16;
 pub const TP_WORKER_AUX_BADGE_BASE: u64 = 0x200;
-pub const TP_WORKER_STACK_BASE: u64 = 0x0000_0100_1058_0000;
-pub const TP_WORKER_STACK_FRAMES: u64 = 16;
-pub const TP_WORKER_STACK_TOP: u64 = TP_WORKER_STACK_BASE + TP_WORKER_STACK_FRAMES * 0x1000;
-pub const TP_WORKER_CONTEXT_RSP: u64 = ((TP_WORKER_STACK_TOP - 6 * 8) & !15) - 8;
-pub const TP_WORKER_IPCBUF_VA: u64 = 0x0000_0100_1059_0000;
-pub const TP_WORKER_TEB_VA: u64 = 0x0000_0100_105A_0000;
-pub const TP_WORKER_TRAMP_VA: u64 = 0x0000_0100_105B_0000;
 pub const TP_WORKER_EXEC_BASE: u64 = 0x0000_0100_13A0_0000;
 pub const TP_WORKER_EXEC_STRIDE: u64 = 0x0004_0000;
 pub const TP_WORKER_ENV_SCRATCH_OFFSET: u64 = 0x0002_0000;
 pub const TP_WORKER_SLOT1_REGION_BASE: u64 = 0x0000_0100_13E0_0000;
+pub const TP_WORKER_SLOT0_REGION_BASE: u64 =
+    TP_WORKER_SLOT1_REGION_BASE - TP_WORKER_EXEC_STRIDE;
+pub const TP_WORKER_STACK_BASE: u64 = TP_WORKER_SLOT0_REGION_BASE;
+pub const TP_WORKER_STACK_FRAMES: u64 = 16;
+pub const TP_WORKER_STACK_TOP: u64 = TP_WORKER_STACK_BASE + TP_WORKER_STACK_FRAMES * 0x1000;
+pub const TP_WORKER_CONTEXT_RSP: u64 = ((TP_WORKER_STACK_TOP - 6 * 8) & !15) - 8;
+pub const TP_WORKER_IPCBUF_VA: u64 = TP_WORKER_SLOT0_REGION_BASE + 0x1_0000;
+pub const TP_WORKER_TEB_VA: u64 = TP_WORKER_SLOT0_REGION_BASE + 0x2_0000;
+pub const TP_WORKER_TRAMP_VA: u64 = TP_WORKER_SLOT0_REGION_BASE + 0x3_0000;
 pub const TP_WORKER_SLOT1_STACK_BASE: u64 = TP_WORKER_SLOT1_REGION_BASE;
 pub const TP_WORKER_SLOT1_IPCBUF_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x1_0000;
 pub const TP_WORKER_SLOT1_TEB_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x2_0000;
@@ -538,16 +540,12 @@ pub const fn tp_worker_identity_from_badge(badge: u64) -> Option<(usize, usize)>
 
 #[inline]
 pub const fn tp_worker_high_region_base(slot: usize) -> u64 {
-    TP_WORKER_SLOT1_REGION_BASE + (slot as u64 - 1) * TP_WORKER_EXEC_STRIDE
+    TP_WORKER_SLOT0_REGION_BASE + slot as u64 * TP_WORKER_EXEC_STRIDE
 }
 
 #[inline]
 pub const fn tp_worker_stack_base(slot: usize) -> u64 {
-    if slot == 0 {
-        TP_WORKER_STACK_BASE
-    } else {
-        tp_worker_high_region_base(slot)
-    }
+    tp_worker_high_region_base(slot)
 }
 
 #[inline]
@@ -562,29 +560,17 @@ pub const fn tp_worker_context_rsp(slot: usize) -> u64 {
 
 #[inline]
 pub const fn tp_worker_ipcbuf_va(slot: usize) -> u64 {
-    if slot == 0 {
-        TP_WORKER_IPCBUF_VA
-    } else {
-        tp_worker_high_region_base(slot) + 0x1_0000
-    }
+    tp_worker_high_region_base(slot) + 0x1_0000
 }
 
 #[inline]
 pub const fn tp_worker_teb_va(slot: usize) -> u64 {
-    if slot == 0 {
-        TP_WORKER_TEB_VA
-    } else {
-        tp_worker_high_region_base(slot) + 0x2_0000
-    }
+    tp_worker_high_region_base(slot) + 0x2_0000
 }
 
 #[inline]
 pub const fn tp_worker_tramp_va(slot: usize) -> u64 {
-    if slot == 0 {
-        TP_WORKER_TRAMP_VA
-    } else {
-        tp_worker_high_region_base(slot) + 0x3_0000
-    }
+    tp_worker_high_region_base(slot) + 0x3_0000
 }
 
 #[inline]
@@ -775,6 +761,10 @@ const fn hosted_thread_layout_is_disjoint(
         && teb_va + 0x3000 <= tramp_va
 }
 
+const fn ranges_are_disjoint(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
+    a_base + a_size <= b_base || b_base + b_size <= a_base
+}
+
 const _: () = {
     assert!(WL_LISTENER_STACK_FRAMES >= 8);
     assert!(nt_syscall_abi::native_ipc_buffer_va(SMSS_TEB_VA) == IPCBUF_VADDR);
@@ -845,8 +835,16 @@ const _: () = {
         TP_WORKER_SLOT1_TEB_VA,
         TP_WORKER_SLOT1_TRAMP_VA,
     ));
-    assert!(TP_WORKER_STACK_BASE >= WORK_CLUSTER_BASE);
-    assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
+    assert!(TP_WORKER_SLOT0_REGION_BASE + TP_WORKER_EXEC_STRIDE == TP_WORKER_SLOT1_REGION_BASE);
+    assert!(TP_WORKER_SLOT0_REGION_BASE & 0xffff == 0);
+    assert!(tp_worker_high_region_base(0) == TP_WORKER_SLOT0_REGION_BASE);
+    assert!(tp_worker_high_region_base(1) == TP_WORKER_SLOT1_REGION_BASE);
+    assert!(ranges_are_disjoint(
+        TP_WORKER_SLOT0_REGION_BASE,
+        TP_WORKER_EXEC_STRIDE,
+        HOSTED_MAIN_STACK_ALLOCATION_BASE,
+        STACK_BASE + STACK_FRAMES * 0x1000 - HOSTED_MAIN_STACK_ALLOCATION_BASE,
+    ));
     assert!(TP_WORKER_AUX_BADGE_BASE >= 0x100);
     assert!(TP_WORKER_SLOT_COUNT > TP_WORKER_LEGACY_SLOT_COUNT);
     assert!(TP_WORKER_SLOT_COUNT <= 16);
@@ -12152,9 +12150,11 @@ pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
 }
 
-unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
-    let mut base = TP_WORKER_SLOT1_REGION_BASE;
-    let end = tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + 0x20_0000;
+unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
+    let mut base = TP_WORKER_SLOT0_REGION_BASE & !0x1f_ffff;
+    let end =
+        (tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + TP_WORKER_EXEC_STRIDE + 0x1f_ffff)
+            & !0x1f_ffff;
     while base < end {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);

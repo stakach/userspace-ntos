@@ -100,6 +100,23 @@ pages are not published as committed VAD state. Local validation is in progress;
 validation is a serialized desktop proof showing the previous `csrss` stack fault is gone and the
 desktop gates return to green.
 
+Follow-up worker-window separation slice (2026-08-15): serialized proof
+`.tmp/run-desktop-thread-stack-growth-20260815.log` confirmed the old `csrss` loader stack-growth
+fault was gone and that hosted main stacks now grow through real per-thread reservation metadata.
+That proof exposed a new VA-layout bug instead of a launch-policy gap: the historical generic worker
+slot0 target window lived at `0x1058..0x105b`, inside the now-valid hosted main-stack reservation.
+When a dynamic CSR API worker later mapped its trampoline at `0x105b0000`, the address already held
+a read/write NX stack page, so the worker took a present-page instruction-fetch fault at the
+trampoline VA. The current fix moves generic worker slot0 into the same high target-lane scheme as
+the other generic worker slots, maps those target-lane page tables for hosted SEC_IMAGE VSpaces, and
+adds compile-time disjointness checks against the hosted main-stack reservation. Remaining
+validation is a serialized desktop proof confirming CSR dynamic worker creation no longer faults on
+the slot0 trampoline and that the shell-chrome gates return to green. Review adjustment: the legacy
+`USER_ALLOC_BASE` bump allocator still starts at the hosted main-stack reservation base for older
+non-SEC_IMAGE user-thread tests; after the desktop blocker is cleared, move that allocator into a
+separate reserved lane or replace it with the hosted VAD allocator so future stack growth cannot
+collide with ad hoc user allocations.
+
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
 handle routes to the hosted ReactOS driver path. The component-side WDM IRP projection now carries
