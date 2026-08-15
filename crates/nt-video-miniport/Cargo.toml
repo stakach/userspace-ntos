@@ -1,6 +1,6 @@
 [package]
 name = "nt-video-miniport"
-description = "Host-testable NT video miniport behavior for a boot framebuffer-backed Video0 device."
+description = "Host-testable NT video-port and miniport behavior for display devices."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

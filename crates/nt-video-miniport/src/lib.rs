@@ -1,12 +1,18 @@
-//! Minimal NT video miniport contract for a boot framebuffer-backed adapter.
+//! Minimal NT video-port/miniport contract for display adapters.
 //!
-//! The real ReactOS path is videoprt.sys dispatching video IOCTLs to a display miniport. This crate
-//! models the miniport-facing contract for the one boot framebuffer mode we can currently expose,
-//! with tested encoders for the public `ntddvdeo.h` structures consumed by the framebuf display DLL.
+//! The real ReactOS path is `videoprt.sys` handling port-owned IOCTLs and forwarding ordinary video
+//! requests to a display miniport's `HwStartIO` callback. This crate keeps that split host-tested:
+//! `VideoPort` owns the port controls consumed by win32k, while adapters implement
+//! `VideoMiniportAdapter` for the mode/memory controls consumed by the display DLL.
 
 #![no_std]
 
 pub const FILE_DEVICE_VIDEO: u32 = 0x23;
+
+pub const VIDEO_DRIVER_OBJECT_PATH_PREFIX: &str = "\\Driver\\";
+pub const VIDEO_DEVICE_PATH_PREFIX: &str = "\\Device\\Video";
+pub const VIDEO_DEVICE_MAP_KEY: &str = "\\Registry\\Machine\\Hardware\\DeviceMap\\Video";
+pub const VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE: &str = "MaxObjectNumber";
 
 pub const IOCTL_VIDEO_QUERY_AVAIL_MODES: u32 = 0x0023_0400;
 pub const IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES: u32 = 0x0023_0404;
@@ -27,6 +33,128 @@ pub const VIDEO_MODE_GRAPHICS: u32 = 0x0002;
 pub const VIDEO_MODE_LINEAR: u32 = 0x0100;
 pub const VIDEO_MODE_MAP_MEM_LINEAR: u32 = 0x4000_0000;
 pub const VIDEO_MODE_NO_ZERO_MEMORY: u32 = 0x8000_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoDeviceIdentityError {
+    InvalidDriverName,
+    InvalidServiceRegistryPath,
+    BufferTooSmall { needed: usize },
+}
+
+/// NT object/registry identity for a video miniport-created `\Device\Video<N>` route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoDeviceIdentity<'a> {
+    object_number: u32,
+    driver_name: &'a [u8],
+    service_registry_path: &'a [u8],
+}
+
+impl<'a> VideoDeviceIdentity<'a> {
+    pub fn new(
+        object_number: u32,
+        driver_name: &'a [u8],
+        service_registry_path: &'a [u8],
+    ) -> Result<Self, VideoDeviceIdentityError> {
+        if !driver_name_component_is_safe(driver_name) {
+            return Err(VideoDeviceIdentityError::InvalidDriverName);
+        }
+        if service_registry_path.is_empty()
+            || !service_registry_path
+                .iter()
+                .copied()
+                .all(|byte| byte.is_ascii())
+        {
+            return Err(VideoDeviceIdentityError::InvalidServiceRegistryPath);
+        }
+        Ok(Self {
+            object_number,
+            driver_name,
+            service_registry_path,
+        })
+    }
+
+    pub fn object_number(&self) -> u32 {
+        self.object_number
+    }
+
+    pub fn max_object_number(&self) -> u32 {
+        self.object_number
+    }
+
+    pub fn driver_name(&self) -> &'a [u8] {
+        self.driver_name
+    }
+
+    pub fn service_registry_path(&self) -> &'a [u8] {
+        self.service_registry_path
+    }
+
+    pub fn driver_object_path_len(&self) -> usize {
+        VIDEO_DRIVER_OBJECT_PATH_PREFIX.len() + self.driver_name.len()
+    }
+
+    pub fn device_path_len(&self) -> usize {
+        VIDEO_DEVICE_PATH_PREFIX.len() + decimal_u32_digits(self.object_number)
+    }
+
+    pub fn service_registry_path_utf16le_nul_len(&self) -> Option<usize> {
+        self.service_registry_path
+            .len()
+            .checked_mul(2)?
+            .checked_add(2)
+    }
+
+    pub fn write_driver_object_path_ascii(
+        &self,
+        out: &mut [u8],
+    ) -> Result<usize, VideoDeviceIdentityError> {
+        write_concat_ascii(
+            out,
+            VIDEO_DRIVER_OBJECT_PATH_PREFIX.as_bytes(),
+            self.driver_name,
+        )
+    }
+
+    pub fn write_device_path_ascii(
+        &self,
+        out: &mut [u8],
+    ) -> Result<usize, VideoDeviceIdentityError> {
+        let need = self.device_path_len();
+        require_identity_output(out, need)?;
+        let prefix = VIDEO_DEVICE_PATH_PREFIX.as_bytes();
+        out[..prefix.len()].copy_from_slice(prefix);
+        write_decimal_u32(self.object_number, &mut out[prefix.len()..need]);
+        Ok(need)
+    }
+
+    pub fn write_service_registry_path_utf16le_nul(
+        &self,
+        out: &mut [u8],
+    ) -> Result<usize, VideoDeviceIdentityError> {
+        let need = self
+            .service_registry_path_utf16le_nul_len()
+            .ok_or(VideoDeviceIdentityError::InvalidServiceRegistryPath)?;
+        require_identity_output(out, need)?;
+        for (idx, &byte) in self.service_registry_path.iter().enumerate() {
+            let unit = (byte as u16).to_le_bytes();
+            out[idx * 2] = unit[0];
+            out[idx * 2 + 1] = unit[1];
+        }
+        out[need - 2] = 0;
+        out[need - 1] = 0;
+        Ok(need)
+    }
+
+    pub fn device_path_eq_ascii_ignore_case(&self, candidate: &[u8]) -> bool {
+        let need = self.device_path_len();
+        if candidate.len() != need {
+            return false;
+        }
+        let prefix = VIDEO_DEVICE_PATH_PREFIX.as_bytes();
+        ascii_eq_ignore_case(&candidate[..prefix.len()], prefix)
+            && decimal_u32_eq_ascii(self.object_number, &candidate[prefix.len()..need])
+    }
+}
 
 const MODE_INDEX: u32 = 1;
 const RGB_BITS: u32 = 8;
@@ -57,6 +185,12 @@ pub struct BootFramebufferMiniport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoPort<A> {
+    adapter: A,
+    video_device_object: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoMiniportError {
     InvalidRegistration,
     UnsupportedMode,
@@ -64,6 +198,96 @@ pub enum VideoMiniportError {
     BufferTooSmall { needed: usize },
     InvalidModeRequest,
     UnsupportedIoctl,
+}
+
+pub trait VideoMiniportAdapter {
+    fn dispatch_io_control(
+        &self,
+        ioctl: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, VideoMiniportError>;
+
+    fn dispatch_buffered_io_control(
+        &self,
+        ioctl: u32,
+        system_buffer: &mut [u8],
+        input_len: usize,
+        output_len: usize,
+    ) -> Result<usize, VideoMiniportError>;
+}
+
+impl<A> VideoPort<A> {
+    pub fn new(adapter: A, video_device_object: u64) -> Self {
+        Self {
+            adapter,
+            video_device_object,
+        }
+    }
+
+    pub fn adapter(&self) -> &A {
+        &self.adapter
+    }
+
+    pub fn video_device_object(&self) -> u64 {
+        self.video_device_object
+    }
+}
+
+impl<A: VideoMiniportAdapter> VideoPort<A> {
+    /// Dispatch a video I/O control as the video port driver would: handle port-owned controls and
+    /// forward the remaining public `ntddvdeo.h` controls to the miniport adapter.
+    pub fn dispatch_io_control(
+        &self,
+        ioctl: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, VideoMiniportError> {
+        match ioctl {
+            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+                write_win32k_callbacks(input, output, self.video_device_object)
+            }
+            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+            _ => self.adapter.dispatch_io_control(ioctl, input, output),
+        }
+    }
+
+    /// Dispatch the same port/miniport controls through a buffered I/O `SystemBuffer`.
+    pub fn dispatch_buffered_io_control(
+        &self,
+        ioctl: u32,
+        system_buffer: &mut [u8],
+        input_len: usize,
+        output_len: usize,
+    ) -> Result<usize, VideoMiniportError> {
+        if input_len > system_buffer.len() {
+            return Err(VideoMiniportError::BufferTooSmall { needed: input_len });
+        }
+        if output_len > system_buffer.len() {
+            return Err(VideoMiniportError::BufferTooSmall { needed: output_len });
+        }
+        match ioctl {
+            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+                let input = &system_buffer[..input_len];
+                let phys_disp = read_u64(input, 0)?;
+                let callout = read_u64(input, 8)?;
+                let output = &mut system_buffer[..output_len];
+                write_win32k_callbacks_from_parts(
+                    output,
+                    phys_disp,
+                    callout,
+                    self.video_device_object,
+                )
+            }
+            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
+            _ => self.adapter.dispatch_buffered_io_control(
+                ioctl,
+                system_buffer,
+                input_len,
+                output_len,
+            ),
+        }
+    }
 }
 
 impl BootFramebufferMiniport {
@@ -202,52 +426,30 @@ impl BootFramebufferMiniport {
     }
 }
 
-/// Dispatch the video-port control surface exposed for the boot framebuffer-backed display route.
-///
-/// This covers the win32k/videoprt-facing controls around the miniport's ordinary `ntddvdeo.h`
-/// IOCTLs. Keeping this logic in the crate means the executive's EngDeviceIoControl shim and its
-/// I/O Manager backend share one tested semantic boundary.
-pub fn dispatch_boot_video_io_control(
-    miniport: &BootFramebufferMiniport,
-    ioctl: u32,
-    input: &[u8],
-    output: &mut [u8],
-    video_device_object: u64,
-) -> Result<usize, VideoMiniportError> {
-    match ioctl {
-        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
-            write_win32k_callbacks(input, output, video_device_object)
-        }
-        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
-        _ => miniport.dispatch_io_control(ioctl, input, output),
+impl VideoMiniportAdapter for BootFramebufferMiniport {
+    fn dispatch_io_control(
+        &self,
+        ioctl: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, VideoMiniportError> {
+        BootFramebufferMiniport::dispatch_io_control(self, ioctl, input, output)
     }
-}
 
-/// Dispatch the same boot-video controls through a buffered I/O `SystemBuffer`.
-pub fn dispatch_boot_video_buffered_io_control(
-    miniport: &BootFramebufferMiniport,
-    ioctl: u32,
-    system_buffer: &mut [u8],
-    input_len: usize,
-    output_len: usize,
-    video_device_object: u64,
-) -> Result<usize, VideoMiniportError> {
-    if input_len > system_buffer.len() {
-        return Err(VideoMiniportError::BufferTooSmall { needed: input_len });
-    }
-    if output_len > system_buffer.len() {
-        return Err(VideoMiniportError::BufferTooSmall { needed: output_len });
-    }
-    match ioctl {
-        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
-            let input = &system_buffer[..input_len];
-            let phys_disp = read_u64(input, 0)?;
-            let callout = read_u64(input, 8)?;
-            let output = &mut system_buffer[..output_len];
-            write_win32k_callbacks_from_parts(output, phys_disp, callout, video_device_object)
-        }
-        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Ok(0),
-        _ => miniport.dispatch_buffered_io_control(ioctl, system_buffer, input_len, output_len),
+    fn dispatch_buffered_io_control(
+        &self,
+        ioctl: u32,
+        system_buffer: &mut [u8],
+        input_len: usize,
+        output_len: usize,
+    ) -> Result<usize, VideoMiniportError> {
+        BootFramebufferMiniport::dispatch_buffered_io_control(
+            self,
+            ioctl,
+            system_buffer,
+            input_len,
+            output_len,
+        )
     }
 }
 
@@ -350,6 +552,76 @@ fn read_u64(input: &[u8], offset: usize) -> Result<u64, VideoMiniportError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn driver_name_component_is_safe(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .copied()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && !name.windows(2).any(|w| w == b"..")
+}
+
+fn write_concat_ascii(
+    out: &mut [u8],
+    prefix: &[u8],
+    suffix: &[u8],
+) -> Result<usize, VideoDeviceIdentityError> {
+    let need = prefix
+        .len()
+        .checked_add(suffix.len())
+        .ok_or(VideoDeviceIdentityError::BufferTooSmall { needed: usize::MAX })?;
+    require_identity_output(out, need)?;
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..need].copy_from_slice(suffix);
+    Ok(need)
+}
+
+fn require_identity_output(out: &[u8], needed: usize) -> Result<(), VideoDeviceIdentityError> {
+    if out.len() < needed {
+        Err(VideoDeviceIdentityError::BufferTooSmall { needed })
+    } else {
+        Ok(())
+    }
+}
+
+fn decimal_u32_digits(mut value: u32) -> usize {
+    let mut digits = 1usize;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn write_decimal_u32(mut value: u32, out: &mut [u8]) {
+    for idx in (0..out.len()).rev() {
+        out[idx] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+}
+
+fn decimal_u32_eq_ascii(value: u32, ascii: &[u8]) -> bool {
+    if ascii.len() != decimal_u32_digits(value) {
+        return false;
+    }
+    let mut rendered = [0u8; 10];
+    let len = rendered.len();
+    write_decimal_u32(value, &mut rendered[len - ascii.len()..]);
+    &rendered[len - ascii.len()..] == ascii
+}
+
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +642,10 @@ mod tests {
         .unwrap()
     }
 
+    fn video_port() -> VideoPort<BootFramebufferMiniport> {
+        VideoPort::new(miniport(), 0x9999_AAAA_BBBB_CCCCu64)
+    }
+
     fn u32_at(buf: &[u8], offset: usize) -> u32 {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(&buf[offset..offset + 4]);
@@ -380,6 +656,82 @@ mod tests {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&buf[offset..offset + 8]);
         u64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn video_identity_materializes_nt_paths() {
+        let identity = VideoDeviceIdentity::new(
+            12,
+            b"framebuf",
+            b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf",
+        )
+        .unwrap();
+
+        let mut driver_path = [0u8; 32];
+        let driver_len = identity
+            .write_driver_object_path_ascii(&mut driver_path)
+            .unwrap();
+        assert_eq!(&driver_path[..driver_len], b"\\Driver\\framebuf");
+
+        let mut device_path = [0u8; 32];
+        let device_len = identity.write_device_path_ascii(&mut device_path).unwrap();
+        assert_eq!(&device_path[..device_len], b"\\Device\\Video12");
+        assert!(identity.device_path_eq_ascii_ignore_case(b"\\device\\video12"));
+        assert!(!identity.device_path_eq_ascii_ignore_case(b"\\Device\\Video0"));
+        assert_eq!(identity.max_object_number(), 12);
+    }
+
+    #[test]
+    fn video_identity_writes_service_path_for_device_map() {
+        let identity = VideoDeviceIdentity::new(
+            0,
+            b"framebuf",
+            b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf",
+        )
+        .unwrap();
+        let expected_len = identity.service_registry_path().len() * 2 + 2;
+        assert_eq!(
+            identity.service_registry_path_utf16le_nul_len(),
+            Some(expected_len)
+        );
+
+        let mut data = [0u8; 128];
+        let written = identity
+            .write_service_registry_path_utf16le_nul(&mut data)
+            .unwrap();
+        assert_eq!(written, expected_len);
+        assert_eq!(data[written - 2], 0);
+        assert_eq!(data[written - 1], 0);
+        for (idx, &byte) in identity.service_registry_path().iter().enumerate() {
+            assert_eq!(data[idx * 2], byte);
+            assert_eq!(data[idx * 2 + 1], 0);
+        }
+    }
+
+    #[test]
+    fn video_identity_rejects_unstable_names_and_small_outputs() {
+        assert_eq!(
+            VideoDeviceIdentity::new(0, b"", b"\\Registry\\Machine\\System"),
+            Err(VideoDeviceIdentityError::InvalidDriverName)
+        );
+        assert_eq!(
+            VideoDeviceIdentity::new(0, b"..\\bad", b"\\Registry\\Machine\\System"),
+            Err(VideoDeviceIdentityError::InvalidDriverName)
+        );
+        assert_eq!(
+            VideoDeviceIdentity::new(0, b"framebuf", b""),
+            Err(VideoDeviceIdentityError::InvalidServiceRegistryPath)
+        );
+
+        let identity =
+            VideoDeviceIdentity::new(0, b"framebuf", b"\\Registry\\Machine\\System").unwrap();
+        let mut out = [0u8; 4];
+        assert_eq!(
+            identity.write_device_path_ascii(&mut out),
+            Err(VideoDeviceIdentityError::BufferTooSmall {
+                needed: "\\Device\\Video0".len()
+            })
+        );
     }
 
     #[test]
@@ -525,19 +877,14 @@ mod tests {
     }
 
     #[test]
-    fn boot_video_control_initializes_win32k_callbacks() {
+    fn video_port_control_initializes_win32k_callbacks() {
         let mut input = [0u8; 16];
         input[..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
         input[8..16].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
         let mut out = [0xCCu8; VIDEO_WIN32K_CALLBACKS_SIZE_X64];
-        let written = dispatch_boot_video_io_control(
-            &miniport(),
-            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
-            &input,
-            &mut out,
-            0x9999_AAAA_BBBB_CCCCu64,
-        )
-        .unwrap();
+        let written = video_port()
+            .dispatch_io_control(IOCTL_VIDEO_INIT_WIN32K_CALLBACKS, &input, &mut out)
+            .unwrap();
         assert_eq!(written, VIDEO_WIN32K_CALLBACKS_SIZE_X64);
         assert_eq!(u64_at(&out, 0), 0x1111_2222_3333_4444);
         assert_eq!(u64_at(&out, 8), 0x5555_6666_7777_8888);
@@ -548,19 +895,18 @@ mod tests {
     }
 
     #[test]
-    fn buffered_boot_video_control_uses_system_buffer_for_callbacks() {
+    fn buffered_video_port_control_uses_system_buffer_for_callbacks() {
         let mut sys = [0u8; VIDEO_WIN32K_CALLBACKS_SIZE_X64];
         sys[..8].copy_from_slice(&0x1010_2020_3030_4040u64.to_le_bytes());
         sys[8..16].copy_from_slice(&0x5050_6060_7070_8080u64.to_le_bytes());
-        let written = dispatch_boot_video_buffered_io_control(
-            &miniport(),
-            IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
-            &mut sys,
-            16,
-            VIDEO_WIN32K_CALLBACKS_SIZE_X64,
-            0x9090_A0A0_B0B0_C0C0u64,
-        )
-        .unwrap();
+        let written = VideoPort::new(miniport(), 0x9090_A0A0_B0B0_C0C0u64)
+            .dispatch_buffered_io_control(
+                IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
+                &mut sys,
+                16,
+                VIDEO_WIN32K_CALLBACKS_SIZE_X64,
+            )
+            .unwrap();
         assert_eq!(written, VIDEO_WIN32K_CALLBACKS_SIZE_X64);
         assert_eq!(u64_at(&sys, 0), 0x1010_2020_3030_4040);
         assert_eq!(u64_at(&sys, 8), 0x5050_6060_7070_8080);
@@ -568,15 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn boot_video_control_unmap_is_a_visible_success_noop() {
+    fn video_port_control_unmap_is_a_visible_success_noop() {
         let mut out = [0xCCu8; 8];
         assert_eq!(
-            dispatch_boot_video_io_control(
-                &miniport(),
+            VideoPort::new(miniport(), 0x1234).dispatch_io_control(
                 IOCTL_VIDEO_UNMAP_VIDEO_MEMORY,
                 &[],
                 &mut out,
-                0x1234,
             ),
             Ok(0)
         );

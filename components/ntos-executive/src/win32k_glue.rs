@@ -4406,23 +4406,39 @@ pub(crate) unsafe fn load_win32k_static_import_drivers(host_pml4: u64) {
     }
 }
 
-fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
-    if driver_leaf.is_empty()
-        || driver_leaf.len() > 32
-        || !driver_leaf.iter().copied().all(|b| {
+fn system32_driver_leaf_is_safe(driver_leaf: &[u8]) -> bool {
+    !driver_leaf.is_empty()
+        && driver_leaf.iter().copied().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
         })
-        || driver_leaf.windows(2).any(|w| w == b"..")
-    {
+        && !driver_leaf.windows(2).any(|w| w == b"..")
+}
+
+fn system32_driver_path_vec(driver_leaf: &[u8]) -> Option<Vec<u8>> {
+    if !system32_driver_leaf_is_safe(driver_leaf) {
         return None;
     }
     let prefix = b"reactos\\system32\\";
-    if prefix.len() + driver_leaf.len() > out.len() {
+    let len = prefix.len().checked_add(driver_leaf.len())?;
+    let mut path = Vec::new();
+    path.try_reserve_exact(len).ok()?;
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(driver_leaf);
+    Some(path)
+}
+
+fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
+    if !system32_driver_leaf_is_safe(driver_leaf) {
+        return None;
+    }
+    let prefix = b"reactos\\system32\\";
+    let len = prefix.len().checked_add(driver_leaf.len())?;
+    if len > out.len() {
         return None;
     }
     out[..prefix.len()].copy_from_slice(prefix);
     out[prefix.len()..prefix.len() + driver_leaf.len()].copy_from_slice(driver_leaf);
-    Some(prefix.len() + driver_leaf.len())
+    Some(len)
 }
 
 unsafe fn map_bootboot_framebuffer_into_win32k(host_pml4: u64) {
@@ -4469,14 +4485,13 @@ pub(crate) unsafe fn load_display_driver(
         print_str(b"[win32k-svc] display DLL unavailable - executive FS not mounted\n");
         return;
     };
-    let mut path = [0u8; 64];
-    let Some(path_len) = system32_driver_path(spec.display_driver_leaf, &mut path) else {
+    let Some(path) = system32_driver_path_vec(spec.display_driver_leaf) else {
         print_str(b"[win32k-svc] display DLL leaf rejected by loader policy\n");
         return;
     };
-    let Some((src_va, sz)) = load_file_to_pool(&fs, &path[..path_len]) else {
+    let Some((src_va, sz)) = load_file_to_pool(&fs, &path) else {
         print_str(b"[win32k-svc] display DLL not found by registry path: ");
-        print_str(&path[..path_len]);
+        print_str(&path);
         print_str(b"\n");
         return;
     };
@@ -4488,7 +4503,7 @@ pub(crate) unsafe fn load_display_driver(
         0,
     ) {
         Some((entry, expdir, len)) => {
-            let _ = register_system_module(&path[..path_len], win32k_subsystem::FRAMEBUF_VA, len);
+            let _ = register_system_module(&path, win32k_subsystem::FRAMEBUF_VA, len);
             let recorded = win32k_subsystem::record_display_driver(spec, entry, expdir, len);
             print_str(b"[win32k-svc] hosted display driver ");
             print_str(spec.display_driver_leaf);

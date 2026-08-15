@@ -7154,17 +7154,14 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 // win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
 // win32ss/user/ntuser/display.c) open registry keys through ntoskrnl imports. These trampolines now
 // resolve those imports against real executive-owned state: the mounted SYSTEM hive for service and
-// keyboard-layout keys, plus the runtime Video0 DeviceMap key published through Configuration
+// keyboard-layout keys, plus the runtime video DeviceMap key published through Configuration
 // Manager when the selected display route is registered. There is no key/value mirror: ZwOpenKey
 // only mints an opaque handle to a live target, and ZwQueryValueKey reads the value from that target.
-// Video0's projected IO object identities and framebuffer IOCTL state are owned by `video_device`;
+// The video route's projected IO object identities and framebuffer IOCTL state are owned by `video_device`;
 // win32k only carries opaque registry handles to the registry authority.
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
-const WIN32K_REG_PATH_CAP: usize = 192;
-const WIN32K_REG_VALUE_NAME_CAP: usize = 48;
-const WIN32K_REG_VALUE_DATA_CAP: usize = 512;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -7190,6 +7187,7 @@ impl Win32kRegHandle {
 static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
 
 pub(crate) struct DisplayRegistrySpec<'a> {
+    pub(crate) video_object_number: u32,
     pub(crate) service_name: &'a [u8],
     pub(crate) service_key_pattern: &'a [u8],
     pub(crate) service_registry_path: &'a [u8],
@@ -7286,6 +7284,7 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
     unsafe {
         crate::video_device::publish_boot_framebuffer_video_device(
             &crate::video_device::VideoDeviceRegistration {
+                object_number: spec.video_object_number,
                 driver_name: spec.service_name,
                 service_registry_path: spec.service_registry_path,
                 framebuffer_va: WIN32K_FB_VA,
@@ -7325,39 +7324,36 @@ fn is_video_device_map_key(path: &[u8]) -> bool {
     reg_ascii_eq(registry_path_tail(path), b"hardware\\devicemap\\video")
 }
 
-fn system_hive_relative_path(path: &[u8], out: &mut [u8]) -> Option<usize> {
+fn system_hive_relative_path(path: &[u8]) -> Option<Vec<u8>> {
     let mut tail = registry_path_tail(path);
     tail = strip_ascii_prefix(tail, b"system\\")?;
     if reg_ascii_eq(tail, b"currentcontrolset") {
         let alias = b"controlset001";
-        if alias.len() > out.len() {
-            return None;
-        }
-        out[..alias.len()].copy_from_slice(alias);
-        Some(alias.len())
+        let mut out = Vec::new();
+        out.try_reserve_exact(alias.len()).ok()?;
+        out.extend_from_slice(alias);
+        Some(out)
     } else if let Some(rest) = strip_ascii_prefix(tail, b"currentcontrolset\\") {
         let alias = b"controlset001";
-        if alias.len() + 1 + rest.len() > out.len() {
-            return None;
-        }
-        out[..alias.len()].copy_from_slice(alias);
-        out[alias.len()] = b'\\';
-        out[alias.len() + 1..alias.len() + 1 + rest.len()].copy_from_slice(rest);
-        Some(alias.len() + 1 + rest.len())
+        let len = alias.len().checked_add(1)?.checked_add(rest.len())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).ok()?;
+        out.extend_from_slice(alias);
+        out.push(b'\\');
+        out.extend_from_slice(rest);
+        Some(out)
     } else {
-        if tail.len() > out.len() {
-            return None;
-        }
-        out[..tail.len()].copy_from_slice(tail);
-        Some(tail.len())
+        let mut out = Vec::new();
+        out.try_reserve_exact(tail.len()).ok()?;
+        out.extend_from_slice(tail);
+        Some(out)
     }
 }
 
 fn system_hive_key_from_path(path: &[u8]) -> Option<u32> {
     let hive = system_hive_regf()?;
-    let mut rel = [0u8; WIN32K_REG_PATH_CAP];
-    let rel_len = system_hive_relative_path(path, &mut rel)?;
-    let rel_str = unsafe { core::str::from_utf8_unchecked(&rel[..rel_len]) };
+    let rel = system_hive_relative_path(path)?;
+    let rel_str = unsafe { core::str::from_utf8_unchecked(&rel) };
     hive.open_key(rel_str)
 }
 
@@ -7377,7 +7373,7 @@ fn win32k_reg_path_is_absolute(path: &[u8]) -> bool {
         || strip_ascii_prefix(path, b"hardware\\").is_some()
 }
 
-unsafe fn read_unicode_string_ascii_lower(ustr: u64, out: &mut [u8]) -> Option<usize> {
+unsafe fn read_unicode_string_ascii_lower(ustr: u64) -> Option<Vec<u8>> {
     if ustr == 0 {
         return None;
     }
@@ -7386,29 +7382,28 @@ unsafe fn read_unicode_string_ascii_lower(ustr: u64, out: &mut [u8]) -> Option<u
         return None;
     }
     let chars = len / 2;
-    if chars > out.len() {
-        return None;
-    }
     let buf = read_unaligned((ustr + 8) as *const u64);
     if chars != 0 && buf == 0 {
         return None;
     }
+    let mut out = Vec::new();
+    out.try_reserve_exact(chars).ok()?;
     for i in 0..chars {
         let unit = read_unaligned((buf + (i * 2) as u64) as *const u16);
         if unit > 0x7f {
             return None;
         }
-        out[i] = (unit as u8).to_ascii_lowercase();
+        out.push((unit as u8).to_ascii_lowercase());
     }
-    Some(chars)
+    Some(out)
 }
 
-unsafe fn object_attributes_name_ascii_lower(obj_attr: u64, out: &mut [u8]) -> Option<usize> {
+unsafe fn object_attributes_name_ascii_lower(obj_attr: u64) -> Option<Vec<u8>> {
     if obj_attr == 0 {
         return None;
     }
     let ustr = read_unaligned((obj_attr + 0x10) as *const u64);
-    read_unicode_string_ascii_lower(ustr, out)
+    read_unicode_string_ascii_lower(ustr)
 }
 
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
@@ -7422,21 +7417,19 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
-        let mut path = [0u8; WIN32K_REG_PATH_CAP];
-        let Some(path_len) = object_attributes_name_ascii_lower(obj_attr, &mut path) else {
+        let Some(path) = object_attributes_name_ascii_lower(obj_attr) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let path = &path[..path_len];
         let root_dir = read_unaligned((obj_attr + 0x8) as *const u64);
         let root_target = if root_dir == 0 {
             None
         } else {
             lookup_win32k_reg_handle(root_dir)
         };
-        let target = if !win32k_reg_path_is_absolute(path) {
+        let target = if !win32k_reg_path_is_absolute(&path) {
             match root_target {
                 Some(Win32kRegHandleTarget::SystemHive { key }) => {
-                    if let Some(key) = system_hive_key_from_root_path(key, path) {
+                    if let Some(key) = system_hive_key_from_root_path(key, &path) {
                         Win32kRegHandleTarget::SystemHive { key }
                     } else {
                         return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -7446,12 +7439,12 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
             }
-        } else if is_video_device_map_key(path) {
+        } else if is_video_device_map_key(&path) {
             if !crate::video_device::video_device_map_published() {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             Win32kRegHandleTarget::VideoDeviceMap
-        } else if let Some(key) = system_hive_key_from_path(path) {
+        } else if let Some(key) = system_hive_key_from_path(&path) {
             Win32kRegHandleTarget::SystemHive { key }
         } else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -7511,11 +7504,8 @@ unsafe fn query_video_device_map_value(
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    let mut data = [0u8; WIN32K_REG_VALUE_DATA_CAP];
-    match crate::video_device::query_video_device_map_value(name, &mut data) {
-        Ok((value_type, data_len)) => {
-            emit_kvpi_bytes(kvi, length, result_len, value_type, &data[..data_len])
-        }
+    match crate::video_device::query_video_device_map_value_owned(name) {
+        Ok((value_type, data)) => emit_kvpi_bytes(kvi, length, result_len, value_type, &data),
         Err(status) => status,
     }
 }
@@ -7538,18 +7528,16 @@ extern "win64" fn s_zw_query_value_key(
         let Some(target) = lookup_win32k_reg_handle(hkey) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let mut name = [0u8; WIN32K_REG_VALUE_NAME_CAP];
-        let Some(name_len) = read_unicode_string_ascii_lower(value_name, &mut name) else {
+        let Some(name) = read_unicode_string_ascii_lower(value_name) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let name = &name[..name_len];
         match target {
             Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
             Win32kRegHandleTarget::VideoDeviceMap => {
-                query_video_device_map_value(name, kvi, length, result_len)
+                query_video_device_map_value(&name, kvi, length, result_len)
             }
             Win32kRegHandleTarget::SystemHive { key } => {
-                query_system_hive_value(key, name, kvi, length, result_len)
+                query_system_hive_value(key, &name, kvi, length, result_len)
             }
         }
     }

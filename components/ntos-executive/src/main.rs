@@ -17245,57 +17245,26 @@ fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<
     Some(n)
 }
 
-const DISPLAY_SERVICE_NAME_CAP: usize = 32;
-const DISPLAY_SERVICE_KEY_CAP: usize = 96;
-const DISPLAY_REGISTRY_PATH_CAP: usize = 96;
-const DISPLAY_DRIVER_VALUE_CAP: usize = 32;
-const DISPLAY_DRIVER_LEAF_CAP: usize = 32;
-const DISPLAY_DESCRIPTION_CAP: usize = 96;
-
 struct SystemHiveDisplayDriverSpec {
-    service_name: [u8; DISPLAY_SERVICE_NAME_CAP],
-    service_name_len: usize,
-    service_key_pattern: [u8; DISPLAY_SERVICE_KEY_CAP],
-    service_key_pattern_len: usize,
-    service_registry_path: [u8; DISPLAY_REGISTRY_PATH_CAP],
-    service_registry_path_len: usize,
-    installed_display_driver: [u8; DISPLAY_DRIVER_VALUE_CAP],
-    installed_display_driver_len: usize,
-    display_driver_leaf: [u8; DISPLAY_DRIVER_LEAF_CAP],
-    display_driver_leaf_len: usize,
-    device_description: [u8; DISPLAY_DESCRIPTION_CAP],
-    device_description_len: usize,
+    service_name: Vec<u8>,
+    service_key_pattern: Vec<u8>,
+    service_registry_path: Vec<u8>,
+    installed_display_driver: Vec<u8>,
+    display_driver_leaf: Vec<u8>,
+    device_description: Vec<u8>,
     vga_compatible: u32,
 }
 
 impl SystemHiveDisplayDriverSpec {
-    const fn empty() -> Self {
-        Self {
-            service_name: [0; DISPLAY_SERVICE_NAME_CAP],
-            service_name_len: 0,
-            service_key_pattern: [0; DISPLAY_SERVICE_KEY_CAP],
-            service_key_pattern_len: 0,
-            service_registry_path: [0; DISPLAY_REGISTRY_PATH_CAP],
-            service_registry_path_len: 0,
-            installed_display_driver: [0; DISPLAY_DRIVER_VALUE_CAP],
-            installed_display_driver_len: 0,
-            display_driver_leaf: [0; DISPLAY_DRIVER_LEAF_CAP],
-            display_driver_leaf_len: 0,
-            device_description: [0; DISPLAY_DESCRIPTION_CAP],
-            device_description_len: 0,
-            vga_compatible: 0,
-        }
-    }
-
     fn win32k_spec(&self) -> win32k_subsystem::DisplayRegistrySpec<'_> {
         win32k_subsystem::DisplayRegistrySpec {
-            service_name: &self.service_name[..self.service_name_len],
-            service_key_pattern: &self.service_key_pattern[..self.service_key_pattern_len],
-            service_registry_path: &self.service_registry_path[..self.service_registry_path_len],
-            installed_display_driver: &self.installed_display_driver
-                [..self.installed_display_driver_len],
-            display_driver_leaf: &self.display_driver_leaf[..self.display_driver_leaf_len],
-            device_description: &self.device_description[..self.device_description_len],
+            video_object_number: 0,
+            service_name: &self.service_name,
+            service_key_pattern: &self.service_key_pattern,
+            service_registry_path: &self.service_registry_path,
+            installed_display_driver: &self.installed_display_driver,
+            display_driver_leaf: &self.display_driver_leaf,
+            device_description: &self.device_description,
             vga_compatible: self.vga_compatible,
             framebuffer_size: FB_SIZE_BYTES.load(Ordering::Relaxed),
             mode: win32k_subsystem::DisplayModeSpec {
@@ -17308,79 +17277,106 @@ impl SystemHiveDisplayDriverSpec {
     }
 
     fn service_name(&self) -> &[u8] {
-        &self.service_name[..self.service_name_len]
+        &self.service_name
     }
 }
 
-static mut SYSTEM_HIVE_DISPLAY_DRIVER_SPEC: SystemHiveDisplayDriverSpec =
-    SystemHiveDisplayDriverSpec::empty();
+static mut SYSTEM_HIVE_DISPLAY_DRIVER_SPEC: Option<SystemHiveDisplayDriverSpec> = None;
 static SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY: AtomicU64 = AtomicU64::new(0);
 
-fn registry_copy_ascii_lower_str(s: &str, out: &mut [u8]) -> Option<usize> {
-    if s.is_empty() || s.len() > out.len() {
+fn registry_ascii_lower_vec(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() {
         return None;
     }
-    let mut n = 0usize;
+    let mut out = Vec::new();
+    out.try_reserve_exact(s.len()).ok()?;
     for b in s.bytes() {
         if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
             return None;
         }
-        out[n] = b.to_ascii_lowercase();
-        n += 1;
+        out.push(b.to_ascii_lowercase());
     }
-    Some(n)
+    Some(out)
 }
 
-fn registry_append_bytes(out: &mut [u8], mut pos: usize, bytes: &[u8]) -> Option<usize> {
-    if pos + bytes.len() > out.len() {
+fn registry_utf16_ascii_vec(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 2 {
         return None;
     }
-    out[pos..pos + bytes.len()].copy_from_slice(bytes);
-    pos += bytes.len();
-    Some(pos)
+    let mut out = Vec::new();
+    out.try_reserve_exact(data.len() / 2).ok()?;
+    let mut i = 0usize;
+    while i + 1 < data.len() {
+        let unit = u16::from_le_bytes([data[i], data[i + 1]]);
+        if unit == 0 {
+            break;
+        }
+        if unit > 0x7f {
+            return None;
+        }
+        let mut b = unit as u8;
+        if b == b'/' {
+            b = b'\\';
+        }
+        out.push(b.to_ascii_lowercase());
+        i += 2;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
-fn registry_build_display_service_paths(
-    service_name: &[u8],
-    key_pattern: &mut [u8],
-    registry_path: &mut [u8],
-) -> Option<(usize, usize)> {
-    let mut key_len =
-        registry_append_bytes(key_pattern, 0, b"SYSTEM\\CURRENTCONTROLSET\\SERVICES\\")?;
-    key_len = registry_append_bytes(key_pattern, key_len, service_name)?;
-    key_len = registry_append_bytes(key_pattern, key_len, b"\\DEVICE0")?;
-
-    let mut path_len = registry_append_bytes(
-        registry_path,
-        0,
-        b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\",
-    )?;
-    path_len = registry_append_bytes(registry_path, path_len, service_name)?;
-    path_len = registry_append_bytes(registry_path, path_len, b"\\Device0")?;
-    Some((key_len, path_len))
+fn registry_build_display_service_paths(service_name: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let key_prefix = b"SYSTEM\\CURRENTCONTROLSET\\SERVICES\\";
+    let key_suffix = b"\\DEVICE0";
+    let path_prefix = b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
+    let path_suffix = b"\\Device0";
+    let key_len = key_prefix
+        .len()
+        .checked_add(service_name.len())?
+        .checked_add(key_suffix.len())?;
+    let path_len = path_prefix
+        .len()
+        .checked_add(service_name.len())?
+        .checked_add(path_suffix.len())?;
+    let mut key = Vec::new();
+    key.try_reserve_exact(key_len).ok()?;
+    key.extend_from_slice(key_prefix);
+    key.extend_from_slice(service_name);
+    key.extend_from_slice(key_suffix);
+    let mut path = Vec::new();
+    path.try_reserve_exact(path_len).ok()?;
+    path.extend_from_slice(path_prefix);
+    path.extend_from_slice(service_name);
+    path.extend_from_slice(path_suffix);
+    Some((key, path))
 }
 
-fn registry_display_driver_leaf(installed_driver: &[u8], out: &mut [u8]) -> Option<usize> {
-    if installed_driver.is_empty() || installed_driver.len() > out.len() {
+fn registry_display_driver_leaf(installed_driver: &[u8]) -> Option<Vec<u8>> {
+    if installed_driver.is_empty() {
         return None;
     }
     if !registry_driver_leaf_is_safe(installed_driver) {
         return None;
     }
-    out[..installed_driver.len()].copy_from_slice(installed_driver);
-    let mut n = installed_driver.len();
+    let suffix_len = if installed_driver.contains(&b'.') { 0 } else { 4 };
+    let mut out = Vec::new();
+    out.try_reserve_exact(installed_driver.len().checked_add(suffix_len)?)
+        .ok()?;
+    out.extend_from_slice(installed_driver);
     if !installed_driver.contains(&b'.') {
-        n = registry_append_bytes(out, n, b".dll")?;
+        out.extend_from_slice(b".dll");
     }
-    if !registry_driver_leaf_is_safe(&out[..n]) {
+    if !registry_driver_leaf_is_safe(&out) {
         return None;
     }
-    Some(n)
+    Some(out)
 }
 
 fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverSpec> {
     if SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY.load(Ordering::Relaxed) != 0 {
-        return Some(unsafe { &*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) });
+        return unsafe { (&*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC)).as_ref() };
     }
     let hive = system_hive_regf()?;
     let services = hive.open_key("ControlSet001\\Services")?;
@@ -17401,52 +17397,42 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
             continue;
         };
 
-        let spec = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) };
-        *spec = SystemHiveDisplayDriverSpec::empty();
-        let Some(service_name_len) =
-            registry_copy_ascii_lower_str(&service_name, &mut spec.service_name)
+        let Some(service_name) = registry_ascii_lower_vec(&service_name) else {
+            continue;
+        };
+        let Some(installed_display_driver) = registry_utf16_ascii_vec(&installed_value.1) else {
+            continue;
+        };
+        let Some(display_driver_leaf) = registry_display_driver_leaf(&installed_display_driver)
         else {
             continue;
         };
-        let Some(installed_len) =
-            registry_utf16_ascii(&installed_value.1, &mut spec.installed_display_driver)
-        else {
-            continue;
-        };
-        let Some(display_leaf_len) = registry_display_driver_leaf(
-            &spec.installed_display_driver[..installed_len],
-            &mut spec.display_driver_leaf,
-        ) else {
-            continue;
-        };
-        if unsafe { !crate::fs_loader::sys32_exists(&spec.display_driver_leaf[..display_leaf_len]) }
-        {
+        if unsafe { !crate::fs_loader::sys32_exists(&display_driver_leaf) } {
             continue;
         }
-        let Some(description_len) =
-            registry_utf16_ascii(&description_value.1, &mut spec.device_description)
-        else {
+        let Some(device_description) = registry_utf16_ascii_vec(&description_value.1) else {
             continue;
         };
-        let Some((service_key_pattern_len, service_registry_path_len)) =
-            registry_build_display_service_paths(
-                &spec.service_name[..service_name_len],
-                &mut spec.service_key_pattern,
-                &mut spec.service_registry_path,
-            )
+        let Some((service_key_pattern, service_registry_path)) =
+            registry_build_display_service_paths(&service_name)
         else {
             continue;
         };
 
-        spec.service_name_len = service_name_len;
-        spec.service_key_pattern_len = service_key_pattern_len;
-        spec.service_registry_path_len = service_registry_path_len;
-        spec.installed_display_driver_len = installed_len;
-        spec.display_driver_leaf_len = display_leaf_len;
-        spec.device_description_len = description_len;
-        spec.vga_compatible = vga_compatible;
+        let spec = SystemHiveDisplayDriverSpec {
+            service_name,
+            service_key_pattern,
+            service_registry_path,
+            installed_display_driver,
+            display_driver_leaf,
+            device_description,
+            vga_compatible,
+        };
+        unsafe {
+            *core::ptr::addr_of_mut!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) = Some(spec);
+        }
         SYSTEM_HIVE_DISPLAY_DRIVER_SPEC_READY.store(1, Ordering::Relaxed);
-        return Some(unsafe { &*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) });
+        return unsafe { (&*core::ptr::addr_of!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC)).as_ref() };
     }
     None
 }
