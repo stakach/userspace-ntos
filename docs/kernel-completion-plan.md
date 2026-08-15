@@ -3468,8 +3468,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   snapshots from that state. This keeps the current boot-framebuffer IOCTL semantics unchanged while
   reducing the state surface that real videoprt/miniport hosting must replace. Validation:
   `cargo fmt --all`,
-  `cargo test -p nt-video-miniport`, and `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  `cargo test -p nt-video-miniport`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh
+  extern-rootserver`, and serialized
+  `RUN_LOG=.tmp/run-desktop-video-bridge-state-20260815.log ./run.sh --desktop`. The desktop proof
+  reached `296/296` checks with no `FAIL` lines in the gate scan, passed
+  `exec_video_device_objects_registered`, `exec_vm_pool_headroom`, `exec_gdi_user_batch_flushed`,
+  `exec_profile_ntuser_dat_present`, `exec_ntloadkey_serviced`, `exec_winlogon_user_shell_activated`,
+  `exec_userinit_process_spawned`, `exec_explorer_process_spawned`, and
+  `exec_explorer_shell_chrome_painted`, and finished with `exec-heap-free=8048KiB`.
 
 - B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
   longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a
