@@ -2193,10 +2193,23 @@ const NT_QUERY_SYSTEM_TIME: u64 = 0x57; // NtQuerySystemTime() → HPET counter 
 const NT_CREATE_SECTION: u64 = 0x47; // NtCreateSection(size in R10) → section handle in RAX
 const NT_MAP_VIEW: u64 = 0x25; // NtMapViewOfSection(section handle in R10) → view base VA in RAX
 const NT_CREATE_THREAD: u64 = 0xA5; // NtCreateThreadEx(start routine in R10) → thread handle in RAX
-/// Where the executive backs NtAllocateVirtualMemory for the user thread — inside the relocated
-/// cluster PT (WORK_CLUSTER_BASE), which spawn_user_thread builds; the 2 MiB alloc window
-/// [USER_ALLOC_BASE, +0x20_0000) stays within it, so mapping needs no new page table.
-pub const USER_ALLOC_BASE: u64 = 0x0000_0100_1050_0000;
+/// Legacy non-SEC_IMAGE selftest allocation window. Real hosted processes allocate from the
+/// per-process VAD arena; these throwaway user-thread tests use the same private-VM base but get only
+/// one explicit leaf PT in their VSpace, keeping ad hoc allocations out of hosted stack reservations.
+pub const USER_ALLOC_BASE: u64 = SMSS_ALLOC_VA;
+pub const USER_ALLOC_WINDOW_SIZE: u64 = 0x0020_0000;
+const _: () = {
+    assert!(USER_ALLOC_BASE & 0x1f_ffff == 0);
+    assert!(USER_ALLOC_WINDOW_SIZE == 0x20_0000);
+    assert!(USER_ALLOC_BASE >= SMSS_ALLOC_VA);
+    assert!(USER_ALLOC_BASE + USER_ALLOC_WINDOW_SIZE <= PRIVATE_VM_LIMIT);
+    assert!(ranges_are_disjoint(
+        USER_ALLOC_BASE,
+        USER_ALLOC_WINDOW_SIZE,
+        HOSTED_MAIN_STACK_ALLOCATION_BASE,
+        STACK_BASE + STACK_FRAMES * 0x1000 - HOSTED_MAIN_STACK_ALLOCATION_BASE,
+    ));
+};
 
 // The Object Manager namespace ops aren't in the `NativeService` enum (a niche
 // syscall surface), so they keep synthetic numbers — but now carry a real
@@ -12216,6 +12229,12 @@ pub(crate) unsafe fn map_hosted_client_env_pt(pml4: u64) {
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, HOSTED_CLIENT_ENV_BASE, pml4);
 }
 
+unsafe fn map_user_alloc_pt(pml4: u64) {
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, USER_ALLOC_BASE, pml4);
+}
+
 /// Build the standard executive-image paging skeleton in `pml4`: pdpt + pd for the image's 1 GiB
 /// slot, one PT per 2 MiB of image (so the ELF can grow into its 64 MiB reserve), and the
 /// relocated cluster PT. Callers then map the image frames + any region-specific buffer PTs. The
@@ -20025,6 +20044,7 @@ unsafe fn spawn_user_thread(
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     map_image_skeleton(pml4, img_count);
+    map_user_alloc_pt(pml4);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(
@@ -20108,11 +20128,15 @@ unsafe fn spawn_user_thread(
 /// buffer + CNode (fault ep) at bumped user vaddrs, starting at `entry`. The thread shares the
 /// caller's address space (so it sees the caller's mappings). Returns the TCB cap.
 unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
-    let stack_base = NEXT_USER_VADDR.fetch_add(0x4000, Ordering::Relaxed);
+    let Some(stack_base) = user_alloc_bump(0x4000) else {
+        return 0;
+    };
     for i in 0..4u64 {
         let _ = page_map(alloc_frame(), stack_base + i * 0x1000, RW_NX, pml4);
     }
-    let ipcbuf_va = NEXT_USER_VADDR.fetch_add(0x1000, Ordering::Relaxed);
+    let Some(ipcbuf_va) = user_alloc_bump(0x1000) else {
+        return 0;
+    };
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, ipcbuf_va, RW_NX, pml4);
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -20764,6 +20788,24 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
 static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
+
+fn user_alloc_bump(size: u64) -> Option<u64> {
+    let size = (if size == 0 { 0x1000 } else { size }).checked_add(0xFFF)? & !0xFFF;
+    loop {
+        let base = NEXT_USER_VADDR.load(Ordering::Relaxed);
+        let end = base.checked_add(size)?;
+        if base < USER_ALLOC_BASE || end > USER_ALLOC_BASE + USER_ALLOC_WINDOW_SIZE {
+            return None;
+        }
+        if NEXT_USER_VADDR
+            .compare_exchange(base, end, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(base);
+        }
+    }
+}
+
 /// How many VMFaults (page faults) the service loop demand-paged in for the user thread.
 static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
@@ -21531,15 +21573,30 @@ where
                 // the next bump vaddr, and return the base (arg1 = size in bytes).
                 NativeService::NtAllocateVirtualMemory => {
                     let size = if arg1 == 0 { 0x1000 } else { arg1 };
-                    let pages = (size + 0xFFF) / 0x1000;
-                    let base = NEXT_USER_VADDR.fetch_add(pages * 0x1000, Ordering::Relaxed);
-                    for i in 0..pages {
-                        let f = alloc_slot();
-                        let _ =
-                            untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-                        let _ = page_map(f, base + i * 0x1000, RW_NX, user_pml4);
+                    let pages = match size.checked_add(0xFFF).map(|rounded| rounded / 0x1000) {
+                        Some(pages) => pages,
+                        None => 0,
+                    };
+                    if pages != 0 {
+                        if let Some(base) = pages.checked_mul(0x1000).and_then(user_alloc_bump) {
+                            for i in 0..pages {
+                                let f = alloc_slot();
+                                let _ = untyped_retype(
+                                    CAP_INIT_UNTYPED,
+                                    OBJ_X86_4K_PAGE,
+                                    PAGING_BITS,
+                                    1,
+                                    f,
+                                );
+                                let _ = page_map(f, base + i * 0x1000, RW_NX, user_pml4);
+                            }
+                            base
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
                     }
-                    base
                 }
                 // P3 clock: the CPU timestamp counter — a real monotonic time source that
                 // needs no device mapping (the HPET isn't mapped yet at this point).
@@ -21577,18 +21634,21 @@ where
                 NativeService::NtMapViewOfSection => {
                     let h = arg1 as usize;
                     if h >= 1 && h <= sec_count {
-                        let base = NEXT_USER_VADDR.fetch_add(0x1000, Ordering::Relaxed);
-                        if sec_demand[h - 1] {
-                            if view_count < views.len() {
-                                views[view_count] = (base, sec_frames[h - 1]);
-                                view_count += 1;
+                        if let Some(base) = user_alloc_bump(0x1000) {
+                            if sec_demand[h - 1] {
+                                if view_count < views.len() {
+                                    views[view_count] = (base, sec_frames[h - 1]);
+                                    view_count += 1;
+                                }
+                                // deliberately NOT mapped — the page faults in on access.
+                            } else {
+                                let cp = copy_cap(sec_frames[h - 1]);
+                                let _ = page_map(cp, base, RW_NX, user_pml4);
                             }
-                            // deliberately NOT mapped — the page faults in on access.
+                            base
                         } else {
-                            let cp = copy_cap(sec_frames[h - 1]);
-                            let _ = page_map(cp, base, RW_NX, user_pml4);
+                            0
                         }
-                        base
                     } else {
                         0
                     }
@@ -22553,7 +22613,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(
         b"exec_nt_alloc_vm_base",
-        vm_base >= USER_ALLOC_BASE && vm_base < USER_ALLOC_BASE + 0x0020_0000,
+        vm_base >= USER_ALLOC_BASE && vm_base < USER_ALLOC_BASE + USER_ALLOC_WINDOW_SIZE,
         &mut passed,
     );
     check(b"exec_nt_alloc_vm_readback", vm_readback == 1, &mut passed);

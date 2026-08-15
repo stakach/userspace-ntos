@@ -39,9 +39,11 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-dbgk-worker-lane-20260815.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the Dbgk remote-breakin target VSpace was brought
-onto the same high worker target-lane contract as normal hosted SEC_IMAGE processes. This
+`.tmp/run-desktop-user-alloc-private-vm-20260815.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the legacy non-SEC_IMAGE user-allocation window
+was moved off the hosted main-stack reservation and onto the private-VM lane. This also retains the
+Dbgk remote-breakin target VSpace on the same high worker target-lane contract as normal hosted
+SEC_IMAGE processes. This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -50,7 +52,9 @@ shell path is fully live: `WlxActivateUserShell` reads the real `Userinit` regis
 `userinit.exe` and `explorer.exe` spawn through ordinary section/process creation, Explorer opens
 shell COM classes, redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches,
 and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with
-at least 32 distinct non-background colors. The Dbgk remote-breakin selftest now reports
+at least 32 distinct non-background colors. The legacy allocator proof reports
+`exec_nt_alloc_vm_base` at `0x10030000000`, inside the private-VM lane instead of the hosted
+main-stack lane, while the Dbgk remote-breakin selftest still reports
 `bits=0x7f`, `remote-created=1`, `remote-spawned=1`, and marker `0x12`, so
 `exec_dbgk_remote_breakin_thread_runs` and `exec_dbgk_remote_breakin_reports_breakpoint` are green
 with the desktop. The preceding headless proof remains
@@ -66,7 +70,7 @@ proof remains
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
 the current desktop path.
 
-Current ntdll import-reference slice (2026-08-15): the late `rundll32.exe` fault is being treated as
+Completed ntdll import-reference slice (2026-08-15): the late `rundll32.exe` fault is being treated as
 a loader-lifetime bug rather than a kernel process-launch shortcut. The Rust ntdll loader now records
 the unique normal and delay import edges of each successfully snapped module and publishes the
 missing load-count increment only for dependencies that were already present before that module
@@ -84,11 +88,12 @@ a pending increment that cannot be matched to a real loader entry fails the load
 validation is green:
 `cargo test -p nt-ntdll loader -- --nocapture`, `./scripts/build_ntdll_dll.sh`, executive
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
-and `git diff --check`. Remaining validation is a serialized desktop proof confirming that the late
-`rundll32.exe`/`advapi32` instruction-fetch `vmf-out` is gone while the `296/296` shell-chrome gates
-remain green.
+and `git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-user-alloc-private-vm-20260815.log` confirms `rundll32.exe` reaches real win32k
+service dispatch, the late `advapi32` instruction-fetch `vmf-out` signature is absent, and the
+`296/296` shell-chrome gates remain green.
 
-Current hosted-main stack-growth slice (2026-08-15): the import-reference desktop proof exposed a
+Completed hosted-main stack-growth slice (2026-08-15): the import-reference desktop proof exposed a
 different, earlier wall in `csrss.exe`: the hosted SEC_IMAGE main thread faulted one page below the
 old globally bounded stack-growth floor while entering ntdll loader code. The retained fix removes
 the historical `STACK_GROWTH_FLOOR` policy and records a real hosted main-thread stack reservation in
@@ -96,9 +101,10 @@ thread runtime metadata. The fault path now grows only inside the faulting threa
 reservation, requires the immediately higher page to be a registered stack page for the same process,
 uses the host-tested `next_stack_growth_page` guard, and updates the main TEB `StackLimit` when a
 page is committed. This is a mechanism boundary, not a larger magic stack: uncommitted reservation
-pages are not published as committed VAD state. Local validation is in progress; remaining
-validation is a serialized desktop proof showing the previous `csrss` stack fault is gone and the
-desktop gates return to green.
+pages are not published as committed VAD state. Serialized desktop proofs
+`.tmp/run-desktop-thread-stack-growth-20260815.log` and
+`.tmp/run-desktop-user-alloc-private-vm-20260815.log` show the previous `csrss` stack fault is gone
+and the desktop gates return to green.
 
 Follow-up worker-window separation slice (2026-08-15): serialized proof
 `.tmp/run-desktop-thread-stack-growth-20260815.log` confirmed the old `csrss` loader stack-growth
@@ -129,10 +135,13 @@ high worker target-lane page tables after generic worker slot0 moved out of the 
 reservation. The retained Dbgk fix shares `map_tp_worker_target_lane_pts` with the throwaway target
 setup, and serialized proof `.tmp/run-desktop-dbgk-worker-lane-20260815.log` confirms the same
 desktop shell-chrome path now reaches `296/296` with remote break-in thread execution and breakpoint
-reporting green. Review adjustment: the legacy `USER_ALLOC_BASE` bump allocator still starts at the
-hosted main-stack reservation base for older non-SEC_IMAGE user-thread tests; move that allocator
-into a separate reserved lane or replace it with the hosted VAD allocator so future stack growth
-cannot collide with ad hoc user allocations.
+reporting green. The final retained allocator cleanup moves the legacy `USER_ALLOC_BASE` bump
+allocator for older non-SEC_IMAGE user-thread tests to `SMSS_ALLOC_VA`, adds an explicit
+`USER_ALLOC_WINDOW_SIZE`, maps that leaf PT only into those throwaway VSpaces, and routes stack,
+IPC-buffer, `NtAllocateVirtualMemory`, and legacy section-view bumps through checked allocation.
+Serialized proof `.tmp/run-desktop-user-alloc-private-vm-20260815.log` confirms
+`exec_nt_alloc_vm_base` returns `0x10030000000`, the old hosted-stack collision is gone, and the
+desktop shell-chrome gates still reach `296/296`.
 
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
