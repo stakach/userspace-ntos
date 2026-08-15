@@ -1656,8 +1656,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    access/concurrency/status scalars, and file-query information class/length fields. The
    `NtCreateFile` follow-on now captures desired access, file attributes, share access, create
    disposition, and create options once at the syscall boundary before routing boot-status, NPFS,
-   writable-overlay, volume-overlay, and read-only FAT opens. The remaining dense raw-cast clusters
-   are file information setters and section/map-view services.
+   writable-overlay, volume-overlay, and read-only FAT opens. The file I/O follow-on now covers
+   `NtReadFile`/`NtWriteFile` lengths, `NtSetInformationFile` information class and length, and the
+   `NtQueryIoCompletion` query class/length. The remaining dense raw-cast cluster is section/map-view
+   service scalar capture.
 
 ## Review Log
 

@@ -27082,6 +27082,8 @@ impl ExecNtHandler {
                 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
                 const IO_COMPLETION_QUERY_STATE: u32 = 0x1;
                 const BASIC_INFO_LEN: u32 = 4;
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]);
                 let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_QUERY_STATE) {
                     Ok(id) => id,
                     Err(status) => return status,
@@ -27093,10 +27095,10 @@ impl ExecNtHandler {
                     }
                     self.xas_write_buf(args[4], &BASIC_INFO_LEN.to_le_bytes());
                 }
-                if args[1] as u32 != 0 {
+                if information_class != 0 {
                     return STATUS_INVALID_INFO_CLASS;
                 }
-                if (args[3] as u32) < BASIC_INFO_LEN {
+                if information_length < BASIC_INFO_LEN {
                     return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let mut output_probe = [0u8; 4];
@@ -27572,7 +27574,7 @@ impl ExecNtHandler {
             NativeService::NtWriteFile => unsafe {
                 let iosb = args[4];
                 let buffer = args[5];
-                let len = args[6] as u32 as usize;
+                let len = nt_ulong_arg(args[6]) as usize;
                 let byte_offset = args[7];
                 let key = args[8];
                 let fh = args[0]; // R10 = FileHandle
@@ -27964,7 +27966,7 @@ impl ExecNtHandler {
             NativeService::NtReadFile => unsafe {
                 let iosb = args[4];
                 let buffer = args[5];
-                let len = args[6] as u32 as usize;
+                let len = nt_ulong_arg(args[6]) as usize;
                 let byte_offset = args[7];
                 let fh = args[0];
                 let event = args[1];
@@ -28414,8 +28416,8 @@ impl ExecNtHandler {
             // system processes.
             NativeService::NtSetInformationFile => unsafe {
                 let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
-                let information_class = args[4] as u32;
-                let length = args[3] as u32 as usize;
+                let information_class = nt_ulong_arg(args[4]);
+                let length = nt_ulong_arg(args[3]) as usize;
                 let overlay_file = self.overlay_file_id_for(args[0]);
                 // ★ 64, not 32. The staging buffer TRUNCATES the caller's structure to its own
                 // size, so a 40-byte `FILE_BASIC_INFORMATION` (the class `kernel32!SetLastWriteTime`
