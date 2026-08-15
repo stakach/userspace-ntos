@@ -21939,13 +21939,14 @@ impl ExecNtHandler {
                                         if deadline.is_some_and(|value| value <= now) {
                                             status = STATUS_IO_TIMEOUT as u64;
                                         } else {
-                                            let waiters =
-                                                &*core::ptr::addr_of!(crate::PIPE_NAME_WAITERS);
+                                            let waiters = &mut *core::ptr::addr_of_mut!(
+                                                crate::PIPE_NAME_WAITERS
+                                            );
                                             let reply_capacity = REPLY_MAIN_SLOT
                                                 .load(Ordering::Relaxed)
                                                 != 0
                                                 && wait_reply_pool_has_free();
-                                            if !waiters.has_capacity() || !reply_capacity {
+                                            if !waiters.ensure_capacity() || !reply_capacity {
                                                 status =
                                                     nt_io_completion::STATUS_INSUFFICIENT_RESOURCES
                                                         as u64;

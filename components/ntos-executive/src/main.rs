@@ -2590,7 +2590,6 @@ static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN
 const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
     nt_io_manager::PipeNameWaiterTable::new();
-static mut PIPE_NAME_CANCEL_REPLY_CAPS_WORK: [u64; PIPE_NAME_WAITER_N] = [0; PIPE_NAME_WAITER_N];
 /// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
 static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_LISTEN_SIGNALLED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -14278,11 +14277,9 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
 unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = handler.cancel_pipe_io_for_thread_teardown(tid);
     let name_waiters = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
-    let name_wait_reply_caps = &mut *core::ptr::addr_of_mut!(PIPE_NAME_CANCEL_REPLY_CAPS_WORK);
-    let name_wait_count = name_waiters.cancel_thread_collect_reply_caps(tid, name_wait_reply_caps);
-    for index in 0..name_wait_count.min(name_wait_reply_caps.len()) {
-        let cap = name_wait_reply_caps[index];
-        if cap != 0 {
+    let _ = name_waiters.cancel_thread_with(tid, |waiter| {
+        if waiter.reply_cap != 0 {
+            let cap = waiter.reply_cap;
             let deleted = cnode_delete_r(cap);
             let retyped = if deleted == 0 {
                 untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
@@ -14293,7 +14290,7 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
                 release_reply_pool_cap(cap);
             }
         }
-    }
+    });
     thread_wait_state_clear_tid(handler, tid);
 }
 

@@ -5787,6 +5787,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
 
+  A4 named-pipe root-wait queue cleanup (2026-08-15): root `FSCTL_PIPE_WAIT` waiters are no longer
+  stored in a fixed array sized by the reply-cap pool. `PipeNameWaiterTable` now follows the same
+  small-initial-reservation/growable `Vec<Option<_>>` model as pending pipe reads/writes and async
+  `FSCTL_PIPE_LISTEN`: callers reserve storage before returning `STATUS_PENDING`, `arm` grows only on
+  real allocation demand, and teardown drains waiters through a per-record callback instead of a
+  fixed reply-cap scratch array. This keeps reply-cap ownership explicit while removing another
+  global cap from named-pipe listener/client coordination. Remaining A4 data-plane work is broader
+  RPC/NPFS association behavior and LSA self-RPC diagnostics, not a table-size limit at the root wait
+  boundary. Validation: `cargo test -p nt-io-manager pipe_name_waiter -- --nocapture` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
+
   Native file-position FILE_OBJECT cleanup (2026-08-14): read-only FAT file handles now own a real
   shared FILE_OBJECT record rather than just a backing extent. The record carries the current byte
   offset, is retained across `NtDuplicateObject`, released on close/teardown, and is used by

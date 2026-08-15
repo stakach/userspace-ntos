@@ -1234,10 +1234,14 @@ pub struct PipeNameWaiter {
     pub deadline_100ns: u64,
 }
 
-/// Fixed-capacity wait queue for root `FSCTL_PIPE_WAIT` requests.
+/// Reset-safe wait queue for root `FSCTL_PIPE_WAIT` requests.
+///
+/// The const parameter is the initial reservation size, not a semantic limit. Native NPFS keeps a
+/// VCB wait queue; service waves can have many named-pipe root waits outstanding at once, so this
+/// table grows on demand and refuses only when it cannot allocate another waiter record.
 #[derive(Clone, Debug)]
 pub struct PipeNameWaiterTable<const N: usize> {
-    slots: [Option<PipeNameWaiter>; N],
+    slots: Vec<Option<PipeNameWaiter>>,
 }
 
 impl<const N: usize> Default for PipeNameWaiterTable<N> {
@@ -1248,7 +1252,31 @@ impl<const N: usize> Default for PipeNameWaiterTable<N> {
 
 impl<const N: usize> PipeNameWaiterTable<N> {
     pub const fn new() -> Self {
-        Self { slots: [None; N] }
+        Self { slots: Vec::new() }
+    }
+
+    fn grow_reservation(&mut self) -> bool {
+        if self.slots.len() == self.slots.capacity() {
+            let reserve = if self.slots.capacity() == 0 {
+                N.max(1)
+            } else {
+                1
+            };
+            if self.slots.try_reserve(reserve).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Ensure one future [`arm`](Self::arm) can record a distinct waiter without allocating at the
+    /// point where the executive has already decided to park the caller.
+    pub fn ensure_capacity(&mut self) -> bool {
+        if self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
+        {
+            return true;
+        }
+        self.grow_reservation()
     }
 
     pub fn len(&self) -> usize {
@@ -1260,7 +1288,11 @@ impl<const N: usize> PipeNameWaiterTable<N> {
     }
 
     pub fn has_capacity(&self) -> bool {
-        self.slots.iter().any(|slot| slot.is_none())
+        self.slots.iter().any(|slot| slot.is_none()) || self.slots.len() < self.slots.capacity()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
     }
 
     pub fn has_thread(&self, tid: u64) -> bool {
@@ -1276,7 +1308,11 @@ impl<const N: usize> PipeNameWaiterTable<N> {
                 return Some(index);
             }
         }
-        None
+        if !self.grow_reservation() {
+            return None;
+        }
+        self.slots.push(Some(waiter));
+        Some(self.slots.len() - 1)
     }
 
     pub fn complete_by_name(&mut self, name_hash: u64) -> Option<PipeNameWaiter> {
@@ -1316,6 +1352,23 @@ impl<const N: usize> PipeNameWaiterTable<N> {
                     *slot = None;
                     count += 1;
                 }
+            }
+        }
+        count
+    }
+
+    /// Cancel + free all waiters owned by `tid`, invoking `complete` with every removed waiter.
+    /// This avoids any separate fixed-size scratch array in callers.
+    pub fn cancel_thread_with<F>(&mut self, tid: u64, mut complete: F) -> usize
+    where
+        F: FnMut(PipeNameWaiter),
+    {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if slot.is_some_and(|waiter| waiter.tid == tid) {
+                let waiter = slot.take().unwrap();
+                complete(waiter);
+                count += 1;
             }
         }
         count
@@ -2620,6 +2673,32 @@ mod tests {
         );
         assert_eq!(t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap().tid, 11);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn pipe_name_waiter_table_grows_beyond_initial_reservation() {
+        let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let samr: std::vec::Vec<u16> = "\\samr".encode_utf16().collect();
+        let mut t = PipeNameWaiterTable::<1>::new();
+
+        assert!(t.ensure_capacity());
+        assert!(t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).is_some());
+        assert!(t.arm(pnw(&ntsvcs, 11, 0x31, 200)).is_some());
+        assert!(t.arm(pnw(&samr, 12, 0x32, 300)).is_some());
+        assert_eq!(t.len(), 3);
+        assert!(t.capacity() >= 3);
+
+        assert_eq!(
+            t.complete_by_name(pipe_name_hash(&ntsvcs))
+                .unwrap()
+                .reply_cap,
+            0x31
+        );
+        assert_eq!(t.len(), 2);
+        assert!(t.has_capacity());
+        assert!(t.arm(pnw(&ntsvcs, 13, 0x33, u64::MAX)).is_some());
+        assert_eq!(t.len(), 3);
     }
 
     #[test]
