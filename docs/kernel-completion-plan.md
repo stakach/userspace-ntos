@@ -3459,6 +3459,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `exec-heap-free=7918KiB`, and passed the userinit, explorer process, GDI batch, profile hive,
   `NtLoadKey`, and `exec_explorer_shell_chrome_painted` gates.
 
+- B3 Video0 bridge route-state cleanup (2026-08-15). The temporary boot-framebuffer Video0 bridge no
+  longer keeps projected WDM object pointers and I/O Manager route identities as a dozen unrelated
+  file-level scalar statics. `video_device.rs` now groups projected driver/device/file bodies into
+  `VideoProjectionObjects` and the registered driver/device/open route into `VideoIoRoute`; all
+  readiness checks, proofs, teardown, `IoGetDeviceObjectPointer`, EngDeviceIoControl, and buffered
+  I/O Manager dispatch now consume snapshots from those records. This keeps the current
+  boot-framebuffer IOCTL semantics unchanged while reducing the state surface that real
+  videoprt/miniport hosting must replace. Validation: `cargo fmt --all`,
+  `cargo test -p nt-video-miniport`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
 - B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
   longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a
   growable vector, reuses cleared holes, and reports `STATUS_INSUFFICIENT_RESOURCES` only on real
