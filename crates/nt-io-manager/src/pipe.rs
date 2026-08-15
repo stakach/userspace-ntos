@@ -215,6 +215,8 @@ impl DataQueue {
 /// A single connection instance (`NP_CCB`): a server end + a client end sharing
 /// two directional data queues + the pipe state.
 pub struct PipeConnection {
+    /// Stable id within the owning FCB. This mirrors a CCB identity rather than a vector slot.
+    id: usize,
     /// `NP_CCB.NamedPipeState`.
     pub state: PipeState,
     /// Whether the server end has an attached open (`FileObject[SERVER_END]`).
@@ -238,6 +240,7 @@ impl PipeConnection {
         let msg = params.pipe_type == FILE_PIPE_MESSAGE_TYPE;
         let server_msg = params.read_mode == FILE_PIPE_MESSAGE_MODE;
         PipeConnection {
+            id: 0,
             state: PipeState::Disconnected,
             server_attached: true, // created by the server side
             client_attached: false,
@@ -340,6 +343,9 @@ pub struct PipeFcb {
     pub name: String,
     /// The pipe config all instances share.
     pub params: PipeParams,
+    /// Stable per-FCB connection id allocator. Vector indices may move when closed instances are
+    /// removed; CCB handles must not.
+    next_connection_id: usize,
     /// The live connection instances (`NP_FCB.CcbList`).
     connections: Vec<PipeConnection>,
 }
@@ -350,7 +356,7 @@ impl PipeFcb {
     }
 }
 
-/// A handle to one end of one connection: `(pipe index, connection index, end)`.
+/// A handle to one end of one connection: `(pipe index, stable connection id, end)`.
 /// This is the "CCB pointer + NamedPipeEnd" a FILE_OBJECT decodes to.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PipeHandle {
@@ -415,6 +421,7 @@ impl PipeRegistry {
                 self.pipes.push(PipeFcb {
                     name: String::from(name),
                     params,
+                    next_connection_id: 1,
                     connections: Vec::new(),
                 });
                 self.pipes.len() - 1
@@ -422,11 +429,14 @@ impl PipeRegistry {
         };
         let fcb = &mut self.pipes[fcb_idx];
         let mut conn = PipeConnection::new(&fcb.params);
+        conn.id = fcb.next_connection_id;
+        fcb.next_connection_id = fcb.next_connection_id.checked_add(1).unwrap_or(1).max(1);
         conn.state = PipeState::Listening;
+        let conn_id = conn.id;
         fcb.connections.push(conn);
         Ok(PipeHandle {
             fcb: fcb_idx,
-            conn: fcb.connections.len() - 1,
+            conn: conn_id,
             end: PipeEnd::Server,
         })
     }
@@ -475,9 +485,10 @@ impl PipeRegistry {
         conn.read_message_mode[FILE_PIPE_CLIENT_END] = false;
         conn.completion_mode[FILE_PIPE_CLIENT_END] = FILE_PIPE_QUEUE_OPERATION;
         conn.state = PipeState::Connected;
+        let conn_id = conn.id;
         Ok(PipeHandle {
             fcb: fcb_idx,
-            conn: conn_idx,
+            conn: conn_id,
             end: PipeEnd::Client,
         })
     }
@@ -553,16 +564,18 @@ impl PipeRegistry {
     /// still drain queued bytes) then `Disconnected`.
     pub fn disconnect(&mut self, h: PipeHandle) -> Result<(), NtStatus> {
         let fcb = self.pipes.get_mut(h.fcb).ok_or(NtStatus::INVALID_HANDLE)?;
-        let conn = fcb
+        let conn_idx = fcb
             .connections
-            .get_mut(h.conn)
+            .iter()
+            .position(|conn| conn.id == h.conn)
             .ok_or(NtStatus::INVALID_HANDLE)?;
+        let conn = &mut fcb.connections[conn_idx];
         match h.end {
             PipeEnd::Server => conn.server_attached = false,
             PipeEnd::Client => conn.client_attached = false,
         }
         if !conn.server_attached && !conn.client_attached {
-            fcb.connections.remove(h.conn);
+            fcb.connections.remove(conn_idx);
         } else {
             // The peer's read queue KEEPS its buffered bytes (the peer may still
             // drain what the gone end already wrote — NPFS's `Closing` semantics);
@@ -624,14 +637,14 @@ impl PipeRegistry {
     fn conn(&self, h: PipeHandle) -> Result<&PipeConnection, NtStatus> {
         self.pipes
             .get(h.fcb)
-            .and_then(|f| f.connections.get(h.conn))
+            .and_then(|f| f.connections.iter().find(|conn| conn.id == h.conn))
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 
     fn conn_mut(&mut self, h: PipeHandle) -> Result<&mut PipeConnection, NtStatus> {
         self.pipes
             .get_mut(h.fcb)
-            .and_then(|f| f.connections.get_mut(h.conn))
+            .and_then(|f| f.connections.iter_mut().find(|conn| conn.id == h.conn))
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 }
@@ -2091,6 +2104,30 @@ mod tests {
         r.pipe_write(s2, b"two").unwrap();
         assert_eq!(r.pipe_read(c1, 8).unwrap().0, b"one");
         assert_eq!(r.pipe_read(c2, 8).unwrap().0, b"two");
+    }
+
+    #[test]
+    fn closing_one_instance_does_not_retarget_other_handles() {
+        let mut r = dx();
+        let p = PipeParams {
+            max_instances: 2,
+            ..PipeParams::default()
+        };
+        let s1 = r.create_server_pipe("ntsvcs", p).unwrap();
+        let s2 = r.create_server_pipe("ntsvcs", p).unwrap();
+        r.listen(s1).unwrap();
+        r.listen(s2).unwrap();
+        let c1 = r.connect_client("ntsvcs").unwrap();
+        let c2 = r.connect_client("ntsvcs").unwrap();
+
+        r.pipe_write(s2, b"second").unwrap();
+        r.disconnect(c1).unwrap();
+        r.disconnect(s1).unwrap();
+
+        assert_eq!(r.state(s1).unwrap_err(), NtStatus::INVALID_HANDLE);
+        assert_eq!(r.state(s2).unwrap(), PipeState::Connected);
+        assert_eq!(r.state(c2).unwrap(), PipeState::Connected);
+        assert_eq!(r.pipe_read(c2, 16).unwrap().0, b"second");
     }
 
     #[test]

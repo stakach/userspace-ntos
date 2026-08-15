@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-15
+Last updated: 2026-08-16
 
 ## Objective
 
@@ -1663,6 +1663,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    attributes, and `NtMapViewOfSection` allocation/protection flags. The residual `args[n] as u32`
    hits in this file are diagnostic `print_hex` narrowing sites; the next audit should move from
    scalar-boundary cleanup back to semantic kernel gaps.
+6. A4 NPFS multi-instance handle stability is now pinned in the host-testable pipe data plane.
+   `PipeRegistry` handles carry stable per-FCB CCB ids rather than vector slots, so closing one
+   same-name pipe instance cannot retarget or invalidate unrelated live handles when the connection
+   list compacts. The regression test covers two `\ntsvcs` instances, closes the first pair, and
+   proves the second server/client pair remains connected and receives its queued bytes. Continue
+   A4 by wiring any remaining live executive NPFS association behavior to the same stable
+   file-object/CCB identity rules rather than by pipe-name or process-role special cases.
 
 ## Review Log
 
