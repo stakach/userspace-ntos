@@ -9188,6 +9188,30 @@ static WL_NTRPC_LAST_AUX: AtomicU64 = AtomicU64::new(0);
 static TEB_WATCH_LAST_TAG: AtomicU64 = AtomicU64::new(u64::MAX);
 static TEB_WATCH_LAST_AUX: AtomicU64 = AtomicU64::new(0);
 static TEB_WATCH_LAST_AUX2: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn publish_process_teb_tail_alias(pi: usize, teb2_frame_cap: u64) {
+    if pi >= MAX_PI || pi >= 64 {
+        return;
+    }
+    TEB2_FRAME_CAP[pi].store(teb2_frame_cap, Ordering::Relaxed);
+    TEB_WATCH_GOOD[pi].store(1, Ordering::Relaxed);
+    TEB_TAIL_ALIAS_LIVE.fetch_or(1u64 << pi, Ordering::Relaxed);
+}
+
+pub(crate) fn revoke_process_teb_tail_alias(pi: usize) {
+    if pi >= MAX_PI || pi >= 64 {
+        return;
+    }
+    TEB_TAIL_ALIAS_LIVE.fetch_and(!(1u64 << pi), Ordering::Relaxed);
+    TEB2_FRAME_CAP[pi].store(0, Ordering::Relaxed);
+    TEB_WATCH_GOOD[pi].store(1, Ordering::Relaxed);
+    if pi == 2 {
+        WL_NTRPC_SLOT.store(0, Ordering::Relaxed);
+        WL_NTRPC_LAST_TAG.store(u64::MAX, Ordering::Relaxed);
+        WL_NTRPC_LAST_AUX.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Sample a process' live TEB tail and report the good→bad TRANSITION with the event that preceded
 /// it. `tag`/`aux` name the call site (0 = service-loop event with `aux` = SSN, 1 = before a win32k
 /// dispatch, 2 = after one) — the measurement that says whether a win32k dispatch is the writer at
@@ -14339,6 +14363,7 @@ unsafe fn reclaim_final_process_vm(process_index: u8, handler: &mut ExecNtHandle
     }
 
     let mut stats = ProcessVmReclaimStats::default();
+    revoke_process_teb_tail_alias(pi);
     if let Some(ctx) = handler.loop_ctx {
         let generic_sections = &mut *ctx.generic_sections;
         while let Some(view) = generic_sections.first_view_for_process(pi) {

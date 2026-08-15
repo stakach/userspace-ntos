@@ -107,15 +107,30 @@ That proof exposed a new VA-layout bug instead of a launch-policy gap: the histo
 slot0 target window lived at `0x1058..0x105b`, inside the now-valid hosted main-stack reservation.
 When a dynamic CSR API worker later mapped its trampoline at `0x105b0000`, the address already held
 a read/write NX stack page, so the worker took a present-page instruction-fetch fault at the
-trampoline VA. The current fix moves generic worker slot0 into the same high target-lane scheme as
+trampoline VA. The retained fix moves generic worker slot0 into the same high target-lane scheme as
 the other generic worker slots, maps those target-lane page tables for hosted SEC_IMAGE VSpaces, and
-adds compile-time disjointness checks against the hosted main-stack reservation. Remaining
-validation is a serialized desktop proof confirming CSR dynamic worker creation no longer faults on
-the slot0 trampoline and that the shell-chrome gates return to green. Review adjustment: the legacy
-`USER_ALLOC_BASE` bump allocator still starts at the hosted main-stack reservation base for older
-non-SEC_IMAGE user-thread tests; after the desktop blocker is cleared, move that allocator into a
-separate reserved lane or replace it with the hosted VAD allocator so future stack growth cannot
-collide with ad hoc user allocations.
+adds compile-time disjointness checks against the hosted main-stack reservation. Serialized proof
+`.tmp/run-desktop-worker-slot0-stack-separation-20260815.log` confirmed the old slot0 trampoline
+fault is gone: the dynamic CSR API worker runs from the high lane and completes multiple real CSR
+API replies, and the boot reaches real `WlxActivateUserShell`, `userinit.exe` section creation, and
+`userinit` win32k activity. The same proof exposed a teardown-lifecycle blocker: after
+`services.exe` final process reclaim drops its client frames, the generic TEB-tail observer still
+has the process' alias-live bit set and faults the executive while sampling
+`SERVICES_ENV_SCRATCH_VA + 0x525a`. The retained TEB-tail lifecycle fix makes alias publication and
+revocation follow process lifetime explicitly, clearing stale observer metadata before final VM
+reclaim unmaps a hosted process. Serialized proof
+`.tmp/run-desktop-teb-tail-revoke-20260815.log` confirms the exact services.exe final reclaim now
+continues, `SvcctrlStartEvent_A3752DX` wakes winlogon, and the desktop returns to genuine shell
+chrome: `exec_winlogon_user_shell_activated`, `exec_userinit_process_spawned`,
+`exec_gdi_user_batch_flushed`, and `exec_explorer_shell_chrome_painted` all pass, with Explorer
+reporting `786432/786432` non-background pixels and at least 32 distinct non-background colors. The
+run exits through the microtest sentinel at `294/296`; the remaining red gates are the Dbgk remote
+break-in pair (`exec_dbgk_remote_breakin_thread_runs` and
+`exec_dbgk_remote_breakin_reports_breakpoint`) rather than the desktop boot/frontier path. Review
+adjustment: the legacy `USER_ALLOC_BASE` bump allocator still starts at the hosted main-stack
+reservation base for older non-SEC_IMAGE user-thread tests; after the desktop blocker is cleared,
+move that allocator into a separate reserved lane or replace it with the hosted VAD allocator so
+future stack growth cannot collide with ad hoc user allocations.
 
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
