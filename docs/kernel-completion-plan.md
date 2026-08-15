@@ -39,8 +39,9 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-grow-launch-ids-20260815-101610.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3 display/PnP launch-plan ID cleanup. This
+`.tmp/run-desktop-session-runtime-cache-20260815.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3/A4 win32k session runtime cache cleanup.
+This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -3401,6 +3402,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `exec_gdi_user_batch_flushed`, `exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted`
   green. The proof records `class-atom-names=413`, `cursor-identities=32`, and final
   `exec-heap-free=7794KiB`.
+
+- A4/B3 win32k local event signal queue cleanup (2026-08-15). The component-local queue-event
+  signal bridge no longer stores pending wake bodies in a fixed 128-slot overwrite ring. Signals now
+  live in a pool-backed FIFO that grows on demand, preserves ordering across bursts, records high-water
+  and growth counts, and reports bounded allocation failures instead of silently dropping or
+  overwriting unrelated event bodies. `KeSetEvent`/`KePulseEvent` wake delivery remains generic
+  queue-event machinery for hosted GUI/service threads, with no shell-specific success path.
+  Validation so far: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
 
 - B3 root-bus resource profile catalog cleanup (2026-08-15). The executive PnP broker no longer
   stores broker-backed root-bus resource profiles in a one-entry static array. `nt-pnp` now owns a

@@ -4962,38 +4962,117 @@ static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x0000_0000_6E00_0000);
-static WIN32K_LOCAL_EVENT_SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
-const WIN32K_LOCAL_EVENT_SIGNAL_RING_N: usize = 128;
-static WIN32K_LOCAL_EVENT_SIGNAL_WRITE: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_READ: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_BODIES: [AtomicU64; WIN32K_LOCAL_EVENT_SIGNAL_RING_N] =
-    [const { AtomicU64::new(0) }; WIN32K_LOCAL_EVENT_SIGNAL_RING_N];
+const WIN32K_LOCAL_EVENT_SIGNAL_INITIAL_CAP: u64 = 128;
+static WIN32K_LOCAL_EVENT_SIGNAL_PTR: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_HEAD: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_LEN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_CAP: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_GROWTHS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static WIN32K_LOCAL_EVENT_SIGNAL_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_THREAD_QUEUE_EVENT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
+unsafe fn ensure_local_event_signal_capacity(required: u64) -> bool {
+    let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
+    if required <= cap {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        WIN32K_LOCAL_EVENT_SIGNAL_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let Some(next) = new_cap.checked_mul(2) else {
+            return false;
+        };
+        new_cap = next;
+    }
+    let Some(bytes) = new_cap.checked_mul(8) else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+
+    let old_base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
+    let old_cap = cap;
+    let old_head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
+    let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
+    let mut i = 0u64;
+    while i < len {
+        let value = if old_base != 0 && old_cap != 0 {
+            let old_index = (old_head + i) % old_cap;
+            read_volatile((old_base + old_index * 8) as *const u64)
+        } else {
+            0
+        };
+        write_volatile((new_base + i * 8) as *mut u64, value);
+        i += 1;
+    }
+    WIN32K_LOCAL_EVENT_SIGNAL_PTR.store(new_base, Ordering::Relaxed);
+    WIN32K_LOCAL_EVENT_SIGNAL_CAP.store(new_cap, Ordering::Relaxed);
+    WIN32K_LOCAL_EVENT_SIGNAL_HEAD.store(0, Ordering::Relaxed);
+    WIN32K_LOCAL_EVENT_SIGNAL_GROWTHS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 fn record_local_event_signal(event: u64) {
-    let write = WIN32K_LOCAL_EVENT_SIGNAL_WRITE.fetch_add(1, Ordering::Relaxed);
-    WIN32K_LOCAL_EVENT_SIGNAL_BODIES[write as usize % WIN32K_LOCAL_EVENT_SIGNAL_RING_N]
-        .store(event, Ordering::Relaxed);
-    WIN32K_LOCAL_EVENT_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
+    if event == 0 {
+        return;
+    }
+    unsafe {
+        let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
+        let required = len.saturating_add(1);
+        if !ensure_local_event_signal_capacity(required) {
+            let failures =
+                WIN32K_LOCAL_EVENT_SIGNAL_RECORD_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if failures < 16 {
+                print_str(b"[win32k-event] ERROR: queue-event signal allocation failed event=0x");
+                print_hex((event >> 32) as u32);
+                print_hex(event as u32);
+                print_str(b" pending=");
+                print_u64(len);
+                print_str(b"\n");
+            }
+            return;
+        }
+        let base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
+        let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
+        if base == 0 || cap == 0 {
+            return;
+        }
+        let head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
+        let slot = (head + len) % cap;
+        write_volatile((base + slot * 8) as *mut u64, event);
+        WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(required, Ordering::Relaxed);
+        let high = WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER.load(Ordering::Relaxed);
+        if required > high {
+            WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER.store(required, Ordering::Relaxed);
+        }
+    }
 }
 
 pub(crate) fn take_local_event_signal_body() -> Option<u64> {
-    loop {
-        let pending = WIN32K_LOCAL_EVENT_SIGNAL_PENDING.load(Ordering::Relaxed);
-        if pending == 0 {
+    unsafe {
+        let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
+        if len == 0 {
             return None;
         }
-        if WIN32K_LOCAL_EVENT_SIGNAL_PENDING
-            .compare_exchange(pending, pending - 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            let read = WIN32K_LOCAL_EVENT_SIGNAL_READ.fetch_add(1, Ordering::Relaxed);
-            let body = WIN32K_LOCAL_EVENT_SIGNAL_BODIES
-                [read as usize % WIN32K_LOCAL_EVENT_SIGNAL_RING_N]
-                .load(Ordering::Relaxed);
-            return (body != 0).then_some(body);
+        let base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
+        let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
+        if base == 0 || cap == 0 {
+            WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(0, Ordering::Relaxed);
+            return None;
         }
+        let head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
+        let body = read_volatile((base + head * 8) as *const u64);
+        write_volatile((base + head * 8) as *mut u64, 0);
+        WIN32K_LOCAL_EVENT_SIGNAL_HEAD.store((head + 1) % cap, Ordering::Relaxed);
+        WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(len - 1, Ordering::Relaxed);
+        (body != 0).then_some(body)
     }
 }
 
