@@ -75,7 +75,6 @@ const REGISTRY_SERVICES_CANON: &str = r"\registry\machine\system\controlset001\s
 const REGISTRY_SERVICE_GROUP_ORDER_CANON: &str =
     r"\registry\machine\system\controlset001\control\servicegrouporder";
 const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
-const MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS: u32 = 64;
 const PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET: usize = 48;
 const PNP_EVENT_CATEGORY_DEVICE_INSTALL: u32 = 4;
 const PNP_CONTROL_ENUMERATE_DEVICE_LEN: usize = 24;
@@ -3519,15 +3518,14 @@ impl ExecNtHandler {
         manager
             .mutate(hive, op)
             .map_err(Self::mutable_hive_journal_status)?;
+        // The sidecar journal record is already appended and flushed here. Whole-volume
+        // snapshots are owned by explicit flush/quiesce paths, not by every registry mutation.
         self.mutable_hive_journal_pending_records = self
             .mutable_hive_journal_pending_records
             .saturating_add(1);
         if let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) {
             self.mutable_hive_journal_pending_boot_mask |= bit;
             self.mutable_hive_journal_dirty_boot_mask |= bit;
-        }
-        if self.mutable_hive_journal_pending_records >= MUTABLE_HIVE_JOURNAL_SNAPSHOT_RECORDS {
-            self.writable_fs_dirty = true;
         }
         Ok(())
     }

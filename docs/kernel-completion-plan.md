@@ -70,6 +70,29 @@ proof remains
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
 the current desktop path.
 
+Current desktop retry (2026-08-15): `.tmp/run-desktop-pipe-name-wait-grow-20260815.log` proves the
+growable root pipe wait queue did not regress early boot, winlogon USER/GDI setup, services.exe,
+LSASS image loading, CSR connection, or SCM event creation. The run was stopped intentionally after
+services reached `CheckSetup()` and then kept committing `service-loop` SYSTEM hive journal snapshots
+in 64-record batches while `explorer total=0`. Review adjustment: this is a CM/writable-volume
+lazy-writer problem, not a process launch fallback target. Mutable-hive log appends should remain
+ordinary journal writes and should not force whole writable-volume snapshots from the hot syscall
+loop; explicit `NtFlushKey`, ordinary file writes that already require a volume snapshot, and
+quiesce/shutdown own durable snapshot commits.
+
+Current desktop proof update (2026-08-15): `.tmp/run-desktop-journal-lazy-volume-20260815.log` plus
+the visible screenshot `.tmp/desktop-journal-lazy-volume-20260815.png` prove the lazy journal-volume
+policy moves past the old SCM registry-copy stall. The run was manually stopped after QEMU displayed
+real shell chrome: a ReactOS-style taskbar, Start button, and clock. The serial log shows
+`WlxActivateUserShell` reading the real `Userinit` value from SOFTWARE, `userinit.exe` spawning at
+line 22488, `explorer.exe` spawning dynamically at line 25830, Explorer reaching 7,290 native/win32k
+syscalls in the final census, and WM_PAINT messages dispatched through real api0 callbacks for
+Explorer windows at lines 45637, 45733, 45748, and 45760. The remaining frontier is no longer
+process launch: Explorer logs `desktop.cpp:193: Unexpected failure (hres)=80004005`, cannot open
+`MSGina: ShellReadyEvent` / `Global\MSGina: ShellReadyEvent`, then continues into `kbswitch.exe`.
+Next cleanup should make the shell-ready desktop/session notification path real and capture a
+non-manual gate once the shell settles.
+
 Completed ntdll import-reference slice (2026-08-15): the late `rundll32.exe` fault is being treated as
 a loader-lifetime bug rather than a kernel process-launch shortcut. The Rust ntdll loader now records
 the unique normal and delay import edges of each successfully snapped module and publishes the
@@ -5123,6 +5146,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   same-disk boot that mounts seeded primary images plus replayed sidecar logs, preserves the
   account-domain SID/ProfileList state, and reaches Explorer shell chrome without re-provisioning or
   heap growth from boot-hive primary rewrites.
+
+  D4 service-loop journal snapshot throttling (2026-08-15): the next desktop retry exposed a
+  correctness/performance boundary in the journal-backed flush slice. SCM's first-boot registry copy
+  can legitimately append thousands of boot-hive `.LOG` records before userinit/explorer, but the
+  executive was promoting every 64 appended records into `writable_fs_dirty`, which forced a full
+  writable-volume snapshot from the hot service loop. The retained cleanup removes that promotion:
+  `WritableHiveIoProvider` still appends and flushes the journal record before mutating the live
+  hive, and pending journal counters are still reported when a volume snapshot actually commits, but
+  the expensive block-level snapshot is owned by explicit `NtFlushKey`, unrelated writable-file
+  commits that already require a snapshot, and quiesce/shutdown. Validation: `cargo fmt --all`,
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and
+  `.tmp/run-desktop-journal-lazy-volume-20260815.log`, manually stopped after visible shell chrome.
+  The desktop proof confirms services moved past the repeated `service-loop pending-records=64`
+  checkpoint pattern, `userinit.exe` and `explorer.exe` launched dynamically, and Explorer dispatched
+  real WM_PAINT api0 callbacks. Review adjustment: the next D4 target is shell-ready/session
+  notification fidelity, not process-spawn scaffolding.
 
   D4 restored journal proof slice (2026-08-13): the restored same-disk boot exposed that some
   ReactOS setup-owned registry seeders still wrote directly into `MutableHiveSet`, outside the CM
