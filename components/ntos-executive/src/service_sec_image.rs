@@ -6151,40 +6151,116 @@ pub(crate) unsafe fn service_sec_image(
                     park_and_log!(pi, b"wl-stack-growth", m0, addr);
                 }
             }
-            // Dynamic stack growth (Windows guard-page style): a fault just below the committed
-            // stack commits a fresh zeroed page and restarts, so smss's stack grows on demand
-            // instead of crashing at the 16 KiB initial commit. Bounded by STACK_GROWTH_FLOOR so it
-            // never runs into the env mappings below.
-            if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
-                let f = alloc_frame();
-                if pi == 0 {
-                    let _ = page_map(f, page, RW_NX, pml4);
-                    csrss_frame_put(pi as u64, page, f);
-                } else {
-                    let map_cap = copy_cap(f);
-                    let _ = page_map(map_cap, page, RW_NX, pml4);
-                    let source_cap =
-                        csrss_frame_create_source_copy(map_cap, pi as u64, page, b"stack-growth");
-                    // Preserve the mapped frame cap so stack-based syscall arguments remain
-                    // reachable after the stack grows below its fixed executive mirror. GUI clients
-                    // also keep an unmapped source cap for win32k/client temporary aliases.
-                    if source_cap != 0 {
-                        csrss_frame_put_with_source(pi as u64, page, map_cap, source_cap);
+            // Dynamic stack growth (Windows guard-page style): grow only inside the faulting
+            // thread's recorded stack reservation, and only if the page immediately above the fault
+            // is already a registered stack page for the same process. This replaces the historical
+            // global floor with per-thread NT stack metadata.
+            if m3 & 1 == 0 {
+                if let Some((allocation_base, stack_base, role)) =
+                    nt_handler.hosted_thread_user_stack_for_badge(badge, pi)
+                {
+                    let next_page = page.checked_add(nt_thread_start::USER_PAGE_SIZE);
+                    let next_page_is_stack = next_page.is_some_and(|next_page| {
+                        next_page < stack_base
+                            && csrss_frame_get_exact(pi as u64, next_page).0 != 0
+                    });
+                    if page < stack_base
+                        && csrss_frame_get_exact(pi as u64, page).0 == 0
+                        && next_page_is_stack
+                        && next_page.is_some_and(|next_page| {
+                            nt_thread_start::next_stack_growth_page(
+                                allocation_base,
+                                next_page,
+                                addr,
+                            ) == Some(page)
+                        })
+                    {
+                        let f = alloc_frame();
+                        let mut registered = false;
+                        let mut map_cap = 0;
+                        let mut source_cap = 0;
+                        if pi == 0 {
+                            let map_error = page_map_r(f, page, RW_NX, pml4);
+                            if map_error == 0 {
+                                csrss_frame_put(pi as u64, page, f);
+                                registered = csrss_frame_get_exact(pi as u64, page).0 == f;
+                            }
+                        } else {
+                            map_cap = copy_cap(f);
+                            let map_error = page_map_r(map_cap, page, RW_NX, pml4);
+                            if map_error == 0 {
+                                source_cap = csrss_frame_create_source_copy(
+                                    map_cap,
+                                    pi as u64,
+                                    page,
+                                    b"stack-growth",
+                                );
+                                // Preserve the mapped frame cap so stack-based syscall arguments
+                                // remain reachable after the stack grows below its fixed executive
+                                // mirror. GUI clients also keep an unmapped source cap for
+                                // win32k/client temporary aliases.
+                                registered = source_cap != 0
+                                    && csrss_frame_put_with_source(
+                                        pi as u64,
+                                        page,
+                                        map_cap,
+                                        source_cap,
+                                    );
+                            }
+                        }
+                        if registered {
+                            if pi != 0 && f != 0 {
+                                let _ = cnode_delete_recycle_r(f);
+                            }
+                            if matches!(role, HostedThreadRole::Main) {
+                                let _ = smss_copyout(SMSS_TEB_VA + 0x10, &page.to_le_bytes());
+                            }
+                            print_str(b"[stack-growth] pi=");
+                            print_u64(pi as u64);
+                            print_str(b" badge=");
+                            print_u64(badge);
+                            print_str(b" page=0x");
+                            print_hex((page >> 32) as u32);
+                            print_hex(page as u32);
+                            print_str(b" allocation=0x");
+                            print_hex((allocation_base >> 32) as u32);
+                            print_hex(allocation_base as u32);
+                            print_str(b"\n");
+                            faults += 1;
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                        if source_cap != 0 {
+                            let _ = cnode_delete_recycle_r(source_cap);
+                        }
+                        if map_cap != 0 {
+                            let _ = cnode_delete_recycle_r(map_cap);
+                        }
+                        if f != 0 {
+                            let _ = cnode_delete_recycle_r(f);
+                        }
+                        print_str(b"[stack-growth] failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" page=0x");
+                        print_hex((page >> 32) as u32);
+                        print_hex(page as u32);
+                        print_str(b"\n");
+                        park_and_log!(pi, b"stack-growth", m0, addr);
                     }
                 }
-                faults += 1;
-                procs[pi].faults = faults;
-                procs[pi].first = first;
-                procs[pi].ntfaults = ntfaults;
-                pfilled[pi] = *filled_pages;
-                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
-                badge = nb;
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
             }
             // csrss's anonymous section (CSR shared memory): commit a ZERO frame on touch.
             if pi == 1

@@ -88,6 +88,18 @@ and `git diff --check`. Remaining validation is a serialized desktop proof confi
 `rundll32.exe`/`advapi32` instruction-fetch `vmf-out` is gone while the `296/296` shell-chrome gates
 remain green.
 
+Current hosted-main stack-growth slice (2026-08-15): the import-reference desktop proof exposed a
+different, earlier wall in `csrss.exe`: the hosted SEC_IMAGE main thread faulted one page below the
+old globally bounded stack-growth floor while entering ntdll loader code. The retained fix removes
+the historical `STACK_GROWTH_FLOOR` policy and records a real hosted main-thread stack reservation in
+thread runtime metadata. The fault path now grows only inside the faulting thread's recorded
+reservation, requires the immediately higher page to be a registered stack page for the same process,
+uses the host-tested `next_stack_growth_page` guard, and updates the main TEB `StackLimit` when a
+page is committed. This is a mechanism boundary, not a larger magic stack: uncommitted reservation
+pages are not published as committed VAD state. Local validation is in progress; remaining
+validation is a serialized desktop proof showing the previous `csrss` stack fault is gone and the
+desktop gates return to green.
+
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
 handle routes to the hosted ReactOS driver path. The component-side WDM IRP projection now carries

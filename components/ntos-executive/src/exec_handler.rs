@@ -7007,7 +7007,19 @@ impl ExecNtHandler {
     pub(crate) fn register_main_thread_tcb(&mut self, pi: usize, tcb: u64) {
         if let Some(tid) = self.pm_main_tid_for_pi(pi) {
             let badge = self.hosted_process_top_badge(pi).unwrap_or(0);
-            self.register_hosted_thread_tcb(pi, u64::from(tid), tcb, badge, HostedThreadRole::Main);
+            if self.register_hosted_thread_tcb(
+                pi,
+                u64::from(tid),
+                tcb,
+                badge,
+                HostedThreadRole::Main,
+            ) {
+                let _ = self.thread_runtime.set_user_stack(
+                    u64::from(tid),
+                    HOSTED_MAIN_STACK_ALLOCATION_BASE,
+                    STACK_BASE + STACK_FRAMES * 0x1000,
+                );
+            }
         }
     }
 
@@ -7616,6 +7628,23 @@ impl ExecNtHandler {
             return None;
         }
         Some((allocation_base, stack_base))
+    }
+
+    pub(crate) fn hosted_thread_user_stack_for_badge(
+        &self,
+        badge: u64,
+        pi: usize,
+    ) -> Option<(u64, u64, HostedThreadRole)> {
+        let runtime = self.thread_runtime.get_by_badge(badge)?;
+        if runtime.pi != pi {
+            return None;
+        }
+        let allocation_base = runtime.user_stack_allocation_base;
+        let stack_base = runtime.user_stack_base;
+        if allocation_base == 0 || stack_base <= allocation_base {
+            return None;
+        }
+        Some((allocation_base, stack_base, runtime.role))
     }
 
     fn current_hosted_thread_user_stack_contains(&self, va: u64, len: usize) -> bool {

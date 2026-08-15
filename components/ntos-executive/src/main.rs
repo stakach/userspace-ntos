@@ -163,11 +163,11 @@ pub const LPC_COMP_VADDR: u64 = 0x0000_0100_1041_0000;
 pub const LPC_REQ_VADDR: u64 = 0x0000_0100_1042_0000;
 pub const LPC_REP_VADDR: u64 = 0x0000_0100_1043_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_105C_0000;
-/// Floor for on-demand stack growth: a fault in [STACK_GROWTH_FLOOR, STACK_BASE) commits a fresh
-/// page and restarts (Windows guard-page style), so smss's stack grows past the 16 KiB initial
-/// commit instead of crashing. Bounded above IO_REP_VADDR (…5B_0000) so growth never collides
-/// with the env mappings below. ~60 KiB of growth room; ~76 KiB total stack.
-pub const STACK_GROWTH_FLOOR: u64 = 0x0000_0100_105B_1000;
+/// Reservation base for hosted SEC_IMAGE main-thread stacks. The initial commit is the four pages
+/// at `STACK_BASE`; page faults below that commit grow downward inside this per-thread reservation.
+pub const HOSTED_MAIN_STACK_ALLOCATION_BASE: u64 = 0x0000_0100_1050_0000;
+const _: () = assert!(HOSTED_MAIN_STACK_ALLOCATION_BASE & 0xffff == 0);
+const _: () = assert!(HOSTED_MAIN_STACK_ALLOCATION_BASE < STACK_BASE);
 /// A per-user-thread syscall argument frame, mapped at the SAME vaddr in both the
 /// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
 /// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
