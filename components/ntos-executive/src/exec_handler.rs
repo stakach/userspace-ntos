@@ -28796,9 +28796,9 @@ impl ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &*ctx.reg;
                 let sect = args[0];
-                let class = args[1] as u32;
+                let class = nt_ulong_arg(args[1]);
                 let buf = args[2];
-                let len = args[3] as u32 as usize;
+                let len = nt_ulong_arg(args[3]) as usize;
                 let result_len = args[4];
                 let required = match class {
                     SECTION_BASIC_INFORMATION => SECTION_BASIC_INFORMATION_SIZE,
@@ -28972,6 +28972,7 @@ impl ExecNtHandler {
                 let filled_pages = &mut *ctx.filled_pages;
                 let faults = &mut *ctx.faults;
                 let out = args[0];
+                let desired_access = nt_ulong_arg(args[1]);
                 let maxsize_ptr = args[3];
                 let mut maxsize = 0u64;
                 if maxsize_ptr != 0 {
@@ -28981,8 +28982,8 @@ impl ExecNtHandler {
                     }
                     maxsize = u64::from_le_bytes(bytes);
                 }
-                let page_protection = args[4] as u32;
-                let allocation_attrs = args[5] as u32;
+                let page_protection = nt_ulong_arg(args[4]);
+                let allocation_attrs = nt_ulong_arg(args[5]);
                 let sec_file = args[6];
                 let registry_slot = reg.index_for_file(self.pi, sec_file);
 
@@ -29169,7 +29170,7 @@ impl ExecNtHandler {
                 let h = match self.insert_process_handle(
                     caller_pid,
                     nt_process::HandleObject::Section(index as nt_process::SectionId),
-                    args[1] as u32,
+                    desired_access,
                 ) {
                     Ok(handle) => handle as u64,
                     Err(status) => {
@@ -29506,8 +29507,8 @@ impl ExecNtHandler {
                     } else {
                         PRIVATE_VM_LIMIT
                     };
-                    let allocation_type = args[8] as u32;
-                    let win32_protect = args[9] as u32;
+                    let allocation_type = nt_ulong_arg(args[8]);
+                    let win32_protect = nt_ulong_arg(args[9]);
                     let view_protection = if win32_protect == 0 {
                         section.protection
                     } else {

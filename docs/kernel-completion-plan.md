@@ -1658,8 +1658,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    disposition, and create options once at the syscall boundary before routing boot-status, NPFS,
    writable-overlay, volume-overlay, and read-only FAT opens. The file I/O follow-on now covers
    `NtReadFile`/`NtWriteFile` lengths, `NtSetInformationFile` information class and length, and the
-   `NtQueryIoCompletion` query class/length. The remaining dense raw-cast cluster is section/map-view
-   service scalar capture.
+   `NtQueryIoCompletion` query class/length. The section/map-view follow-on now covers
+   `NtQuerySection` class/length, `NtCreateSection` desired access/page protection/allocation
+   attributes, and `NtMapViewOfSection` allocation/protection flags. The residual `args[n] as u32`
+   hits in this file are diagnostic `print_hex` narrowing sites; the next audit should move from
+   scalar-boundary cleanup back to semantic kernel gaps.
 
 ## Review Log
 
