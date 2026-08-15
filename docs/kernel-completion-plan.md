@@ -1642,7 +1642,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    virtual-memory query information class, and PnP event/control classes and buffer lengths explicit
    at the same boundary. The I/O-control follow-on does the same for `NtDeviceIoControlFile` and
    `NtFsControlFile` control codes, input/output buffer lengths, and pending pipe waiter buffer
-   metadata.
+   metadata. The registry/atom follow-on now applies the same explicit boundary to atom name lengths
+   and atom information classes, registry desired-access masks/create options, value type/data lengths,
+   key/value enumeration index/class/length parameters, value/query buffer lengths, and `NtLoadKey*` /
+   `NtUnloadKey*` flags.
 
 ## Review Log
 

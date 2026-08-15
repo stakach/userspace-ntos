@@ -3894,6 +3894,7 @@ impl ExecNtHandler {
         oa: u64,
         args: &[u64],
     ) -> Option<u32> {
+        let desired_access = nt_ulong_arg(args[1]);
         // An EMPTY mirror-read name means the OA names an `RTL_CONSTANT_STRING` in a `.rdata` page
         // the process never dereferenced — `userenv!UpdateUsersShellFolderSettings` opens
         // `SOFTWARE\…\Shell Folders` relative to the user-hive handle exactly that way — so recover
@@ -3903,7 +3904,7 @@ impl ExecNtHandler {
         // (a) The predefined `HKEY_USERS` root itself (advapi32's `MapDefaultKey`).
         if root_target.is_none() && Self::is_user_root_comps(&Self::key_components(&name)) {
             USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
-            return Some(self.mint_registry_key(USER_ROOT_KEY, args[1] as u32, args[0]));
+            return Some(self.mint_registry_key(USER_ROOT_KEY, desired_access, args[0]));
         }
         let full = self.user_namespace_target(root_target, &name)?;
         // (b) Overlay/mutable/base resolution follows the same full-path authority as machine
@@ -3917,7 +3918,7 @@ impl ExecNtHandler {
             print_u64(self.resolve_user_key(&full).unwrap_or(0) as u64);
             print_str(b"\n");
         }
-        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+        if let Some(status) = self.open_registry_full_path(&full, desired_access, args[0]) {
             if status == 0xC000_0034
                 && self.current_process_is_winlogon()
                 && post_profile_phase()
@@ -3957,6 +3958,7 @@ impl ExecNtHandler {
         if !self.current_process_is_interactive_shell() {
             return None;
         }
+        let desired_access = nt_ulong_arg(args[1]);
         let name = self.effective_objattr_name(path, oa);
         if root_target.is_none() {
             let comps = Self::key_components(&name);
@@ -3964,7 +3966,7 @@ impl ExecNtHandler {
                 && comps[0].eq_ignore_ascii_case("Registry")
                 && comps[1].eq_ignore_ascii_case("Machine")
             {
-                return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
+                return Some(self.mint_registry_key(MACHINE_ROOT_KEY, desired_access, args[0]));
             }
         }
 
@@ -4003,7 +4005,7 @@ impl ExecNtHandler {
         }
 
         let bit = explorer_shell_com_class_bit_for_path(&canon);
-        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+        if let Some(status) = self.open_registry_full_path(&full, desired_access, args[0]) {
             if status == 0 && bit != 0 {
                 EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
             }
@@ -4027,15 +4029,16 @@ impl ExecNtHandler {
         oa: u64,
         args: &[u64],
     ) -> Option<u32> {
+        let desired_access = nt_ulong_arg(args[1]);
         let name = self.effective_objattr_name(path, oa);
         let full = self.machine_namespace_target(root_target, &name)?;
         let canon = self.overlay_canon(&full);
         if canon == r"\registry\machine" {
-            return Some(self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]));
+            return Some(self.mint_registry_key(MACHINE_ROOT_KEY, desired_access, args[0]));
         }
 
         let bit = explorer_shell_com_class_bit_for_path(&canon);
-        if let Some(status) = self.open_registry_full_path(&full, args[1] as u32, args[0]) {
+        if let Some(status) = self.open_registry_full_path(&full, desired_access, args[0]) {
             if status == 0 && bit != 0 {
                 EXPLORER_SHELL_COM_CLASS_OPEN_MASK.fetch_or(bit, Ordering::Relaxed);
             }
@@ -20349,7 +20352,7 @@ impl ExecNtHandler {
                 if out_atom != 0 && !self.probe_atom_output(out_atom, 2) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let byte_len = args[1] as u32;
+                let byte_len = nt_ulong_arg(args[1]);
                 let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP];
                 let integer = match self.copyin_atom_name(args[0], byte_len, &mut name) {
                     Ok(integer) => integer,
@@ -20384,9 +20387,9 @@ impl ExecNtHandler {
                 const TABLE_HEADER: usize = 4;
 
                 let atom = args[0] as u16;
-                let info_class = args[1] as u32;
+                let info_class = nt_ulong_arg(args[1]);
                 let info_va = args[2];
-                let info_len = args[3] as u32 as usize;
+                let info_len = nt_ulong_arg(args[3]) as usize;
                 let return_len_va = args[4];
 
                 if return_len_va != 0 && !self.probe_atom_output(return_len_va, 4) {
@@ -20476,6 +20479,7 @@ impl ExecNtHandler {
             // name and root from the caller, resolve it in the registry namespace, and hand back a
             // process-local handle (copyout to arg0).
             NativeService::NtOpenKey => unsafe {
+                let desired_access = nt_ulong_arg(args[1]);
                 // OBJECT_ATTRIBUTES: RootDirectory @+8, ObjectName @+0x10. RtlQueryRegistryValues
                 // opens subkeys RELATIVE to an already-open key (RootDirectory = its handle,
                 // ObjectName = a leaf like "Environment"), so honour RootDirectory.
@@ -20543,7 +20547,7 @@ impl ExecNtHandler {
                 };
                 if let Some(ref full) = full_open_path {
                     if let Some(status) =
-                        self.open_registry_full_path(full, args[1] as u32, args[0])
+                        self.open_registry_full_path(full, desired_access, args[0])
                     {
                         return status;
                     }
@@ -20584,7 +20588,7 @@ impl ExecNtHandler {
                             full
                         };
                         if let Some(status) =
-                            self.open_registry_full_path(&full, args[1] as u32, args[0])
+                            self.open_registry_full_path(&full, desired_access, args[0])
                         {
                             return status;
                         }
@@ -20600,7 +20604,7 @@ impl ExecNtHandler {
                         {
                             return self.mint_registry_key(
                                 MACHINE_ROOT_KEY,
-                                args[1] as u32,
+                                desired_access,
                                 args[0],
                             );
                         }
@@ -20611,7 +20615,7 @@ impl ExecNtHandler {
                     if is_profile_list_key(&eff_name) {
                         let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
                         if let Some(status) =
-                            self.open_registry_full_path(&full, args[1] as u32, args[0])
+                            self.open_registry_full_path(&full, desired_access, args[0])
                         {
                             return status;
                         }
@@ -20655,7 +20659,7 @@ impl ExecNtHandler {
                         {
                             return self.mint_registry_key(
                                 MACHINE_ROOT_KEY,
-                                args[1] as u32,
+                                desired_access,
                                 args[0],
                             );
                         }
@@ -20663,7 +20667,7 @@ impl ExecNtHandler {
                     };
                     if let Some(ref full) = full_opt {
                         if let Some(status) =
-                            self.open_registry_full_path(full, args[1] as u32, args[0])
+                            self.open_registry_full_path(full, desired_access, args[0])
                         {
                             return status;
                         }
@@ -20704,7 +20708,7 @@ impl ExecNtHandler {
                     && path.is_empty()
                     && SERVICES_CREATE_STARTED.load(Ordering::Relaxed) == 0
                 {
-                    return self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]);
+                    return self.mint_registry_key(MACHINE_ROOT_KEY, desired_access, args[0]);
                 }
                 // Once winlogon's Win32 create for services.exe has begun, an empty-name absolute open
                 // is BasepIsProcessAllowed's AppCertDlls key (its .rdata static reads empty in the
@@ -20725,7 +20729,7 @@ impl ExecNtHandler {
                     self.resolve_key(&path)
                 };
                 match cell {
-                    Some(cell) => self.mint_registry_key(cell, args[1] as u32, args[0]),
+                    Some(cell) => self.mint_registry_key(cell, desired_access, args[0]),
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
@@ -20736,6 +20740,7 @@ impl ExecNtHandler {
             // hives stay in the volatile overlay until D4 gives volatile keys first-class hive
             // ownership.
             NativeService::NtCreateKey => unsafe {
+                let desired_access = nt_ulong_arg(args[1]);
                 if args[0] == 0 || !self.probe_user_output(args[0], 8) {
                     return 0xC000_0005;
                 }
@@ -20809,7 +20814,7 @@ impl ExecNtHandler {
                     if target == USER_ROOT_KEY {
                         USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
                     }
-                    let status = self.mint_registry_key(target, args[1] as u32, args[0]);
+                    let status = self.mint_registry_key(target, desired_access, args[0]);
                     if status != 0 {
                         return status;
                     }
@@ -20834,7 +20839,7 @@ impl ExecNtHandler {
                 // shadows yield to mounted mutable hives, so existing mounted-hive keys open from
                 // the Hive Manager even when the caller supplied REG_OPTION_VOLATILE. The volatile
                 // bit only controls creation of a new key.
-                let create_options = args[5] as u32;
+                let create_options = nt_ulong_arg(args[5]);
                 let create_volatile = create_options & 0x1 != 0;
                 let root_is_overlay = root_target.and_then(overlay_key_idx).is_some();
                 let overlay_existing = if root_is_overlay {
@@ -20855,7 +20860,7 @@ impl ExecNtHandler {
                 if let Some(oidx) = overlay_existing {
                     let status = self.mint_registry_key(
                         OVERLAY_KEY_TAG | (oidx as u32),
-                        args[1] as u32,
+                        desired_access,
                         args[0],
                     );
                     if status != 0 {
@@ -20877,7 +20882,7 @@ impl ExecNtHandler {
                 }
                 if let Some(mutable_key) = mutable_existing {
                     let status =
-                        self.mint_mutable_registry_key(mutable_key, args[1] as u32, args[0]);
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0]);
                     if status != 0 {
                         return status;
                     }
@@ -20896,7 +20901,7 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(base_key) = base_existing {
-                    let status = self.mint_registry_key(base_key, args[1] as u32, args[0]);
+                    let status = self.mint_registry_key(base_key, desired_access, args[0]);
                     if status != 0 {
                         return status;
                     }
@@ -21032,7 +21037,7 @@ impl ExecNtHandler {
                         }
                     }
                     let status =
-                        self.mint_mutable_registry_key(mutable_key, args[1] as u32, args[0]);
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0]);
                     if status != 0 {
                         return status;
                     }
@@ -21119,7 +21124,7 @@ impl ExecNtHandler {
                 }
                 let status = self.mint_registry_key(
                     OVERLAY_KEY_TAG | (oidx as u32),
-                    args[1] as u32,
+                    desired_access,
                     args[0],
                 );
                 if status != 0 {
@@ -21142,9 +21147,9 @@ impl ExecNtHandler {
                 };
                 let transient_mark = allocator::mark();
                 let name = self.read_registry_ustr_name(args[1]);
-                let ty = args[3] as u32; // R9 = Type
+                let ty = nt_ulong_arg(args[3]); // R9 = Type
                 let data_ptr = args[4];
-                let data_size = args[5] as u32 as usize;
+                let data_size = nt_ulong_arg(args[5]) as usize;
                 if data_size != 0 && data_ptr == 0 {
                     return 0xC000_0005;
                 }
@@ -21446,14 +21451,14 @@ impl ExecNtHandler {
             // are backed by the same real CM path instead of being left as gaps.
             NativeService::NtLoadKey => unsafe { self.nt_load_key_ex(args[0], args[1], 0, 0) },
             NativeService::NtLoadKey2 => unsafe {
-                self.nt_load_key_ex(args[0], args[1], args[2] as u32, 0)
+                self.nt_load_key_ex(args[0], args[1], nt_ulong_arg(args[2]), 0)
             },
             NativeService::NtLoadKeyEx => unsafe {
-                self.nt_load_key_ex(args[0], args[1], args[2] as u32, args[3])
+                self.nt_load_key_ex(args[0], args[1], nt_ulong_arg(args[2]), args[3])
             },
             NativeService::NtUnloadKey => unsafe { self.nt_unload_key_ex(args[0], 0, 0) },
             NativeService::NtUnloadKey2 => unsafe {
-                self.nt_unload_key_ex(args[0], args[1] as u32, 0)
+                self.nt_unload_key_ex(args[0], nt_ulong_arg(args[1]), 0)
             },
             NativeService::NtUnloadKeyEx => unsafe { self.nt_unload_key_ex(args[0], 0, args[1]) },
             NativeService::NtLoadDriver => unsafe { self.nt_load_driver(args[0]) },
@@ -21547,9 +21552,9 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let use_xas_write = self.pi >= 2;
-                let index = args[1] as u32 as usize;
-                let info_class = args[2] as u32 as u64;
-                let output_length = args[4] as u32 as usize;
+                let index = nt_ulong_arg(args[1]) as usize;
+                let info_class = nt_ulong_arg(args[2]) as u64;
+                let output_length = nt_ulong_arg(args[4]) as usize;
                 let (status, provenance) = self
                     .registry_value_by_index_with(key, index, |name, ty, data, source| {
                         let Some(layout) = key_value_info_layout(info_class, name, data.len()) else {
@@ -21608,9 +21613,9 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let idx = args[1] as u32 as usize;
-                let info_class = args[2] as u32;
-                let output_length = args[4] as u32 as usize;
+                let idx = nt_ulong_arg(args[1]) as usize;
+                let info_class = nt_ulong_arg(args[2]);
+                let output_length = nt_ulong_arg(args[4]) as usize;
                 let key_path = self.registry_target_path(key);
                 let Some(name) = self.registry_subkey_by_index(key, idx) else {
                     trace_winlogon_post_lsa_registry(
@@ -21694,7 +21699,7 @@ impl ExecNtHandler {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
                 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
-                let info_class = args[1] as u32;
+                let info_class = nt_ulong_arg(args[1]);
                 let required_access = if info_class == 3 { 0 } else { 0x1 };
                 let key = match self.resolve_registry_key(args[0], required_access) {
                     Ok(key) => key,
@@ -21702,7 +21707,7 @@ impl ExecNtHandler {
                 };
                 let use_xas_write = self.pi >= 2;
                 let stats = self.registry_key_stats(key);
-                let output_length = args[3] as u32 as usize;
+                let output_length = nt_ulong_arg(args[3]) as usize;
                 let full_path = self.registry_target_path(key).unwrap_or_default();
                 let class_name = self.registry_key_class(key);
                 let (info, minimum_length) =
@@ -22256,8 +22261,8 @@ impl ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let output_length = args[4] as u32 as usize;
-                let info_class = args[2] as u32 as u64;
+                let output_length = nt_ulong_arg(args[4]) as usize;
+                let info_class = nt_ulong_arg(args[2]) as u64;
                 if args[5] == 0 || !self.probe_user_output(args[5], 4) {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
