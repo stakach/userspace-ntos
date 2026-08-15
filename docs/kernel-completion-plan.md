@@ -3461,12 +3461,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
 - B3 Video0 bridge route-state cleanup (2026-08-15). The temporary boot-framebuffer Video0 bridge no
   longer keeps projected WDM object pointers and I/O Manager route identities as a dozen unrelated
-  file-level scalar statics. `video_device.rs` now groups projected driver/device/file bodies into
-  `VideoProjectionObjects` and the registered driver/device/open route into `VideoIoRoute`; all
-  readiness checks, proofs, teardown, `IoGetDeviceObjectPointer`, EngDeviceIoControl, and buffered
-  I/O Manager dispatch now consume snapshots from those records. This keeps the current
-  boot-framebuffer IOCTL semantics unchanged while reducing the state surface that real
-  videoprt/miniport hosting must replace. Validation: `cargo fmt --all`,
+  file-level scalar statics. `video_device.rs` now has one `VideoBridgeState` owner for projected
+  driver/device/file bodies, DeviceMap metadata, the boot framebuffer miniport, readiness, and the
+  registered driver/device/open route; all readiness checks, proofs, teardown,
+  `IoGetDeviceObjectPointer`, EngDeviceIoControl, and buffered I/O Manager dispatch consume
+  snapshots from that state. This keeps the current boot-framebuffer IOCTL semantics unchanged while
+  reducing the state surface that real videoprt/miniport hosting must replace. Validation:
+  `cargo fmt --all`,
   `cargo test -p nt-video-miniport`, and `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 

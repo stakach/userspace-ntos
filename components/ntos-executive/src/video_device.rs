@@ -54,6 +54,7 @@ pub(crate) struct VideoDeviceRegistration<'a> {
     pub(crate) allocate_projection: unsafe fn(u64) -> u64,
 }
 
+#[derive(Clone, Copy)]
 struct VideoRegistrationMetadata {
     driver_name_ptr: u64,
     driver_name_len: usize,
@@ -130,11 +131,55 @@ impl VideoIoRoute {
     }
 }
 
-static mut VIDEO_OBJECTS: VideoProjectionObjects = VideoProjectionObjects::empty();
-static mut VIDEO_REGISTRATION_METADATA: Option<VideoRegistrationMetadata> = None;
-static mut VIDEO_MINIPORT: Option<BootFramebufferMiniport> = None;
-static mut VIDEO_IO_ROUTE: VideoIoRoute = VideoIoRoute::empty();
-static mut VIDEO_DEVICE_READY: bool = false;
+#[derive(Clone, Copy)]
+struct VideoBridgeState {
+    objects: VideoProjectionObjects,
+    metadata: Option<VideoRegistrationMetadata>,
+    miniport: Option<BootFramebufferMiniport>,
+    route: VideoIoRoute,
+    ready: bool,
+}
+
+impl VideoBridgeState {
+    const fn empty() -> Self {
+        Self {
+            objects: VideoProjectionObjects::empty(),
+            metadata: None,
+            miniport: None,
+            route: VideoIoRoute::empty(),
+            ready: false,
+        }
+    }
+
+    fn metadata_ready(&self) -> bool {
+        match self.metadata {
+            Some(metadata) => metadata.ready(),
+            None => false,
+        }
+    }
+
+    fn map_ready(&self) -> bool {
+        self.ready
+            && self.metadata_ready()
+            && self.objects.ready()
+            && self.miniport.is_some()
+            && self.route.ready()
+    }
+
+    fn map_published(&self) -> bool {
+        self.ready && self.metadata_ready()
+    }
+
+    fn projected_ready(&self) -> bool {
+        self.ready
+            && self.metadata_ready()
+            && self.objects.ready()
+            && self.route.ready()
+            && self.miniport.is_some()
+    }
+}
+
+static mut VIDEO_STATE: VideoBridgeState = VideoBridgeState::empty();
 
 #[inline(never)]
 pub(crate) unsafe fn publish_boot_framebuffer_video_device(
@@ -150,22 +195,22 @@ pub(crate) unsafe fn publish_boot_framebuffer_video_device(
         return false;
     }
     if !ensure_video_io_route(reg.driver_name) {
-        VIDEO_MINIPORT = None;
+        (*addr_of_mut!(VIDEO_STATE)).miniport = None;
         return false;
     }
     let Some(metadata) = video_registration_metadata_from(reg) else {
         teardown_video_io_route();
-        VIDEO_MINIPORT = None;
+        (*addr_of_mut!(VIDEO_STATE)).miniport = None;
         return false;
     };
     if !publish_video_device_map(reg.service_registry_path) {
         teardown_video_io_route();
-        VIDEO_MINIPORT = None;
+        (*addr_of_mut!(VIDEO_STATE)).miniport = None;
         return false;
     }
 
-    *core::ptr::addr_of_mut!(VIDEO_REGISTRATION_METADATA) = Some(metadata);
-    VIDEO_DEVICE_READY = true;
+    (*addr_of_mut!(VIDEO_STATE)).metadata = Some(metadata);
+    (*addr_of_mut!(VIDEO_STATE)).ready = true;
     true
 }
 
@@ -175,7 +220,7 @@ unsafe fn install_video_miniport(
     framebuffer_size: u64,
     mode: VideoModeSpec,
 ) -> bool {
-    VIDEO_MINIPORT = None;
+    (*addr_of_mut!(VIDEO_STATE)).miniport = None;
     let Ok(miniport) = BootFramebufferMiniport::new(
         FramebufferMapping {
             virtual_address: framebuffer_va,
@@ -185,7 +230,7 @@ unsafe fn install_video_miniport(
     ) else {
         return false;
     };
-    VIDEO_MINIPORT = Some(miniport);
+    (*addr_of_mut!(VIDEO_STATE)).miniport = Some(miniport);
     true
 }
 
@@ -219,48 +264,31 @@ unsafe fn video_registration_metadata_from(
     })
 }
 
-unsafe fn video_registration_metadata() -> Option<&'static VideoRegistrationMetadata> {
-    (&*core::ptr::addr_of!(VIDEO_REGISTRATION_METADATA)).as_ref()
-}
-
-unsafe fn video_registration_metadata_ready() -> bool {
-    match video_registration_metadata() {
-        Some(metadata) => metadata.ready(),
-        None => false,
-    }
-}
-
-unsafe fn video_objects_snapshot() -> VideoProjectionObjects {
-    core::ptr::read_volatile(addr_of!(VIDEO_OBJECTS))
-}
-
-unsafe fn video_io_route_snapshot() -> VideoIoRoute {
-    core::ptr::read_volatile(addr_of!(VIDEO_IO_ROUTE))
+unsafe fn video_state_snapshot() -> VideoBridgeState {
+    core::ptr::read_volatile(addr_of!(VIDEO_STATE))
 }
 
 pub(crate) fn video_device_map_ready() -> bool {
     unsafe {
-        let objects = video_objects_snapshot();
-        VIDEO_DEVICE_READY
-            && video_registration_metadata_ready()
-            && objects.ready()
-            && core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)).is_some()
+        let state = video_state_snapshot();
+        state.map_ready()
             && video_io_route_ready()
     }
 }
 
 pub(crate) fn video_device_map_published() -> bool {
-    unsafe { VIDEO_DEVICE_READY && video_registration_metadata_ready() }
+    unsafe { video_state_snapshot().map_published() }
 }
 
 pub(crate) unsafe fn query_video_device_map_value(
     name: &[u8],
     out: &mut [u8],
 ) -> Result<(u32, usize), i32> {
-    let Some(metadata) = video_registration_metadata() else {
+    let state = video_state_snapshot();
+    let Some(metadata) = state.metadata else {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     };
-    if !VIDEO_DEVICE_READY {
+    if !state.ready {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     if ascii_eq_ignore_case(name, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE.as_bytes()) {
@@ -282,19 +310,19 @@ pub(crate) unsafe fn query_video_device_map_value(
 
 pub(crate) fn video_device_projection_proofs() -> (u64, u64, u64, u64) {
     unsafe {
-        let objects = video_objects_snapshot();
+        let state = video_state_snapshot();
         (
             video_device_map_ready() as u64,
-            objects.driver,
-            objects.device,
-            objects.file,
+            state.objects.driver,
+            state.objects.device,
+            state.objects.file,
         )
     }
 }
 
 #[inline(never)]
 unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bool {
-    if video_objects_snapshot().ready() {
+    if video_state_snapshot().objects.ready() {
         return true;
     }
     let driver_len = WDM_X64_DRIVER_OBJECT_SIZE + WDM_X64_DRIVER_EXTENSION_SIZE;
@@ -322,7 +350,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
     {
         return false;
     }
-    *addr_of_mut!(VIDEO_OBJECTS) = VideoProjectionObjects {
+    (*addr_of_mut!(VIDEO_STATE)).objects = VideoProjectionObjects {
         driver,
         device,
         file,
@@ -332,7 +360,7 @@ unsafe fn ensure_video_objects(allocate_projection: unsafe fn(u64) -> u64) -> bo
 
 #[inline(never)]
 unsafe fn rewrite_video_file_projection(file_id: u64) -> bool {
-    let objects = video_objects_snapshot();
+    let objects = video_state_snapshot().objects;
     if !objects.ready() {
         return false;
     }
@@ -400,7 +428,7 @@ unsafe fn ensure_video_io_route(driver_name: &[u8]) -> bool {
 
 #[inline(never)]
 unsafe fn video_io_route_ids_present() -> bool {
-    video_io_route_snapshot().ready()
+    video_state_snapshot().route.ready()
 }
 
 #[inline(never)]
@@ -454,7 +482,7 @@ unsafe fn commit_video_io_route(
     file_id: u64,
     file_object_id: u64,
 ) {
-    *addr_of_mut!(VIDEO_IO_ROUTE) = VideoIoRoute {
+    (*addr_of_mut!(VIDEO_STATE)).route = VideoIoRoute {
         driver_id,
         device_id,
         device_object_id,
@@ -470,31 +498,25 @@ unsafe fn teardown_video_driver_route(driver_id: u64) {
 }
 
 unsafe fn video_io_route_ready() -> bool {
-    let route = video_io_route_snapshot();
+    let route = video_state_snapshot().route;
     route.ready()
         && crate::driver_launch::device_id_by_name(VIDEO_DEVICE_PATH_STR) == Some(route.device_id)
         && crate::driver_launch::device_object_id(route.device_id) == route.device_object_id
 }
 
 unsafe fn projected_video_route_ready() -> bool {
-    let objects = video_objects_snapshot();
-    let route = video_io_route_snapshot();
-    VIDEO_DEVICE_READY
-        && video_registration_metadata_ready()
-        && objects.ready()
-        && route.ready()
-        && core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)).is_some()
+    video_state_snapshot().projected_ready()
 }
 
 unsafe fn teardown_video_io_route() {
-    let route = video_io_route_snapshot();
+    let route = video_state_snapshot().route;
     if route.file_handle != 0 {
         let _ = crate::driver_launch::close_io_handle(route.file_handle);
     }
     if route.driver_id != 0 {
         crate::driver_launch::destroy_io_driver(route.driver_id);
     }
-    *addr_of_mut!(VIDEO_IO_ROUTE) = VideoIoRoute::empty();
+    (*addr_of_mut!(VIDEO_STATE)).route = VideoIoRoute::empty();
 }
 
 struct BootVideoDriverBackend;
@@ -513,9 +535,8 @@ impl DriverDispatchBackend for BootVideoDriverBackend {
                 })
             }
             major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
-                let Some(miniport) =
-                    (unsafe { core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)) })
-                else {
+                let state = unsafe { video_state_snapshot() };
+                let Some(miniport) = state.miniport else {
                     return Ok(DispatchOutcome::Failed {
                         status: NtStatus::DEVICE_NOT_CONNECTED,
                     });
@@ -539,7 +560,7 @@ impl DriverDispatchBackend for BootVideoDriverBackend {
                     ctx.system_buffer,
                     input_len,
                     output_len,
-                    unsafe { video_objects_snapshot().device },
+                    state.objects.device,
                 ) {
                     Ok(information) => Ok(DispatchOutcome::Completed {
                         status: NtStatus::SUCCESS,
@@ -678,7 +699,7 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     if !wstr_eq_ascii(buf, len, VIDEO_DEVICE_PATH) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    let objects = video_objects_snapshot();
+    let objects = video_state_snapshot().objects;
     if !objects.ready() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -703,7 +724,8 @@ pub(crate) unsafe fn video_device_io_control(
     if !projected_video_route_ready() {
         return 1;
     }
-    let objects = video_objects_snapshot();
+    let state = video_state_snapshot();
+    let objects = state.objects;
     if hdev != objects.device {
         return 1;
     }
@@ -729,7 +751,7 @@ pub(crate) unsafe fn video_device_io_control(
     } else {
         return 1;
     };
-    let Some(miniport) = core::ptr::read_volatile(core::ptr::addr_of!(VIDEO_MINIPORT)) else {
+    let Some(miniport) = state.miniport else {
         return 1;
     };
     match dispatch_boot_video_io_control(
