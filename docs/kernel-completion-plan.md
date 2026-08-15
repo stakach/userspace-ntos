@@ -39,9 +39,9 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-session-runtime-cache-20260815.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3/A4 win32k session runtime cache cleanup.
-This
+`.tmp/run-desktop-local-event-queue-20260815.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3/A4 win32k local event signal queue
+cleanup. This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -50,7 +50,10 @@ shell path is fully live: `WlxActivateUserShell` reads the real `Userinit` regis
 `userinit.exe` and `explorer.exe` spawn through ordinary section/process creation, Explorer opens
 shell COM classes, redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches,
 and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with
-at least 32 distinct non-background colors. The preceding headless proof remains
+at least 32 distinct non-background colors. The same run continues into later service/autostart
+activity and exposes the next non-gated runtime frontier: a dynamic `rundll32.exe` instance
+(`pi=17`, badge 39) takes an instruction-fetch VM fault at `0x8028b640` after its win32k process
+callout and is reclaimed before the final summary. The preceding headless proof remains
 `.tmp/run-headless-current-20260815-082827.log`, and the prior visible Dbgk proof remains
 `.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
 `.tmp/run-desktop-20260814-125406.log`, which closes the Dbgk hardware-breakpoint context proof:
@@ -3409,8 +3412,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   and growth counts, and reports bounded allocation failures instead of silently dropping or
   overwriting unrelated event bodies. `KeSetEvent`/`KePulseEvent` wake delivery remains generic
   queue-event machinery for hosted GUI/service threads, with no shell-specific success path.
-  Validation so far: `cargo fmt --all`, `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and serialized desktop proof `.tmp/run-desktop-local-event-queue-20260815.log`, which reaches
+  `296/296` with `exec_gdi_user_batch_flushed`, `exec_profile_ntuser_dat_present`,
+  `exec_ntloadkey_serviced`, `exec_winlogon_user_shell_activated`, `exec_userinit_process_spawned`,
+  `exec_explorer_process_spawned`, `exec_vm_pool_headroom`, and
+  `exec_explorer_shell_chrome_painted` green. The proof records final `exec-heap-free=8034KiB`,
+  `class-atom-names=413`, `cursor-identities=32`, `KeGdiFlushUserBatch flushes=218`, and Explorer
+  framebuffer `786432/786432` non-background pixels with at least 32 distinct colors. Review
+  adjustment: the desktop proof is green; the next frontier is the later dynamic `rundll32.exe`
+  instruction-fetch VM fault during service/autostart churn, not the GUI queue-event bridge.
 
 - B3 root-bus resource profile catalog cleanup (2026-08-15). The executive PnP broker no longer
   stores broker-backed root-bus resource profiles in a one-entry static array. `nt-pnp` now owns a
