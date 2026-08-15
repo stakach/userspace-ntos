@@ -1650,7 +1650,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    create/open access masks and `NtCreateThreadEx` flags; `NtCreateProcess` access publication;
    `NtOpenProcess`/`NtOpenThread`; process/thread information classes and lengths; duplicate-object
    options/access; named-pipe create options/access; hard-error scalar fields; system information
-   class/length; and LPC port maximum-count fields.
+   class/length; and LPC port maximum-count fields. The object/file-query follow-on now covers
+   object-directory and symbolic-link access masks, `NtQueryDirectoryObject` lengths, volume/query
+   information class and length fields, directory-query lengths/classes, I/O completion
+   access/concurrency/status scalars, and file-query information class/length fields. The remaining
+   dense raw-cast clusters are `NtCreateFile`/file information setters and section/map-view services.
 
 ## Review Log
 

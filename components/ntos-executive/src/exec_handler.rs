@@ -25721,6 +25721,7 @@ impl ExecNtHandler {
             // Resolve/insert in the executive object namespace, hand back a real handle.
             NativeService::NtOpenDirectoryObject | NativeService::NtCreateDirectoryObject => unsafe {
                 let out = args[0]; // R10 = *Handle
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES
                 if out == 0 {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
@@ -25770,7 +25771,7 @@ impl ExecNtHandler {
                     }
                     index
                 };
-                let Some(handle) = self.mint_object_namespace_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_object_namespace_handle(index, desired_access) else {
                     if created {
                         self.rollback_new_namespace_object(index);
                     }
@@ -25799,7 +25800,7 @@ impl ExecNtHandler {
                 SERVICES_QUERY_DIR_OBJECT.fetch_add(1, Ordering::Relaxed);
                 let dir_handle = args[0];
                 let buf = args[1];
-                let length = args[2] as u32 as u64;
+                let length = nt_ulong_arg(args[2]) as u64;
                 let return_single = nt_boolean_arg(args[3]);
                 let restart_scan = nt_boolean_arg(args[4]);
                 let context_ptr = args[5];
@@ -25942,6 +25943,7 @@ impl ExecNtHandler {
             // *LinkTarget[R9]=args[3]). SmpInit creates the \?? drive-letter links.
             NativeService::NtCreateSymbolicLinkObject => unsafe {
                 let out = args[0];
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
                 let tgt = args[3]; // R9 = PUNICODE_STRING target
                 if out == 0 {
@@ -25978,7 +25980,7 @@ impl ExecNtHandler {
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(index) if self.obj_ns[index].kind == OBJ_KIND_SYMBOLIC_LINK => {
                         let Some(handle) =
-                            self.mint_object_namespace_handle(index, args[1] as u32)
+                            self.mint_object_namespace_handle(index, desired_access)
                         else {
                             return 0xC000_009A;
                         };
@@ -26000,7 +26002,7 @@ impl ExecNtHandler {
                     ) {
                         Some(index) => {
                             let Some(handle) =
-                                self.mint_object_namespace_handle(index, args[1] as u32)
+                                self.mint_object_namespace_handle(index, desired_access)
                             else {
                                 self.rollback_new_namespace_object(index);
                                 return 0xC000_009A;
@@ -26022,6 +26024,7 @@ impl ExecNtHandler {
             // Resolve; hand back a handle only for an actual symbolic link (a dir match is a miss).
             NativeService::NtOpenSymbolicLinkObject => unsafe {
                 let out = args[0];
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
                 if out == 0 {
                     return 0xC000_0005;
@@ -26042,7 +26045,7 @@ impl ExecNtHandler {
                 };
                 match self.obj_resolve_open_link(path, root_idx) {
                     Some(i) if self.obj_ns[i].kind == 1 => {
-                        let Some(handle) = self.mint_object_namespace_handle(i, args[1] as u32)
+                        let Some(handle) = self.mint_object_namespace_handle(i, desired_access)
                         else {
                             return 0xC000_009A;
                         };
@@ -26168,8 +26171,8 @@ impl ExecNtHandler {
                 let file_handle = args[0];
                 let iosb = args[1];
                 let buf = args[2];
-                let len = args[3] as u32 as u64;
-                let class = args[4] as u32;
+                let len = nt_ulong_arg(args[3]) as u64;
+                let class = nt_ulong_arg(args[4]);
                 if class != 4 {
                     return STATUS_INVALID_INFO_CLASS;
                 }
@@ -26225,24 +26228,24 @@ impl ExecNtHandler {
 
                 let iosb = args[4];
                 let output = args[5];
+                let raw_length = nt_ulong_arg(args[6]) as u64;
+                let information_class = nt_ulong_arg(args[7]);
                 crate::writable_fs::trace_dir_refusal(
                     b"call",
                     self.pi,
                     args[0],
                     iosb,
                     output,
-                    args[6] as u32 as usize,
+                    raw_length as usize,
                     args[7],
                 );
                 // `Length` is a ULONG and `ReturnSingleEntry` / `RestartScan` are BOOLEANs. They
                 // often live in stack slots whose high halves still contain older pointer data, so
                 // the ABI boundary must truncate them before validation for every filesystem path.
-                let raw_length = args[6] as u32 as u64;
                 let length = match usize::try_from(raw_length) {
                     Ok(length) => length,
                     _ => return STATUS_INSUFFICIENT_RESOURCES,
                 };
-                let information_class = args[7] as u32;
                 let return_single_entry = nt_boolean_arg(args[8]);
                 let restart_scan = nt_boolean_arg(args[10]);
                 if iosb == 0 || output == 0 {
@@ -26463,8 +26466,8 @@ impl ExecNtHandler {
             NativeService::NtQueryInformationFile => unsafe {
                 let iosb = args[1];
                 let output = args[2];
-                let length = args[3] as u32 as usize;
-                let class = args[4] as u32;
+                let length = nt_ulong_arg(args[3]) as usize;
+                let class = nt_ulong_arg(args[4]);
                 if class == 41 {
                     const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN: usize = 4;
                     if length < FILE_IO_COMPLETION_NOTIFICATION_INFORMATION_LEN {
@@ -26744,9 +26747,9 @@ impl ExecNtHandler {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
                 let out_handle = args[0];
-                let desired_access = args[1] as u32;
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
-                let concurrency = args[3] as u32;
+                let concurrency = nt_ulong_arg(args[3]);
                 let mut output_probe = [0u8; 8];
                 if out_handle == 0 || !self.xas_read(out_handle, &mut output_probe) {
                     return STATUS_ACCESS_VIOLATION;
@@ -26816,7 +26819,7 @@ impl ExecNtHandler {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
                 let out_handle = args[0];
-                let desired_access = args[1] as u32;
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
                 let mut output_probe = [0u8; 8];
                 let mut oa_header = [0u8; 32];
@@ -26869,7 +26872,7 @@ impl ExecNtHandler {
                 let packet = nt_io_completion::CompletionPacket {
                     key_context: args[1],
                     apc_context: args[2],
-                    status: args[3] as u32,
+                    status: nt_ulong_arg(args[3]),
                     information: args[4],
                 };
                 let status = self.post_io_completion_packet(object_id, packet);
