@@ -86,9 +86,79 @@ impl<const N: usize> ReferenceReleaseLedger<N> {
     pub fn as_slice(&self) -> &[ReferenceRelease] {
         &self.entries[..self.len]
     }
+
+    pub fn contains(&self, base: u64) -> bool {
+        self.entries[..self.len]
+            .iter()
+            .any(|entry| entry.base == base)
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        N - self.len
+    }
 }
 
 impl<const N: usize> Default for ReferenceReleaseLedger<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReferenceEdge {
+    pub base: u64,
+    pub increment_existing: bool,
+}
+
+/// Unique import edges a successfully snapped module will publish to loader load counts.
+///
+/// A dependency first mapped for the importing module consumes the new module's initial load count.
+/// A dependency that was already present needs one additional count. Duplicate descriptors or
+/// delay descriptors inside the same importing module still publish only one edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportReferenceLedger<const N: usize> {
+    entries: [ImportReferenceEdge; N],
+    len: usize,
+}
+
+impl<const N: usize> ImportReferenceLedger<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [ImportReferenceEdge {
+                base: 0,
+                increment_existing: false,
+            }; N],
+            len: 0,
+        }
+    }
+
+    pub fn record(&mut self, base: u64, increment_existing: bool) -> bool {
+        if base == 0 {
+            return false;
+        }
+        if self.entries[..self.len]
+            .iter()
+            .any(|entry| entry.base == base)
+        {
+            return true;
+        }
+        if self.len == N {
+            return false;
+        }
+        self.entries[self.len] = ImportReferenceEdge {
+            base,
+            increment_existing,
+        };
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[ImportReferenceEdge] {
+        &self.entries[..self.len]
+    }
+}
+
+impl<const N: usize> Default for ImportReferenceLedger<N> {
     fn default() -> Self {
         Self::new()
     }
@@ -291,6 +361,18 @@ pub fn plan_reference_add(load_count: u16, pin: bool) -> u16 {
     add_reference(load_count, pin)
 }
 
+pub fn plan_reference_add_many(load_count: u16, pin: bool, adds: u32) -> u16 {
+    if load_count == LOAD_COUNT_PINNED || pin {
+        return LOAD_COUNT_PINNED;
+    }
+    let next = u32::from(load_count).saturating_add(adds);
+    if next >= u32::from(LOAD_COUNT_PINNED) {
+        LOAD_COUNT_PINNED
+    } else {
+        next as u16
+    }
+}
+
 /// Thread callouts may only be disabled for a module without an allocated TLS slot.
 pub fn can_disable_thread_callouts(tls_index: u16) -> bool {
     tls_index == 0
@@ -326,6 +408,21 @@ mod tests {
             LOAD_COUNT_PINNED
         );
         assert_eq!(plan_reference_add(1, true), LOAD_COUNT_PINNED);
+    }
+
+    #[test]
+    fn reference_add_many_plans_bounded_increments() {
+        assert_eq!(plan_reference_add_many(1, false, 0), 1);
+        assert_eq!(plan_reference_add_many(1, false, 3), 4);
+        assert_eq!(
+            plan_reference_add_many(LOAD_COUNT_PINNED - 1, false, 1),
+            LOAD_COUNT_PINNED
+        );
+        assert_eq!(
+            plan_reference_add_many(LOAD_COUNT_PINNED - 2, false, 3),
+            LOAD_COUNT_PINNED
+        );
+        assert_eq!(plan_reference_add_many(1, true, 0), LOAD_COUNT_PINNED);
     }
 
     #[test]
@@ -445,9 +542,13 @@ mod tests {
     #[test]
     fn release_ledger_preserves_import_edge_multiplicity() {
         let mut ledger = ReferenceReleaseLedger::<3>::new();
+        assert_eq!(ledger.remaining_capacity(), 3);
         assert!(ledger.record(10));
         assert!(ledger.record(20));
         assert!(ledger.record(10));
+        assert!(ledger.contains(10));
+        assert!(!ledger.contains(40));
+        assert_eq!(ledger.remaining_capacity(), 1);
         assert_eq!(
             ledger.as_slice(),
             &[
@@ -463,6 +564,30 @@ mod tests {
         );
         assert!(ledger.record(30));
         assert!(!ledger.record(40));
+    }
+
+    #[test]
+    fn import_reference_ledger_records_unique_edges() {
+        let mut ledger = ImportReferenceLedger::<3>::new();
+        assert!(ledger.record(0x1000, false));
+        assert!(ledger.record(0x2000, true));
+        assert!(ledger.record(0x1000, true));
+        assert_eq!(
+            ledger.as_slice(),
+            &[
+                ImportReferenceEdge {
+                    base: 0x1000,
+                    increment_existing: false
+                },
+                ImportReferenceEdge {
+                    base: 0x2000,
+                    increment_existing: true
+                }
+            ]
+        );
+        assert!(ledger.record(0x3000, true));
+        assert!(!ledger.record(0x4000, false));
+        assert!(!ledger.record(0, false));
     }
 
     #[test]

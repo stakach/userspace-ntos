@@ -66,6 +66,28 @@ proof remains
 close the D3 reboot-persistence proof for system hives, profile hives, and writable overlay state on
 the current desktop path.
 
+Current ntdll import-reference slice (2026-08-15): the late `rundll32.exe` fault is being treated as
+a loader-lifetime bug rather than a kernel process-launch shortcut. The Rust ntdll loader now records
+the unique normal and delay import edges of each successfully snapped module and publishes the
+missing load-count increment only for dependencies that were already present before that module
+snapped. Dependencies first mapped for the importing module keep using their initial load count as
+that first import reference. Static import snapping can run before `PEB->Ldr` exists, so snap-time
+increments whose loader entries are not materialized yet are retained in a bounded pending ledger and
+flushed immediately after initial `PEB->Ldr` construction or after runtime `LdrLoadDll` threads
+transitive dependencies into the loader lists. The publication plan scratch is process-local static
+storage and each per-module import ledger is process-heap owned, keeping recursive import snapping
+inside the small hosted loader stack without hiding allocation failure. `LdrUnloadDll` release
+planning now walks the same normal plus delay import surfaces once per importing module, so duplicate
+descriptors inside one module do not over-release while distinct import edges still balance. This is
+not a fallback: failed reference publication aborts the snap before `imports_ready` is committed, and
+a pending increment that cannot be matched to a real loader entry fails the loader drive. Local
+validation is green:
+`cargo test -p nt-ntdll loader -- --nocapture`, `./scripts/build_ntdll_dll.sh`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Remaining validation is a serialized desktop proof confirming that the late
+`rundll32.exe`/`advapi32` instruction-fetch `vmf-out` is gone while the `296/296` shell-chrome gates
+remain green.
+
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the
 handle routes to the hosted ReactOS driver path. The component-side WDM IRP projection now carries

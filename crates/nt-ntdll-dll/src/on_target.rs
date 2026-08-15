@@ -1524,6 +1524,18 @@ impl ModuleTable {
 #[cfg(target_arch = "x86_64")]
 static mut MODULE_TABLE: ModuleTable = ModuleTable::new();
 
+#[cfg(target_arch = "x86_64")]
+static mut PENDING_IMPORT_REFERENCE_INCREMENTS:
+    nt_ntdll::loader::lifecycle::ReferenceReleaseLedger<MODULE_TABLE_CAP> =
+    nt_ntdll::loader::lifecycle::ReferenceReleaseLedger::new();
+
+#[cfg(target_arch = "x86_64")]
+static mut IMPORT_REFERENCE_COUNT_PTRS: [u64; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
+#[cfg(target_arch = "x86_64")]
+static mut IMPORT_REFERENCE_NEXT_COUNTS: [u16; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
+#[cfg(target_arch = "x86_64")]
+static mut IMPORT_REFERENCE_DEFER_BASES: [u64; MODULE_TABLE_CAP] = [0; MODULE_TABLE_CAP];
+
 /// Balances future per-thread attach and detach callouts. No current thread is committed until the
 /// secondary-thread initialization path begins issuing DLL_THREAD_ATTACH.
 #[cfg(target_arch = "x86_64")]
@@ -2125,7 +2137,15 @@ unsafe fn snap_descriptor_against(
             } else {
                 // by ordinal.
                 let ord = (thunk & 0xffff) as u32;
-                resolve_export_addr(dep_base, true, &[], ord, table, &mut out.status, 0)
+                resolve_export_addr(
+                    dep_base,
+                    true,
+                    &[],
+                    ord,
+                    table,
+                    &mut out.status,
+                    0,
+                )
             };
             if out.status != 0 {
                 core::ptr::write_unaligned(
@@ -2292,13 +2312,14 @@ unsafe fn resolve_export_addr(
         let mut tbase = (&*table).find(tmod_lc);
         if tbase == 0 {
             let mut sink = SnapResult::default();
-            tbase = load_and_snap_dependency(
+            let loaded = load_and_snap_dependency(
                 tmod_lc,
                 (&*table).find(b"ntdll"),
                 table,
                 &mut sink,
                 depth + 1,
             );
+            tbase = loaded.base;
             if sink.status != 0 {
                 if *load_status == 0 {
                     *load_status = sink.status;
@@ -2325,9 +2346,25 @@ unsafe fn resolve_export_addr(
                 }
                 ord = ord * 10 + (c - b'0') as u32;
             }
-            resolve_export_addr(tbase, true, &[], ord, table, load_status, depth + 1)
+            resolve_export_addr(
+                tbase,
+                true,
+                &[],
+                ord,
+                table,
+                load_status,
+                depth + 1,
+            )
         } else {
-            resolve_export_addr(tbase, false, sym_part, 0, table, load_status, depth + 1)
+            resolve_export_addr(
+                tbase,
+                false,
+                sym_part,
+                0,
+                table,
+                load_status,
+                depth + 1,
+            )
         }
     }
 }
@@ -2422,16 +2459,70 @@ unsafe fn load_dependent_dll(open_name_lc: &[u8]) -> u64 {
 /// A failed mapping remains registered because the executive cannot safely unmap it yet; retrying
 /// that exact base avoids duplicate mappings and preserves the loader entry's owned state.
 #[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone)]
+struct DependencySnap {
+    base: u64,
+    increment_existing_reference: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct ImportReferenceLedgerBox {
+    ptr: *mut nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ImportReferenceLedgerBox {
+    unsafe fn new() -> Result<Self, u32> {
+        let size = core::mem::size_of::<
+            nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP>,
+        >();
+        let ptr = unsafe { crate::process_heap_alloc(size) }
+            as *mut nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP>;
+        if ptr.is_null() {
+            return Err(STATUS_NO_MEMORY as u32);
+        }
+        unsafe {
+            core::ptr::write(ptr, nt_ntdll::loader::lifecycle::ImportReferenceLedger::new());
+        }
+        Ok(Self { ptr })
+    }
+
+    fn as_ref(
+        &self,
+    ) -> &nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP> {
+        unsafe { &*self.ptr }
+    }
+
+    fn as_mut(
+        &mut self,
+    ) -> &mut nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP> {
+        unsafe { &mut *self.ptr }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ImportReferenceLedgerBox {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { crate::process_heap_free(self.ptr.cast::<u8>()) };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn load_and_snap_dependency(
     name_lc: &[u8],
     ntdll_base: u64,
     table: *mut ModuleTable,
     out: &mut SnapResult,
     depth: u32,
-) -> u64 {
+) -> DependencySnap {
     let existing = unsafe { (&*table).find(name_lc) };
     if existing != 0 {
-        return existing;
+        return DependencySnap {
+            base: existing,
+            increment_existing_reference: true,
+        };
     }
     let retained = unsafe { (&*table).find_any(name_lc) };
     let base = if retained != 0 {
@@ -2442,7 +2533,10 @@ unsafe fn load_and_snap_dependency(
             if out.status == 0 {
                 out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
             }
-            return 0;
+            return DependencySnap {
+                base: 0,
+                increment_existing_reference: false,
+            };
         }
         unsafe { (&mut *table).insert(name_lc, loaded) };
         loaded
@@ -2452,14 +2546,150 @@ unsafe fn load_and_snap_dependency(
         if out.status == 0 {
             out.status = status;
         }
-        return 0;
+        return DependencySnap {
+            base: 0,
+            increment_existing_reference: false,
+        };
     }
     unsafe { snap_module(base, ntdll_base, table, out, depth) };
     if out.status == 0 {
-        base
+        DependencySnap {
+            base,
+            increment_existing_reference: false,
+        }
     } else {
-        0
+        DependencySnap {
+            base: 0,
+            increment_existing_reference: false,
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_import_reference_edges(
+    import_edges: &nt_ntdll::loader::lifecycle::ImportReferenceLedger<MODULE_TABLE_CAP>,
+) -> u32 {
+    let count_ptrs = core::ptr::addr_of_mut!(IMPORT_REFERENCE_COUNT_PTRS).cast::<u64>();
+    let next_counts = core::ptr::addr_of_mut!(IMPORT_REFERENCE_NEXT_COUNTS).cast::<u16>();
+    let defer_bases = core::ptr::addr_of_mut!(IMPORT_REFERENCE_DEFER_BASES).cast::<u64>();
+    let mut planned = 0usize;
+    let mut deferred = 0usize;
+    for edge in import_edges.as_slice() {
+        if !edge.increment_existing {
+            continue;
+        }
+        if unsafe { ldr_entry_for_base(edge.base) } == 0 {
+            if deferred == MODULE_TABLE_CAP {
+                return STATUS_NO_MEMORY as u32;
+            }
+            unsafe { core::ptr::write(defer_bases.add(deferred), edge.base) };
+            deferred += 1;
+            continue;
+        }
+        let (count_ptr, next) = match unsafe {
+            crate::exports::ldr_plan_module_reference(edge.base, false)
+        } {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        unsafe {
+            core::ptr::write(count_ptrs.add(planned), count_ptr as u64);
+            core::ptr::write(next_counts.add(planned), next);
+        }
+        planned += 1;
+    }
+
+    let pending = unsafe { &*core::ptr::addr_of!(PENDING_IMPORT_REFERENCE_INCREMENTS) };
+    let mut needed = 0usize;
+    let mut index = 0usize;
+    while index < deferred {
+        let base = unsafe { core::ptr::read(defer_bases.add(index)) };
+        if !pending.contains(base) {
+            let mut already_needed = false;
+            let mut prior = 0usize;
+            while prior < index {
+                if unsafe { core::ptr::read(defer_bases.add(prior)) } == base {
+                    already_needed = true;
+                    break;
+                }
+                prior += 1;
+            }
+            if !already_needed {
+                needed += 1;
+            }
+        }
+        index += 1;
+    }
+    if needed > pending.remaining_capacity() {
+        return STATUS_NO_MEMORY as u32;
+    }
+
+    let mut index = 0usize;
+    while index < planned {
+        unsafe {
+            let count_ptr = core::ptr::read(count_ptrs.add(index)) as *mut u16;
+            let next = core::ptr::read(next_counts.add(index));
+            core::ptr::write_unaligned(count_ptr, next);
+        }
+        index += 1;
+    }
+    let pending = unsafe { &mut *core::ptr::addr_of_mut!(PENDING_IMPORT_REFERENCE_INCREMENTS) };
+    let mut index = 0usize;
+    while index < deferred {
+        let base = unsafe { core::ptr::read(defer_bases.add(index)) };
+        if !pending.record(base) {
+            return STATUS_NO_MEMORY as u32;
+        }
+        index += 1;
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_pending_import_reference_edges() -> u32 {
+    let count_ptrs = core::ptr::addr_of_mut!(IMPORT_REFERENCE_COUNT_PTRS).cast::<u64>();
+    let next_counts = core::ptr::addr_of_mut!(IMPORT_REFERENCE_NEXT_COUNTS).cast::<u16>();
+    let pending_len = {
+        let pending = unsafe { &*core::ptr::addr_of!(PENDING_IMPORT_REFERENCE_INCREMENTS) };
+        let pending_len = pending.as_slice().len();
+        if pending_len == 0 {
+            return 0;
+        }
+        for (index, reference) in pending.as_slice().iter().enumerate() {
+            let entry = unsafe { ldr_entry_for_base(reference.base) };
+            if entry == 0 {
+                return 0xC000_000D; // STATUS_INVALID_PARAMETER
+            }
+            let count_ptr = (entry + 0x6C) as *mut u16;
+            let load_count = unsafe { core::ptr::read_unaligned(count_ptr) };
+            unsafe {
+                core::ptr::write(count_ptrs.add(index), count_ptr as u64);
+                core::ptr::write(
+                    next_counts.add(index),
+                    nt_ntdll::loader::lifecycle::plan_reference_add_many(
+                        load_count,
+                        false,
+                        reference.releases,
+                    ),
+                );
+            }
+        }
+        pending_len
+    };
+    let mut index = 0usize;
+    while index < pending_len {
+        unsafe {
+            let count_ptr = core::ptr::read(count_ptrs.add(index)) as *mut u16;
+            let next = core::ptr::read(next_counts.add(index));
+            core::ptr::write_unaligned(count_ptr, next);
+        }
+        index += 1;
+    }
+    unsafe {
+        PENDING_IMPORT_REFERENCE_INCREMENTS =
+            nt_ntdll::loader::lifecycle::ReferenceReleaseLedger::new();
+    }
+    0
 }
 
 /// `NtMapViewOfSection` — a dedicated 10-arg caller (its arity exceeds syscall8's 8). Uses the same
@@ -2646,6 +2876,14 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
             core::hint::unreachable_unchecked()
         }
     }
+    let import_reference_status = unsafe { publish_pending_import_reference_edges() };
+    if import_reference_status != 0 {
+        drop(_loader_lock);
+        unsafe {
+            crate::exports::rtl_raise_status(import_reference_status);
+            core::hint::unreachable_unchecked()
+        }
+    }
     let tls_status =
         unsafe { initialize_process_static_tls(smss_base, core::ptr::addr_of!(MODULE_TABLE)) };
     if tls_status != 0 {
@@ -2750,6 +2988,13 @@ unsafe fn snap_module(
                 return;
             }
         };
+    let mut import_edges = match unsafe { ImportReferenceLedgerBox::new() } {
+        Ok(import_edges) => import_edges,
+        Err(status) => {
+            out.status = status;
+            return;
+        }
+    };
     // SAFETY: reading the mapped import directory + writing the mapped RW IAT per the contract.
     unsafe {
         let (idir_rva, _sz) = data_directory(image_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
@@ -2769,9 +3014,14 @@ unsafe fn snap_module(
                 let bn = import_desc_basename(image_base, name_rva, &mut base);
                 let dep_name = &base[..bn];
                 let mut dep_base = (&*table).find(dep_name);
+                let mut edge = DependencySnap {
+                    base: dep_base,
+                    increment_existing_reference: dep_base != 0,
+                };
                 if dep_base == 0 {
-                    dep_base =
+                    edge =
                         load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
+                    dep_base = edge.base;
                     if out.status != 0 {
                         core::ptr::write_unaligned(
                             (image_base + ft as u64) as *mut u64,
@@ -2782,8 +3032,22 @@ unsafe fn snap_module(
                     }
                 }
                 if dep_base != 0 {
-                    snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
+                    snap_descriptor_against(
+                        image_base,
+                        ilt_rva,
+                        ft,
+                        dep_base,
+                        table,
+                        out,
+                    );
                     if out.status != 0 {
+                        return;
+                    }
+                    if !import_edges
+                        .as_mut()
+                        .record(dep_base, edge.increment_existing_reference)
+                    {
+                        out.status = STATUS_NO_MEMORY as u32;
                         return;
                     }
                 } else {
@@ -2828,9 +3092,14 @@ unsafe fn snap_module(
                     let bn = import_desc_basename(image_base, name_rva, &mut base);
                     let dep_name = &base[..bn];
                     let mut dep_base = (&*table).find(dep_name);
+                    let mut edge = DependencySnap {
+                        base: dep_base,
+                        increment_existing_reference: dep_base != 0,
+                    };
                     if dep_base == 0 {
-                        dep_base =
+                        edge =
                             load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
+                        dep_base = edge.base;
                         if out.status != 0 {
                             core::ptr::write_unaligned(
                                 (image_base + iat_rva as u64) as *mut u64,
@@ -2843,8 +3112,22 @@ unsafe fn snap_module(
                     if dep_base != 0 {
                         // Snap the delay INT (int_rva) → the delay IAT (iat_rva), exactly like a normal
                         // import descriptor. The delay-load helper is now bypassed for this DLL.
-                        snap_descriptor_against(image_base, int_rva, iat_rva, dep_base, table, out);
+                        snap_descriptor_against(
+                            image_base,
+                            int_rva,
+                            iat_rva,
+                            dep_base,
+                            table,
+                            out,
+                        );
                         if out.status != 0 {
+                            return;
+                        }
+                        if !import_edges
+                            .as_mut()
+                            .record(dep_base, edge.increment_existing_reference)
+                        {
+                            out.status = STATUS_NO_MEMORY as u32;
                             return;
                         }
                     } else {
@@ -2861,6 +3144,11 @@ unsafe fn snap_module(
             }
         }
         if out.status == 0 {
+            let reference_status = publish_import_reference_edges(import_edges.as_ref());
+            if reference_status != 0 {
+                out.status = reference_status;
+                return;
+            }
             imports_ready.commit();
         }
     }
@@ -3634,6 +3922,10 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 }
                 thread_ldr_lists();
             }
+            let status = publish_pending_import_reference_edges();
+            if status != 0 {
+                return status;
+            }
             loaded
         };
         let attach_status = run_process_attach_root(table_ptr, base);
@@ -3886,37 +4178,81 @@ unsafe fn collect_reference_releases(
     visited[*visited_count] = base;
     *visited_count += 1;
 
+    let mut dependencies = [0u64; MODULE_TABLE_CAP];
+    let mut dependency_count = 0usize;
     let (imports_rva, _) = unsafe { data_directory(base, 1) };
-    if imports_rva == 0 {
-        return 0;
+    if imports_rva != 0 {
+        let mut descriptor = base + imports_rva as u64;
+        let mut descriptor_count = 0usize;
+        loop {
+            let name_rva = unsafe { rd32(descriptor, 12) };
+            let first_thunk = unsafe { rd32(descriptor, 16) };
+            if name_rva == 0 || first_thunk == 0 {
+                break;
+            }
+            let mut name = [0u8; 32];
+            let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+            let dependency = unsafe { (&*table).find(&name[..length]) };
+            if dependency >= 0x1_0000
+                && !dependencies[..dependency_count].contains(&dependency)
+            {
+                if dependency_count == MODULE_TABLE_CAP {
+                    return 0xC000_0017;
+                }
+                dependencies[dependency_count] = dependency;
+                dependency_count += 1;
+            }
+            descriptor += 20;
+            descriptor_count += 1;
+            if descriptor_count >= MODULE_TABLE_CAP {
+                return 0xC000_007B;
+            }
+        }
     }
-    let mut descriptor = base + imports_rva as u64;
-    let mut descriptor_count = 0usize;
-    loop {
-        let name_rva = unsafe { rd32(descriptor, 12) };
-        let first_thunk = unsafe { rd32(descriptor, 16) };
-        if name_rva == 0 || first_thunk == 0 {
-            break;
-        }
-        let mut name = [0u8; 32];
-        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-        let dependency = unsafe { (&*table).find(&name[..length]) };
-        if dependency >= 0x1_0000 {
-            if !ledger.record(dependency) {
-                return 0xC000_0017;
+    let (delay_rva, _) = unsafe { data_directory(base, 13) };
+    if delay_rva != 0 {
+        let mut descriptor = base + delay_rva as u64;
+        let mut descriptor_count = 0usize;
+        loop {
+            let name_rva = unsafe { rd32(descriptor, 4) };
+            let iat_rva = unsafe { rd32(descriptor, 12) };
+            let int_rva = unsafe { rd32(descriptor, 16) };
+            if name_rva == 0 && iat_rva == 0 {
+                break;
             }
-            let status = unsafe {
-                collect_reference_releases(table, dependency, ledger, visited, visited_count)
-            };
-            if status != 0 {
-                return status;
+            if int_rva != 0 && iat_rva != 0 {
+                let mut name = [0u8; 32];
+                let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+                let dependency = unsafe { (&*table).find(&name[..length]) };
+                if dependency >= 0x1_0000
+                    && !dependencies[..dependency_count].contains(&dependency)
+                {
+                    if dependency_count == MODULE_TABLE_CAP {
+                        return 0xC000_0017;
+                    }
+                    dependencies[dependency_count] = dependency;
+                    dependency_count += 1;
+                }
+            }
+            descriptor += 32;
+            descriptor_count += 1;
+            if descriptor_count >= MODULE_TABLE_CAP {
+                return 0xC000_007B;
             }
         }
-        descriptor += 20;
-        descriptor_count += 1;
-        if descriptor_count >= MODULE_TABLE_CAP {
-            return 0xC000_007B;
+    }
+    let mut index = 0usize;
+    while index < dependency_count {
+        let dependency = dependencies[index];
+        if !ledger.record(dependency) {
+            return 0xC000_0017;
         }
+        let status =
+            unsafe { collect_reference_releases(table, dependency, ledger, visited, visited_count) };
+        if status != 0 {
+            return status;
+        }
+        index += 1;
     }
     0
 }
@@ -3938,31 +4274,62 @@ unsafe fn collect_reference_modules_dfs(
     *visited_count += 1;
 
     let (imports_rva, _) = unsafe { data_directory(base, 1) };
-    if imports_rva == 0 {
-        return 0;
-    }
-    let mut descriptor = base + imports_rva as u64;
-    let mut descriptor_count = 0usize;
-    loop {
-        let name_rva = unsafe { rd32(descriptor, 12) };
-        let first_thunk = unsafe { rd32(descriptor, 16) };
-        if name_rva == 0 || first_thunk == 0 {
-            break;
-        }
-        let mut name = [0u8; 32];
-        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-        let dependency = unsafe { (&*table).find(&name[..length]) };
-        if dependency >= 0x1_0000 {
-            let status =
-                unsafe { collect_reference_modules_dfs(table, dependency, visited, visited_count) };
-            if status != 0 {
-                return status;
+    if imports_rva != 0 {
+        let mut descriptor = base + imports_rva as u64;
+        let mut descriptor_count = 0usize;
+        loop {
+            let name_rva = unsafe { rd32(descriptor, 12) };
+            let first_thunk = unsafe { rd32(descriptor, 16) };
+            if name_rva == 0 || first_thunk == 0 {
+                break;
+            }
+            let mut name = [0u8; 32];
+            let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+            let dependency = unsafe { (&*table).find(&name[..length]) };
+            if dependency >= 0x1_0000 {
+                let status = unsafe {
+                    collect_reference_modules_dfs(table, dependency, visited, visited_count)
+                };
+                if status != 0 {
+                    return status;
+                }
+            }
+            descriptor += 20;
+            descriptor_count += 1;
+            if descriptor_count >= MODULE_TABLE_CAP {
+                return 0xC000_007B; // STATUS_INVALID_IMAGE_FORMAT
             }
         }
-        descriptor += 20;
-        descriptor_count += 1;
-        if descriptor_count >= MODULE_TABLE_CAP {
-            return 0xC000_007B; // STATUS_INVALID_IMAGE_FORMAT
+    }
+    let (delay_rva, _) = unsafe { data_directory(base, 13) };
+    if delay_rva != 0 {
+        let mut descriptor = base + delay_rva as u64;
+        let mut descriptor_count = 0usize;
+        loop {
+            let name_rva = unsafe { rd32(descriptor, 4) };
+            let iat_rva = unsafe { rd32(descriptor, 12) };
+            let int_rva = unsafe { rd32(descriptor, 16) };
+            if name_rva == 0 && iat_rva == 0 {
+                break;
+            }
+            if int_rva != 0 && iat_rva != 0 {
+                let mut name = [0u8; 32];
+                let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+                let dependency = unsafe { (&*table).find(&name[..length]) };
+                if dependency >= 0x1_0000 {
+                    let status = unsafe {
+                        collect_reference_modules_dfs(table, dependency, visited, visited_count)
+                    };
+                    if status != 0 {
+                        return status;
+                    }
+                }
+            }
+            descriptor += 32;
+            descriptor_count += 1;
+            if descriptor_count >= MODULE_TABLE_CAP {
+                return 0xC000_007B;
+            }
         }
     }
     0
