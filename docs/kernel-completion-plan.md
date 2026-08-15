@@ -39,9 +39,9 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-local-event-queue-20260815.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3/A4 win32k local event signal queue
-cleanup. This
+`.tmp/run-desktop-dbgk-worker-lane-20260815.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the Dbgk remote-breakin target VSpace was brought
+onto the same high worker target-lane contract as normal hosted SEC_IMAGE processes. This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -50,10 +50,10 @@ shell path is fully live: `WlxActivateUserShell` reads the real `Userinit` regis
 `userinit.exe` and `explorer.exe` spawn through ordinary section/process creation, Explorer opens
 shell COM classes, redirects real api0 callbacks, installs client WndProcs, flushes GDI user batches,
 and `exec_explorer_shell_chrome_painted` reports the full 1024x768 framebuffer as non-background with
-at least 32 distinct non-background colors. The same run continues into later service/autostart
-activity and exposes the next non-gated runtime frontier: a dynamic `rundll32.exe` instance
-(`pi=17`, badge 39) takes an instruction-fetch VM fault at `0x8028b640` after its win32k process
-callout and is reclaimed before the final summary. The preceding headless proof remains
+at least 32 distinct non-background colors. The Dbgk remote-breakin selftest now reports
+`bits=0x7f`, `remote-created=1`, `remote-spawned=1`, and marker `0x12`, so
+`exec_dbgk_remote_breakin_thread_runs` and `exec_dbgk_remote_breakin_reports_breakpoint` are green
+with the desktop. The preceding headless proof remains
 `.tmp/run-headless-current-20260815-082827.log`, and the prior visible Dbgk proof remains
 `.tmp/run-desktop-hw-breakpoints-20260814.log` plus serial mirror
 `.tmp/run-desktop-20260814-125406.log`, which closes the Dbgk hardware-breakpoint context proof:
@@ -123,14 +123,16 @@ reclaim unmaps a hosted process. Serialized proof
 continues, `SvcctrlStartEvent_A3752DX` wakes winlogon, and the desktop returns to genuine shell
 chrome: `exec_winlogon_user_shell_activated`, `exec_userinit_process_spawned`,
 `exec_gdi_user_batch_flushed`, and `exec_explorer_shell_chrome_painted` all pass, with Explorer
-reporting `786432/786432` non-background pixels and at least 32 distinct non-background colors. The
-run exits through the microtest sentinel at `294/296`; the remaining red gates are the Dbgk remote
-break-in pair (`exec_dbgk_remote_breakin_thread_runs` and
-`exec_dbgk_remote_breakin_reports_breakpoint`) rather than the desktop boot/frontier path. Review
-adjustment: the legacy `USER_ALLOC_BASE` bump allocator still starts at the hosted main-stack
-reservation base for older non-SEC_IMAGE user-thread tests; after the desktop blocker is cleared,
-move that allocator into a separate reserved lane or replace it with the hosted VAD allocator so
-future stack growth cannot collide with ad hoc user allocations.
+reporting `786432/786432` non-background pixels and at least 32 distinct non-background colors. That
+proof stopped at `294/296` because the Dbgk remote-breakin throwaway target VSpace did not map the
+high worker target-lane page tables after generic worker slot0 moved out of the hosted main-stack
+reservation. The retained Dbgk fix shares `map_tp_worker_target_lane_pts` with the throwaway target
+setup, and serialized proof `.tmp/run-desktop-dbgk-worker-lane-20260815.log` confirms the same
+desktop shell-chrome path now reaches `296/296` with remote break-in thread execution and breakpoint
+reporting green. Review adjustment: the legacy `USER_ALLOC_BASE` bump allocator still starts at the
+hosted main-stack reservation base for older non-SEC_IMAGE user-thread tests; move that allocator
+into a separate reserved lane or replace it with the hosted VAD allocator so future stack growth
+cannot collide with ad hoc user allocations.
 
 Completed hosted IOCTL transfer-method slice (2026-08-14): the executive no longer rejects
 `NtDeviceIoControlFile` requests solely because the CTL_CODE method is not `METHOD_BUFFERED` when the

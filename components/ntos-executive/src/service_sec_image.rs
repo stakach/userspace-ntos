@@ -18081,6 +18081,7 @@ pub(crate) unsafe fn service_sec_image(
             let target_pml4 = make!(OBJ_X86_PML4, PAGING_BITS);
             map_image_skeleton(target_pml4, 1);
             map_hosted_client_env_pt(target_pml4);
+            map_tp_worker_target_lane_pts(target_pml4);
             // The target's PEB page: mapped in ITS VSpace first, then windowed into the executive
             // (a frame capability carries its own mapping — map the original before any copy), and
             // registered with that window as its permanent alias, exactly as `spawn_sec_image`

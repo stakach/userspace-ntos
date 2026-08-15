@@ -12174,7 +12174,7 @@ pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
 }
 
-unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
+pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
     let mut base = TP_WORKER_SLOT0_REGION_BASE & !0x1f_ffff;
     let end =
         (tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + TP_WORKER_EXEC_STRIDE + 0x1f_ffff)
