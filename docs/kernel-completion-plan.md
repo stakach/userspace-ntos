@@ -1637,7 +1637,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    `NtSetInformationProcess(ProcessAccessToken)`, `NtDuplicateToken`, `NtCreateToken`,
    `NtOpenThreadToken`, `NtSetInformationThread`'s token/name/TLS lengths,
    `NtAdjustPrivilegesToken`, `NtQueryInformationToken`, object security query/set services, locale
-   setters, registry initialization mode, and power-state flags.
+   setters, registry initialization mode, and power-state flags. The VM/object/PnP follow-on makes
+   object query/set information classes and lengths, virtual allocation/protection/free flags,
+   virtual-memory query information class, and PnP event/control classes and buffer lengths explicit
+   at the same boundary.
 
 ## Review Log
 

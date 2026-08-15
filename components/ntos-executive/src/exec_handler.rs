@@ -13238,9 +13238,9 @@ impl ExecNtHandler {
         const OBJECT_HANDLE_FLAG_INFORMATION_SIZE: usize = 2;
 
         let handle = args.first().copied().unwrap_or(0);
-        let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
+        let class = nt_ulong_arg(args.get(1).copied().unwrap_or(u64::MAX));
         let information = args.get(2).copied().unwrap_or(0);
-        let length = args.get(3).copied().unwrap_or(0) as u32 as usize;
+        let length = nt_ulong_arg(args.get(3).copied().unwrap_or(0)) as usize;
         let return_length = args.get(4).copied().unwrap_or(0);
 
         if return_length != 0 && !self.user_memory_probe_output(memory, return_length, 4) {
@@ -13442,9 +13442,9 @@ impl ExecNtHandler {
         const OBJECT_HANDLE_FLAG_INFORMATION_SIZE: usize = 2;
 
         let handle = args.first().copied().unwrap_or(0);
-        let class = args.get(1).copied().unwrap_or(u64::MAX) as u32;
+        let class = nt_ulong_arg(args.get(1).copied().unwrap_or(u64::MAX));
         let information = args.get(2).copied().unwrap_or(0);
-        let length = args.get(3).copied().unwrap_or(0) as u32 as usize;
+        let length = nt_ulong_arg(args.get(3).copied().unwrap_or(0)) as usize;
 
         match class {
             OBJECT_HANDLE_FLAG_INFORMATION => {
@@ -13496,8 +13496,8 @@ impl ExecNtHandler {
         let base_ptr = args[1];
         let size_ptr = args[3];
         let zero_bits = args[2];
-        let allocation_type = args[4] as u32;
-        let protection = args[5] as u32;
+        let allocation_type = nt_ulong_arg(args[4]);
+        let protection = nt_ulong_arg(args[5]);
         if let Err(status) =
             nt_address_space::validate_allocate_parameters(zero_bits, allocation_type, protection)
         {
@@ -13682,7 +13682,7 @@ impl ExecNtHandler {
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
         let base_ptr = args[1];
         let size_ptr = args[2];
-        let new_protection = args[3] as u32;
+        let new_protection = nt_ulong_arg(args[3]);
         let oldprot_ptr = args[4];
         if let Err(status) = nt_address_space::validate_protect_parameters(new_protection) {
             return status;
@@ -13993,7 +13993,7 @@ impl ExecNtHandler {
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
         let process_handle = args.first().copied().unwrap_or(0);
         let base = args.get(1).copied().unwrap_or(0);
-        let info_class = args.get(2).copied().unwrap_or(u64::MAX) as u32;
+        let info_class = nt_ulong_arg(args.get(2).copied().unwrap_or(u64::MAX));
         let buffer = args.get(3).copied().unwrap_or(0);
         let length = args.get(4).copied().unwrap_or(0);
         let return_length = args.get(5).copied().unwrap_or(0);
@@ -14236,7 +14236,7 @@ impl ExecNtHandler {
         const PROCESS_VM_OPERATION: u32 = 0x0008;
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
 
-        let free_type = args[3] as u32;
+        let free_type = nt_ulong_arg(args[3]);
         if free_type != nt_address_space::MEM_RELEASE && free_type != nt_address_space::MEM_DECOMMIT
         {
             return nt_address_space::STATUS_INVALID_PARAMETER_4;
@@ -14442,7 +14442,7 @@ impl ExecNtHandler {
         let reserved1 = args.first().copied().unwrap_or(0);
         let reserved2 = args.get(1).copied().unwrap_or(0);
         let buffer = args.get(2).copied().unwrap_or(0);
-        let buffer_size = args.get(3).copied().unwrap_or(0) as u32 as usize;
+        let buffer_size = nt_ulong_arg(args.get(3).copied().unwrap_or(0)) as usize;
         if reserved1 != 0 || reserved2 != 0 {
             return STATUS_INVALID_PARAMETER;
         }
@@ -14481,9 +14481,9 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_plug_play_control(&mut self, args: &[u64]) -> u32 {
-        let control_class = args.first().copied().unwrap_or(0) as u32;
+        let control_class = nt_ulong_arg(args.first().copied().unwrap_or(0));
         let buffer = args.get(1).copied().unwrap_or(0);
-        let buffer_len = args.get(2).copied().unwrap_or(0) as u32 as usize;
+        let buffer_len = nt_ulong_arg(args.get(2).copied().unwrap_or(0)) as usize;
         if !self.current_token_has_privilege(nt_security::SE_TCB) {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
