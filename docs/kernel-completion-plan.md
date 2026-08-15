@@ -5888,6 +5888,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
 
+  A4 NPFS endpoint-id cleanup (2026-08-16): the ReactOS NPFS `FILE_OBJECT.FsContext` endpoint
+  encoding is now an explicit `nt-io-manager` contract instead of open-coded syscall arithmetic.
+  `pipe_endpoint_primary_context`, `pipe_endpoint_end`, `pipe_endpoint_file_id`, and
+  `pipe_server_file_id_for_endpoint` model the `Ccb | FILE_PIPE_*_END` rule host-side, reject
+  invalid sentinel ids, and are covered by a focused regression. `NtOpenFile` and `NtCreateFile`
+  now use that helper before publishing a pipe client handle, then consume/redrive the exact
+  server-end listen for the accepted CCB. Remaining A4 data-plane work is live RPC/NPFS association
+  behavior and LSA self-RPC diagnostics; the client/server endpoint pairing rule is closed.
+  Validation: `cargo fmt --all`, `cargo test -p nt-io-manager pipe -- --nocapture`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
+
   Native file-position FILE_OBJECT cleanup (2026-08-14): read-only FAT file handles now own a real
   shared FILE_OBJECT record rather than just a backing extent. The record carries the current byte
   offset, is retained across `NtDuplicateObject`, released on close/teardown, and is used by

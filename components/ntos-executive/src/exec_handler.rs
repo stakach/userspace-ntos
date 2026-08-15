@@ -19448,22 +19448,33 @@ impl ExecNtHandler {
                     Ok((st, fid)) => {
                         let mut status = st as u32;
                         let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
+                        let mut redrive_server_fid = 0;
                         let opened_handle = if status == 0 && fid != 0 {
                             let synchronous = open_options
                                 & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                     | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                 != 0;
-                            if let Err(name_status) = crate::pipe_fid_name_remember(fid, pipe_hash)
+                            if let Some(server_fid) =
+                                nt_io_manager::pipe_server_file_id_for_endpoint(fid)
                             {
-                                status = name_status;
-                                None
-                            } else {
-                                let handle = self.mint_file_handle(fid, desired_access, synchronous);
-                                if handle.is_none() {
-                                    crate::pipe_fid_name_forget(fid);
-                                    status = 0xC000_009A;
+                                redrive_server_fid = server_fid;
+                                if let Err(name_status) =
+                                    crate::pipe_fid_name_remember(fid, pipe_hash)
+                                {
+                                    status = name_status;
+                                    None
+                                } else {
+                                    let handle =
+                                        self.mint_file_handle(fid, desired_access, synchronous);
+                                    if handle.is_none() {
+                                        crate::pipe_fid_name_forget(fid);
+                                        status = 0xC000_009A;
+                                    }
+                                    handle
                                 }
-                                handle
+                            } else {
+                                status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                                None
                             }
                         } else {
                             if status == 0 {
@@ -19474,9 +19485,8 @@ impl ExecNtHandler {
                         if let Some(handle) = opened_handle {
                             self.queue_write(file_handle_out, handle);
                             if status == 0 {
-                                let server_fid = (fid & !1) | 1;
-                                crate::pipe_server_available_consume(server_fid);
-                                self.pipe_connect_redrive_server_fid = server_fid;
+                                crate::pipe_server_available_consume(redrive_server_fid);
+                                self.pipe_connect_redrive_server_fid = redrive_server_fid;
                             }
                         } else {
                             self.write_nt_open_file_handle_out(file_handle_out, 0);
@@ -27227,23 +27237,28 @@ impl ExecNtHandler {
                                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                             | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                         != 0;
-                                    if let Err(name_status) =
-                                        crate::pipe_fid_name_remember(file_id, pipe_hash)
+                                    // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
+                                    // Complete the exact server-end listen IRP for the same CCB.
+                                    if let Some(server_fid) =
+                                        nt_io_manager::pipe_server_file_id_for_endpoint(file_id)
                                     {
-                                        status = name_status;
-                                    } else if let Some(handle) =
-                                        self.mint_file_handle(file_id, desired_access, synchronous)
-                                    {
-                                        self.queue_write(file_handle_out, handle);
-                                        info = nt_fs::FILE_OPENED as u64;
-                                        // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
-                                        // Complete the exact server-end listen IRP for the same CCB.
-                                        let server_fid = (file_id & !1) | 1;
-                                        crate::pipe_server_available_consume(server_fid);
-                                        self.pipe_connect_redrive_server_fid = server_fid;
+                                        if let Err(name_status) =
+                                            crate::pipe_fid_name_remember(file_id, pipe_hash)
+                                        {
+                                            status = name_status;
+                                        } else if let Some(handle) =
+                                            self.mint_file_handle(file_id, desired_access, synchronous)
+                                        {
+                                            self.queue_write(file_handle_out, handle);
+                                            info = nt_fs::FILE_OPENED as u64;
+                                            crate::pipe_server_available_consume(server_fid);
+                                            self.pipe_connect_redrive_server_fid = server_fid;
+                                        } else {
+                                            crate::pipe_fid_name_forget(file_id);
+                                            status = 0xC000_009A;
+                                        }
                                     } else {
-                                        crate::pipe_fid_name_forget(file_id);
-                                        status = 0xC000_009A;
+                                        status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
                                     }
                                 } else if status == nt_fs::STATUS_SUCCESS {
                                     status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;

@@ -116,6 +116,43 @@ impl PipeEnd {
     }
 }
 
+/// Decode the primary CCB pointer portion of a ReactOS NPFS endpoint `FILE_OBJECT.FsContext`.
+///
+/// ReactOS `NpSetFileObject` stores `Ccb | FILE_PIPE_SERVER_END` for server endpoints and plain
+/// `Ccb | FILE_PIPE_CLIENT_END` for client endpoints. `0` and `1` are not pipe CCB endpoints.
+pub fn pipe_endpoint_primary_context(file_id: u64) -> Option<u64> {
+    let primary = file_id & !1;
+    if primary == 0 {
+        None
+    } else {
+        Some(primary)
+    }
+}
+
+/// Decode the named-pipe end bit from a ReactOS NPFS endpoint `FILE_OBJECT.FsContext`.
+pub fn pipe_endpoint_end(file_id: u64) -> Option<PipeEnd> {
+    pipe_endpoint_primary_context(file_id)?;
+    if (file_id & 1) == FILE_PIPE_SERVER_END as u64 {
+        Some(PipeEnd::Server)
+    } else {
+        Some(PipeEnd::Client)
+    }
+}
+
+/// Encode a ReactOS NPFS endpoint `FILE_OBJECT.FsContext` for a CCB primary pointer and end.
+pub fn pipe_endpoint_file_id(primary_context: u64, end: PipeEnd) -> Option<u64> {
+    if primary_context == 0 || (primary_context & 1) != 0 {
+        None
+    } else {
+        Some(primary_context | end.to_raw() as u64)
+    }
+}
+
+/// Return the server endpoint id for the same NPFS CCB as `file_id`.
+pub fn pipe_server_file_id_for_endpoint(file_id: u64) -> Option<u64> {
+    pipe_endpoint_file_id(pipe_endpoint_primary_context(file_id)?, PipeEnd::Server)
+}
+
 /// One directional data queue (`NP_DATA_QUEUE`). We model it as a byte ring plus
 /// per-message boundaries: byte-mode reads ignore the boundaries and drain bytes;
 /// message-mode reads return exactly one queued message at a time.
@@ -2585,6 +2622,35 @@ mod tests {
         t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
         assert!(!t2.armed_name(0));
         assert_eq!(t2.len(), 1);
+    }
+
+    #[test]
+    fn reactos_npfs_endpoint_file_ids_decode_and_pair() {
+        let ccb = 0x1000_4000;
+        let client_fid = pipe_endpoint_file_id(ccb, PipeEnd::Client).unwrap();
+        let server_fid = pipe_endpoint_file_id(ccb, PipeEnd::Server).unwrap();
+
+        assert_eq!(client_fid, ccb | FILE_PIPE_CLIENT_END as u64);
+        assert_eq!(server_fid, ccb | FILE_PIPE_SERVER_END as u64);
+        assert_eq!(pipe_endpoint_primary_context(client_fid), Some(ccb));
+        assert_eq!(pipe_endpoint_primary_context(server_fid), Some(ccb));
+        assert_eq!(pipe_endpoint_end(client_fid), Some(PipeEnd::Client));
+        assert_eq!(pipe_endpoint_end(server_fid), Some(PipeEnd::Server));
+        assert_eq!(
+            pipe_server_file_id_for_endpoint(client_fid),
+            Some(server_fid)
+        );
+        assert_eq!(
+            pipe_server_file_id_for_endpoint(server_fid),
+            Some(server_fid)
+        );
+
+        assert_eq!(pipe_endpoint_primary_context(0), None);
+        assert_eq!(pipe_endpoint_primary_context(1), None);
+        assert_eq!(pipe_endpoint_end(0), None);
+        assert_eq!(pipe_server_file_id_for_endpoint(1), None);
+        assert_eq!(pipe_endpoint_file_id(0, PipeEnd::Client), None);
+        assert_eq!(pipe_endpoint_file_id(1, PipeEnd::Server), None);
     }
 
     #[test]

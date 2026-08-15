@@ -18433,10 +18433,10 @@ struct ExecNtHandler {
     pipe_name_wait_deadline_100ns: u64,
     pipe_name_wait_redrive: u64,
     /// BATCH 34 — set to the connected pipe's SERVER-end fid by a client pipe CONNECT
-    /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe). ReactOS NPFS encodes the named-pipe end in
-    /// `FILE_OBJECT.FsContext` bit 0, so a successful client open exposes the exact server CCB as
-    /// `(client_fid & !1) | FILE_PIPE_SERVER_END`. The loop completes that one pending
-    /// `FSCTL_PIPE_LISTEN` IRP, not merely the first listen with the same pipe name.
+    /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe). The endpoint relation is decoded through
+    /// `nt_io_manager::pipe_server_file_id_for_endpoint`, keeping the ReactOS NPFS `FsContext`
+    /// encoding out of syscall code. The loop completes that one pending `FSCTL_PIPE_LISTEN` IRP,
+    /// not merely the first listen with the same pipe name.
     pipe_connect_redrive_server_fid: u64,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
