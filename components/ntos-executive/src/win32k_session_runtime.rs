@@ -1,7 +1,6 @@
+use alloc::vec::Vec;
+
 const WIN32K_STOCK_OBJECT_COUNT: u32 = 22;
-const SESSION_CURSOR_RECORD_CAP: usize = 64;
-const SESSION_BUILTIN_CLASS_RECORD_CAP: usize = 32;
-const SESSION_ATOM_NAME_RECORD_CAP: usize = 128;
 
 #[derive(Clone, Copy)]
 struct SessionCursorRecord {
@@ -26,23 +25,19 @@ struct SessionAtomNameRecord {
 struct Win32kSessionRuntimeState {
     stock_object_observed_mask: u32,
     stock_objects_observed: u64,
-    cursor_records: [Option<SessionCursorRecord>; SESSION_CURSOR_RECORD_CAP],
-    cursor_record_next: usize,
-    promoted_cursor_handles: [u32; SESSION_CURSOR_RECORD_CAP],
-    promoted_cursor_handle_next: usize,
+    cursor_records: Vec<SessionCursorRecord>,
+    promoted_cursor_handles: Vec<u32>,
     cursor_identities_observed: u64,
     cursor_promotions: u64,
     userinit_cursor_hits: u64,
     userinit_cursor_handle: u64,
-    builtin_class_records: [Option<SessionBuiltinClassRecord>; SESSION_BUILTIN_CLASS_RECORD_CAP],
-    builtin_class_record_next: usize,
+    builtin_class_records: Vec<SessionBuiltinClassRecord>,
     builtin_classes_observed: u64,
     userinit_builtin_class_hits: u64,
     userinit_builtin_class_misses: u64,
     userinit_builtin_class_mask: u64,
     userinit_dialog_class_atom: u64,
-    class_atom_name_records: [Option<SessionAtomNameRecord>; SESSION_ATOM_NAME_RECORD_CAP],
-    class_atom_name_record_next: usize,
+    class_atom_name_records: Vec<SessionAtomNameRecord>,
     class_atom_names_observed: u64,
     class_atom_name_serves: u64,
     class_atom_name_failures: u64,
@@ -56,27 +51,23 @@ struct Win32kSessionRuntimeState {
 }
 
 impl Win32kSessionRuntimeState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             stock_object_observed_mask: 0,
             stock_objects_observed: 0,
-            cursor_records: [None; SESSION_CURSOR_RECORD_CAP],
-            cursor_record_next: 0,
-            promoted_cursor_handles: [0; SESSION_CURSOR_RECORD_CAP],
-            promoted_cursor_handle_next: 0,
+            cursor_records: Vec::new(),
+            promoted_cursor_handles: Vec::new(),
             cursor_identities_observed: 0,
             cursor_promotions: 0,
             userinit_cursor_hits: 0,
             userinit_cursor_handle: 0,
-            builtin_class_records: [None; SESSION_BUILTIN_CLASS_RECORD_CAP],
-            builtin_class_record_next: 0,
+            builtin_class_records: Vec::new(),
             builtin_classes_observed: 0,
             userinit_builtin_class_hits: 0,
             userinit_builtin_class_misses: 0,
             userinit_builtin_class_mask: 0,
             userinit_dialog_class_atom: 0,
-            class_atom_name_records: [None; SESSION_ATOM_NAME_RECORD_CAP],
-            class_atom_name_record_next: 0,
+            class_atom_name_records: Vec::new(),
             class_atom_names_observed: 0,
             class_atom_name_serves: 0,
             class_atom_name_failures: 0,
@@ -94,23 +85,19 @@ impl Win32kSessionRuntimeState {
     fn clear(&mut self) {
         self.stock_object_observed_mask = 0;
         self.stock_objects_observed = 0;
-        self.cursor_records = [None; SESSION_CURSOR_RECORD_CAP];
-        self.cursor_record_next = 0;
-        self.promoted_cursor_handles = [0; SESSION_CURSOR_RECORD_CAP];
-        self.promoted_cursor_handle_next = 0;
+        self.cursor_records.clear();
+        self.promoted_cursor_handles.clear();
         self.cursor_identities_observed = 0;
         self.cursor_promotions = 0;
         self.userinit_cursor_hits = 0;
         self.userinit_cursor_handle = 0;
-        self.builtin_class_records = [None; SESSION_BUILTIN_CLASS_RECORD_CAP];
-        self.builtin_class_record_next = 0;
+        self.builtin_class_records.clear();
         self.builtin_classes_observed = 0;
         self.userinit_builtin_class_hits = 0;
         self.userinit_builtin_class_misses = 0;
         self.userinit_builtin_class_mask = 0;
         self.userinit_dialog_class_atom = 0;
-        self.class_atom_name_records = [None; SESSION_ATOM_NAME_RECORD_CAP];
-        self.class_atom_name_record_next = 0;
+        self.class_atom_name_records.clear();
         self.class_atom_names_observed = 0;
         self.class_atom_name_serves = 0;
         self.class_atom_name_failures = 0;
@@ -146,7 +133,7 @@ impl Win32kSessionRuntimeState {
         }
         self.cursor_identities_observed = self.cursor_identities_observed.saturating_add(1);
         let promoted = self.promoted_cursor_handles.contains(&handle);
-        for record in self.cursor_records.iter_mut().flatten() {
+        for record in self.cursor_records.iter_mut() {
             if record.key.same_identity(key) {
                 if !record.promoted || record.handle == handle {
                     record.handle = handle;
@@ -155,16 +142,10 @@ impl Win32kSessionRuntimeState {
                 return;
             }
         }
-        let slot = self
-            .cursor_records
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                let slot = self.cursor_record_next % SESSION_CURSOR_RECORD_CAP;
-                self.cursor_record_next = self.cursor_record_next.wrapping_add(1);
-                slot
-            });
-        self.cursor_records[slot] = Some(SessionCursorRecord {
+        if self.cursor_records.try_reserve_exact(1).is_err() {
+            return;
+        }
+        self.cursor_records.push(SessionCursorRecord {
             key: *key,
             handle,
             promoted,
@@ -177,23 +158,22 @@ impl Win32kSessionRuntimeState {
         }
         self.cursor_promotions = self.cursor_promotions.saturating_add(1);
         let mut found = false;
-        for record in self.cursor_records.iter_mut().flatten() {
+        for record in self.cursor_records.iter_mut() {
             if record.handle == handle {
                 record.promoted = true;
                 found = true;
             }
         }
         if !found && !self.promoted_cursor_handles.contains(&handle) {
-            let slot = self.promoted_cursor_handle_next % SESSION_CURSOR_RECORD_CAP;
-            self.promoted_cursor_handles[slot] = handle;
-            self.promoted_cursor_handle_next = self.promoted_cursor_handle_next.wrapping_add(1);
+            if self.promoted_cursor_handles.try_reserve_exact(1).is_ok() {
+                self.promoted_cursor_handles.push(handle);
+            }
         }
     }
 
     fn lookup_cursor(&self, key: &nt_kernel_exec::user_cursor::CursorLookupKey) -> Option<u32> {
         self.cursor_records
             .iter()
-            .flatten()
             .find(|record| record.promoted && record.handle != 0 && record.key.same_identity(key))
             .map(|record| record.handle)
     }
@@ -212,23 +192,16 @@ impl Win32kSessionRuntimeState {
             return;
         }
         self.builtin_classes_observed = self.builtin_classes_observed.saturating_add(1);
-        for record in self.builtin_class_records.iter_mut().flatten() {
+        for record in self.builtin_class_records.iter_mut() {
             if record.key.same_identity(key) {
                 record.atom = atom;
                 return;
             }
         }
-        let slot = self
-            .builtin_class_records
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                let slot = self.builtin_class_record_next % SESSION_BUILTIN_CLASS_RECORD_CAP;
-                self.builtin_class_record_next =
-                    self.builtin_class_record_next.wrapping_add(1);
-                slot
-        });
-        self.builtin_class_records[slot] = Some(SessionBuiltinClassRecord { key: *key, atom });
+        if self.builtin_class_records.try_reserve_exact(1).is_ok() {
+            self.builtin_class_records
+                .push(SessionBuiltinClassRecord { key: *key, atom });
+        }
     }
 
     fn lookup_builtin_class(
@@ -237,7 +210,6 @@ impl Win32kSessionRuntimeState {
     ) -> Option<u16> {
         self.builtin_class_records
             .iter()
-            .flatten()
             .find(|record| record.atom != 0 && record.key.same_identity(key))
             .map(|record| record.atom)
     }
@@ -268,23 +240,16 @@ impl Win32kSessionRuntimeState {
                 units: [0; nt_kernel_exec::user_class::CLASS_ATOM_NAME_CAP],
             };
             stored.units[..units.len()].copy_from_slice(units);
-            for record in self.class_atom_name_records.iter_mut().flatten() {
+            for record in self.class_atom_name_records.iter_mut() {
                 if record.atom == atom {
                     *record = stored;
                     return true;
                 }
             }
-            let slot = self
-                .class_atom_name_records
-                .iter()
-                .position(Option::is_none)
-                .unwrap_or_else(|| {
-                    let slot = self.class_atom_name_record_next % SESSION_ATOM_NAME_RECORD_CAP;
-                    self.class_atom_name_record_next =
-                        self.class_atom_name_record_next.wrapping_add(1);
-                    slot
-                });
-            self.class_atom_name_records[slot] = Some(stored);
+            if self.class_atom_name_records.try_reserve_exact(1).is_err() {
+                return false;
+            }
+            self.class_atom_name_records.push(stored);
         }
         observed
     }
@@ -300,7 +265,6 @@ impl Win32kSessionRuntimeState {
         if let Some(record) = self
             .class_atom_name_records
             .iter()
-            .flatten()
             .find(|record| record.atom == atom)
         {
             let len = record.len as usize;
@@ -346,8 +310,19 @@ impl Win32kSessionRuntimeState {
     }
 }
 
-static mut WIN32K_SESSION_RUNTIME_WORK: Win32kSessionRuntimeState =
-    Win32kSessionRuntimeState::new();
+static mut WIN32K_SESSION_RUNTIME_WORK: Option<Win32kSessionRuntimeState> = None;
+
+unsafe fn win32k_session_runtime_mut() -> &'static mut Win32kSessionRuntimeState {
+    let slot = &mut *core::ptr::addr_of_mut!(WIN32K_SESSION_RUNTIME_WORK);
+    if slot.is_none() {
+        *slot = Some(Win32kSessionRuntimeState::new());
+    }
+    slot.as_mut().unwrap_unchecked()
+}
+
+unsafe fn win32k_session_runtime_ref() -> Option<&'static Win32kSessionRuntimeState> {
+    (&*core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK)).as_ref()
+}
 
 pub(crate) struct Win32kSessionRuntime {
     state: *mut Win32kSessionRuntimeState,
@@ -381,9 +356,9 @@ pub(crate) struct Win32kSessionAtomScrollbarCounters {
 impl Win32kSessionRuntime {
     #[inline(never)]
     pub(crate) fn reset() -> Self {
-        let state = core::ptr::addr_of_mut!(WIN32K_SESSION_RUNTIME_WORK);
         // SAFETY: `service_sec_image` is serialized and the live handler is the sole owner.
-        unsafe { (&mut *state).clear() };
+        let state = unsafe { win32k_session_runtime_mut() };
+        state.clear();
         Self { state }
     }
 
@@ -497,43 +472,72 @@ impl Win32kSessionRuntime {
 }
 
 pub(crate) fn win32k_session_stock_counters() -> u64 {
-    let state = core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK);
     // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
-    let state = unsafe { &*state };
-    state.stock_objects_observed
+    unsafe {
+        win32k_session_runtime_ref()
+            .map(|state| state.stock_objects_observed)
+            .unwrap_or(0)
+    }
 }
 
 pub(crate) fn win32k_session_cursor_class_counters() -> Win32kSessionCursorClassCounters {
-    let state = core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK);
     // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
-    let state = unsafe { &*state };
-    Win32kSessionCursorClassCounters {
-        cursor_identities_observed: state.cursor_identities_observed,
-        cursor_promotions: state.cursor_promotions,
-        userinit_cursor_hits: state.userinit_cursor_hits,
-        userinit_cursor_handle: state.userinit_cursor_handle,
-        builtin_classes_observed: state.builtin_classes_observed,
-        userinit_builtin_class_hits: state.userinit_builtin_class_hits,
-        userinit_builtin_class_misses: state.userinit_builtin_class_misses,
-        userinit_builtin_class_mask: state.userinit_builtin_class_mask,
-        userinit_dialog_class_atom: state.userinit_dialog_class_atom,
+    unsafe {
+        let Some(state) = win32k_session_runtime_ref() else {
+            return Win32kSessionCursorClassCounters {
+                cursor_identities_observed: 0,
+                cursor_promotions: 0,
+                userinit_cursor_hits: 0,
+                userinit_cursor_handle: 0,
+                builtin_classes_observed: 0,
+                userinit_builtin_class_hits: 0,
+                userinit_builtin_class_misses: 0,
+                userinit_builtin_class_mask: 0,
+                userinit_dialog_class_atom: 0,
+            };
+        };
+        Win32kSessionCursorClassCounters {
+            cursor_identities_observed: state.cursor_identities_observed,
+            cursor_promotions: state.cursor_promotions,
+            userinit_cursor_hits: state.userinit_cursor_hits,
+            userinit_cursor_handle: state.userinit_cursor_handle,
+            builtin_classes_observed: state.builtin_classes_observed,
+            userinit_builtin_class_hits: state.userinit_builtin_class_hits,
+            userinit_builtin_class_misses: state.userinit_builtin_class_misses,
+            userinit_builtin_class_mask: state.userinit_builtin_class_mask,
+            userinit_dialog_class_atom: state.userinit_dialog_class_atom,
+        }
     }
 }
 
 pub(crate) fn win32k_session_atom_scrollbar_counters() -> Win32kSessionAtomScrollbarCounters {
-    let state = core::ptr::addr_of!(WIN32K_SESSION_RUNTIME_WORK);
     // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
-    let state = unsafe { &*state };
-    Win32kSessionAtomScrollbarCounters {
-        class_atom_names_observed: state.class_atom_names_observed,
-        class_atom_name_serves: state.class_atom_name_serves,
-        class_atom_name_failures: state.class_atom_name_failures,
-        userinit_scrollbar_queries: state.userinit_scrollbar_queries,
-        userinit_scrollbar_copyouts: state.userinit_scrollbar_copyouts,
-        userinit_scrollbar_errors: state.userinit_scrollbar_errors,
-        userinit_scrollbar_atom: state.userinit_scrollbar_atom,
-        userinit_scrollbar_style: state.userinit_scrollbar_style,
-        userinit_scrollbar_extra: state.userinit_scrollbar_extra,
-        userinit_scrollbar_proc: state.userinit_scrollbar_proc,
+    unsafe {
+        let Some(state) = win32k_session_runtime_ref() else {
+            return Win32kSessionAtomScrollbarCounters {
+                class_atom_names_observed: 0,
+                class_atom_name_serves: 0,
+                class_atom_name_failures: 0,
+                userinit_scrollbar_queries: 0,
+                userinit_scrollbar_copyouts: 0,
+                userinit_scrollbar_errors: 0,
+                userinit_scrollbar_atom: 0,
+                userinit_scrollbar_style: 0,
+                userinit_scrollbar_extra: 0,
+                userinit_scrollbar_proc: 0,
+            };
+        };
+        Win32kSessionAtomScrollbarCounters {
+            class_atom_names_observed: state.class_atom_names_observed,
+            class_atom_name_serves: state.class_atom_name_serves,
+            class_atom_name_failures: state.class_atom_name_failures,
+            userinit_scrollbar_queries: state.userinit_scrollbar_queries,
+            userinit_scrollbar_copyouts: state.userinit_scrollbar_copyouts,
+            userinit_scrollbar_errors: state.userinit_scrollbar_errors,
+            userinit_scrollbar_atom: state.userinit_scrollbar_atom,
+            userinit_scrollbar_style: state.userinit_scrollbar_style,
+            userinit_scrollbar_extra: state.userinit_scrollbar_extra,
+            userinit_scrollbar_proc: state.userinit_scrollbar_proc,
+        }
     }
 }

@@ -3387,6 +3387,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
 
+- A4/B3 win32k session runtime cache cleanup (2026-08-15). The executive-side session observations
+  used to reconnect real user32/win32k state for cursors, builtin class atoms, and registered class
+  atom names no longer live in fixed 64/32/128-entry ring buffers. `Win32kSessionRuntimeState` now
+  owns growable record vectors, updates existing entries by identity, keeps promoted cursor handles
+  without overwriting older observations, and surfaces allocation pressure by declining the cache
+  insert instead of silently evicting unrelated session state. This keeps the current shell proof
+  counters unchanged while removing another fixed GUI-client/session cap before multi-session and
+  heavier service-GUI traffic. Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
 - B3 root-bus resource profile catalog cleanup (2026-08-15). The executive PnP broker no longer
   stores broker-backed root-bus resource profiles in a one-entry static array. `nt-pnp` now owns a
   host-tested growable `RootBusResourceCatalog` with duplicate/invalid-profile rejection and
