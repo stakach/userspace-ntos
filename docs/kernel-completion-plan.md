@@ -1640,7 +1640,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    setters, registry initialization mode, and power-state flags. The VM/object/PnP follow-on makes
    object query/set information classes and lengths, virtual allocation/protection/free flags,
    virtual-memory query information class, and PnP event/control classes and buffer lengths explicit
-   at the same boundary.
+   at the same boundary. The I/O-control follow-on does the same for `NtDeviceIoControlFile` and
+   `NtFsControlFile` control codes, input/output buffer lengths, and pending pipe waiter buffer
+   metadata.
 
 ## Review Log
 

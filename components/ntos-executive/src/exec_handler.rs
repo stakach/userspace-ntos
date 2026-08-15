@@ -10305,9 +10305,9 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
 
-        let ioctl = args[5] as u32;
-        let raw_input_len = args[7] as u32 as usize;
-        let raw_output_len = args[9] as u32 as usize;
+        let ioctl = nt_ulong_arg(args[5]);
+        let raw_input_len = nt_ulong_arg(args[7]) as usize;
+        let raw_output_len = nt_ulong_arg(args[9]) as usize;
         if raw_input_len > DEVICE_CONTROL_BUFFER_CAP || raw_output_len > DEVICE_CONTROL_BUFFER_CAP
         {
             self.write_current_iosb(iosb, STATUS_INVALID_BUFFER_SIZE, 0);
@@ -21877,7 +21877,7 @@ impl ExecNtHandler {
                 // Hosted pipe clients route FSCTLs (LISTEN/WAIT/TRANSCEIVE) to npfs for tracked pipe
                 // endpoint handles. WaitNamedPipe opens the NPFS root/control file first; its
                 // FSCTL_PIPE_WAIT probes the same async-listen table that client connects consume.
-                let fsctl = args[5] as u32 as u64;
+                let fsctl = nt_ulong_arg(args[5]) as u64;
                 let mut status: u64;
                 let mut information = 0u64;
                 let completion_port_suppressed =
@@ -21892,8 +21892,8 @@ impl ExecNtHandler {
                     Err(event_status) => return event_status,
                 };
                 let is_pipe_listen = (fsctl as u32) == FSCTL_PIPE_LISTEN;
-                let raw_input_len = args[7] as u32 as usize;
-                let raw_output_len = args[9] as u32 as usize;
+                let raw_input_len = nt_ulong_arg(args[7]) as usize;
+                let raw_output_len = nt_ulong_arg(args[9]) as usize;
                 let file_route = self.npfs_file_route_for(args[0]);
                 let fid = file_route.map(|route| route.file_id).unwrap_or(0);
                 let route_device_id = file_route.map(|route| route.device_id).unwrap_or(0);
@@ -22096,7 +22096,7 @@ impl ExecNtHandler {
                         self.pipe_park_device_id = route_device_id;
                         self.pipe_park_fid = fid;
                         self.pipe_park_buffer_va = args[8];
-                        self.pipe_park_buffer_len = args[9] as u32;
+                        self.pipe_park_buffer_len = nt_ulong_arg(args[9]);
                         self.pipe_park_iosb_va = iosb;
                         self.pipe_park_apc_routine = args[2];
                         self.pipe_park_apc_context = args[3];
@@ -22112,7 +22112,7 @@ impl ExecNtHandler {
                             tid: self.current_tid,
                             badge: self.current_badge,
                             buffer_va: args[8],
-                            buffer_len: args[9] as u32,
+                            buffer_len: nt_ulong_arg(args[9]),
                             iosb_va: iosb,
                             apc_routine: args[2],
                             apc_context: args[3],
