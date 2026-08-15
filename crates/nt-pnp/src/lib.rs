@@ -510,12 +510,16 @@ impl RootBusResourceCatalog {
         Ok(())
     }
 
-    pub fn find_for_devnode(
+    pub fn find_for_devnode<H, C>(
         &self,
         instance_id: &str,
-        hardware_ids: &[&str],
-        compatible_ids: &[&str],
-    ) -> Option<RootBusResourceProfile> {
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+    ) -> Option<RootBusResourceProfile>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
         self.profiles.iter().copied().find(|profile| {
             devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
         })
@@ -534,34 +538,42 @@ fn id_matches_profile(id: &str, profile: &RootBusResourceProfile) -> bool {
 }
 
 /// Return true when a registry devnode instance path or ID list names a root-bus resource profile.
-pub fn devnode_matches_root_bus_profile(
+pub fn devnode_matches_root_bus_profile<H, C>(
     instance_id: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
+    hardware_ids: &[H],
+    compatible_ids: &[C],
     profile: &RootBusResourceProfile,
-) -> bool {
+) -> bool
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     id_matches_profile(devnode_device_id(instance_id), profile)
         || hardware_ids
             .iter()
-            .any(|id| id_matches_profile(id, profile))
+            .any(|id| id_matches_profile(id.as_ref(), profile))
         || compatible_ids
             .iter()
-            .any(|id| id_matches_profile(id, profile))
+            .any(|id| id_matches_profile(id.as_ref(), profile))
 }
 
 /// Assign resources to a root-bus devnode when its instance path or registry IDs match a known
 /// broker-backed profile. This is the root-bus counterpart to PCI BAR assignment: the returned
 /// abstract resource list still has to be minted by the executive before `START_DEVICE`.
-pub fn assign_root_bus_resources(
+pub fn assign_root_bus_resources<H, C>(
     instance_id: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
+    hardware_ids: &[H],
+    compatible_ids: &[C],
     profile: &RootBusResourceProfile,
     int_vector: u32,
     int_latched: bool,
     int_affinity: u64,
     dma_len: u64,
-) -> Option<ResourceAssignment> {
+) -> Option<ResourceAssignment>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     if !devnode_matches_root_bus_profile(instance_id, hardware_ids, compatible_ids, profile)
         || profile.mmio_phys == 0
         || profile.mmio_len == 0
@@ -954,28 +966,29 @@ mod tests {
 
     #[test]
     fn root_bus_dma_profile_matches_registry_ids() {
+        let empty: [&str; 0] = [];
         assert!(devnode_matches_root_bus_profile(
             r"ROOT\USERSPACE_NTOS_DMA\0001",
-            &[],
-            &[],
+            &empty,
+            &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
         ));
         assert!(devnode_matches_root_bus_profile(
             r"ROOT\OTHER\0001",
             &[r"ROOT\USERSPACE_NTOS_DMA"],
-            &[],
+            &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
         ));
         assert!(devnode_matches_root_bus_profile(
             r"ROOT\OTHER\0001",
-            &[],
+            &empty,
             &[r"ROOT\USERSPACE_NTOS_DMA"],
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
         ));
         let assignment = assign_root_bus_resources(
             r"ROOT\USERSPACE_NTOS_DMA\0001",
             &[r"ROOT\USERSPACE_NTOS_DMA"],
-            &[],
+            &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
             5,
             false,
@@ -995,16 +1008,17 @@ mod tests {
 
     #[test]
     fn root_bus_profile_rejects_unmatched_devnode() {
+        let empty: [&str; 0] = [];
         assert!(!devnode_matches_root_bus_profile(
             r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
             &[r"PCI\VEN_8086&DEV_100E"],
-            &[],
+            &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
         ));
         assert!(assign_root_bus_resources(
             r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
             &[r"PCI\VEN_8086&DEV_100E"],
-            &[],
+            &empty,
             &ROOT_DMA_TEST_RESOURCE_PROFILE,
             5,
             false,
@@ -1016,6 +1030,7 @@ mod tests {
 
     #[test]
     fn root_bus_catalog_selects_from_multiple_profiles() {
+        let empty: [&str; 0] = [];
         let second = RootBusResourceProfile {
             device_id: r"ROOT\USERSPACE_NTOS_SECOND",
             mmio_phys: 0x1001_0000,
@@ -1027,11 +1042,11 @@ mod tests {
 
         assert_eq!(catalog.profiles().len(), 2);
         assert_eq!(
-            catalog.find_for_devnode(r"ROOT\USERSPACE_NTOS_SECOND\0001", &[], &[]),
+            catalog.find_for_devnode(r"ROOT\USERSPACE_NTOS_SECOND\0001", &empty, &empty),
             Some(second),
         );
         assert_eq!(
-            catalog.find_for_devnode(r"ROOT\OTHER\0001", &[], &[r"ROOT\USERSPACE_NTOS_DMA"],),
+            catalog.find_for_devnode(r"ROOT\OTHER\0001", &empty, &[r"ROOT\USERSPACE_NTOS_DMA"],),
             Some(ROOT_DMA_TEST_RESOURCE_PROFILE),
         );
     }

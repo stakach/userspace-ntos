@@ -143,19 +143,23 @@ impl RootBus {
 
     /// Enumerate a child: create a PDO with the given identity + default capabilities. Returns the
     /// PDO's `object_id`.
-    pub fn create_pdo(
+    pub fn create_pdo<H, C>(
         &mut self,
         object_id: u64,
         device_id: &str,
-        hardware_ids: &[&str],
-        compatible_ids: &[&str],
+        hardware_ids: &[H],
+        compatible_ids: &[C],
         instance_id: &str,
-    ) -> u64 {
+    ) -> u64
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
         self.pdos.push(Pdo {
             object_id,
             device_id: device_id.into(),
-            hardware_ids: hardware_ids.iter().map(|s| (*s).into()).collect(),
-            compatible_ids: compatible_ids.iter().map(|s| (*s).into()).collect(),
+            hardware_ids: hardware_ids.iter().map(|s| s.as_ref().into()).collect(),
+            compatible_ids: compatible_ids.iter().map(|s| s.as_ref().into()).collect(),
             instance_id: instance_id.into(),
             capabilities: DeviceCapabilities::root_default(),
             started: false,
@@ -321,9 +325,10 @@ mod tests {
     #[test]
     fn bus_relations_lists_all_children() {
         let mut b = RootBus::new();
-        b.create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &[], "0001");
-        b.create_pdo(0x2000, r"ROOT\B", &[r"ROOT\B"], &[], "0001");
-        b.create_pdo(0x3000, r"ROOT\C", &[r"ROOT\C"], &[], "0001");
+        let empty: [&str; 0] = [];
+        b.create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, "0001");
+        b.create_pdo(0x2000, r"ROOT\B", &[r"ROOT\B"], &empty, "0001");
+        b.create_pdo(0x3000, r"ROOT\C", &[r"ROOT\C"], &empty, "0001");
         let rel = b.query_device_relations();
         assert_eq!(rel, alloc::vec![0x1000, 0x2000, 0x3000]);
         assert_eq!(b.len(), 3);

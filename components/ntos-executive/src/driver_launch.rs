@@ -11143,12 +11143,16 @@ fn register_hosted_root_pdo_binding(
     Ok(())
 }
 
-unsafe fn register_hosted_root_pdo(
+unsafe fn register_hosted_root_pdo<H, C>(
     pdo_object: u64,
     instance_path: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
-) -> Result<u64, nt_status::NtStatus> {
+    hardware_ids: &[H],
+    compatible_ids: &[C],
+) -> Result<u64, nt_status::NtStatus>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     if pdo_object == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -11170,19 +11174,24 @@ unsafe fn register_hosted_root_pdo(
     }
     let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
     let fallback_hardware = [device_id];
-    let hardware_refs = if hardware_ids.is_empty() {
-        &fallback_hardware[..]
-    } else {
-        hardware_ids
-    };
     let bus = hosted_root_bus_mut();
-    bus.create_pdo(
-        pdo_object,
-        device_id,
-        hardware_refs,
-        compatible_ids,
-        instance_id,
-    );
+    if hardware_ids.is_empty() {
+        bus.create_pdo(
+            pdo_object,
+            device_id,
+            &fallback_hardware[..],
+            compatible_ids,
+            instance_id,
+        );
+    } else {
+        bus.create_pdo(
+            pdo_object,
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+        );
+    }
     Ok(pdo_device_id.raw())
 }
 
@@ -11833,15 +11842,19 @@ unsafe fn dispatch_add_device_for_instance(
 
 /// Invoke a loaded WDM driver's real `DriverExtension->AddDevice` for one registry-selected devnode
 /// and publish the FDO it creates as an unnamed I/O Manager device owned by that driver.
-pub(crate) unsafe fn call_add_device_for_driver(
+pub(crate) unsafe fn call_add_device_for_driver<H, C>(
     driver_id: u64,
     class_guid: Option<&str>,
     driver_key: Option<&str>,
     linkage_export: Option<&str>,
     instance_path: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
-) -> Result<u64, nt_status::NtStatus> {
+    hardware_ids: &[H],
+    compatible_ids: &[C],
+) -> Result<u64, nt_status::NtStatus>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     let (index, inst) =
         instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     let registry_identity =

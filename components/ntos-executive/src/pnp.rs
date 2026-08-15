@@ -55,11 +55,15 @@ pub(crate) struct DevnodeRootResourceGrant {
     pub resource_list: Vec<u8>,
 }
 
-pub(crate) fn root_bus_resource_profile_for_devnode(
+pub(crate) fn root_bus_resource_profile_for_devnode<H, C>(
     instance_id: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
-) -> Option<RootBusResourceProfile> {
+    hardware_ids: &[H],
+    compatible_ids: &[C],
+) -> Option<RootBusResourceProfile>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     unsafe {
         root_bus_resource_catalog_mut()?.find_for_devnode(
             instance_id,
@@ -127,15 +131,19 @@ pub(crate) fn build_devnode_pci_resource_grant(
 
 /// Resolve a registry-selected root-bus devnode against broker-backed resource profiles and build
 /// the physical `CM_RESOURCE_LIST` that will be passed to the hosted driver's START IRP.
-pub(crate) fn assign_devnode_root_dma_resources(
+pub(crate) fn assign_devnode_root_dma_resources<H, C>(
     instance_id: &str,
-    hardware_ids: &[&str],
-    compatible_ids: &[&str],
+    hardware_ids: &[H],
+    compatible_ids: &[C],
     int_vector: u32,
     int_latched: bool,
     dma_len: u64,
     granted_mmio_len: u32,
-) -> Option<DevnodeRootResourceGrant> {
+) -> Option<DevnodeRootResourceGrant>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     let profile = root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)?;
     let assignment = assign_root_bus_resources(
         instance_id,

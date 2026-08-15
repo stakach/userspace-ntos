@@ -305,12 +305,12 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) first_error: u32,
 }
 
-struct HostedPnpDevnodeStart<'a> {
+struct HostedPnpDevnodeStart<'a, H, C> {
     instance_id: &'a str,
     driver_key: Option<&'a str>,
     linkage_export: Option<&'a str>,
-    hardware_ids: &'a [&'a str],
-    compatible_ids: &'a [&'a str],
+    hardware_ids: &'a [H],
+    compatible_ids: &'a [C],
 }
 
 pub(crate) unsafe fn publish_hosted_pnp_resource_context(
@@ -341,7 +341,7 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
 pub(crate) unsafe fn start_inline_driver_service_devnodes(
     dc: &driver_launch::DriverComponent,
     spec: &InlineDriverLaunchSpec,
-    devnodes: &[InlineDriverDevnodeSpec],
+    plan: &InlineDriverLaunchPlan,
     options: HostedPnpStartOptions,
 ) -> HostedPnpStartReport {
     let mut report = HostedPnpStartReport {
@@ -353,11 +353,9 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
     } else {
         None
     };
-    for devnode in devnodes {
-        let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
-        let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
-        let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
-        let compatible_refs = devnode.compatible_refs(&mut compatible_refs);
+    for devnode in plan.devnodes_for(spec) {
+        let hardware_refs = plan.hardware_ids_for(devnode);
+        let compatible_refs = plan.compatible_ids_for(devnode);
         let driver_key = if devnode.driver_key_present {
             Some(devnode.driver_key.as_str())
         } else {
@@ -441,14 +439,17 @@ fn copy_service_string_refs<'a>(
     count
 }
 
-unsafe fn start_one_devnode(
+unsafe fn start_one_devnode<H, C>(
     dc: &driver_launch::DriverComponent,
     service_name: &str,
     class_guid: Option<&str>,
-    devnode: HostedPnpDevnodeStart<'_>,
+    devnode: HostedPnpDevnodeStart<'_, H, C>,
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
-) {
+) where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     report.attempted += 1;
     match driver_launch::call_add_device_for_driver(
         dc.driver_id,
@@ -530,12 +531,16 @@ unsafe fn start_one_devnode(
     }
 }
 
-unsafe fn grant_current_hosted_devnode_resources(
+unsafe fn grant_current_hosted_devnode_resources<H, C>(
     device_id: u64,
     instance_id: &str,
-    hardware_refs: &[&str],
-    compatible_refs: &[&str],
-) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
+    hardware_refs: &[H],
+    compatible_refs: &[C],
+) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus>
+where
+    H: AsRef<str>,
+    C: AsRef<str>,
+{
     let devices = (*core::ptr::addr_of!(HOSTED_PNP_PCI_DEVICES))
         .as_ref()
         .ok_or(STATUS_DEVICE_NOT_READY)?;

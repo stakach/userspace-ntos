@@ -39,8 +39,8 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-grow-devnodes-20260815-100315.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3 display/PnP launch-plan cleanup. This
+`.tmp/run-desktop-grow-launch-ids-20260815-101610.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3 display/PnP launch-plan ID cleanup. This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -3421,6 +3421,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   adjustment: the same proof exposes a non-gating late `rundll32.exe` `vmf-out`; track that under the
   next process image/VAD cleanup rather than hiding it in the launch-plan work.
 
+- B3 boot/system driver ID-list cleanup (2026-08-15). The inline boot launch plan no longer stores
+  hardware and compatible IDs in fixed four-entry arrays inside each devnode. `InlineDriverLaunchPlan`
+  now owns a third growable table for ID strings, devnodes store hardware/compatible ranges into that
+  table, and the shape pass reserves specs/devnodes/IDs before the temporary Config Manager heap mark
+  is rewound. PCI matching, root-bus profile matching, hosted resource grants, `AddDevice`, and
+  root-PDO registration now accept `AsRef<str>` ID slices, so the inline launch path can pass the
+  plan-owned ID ranges directly without stack truncation or transient allocation. Validation:
+  `cargo fmt --all`, `cargo test -p nt-pnp`, `cargo test -p nt-root-bus`, `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and serialized
+  desktop proof `.tmp/run-desktop-grow-launch-ids-20260815-101610.log` reaching `296/296` with no
+  launch-plan reserve/capacity/fill failures and `exec_explorer_shell_chrome_painted` green.
+  Remaining B3 launch-plan cleanup is the path/string capture bounds. Review adjustment: the same
+  proof keeps the non-gating late `rundll32.exe` `vmf-out` visible and reduces gate heap headroom to
+  about 128 KiB, so the next cleanup should avoid persistent heap growth or reclaim older
+  boot-frontier state.
+
 - B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
   longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a
   growable vector, reuses cleared holes, and reports `STATUS_INSUFFICIENT_RESOURCES` only on real
@@ -3430,7 +3446,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
 - B3 combined desktop validation after growable PnP cleanup (2026-08-15). Serialized
-  `./run.sh --desktop` proof `.tmp/run-desktop-grow-devnodes-20260815-100315.log` reaches the
+  `./run.sh --desktop` proof `.tmp/run-desktop-grow-launch-ids-20260815-101610.log` reaches the
   sentinel with `296/296` checks, no launch-plan reserve/capacity/fill failures, no PnP status
   growth failures, `userinit.exe` and `explorer.exe` shell gates green,
   `exec_explorer_shell_chrome_painted` green, and the final framebuffer fully non-background.
