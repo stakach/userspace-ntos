@@ -15325,26 +15325,25 @@ fn registry_utf16_ascii(data: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-fn registry_ascii_path(path: &str, out: &mut [u8]) -> Option<usize> {
-    let mut tmp = [0u8; 160];
-    let mut n = 0usize;
+fn registry_ascii_path(path: &str) -> Option<Vec<u8>> {
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(path.len()).ok()?;
     for mut b in path.bytes() {
-        if b > 0x7f || n >= tmp.len() {
+        if b > 0x7f {
             return None;
         }
         if b == b'/' {
             b = b'\\';
         }
-        tmp[n] = b.to_ascii_lowercase();
-        n += 1;
+        tmp.push(b.to_ascii_lowercase());
     }
-    if n == 0 {
+    if tmp.is_empty() {
         return None;
     }
-    normalize_registry_ascii_path(&tmp[..n], out)
+    normalize_registry_ascii_path(&tmp)
 }
 
-fn normalize_registry_ascii_path(path: &[u8], out: &mut [u8]) -> Option<usize> {
+fn normalize_registry_ascii_path(path: &[u8]) -> Option<Vec<u8>> {
     let mut s = path;
     if s.starts_with(b"\\??\\") {
         s = &s[4..];
@@ -15356,40 +15355,34 @@ fn normalize_registry_ascii_path(path: &[u8], out: &mut [u8]) -> Option<usize> {
         s = &s[1..];
     }
 
-    let mut prefixed = [0u8; 180];
-    let normalized = if let Some(rest) = s.strip_prefix(b"%systemroot%\\") {
+    let mut out = Vec::new();
+    if let Some(rest) = s.strip_prefix(b"%systemroot%\\") {
         let prefix = b"reactos\\";
-        if prefix.len() + rest.len() > prefixed.len() {
-            return None;
-        }
-        prefixed[..prefix.len()].copy_from_slice(prefix);
-        prefixed[prefix.len()..prefix.len() + rest.len()].copy_from_slice(rest);
-        &prefixed[..prefix.len() + rest.len()]
+        out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
+            .ok()?;
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(rest);
     } else if let Some(rest) = s.strip_prefix(b"systemroot\\") {
         let prefix = b"reactos\\";
-        if prefix.len() + rest.len() > prefixed.len() {
-            return None;
-        }
-        prefixed[..prefix.len()].copy_from_slice(prefix);
-        prefixed[prefix.len()..prefix.len() + rest.len()].copy_from_slice(rest);
-        &prefixed[..prefix.len() + rest.len()]
+        out.try_reserve_exact(prefix.len().checked_add(rest.len())?)
+            .ok()?;
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(rest);
     } else if s.starts_with(b"system32\\") {
         let prefix = b"reactos\\";
-        if prefix.len() + s.len() > prefixed.len() {
-            return None;
-        }
-        prefixed[..prefix.len()].copy_from_slice(prefix);
-        prefixed[prefix.len()..prefix.len() + s.len()].copy_from_slice(s);
-        &prefixed[..prefix.len() + s.len()]
+        out.try_reserve_exact(prefix.len().checked_add(s.len())?)
+            .ok()?;
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(s);
     } else {
-        s
-    };
+        out.try_reserve_exact(s.len()).ok()?;
+        out.extend_from_slice(s);
+    }
 
-    if normalized.is_empty() || normalized.len() > out.len() {
+    if out.is_empty() {
         return None;
     }
-    out[..normalized.len()].copy_from_slice(normalized);
-    Some(normalized.len())
+    Some(out)
 }
 
 fn system_hive_regf() -> Option<RegfHive<'static>> {
@@ -15404,7 +15397,7 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
 struct ConfigHiveDriverLaunchSpec {
     service_name: alloc::string::String,
     driver_object_path: alloc::string::String,
-    image_path_len: usize,
+    image_path: Vec<u8>,
     class: driver_launch::DriverClass,
 }
 
@@ -15429,13 +15422,10 @@ pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
 
-const BOOT_DRIVER_ID_MAX: usize = 4;
 const BOOT_DRIVER_SERVICE_NAME_MAX: usize = 64;
-const BOOT_DRIVER_CLASS_GUID_MAX: usize = 48;
 const BOOT_DRIVER_OBJECT_PATH_MAX: usize = 96;
 const BOOT_DRIVER_IMAGE_PATH_MAX: usize = 180;
 const BOOT_DRIVER_DEVNODE_PATH_MAX: usize = 128;
-const BOOT_DRIVER_ID_BYTES_MAX: usize = 96;
 
 #[derive(Clone, Copy)]
 struct InlineAscii<const N: usize> {
@@ -15474,6 +15464,39 @@ impl<const N: usize> InlineAscii<N> {
 }
 
 impl<const N: usize> AsRef<str> for InlineAscii<N> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlinePlanString {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl InlinePlanString {
+    const fn empty() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+}
+
+impl AsRef<str> for InlinePlanString {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -15526,12 +15549,12 @@ fn ascii_starts_with_ignore_case(text: &[u8], prefix: &[u8]) -> bool {
 
 #[derive(Clone, Copy)]
 struct InlineDriverDevnodeSpec {
-    instance_id: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
-    pdo_name: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    instance_id: InlinePlanString,
+    pdo_name: InlinePlanString,
     pdo_name_present: bool,
-    driver_key: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    driver_key: InlinePlanString,
     driver_key_present: bool,
-    linkage_export: InlineAscii<BOOT_DRIVER_DEVNODE_PATH_MAX>,
+    linkage_export: InlinePlanString,
     linkage_export_present: bool,
     hardware_id_start: usize,
     hardware_id_count: usize,
@@ -15542,12 +15565,12 @@ struct InlineDriverDevnodeSpec {
 impl InlineDriverDevnodeSpec {
     const fn empty() -> Self {
         Self {
-            instance_id: InlineAscii::empty(),
-            pdo_name: InlineAscii::empty(),
+            instance_id: InlinePlanString::empty(),
+            pdo_name: InlinePlanString::empty(),
             pdo_name_present: false,
-            driver_key: InlineAscii::empty(),
+            driver_key: InlinePlanString::empty(),
             driver_key_present: false,
-            linkage_export: InlineAscii::empty(),
+            linkage_export: InlinePlanString::empty(),
             linkage_export_present: false,
             hardware_id_start: 0,
             hardware_id_count: 0,
@@ -15559,11 +15582,11 @@ impl InlineDriverDevnodeSpec {
 
 #[derive(Clone, Copy)]
 struct InlineDriverLaunchSpec {
-    service_name: InlineAscii<BOOT_DRIVER_SERVICE_NAME_MAX>,
-    class_guid: InlineAscii<BOOT_DRIVER_CLASS_GUID_MAX>,
+    service_name: InlinePlanString,
+    class_guid: InlinePlanString,
     class_guid_present: bool,
-    driver_object_path: InlineAscii<BOOT_DRIVER_OBJECT_PATH_MAX>,
-    image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
+    driver_object_path: InlinePlanString,
+    image_path: InlinePlanString,
     class: driver_launch::DriverClass,
     devnode_start: usize,
     devnode_count: usize,
@@ -15572,11 +15595,11 @@ struct InlineDriverLaunchSpec {
 impl InlineDriverLaunchSpec {
     const fn empty() -> Self {
         Self {
-            service_name: InlineAscii::empty(),
-            class_guid: InlineAscii::empty(),
+            service_name: InlinePlanString::empty(),
+            class_guid: InlinePlanString::empty(),
             class_guid_present: false,
-            driver_object_path: InlineAscii::empty(),
-            image_path: InlineAscii::empty(),
+            driver_object_path: InlinePlanString::empty(),
+            image_path: InlinePlanString::empty(),
             class: driver_launch::DriverClass::Fsd,
             devnode_start: 0,
             devnode_count: 0,
@@ -15596,7 +15619,8 @@ fn inline_launch_spec_has_pci_devnode(devnodes: &[InlineDriverDevnodeSpec]) -> b
 struct InlineDriverLaunchPlan {
     specs: alloc::vec::Vec<InlineDriverLaunchSpec>,
     devnodes: alloc::vec::Vec<InlineDriverDevnodeSpec>,
-    ids: alloc::vec::Vec<InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>>,
+    ids: alloc::vec::Vec<InlinePlanString>,
+    string_bytes: alloc::vec::Vec<u8>,
 }
 
 impl InlineDriverLaunchPlan {
@@ -15605,6 +15629,7 @@ impl InlineDriverLaunchPlan {
             specs: alloc::vec::Vec::new(),
             devnodes: alloc::vec::Vec::new(),
             ids: alloc::vec::Vec::new(),
+            string_bytes: alloc::vec::Vec::new(),
         }
     }
 
@@ -15612,6 +15637,7 @@ impl InlineDriverLaunchPlan {
         self.specs.clear();
         self.devnodes.clear();
         self.ids.clear();
+        self.string_bytes.clear();
     }
 
     fn reserve_shape(&mut self, shape: InlineDriverLaunchPlanShape) -> bool {
@@ -15642,6 +15668,15 @@ impl InlineDriverLaunchPlan {
                 return false;
             }
         }
+        if self.string_bytes.capacity() < shape.string_bytes {
+            if self
+                .string_bytes
+                .try_reserve_exact(shape.string_bytes - self.string_bytes.capacity())
+                .is_err()
+            {
+                return false;
+            }
+        }
         true
     }
 
@@ -15661,12 +15696,33 @@ impl InlineDriverLaunchPlan {
         true
     }
 
-    fn push_id(&mut self, id: InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>) -> bool {
+    fn push_id(&mut self, id: InlinePlanString) -> bool {
         if self.ids.len() >= self.ids.capacity() {
             return false;
         }
         self.ids.push(id);
         true
+    }
+
+    fn push_string(&mut self, value: &str) -> Option<InlinePlanString> {
+        self.push_string_bytes(value.as_bytes())
+    }
+
+    fn push_string_bytes(&mut self, value: &[u8]) -> Option<InlinePlanString> {
+        core::str::from_utf8(value).ok()?;
+        if value.is_empty() {
+            return Some(InlinePlanString::empty());
+        }
+        let start = self.string_bytes.len();
+        let end = start.checked_add(value.len())?;
+        if end > self.string_bytes.capacity() {
+            return None;
+        }
+        self.string_bytes.extend_from_slice(value);
+        Some(InlinePlanString {
+            ptr: unsafe { self.string_bytes.as_ptr().add(start) },
+            len: value.len(),
+        })
     }
 
     fn devnode_len(&self) -> usize {
@@ -15686,11 +15742,7 @@ impl InlineDriverLaunchPlan {
             .unwrap_or(&[])
     }
 
-    fn ids_for(
-        &self,
-        start: usize,
-        count: usize,
-    ) -> &[InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>] {
+    fn ids_for(&self, start: usize, count: usize) -> &[InlinePlanString] {
         let Some(end) = start.checked_add(count) else {
             return &[];
         };
@@ -15700,14 +15752,14 @@ impl InlineDriverLaunchPlan {
     fn hardware_ids_for(
         &self,
         devnode: &InlineDriverDevnodeSpec,
-    ) -> &[InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>] {
+    ) -> &[InlinePlanString] {
         self.ids_for(devnode.hardware_id_start, devnode.hardware_id_count)
     }
 
     fn compatible_ids_for(
         &self,
         devnode: &InlineDriverDevnodeSpec,
-    ) -> &[InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>] {
+    ) -> &[InlinePlanString] {
         self.ids_for(devnode.compatible_id_start, devnode.compatible_id_count)
     }
 
@@ -15721,10 +15773,11 @@ struct InlineDriverLaunchPlanShape {
     specs: usize,
     devnodes: usize,
     ids: usize,
+    string_bytes: usize,
 }
 
 impl InlineDriverLaunchPlanShape {
-    fn add_spec(&mut self, devnodes: usize, ids: usize) -> bool {
+    fn add_spec(&mut self, devnodes: usize, ids: usize, string_bytes: usize) -> bool {
         let Some(specs) = self.specs.checked_add(1) else {
             return false;
         };
@@ -15734,9 +15787,13 @@ impl InlineDriverLaunchPlanShape {
         let Some(total_ids) = self.ids.checked_add(ids) else {
             return false;
         };
+        let Some(total_string_bytes) = self.string_bytes.checked_add(string_bytes) else {
+            return false;
+        };
         self.specs = specs;
         self.devnodes = total_devnodes;
         self.ids = total_ids;
+        self.string_bytes = total_string_bytes;
         true
     }
 }
@@ -16347,24 +16404,22 @@ fn driver_class_from_config(class: DriverServiceClass) -> driver_launch::DriverC
 
 fn driver_launch_spec_from_config_driver_spec(
     service: &nt_config_manager::DriverServiceLaunchSpec,
-    out_path: &mut [u8],
     max_start: u32,
-) -> Option<(usize, driver_launch::DriverClass)> {
+) -> Option<(Vec<u8>, driver_launch::DriverClass)> {
     if service.start_type > max_start || service.start_type >= SERVICE_DISABLED {
         return None;
     };
     let class = driver_class_from_config(service.class);
-    let path_len = registry_ascii_path(&service.image_path, out_path)?;
-    Some((path_len, class))
+    let path = registry_ascii_path(&service.image_path)?;
+    Some((path, class))
 }
 
 fn driver_launch_spec_from_service_metadata(
     service: &nt_config_manager::ServiceMetadata,
-    out_path: &mut [u8],
     max_start: u32,
-) -> Option<(usize, driver_launch::DriverClass)> {
+) -> Option<(Vec<u8>, driver_launch::DriverClass)> {
     let service = service.driver_launch_spec()?;
-    driver_launch_spec_from_config_driver_spec(&service, out_path, max_start)
+    driver_launch_spec_from_config_driver_spec(&service, max_start)
 }
 
 fn current_driver_host_can_boot_launch(
@@ -16386,9 +16441,7 @@ fn owned_driver_launch_spec_from_config_driver_spec(
     max_start: u32,
     devnodes: alloc::vec::Vec<DriverServiceDevnodeSpec>,
 ) -> Option<DriverServiceLaunchSpec> {
-    let mut image_path = [0u8; 180];
-    let (image_path_len, class) =
-        driver_launch_spec_from_config_driver_spec(&service, &mut image_path, max_start)?;
+    let (image_path, class) = driver_launch_spec_from_config_driver_spec(&service, max_start)?;
     let driver_object_path = service.driver_object_path;
     let service_name = service.service_name;
     let class_guid = service.class_guid;
@@ -16396,7 +16449,7 @@ fn owned_driver_launch_spec_from_config_driver_spec(
         service_name,
         class_guid,
         driver_object_path,
-        image_path: alloc::vec::Vec::from(&image_path[..image_path_len]),
+        image_path,
         class,
         devnodes,
     })
@@ -16423,21 +16476,33 @@ fn driver_service_devnode_specs(
 struct InlineDriverDevnodePlanShape {
     devnodes: usize,
     ids: usize,
+    string_bytes: usize,
 }
 
-fn inline_id_from_string(value: &str) -> Option<InlineAscii<BOOT_DRIVER_ID_BYTES_MAX>> {
-    let mut id = InlineAscii::empty();
-    id.set_str(value).then_some(id)
+#[derive(Clone, Copy, Default)]
+struct InlineDriverIdListShape {
+    ids: usize,
+    string_bytes: usize,
 }
 
-fn count_inline_id_list(src: &[alloc::string::String]) -> usize {
-    let mut count = 0usize;
+fn checked_add_plan_string(total: &mut usize, value: &str) -> Option<()> {
+    *total = total.checked_add(value.len())?;
+    Some(())
+}
+
+fn checked_add_plan_bytes(total: &mut usize, value: &[u8]) -> Option<()> {
+    core::str::from_utf8(value).ok()?;
+    *total = total.checked_add(value.len())?;
+    Some(())
+}
+
+fn count_inline_id_list(src: &[alloc::string::String]) -> Option<InlineDriverIdListShape> {
+    let mut shape = InlineDriverIdListShape::default();
     for value in src {
-        if inline_id_from_string(value).is_some() {
-            count += 1;
-        }
+        shape.ids = shape.ids.checked_add(1)?;
+        checked_add_plan_string(&mut shape.string_bytes, value)?;
     }
-    count
+    Some(shape)
 }
 
 fn append_inline_id_list(
@@ -16447,12 +16512,11 @@ fn append_inline_id_list(
     let start = plan.id_len();
     let mut count = 0usize;
     for value in src {
-        if let Some(id) = inline_id_from_string(value) {
-            if !plan.push_id(id) {
-                return None;
-            }
-            count += 1;
+        let id = plan.push_string(value)?;
+        if !plan.push_id(id) {
+            return None;
         }
+        count += 1;
     }
     Some((start, count))
 }
@@ -16460,27 +16524,41 @@ fn append_inline_id_list(
 fn inline_devnode_spec_header_from_record(
     cm: &nt_config_manager::ConfigManager,
     devnode: &nt_config_manager::DevnodeRecord,
+    plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverDevnodeSpec> {
     let mut dst = InlineDriverDevnodeSpec::empty();
-    if !dst.instance_id.set_str(&devnode.instance_id) {
-        return None;
-    }
+    dst.instance_id = plan.push_string(&devnode.instance_id)?;
     if let Some(pdo_name) = devnode.pdo_name.as_deref() {
-        dst.pdo_name_present = dst.pdo_name.set_str(pdo_name);
+        dst.pdo_name = plan.push_string(pdo_name)?;
+        dst.pdo_name_present = true;
     }
     if let Some(driver_key) = devnode.driver_key.as_deref() {
-        if !dst.driver_key.set_str(driver_key) {
-            return None;
-        }
+        dst.driver_key = plan.push_string(driver_key)?;
         dst.driver_key_present = true;
     }
-    if let Some(linkage_export) = cm.devnode_linkage_export(devnode).as_deref() {
-        if !dst.linkage_export.set_str(linkage_export) {
-            return None;
-        }
+    if let Some(linkage_export) = cm.devnode_linkage_export(devnode) {
+        dst.linkage_export = plan.push_string(&linkage_export)?;
         dst.linkage_export_present = true;
     }
     Some(dst)
+}
+
+fn inline_devnode_spec_header_shape_from_record(
+    cm: &nt_config_manager::ConfigManager,
+    devnode: &nt_config_manager::DevnodeRecord,
+) -> Option<usize> {
+    let mut string_bytes = 0usize;
+    checked_add_plan_string(&mut string_bytes, &devnode.instance_id)?;
+    if let Some(pdo_name) = devnode.pdo_name.as_deref() {
+        checked_add_plan_string(&mut string_bytes, pdo_name)?;
+    }
+    if let Some(driver_key) = devnode.driver_key.as_deref() {
+        checked_add_plan_string(&mut string_bytes, driver_key)?;
+    }
+    if let Some(linkage_export) = cm.devnode_linkage_export(devnode) {
+        checked_add_plan_string(&mut string_bytes, &linkage_export)?;
+    }
+    Some(string_bytes)
 }
 
 fn inline_devnode_spec_from_record(
@@ -16488,7 +16566,7 @@ fn inline_devnode_spec_from_record(
     devnode: &nt_config_manager::DevnodeRecord,
     plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverDevnodeSpec> {
-    let mut dst = inline_devnode_spec_header_from_record(cm, devnode)?;
+    let mut dst = inline_devnode_spec_header_from_record(cm, devnode, plan)?;
     let (hardware_start, hardware_count) = append_inline_id_list(&devnode.hardware_ids, plan)?;
     let (compatible_start, compatible_count) =
         append_inline_id_list(&devnode.compatible_ids, plan)?;
@@ -16503,11 +16581,15 @@ fn inline_devnode_shape_from_record(
     cm: &nt_config_manager::ConfigManager,
     devnode: &nt_config_manager::DevnodeRecord,
 ) -> Option<InlineDriverDevnodePlanShape> {
-    inline_devnode_spec_header_from_record(cm, devnode)?;
+    let header_string_bytes = inline_devnode_spec_header_shape_from_record(cm, devnode)?;
+    let hardware = count_inline_id_list(&devnode.hardware_ids)?;
+    let compatible = count_inline_id_list(&devnode.compatible_ids)?;
     Some(InlineDriverDevnodePlanShape {
         devnodes: 1,
-        ids: count_inline_id_list(&devnode.hardware_ids)
-            .checked_add(count_inline_id_list(&devnode.compatible_ids))?,
+        ids: hardware.ids.checked_add(compatible.ids)?,
+        string_bytes: header_string_bytes
+            .checked_add(hardware.string_bytes)?
+            .checked_add(compatible.string_bytes)?,
     })
 }
 
@@ -16524,8 +16606,15 @@ fn count_inline_devnodes_from_records(
             let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
                 break;
             };
+            let Some(string_bytes) = shape
+                .string_bytes
+                .checked_add(devnode_shape.string_bytes)
+            else {
+                break;
+            };
             shape.devnodes = devnodes;
             shape.ids = ids;
+            shape.string_bytes = string_bytes;
         }
     }
     shape
@@ -16544,8 +16633,15 @@ fn count_inline_devnodes(
             let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
                 break;
             };
+            let Some(string_bytes) = shape
+                .string_bytes
+                .checked_add(devnode_shape.string_bytes)
+            else {
+                break;
+            };
             shape.devnodes = devnodes;
             shape.ids = ids;
+            shape.string_bytes = string_bytes;
         }
     }
     shape
@@ -16590,26 +16686,36 @@ fn append_inline_devnodes(
 fn inline_driver_launch_spec_header_from_service_metadata(
     service: &nt_config_manager::ServiceMetadata,
     max_start: u32,
+    plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
-    let mut image_path = [0u8; BOOT_DRIVER_IMAGE_PATH_MAX];
-    let (image_path_len, class) =
-        driver_launch_spec_from_service_metadata(service, &mut image_path, max_start)?;
+    let (image_path, class) = driver_launch_spec_from_service_metadata(service, max_start)?;
     let driver_object_path = service.driver_object_path()?;
     let mut spec = InlineDriverLaunchSpec::empty();
-    if !spec.service_name.set_str(&service.name)
-        || !spec.driver_object_path.set_str(&driver_object_path)
-        || !spec.image_path.set_bytes(&image_path[..image_path_len])
-    {
-        return None;
-    }
+    spec.service_name = plan.push_string(&service.name)?;
+    spec.driver_object_path = plan.push_string(&driver_object_path)?;
+    spec.image_path = plan.push_string_bytes(&image_path)?;
     if let Some(class_guid) = service.class_guid.as_deref() {
-        if !spec.class_guid.set_str(class_guid) {
-            return None;
-        }
+        spec.class_guid = plan.push_string(class_guid)?;
         spec.class_guid_present = true;
     }
     spec.class = class;
     Some(spec)
+}
+
+fn inline_driver_launch_spec_header_shape_from_service_metadata(
+    service: &nt_config_manager::ServiceMetadata,
+    max_start: u32,
+) -> Option<usize> {
+    let (image_path, _) = driver_launch_spec_from_service_metadata(service, max_start)?;
+    let driver_object_path = service.driver_object_path()?;
+    let mut string_bytes = 0usize;
+    checked_add_plan_string(&mut string_bytes, &service.name)?;
+    checked_add_plan_string(&mut string_bytes, &driver_object_path)?;
+    checked_add_plan_bytes(&mut string_bytes, &image_path)?;
+    if let Some(class_guid) = service.class_guid.as_deref() {
+        checked_add_plan_string(&mut string_bytes, class_guid)?;
+    }
+    Some(string_bytes)
 }
 
 fn inline_driver_launch_spec_from_service_metadata(
@@ -16618,7 +16724,8 @@ fn inline_driver_launch_spec_from_service_metadata(
     max_start: u32,
     plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
-    let mut spec = inline_driver_launch_spec_header_from_service_metadata(service, max_start)?;
+    let mut spec =
+        inline_driver_launch_spec_header_from_service_metadata(service, max_start, plan)?;
     let (start, count) = append_inline_devnodes(cm, &service.name, plan)?;
     spec.devnode_start = start;
     spec.devnode_count = count;
@@ -16632,7 +16739,7 @@ fn inline_driver_launch_spec_from_pnp_binding(
     plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
     let mut spec =
-        inline_driver_launch_spec_header_from_service_metadata(&binding.service, max_start)?;
+        inline_driver_launch_spec_header_from_service_metadata(&binding.service, max_start, plan)?;
     let (start, count) = append_inline_devnodes_from_records(cm, &binding.devnodes, plan)?;
     spec.devnode_start = start;
     spec.devnode_count = count;
@@ -16674,21 +16781,19 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     Some(cm)
 }
 
-fn config_hive_boot_system_driver_launch_spec(
-    out_path: &mut [u8],
-) -> Option<ConfigHiveDriverLaunchSpec> {
+fn config_hive_boot_system_driver_launch_spec() -> Option<ConfigHiveDriverLaunchSpec> {
     let cm = config_hive_config_manager()?;
     let service = cm
         .boot_system_driver_candidates()
         .into_iter()
         .find(|service| service.driver_service_class() == Some(DriverServiceClass::FileSystem))?;
-    let (image_path_len, class) =
-        driver_launch_spec_from_service_metadata(&service, out_path, SERVICE_SYSTEM_START)?;
+    let (image_path, class) =
+        driver_launch_spec_from_service_metadata(&service, SERVICE_SYSTEM_START)?;
     let driver_object_path = service.driver_object_path()?;
     Some(ConfigHiveDriverLaunchSpec {
         service_name: service.name,
         driver_object_path,
-        image_path_len,
+        image_path,
         class,
     })
 }
@@ -16698,14 +16803,20 @@ fn count_config_hive_boot_system_pnp_driver_launch_shape() -> InlineDriverLaunch
     let mut shape = InlineDriverLaunchPlanShape::default();
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
-            if inline_driver_launch_spec_header_from_service_metadata(
+            if let Some(header_string_bytes) = inline_driver_launch_spec_header_shape_from_service_metadata(
                 &binding.service,
                 SERVICE_SYSTEM_START,
             )
-            .is_some()
             {
                 let devnodes = count_inline_devnodes_from_records(&cm, &binding.devnodes);
-                if devnodes.devnodes != 0 && !shape.add_spec(devnodes.devnodes, devnodes.ids) {
+                let Some(string_bytes) =
+                    header_string_bytes.checked_add(devnodes.string_bytes)
+                else {
+                    break;
+                };
+                if devnodes.devnodes != 0
+                    && !shape.add_spec(devnodes.devnodes, devnodes.ids, string_bytes)
+                {
                     break;
                 }
             }
@@ -16726,13 +16837,15 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
         print_u64(required.devnodes as u64);
         print_str(b" ids=");
         print_u64(required.ids as u64);
+        print_str(b" strings=");
+        print_u64(required.string_bytes as u64);
         print_str(b"\n");
         return plan;
     }
     let heap_mark = allocator::mark();
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
-            if inline_driver_launch_spec_header_from_service_metadata(
+            if inline_driver_launch_spec_header_shape_from_service_metadata(
                 &binding.service,
                 SERVICE_SYSTEM_START,
             )
@@ -16753,6 +16866,8 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
                     print_u64(required.devnodes as u64);
                     print_str(b" ids=");
                     print_u64(required.ids as u64);
+                    print_str(b" strings=");
+                    print_u64(required.string_bytes as u64);
                     print_str(b"\n");
                     break;
                 }
@@ -16763,6 +16878,8 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
                 print_u64(required.devnodes as u64);
                 print_str(b" ids=");
                 print_u64(required.ids as u64);
+                print_str(b" strings=");
+                print_u64(required.string_bytes as u64);
                 print_str(b"\n");
                 break;
             }
@@ -16890,14 +17007,18 @@ fn count_system_hive_boot_driver_launch_shape() -> InlineDriverLaunchPlanShape {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
             }
-            if inline_driver_launch_spec_header_from_service_metadata(
+            if let Some(header_string_bytes) = inline_driver_launch_spec_header_shape_from_service_metadata(
                 &service,
                 SERVICE_SYSTEM_START,
             )
-            .is_some()
             {
                 let devnodes = count_inline_devnodes(&cm, &service.name);
-                if !shape.add_spec(devnodes.devnodes, devnodes.ids) {
+                let Some(string_bytes) =
+                    header_string_bytes.checked_add(devnodes.string_bytes)
+                else {
+                    break;
+                };
+                if !shape.add_spec(devnodes.devnodes, devnodes.ids, string_bytes) {
                     break;
                 }
             }
@@ -16918,6 +17039,8 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
         print_u64(required.devnodes as u64);
         print_str(b" ids=");
         print_u64(required.ids as u64);
+        print_str(b" strings=");
+        print_u64(required.string_bytes as u64);
         print_str(b"\n");
         return plan;
     }
@@ -16927,7 +17050,7 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
             }
-            if inline_driver_launch_spec_header_from_service_metadata(
+            if inline_driver_launch_spec_header_shape_from_service_metadata(
                 &service,
                 SERVICE_SYSTEM_START,
             )
@@ -16948,6 +17071,8 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
                     print_u64(required.devnodes as u64);
                     print_str(b" ids=");
                     print_u64(required.ids as u64);
+                    print_str(b" strings=");
+                    print_u64(required.string_bytes as u64);
                     print_str(b"\n");
                     break;
                 }
@@ -16958,6 +17083,8 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
                 print_u64(required.devnodes as u64);
                 print_str(b" ids=");
                 print_u64(required.ids as u64);
+                print_str(b" strings=");
+                print_u64(required.string_bytes as u64);
                 print_str(b"\n");
                 break;
             }
@@ -25501,19 +25628,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // service subtree into Config Manager metadata, selects the boot/system driver candidate,
         // then proves load -> DriverEntry -> dispatch -> unload -> object teardown without probing a
         // compiled-in service identity.
-        let mut proof_driver_path = [0u8; 128];
-        let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&mut proof_driver_path);
+        let proof_driver_spec = config_hive_boot_system_driver_launch_spec();
         if let Some(proof_driver_spec) = proof_driver_spec {
             print_str(b"[driver-launch] launching service ");
             print_str(proof_driver_spec.service_name.as_bytes());
             print_str(b" from config hive path=");
-            print_str(&proof_driver_path[..proof_driver_spec.image_path_len]);
+            print_str(&proof_driver_spec.image_path);
             print_str(b" object=");
             print_str(proof_driver_spec.driver_object_path.as_bytes());
             print_str(b"\n");
             if let Some(dc) = load_driver(
                 &fs,
-                &proof_driver_path[..proof_driver_spec.image_path_len],
+                &proof_driver_spec.image_path,
                 proof_driver_spec.class,
                 &proof_driver_spec.driver_object_path,
             ) {

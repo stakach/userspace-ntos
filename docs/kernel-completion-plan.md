@@ -1244,9 +1244,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    `RootBusResourceCatalog` rather than a one-entry executive array. Boot/system driver launch plans
    also no longer have an eight-service snapshot cap: the executive counts accepted registry
    candidates under a reclaimable heap mark, reserves persistent plan storage, and then fills the
-   plan under a second reclaimable mark so Config Manager scratch state is still released. Remaining
-   launch-plan cleanup is the per-service devnode/ID/path inline capture bounds. Remaining display
-   debt is hosting real videoprt/miniport instead of the boot-framebuffer bridge.
+   plan under a second reclaimable mark so Config Manager scratch state is still released. The
+   remaining per-service devnode/ID/path inline capture bounds have been removed from that launch
+   boundary by reserving a persistent plan-owned string byte arena and passing plan-owned ID slices
+   through PnP/start paths. Remaining display debt is hosting real videoprt/miniport instead of the
+   boot-framebuffer bridge.
 2. A3/A4 for Win32 service starts is closed for the current frontier. SCM-owned service metadata now
    produces typed
    `Win32ServiceLaunchSpec` and `ServiceStartSpec::{Win32, Driver}` records, the hosted executable
@@ -3436,6 +3438,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   proof keeps the non-gating late `rundll32.exe` `vmf-out` visible and reduces gate heap headroom to
   about 128 KiB, so the next cleanup should avoid persistent heap growth or reclaim older
   boot-frontier state.
+
+- B3 boot/system driver path/string capture cleanup (2026-08-15). The inline launch plan no longer
+  stores service names, class GUIDs, driver-object paths, image paths, devnode instance paths,
+  driver keys, linkage exports, or ID strings in fixed per-record byte arrays. The shape pass now
+  counts accepted plan string bytes, `reserve_shape` reserves a persistent plan-owned byte arena
+  before the temporary Config Manager heap mark, and the fill pass copies all launch strings into
+  that arena without allocating under the reclaimable mark. `InlinePlanString` gives consumers stable
+  `&str`/`&[u8]` views into the plan arena, so PCI matching, root-bus matching, driver loading, and
+  hosted `AddDevice` startup no longer depend on per-string caps. Demand-start driver devnodes also
+  no longer truncate hardware/compatible IDs through four-entry stack arrays; they pass the
+  registry-owned ID slices directly through the generic `AsRef<str>` path. The registry image-path
+  normalizer now returns a dynamically-sized normalized path instead of failing at 160/180-byte
+  scratch buffers. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh
+  extern-rootserver`, and serialized `RUN_LOG=.tmp/run-desktop-plan-string-arena-20260815.log
+  ./run.sh --desktop`. The desktop proof reached `296/296` checks with no `FAIL` lines or
+  launch-plan reserve/fill/capacity failures, kept `exec_vm_pool_headroom` green with
+  `exec-heap-free=7918KiB`, and passed the userinit, explorer process, GDI batch, profile hive,
+  `NtLoadKey`, and `exec_explorer_shell_chrome_painted` gates.
 
 - B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
   longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a

@@ -395,11 +395,6 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     };
     let class_guid = spec.class_guid.as_deref();
     for devnode in &spec.devnodes {
-        let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
-        let hardware_count = copy_service_string_refs(&devnode.hardware_ids, &mut hardware_refs);
-        let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
-        let compatible_count =
-            copy_service_string_refs(&devnode.compatible_ids, &mut compatible_refs);
         start_one_devnode(
             dc,
             &spec.service_name,
@@ -408,8 +403,8 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
                 instance_id: &devnode.instance_id,
                 driver_key: devnode.driver_key.as_deref(),
                 linkage_export: devnode.linkage_export.as_deref(),
-                hardware_ids: &hardware_refs[..hardware_count],
-                compatible_ids: &compatible_refs[..compatible_count],
+                hardware_ids: &devnode.hardware_ids,
+                compatible_ids: &devnode.compatible_ids,
             },
             options,
             &mut report,
@@ -422,21 +417,6 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     } else {
         Ok(report)
     }
-}
-
-fn copy_service_string_refs<'a>(
-    src: &'a [alloc::string::String],
-    dst: &mut [&'a str; BOOT_DRIVER_ID_MAX],
-) -> usize {
-    let mut count = 0usize;
-    for value in src {
-        if count >= dst.len() {
-            break;
-        }
-        dst[count] = value.as_str();
-        count += 1;
-    }
-    count
 }
 
 unsafe fn start_one_devnode<H, C>(
