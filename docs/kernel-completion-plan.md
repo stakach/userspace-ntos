@@ -90,8 +90,15 @@ syscalls in the final census, and WM_PAINT messages dispatched through real api0
 Explorer windows at lines 45637, 45733, 45748, and 45760. The remaining frontier is no longer
 process launch: Explorer logs `desktop.cpp:193: Unexpected failure (hres)=80004005`, cannot open
 `MSGina: ShellReadyEvent` / `Global\MSGina: ShellReadyEvent`, then continues into `kbswitch.exe`.
-Next cleanup should make the shell-ready desktop/session notification path real and capture a
-non-manual gate once the shell settles.
+Review adjustment: ReactOS Explorer treats `MSGina: ShellReadyEvent` as best-effort (`OpenEventW`,
+`SetEvent` only if the named event exists), and the ReactOS MSGina source in this tree does not
+create that named event. The open-miss is therefore a correct object-manager result, not a kernel
+event to synthesize. The `desktop.cpp:193` failure is the honest cleanup frontier: Explorer's
+secondary desktop helper exits before `CDesktopThread::Initialize` observes its init event. Generic
+thread/event/win32k callback transport is still live: Explorer workers are dynamically badged as
+hosted TP slots, run real `ClientThreadSetup`, signal and wait on ordinary dispatcher objects, and
+the same log continues to real shell chrome. Next proof work should capture a non-manual gate once
+the shell settles, then inspect the helper-thread failure only if it blocks shell UI progress.
 
 Completed ntdll import-reference slice (2026-08-15): the late `rundll32.exe` fault is being treated as
 a loader-lifetime bug rather than a kernel process-launch shortcut. The Rust ntdll loader now records
@@ -1619,8 +1626,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    descriptor query paths. The thread/VM follow-on now truncates `NtCreateThreadEx(CreateFlags)` and
    `NtQueryVirtualMemory(MemoryInformationClass)` while preserving pointer-width stack and `SIZE_T`
    fields. The PnP follow-on now also truncates `NtPlugPlayControl(BufferLength)` before all CM-backed
-   PnP control buffer validation. `NtCreateKeyedEvent(Flags)` now uses the same declared `ULONG`
-   boundary before rejecting non-zero flag bits.
+   PnP control buffer validation. The synchronization/debug follow-on adds explicit
+   `nt_ulong_arg`/`nt_long_arg` capture helpers and applies them to Dbgk debug-object flags/access
+   masks/continue status, event/timer/semaphore/mutant access masks and type/query/count fields,
+   `NtSetTimer`'s `LONG Period`, keyed-event flags, and process/thread/system information classes and
+   lengths touched by the same slice. Stale wait-path comments that still described a fallback now
+   document the real `STATUS_INSUFFICIENT_RESOURCES` result. Continue replacing remaining raw
+   `args[n] as u32` service-body captures with explicit NT scalar helpers in small audited groups.
 
 ## Review Log
 

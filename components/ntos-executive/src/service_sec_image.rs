@@ -4471,8 +4471,8 @@ pub(crate) unsafe fn service_sec_image(
             &*(dll_pe_store.as_ptr()
                 as *const [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT]),
         )[..];
-    // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
-    // to the broker match below.
+    // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
+    // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = reset_exec_nt_handler(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
@@ -14704,7 +14704,8 @@ pub(crate) unsafe fn service_sec_image(
             }
             // Array-wait park (NtWaitForMultipleObjects): PARK on the resolved event SET (WaitAny/All).
             // The matching NtSetEvent (signal_state_changed → SetEvent(mgr_event)) wakes it via
-            // dispatcher wake path, returning WAIT_0+index. Pool/queue exhaustion → immediate fallback.
+            // dispatcher wake path, returning WAIT_0+index. Pool/queue exhaustion returns
+            // STATUS_INSUFFICIENT_RESOURCES through the normal reply path.
             if park_wait_set_n > 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;

@@ -435,6 +435,16 @@ fn nt_boolean_arg(value: u64) -> bool {
     (value as u8) != 0
 }
 
+#[inline]
+fn nt_ulong_arg(value: u64) -> u32 {
+    value as u32
+}
+
+#[inline]
+fn nt_long_arg(value: u64) -> i32 {
+    nt_ulong_arg(value) as i32
+}
+
 fn debug_register_error_status(error: nt_thread_start::Amd64DebugRegisterError) -> u32 {
     match error {
         nt_thread_start::Amd64DebugRegisterError::UnsupportedControlBits
@@ -23191,7 +23201,7 @@ impl ExecNtHandler {
                         return 0xC000_009A;
                     }
                 }
-                // Generic same-process NtCreateThread fallback. Named SM/CSR/RPC routes above keep
+                // Generic same-process NtCreateThread route. Named SM/CSR/RPC routes above keep
                 // their custom layouts; every remaining local hosted thread gets a real generic
                 // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
                 if let Some(status) =
@@ -23462,7 +23472,7 @@ impl ExecNtHandler {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
                     // EventType=args[3], InitialState=args[4].
-                    let event_type = args[3] as u32;
+                    let event_type = nt_ulong_arg(args[3]);
                     if event_type > 1 {
                         return 0xC000_000D; // STATUS_INVALID_PARAMETER
                     }
@@ -23481,7 +23491,7 @@ impl ExecNtHandler {
                         let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                             return 0xC000_009A;
                         };
-                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32)
+                        let Some(event_handle) = self.mint_event_handle(index, nt_ulong_arg(args[1]))
                         else {
                             self.rollback_new_event(index);
                             return 0xC000_009A;
@@ -23502,7 +23512,7 @@ impl ExecNtHandler {
                             print_str(b" obj=");
                             print_u64(index as u64);
                             print_str(b" access=0x");
-                            print_hex(args[1] as u32);
+                            print_hex(nt_ulong_arg(args[1]));
                             print_str(if auto_reset { b" sync" } else { b" notification" });
                             print_str(if init_state { b" initial=1\n" } else { b" initial=0\n" });
                         }
@@ -23523,7 +23533,9 @@ impl ExecNtHandler {
                             let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                                 return 0xC000_009A;
                             };
-                            let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                            let Some(event_handle) =
+                                self.mint_event_handle(index, nt_ulong_arg(args[1]))
+                            else {
                                 self.rollback_new_event(index);
                                 return 0xC000_009A;
                             };
@@ -23559,7 +23571,9 @@ impl ExecNtHandler {
                                     init_state,
                                 );
                             }
-                            let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
+                            let Some(event_handle) =
+                                self.mint_event_handle(i, nt_ulong_arg(args[1]))
+                            else {
                                 if !existed {
                                     self.rollback_new_event(i);
                                 }
@@ -23655,8 +23669,8 @@ impl ExecNtHandler {
             }
             NativeService::NtQueryEvent => {
                 const EVENT_BASIC_INFORMATION_SIZE: u32 = 8;
-                let information_class = args[1] as u32;
-                let information_length = args[3] as u32;
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]);
                 if information_class != 0 {
                     return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
                 }
@@ -23792,7 +23806,7 @@ impl ExecNtHandler {
                 }
             }
             // NtOpenEvent(*EventHandle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]). CreateEventW's
-            // ERROR_ALREADY_EXISTS fallback + OpenEventW resolve an existing named event. Return the
+            // ERROR_ALREADY_EXISTS retry path + OpenEventW resolve an existing named event. Return the
             // registered event's handle, or STATUS_OBJECT_NAME_NOT_FOUND if it doesn't exist (so the
             // create-then-open logic behaves).
             NativeService::NtOpenEvent => unsafe {
@@ -23827,7 +23841,7 @@ impl ExecNtHandler {
                     if self.obj_ns[i].kind != 2 {
                         return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                     }
-                    let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
+                    let Some(event_handle) = self.mint_event_handle(i, nt_ulong_arg(args[1])) else {
                         return 0xC000_009A;
                     };
                     if !self.xas_write_u64(out, event_handle) {
@@ -23861,7 +23875,7 @@ impl ExecNtHandler {
             NativeService::NtCreateTimer => unsafe {
                 let out = args[0];
                 let oa = args[2];
-                let timer_type = args[3];
+                let timer_type = nt_ulong_arg(args[3]);
                 if timer_type > 1 {
                     return 0xC000_000D; // STATUS_INVALID_PARAMETER
                 }
@@ -23880,7 +23894,7 @@ impl ExecNtHandler {
                     let Some(index) = this.obj_create_anon_timer(auto_reset) else {
                         return Err(0xC000_009A);
                     };
-                    let Some(handle) = this.mint_timer_handle(index, args[1] as u32) else {
+                    let Some(handle) = this.mint_timer_handle(index, nt_ulong_arg(args[1])) else {
                         this.rollback_new_timer(index);
                         return Err(0xC000_009A);
                     };
@@ -23935,7 +23949,7 @@ impl ExecNtHandler {
                         return 0xC000_009A;
                     }
                 }
-                let Some(handle) = self.mint_timer_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_timer_handle(index, nt_ulong_arg(args[1])) else {
                     if !existed {
                         self.rollback_new_timer(index);
                     }
@@ -23984,7 +23998,7 @@ impl ExecNtHandler {
                 if self.obj_ns[index].kind != OBJ_KIND_TIMER {
                     return 0xC000_0024;
                 }
-                let Some(handle) = self.mint_timer_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_timer_handle(index, nt_ulong_arg(args[1])) else {
                     return 0xC000_009A;
                 };
                 if !self.xas_write_u64(out, handle) {
@@ -24014,7 +24028,7 @@ impl ExecNtHandler {
                 let apc_routine = args[2];
                 let apc_context = args[3];
                 let wake_timer = nt_boolean_arg(args[4]);
-                let period = args[5] as u32 as i32;
+                let period = nt_long_arg(args[5]);
                 let previous_state = args[6];
                 if period < 0 {
                     return 0xC000_00F4; // STATUS_INVALID_PARAMETER_6
@@ -24098,8 +24112,8 @@ impl ExecNtHandler {
             NativeService::NtCreateSemaphore => unsafe {
                 let out = args[0];
                 let oa = args[2];
-                let initial = args[3] as u32 as i32;
-                let maximum = args[4] as u32 as i32;
+                let initial = nt_long_arg(args[3]);
+                let maximum = nt_long_arg(args[4]);
                 if out == 0 {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
@@ -24117,7 +24131,8 @@ impl ExecNtHandler {
                     let Some(index) = this.obj_create_anon_semaphore(initial, maximum) else {
                         return Err(0xC000_009A); // STATUS_INSUFFICIENT_RESOURCES
                     };
-                    let Some(handle) = this.mint_semaphore_handle(index, args[1] as u32) else {
+                    let Some(handle) = this.mint_semaphore_handle(index, nt_ulong_arg(args[1]))
+                    else {
                         this.rollback_new_semaphore(index);
                         return Err(0xC000_009A);
                     };
@@ -24165,7 +24180,7 @@ impl ExecNtHandler {
                     self.rollback_new_semaphore(index);
                     return 0xC000_000D;
                 }
-                let Some(handle) = self.mint_semaphore_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_semaphore_handle(index, nt_ulong_arg(args[1])) else {
                     if !existed {
                         self.rollback_new_semaphore(index);
                     }
@@ -24214,7 +24229,7 @@ impl ExecNtHandler {
                 if self.obj_ns[index].kind != 3 {
                     return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                 }
-                let Some(handle) = self.mint_semaphore_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_semaphore_handle(index, nt_ulong_arg(args[1])) else {
                     return 0xC000_009A;
                 };
                 if !self.xas_write_u64(out, handle) {
@@ -24225,8 +24240,8 @@ impl ExecNtHandler {
             },
             NativeService::NtQuerySemaphore => {
                 const SEMAPHORE_BASIC_INFORMATION_SIZE: u32 = 8;
-                let information_class = args[1] as u32;
-                let information_length = args[3] as u32;
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]);
                 if information_class != 0 {
                     return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
                 }
@@ -24264,7 +24279,7 @@ impl ExecNtHandler {
                 0
             },
             NativeService::NtReleaseSemaphore => {
-                let release_count = args[1] as u32 as i32;
+                let release_count = nt_long_arg(args[1]);
                 let previous_count = args[2];
                 if previous_count != 0 && previous_count & 3 != 0 {
                     return 0x8000_0002;
@@ -24317,7 +24332,7 @@ impl ExecNtHandler {
                     let Some(index) = this.obj_create_anon_mutant(owner) else {
                         return Err(0xC000_009A);
                     };
-                    let Some(handle) = this.mint_mutant_handle(index, args[1] as u32) else {
+                    let Some(handle) = this.mint_mutant_handle(index, nt_ulong_arg(args[1])) else {
                         this.rollback_new_mutant(index);
                         return Err(0xC000_009A);
                     };
@@ -24360,7 +24375,7 @@ impl ExecNtHandler {
                 if !initialized {
                     self.mutants.initialize(index as u64, owner);
                 }
-                let Some(handle) = self.mint_mutant_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_mutant_handle(index, nt_ulong_arg(args[1])) else {
                     if !existed {
                         self.rollback_new_mutant(index);
                     }
@@ -24412,7 +24427,7 @@ impl ExecNtHandler {
                 if !self.mutants.contains(index as u64) {
                     return 0xC000_0008; // STATUS_INVALID_HANDLE
                 }
-                let Some(handle) = self.mint_mutant_handle(index, args[1] as u32) else {
+                let Some(handle) = self.mint_mutant_handle(index, nt_ulong_arg(args[1])) else {
                     return 0xC000_009A;
                 };
                 if !self.xas_write_u64(out, handle) {
@@ -24478,9 +24493,9 @@ impl ExecNtHandler {
                 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
                 let out_handle = args[0];
-                let desired_access = args[1] as u32;
+                let desired_access = nt_ulong_arg(args[1]);
                 let _object_attributes = args[2];
-                let flags = args[3] as u32;
+                let flags = nt_ulong_arg(args[3]);
                 if flags != 0 {
                     return STATUS_INVALID_PARAMETER;
                 }
@@ -24562,8 +24577,8 @@ impl ExecNtHandler {
             // Model process information setters through real EPROCESS state. Unsupported classes fail
             // visibly so new callers add the missing mechanism instead of relying on fallback success.
             NativeService::NtSetInformationProcess => unsafe {
-                let information_class = args[1] as u32;
-                let information_length = args[3] as u32 as usize;
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]) as usize;
                 if information_class == 9 {
                     return self.nt_set_process_access_token(args);
                 }
@@ -24735,7 +24750,7 @@ impl ExecNtHandler {
                 }
             },
             NativeService::NtSetInformationThread => unsafe {
-                let information_class = args[1] as u32;
+                let information_class = nt_ulong_arg(args[1]);
                 if information_class == 5 {
                     return self.nt_set_thread_impersonation_token(args);
                 }
@@ -24749,7 +24764,7 @@ impl ExecNtHandler {
                     Ok(length) => length,
                     Err(status) => return status,
                 };
-                if args[3] as u32 as usize != expected {
+                if nt_ulong_arg(args[3]) as usize != expected {
                     return 0xC000_0004;
                 }
                 let mut value = [0u8; 8];
@@ -24775,9 +24790,9 @@ impl ExecNtHandler {
 
                 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
-                let class = args[0] as u32;
+                let class = nt_ulong_arg(args[0]);
                 let buffer = args[1];
-                let length = args[2] as u32 as usize;
+                let length = nt_ulong_arg(args[2]) as usize;
                 let plan = match set_plan(class, length) {
                     Ok(plan) => plan,
                     Err(status) => return status,
@@ -29801,7 +29816,8 @@ impl ExecNtHandler {
                 let Some(pid) = self.pm_pid_for_pi(self.pi) else {
                     return nt_process::STATUS_INVALID_HANDLE;
                 };
-                let object = match self.pm.create_debug_object(args[3] as u32) {
+                let flags = nt_ulong_arg(args[3]);
+                let object = match self.pm.create_debug_object(flags) {
                     Ok(object) => object,
                     Err(status) => return status,
                 };
@@ -29815,7 +29831,7 @@ impl ExecNtHandler {
                 if let Some(o) = self.pm.debug_object_mut(object) {
                     o.host_event = index + 1;
                 }
-                let access = nt_process::dbgk::map_debug_object_access(args[1] as u32);
+                let access = nt_process::dbgk::map_debug_object_access(nt_ulong_arg(args[1]));
                 let Ok(handle) = self.insert_process_handle(
                     pid,
                     nt_process::HandleObject::DebugObject(object),
@@ -29901,7 +29917,7 @@ impl ExecNtHandler {
                 };
                 match self
                     .pm
-                    .debug_continue(object, client_id, args[2] as u32)
+                    .debug_continue(object, client_id, nt_ulong_arg(args[2]))
                 {
                     Ok(event) => {
                         // ★ `DbgkpWakeTarget`: apply the continue status to the reporting thread
@@ -29910,7 +29926,7 @@ impl ExecNtHandler {
                         self.dbgk_wake_target(
                             event.client_id,
                             event.reporter_block(),
-                            args[2] as u32,
+                            nt_ulong_arg(args[2]),
                         );
                         self.sync_debug_object_signal(object);
                         DBGK_CONTINUES.fetch_add(1, Ordering::Relaxed);
