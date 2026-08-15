@@ -1645,7 +1645,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    metadata. The registry/atom follow-on now applies the same explicit boundary to atom name lengths
    and atom information classes, registry desired-access masks/create options, value type/data lengths,
    key/value enumeration index/class/length parameters, value/query buffer lengths, and `NtLoadKey*` /
-   `NtUnloadKey*` flags.
+   `NtUnloadKey*` flags. The process/file/thread follow-on now covers `NtOpenFile` desired access,
+   share access, and open options across boot-status, NPFS, writable-overlay, and FAT paths; thread
+   create/open access masks and `NtCreateThreadEx` flags; `NtCreateProcess` access publication;
+   `NtOpenProcess`/`NtOpenThread`; process/thread information classes and lengths; duplicate-object
+   options/access; named-pipe create options/access; hard-error scalar fields; system information
+   class/length; and LPC port maximum-count fields.
 
 ## Review Log
 

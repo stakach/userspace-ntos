@@ -10766,7 +10766,7 @@ impl ExecNtHandler {
         let handle = match self.insert_process_handle(
             caller_pid,
             nt_process::HandleObject::Thread(thread),
-            args[1] as u32,
+            nt_ulong_arg(args[1]),
         ) {
             Ok(handle) => handle as u64,
             Err(status) => {
@@ -10909,7 +10909,7 @@ impl ExecNtHandler {
             self.queue_write(thread_handle_out, 0);
             return STATUS_INVALID_PARAMETER;
         }
-        let create_flags = args[6] as u32;
+        let create_flags = nt_ulong_arg(args[6]);
         if create_flags & !SUPPORTED_THREAD_CREATE_FLAGS != 0 {
             self.queue_write(thread_handle_out, 0);
             return STATUS_NOT_SUPPORTED;
@@ -10955,7 +10955,7 @@ impl ExecNtHandler {
         let (slot, tid, handle) = match self.create_hosted_worker_thread_from_start(
             target_pi,
             caller_pid,
-            args[1] as u32,
+            nt_ulong_arg(args[1]),
             start,
             create_suspended,
             hide_from_debugger,
@@ -11187,7 +11187,7 @@ impl ExecNtHandler {
         let create_suspended =
             nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         let Some((slot, tid, handle)) =
-            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+            self.nt_create_thread_handle(start.rip, create_suspended, nt_ulong_arg(args[1]))
         else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
@@ -11392,7 +11392,7 @@ impl ExecNtHandler {
             .unwrap_or(HostedThreadRole::TpWorker { slot: tp_slot });
 
         let Some((pool_slot, tid, handle)) =
-            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+            self.nt_create_thread_handle(start.rip, create_suspended, nt_ulong_arg(args[1]))
         else {
             return Some(0xC000_009A);
         };
@@ -19331,18 +19331,20 @@ impl ExecNtHandler {
         let reg = &mut *ctx.reg;
         const FILE_DIRECTORY_FILE: u64 = 0x01;
         let file_handle_out = args[0];
+        let desired_access = nt_ulong_arg(args[1]);
+        let share_access = nt_ulong_arg(args[4]);
+        let open_options = nt_ulong_arg(args[5]);
         {
             let oa_probe = args[2];
             let nm = self.read_objattr_name_pe(oa_probe);
             if boot_status_path_matches(&nm) {
-                let options = args[5] as u32;
                 let mut status = nt_fs::STATUS_SUCCESS;
                 let mut opened_handle = None;
-                if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                if open_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                     status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
                 } else {
                     ensure_boot_status_data();
-                    opened_handle = self.mint_boot_status_handle(args[1] as u32);
+                    opened_handle = self.mint_boot_status_handle(desired_access);
                     if opened_handle.is_none() {
                         status = 0xC000_009A;
                     }
@@ -19390,7 +19392,7 @@ impl ExecNtHandler {
                     STATUS_DEVICE_NOT_READY
                 };
                 let opened_handle = if status == nt_fs::STATUS_SUCCESS {
-                    match self.mint_npfs_root_handle(args[1] as u32) {
+                    match self.mint_npfs_root_handle(desired_access) {
                         Some(handle) => Some(handle),
                         None => {
                             status = 0xC000_009A;
@@ -19420,10 +19422,10 @@ impl ExecNtHandler {
                     self.pi,
                     self.current_badge,
                     self.current_tid,
-                    args[1] as u32,
-                    args[4] as u32,
+                    desired_access,
+                    share_access,
                     nt_fs::FILE_OPEN,
-                    args[5] as u32,
+                    open_options,
                     status,
                     info,
                     &nm,
@@ -19447,8 +19449,7 @@ impl ExecNtHandler {
                         let mut status = st as u32;
                         let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
                         let opened_handle = if status == 0 && fid != 0 {
-                            let options = args[5] as u32;
-                            let synchronous = options
+                            let synchronous = open_options
                                 & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                     | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                 != 0;
@@ -19457,8 +19458,7 @@ impl ExecNtHandler {
                                 status = name_status;
                                 None
                             } else {
-                                let handle =
-                                    self.mint_file_handle(fid, args[1] as u32, synchronous);
+                                let handle = self.mint_file_handle(fid, desired_access, synchronous);
                                 if handle.is_none() {
                                     crate::pipe_fid_name_forget(fid);
                                     status = 0xC000_009A;
@@ -19492,10 +19492,10 @@ impl ExecNtHandler {
                             self.pi,
                             self.current_badge,
                             self.current_tid,
-                            args[1] as u32,
-                            args[4] as u32,
+                            desired_access,
+                            share_access,
                             nt_fs::FILE_OPEN,
-                            args[5] as u32,
+                            open_options,
                             status,
                             info,
                             &nm,
@@ -19523,10 +19523,10 @@ impl ExecNtHandler {
                             self.pi,
                             self.current_badge,
                             self.current_tid,
-                            args[1] as u32,
-                            args[4] as u32,
+                            desired_access,
+                            share_access,
                             nt_fs::FILE_OPEN,
-                            args[5] as u32,
+                            open_options,
                             status,
                             0,
                             &nm,
@@ -19555,18 +19555,18 @@ impl ExecNtHandler {
         if let Some(relative) = crate::writable_fs::writable_path(&name16) {
             let (mut status, file_id, information) = crate::writable_fs::create(
                 &relative,
-                args[1] as u32,
+                desired_access,
                 0,
-                args[4] as u32,
+                share_access,
                 nt_fs::FILE_OPEN,
-                args[5] as u32,
+                open_options,
             );
             if !Self::overlay_open_missed(status) || Self::readonly_volume_entry(&name16).is_none()
             {
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
                     self.writable_fs_dirty = true;
-                    match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                    match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
                             self.queue_write(file_handle_out, handle);
@@ -19604,15 +19604,15 @@ impl ExecNtHandler {
                 let (mut status, file_id, information) =
                     crate::writable_fs::open_existing_relative_if_mounted(
                         &relative,
-                        args[1] as u32,
+                        desired_access,
                         0,
-                        args[4] as u32,
-                        args[5] as u32,
+                        share_access,
+                        open_options,
                     );
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
                     self.writable_fs_dirty = true;
-                    match self.mint_overlay_file_handle(file_id, args[1] as u32) {
+                    match self.mint_overlay_file_handle(file_id, desired_access) {
                         Some(handle) => {
                             opened_handle = handle;
                             self.queue_write(file_handle_out, handle);
@@ -19649,9 +19649,7 @@ impl ExecNtHandler {
         let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
             || nb[..nlen].windows(9).any(|w| w == b".manifest")
             || nb[..nlen].windows(7).any(|w| w == b".config");
-        let want_dir = args[5] as u32 & FILE_DIRECTORY_FILE as u32 != 0;
-        let open_options = args[5] as u32;
-        let desired_access = args[1] as u32;
+        let want_dir = open_options & FILE_DIRECTORY_FILE as u32 != 0;
         // Directory opens resolve authoritatively against the mounted FAT volume. The empty
         // volume-relative path denotes the FAT root directory.
         let volume_entry =
@@ -20004,7 +20002,7 @@ impl ExecNtHandler {
             catalog,
             self.pi,
             sect,
-            args[1] as u32,
+            nt_ulong_arg(args[1]),
             args[0],
         ) {
             Ok(request) => {
@@ -20128,10 +20126,10 @@ impl ExecNtHandler {
                 0
             }
             NativeService::NtOpenProcess => unsafe {
-                self.nt_open_process(args[0], args[1] as u32, args[2], args[3])
+                self.nt_open_process(args[0], nt_ulong_arg(args[1]), args[2], args[3])
             },
             NativeService::NtOpenThread => unsafe {
-                self.nt_open_thread(args[0], args[1] as u32, args[2], args[3])
+                self.nt_open_thread(args[0], nt_ulong_arg(args[1]), args[2], args[3])
             },
             NativeService::NtGetContextThread => unsafe { self.nt_get_context_thread(args) },
             NativeService::NtSetContextThread => unsafe { self.nt_set_context_thread(args) },
@@ -20170,9 +20168,9 @@ impl ExecNtHandler {
             NativeService::NtQueryInformationThread => unsafe {
                 self.nt_query_information_thread(
                     args[0],
-                    args[1] as u32,
+                    nt_ulong_arg(args[1]),
                     args[2],
-                    args[3] as u32,
+                    nt_ulong_arg(args[3]),
                     args[4],
                 )
             },
@@ -20199,7 +20197,7 @@ impl ExecNtHandler {
 
                 let source_handle = args[1] as nt_process::Handle;
                 let source_pid = self.resolve_process_handle(args[0]);
-                let options = args[6] as u32;
+                let options = nt_ulong_arg(args[6]);
                 let mut target_pid_for_peak = None;
                 let mut close_source_pid = source_pid;
                 let mut native_duplicate = false;
@@ -20215,8 +20213,8 @@ impl ExecNtHandler {
                         return STATUS_INVALID_HANDLE;
                     };
                     target_pid_for_peak = Some(target_pid);
-                    let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
-                        .then_some(args[4] as u32);
+                    let desired_access =
+                        (options & DUPLICATE_SAME_ACCESS == 0).then_some(nt_ulong_arg(args[4]));
                     let user_same_process_duplicate =
                         source_pid == Some(target_pid) && options & DUPLICATE_SAME_ACCESS != 0;
                     if user_same_process_duplicate {
@@ -21755,6 +21753,7 @@ impl ExecNtHandler {
             // `FSCTL_PIPE_LISTEN`, read, write, and transceive calls route back to.
             NativeService::NtCreateNamedPipeFile => unsafe {
                 let file_handle_out = args[0];
+                let desired_access = nt_ulong_arg(args[1]);
                 let iosb = args[3];
                 let oa = args[2];
                 let name16 = self.read_objattr_name_pe(oa);
@@ -21822,11 +21821,11 @@ impl ExecNtHandler {
                     return status;
                 }
 
-                let options = args[6] as u32;
+                let options = nt_ulong_arg(args[6]);
                 let synchronous = options
                     & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                     != 0;
-                let Some(h) = self.mint_file_handle(routed_file_id, args[1] as u32, synchronous)
+                let Some(h) = self.mint_file_handle(routed_file_id, desired_access, synchronous)
                 else {
                     crate::pipe_server_available_forget(routed_file_id);
                     crate::pipe_fid_name_forget(routed_file_id);
@@ -22511,9 +22510,9 @@ impl ExecNtHandler {
                 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 
-                let class = args[0] as u32;
+                let class = nt_ulong_arg(args[0]);
                 let buf = args[1];
-                let len = args[2] as u32 as usize;
+                let len = nt_ulong_arg(args[2]) as usize;
                 let retlen_ptr = args[3];
 
                 if !matches!(
@@ -22633,9 +22632,9 @@ impl ExecNtHandler {
             NativeService::NtQueryInformationProcess => unsafe {
                 self.nt_query_information_process(
                     args[0],
-                    args[1] as u32,
+                    nt_ulong_arg(args[1]),
                     args[2],
-                    args[3] as u32,
+                    nt_ulong_arg(args[3]),
                     args[4],
                 )
             },
@@ -22681,14 +22680,14 @@ impl ExecNtHandler {
             NativeService::NtRaiseHardError => unsafe {
                 use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
 
-                let number_of_parameters = args[1] as u32;
-                let unicode_mask = args[2] as u32;
+                let number_of_parameters = nt_ulong_arg(args[1]);
+                let unicode_mask = nt_ulong_arg(args[2]);
                 let parameters = args[3];
                 let response = args[5];
                 if let Err(status) = validate_request(
                     number_of_parameters,
                     parameters != 0,
-                    args[4] as u32,
+                    nt_ulong_arg(args[4]),
                 ) {
                     return status;
                 }
@@ -22821,7 +22820,8 @@ impl ExecNtHandler {
                     print_u64(args[3]);
                     print_str(b"\n");
                 }
-                let handle = match client.create_port(&name16, args[2] as u32, args[3] as u32, 0) {
+                let handle =
+                    match client.create_port(&name16, nt_ulong_arg(args[2]), nt_ulong_arg(args[3]), 0) {
                     Ok(handle) if handle != 0 => {
                         if trace < 32 {
                             print_str(b"[lpc-port] create success handle=0x");
@@ -22907,7 +22907,11 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                            self.nt_create_thread_handle(
+                                start.rip,
+                                create_suspended,
+                                nt_ulong_arg(args[1]),
+                            )
                         {
                             let top_badge = self.hosted_process_top_badge(self.pi).unwrap_or(0);
                             let (role, badge, teb) = match slot {
@@ -22989,7 +22993,7 @@ impl ExecNtHandler {
                         let handle = match self.insert_process_handle(
                             caller_pid,
                             nt_process::HandleObject::Thread(tid),
-                            args[1] as u32,
+                            nt_ulong_arg(args[1]),
                         ) {
                             Ok(handle) => handle as u64,
                             Err(status) => return status,
@@ -23070,7 +23074,11 @@ impl ExecNtHandler {
                             ctx_va,
                         );
                         if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                            self.nt_create_thread_handle(
+                                start.rip,
+                                create_suspended,
+                                nt_ulong_arg(args[1]),
+                            )
                         {
                             let (role, badge, teb) = match slot {
                                 0 => (
@@ -23179,7 +23187,11 @@ impl ExecNtHandler {
                         let create_suspended =
                             nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
                         if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                            self.nt_create_thread_handle(
+                                start.rip,
+                                create_suspended,
+                                nt_ulong_arg(args[1]),
+                            )
                         {
                             if !self.reserve_created_hosted_thread_role(
                                 slot,
