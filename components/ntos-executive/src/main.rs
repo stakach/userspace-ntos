@@ -15414,7 +15414,6 @@ pub(crate) struct DriverServiceDevnodeSpec {
     pub(crate) compatible_ids: alloc::vec::Vec<alloc::string::String>,
 }
 
-const BOOT_DRIVER_DEVNODE_MAX: usize = 2;
 const BOOT_DRIVER_ID_MAX: usize = 4;
 const BOOT_DRIVER_SERVICE_NAME_MAX: usize = 64;
 const BOOT_DRIVER_CLASS_GUID_MAX: usize = 48;
@@ -15563,7 +15562,7 @@ struct InlineDriverLaunchSpec {
     driver_object_path: InlineAscii<BOOT_DRIVER_OBJECT_PATH_MAX>,
     image_path: InlineAscii<BOOT_DRIVER_IMAGE_PATH_MAX>,
     class: driver_launch::DriverClass,
-    devnodes: [InlineDriverDevnodeSpec; BOOT_DRIVER_DEVNODE_MAX],
+    devnode_start: usize,
     devnode_count: usize,
 }
 
@@ -15576,14 +15575,14 @@ impl InlineDriverLaunchSpec {
             driver_object_path: InlineAscii::empty(),
             image_path: InlineAscii::empty(),
             class: driver_launch::DriverClass::Fsd,
-            devnodes: [InlineDriverDevnodeSpec::empty(); BOOT_DRIVER_DEVNODE_MAX],
+            devnode_start: 0,
             devnode_count: 0,
         }
     }
 }
 
-fn inline_launch_spec_has_pci_devnode(spec: &InlineDriverLaunchSpec) -> bool {
-    for devnode in &spec.devnodes[..spec.devnode_count] {
+fn inline_launch_spec_has_pci_devnode(devnodes: &[InlineDriverDevnodeSpec]) -> bool {
+    for devnode in devnodes {
         if ascii_starts_with_ignore_case(devnode.instance_id.as_bytes(), b"PCI\\") {
             return true;
         }
@@ -15593,26 +15592,42 @@ fn inline_launch_spec_has_pci_devnode(spec: &InlineDriverLaunchSpec) -> bool {
 
 struct InlineDriverLaunchPlan {
     specs: alloc::vec::Vec<InlineDriverLaunchSpec>,
+    devnodes: alloc::vec::Vec<InlineDriverDevnodeSpec>,
 }
 
 impl InlineDriverLaunchPlan {
     fn new() -> Self {
         Self {
             specs: alloc::vec::Vec::new(),
+            devnodes: alloc::vec::Vec::new(),
         }
     }
 
     fn clear(&mut self) {
         self.specs.clear();
+        self.devnodes.clear();
     }
 
-    fn reserve_len(&mut self, len: usize) -> bool {
-        if self.specs.capacity() >= len {
-            return true;
+    fn reserve_shape(&mut self, shape: InlineDriverLaunchPlanShape) -> bool {
+        if self.specs.capacity() < shape.specs {
+            if self
+                .specs
+                .try_reserve_exact(shape.specs - self.specs.capacity())
+                .is_err()
+            {
+                return false;
+            }
         }
-        self.specs
-            .try_reserve_exact(len - self.specs.capacity())
-            .is_ok()
+        if self.devnodes.capacity() < shape.devnodes {
+            if self
+                .devnodes
+                .try_reserve_exact(shape.devnodes - self.devnodes.capacity())
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn push(&mut self, spec: InlineDriverLaunchSpec) -> bool {
@@ -15623,8 +15638,49 @@ impl InlineDriverLaunchPlan {
         true
     }
 
+    fn push_devnode(&mut self, devnode: InlineDriverDevnodeSpec) -> bool {
+        if self.devnodes.len() >= self.devnodes.capacity() {
+            return false;
+        }
+        self.devnodes.push(devnode);
+        true
+    }
+
+    fn devnode_len(&self) -> usize {
+        self.devnodes.len()
+    }
+
+    fn devnodes_for(&self, spec: &InlineDriverLaunchSpec) -> &[InlineDriverDevnodeSpec] {
+        let Some(end) = spec.devnode_start.checked_add(spec.devnode_count) else {
+            return &[];
+        };
+        self.devnodes
+            .get(spec.devnode_start..end)
+            .unwrap_or(&[])
+    }
+
     fn as_slice(&self) -> &[InlineDriverLaunchSpec] {
         self.specs.as_slice()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InlineDriverLaunchPlanShape {
+    specs: usize,
+    devnodes: usize,
+}
+
+impl InlineDriverLaunchPlanShape {
+    fn add_spec(&mut self, devnodes: usize) -> bool {
+        let Some(specs) = self.specs.checked_add(1) else {
+            return false;
+        };
+        let Some(total_devnodes) = self.devnodes.checked_add(devnodes) else {
+            return false;
+        };
+        self.specs = specs;
+        self.devnodes = total_devnodes;
+        true
     }
 }
 
@@ -16001,7 +16057,7 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
     let mut seen = Vec::new();
     for plan in plans {
         for spec in plan.as_slice() {
-            for devnode in &spec.devnodes[..spec.devnode_count] {
+            for devnode in plan.devnodes_for(spec) {
                 let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
                 let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
                 let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
@@ -16100,7 +16156,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     let mut resource_vas = HostedPnpResourceVaAllocator::default();
     for plan in plans {
         for spec in plan.as_slice() {
-            for devnode in &spec.devnodes[..spec.devnode_count] {
+            for devnode in plan.devnodes_for(spec) {
                 let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
                 let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
                 let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];
@@ -16355,44 +16411,66 @@ fn inline_devnode_spec_from_record(
     Some(dst)
 }
 
-fn fill_inline_devnodes_from_records(
+fn count_inline_devnodes_from_records(
     cm: &nt_config_manager::ConfigManager,
     records: &[nt_config_manager::DevnodeRecord],
-    out: &mut [InlineDriverDevnodeSpec],
 ) -> usize {
     let mut count = 0usize;
     for devnode in records {
-        if count >= out.len() {
-            break;
-        }
-        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
-            out[count] = dst;
+        if inline_devnode_spec_from_record(cm, devnode).is_some() {
             count += 1;
         }
     }
     count
 }
 
-fn fill_inline_devnodes(
-    cm: &nt_config_manager::ConfigManager,
-    service_name: &str,
-    out: &mut [InlineDriverDevnodeSpec],
-) -> usize {
+fn count_inline_devnodes(cm: &nt_config_manager::ConfigManager, service_name: &str) -> usize {
     let mut count = 0usize;
     for devnode in cm.devnodes_for_service(service_name) {
-        if count >= out.len() {
-            break;
-        }
-        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
-            out[count] = dst;
+        if inline_devnode_spec_from_record(cm, devnode).is_some() {
             count += 1;
         }
     }
     count
 }
 
-fn inline_driver_launch_spec_from_service_metadata(
+fn append_inline_devnodes_from_records(
     cm: &nt_config_manager::ConfigManager,
+    records: &[nt_config_manager::DevnodeRecord],
+    plan: &mut InlineDriverLaunchPlan,
+) -> Option<(usize, usize)> {
+    let start = plan.devnode_len();
+    let mut count = 0usize;
+    for devnode in records {
+        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
+            if !plan.push_devnode(dst) {
+                return None;
+            }
+            count += 1;
+        }
+    }
+    Some((start, count))
+}
+
+fn append_inline_devnodes(
+    cm: &nt_config_manager::ConfigManager,
+    service_name: &str,
+    plan: &mut InlineDriverLaunchPlan,
+) -> Option<(usize, usize)> {
+    let start = plan.devnode_len();
+    let mut count = 0usize;
+    for devnode in cm.devnodes_for_service(service_name) {
+        if let Some(dst) = inline_devnode_spec_from_record(cm, devnode) {
+            if !plan.push_devnode(dst) {
+                return None;
+            }
+            count += 1;
+        }
+    }
+    Some((start, count))
+}
+
+fn inline_driver_launch_spec_header_from_service_metadata(
     service: &nt_config_manager::ServiceMetadata,
     max_start: u32,
 ) -> Option<InlineDriverLaunchSpec> {
@@ -16414,7 +16492,19 @@ fn inline_driver_launch_spec_from_service_metadata(
         spec.class_guid_present = true;
     }
     spec.class = class;
-    spec.devnode_count = fill_inline_devnodes(cm, &service.name, &mut spec.devnodes);
+    Some(spec)
+}
+
+fn inline_driver_launch_spec_from_service_metadata(
+    cm: &nt_config_manager::ConfigManager,
+    service: &nt_config_manager::ServiceMetadata,
+    max_start: u32,
+    plan: &mut InlineDriverLaunchPlan,
+) -> Option<InlineDriverLaunchSpec> {
+    let mut spec = inline_driver_launch_spec_header_from_service_metadata(service, max_start)?;
+    let (start, count) = append_inline_devnodes(cm, &service.name, plan)?;
+    spec.devnode_start = start;
+    spec.devnode_count = count;
     Some(spec)
 }
 
@@ -16422,27 +16512,13 @@ fn inline_driver_launch_spec_from_pnp_binding(
     cm: &nt_config_manager::ConfigManager,
     binding: nt_config_manager::PnpDriverBinding,
     max_start: u32,
+    plan: &mut InlineDriverLaunchPlan,
 ) -> Option<InlineDriverLaunchSpec> {
-    let mut image_path = [0u8; BOOT_DRIVER_IMAGE_PATH_MAX];
-    let (image_path_len, class) =
-        driver_launch_spec_from_service_metadata(&binding.service, &mut image_path, max_start)?;
-    let driver_object_path = binding.service.driver_object_path()?;
-    let mut spec = InlineDriverLaunchSpec::empty();
-    if !spec.service_name.set_str(&binding.service.name)
-        || !spec.driver_object_path.set_str(&driver_object_path)
-        || !spec.image_path.set_bytes(&image_path[..image_path_len])
-    {
-        return None;
-    }
-    if let Some(class_guid) = binding.service.class_guid.as_deref() {
-        if !spec.class_guid.set_str(class_guid) {
-            return None;
-        }
-        spec.class_guid_present = true;
-    }
-    spec.class = class;
-    spec.devnode_count =
-        fill_inline_devnodes_from_records(cm, &binding.devnodes, &mut spec.devnodes);
+    let mut spec =
+        inline_driver_launch_spec_header_from_service_metadata(&binding.service, max_start)?;
+    let (start, count) = append_inline_devnodes_from_records(cm, &binding.devnodes, plan)?;
+    spec.devnode_start = start;
+    spec.devnode_count = count;
     (spec.devnode_count != 0).then_some(spec)
 }
 
@@ -16500,45 +16576,72 @@ fn config_hive_boot_system_driver_launch_spec(
     })
 }
 
-fn count_config_hive_boot_system_pnp_driver_launch_specs() -> usize {
+fn count_config_hive_boot_system_pnp_driver_launch_shape() -> InlineDriverLaunchPlanShape {
     let heap_mark = allocator::mark();
-    let mut count = 0usize;
+    let mut shape = InlineDriverLaunchPlanShape::default();
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
-            if let Some(spec) =
-                inline_driver_launch_spec_from_pnp_binding(&cm, binding, SERVICE_SYSTEM_START)
+            if inline_driver_launch_spec_header_from_service_metadata(
+                &binding.service,
+                SERVICE_SYSTEM_START,
+            )
+            .is_some()
             {
-                let _ = spec;
-                count += 1;
+                let devnodes = count_inline_devnodes_from_records(&cm, &binding.devnodes);
+                if devnodes != 0 && !shape.add_spec(devnodes) {
+                    break;
+                }
             }
         }
     }
     unsafe { allocator::reset_to(heap_mark) };
-    count
+    shape
 }
 
 fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    let required = count_config_hive_boot_system_pnp_driver_launch_specs();
+    let required = count_config_hive_boot_system_pnp_driver_launch_shape();
     let plan = unsafe { config_boot_pnp_driver_plan_mut() };
     plan.clear();
-    if !plan.reserve_len(required) {
-        print_str(b"[driver-launch] config PnP launch plan reserve failed count=");
-        print_u64(required as u64);
+    if !plan.reserve_shape(required) {
+        print_str(b"[driver-launch] config PnP launch plan reserve failed specs=");
+        print_u64(required.specs as u64);
+        print_str(b" devnodes=");
+        print_u64(required.devnodes as u64);
         print_str(b"\n");
         return plan;
     }
     let heap_mark = allocator::mark();
     if let Some(cm) = config_hive_config_manager() {
         for binding in cm.boot_system_pnp_driver_bindings() {
-            if let Some(spec) =
-                inline_driver_launch_spec_from_pnp_binding(&cm, binding, SERVICE_SYSTEM_START)
+            if inline_driver_launch_spec_header_from_service_metadata(
+                &binding.service,
+                SERVICE_SYSTEM_START,
+            )
+            .is_none()
             {
+                continue;
+            }
+            if let Some(spec) = inline_driver_launch_spec_from_pnp_binding(
+                &cm,
+                binding,
+                SERVICE_SYSTEM_START,
+                plan,
+            ) {
                 if !plan.push(spec) {
-                    print_str(b"[driver-launch] config PnP launch plan capacity raced count=");
-                    print_u64(required as u64);
+                    print_str(b"[driver-launch] config PnP launch plan capacity raced specs=");
+                    print_u64(required.specs as u64);
+                    print_str(b" devnodes=");
+                    print_u64(required.devnodes as u64);
                     print_str(b"\n");
                     break;
                 }
+            } else {
+                print_str(b"[driver-launch] config PnP launch plan fill failed specs=");
+                print_u64(required.specs as u64);
+                print_str(b" devnodes=");
+                print_u64(required.devnodes as u64);
+                print_str(b"\n");
+                break;
             }
         }
     }
@@ -16656,33 +16759,40 @@ fn system_hive_service_selection_report() -> InlineServiceSelectionReport {
     report
 }
 
-fn count_system_hive_boot_driver_launch_specs() -> usize {
+fn count_system_hive_boot_driver_launch_shape() -> InlineDriverLaunchPlanShape {
     let heap_mark = allocator::mark();
-    let mut count = 0usize;
+    let mut shape = InlineDriverLaunchPlanShape::default();
     if let Some(cm) = system_hive_config_manager() {
         for service in cm.boot_system_driver_candidates() {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
             }
-            if let Some(spec) =
-                inline_driver_launch_spec_from_service_metadata(&cm, &service, SERVICE_SYSTEM_START)
+            if inline_driver_launch_spec_header_from_service_metadata(
+                &service,
+                SERVICE_SYSTEM_START,
+            )
+            .is_some()
             {
-                let _ = spec;
-                count += 1;
+                let devnodes = count_inline_devnodes(&cm, &service.name);
+                if !shape.add_spec(devnodes) {
+                    break;
+                }
             }
         }
     }
     unsafe { allocator::reset_to(heap_mark) };
-    count
+    shape
 }
 
 fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    let required = count_system_hive_boot_driver_launch_specs();
+    let required = count_system_hive_boot_driver_launch_shape();
     let plan = unsafe { system_boot_driver_plan_mut() };
     plan.clear();
-    if !plan.reserve_len(required) {
-        print_str(b"[driver-launch] system boot driver launch plan reserve failed count=");
-        print_u64(required as u64);
+    if !plan.reserve_shape(required) {
+        print_str(b"[driver-launch] system boot driver launch plan reserve failed specs=");
+        print_u64(required.specs as u64);
+        print_str(b" devnodes=");
+        print_u64(required.devnodes as u64);
         print_str(b"\n");
         return plan;
     }
@@ -16692,15 +16802,35 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
             }
-            if let Some(spec) =
-                inline_driver_launch_spec_from_service_metadata(&cm, &service, SERVICE_SYSTEM_START)
+            if inline_driver_launch_spec_header_from_service_metadata(
+                &service,
+                SERVICE_SYSTEM_START,
+            )
+            .is_none()
             {
+                continue;
+            }
+            if let Some(spec) = inline_driver_launch_spec_from_service_metadata(
+                &cm,
+                &service,
+                SERVICE_SYSTEM_START,
+                plan,
+            ) {
                 if !plan.push(spec) {
-                    print_str(b"[driver-launch] system boot driver launch plan capacity raced count=");
-                    print_u64(required as u64);
+                    print_str(b"[driver-launch] system boot driver launch plan capacity raced specs=");
+                    print_u64(required.specs as u64);
+                    print_str(b" devnodes=");
+                    print_u64(required.devnodes as u64);
                     print_str(b"\n");
                     break;
                 }
+            } else {
+                print_str(b"[driver-launch] system boot driver launch plan fill failed specs=");
+                print_u64(required.specs as u64);
+                print_str(b" devnodes=");
+                print_u64(required.devnodes as u64);
+                print_str(b"\n");
+                break;
             }
         }
     }
@@ -24599,6 +24729,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_started = 0u64;
         let mut generic_hw_first_error = 0u32;
         for spec in system_boot_driver_plan.as_slice() {
+            let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
             if driver_launch::driver_id_by_name(spec.driver_object_path.as_str()).is_some() {
                 print_str(b"[driver-launch] boot/system service already loaded ");
                 print_str(spec.service_name.as_bytes());
@@ -24612,8 +24743,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if spec.devnode_count != 0 {
                 print_str(b" devnodes=");
                 print_u64(spec.devnode_count as u64);
-                print_str(b" first=");
-                print_str(spec.devnodes[0].instance_id.as_bytes());
+                if let Some(first) = spec_devnodes.first() {
+                    print_str(b" first=");
+                    print_str(first.instance_id.as_bytes());
+                }
             }
             print_str(b"\n");
             if let Some(dc) = load_driver(
@@ -24626,6 +24759,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let start_report = start_inline_driver_service_devnodes(
                         &dc,
                         spec,
+                        spec_devnodes,
                         HostedPnpStartOptions::boot_service(),
                     );
                     generic_hw_granted |= start_report.resource_granted;
@@ -25456,7 +25590,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if !config_pnp_plan.as_slice().is_empty() {
         if let Some(fs) = exec_fs() {
             for proof_pnp_spec in config_pnp_plan.as_slice() {
-                let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(proof_pnp_spec);
+                let proof_pnp_devnodes = config_pnp_plan.devnodes_for(proof_pnp_spec);
+                let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(proof_pnp_devnodes);
                 let spec_devnodes = proof_pnp_spec.devnode_count as u64;
                 generic_hw_selected += spec_devnodes;
                 generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
@@ -25487,6 +25622,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let start_report = start_inline_driver_service_devnodes(
                         &dc,
                         proof_pnp_spec,
+                        proof_pnp_devnodes,
                         HostedPnpStartOptions::hardware_proof(),
                     );
                     generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;

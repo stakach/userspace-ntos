@@ -341,6 +341,7 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
 pub(crate) unsafe fn start_inline_driver_service_devnodes(
     dc: &driver_launch::DriverComponent,
     spec: &InlineDriverLaunchSpec,
+    devnodes: &[InlineDriverDevnodeSpec],
     options: HostedPnpStartOptions,
 ) -> HostedPnpStartReport {
     let mut report = HostedPnpStartReport {
@@ -352,7 +353,7 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
     } else {
         None
     };
-    for devnode in &spec.devnodes[..spec.devnode_count] {
+    for devnode in devnodes {
         let mut hardware_refs = [""; BOOT_DRIVER_ID_MAX];
         let hardware_refs = devnode.hardware_refs(&mut hardware_refs);
         let mut compatible_refs = [""; BOOT_DRIVER_ID_MAX];

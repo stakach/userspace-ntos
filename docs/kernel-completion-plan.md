@@ -39,8 +39,8 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-15):
-`.tmp/run-desktop-pnp-grow-cleanups-20260815-094938.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the B3 display/PnP growable-state cleanup. This
+`.tmp/run-desktop-grow-devnodes-20260815-100315.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the B3 display/PnP launch-plan cleanup. This
 retains the D2/D3/D4 registry/profile/reboot-persistence guarantees: the live `Default User\ntuser.dat`
 image is staged and copied into the profile, `NtLoadKey` mounts the profile hive, `NtFlushKey`
 checkpoints mutable hives, provider-backed hive boot failures stay non-synthetic, dynamic regf
@@ -3403,8 +3403,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the temporary heap mark. Plan-entry allocation failure now leaves a visible
   `[driver-launch] ... reserve failed` trace rather than silently truncating the plan. Validation:
   `cargo fmt --all` and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`. Remaining B3 launch-plan cleanup is the per-service devnode count and
-  hardware/compatible-ID/path capture bounds.
+  x86_64-unknown-none`.
+
+- B3 boot/system driver devnode-count cleanup (2026-08-15). The launch-plan snapshot no longer keeps
+  a fixed two-devnode array inside every boot/system driver spec. `InlineDriverLaunchPlan` now owns a
+  second growable, persistent devnode table and each launch spec stores a range into that table. The
+  shape pass counts both accepted specs and accepted devnodes, reserves both vectors outside the
+  temporary Config Manager heap mark, and the fill pass only copies into already-reserved storage.
+  PnP hardware-grant discovery, hosted resource-window publication, and hosted `AddDevice` start now
+  consume devnode slices from the owning plan; capacity races emit `[driver-launch] ... fill failed`
+  instead of silently dropping a registry-selected devnode. Validation: `cargo fmt --all` and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, plus serialized desktop proof
+  `.tmp/run-desktop-grow-devnodes-20260815-100315.log` reaching `296/296` with no launch-plan
+  reserve/capacity/fill failures and `exec_explorer_shell_chrome_painted` green. Remaining B3
+  launch-plan cleanup is the hardware/compatible-ID and path/string capture bounds. Review
+  adjustment: the same proof exposes a non-gating late `rundll32.exe` `vmf-out`; track that under the
+  next process image/VAD cleanup rather than hiding it in the launch-plan work.
 
 - B3 PnP runtime status cache cleanup (2026-08-15). `NtPlugPlayControl` device-status overlays no
   longer live in a 64-record table. `PnpRuntimeStatusTable` now stores inline status records in a
@@ -3415,10 +3430,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
 
 - B3 combined desktop validation after growable PnP cleanup (2026-08-15). Serialized
-  `./run.sh --desktop` proof `.tmp/run-desktop-pnp-grow-cleanups-20260815-094938.log` reaches the
-  sentinel with `296/296` checks, no launch-plan reserve/capacity failures, no PnP status growth
-  failures, `userinit.exe` and `explorer.exe` shell gates green, `exec_explorer_shell_chrome_painted`
-  green, and the final framebuffer fully non-background.
+  `./run.sh --desktop` proof `.tmp/run-desktop-grow-devnodes-20260815-100315.log` reaches the
+  sentinel with `296/296` checks, no launch-plan reserve/capacity/fill failures, no PnP status
+  growth failures, `userinit.exe` and `explorer.exe` shell gates green,
+  `exec_explorer_shell_chrome_painted` green, and the final framebuffer fully non-background.
 
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
