@@ -14987,7 +14987,7 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
 
-        let desired_access = args[2] as u32;
+        let desired_access = nt_ulong_arg(args[2]);
         if desired_access & GENERIC_MASK != 0 {
             return STATUS_GENERIC_NOT_MAPPED;
         }
@@ -15060,7 +15060,7 @@ impl ExecNtHandler {
         const PROCESS_SET_INFORMATION: u32 = 0x0200;
         const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
 
-        if args[3] as u32 as usize != 16 {
+        if nt_ulong_arg(args[3]) as usize != 16 {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
         let mut captured = [0u8; 16];
@@ -15385,7 +15385,7 @@ impl ExecNtHandler {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const TOKEN_DUPLICATE: u32 = 0x0002;
 
-        let token_type = match args[4] as u32 {
+        let token_type = match nt_ulong_arg(args[4]) {
             1 => nt_security::TokenType::Primary,
             2 => nt_security::TokenType::Impersonation,
             _ => return STATUS_INVALID_PARAMETER,
@@ -15430,7 +15430,8 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return nt_process::STATUS_INVALID_HANDLE,
         };
-        let desired_access = if args[1] as u32 == 0 {
+        let desired_access_arg = nt_ulong_arg(args[1]);
+        let desired_access = if desired_access_arg == 0 {
             match self
                 .pm
                 .handle_access(caller_pid, args[0] as nt_process::Handle)
@@ -15439,12 +15440,12 @@ impl ExecNtHandler {
                 None => return nt_process::STATUS_INVALID_HANDLE,
             }
         } else {
-            args[1] as u32
+            desired_access_arg
         };
         let duplicate =
             match self
                 .token_store
-                .duplicate(source, token_type, level, (args[3] as u8) != 0)
+                .duplicate(source, token_type, level, nt_boolean_arg(args[3]))
             {
                 Ok(token) => token,
                 Err(status) => return status,
@@ -15492,7 +15493,7 @@ impl ExecNtHandler {
         );
 
         let out = args[0];
-        let desired_access = args[1] as u32;
+        let desired_access = nt_ulong_arg(args[1]);
         let object_attributes = args[2];
         if !self.probe_user_output(out, 8) {
             SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_ACCESS_VIOLATION as u64, Ordering::Relaxed);
@@ -15500,7 +15501,8 @@ impl ExecNtHandler {
         }
         // ReactOS checks the token type BEFORE the privilege check, so a garbage type is reported
         // as STATUS_BAD_TOKEN_TYPE even to an unprivileged caller (tokenlif.c:1686).
-        if args[3] as u32 != 1 && args[3] as u32 != 2 {
+        let token_type_arg = nt_ulong_arg(args[3]);
+        if token_type_arg != 1 && token_type_arg != 2 {
             SE_CREATE_TOKEN_LAST_STATUS.store(STATUS_BAD_TOKEN_TYPE as u64, Ordering::Relaxed);
             return STATUS_BAD_TOKEN_TYPE;
         }
@@ -15552,7 +15554,7 @@ impl ExecNtHandler {
         }
 
         let request = nt_security::CreateTokenArgs {
-            token_type: args[3] as u32,
+            token_type: token_type_arg,
             authentication_id: args[4],
             expiration_time: args[5],
             token_user: args[6],
@@ -15717,7 +15719,7 @@ impl ExecNtHandler {
             }
             context.token
         };
-        let status = self.insert_owned_token_handle(caller_pid, owned, args[1] as u32, out);
+        let status = self.insert_owned_token_handle(caller_pid, owned, nt_ulong_arg(args[1]), out);
         if status == 0 && context.copy_on_open {
             self.token_dirty = true;
         }
@@ -15731,7 +15733,7 @@ impl ExecNtHandler {
         const THREAD_SET_THREAD_TOKEN: u32 = 0x0080;
         const TOKEN_IMPERSONATE: u32 = 0x0004;
 
-        if args[3] as u32 as usize != 8 {
+        if nt_ulong_arg(args[3]) as usize != 8 {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
         let mut captured = [0u8; 8];
@@ -15838,7 +15840,7 @@ impl ExecNtHandler {
 
         let disable_all = nt_boolean_arg(args[1]);
         let new_state = args[2];
-        let buffer_length = args[3] as u32 as usize;
+        let buffer_length = nt_ulong_arg(args[3]) as usize;
         let previous_state = args[4];
         let return_length = args[5];
         if !disable_all && new_state == 0 {
@@ -24469,10 +24471,10 @@ impl ExecNtHandler {
             // EPROCESS, open its primary token into the caller's typed handle table, and preserve
             // the requested token access mask for later checks.
             NativeService::NtOpenProcessToken => unsafe {
-                self.nt_open_process_token(args[0], args[1] as u32, args[2])
+                self.nt_open_process_token(args[0], nt_ulong_arg(args[1]), args[2])
             },
             NativeService::NtOpenProcessTokenEx => unsafe {
-                self.nt_open_process_token(args[0], args[1] as u32, args[3])
+                self.nt_open_process_token(args[0], nt_ulong_arg(args[1]), args[3])
             },
             NativeService::NtDuplicateToken => unsafe { self.nt_duplicate_token(args) },
             // NtCreateToken — 13 args (4 register + 9 stack). See `nt_create_token`.
@@ -24755,10 +24757,10 @@ impl ExecNtHandler {
                     return self.nt_set_thread_impersonation_token(args);
                 }
                 if information_class == 10 {
-                    return self.nt_set_thread_zero_tls_cell(args[0], args[2], args[3] as u32);
+                    return self.nt_set_thread_zero_tls_cell(args[0], args[2], nt_ulong_arg(args[3]));
                 }
                 if information_class == 38 {
-                    return self.nt_set_thread_name(args[0], args[2], args[3] as u32);
+                    return self.nt_set_thread_name(args[0], args[2], nt_ulong_arg(args[3]));
                 }
                 let expected = match Self::thread_set_length(information_class) {
                     Ok(length) => length,
@@ -25018,8 +25020,8 @@ impl ExecNtHandler {
                     | nt_security::GROUP_SECURITY_INFORMATION
                     | nt_security::DACL_SECURITY_INFORMATION
                     | nt_security::SACL_SECURITY_INFORMATION;
-                let security_information = args[1] as u32;
-                let buffer_length = args[3] as u32 as usize;
+                let security_information = nt_ulong_arg(args[1]);
+                let buffer_length = nt_ulong_arg(args[3]) as usize;
                 if security_information & !QUERY_MASK != 0 {
                     return 0xC000_000D;
                 }
@@ -25195,7 +25197,7 @@ impl ExecNtHandler {
                     | nt_security::PROTECTED_SACL_SECURITY_INFORMATION
                     | nt_security::UNPROTECTED_DACL_SECURITY_INFORMATION
                     | nt_security::UNPROTECTED_SACL_SECURITY_INFORMATION;
-                let security_information = args[1] as u32;
+                let security_information = nt_ulong_arg(args[1]);
                 if security_information & !SET_MASK != 0 {
                     return 0xC000_000D;
                 }
@@ -25383,15 +25385,15 @@ impl ExecNtHandler {
                     Err(status) => status,
                 }
             }
-            NativeService::NtInitializeRegistry => self.nt_initialize_registry(args[0] as u32),
+            NativeService::NtInitializeRegistry => self.nt_initialize_registry(nt_ulong_arg(args[0])),
             NativeService::NtSetDefaultLocale => {
-                self.nt_set_default_locale(nt_boolean_arg(args[0]), args[1] as u32)
+                self.nt_set_default_locale(nt_boolean_arg(args[0]), nt_ulong_arg(args[1]))
             }
             NativeService::NtSetDefaultUILanguage => {
-                if args[0] > u16::MAX as u64 {
+                let langid = nt_ulong_arg(args[0]);
+                if langid > u16::MAX as u32 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let langid = args[0] as u32;
                 if langid != 0 {
                     NT_PENDING_UI_LANGUAGE.store(langid, Ordering::Relaxed);
                     0
@@ -25440,9 +25442,9 @@ impl ExecNtHandler {
                 const POWER_ACTION_VALID_MASK: u32 =
                     0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x1000_0000
                     | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
-                let system_action = args.first().copied().unwrap_or(0) as u32;
-                let min_system_state = args.get(1).copied().unwrap_or(0) as u32;
-                let flags = args.get(2).copied().unwrap_or(0) as u32;
+                let system_action = nt_ulong_arg(args.first().copied().unwrap_or(0));
+                let min_system_state = nt_ulong_arg(args.get(1).copied().unwrap_or(0));
+                let flags = nt_ulong_arg(args.get(2).copied().unwrap_or(0));
                 if !(1..=7).contains(&system_action)
                     || !(1..7).contains(&min_system_state)
                     || flags & !POWER_ACTION_VALID_MASK != 0
@@ -25497,9 +25499,9 @@ impl ExecNtHandler {
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
                 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
                 const TOKEN_QUERY: u32 = 0x0008;
-                let class = args[1] as u32;
+                let class = nt_ulong_arg(args[1]);
                 let buf = args[2];
-                let len = args[3] as u32 as usize;
+                let len = nt_ulong_arg(args[3]) as usize;
                 let retlen_ptr = args[4];
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;

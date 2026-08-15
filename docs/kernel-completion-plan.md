@@ -1633,6 +1633,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    lengths touched by the same slice. Stale wait-path comments that still described a fallback now
    document the real `STATUS_INSUFFICIENT_RESOURCES` result. Continue replacing remaining raw
    `args[n] as u32` service-body captures with explicit NT scalar helpers in small audited groups.
+   The next security/token follow-on applies the same boundary to `NtAccessCheck`,
+   `NtSetInformationProcess(ProcessAccessToken)`, `NtDuplicateToken`, `NtCreateToken`,
+   `NtOpenThreadToken`, `NtSetInformationThread`'s token/name/TLS lengths,
+   `NtAdjustPrivilegesToken`, `NtQueryInformationToken`, object security query/set services, locale
+   setters, registry initialization mode, and power-state flags.
 
 ## Review Log
 
