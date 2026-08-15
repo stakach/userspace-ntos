@@ -3394,8 +3394,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   without overwriting older observations, and surfaces allocation pressure by declining the cache
   insert instead of silently evicting unrelated session state. This keeps the current shell proof
   counters unchanged while removing another fixed GUI-client/session cap before multi-session and
-  heavier service-GUI traffic. Validation: `cargo fmt --all` and `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+  heavier service-GUI traffic. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and serialized desktop proof
+  `.tmp/run-desktop-session-runtime-cache-20260815.log`, which reaches `296/296` with
+  `exec_userinit_builtin_classes_reused`, `exec_userinit_scrollbar_classinfo`,
+  `exec_gdi_user_batch_flushed`, `exec_vm_pool_headroom`, and `exec_explorer_shell_chrome_painted`
+  green. The proof records `class-atom-names=413`, `cursor-identities=32`, and final
+  `exec-heap-free=7794KiB`.
 
 - B3 root-bus resource profile catalog cleanup (2026-08-15). The executive PnP broker no longer
   stores broker-backed root-bus resource profiles in a one-entry static array. `nt-pnp` now owns a
