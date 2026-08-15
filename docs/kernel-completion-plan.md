@@ -3451,6 +3451,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   growth failures, `userinit.exe` and `explorer.exe` shell gates green,
   `exec_explorer_shell_chrome_painted` green, and the final framebuffer fully non-background.
 
+- B3 resource runway diagnosis and guard (2026-08-15). The same proof showed plenty of real machine
+  runway (`ut-free=60488KiB`, no `vm-fail` counters, no image-mapcap failures, QEMU configured with
+  1 GiB) while the executive bump heap ended at `8260704/8388608` bytes. That means the current
+  pressure is the executive's local permanent-state arena, not a BOOTBOOT/initrd limit or general VM
+  exhaustion. The executive heap is now 16 MiB, spawned-service heaps stay at 512 KiB, and
+  `exec_vm_pool_headroom` includes a 1 MiB executive-heap runway floor so a future desktop proof
+  cannot pass while the local arena is effectively full. Review adjustment: continue shrinking or
+  reclaiming durable boot/PnP/CM state, but use BOOTBOOT artifact changes only when the explicit
+  initrd-size guard fires. Validation: `cargo fmt --all`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `./components/ntos-executive/build.sh`, `./rust-micro/scripts/build_kernel.sh extern-rootserver`,
+  and serialized boot proof `.tmp/run-headless-exec-heap-16m-20260815.log`. Result: the BOOTBOOT
+  initrd guard did not fire, the run reached `296/296`, `exec_vm_pool_headroom` passed with
+  `ut-free=51196KiB` and `exec-heap-free=7810KiB`, and `exec_explorer_shell_chrome_painted` stayed
+  green.
+
 - D2 REGF-to-mutable-hive bridge slice. `nt-hive-regf` now owns a clean layering adapter,
   `import_regf_into_hive`, that copies a real parsed `regf` tree into the `nt-hive-core::Hive`
   mutable cell arena without making `nt-hive-core` depend on the disk-format parser. The imported

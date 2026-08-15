@@ -5231,6 +5231,7 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
     let untyped_used = UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed);
     let untyped_total = UT_TOTAL_BYTES.load(Ordering::Relaxed);
     let untyped_free = untyped_total.saturating_sub(untyped_used);
+    let executive_heap_remaining = allocator::remaining();
     let slots_total =
         ROOT_CSPACE_END.load(Ordering::Relaxed) - ROOT_CSPACE_START.load(Ordering::Relaxed);
     let slots_available = root_slot_available_count();
@@ -5248,6 +5249,9 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
         untyped_total != 0
             // … and the full ReactOS desktop proof still leaves a substantial root-Untyped runway.
             && untyped_free >= MIN_BOOT_UNTYPED_HEADROOM_BYTES
+            // The executive bump heap is also a hard cap; fail while there is still room to
+            // diagnose instead of letting the next permanent CM/PnP allocation turn into a null.
+            && executive_heap_remaining >= MIN_EXECUTIVE_HEAP_HEADROOM_BYTES
             // Every executive-side fixed pool remains strictly under three quarters of its capacity.
             && slots_total != 0
             && registry * 4 < CSRSS_FRAME_CAP as u64 * 3
@@ -8496,6 +8500,7 @@ pub(crate) static UT_TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// is now checked directly through live slot availability; Untyped pressure is a byte runway, not a
 /// stale percentage tied to the earlier, smaller boot frontier.
 pub(crate) const MIN_BOOT_UNTYPED_HEADROOM_BYTES: u64 = 48 * 1024 * 1024;
+pub(crate) const MIN_EXECUTIVE_HEAP_HEADROOM_BYTES: usize = 1024 * 1024;
 /// Retypes that came back with a real seL4 error label, and the last such label/object type.
 /// `seL4_NotEnoughMemory` = 10 is "the boot Untyped is spent".
 pub(crate) static UT_RETYPE_FAILS: AtomicU64 = AtomicU64::new(0);
@@ -8626,6 +8631,12 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(UT_RETYPE_LIVE_HIGH_WATER.load(Ordering::Relaxed) >> 10);
     print_str(b"KiB ut-released=");
     print_u64(UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed) >> 10);
+    print_str(b"KiB exec-heap=");
+    print_u64((allocator::mark() as u64) >> 10);
+    print_str(b"KiB/");
+    print_u64((allocator::HEAP_FRAMES * 0x1000) >> 10);
+    print_str(b"KiB exec-heap-free=");
+    print_u64((allocator::remaining() as u64) >> 10);
     print_str(b"KiB retypes=");
     print_u64(UT_RETYPE_CALLS.load(Ordering::Relaxed));
     print_str(b" ut-fails=");

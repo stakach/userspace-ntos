@@ -25,9 +25,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 /// HEAP_BASE and the first heap write faulted RO at 0x480000.
 pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// Heap size in 4 KiB frames — the allocator's hard cap. Now that the VA layout is roomy, the
-/// executive gets a generous 2 MiB (was a cramped 128 KiB that OOM'd during registry enum, forcing
-/// per-syscall mark/reset). Spawned services map only [`SERVICE_HEAP_FRAMES`] to spare the boot
-/// frame budget; they never allocate near this cap.
+/// executive gets a dedicated desktop-sized arena (was a cramped 128 KiB that OOM'd during registry
+/// enum, forcing per-syscall mark/reset). Spawned services map only [`SERVICE_HEAP_FRAMES`] to spare
+/// the boot frame budget; they never allocate near this cap.
 /// ★ RAISED 512 -> 1536 (2 MiB -> 6 MiB). The 2 MiB cap was measured at **1953957/2097152 = 93%**
 /// at the winlogon profile frontier: the CM overlay, the writable volume and every `*_dirty`
 /// mark-pin move the permanent floor, and a heap that reaches its cap does not panic — allocations
@@ -42,7 +42,11 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// installed setup state and shell COM class provisioning directly in mounted hives. The prior green
 /// boot measured 6.82 MiB used under the 7 MiB cap, leaving too little room for that durable CM
 /// state before the service-loop reset mark. Spawned service heaps remain capped separately below.
-pub const HEAP_FRAMES: u64 = 2048;
+/// ★ RAISED 2048 -> 4096 (8 MiB -> 16 MiB) after the growable PnP launch/status cleanup produced a
+/// real desktop proof with only about 128 KiB left under the executive bump cap while the measured
+/// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
+/// BOOTBOOT/initrd or general VM-memory limit.
+pub const HEAP_FRAMES: u64 = 4096;
 /// Heap frames mapped into a spawned service's VSpace. **Deliberately NOT raised with
 /// [`HEAP_FRAMES`]** — a service's heap is per-VSpace, so tracking the executive would spend
 /// `services x frames` boot memory for heaps that allocate only a small bootstrap working set. The
