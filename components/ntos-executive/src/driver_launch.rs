@@ -46,6 +46,10 @@ use nt_mdl::MdlRegistry;
 use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
+use nt_video_miniport::{
+    VideoHwInitializationDataError, VideoHwInitializationDataVersion,
+    VideoHwInitializationDataX64, VIDEO_HW_INITIALIZATION_DATA_X64_SIZE,
+};
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_wcslen};
@@ -2703,6 +2707,7 @@ extern "win64" fn s_c_specific_handler(
 }
 
 const STATUS_SUCCESS: i32 = 0;
+const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
@@ -2712,6 +2717,7 @@ const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
+const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 
 const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
 const UNICODE_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
@@ -7550,6 +7556,119 @@ extern "win64" fn s_dbg_print() -> i32 {
     0
 }
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct HostedVideoPortInitialization {
+    calls: u64,
+    driver_object: u64,
+    registry_path: u64,
+    hw_context: u64,
+    data: VideoHwInitializationDataX64,
+}
+
+static mut HOSTED_VIDEO_PORT_INITIALIZATION: Option<HostedVideoPortInitialization> = None;
+static mut HOSTED_VIDEO_PORT_INITIALIZE_CALLS: u64 = 0;
+
+extern "win64" fn s_video_port_zero_memory(destination: u64, length: u32) {
+    if destination != 0 && length != 0 {
+        s_memset(destination, 0, length as u64);
+    }
+}
+
+extern "win64" fn s_video_port_allocate_pool(
+    _hw_device_extension: u64,
+    pool_type: u32,
+    number_of_bytes: u64,
+    tag: u32,
+) -> u64 {
+    s_ex_alloc_pool_tag(pool_type as u64, number_of_bytes, tag as u64)
+}
+
+extern "win64" fn s_video_port_free_pool(_hw_device_extension: u64, ptr: u64) {
+    s_ex_free_pool(ptr);
+}
+
+unsafe fn read_video_hw_initialization_data(
+    ptr: u64,
+) -> Result<VideoHwInitializationDataX64, VideoHwInitializationDataError> {
+    if ptr == 0 {
+        return Err(VideoHwInitializationDataError::BufferTooSmall { needed: 4 });
+    }
+    let declared = read_unaligned(ptr as *const u32) as usize;
+    let copy_len = if declared > VIDEO_HW_INITIALIZATION_DATA_X64_SIZE {
+        4
+    } else {
+        declared.max(4)
+    };
+    let mut raw = [0u8; VIDEO_HW_INITIALIZATION_DATA_X64_SIZE];
+    let mut i = 0usize;
+    while i < copy_len {
+        raw[i] = read_unaligned((ptr + i as u64) as *const u8);
+        i += 1;
+    }
+    VideoHwInitializationDataX64::parse(&raw[..copy_len])
+}
+
+fn video_hw_initialization_error_status(error: VideoHwInitializationDataError) -> i32 {
+    match error {
+        VideoHwInitializationDataError::RevisionMismatch { .. } => STATUS_REVISION_MISMATCH,
+        VideoHwInitializationDataError::UnsupportedSize { .. } => STATUS_UNSUCCESSFUL,
+        VideoHwInitializationDataError::MissingRequiredCallback
+        | VideoHwInitializationDataError::BufferTooSmall { .. } => STATUS_INVALID_PARAMETER,
+    }
+}
+
+fn video_hw_initialization_version_code(version: VideoHwInitializationDataVersion) -> u32 {
+    match version {
+        VideoHwInitializationDataVersion::Nt4 => 4,
+        VideoHwInitializationDataVersion::Windows2000 => 2000,
+        VideoHwInitializationDataVersion::WindowsXpOrLater => 2003,
+    }
+}
+
+extern "win64" fn s_video_port_initialize(
+    context1: u64,
+    context2: u64,
+    hw_initialization_data: u64,
+    hw_context: u64,
+) -> i32 {
+    unsafe {
+        HOSTED_VIDEO_PORT_INITIALIZE_CALLS = HOSTED_VIDEO_PORT_INITIALIZE_CALLS.saturating_add(1);
+        if context1 == 0 || hw_initialization_data == 0 {
+            print_str(b"[videoprt] VideoPortInitialize invalid arguments\n");
+            return STATUS_INVALID_PARAMETER;
+        }
+        match read_video_hw_initialization_data(hw_initialization_data) {
+            Ok(data) => {
+                HOSTED_VIDEO_PORT_INITIALIZATION = Some(HostedVideoPortInitialization {
+                    calls: HOSTED_VIDEO_PORT_INITIALIZE_CALLS,
+                    driver_object: context1,
+                    registry_path: context2,
+                    hw_context,
+                    data,
+                });
+                print_str(b"[videoprt] VideoPortInitialize captured size=");
+                print_u64(data.hw_init_data_size as u64);
+                print_str(b" version=");
+                print_u64(video_hw_initialization_version_code(data.version()) as u64);
+                print_str(b" pnp=");
+                print_u64(data.is_pnp_miniport() as u64);
+                print_str(b" legacy=");
+                print_u64(data.requires_legacy_detection(hw_context) as u64);
+                print_str(b"\n");
+                STATUS_SUCCESS
+            }
+            Err(error) => {
+                print_str(b"[videoprt] VideoPortInitialize rejected init data status=0x");
+                let status = video_hw_initialization_error_status(error);
+                print_hex(status as u32);
+                print_str(b"\n");
+                status
+            }
+        }
+    }
+}
+
 // --- the SHARED ntoskrnl export surface (registration-driven, the win32k model) ---------------
 
 /// The FSD's ntoskrnl-import registry: a heap-free `name -> trampoline-VA` map (the SHARED
@@ -8167,8 +8286,25 @@ fn hosted_ndis_provider_dll(dll: &str) -> bool {
     ascii_eq_ignore_case(dll, "ndis.sys") || ascii_eq_ignore_case(dll, "ndis")
 }
 
+fn hosted_videoprt_provider_dll(dll: &str) -> bool {
+    ascii_eq_ignore_case(dll, "videoprt.sys") || ascii_eq_ignore_case(dll, "videoprt")
+}
+
 fn hosted_dependency_provider_dll(dll: &str) -> bool {
     hosted_ndis_provider_dll(dll)
+}
+
+fn lookup_videoprt_export(name: &str) -> Option<u64> {
+    match name {
+        "VideoPortInitialize" => Some(s_video_port_initialize as *const () as usize as u64),
+        "VideoPortAllocatePool" => Some(s_video_port_allocate_pool as *const () as usize as u64),
+        "VideoPortFreePool" => Some(s_video_port_free_pool as *const () as usize as u64),
+        "VideoPortZeroMemory" | "VideoPortZeroDeviceMemory" => {
+            Some(s_video_port_zero_memory as *const () as usize as u64)
+        }
+        "VideoPortDebugPrint" => Some(s_dbg_print as *const () as usize as u64),
+        _ => None,
+    }
 }
 
 unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
@@ -8191,6 +8327,15 @@ unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
 /// are accepted here; dependency images such as `ndis.sys` must be mapped and resolved as real images.
 /// Unknown provider DLLs or names return `None`, causing the PE load to fail before `DriverEntry`.
 pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
+    if hosted_videoprt_provider_dll(dll) {
+        if let Some(addr) = lookup_videoprt_export(name) {
+            return Some(addr);
+        }
+        unsafe {
+            log_unresolved_driver_import(dll, name);
+        }
+        return None;
+    }
     if hosted_ndis_provider_dll(dll) {
         unsafe {
             if let Some(addr) = lookup_ndis_dependency_export(name) {

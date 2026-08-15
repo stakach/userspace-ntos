@@ -27,6 +27,11 @@ pub const VIDEO_MODE_INFORMATION_SIZE: usize = 80;
 pub const VIDEO_MEMORY_SIZE_X64: usize = 8;
 pub const VIDEO_MEMORY_INFORMATION_SIZE_X64: usize = 32;
 pub const VIDEO_WIN32K_CALLBACKS_SIZE_X64: usize = 40;
+pub const VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE: usize = 64;
+pub const VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE: usize = 140;
+pub const VIDEO_HW_INITIALIZATION_DATA_X64_SIZE: usize = 144;
+pub const VIDEO_REQUEST_PACKET_X64_SIZE: usize = 48;
+pub const VIDEO_STATUS_BLOCK_X64_SIZE: usize = 16;
 
 pub const VIDEO_MODE_COLOR: u32 = 0x0001;
 pub const VIDEO_MODE_GRAPHICS: u32 = 0x0002;
@@ -39,6 +44,185 @@ pub enum VideoDeviceIdentityError {
     InvalidDriverName,
     InvalidServiceRegistryPath,
     BufferTooSmall { needed: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoHwInitializationDataError {
+    BufferTooSmall { needed: usize },
+    RevisionMismatch { declared: usize },
+    UnsupportedSize { declared: usize },
+    MissingRequiredCallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoHwInitializationDataVersion {
+    Nt4,
+    Windows2000,
+    WindowsXpOrLater,
+}
+
+/// x64 `VIDEO_HW_INITIALIZATION_DATA` as supplied by a real video miniport to
+/// `VideoPortInitialize`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoHwInitializationDataX64 {
+    pub hw_init_data_size: u32,
+    pub adapter_interface_type: u32,
+    pub hw_find_adapter: u64,
+    pub hw_initialize: u64,
+    pub hw_interrupt: u64,
+    pub hw_start_io: u64,
+    pub hw_device_extension_size: u32,
+    pub starting_device_number: u32,
+    pub hw_reset_hw: u64,
+    pub hw_timer: u64,
+    pub hw_start_dma: u64,
+    pub hw_set_power_state: u64,
+    pub hw_get_power_state: u64,
+    pub hw_get_video_child_descriptor: u64,
+    pub hw_query_interface: u64,
+    pub hw_child_device_extension_size: u32,
+    pub hw_legacy_resource_list: u64,
+    pub hw_legacy_resource_count: u32,
+    pub hw_get_legacy_resources: u64,
+    pub allow_early_enumeration: bool,
+    pub reserved: u32,
+}
+
+impl VideoHwInitializationDataX64 {
+    pub fn parse(input: &[u8]) -> Result<Self, VideoHwInitializationDataError> {
+        require_video_hw_init_input(input, 4)?;
+        let declared = read_u32_raw(input, 0) as usize;
+        match declared {
+            VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE
+            | VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE
+            | VIDEO_HW_INITIALIZATION_DATA_X64_SIZE => {}
+            _ if declared > VIDEO_HW_INITIALIZATION_DATA_X64_SIZE => {
+                return Err(VideoHwInitializationDataError::RevisionMismatch { declared });
+            }
+            _ => return Err(VideoHwInitializationDataError::UnsupportedSize { declared }),
+        }
+        require_video_hw_init_input(input, declared)?;
+
+        let data = Self {
+            hw_init_data_size: declared as u32,
+            adapter_interface_type: read_u32_present(input, declared, 4),
+            hw_find_adapter: read_u64_present(input, declared, 8),
+            hw_initialize: read_u64_present(input, declared, 16),
+            hw_interrupt: read_u64_present(input, declared, 24),
+            hw_start_io: read_u64_present(input, declared, 32),
+            hw_device_extension_size: read_u32_present(input, declared, 40),
+            starting_device_number: read_u32_present(input, declared, 44),
+            hw_reset_hw: read_u64_present(input, declared, 48),
+            hw_timer: read_u64_present(input, declared, 56),
+            hw_start_dma: read_u64_present(input, declared, 64),
+            hw_set_power_state: read_u64_present(input, declared, 72),
+            hw_get_power_state: read_u64_present(input, declared, 80),
+            hw_get_video_child_descriptor: read_u64_present(input, declared, 88),
+            hw_query_interface: read_u64_present(input, declared, 96),
+            hw_child_device_extension_size: read_u32_present(input, declared, 104),
+            hw_legacy_resource_list: read_u64_present(input, declared, 112),
+            hw_legacy_resource_count: read_u32_present(input, declared, 120),
+            hw_get_legacy_resources: read_u64_present(input, declared, 128),
+            allow_early_enumeration: read_u8_present(input, declared, 136) != 0,
+            reserved: read_u32_present(input, declared, 140),
+        };
+        if data.hw_find_adapter == 0 || data.hw_initialize == 0 || data.hw_start_io == 0 {
+            return Err(VideoHwInitializationDataError::MissingRequiredCallback);
+        }
+        Ok(data)
+    }
+
+    pub fn version(&self) -> VideoHwInitializationDataVersion {
+        match self.hw_init_data_size as usize {
+            VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE => VideoHwInitializationDataVersion::Nt4,
+            VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE => {
+                VideoHwInitializationDataVersion::Windows2000
+            }
+            _ => VideoHwInitializationDataVersion::WindowsXpOrLater,
+        }
+    }
+
+    pub fn is_pnp_miniport(&self) -> bool {
+        (self.hw_init_data_size as usize) >= 96
+            && self.hw_set_power_state != 0
+            && self.hw_get_power_state != 0
+            && self.hw_get_video_child_descriptor != 0
+    }
+
+    pub fn requires_legacy_detection(&self, hw_context: u64) -> bool {
+        !self.is_pnp_miniport() || hw_context != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoRequestPacketError {
+    BufferTooSmall { needed: usize },
+}
+
+/// x64 `VIDEO_REQUEST_PACKET` passed by videoprt to a miniport `HwStartIO`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoRequestPacketX64 {
+    pub io_control_code: u32,
+    pub status_block: u64,
+    pub input_buffer: u64,
+    pub input_buffer_length: u32,
+    pub output_buffer: u64,
+    pub output_buffer_length: u32,
+}
+
+impl VideoRequestPacketX64 {
+    pub fn buffered(
+        io_control_code: u32,
+        status_block: u64,
+        system_buffer: u64,
+        input_buffer_length: u32,
+        output_buffer_length: u32,
+    ) -> Self {
+        Self {
+            io_control_code,
+            status_block,
+            input_buffer: system_buffer,
+            input_buffer_length,
+            output_buffer: system_buffer,
+            output_buffer_length,
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, VideoRequestPacketError> {
+        require_video_request_input(input, VIDEO_REQUEST_PACKET_X64_SIZE)?;
+        Ok(Self {
+            io_control_code: read_u32_raw(input, 0),
+            status_block: read_u64_raw(input, 8),
+            input_buffer: read_u64_raw(input, 16),
+            input_buffer_length: read_u32_raw(input, 24),
+            output_buffer: read_u64_raw(input, 32),
+            output_buffer_length: read_u32_raw(input, 40),
+        })
+    }
+
+    pub fn write(&self, output: &mut [u8]) -> Result<usize, VideoRequestPacketError> {
+        require_video_request_input(output, VIDEO_REQUEST_PACKET_X64_SIZE)?;
+        output[..VIDEO_REQUEST_PACKET_X64_SIZE].fill(0);
+        write_u32(output, 0, self.io_control_code);
+        write_u64(output, 8, self.status_block);
+        write_u64(output, 16, self.input_buffer);
+        write_u32(output, 24, self.input_buffer_length);
+        write_u64(output, 32, self.output_buffer);
+        write_u32(output, 40, self.output_buffer_length);
+        Ok(VIDEO_REQUEST_PACKET_X64_SIZE)
+    }
+}
+
+pub fn write_video_status_block_x64(
+    output: &mut [u8],
+    status: i32,
+    information: u64,
+) -> Result<usize, VideoRequestPacketError> {
+    require_video_request_input(output, VIDEO_STATUS_BLOCK_X64_SIZE)?;
+    output[..VIDEO_STATUS_BLOCK_X64_SIZE].fill(0);
+    write_u32(output, 0, status as u32);
+    write_u64(output, 8, information);
+    Ok(VIDEO_STATUS_BLOCK_X64_SIZE)
 }
 
 /// NT object/registry identity for a video miniport-created `\Device\Video<N>` route.
@@ -527,6 +711,25 @@ fn require_output(output: &[u8], needed: usize) -> Result<(), VideoMiniportError
     }
 }
 
+fn require_video_hw_init_input(
+    input: &[u8],
+    needed: usize,
+) -> Result<(), VideoHwInitializationDataError> {
+    if input.len() < needed {
+        Err(VideoHwInitializationDataError::BufferTooSmall { needed })
+    } else {
+        Ok(())
+    }
+}
+
+fn require_video_request_input(input: &[u8], needed: usize) -> Result<(), VideoRequestPacketError> {
+    if input.len() < needed {
+        Err(VideoRequestPacketError::BufferTooSmall { needed })
+    } else {
+        Ok(())
+    }
+}
+
 fn millimeters_at_default_dpi(pixels: u32) -> u32 {
     ((pixels as u64 * 254 + (DEFAULT_DPI as u64 * 5)) / (DEFAULT_DPI as u64 * 10)) as u32
 }
@@ -543,6 +746,40 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&input[offset..offset + 4]);
     u32::from_le_bytes(bytes)
+}
+
+fn read_u32_raw(input: &[u8], offset: usize) -> u32 {
+    read_u32(input, offset)
+}
+
+fn read_u64_raw(input: &[u8], offset: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&input[offset..offset + 8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn read_u8_present(input: &[u8], declared: usize, offset: usize) -> u8 {
+    if offset < declared {
+        input[offset]
+    } else {
+        0
+    }
+}
+
+fn read_u32_present(input: &[u8], declared: usize, offset: usize) -> u32 {
+    if offset.checked_add(4).is_some_and(|end| end <= declared) {
+        read_u32_raw(input, offset)
+    } else {
+        0
+    }
+}
+
+fn read_u64_present(input: &[u8], declared: usize, offset: usize) -> u64 {
+    if offset.checked_add(8).is_some_and(|end| end <= declared) {
+        read_u64_raw(input, offset)
+    } else {
+        0
+    }
 }
 
 fn read_u64(input: &[u8], offset: usize) -> Result<u64, VideoMiniportError> {
@@ -658,6 +895,28 @@ mod tests {
         u64::from_le_bytes(bytes)
     }
 
+    fn valid_video_hw_init(size: usize) -> [u8; VIDEO_HW_INITIALIZATION_DATA_X64_SIZE] {
+        let mut data = [0u8; VIDEO_HW_INITIALIZATION_DATA_X64_SIZE];
+        write_u32(&mut data, 0, size as u32);
+        write_u32(&mut data, 4, 5);
+        write_u64(&mut data, 8, 0x1000_0000_0000_0001);
+        write_u64(&mut data, 16, 0x1000_0000_0000_0002);
+        write_u64(&mut data, 32, 0x1000_0000_0000_0004);
+        write_u32(&mut data, 40, 0x120);
+        write_u32(&mut data, 44, 7);
+        write_u64(&mut data, 72, 0x1000_0000_0000_0005);
+        write_u64(&mut data, 80, 0x1000_0000_0000_0006);
+        write_u64(&mut data, 88, 0x1000_0000_0000_0007);
+        write_u64(&mut data, 96, 0x1000_0000_0000_0008);
+        write_u32(&mut data, 104, 0x40);
+        write_u64(&mut data, 112, 0x2000_0000_0000_0000);
+        write_u32(&mut data, 120, 3);
+        write_u64(&mut data, 128, 0x1000_0000_0000_0009);
+        data[136] = 1;
+        write_u32(&mut data, 140, 0xAABB_CCDD);
+        data
+    }
+
     #[test]
     fn video_identity_materializes_nt_paths() {
         let identity = VideoDeviceIdentity::new(
@@ -732,6 +991,135 @@ mod tests {
                 needed: "\\Device\\Video0".len()
             })
         );
+    }
+
+    #[test]
+    fn video_hw_initialization_data_parses_full_x64_layout() {
+        let data = valid_video_hw_init(VIDEO_HW_INITIALIZATION_DATA_X64_SIZE);
+        let parsed = VideoHwInitializationDataX64::parse(&data).unwrap();
+
+        assert_eq!(
+            parsed.version(),
+            VideoHwInitializationDataVersion::WindowsXpOrLater
+        );
+        assert_eq!(parsed.adapter_interface_type, 5);
+        assert_eq!(parsed.hw_find_adapter, 0x1000_0000_0000_0001);
+        assert_eq!(parsed.hw_initialize, 0x1000_0000_0000_0002);
+        assert_eq!(parsed.hw_interrupt, 0);
+        assert_eq!(parsed.hw_start_io, 0x1000_0000_0000_0004);
+        assert_eq!(parsed.hw_device_extension_size, 0x120);
+        assert_eq!(parsed.starting_device_number, 7);
+        assert_eq!(parsed.hw_set_power_state, 0x1000_0000_0000_0005);
+        assert_eq!(parsed.hw_get_power_state, 0x1000_0000_0000_0006);
+        assert_eq!(parsed.hw_get_video_child_descriptor, 0x1000_0000_0000_0007);
+        assert_eq!(parsed.hw_query_interface, 0x1000_0000_0000_0008);
+        assert_eq!(parsed.hw_child_device_extension_size, 0x40);
+        assert_eq!(parsed.hw_legacy_resource_list, 0x2000_0000_0000_0000);
+        assert_eq!(parsed.hw_legacy_resource_count, 3);
+        assert_eq!(parsed.hw_get_legacy_resources, 0x1000_0000_0000_0009);
+        assert!(parsed.allow_early_enumeration);
+        assert_eq!(parsed.reserved, 0xAABB_CCDD);
+        assert!(parsed.is_pnp_miniport());
+        assert!(!parsed.requires_legacy_detection(0));
+        assert!(parsed.requires_legacy_detection(0xCAFE));
+    }
+
+    #[test]
+    fn video_hw_initialization_data_preserves_legacy_versions() {
+        let nt4 = valid_video_hw_init(VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE);
+        let parsed =
+            VideoHwInitializationDataX64::parse(&nt4[..VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE])
+                .unwrap();
+        assert_eq!(parsed.version(), VideoHwInitializationDataVersion::Nt4);
+        assert_eq!(parsed.hw_timer, 0);
+        assert_eq!(parsed.hw_start_dma, 0);
+        assert_eq!(parsed.hw_set_power_state, 0);
+        assert!(!parsed.is_pnp_miniport());
+        assert!(parsed.requires_legacy_detection(0));
+
+        let w2k = valid_video_hw_init(VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE);
+        let parsed =
+            VideoHwInitializationDataX64::parse(&w2k[..VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE])
+                .unwrap();
+        assert_eq!(
+            parsed.version(),
+            VideoHwInitializationDataVersion::Windows2000
+        );
+        assert_eq!(parsed.reserved, 0);
+        assert!(parsed.allow_early_enumeration);
+    }
+
+    #[test]
+    fn video_hw_initialization_data_rejects_invalid_inputs() {
+        assert_eq!(
+            VideoHwInitializationDataX64::parse(&[0; 3]),
+            Err(VideoHwInitializationDataError::BufferTooSmall { needed: 4 })
+        );
+
+        let mut data = valid_video_hw_init(VIDEO_HW_INITIALIZATION_DATA_X64_SIZE);
+        write_u32(
+            &mut data,
+            0,
+            (VIDEO_HW_INITIALIZATION_DATA_X64_SIZE + 1) as u32,
+        );
+        assert_eq!(
+            VideoHwInitializationDataX64::parse(&data),
+            Err(VideoHwInitializationDataError::RevisionMismatch {
+                declared: VIDEO_HW_INITIALIZATION_DATA_X64_SIZE + 1
+            })
+        );
+
+        write_u32(&mut data, 0, 96);
+        assert_eq!(
+            VideoHwInitializationDataX64::parse(&data[..96]),
+            Err(VideoHwInitializationDataError::UnsupportedSize { declared: 96 })
+        );
+
+        data = valid_video_hw_init(VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE);
+        write_u64(&mut data, 16, 0);
+        assert_eq!(
+            VideoHwInitializationDataX64::parse(&data[..VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE]),
+            Err(VideoHwInitializationDataError::MissingRequiredCallback)
+        );
+    }
+
+    #[test]
+    fn video_request_packet_uses_x64_vrp_layout() {
+        let packet = VideoRequestPacketX64::buffered(
+            IOCTL_VIDEO_QUERY_CURRENT_MODE,
+            0x1000_0000_0000_0100,
+            0x1000_0000_0000_2000,
+            4,
+            VIDEO_MODE_INFORMATION_SIZE as u32,
+        );
+        let mut raw = [0xCCu8; VIDEO_REQUEST_PACKET_X64_SIZE];
+        assert_eq!(
+            packet.write(&mut raw).unwrap(),
+            VIDEO_REQUEST_PACKET_X64_SIZE
+        );
+
+        assert_eq!(u32_at(&raw, 0), IOCTL_VIDEO_QUERY_CURRENT_MODE);
+        assert_eq!(&raw[4..8], &[0, 0, 0, 0]);
+        assert_eq!(u64_at(&raw, 8), 0x1000_0000_0000_0100);
+        assert_eq!(u64_at(&raw, 16), 0x1000_0000_0000_2000);
+        assert_eq!(u32_at(&raw, 24), 4);
+        assert_eq!(&raw[28..32], &[0, 0, 0, 0]);
+        assert_eq!(u64_at(&raw, 32), 0x1000_0000_0000_2000);
+        assert_eq!(u32_at(&raw, 40), VIDEO_MODE_INFORMATION_SIZE as u32);
+        assert_eq!(&raw[44..48], &[0, 0, 0, 0]);
+        assert_eq!(VideoRequestPacketX64::parse(&raw).unwrap(), packet);
+    }
+
+    #[test]
+    fn video_status_block_uses_x64_status_block_layout() {
+        let mut raw = [0xCCu8; VIDEO_STATUS_BLOCK_X64_SIZE];
+        assert_eq!(
+            write_video_status_block_x64(&mut raw, 0xC000_000Du32 as i32, 0x1234).unwrap(),
+            VIDEO_STATUS_BLOCK_X64_SIZE
+        );
+        assert_eq!(u32_at(&raw, 0), 0xC000_000D);
+        assert_eq!(&raw[4..8], &[0, 0, 0, 0]);
+        assert_eq!(u64_at(&raw, 8), 0x1234);
     }
 
     #[test]

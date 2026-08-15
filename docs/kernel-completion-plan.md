@@ -3557,6 +3557,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `HwStartIO`) behind this boundary, then replace the current boot-framebuffer adapter with a real
   registry-selected miniport instance.
 
+- B3 videoprt initialization ABI slice (2026-08-16). `nt-video-miniport` now owns host-tested x64
+  layouts for `VIDEO_HW_INITIALIZATION_DATA`, `VIDEO_REQUEST_PACKET`, and `STATUS_BLOCK`, including
+  NT4/W2K/XP size validation, required callback checks, PnP-vs-legacy detection, buffered VRP
+  construction, and status-block writes. The hosted-driver import resolver now recognizes
+  `videoprt.sys` as a port-provider DLL only for exports backed by real local behavior in this slice:
+  `VideoPortInitialize` validates and records the miniport callback table, while
+  `VideoPortAllocatePool`, `VideoPortFreePool`, `VideoPortZeroMemory`,
+  `VideoPortZeroDeviceMemory`, and `VideoPortDebugPrint` route to existing pool/memory/debug
+  surfaces. Unsupported videoprt imports remain unresolved and fail the PE load instead of using
+  fallback success. Validation: `cargo fmt --all`, `cargo test -p nt-video-miniport -- --nocapture`,
+  and `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: the next B3 videoprt slice should implement the
+  resource-backed exports needed by the staged `bochsmp.sys` import set (`VideoPortGetAccessRanges`,
+  `VideoPortVerifyAccessRanges`, `VideoPortGetDeviceBase`, `VideoPortMapMemory`,
+  `VideoPortUnmapMemory`, the port/register U16 accessors, and registry parameter writes), then wire
+  AddDevice/StartDevice to call the captured `HwFindAdapter`, `HwInitialize`, and `HwStartIO` through
+  the typed VRP boundary.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same
