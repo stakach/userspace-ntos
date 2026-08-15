@@ -27117,17 +27117,28 @@ impl ExecNtHandler {
             // Route named-pipe client opens through the isolated npfs FSD for every hosted process.
             // Other file namespaces remain unsupported rather than receiving a fake handle.
             NativeService::NtCreateFile => unsafe {
+                let file_handle_out = args[0];
+                let desired_access = nt_ulong_arg(args[1]);
                 let oa = args[2];
                 let name16 = self.read_objattr_name_pe(oa);
                 let iosb = args[3];
+                let file_attributes = nt_ulong_arg(args[5]);
+                let share_access = nt_ulong_arg(args[6]);
+                let create_disposition = nt_ulong_arg(args[7]);
+                let create_options = nt_ulong_arg(args[8]);
                 if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
                     print_str(b"[nt-create-file-frontier] pi=");
                     print_u64(self.pi as u64);
-                    print_str(b" access=0x"); print_hex(args[1] as u32);
-                    print_str(b" attrs=0x"); print_hex(args[5] as u32);
-                    print_str(b" share=0x"); print_hex(args[6] as u32);
-                    print_str(b" disposition=0x"); print_hex(args[7] as u32);
-                    print_str(b" options=0x"); print_hex(args[8] as u32);
+                    print_str(b" access=0x");
+                    print_hex(desired_access);
+                    print_str(b" attrs=0x");
+                    print_hex(file_attributes);
+                    print_str(b" share=0x");
+                    print_hex(share_access);
+                    print_str(b" disposition=0x");
+                    print_hex(create_disposition);
+                    print_str(b" options=0x");
+                    print_hex(create_options);
                     print_str(b" name=\"");
                     for &unit in name16.iter().take(160) {
                         debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
@@ -27141,10 +27152,10 @@ impl ExecNtHandler {
                     crate::writable_fs::query_attributes_relative_if_mounted(relative).is_some()
                 });
                 if boot_status_path_matches(&name16) {
-                    if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                    if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
-                    } else if let Some(handle) = self.mint_boot_status_handle(args[1] as u32) {
-                        let disposition = args[7] as u32;
+                    } else if let Some(handle) = self.mint_boot_status_handle(desired_access) {
+                        let disposition = create_disposition;
                         status = nt_fs::STATUS_SUCCESS;
                         info = match disposition {
                             nt_fs::FILE_SUPERSEDE => {
@@ -27178,20 +27189,20 @@ impl ExecNtHandler {
                             }
                         };
                         if status == nt_fs::STATUS_SUCCESS {
-                            self.queue_write(args[0], handle);
+                            self.queue_write(file_handle_out, handle);
                         }
                     } else {
                         status = 0xC000_009A;
                     }
                 } else if Self::is_named_pipe_root_path(&name16) {
-                    if args[7] as u32 != nt_fs::FILE_OPEN {
+                    if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
                     } else if !driver_launch::npfs_ready() {
                         status = STATUS_DEVICE_NOT_READY;
                     } else {
-                        match self.mint_npfs_root_handle(args[1] as u32) {
+                        match self.mint_npfs_root_handle(desired_access) {
                             Some(handle) => {
-                                self.queue_write(args[0], handle);
+                                self.queue_write(file_handle_out, handle);
                                 status = nt_fs::STATUS_SUCCESS;
                                 info = nt_fs::FILE_OPENED as u64;
                             }
@@ -27199,9 +27210,9 @@ impl ExecNtHandler {
                         }
                     }
                 } else if nt_fs::is_named_pipe_path(&name16) {
-                    if args[7] as u32 != nt_fs::FILE_OPEN {
+                    if create_disposition != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
-                    } else if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                    } else if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                         status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
                     } else {
                         let leaf = Self::pipe_leaf16(&name16);
@@ -27210,8 +27221,7 @@ impl ExecNtHandler {
                                 status = st as u32;
                                 if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
                                     let pipe_hash = nt_io_manager::pipe_name_hash(&leaf);
-                                    let options = args[8] as u32;
-                                    let synchronous = options
+                                    let synchronous = create_options
                                         & (nt_fs::FILE_SYNCHRONOUS_IO_ALERT
                                             | nt_fs::FILE_SYNCHRONOUS_IO_NONALERT)
                                         != 0;
@@ -27220,9 +27230,9 @@ impl ExecNtHandler {
                                     {
                                         status = name_status;
                                     } else if let Some(handle) =
-                                        self.mint_file_handle(file_id, args[1] as u32, synchronous)
+                                        self.mint_file_handle(file_id, desired_access, synchronous)
                                     {
-                                        self.queue_write(args[0], handle);
+                                        self.queue_write(file_handle_out, handle);
                                         info = nt_fs::FILE_OPENED as u64;
                                         // The client fid is the accepted CCB with NamedPipeEnd == CLIENT.
                                         // Complete the exact server-end listen IRP for the same CCB.
@@ -27250,28 +27260,28 @@ impl ExecNtHandler {
                     // with the correct NTSTATUS, and no handle is fabricated.
                     let (st, file_id, information) = crate::writable_fs::create(
                         &relative,
-                        args[1] as u32,
-                        args[5] as u32,
-                        args[6] as u32,
-                        args[7] as u32,
-                        args[8] as u32,
+                        desired_access,
+                        file_attributes,
+                        share_access,
+                        create_disposition,
+                        create_options,
                     );
-                    let disposition = args[7] as u32;
+                    let disposition = create_disposition;
                     if disposition == nt_fs::FILE_OPEN && Self::overlay_open_missed(st) {
                         if let Some((first_cluster, file_size)) = Self::readonly_disk_open_entry(
                             &name16,
-                            args[1] as u32,
-                            args[8] as u32,
+                            desired_access,
+                            create_options,
                         ) {
                             status = nt_fs::STATUS_SUCCESS;
                             info = nt_fs::FILE_OPENED as u64;
                             match self.mint_disk_file_handle(
                                 first_cluster,
                                 file_size,
-                                args[1] as u32,
+                                desired_access,
                             ) {
                                 Some(handle) => {
-                                    self.queue_write(args[0], handle);
+                                    self.queue_write(file_handle_out, handle);
                                     let count = NT_CREATE_FILE_READONLY_FAT_OPENS
                                         .fetch_add(1, Ordering::Relaxed);
                                     if count < 8 {
@@ -27322,7 +27332,7 @@ impl ExecNtHandler {
                         if file_id.is_some() {
                             self.writable_fs_dirty = true;
                         }
-                        if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                        if create_options & nt_fs::FILE_DIRECTORY_FILE != 0 {
                             if status == nt_fs::STATUS_SUCCESS
                                 && info == nt_fs::FILE_CREATED as u64
                             {
@@ -27340,8 +27350,8 @@ impl ExecNtHandler {
                             crate::writable_fs::note_profile_file_create(self.pi, &relative);
                         }
                         if let Some(file_id) = file_id {
-                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                                Some(handle) => self.queue_write(args[0], handle),
+                            match self.mint_overlay_file_handle(file_id, desired_access) {
+                                Some(handle) => self.queue_write(file_handle_out, handle),
                                 None => {
                                     status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                                     info = 0;
@@ -27351,25 +27361,25 @@ impl ExecNtHandler {
                     }
                 } else if let Some(relative) = volume_relative
                     .as_deref()
-                    .filter(|_| args[7] as u32 != nt_fs::FILE_OPEN || volume_overlay_hit)
+                    .filter(|_| create_disposition != nt_fs::FILE_OPEN || volume_overlay_hit)
                 {
-                    let disposition = args[7] as u32;
-                    let options = args[8] as u32;
+                    let disposition = create_disposition;
+                    let options = create_options;
                     if disposition == nt_fs::FILE_OPEN {
                         let (st, file_id, information) =
                             crate::writable_fs::open_existing_relative_if_mounted(
                                 relative,
-                                args[1] as u32,
-                                args[5] as u32,
-                                args[6] as u32,
+                                desired_access,
+                                file_attributes,
+                                share_access,
                                 options,
                             );
                         status = st;
                         info = information;
                         if let Some(file_id) = file_id {
                             self.writable_fs_dirty = true;
-                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                                Some(handle) => self.queue_write(args[0], handle),
+                            match self.mint_overlay_file_handle(file_id, desired_access) {
+                                Some(handle) => self.queue_write(file_handle_out, handle),
                                 None => {
                                     status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                                     info = 0;
@@ -27388,9 +27398,9 @@ impl ExecNtHandler {
                         }
                         let (st, file_id, information) = crate::writable_fs::create(
                             relative,
-                            args[1] as u32,
-                            args[5] as u32,
-                            args[6] as u32,
+                            desired_access,
+                            file_attributes,
+                            share_access,
                             disposition,
                             options,
                         );
@@ -27421,8 +27431,8 @@ impl ExecNtHandler {
                             crate::writable_fs::note_profile_file_create(self.pi, relative);
                         }
                         if let Some(file_id) = file_id {
-                            match self.mint_overlay_file_handle(file_id, args[1] as u32) {
-                                Some(handle) => self.queue_write(args[0], handle),
+                            match self.mint_overlay_file_handle(file_id, desired_access) {
+                                Some(handle) => self.queue_write(file_handle_out, handle),
                                 None => {
                                     status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
                                     info = 0;
@@ -27430,17 +27440,17 @@ impl ExecNtHandler {
                             }
                         }
                     }
-                } else if args[7] as u32 == nt_fs::FILE_OPEN {
+                } else if create_disposition == nt_fs::FILE_OPEN {
                     if let Some((first_cluster, file_size)) = Self::readonly_disk_open_entry(
                         &name16,
-                        args[1] as u32,
-                        args[8] as u32,
+                        desired_access,
+                        create_options,
                     ) {
                         status = nt_fs::STATUS_SUCCESS;
                         info = nt_fs::FILE_OPENED as u64;
-                        match self.mint_disk_file_handle(first_cluster, file_size, args[1] as u32) {
+                        match self.mint_disk_file_handle(first_cluster, file_size, desired_access) {
                             Some(handle) => {
-                                self.queue_write(args[0], handle);
+                                self.queue_write(file_handle_out, handle);
                                 let count = NT_CREATE_FILE_READONLY_FAT_OPENS
                                     .fetch_add(1, Ordering::Relaxed);
                                 if count < 8 {
@@ -27494,9 +27504,9 @@ impl ExecNtHandler {
                 }
                 if status != nt_fs::STATUS_SUCCESS {
                     if self.pi >= 2 {
-                        self.queue_write(args[0], 0);
+                        self.queue_write(file_handle_out, 0);
                     } else {
-                        smss_stack_write(args[0], 0);
+                        smss_stack_write(file_handle_out, 0);
                     }
                 }
                 if nt_fs::is_named_pipe_path(&name16)
@@ -27513,13 +27523,13 @@ impl ExecNtHandler {
                         print_str(b" tid=");
                         print_u64(self.current_tid);
                         print_str(b" access=0x");
-                        print_hex(args[1] as u32);
+                        print_hex(desired_access);
                         print_str(b" share=0x");
-                        print_hex(args[6] as u32);
+                        print_hex(share_access);
                         print_str(b" disposition=0x");
-                        print_hex(args[7] as u32);
+                        print_hex(create_disposition);
                         print_str(b" options=0x");
-                        print_hex(args[8] as u32);
+                        print_hex(create_options);
                         print_str(b" status=0x");
                         print_hex(status);
                         print_str(b" info=");

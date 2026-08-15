@@ -1653,8 +1653,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
    class/length; and LPC port maximum-count fields. The object/file-query follow-on now covers
    object-directory and symbolic-link access masks, `NtQueryDirectoryObject` lengths, volume/query
    information class and length fields, directory-query lengths/classes, I/O completion
-   access/concurrency/status scalars, and file-query information class/length fields. The remaining
-   dense raw-cast clusters are `NtCreateFile`/file information setters and section/map-view services.
+   access/concurrency/status scalars, and file-query information class/length fields. The
+   `NtCreateFile` follow-on now captures desired access, file attributes, share access, create
+   disposition, and create options once at the syscall boundary before routing boot-status, NPFS,
+   writable-overlay, volume-overlay, and read-only FAT opens. The remaining dense raw-cast clusters
+   are file information setters and section/map-view services.
 
 ## Review Log
 
