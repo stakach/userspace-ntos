@@ -5900,6 +5900,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
 
+  CSR modeled-fallback counter cleanup (2026-08-16): the historical established-port CSR modeled
+  success path was already gone, and the remaining `CSR_API_MODELED_FALLBACKS` counter was a
+  read-only zero in the executive summary. The CSR gates now assert the real evidence directly:
+  `CSR_MSGS`, `CSR_API_REAL_REPLIES`, authentic accept counts/masks, and zero
+  `CSR_RENDEZVOUS_FAILURES`. The connect/request paths still fail closed if the real
+  `CsrApiRequestThread` is missing or walled, so no fallback behavior remains behind this gate.
+  Validation: `cargo fmt --all` and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+
   Native file-position FILE_OBJECT cleanup (2026-08-14): read-only FAT file handles now own a real
   shared FILE_OBJECT record rather than just a backing extent. The record carries the current byte
   offset, is retained across `NtDuplicateObject`, released on close/teardown, and is used by

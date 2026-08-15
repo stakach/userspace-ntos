@@ -20949,9 +20949,6 @@ static CSR_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 /// How many established-port CSR API requests completed through the real CsrApiRequestThread.
 static CSR_API_REAL_REPLIES: AtomicU64 = AtomicU64::new(0);
-/// Must remain zero. The historical established-port CSR modeled success path has been removed; the
-/// gate keeps this counter visible so any accidental reintroduction is obvious.
-static CSR_API_MODELED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Count of pending CSR client connects completed by the real CsrApiRequestThread
 /// rendezvous. The boot path must not use the old modeled accept fallback.
 static CSR_AUTHENTIC_ACCEPTS: AtomicU64 = AtomicU64::new(0);
@@ -26452,12 +26449,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // NtReplyWaitReceivePort and RECEIVED a live LPC_CONNECTION_REQUEST message off
                     // \Windows\ApiPort (winlogon's kernel32 CSR client connect). CSR_MSGS counts that real
                     // received-message event in the rendezvous. The accept/failure counters prove the loop
-                    // did not fall back to a modeled CSR accept after a missing or walled rendezvous.
+                    // used the real worker and failed closed on a missing or walled rendezvous.
                     check(
                         b"exec_csr_message_plane",
                         CSR_MSGS.load(Ordering::Relaxed) >= 1
                             && CSR_API_REAL_REPLIES.load(Ordering::Relaxed) >= 1
-                            && CSR_API_MODELED_FALLBACKS.load(Ordering::Relaxed) == 0
                             && CSR_AUTHENTIC_ACCEPTS.load(Ordering::Relaxed) >= 1
                             && CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) & (1 << 2) != 0
                             && CSR_RENDEZVOUS_FAILURES.load(Ordering::Relaxed) == 0,
@@ -27140,8 +27136,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(CSR_AUTHENTIC_ACCEPT_MASK.load(Ordering::Relaxed) as u32);
                     print_str(b" real_replies=");
                     print_u64(CSR_API_REAL_REPLIES.load(Ordering::Relaxed));
-                    print_str(b" modeled_fallbacks=");
-                    print_u64(CSR_API_MODELED_FALLBACKS.load(Ordering::Relaxed));
                     print_str(b"\n");
                     // ★ MILESTONE — services.exe is the 3rd win32k GUI client: its user32 DllMain
                     // NtUserProcessConnect (SSN 0x10FA) was routed to the win32k component (badge 6 /
