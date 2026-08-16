@@ -39,6 +39,20 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
+`.tmp/run-headless-b3-main-stack-alias-20260816.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after hosted driver main stacks were added to the
+per-instance executive alias set used by dispatcher-object translation. The previous
+`KeSetEvent unmapped event` warning for a stack-local hosted driver `KEVENT` is absent, and the
+same run keeps the full shell path green: real `WlxActivateUserShell`, `userinit.exe`,
+`explorer.exe`, shell COM classes, api0 callbacks, GDI user batch flushes, and
+`exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports `786432/786432` non-background pixels
+with at least 32 distinct non-background colors, `exec_win32k_desktop_painted` passes, and the pool
+gate still has usable headroom (`ut-free=77178KiB`, `exec-heap-free=8238KiB`, no pool-accounted
+image-bank, registry, ASID, or VM allocation failures). Non-gating setup-side image-map diagnostics
+remain visible for late helper application loading and should be tracked separately from hosted
+driver dispatcher object aliasing.
+
+Previous accepted desktop proof (2026-08-16):
 `.tmp/run-desktop-dependency-closure.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the boot-framebuffer display route was removed,
 the old fixed boot proof scratch aliases were replaced, hosted-video success-path traces were
@@ -1188,17 +1202,20 @@ before unrelated executive traffic monopolises the receive loop.
   `ndis.sys`/`tcpip.sys`/`afd.sys` images fail-closed. The generated SYSTEM hive also carries
   ReactOS-derived NDIS/TCPIP/AFD service records and the network load-order groups through the same
   Config Manager ordering path used by real REGF hives. Hosted `KeWaitForSingleObject` and
-  `KeWaitForMultipleObjects` now distinguish true zero-timeout polls from blocking or infinite waits:
-  ready dispatcher objects still complete normally, unsatisfied polls return `STATUS_TIMEOUT`, and
-  unsatisfied blocking waits fail closed until a real hosted wait broker can park and resume worker
-  TCBs. The host-testable `nt-kernel-exec` model now includes hosted driver system-thread handle
-  records plus a dispatcher wait queue that admits, parks, wakes, and cancels blocking waits without
-  consuming dispatcher state during readiness scans. `PsCreateSystemThread` now crosses a real
-  component-service label and is backed by executive-owned system-thread handles plus real seL4
-  worker TCB startup for the NT5 null-object-attributes/null-process-handle/null-client-id shape used
-  by boot drivers. Remaining B3 work is broader non-display driver coverage: reply-cap rotation
-  around parked hosted-driver waits, hosted-driver `PsTerminateSystemThread` lifecycle service,
-  metadata-driven TCPIP/AFD activation once hosted waits can block/resume, miniport packet
+  `KeWaitForMultipleObjects` now route through the executive wait broker: ready dispatcher objects
+  complete normally, zero-timeout polls return `STATUS_TIMEOUT`, infinite waits park hosted worker
+  TCBs by rotating driver-owned reply caps, and finite waits are completed from the shared timer
+  path. Dispatcher-object pointer translation covers the live per-instance image, pool, DATA,
+  SHARED, ARG, worker stack, and main-stack aliases, so stack-local `KEVENT` and `KSEMAPHORE`
+  objects are visible to `KeSetEvent`, `KePulseEvent`, and `KeReleaseSemaphore`. The host-testable
+  `nt-kernel-exec` model now includes hosted driver system-thread handle records plus a dispatcher
+  wait queue that admits, parks, wakes, times out, and cancels blocking waits without consuming
+  dispatcher state during readiness scans. `PsCreateSystemThread` crosses a real component-service
+  label and is backed by executive-owned system-thread handles plus real seL4 worker TCB startup for
+  the NT5 null-object-attributes/null-process-handle/null-client-id shape used by boot drivers;
+  `PsTerminateSystemThread` tears down those worker TCBs without replying to the exiting caller.
+  Remaining B3 work is broader non-display driver coverage: hosted thread-handle close/wait
+  semantics if ReactOS drivers expose them, metadata-driven TCPIP/AFD activation, miniport packet
   data-plane behavior, and multi-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
@@ -6448,3 +6465,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun a serialized desktop gate;
   if drivers now progress into closing returned system-thread handles, implement hosted-driver
   `ZwClose`/thread-object release semantics rather than accepting `STATUS_INVALID_HANDLE`.
+
+  B3 hosted driver main-stack dispatcher object aliasing (2026-08-16): hosted driver main stacks now
+  get per-instance executive aliases alongside image, pool, DATA, SHARED, ARG, and worker-stack
+  aliases. Dispatcher-object translation therefore covers stack-local `KEVENT`/`KSEMAPHORE` objects
+  created on the original component stack, which lets the generic wait broker wake hosted workers
+  from `KeSetEvent`, `KePulseEvent`, and `KeReleaseSemaphore` without service-specific object
+  shortcuts. Serialized headless proof `.tmp/run-headless-b3-main-stack-alias-20260816.log` reaches
+  the harness sentinel with `296/296` checks passing, keeps `exec_win32k_desktop_painted` and
+  `exec_explorer_shell_chrome_painted` green, and no longer emits `driver-wait`,
+  `KeSetEvent unmapped`, or stack-alias map-failure diagnostics. Validation: `cargo fmt --all`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and the serialized headless boot proof. Review
+  adjustment: B3 wait-broker mechanism work is closed at this frontier; continue with hosted
+  thread-handle close/wait semantics if exposed, metadata-driven TCPIP/AFD activation, real miniport
+  packet data-plane behavior, and repeated-device scaling under the same dynamic
+  devnode/resource path.

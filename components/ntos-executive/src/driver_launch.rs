@@ -102,6 +102,7 @@ pub const FSD_POOL_FRAMES: u64 = 512; // 2 MiB, pre-mapped
 /// (NpFsdCreate → Np*) are moderately deep.
 pub const FSD_STACK_VADDR: u64 = 0x0000_0100_0F00_0000;
 pub const FSD_STACK_FRAMES: u64 = 32;
+pub const FSD_STACK_BYTES: u64 = FSD_STACK_FRAMES * 0x1000;
 
 /// Aux PT window holding the DATA + SHARED + ARG frames (one 2 MiB PT).
 pub const FSD_AUX_PT_VADDR: u64 = 0x0000_0100_0F20_0000;
@@ -211,6 +212,7 @@ const _: () = assert!(FSD_EXEC_BASE + FSD_EXEC_STRIDE <= FSD_EXEC_LIMIT);
 pub(crate) struct ExecVaWindow {
     pub code_va: u64,
     pub pool_va: u64,
+    pub stack_va: u64,
     pub data_va: u64,
     pub shared_va: u64,
     pub arg_va: u64,
@@ -223,6 +225,7 @@ impl ExecVaWindow {
             Some(ExecVaWindow {
                 code_va: FSD_CODE_VA,
                 pool_va: FSD_POOL_VADDR,
+                stack_va: FSD_STACK_VADDR,
                 data_va: FSD_DATA_VADDR,
                 shared_va: FSD_SHARED_VADDR,
                 arg_va: FSD_ARG_VADDR,
@@ -240,6 +243,7 @@ impl ExecVaWindow {
             // Same RELATIVE offsets as the fixed layout: aux PT (2 MiB) holds DATA/SHARED/ARG.
             Some(ExecVaWindow {
                 code_va: base,                 // 256 KiB image window (fits in the first 2 MiB PT)
+                stack_va: base + 0x0040_0000,  // main component stack (128 KiB, own PT)
                 pool_va: base + 0x0080_0000,   // POOL (2 MiB, own PT)
                 data_va: base + 0x0030_0000,   // DATA (4 frames)
                 shared_va: base + 0x0038_0000, // SHARED (1 frame)
@@ -2208,6 +2212,15 @@ fn component_to_exec_va_for_instance(
             FSD_POOL_VADDR,
             FSD_POOL_FRAMES * 0x1000,
             inst.exec_pool_va,
+        )
+    })
+    .or_else(|| {
+        translate_component_range(
+            component_va,
+            bytes,
+            FSD_STACK_VADDR,
+            FSD_STACK_BYTES,
+            inst.exec_stack_va,
         )
     })
     .or_else(|| {
@@ -12657,6 +12670,9 @@ pub(crate) struct DriverComponent {
     /// the fixed [`FSD_POOL_VADDR`] range and are translated through this base before executive-side
     /// diagnostics or teardown read them.
     pub exec_pool_va: u64,
+    /// The EXECUTIVE-side mirror of this component's main stack frames. Stack-local dispatcher
+    /// objects are legal NT kernel objects and must be visible to the wait broker.
+    pub exec_stack_va: u64,
     /// The EXECUTIVE-side ARG-frame VA for THIS instance (buffered-I/O in/out data).
     pub exec_arg_va: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
@@ -13632,7 +13648,7 @@ unsafe fn load_driver_reserved(
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
-    let (pml4, tcb, cnode) = spawn_fsd_component(
+    let (pml4, tcb, cnode, stack_frame_base) = spawn_fsd_component(
         code_base,
         pool_base,
         data_base,
@@ -13641,6 +13657,13 @@ unsafe fn load_driver_reserved(
         fault_ep,
         &rights[..img_frames as usize],
     );
+    if unsafe { map_fsd_main_stack_exec_alias(instance, stack_frame_base, win.stack_va) }.is_none()
+    {
+        print_str(b"[driver-launch] stack alias map failed inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+        return None;
+    }
     // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
     // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
     let reply_cap = crate::ensure_fsd_reply_slot(instance);
@@ -13657,6 +13680,7 @@ unsafe fn load_driver_reserved(
             pml4,
             exec_shared_va: win.shared_va,
             exec_pool_va: win.pool_va,
+            exec_stack_va: win.stack_va,
             exec_arg_va: win.arg_va,
             tcb,
             cnode,
@@ -13781,6 +13805,7 @@ unsafe fn load_driver_reserved(
         finished,
         exec_shared_va: win.shared_va,
         exec_pool_va: win.pool_va,
+        exec_stack_va: win.stack_va,
         exec_arg_va: win.arg_va,
         instance,
         driver_id,
@@ -13828,7 +13853,7 @@ unsafe fn spawn_fsd_component(
     arg_base: u64,
     fault_ep: u64,
     rights: &[u64],
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, u64) {
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
@@ -13900,7 +13925,7 @@ unsafe fn spawn_fsd_component(
         caps: HostCaps::default(),
     };
     let sc = spawn_component(&d);
-    (sc.pml4, sc.tcb, sc.cnode)
+    (sc.pml4, sc.tcb, sc.cnode, sc.stack_frame_base)
 }
 
 const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
@@ -15750,6 +15775,7 @@ pub(crate) struct DriverInstance {
     pub pml4: u64,
     pub exec_shared_va: u64,
     pub exec_pool_va: u64,
+    pub exec_stack_va: u64,
     pub exec_arg_va: u64,
     pub tcb: u64,
     pub cnode: u64,
@@ -15769,6 +15795,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     pml4: 0,
     exec_shared_va: 0,
     exec_pool_va: 0,
+    exec_stack_va: 0,
     exec_arg_va: 0,
     tcb: 0,
     cnode: 0,
@@ -16260,6 +16287,24 @@ unsafe fn map_instance_exec_frame(
     Some(())
 }
 
+unsafe fn map_fsd_main_stack_exec_alias(
+    instance: usize,
+    stack_frame_base: u64,
+    exec_stack_va: u64,
+) -> Option<()> {
+    let spt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+    map_instance_exec_pt(instance, spt, exec_stack_va)?;
+
+    let mut i = 0u64;
+    while i < FSD_STACK_FRAMES {
+        let cap = copy_cap(stack_frame_base + i);
+        map_instance_exec_frame(instance, cap, exec_stack_va + i * 0x1000, RW_NX)?;
+        i += 1;
+    }
+    Some(())
+}
+
 /// Record a launched driver in [`DRIVER_INSTANCES`] (called by [`load_driver`]). "Ready" iff it
 /// parked at its dispatch loop with a control DEVICE_OBJECT (an FSD; a filter/device without an
 /// IoCreateDevice may still be ready — see [`register_instance_ready`]).
@@ -16286,6 +16331,7 @@ fn register_instance(dc: &DriverComponent) {
         pml4: dc.pml4,
         exec_shared_va: dc.exec_shared_va,
         exec_pool_va: dc.exec_pool_va,
+        exec_stack_va: dc.exec_stack_va,
         exec_arg_va: dc.exec_arg_va,
         tcb: dc.tcb,
         cnode: dc.cnode,
