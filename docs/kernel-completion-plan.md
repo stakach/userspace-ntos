@@ -1213,10 +1213,14 @@ before unrelated executive traffic monopolises the receive loop.
   dispatcher state during readiness scans. `PsCreateSystemThread` crosses a real component-service
   label and is backed by executive-owned system-thread handles plus real seL4 worker TCB startup for
   the NT5 null-object-attributes/null-process-handle/null-client-id shape used by boot drivers;
-  `PsTerminateSystemThread` tears down those worker TCBs without replying to the exiting caller.
+  `PsTerminateSystemThread` tears down those worker TCBs without replying to the exiting caller. The
+  mutable SYSTEM-hive setup seed now materializes ReactOS NDIS/TCPIP/AFD service records plus the
+  TCPIP base `Parameters` subtree into sparse LiveCD-derived hives, so winlogon and later network
+  consumers reach ordinary registry data instead of an executive open fallback.
   Remaining B3 work is broader non-display driver coverage: hosted thread-handle close/wait
-  semantics if ReactOS drivers expose them, metadata-driven TCPIP/AFD activation, miniport packet
-  data-plane behavior, and multi-device scaling under the same dynamic devnode/resource path.
+  semantics if ReactOS drivers expose them, serialized proof of TCPIP/AFD activation from the
+  registry metadata, miniport packet data-plane behavior, and multi-device scaling under the same
+  dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6481,3 +6485,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   thread-handle close/wait semantics if exposed, metadata-driven TCPIP/AFD activation, real miniport
   packet data-plane behavior, and repeated-device scaling under the same dynamic
   devnode/resource path.
+
+  B3 ReactOS network setup hive provisioning (2026-08-16): sparse LiveCD-derived SYSTEM hives now
+  receive the same installed-network setup records that the generated proof hive already carried.
+  `nt-hive-core` owns a host-tested `seed_reactos_network_setup_*` path sourced from ReactOS
+  `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`: it materializes `Ndis`, `Tcpip`, and `Afd`
+  kernel-driver service values plus `Tcpip\Parameters`, `Adapters`, `Interfaces`, and
+  `PersistentRoutes`. The executive calls that seed during mutable-hive provisioning and invalidates
+  the service-order cache only when service metadata actually changes, so later Config Manager
+  imports still own launch ordering. This removes the observed winlogon
+  `HKLM\System\CurrentControlSet\Services\Tcpip\Parameters` open miss by publishing real hive data
+  rather than special-casing the registry path. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core reactos_network -- --nocapture`, `cargo test -p nt-hive-core`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: run the next serialized
+  headless desktop proof and verify the TCPIP Parameters open miss is gone; if TCPIP/AFD now start
+  and expose new failures, fix the next missing generic driver/thread/registry mechanism rather than
+  adding service-specific success paths.

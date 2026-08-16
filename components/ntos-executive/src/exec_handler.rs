@@ -2760,6 +2760,7 @@ impl ExecNtHandler {
         handler.provision_default_user_shell_folders();
         handler.provision_default_user_ntuser_dat_image();
         handler.provision_normal_system_setup_state();
+        handler.provision_reactos_network_setup();
         handler.provision_reactos_print_setup();
         handler.provision_reactos_explorer_shell_com_classes();
         handler
@@ -2947,6 +2948,52 @@ impl ExecNtHandler {
             && value_name.eq_ignore_ascii_case("SetupType")
             && key_path.is_some_and(is_system_setup_key_canon)
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
+    }
+
+    /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
+    /// normally materialize. This publishes installed-boot service and TCPIP parameter metadata into
+    /// the mounted mutable SYSTEM hive; registry consumers and Config Manager still perform ordinary
+    /// opens, queries, ordering, and driver selection.
+    fn provision_reactos_network_setup(&mut self) {
+        let (stats, changed, failed, last_status) = {
+            let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
+            let stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
+            (stats, target.changed(), target.failed, target.last_status)
+        };
+        if !changed {
+            if self
+                .mutable_registry_value_by_path(
+                    r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters",
+                    "Hostname",
+                )
+                .is_some()
+            {
+                print_str(b"[network-setup] ReactOS network setup already present\n");
+            } else {
+                print_str(b"[network-setup] ReactOS network setup not provisioned\n");
+            }
+            if failed {
+                print_str(b"[network-setup] ReactOS network setup journal incomplete status=0x");
+                print_hex(last_status);
+                print_str(b"\n");
+            }
+            return;
+        }
+        self.mark_mutable_hives_dirty();
+        print_str(b"[network-setup] HKLM\\SYSTEM network setup provisioned: ndis=");
+        print_u64(stats.ndis_service_values as u64);
+        print_str(b" tcpip-service=");
+        print_u64(stats.tcpip_service_values as u64);
+        print_str(b" tcpip-params=");
+        print_u64(stats.tcpip_parameter_values as u64);
+        print_str(b" afd=");
+        print_u64(stats.afd_service_values as u64);
+        print_str(b"\n");
+        if failed {
+            print_str(b"[network-setup] ReactOS network setup journal incomplete status=0x");
+            print_hex(last_status);
+            print_str(b"\n");
+        }
     }
 
     /// Seed ReactOS shell COM classes that explorer reaches through `rshell.cpp` fallback

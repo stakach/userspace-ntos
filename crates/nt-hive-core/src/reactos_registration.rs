@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{canon_path, MutableHiveSet, RegistryOverlay, RegistryValueType};
+use nt_config_manager::{SERVICE_BOOT_START, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START};
 
 pub const REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU: u64 = 1 << 0;
 pub const REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE: u64 = 1 << 1;
@@ -42,6 +43,32 @@ impl ReactOsPrintSetupSeedStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReactOsKernelDriverServiceRegistration {
+    service_name: &'static str,
+    image_path: &'static str,
+    start_type: u32,
+    error_control: u32,
+    group: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReactOsNetworkSetupSeedStats {
+    pub ndis_service_values: u32,
+    pub tcpip_service_values: u32,
+    pub tcpip_parameter_values: u32,
+    pub afd_service_values: u32,
+}
+
+impl ReactOsNetworkSetupSeedStats {
+    pub fn total_values(self) -> u32 {
+        self.ndis_service_values
+            + self.tcpip_service_values
+            + self.tcpip_parameter_values
+            + self.afd_service_values
+    }
+}
+
 /// ReactOS `boot/bootdata/hivesys.inf` print setup registrations.
 ///
 /// The base `AddReg` block always creates the x86 environment, while `AddReg.NTamd64` creates the
@@ -59,6 +86,34 @@ pub const REACTOS_PRINT_ENVIRONMENTS: &[ReactOsPrintEnvironmentRegistration] = &
         directory: "x64",
         print_processor: "winprint",
         processor_driver: "winprint.dll",
+    },
+];
+
+/// ReactOS network driver setup registrations.
+///
+/// `Ndis` comes from `boot/bootdata/hivesys.inf`, `Tcpip` comes from
+/// `media/inf/nettcpip.inf`, and `Afd` comes from `drivers/network/afd/afd_reg.inf`.
+const REACTOS_NETWORK_DRIVER_SERVICES: &[ReactOsKernelDriverServiceRegistration] = &[
+    ReactOsKernelDriverServiceRegistration {
+        service_name: "Ndis",
+        image_path: r"system32\drivers\ndis.sys",
+        start_type: SERVICE_BOOT_START,
+        error_control: 1,
+        group: "NDIS Wrapper",
+    },
+    ReactOsKernelDriverServiceRegistration {
+        service_name: "Tcpip",
+        image_path: r"system32\drivers\tcpip.sys",
+        start_type: SERVICE_SYSTEM_START,
+        error_control: 1,
+        group: "PNP_TDI",
+    },
+    ReactOsKernelDriverServiceRegistration {
+        service_name: "Afd",
+        image_path: r"system32\drivers\afd.sys",
+        start_type: SERVICE_SYSTEM_START,
+        error_control: 1,
+        group: "TDI",
     },
 ];
 
@@ -256,6 +311,37 @@ fn join_registry_profile_path(profile_root: &str, child: &str) -> String {
     } else {
         format!(r"{}\{}", root, child)
     }
+}
+
+fn dword_bytes(value: u32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+fn set_setup_dword<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: u32,
+) -> bool {
+    target.set_value(path, name, RegistryValueType::Dword, dword_bytes(value))
+}
+
+fn set_setup_sz<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: &str,
+) -> bool {
+    target.set_value(path, name, RegistryValueType::Sz, utf16le_sz(value))
+}
+
+fn set_setup_expand_sz<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: &str,
+) -> bool {
+    target.set_value(path, name, RegistryValueType::ExpandSz, utf16le_sz(value))
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -562,6 +648,105 @@ pub fn seed_reactos_user_profile_shell_folders_into_target<T: ReactOsSetupSeedTa
     stats
 }
 
+fn seed_reactos_network_driver_service_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    service: &ReactOsKernelDriverServiceRegistration,
+) -> u32 {
+    let service_key = join_key_path(
+        r"\Registry\Machine\System\CurrentControlSet\Services",
+        service.service_name,
+    );
+    if !target.create_key(&service_key) {
+        return 0;
+    }
+
+    let mut changed = 0u32;
+    if set_setup_dword(&mut *target, &service_key, "Type", SERVICE_KERNEL_DRIVER) {
+        changed += 1;
+    }
+    if set_setup_dword(&mut *target, &service_key, "Start", service.start_type) {
+        changed += 1;
+    }
+    if set_setup_dword(
+        &mut *target,
+        &service_key,
+        "ErrorControl",
+        service.error_control,
+    ) {
+        changed += 1;
+    }
+    if set_setup_expand_sz(&mut *target, &service_key, "ImagePath", service.image_path) {
+        changed += 1;
+    }
+    if set_setup_sz(&mut *target, &service_key, "Group", service.group) {
+        changed += 1;
+    }
+    changed
+}
+
+/// Seed ReactOS network service metadata from setup INF sources into a SYSTEM hive.
+///
+/// This materializes installed-boot registry state only. Driver selection, dependency loading,
+/// system-thread startup, and device binding still flow through Config Manager and I/O Manager
+/// mechanisms.
+pub fn seed_reactos_network_setup_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+) -> ReactOsNetworkSetupSeedStats {
+    const TCPIP_PARAMETERS: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters";
+
+    let mut stats = ReactOsNetworkSetupSeedStats::default();
+    for service in REACTOS_NETWORK_DRIVER_SERVICES {
+        let changed = seed_reactos_network_driver_service_into_target(target, service);
+        match service.service_name {
+            "Ndis" => stats.ndis_service_values = changed,
+            "Tcpip" => stats.tcpip_service_values = changed,
+            "Afd" => stats.afd_service_values = changed,
+            _ => {}
+        }
+    }
+
+    if target.create_key(TCPIP_PARAMETERS) {
+        if set_setup_expand_sz(
+            &mut *target,
+            TCPIP_PARAMETERS,
+            "DataBasePath",
+            r"%SystemRoot%\System32\drivers\etc",
+        ) {
+            stats.tcpip_parameter_values += 1;
+        }
+        for (name, value) in [
+            ("Domain", ""),
+            ("Hostname", "ROSHost"),
+            ("NameServer", ""),
+            ("SearchList", ""),
+        ] {
+            if set_setup_sz(&mut *target, TCPIP_PARAMETERS, name, value) {
+                stats.tcpip_parameter_values += 1;
+            }
+        }
+        for (name, value) in [
+            ("ForwardBroadcasts", 0),
+            ("IPEnableRouter", 0),
+            ("EnableSecurityFilters", 0),
+        ] {
+            if set_setup_dword(&mut *target, TCPIP_PARAMETERS, name, value) {
+                stats.tcpip_parameter_values += 1;
+            }
+        }
+    }
+
+    for path in [
+        r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Adapters",
+        r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",
+        r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes",
+    ] {
+        target.create_key(path);
+    }
+
+    stats
+}
+
 pub fn seed_reactos_print_setup_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
 ) -> ReactOsPrintSetupSeedStats {
@@ -710,6 +895,16 @@ pub fn seed_reactos_default_user_shell_folders_in_mutable_hives(
     )
 }
 
+/// Seed ReactOS network setup keys from setup INF sources into the mounted SYSTEM hive.
+///
+/// This keeps TCPIP/AFD activation data in the same registry authority used by Config Manager
+/// rather than synthesizing key-open success in the executive.
+pub fn seed_reactos_network_setup_in_mutable_hives(
+    hives: &mut MutableHiveSet,
+) -> ReactOsNetworkSetupSeedStats {
+    seed_reactos_network_setup_into_target(&mut MutableHiveRgsSeedTarget { hives })
+}
+
 /// Seed ReactOS print setup keys from `boot/bootdata/hivesys.inf` into the mounted SYSTEM hive.
 ///
 /// This materializes setup-owned registry data. Print provider initialization still uses ordinary
@@ -738,6 +933,15 @@ mod tests {
     ) -> (RegistryValueType, &'a [u8]) {
         let key = hives.resolve_key(key).expect("seeded hive key");
         hives.query_value(key, value).expect("seeded hive value")
+    }
+
+    fn hive_dword(hives: &MutableHiveSet, key: &str, value: &str) -> u32 {
+        let key = hives.resolve_key(key).expect("seeded hive key");
+        hives
+            .hive(key.hive)
+            .expect("backing hive")
+            .query_dword(key.key, value)
+            .expect("seeded dword value")
     }
 
     #[test]
@@ -995,6 +1199,104 @@ mod tests {
         assert!(hives.clear_hive_dirty(1));
         let second_stats = seed_reactos_print_setup_in_mutable_hives(&mut hives);
         assert_eq!(second_stats, ReactOsPrintSetupSeedStats::default());
+        assert_eq!(
+            hives.hive(1).expect("system hive").cell_count(),
+            first_cell_count
+        );
+        assert_eq!(hives.hive(1).expect("system hive").dirty_count(), 0);
+    }
+
+    #[test]
+    fn seeds_reactos_network_setup_into_mutable_system_hive() {
+        let mut hives = MutableHiveSet::new();
+        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+
+        let stats = seed_reactos_network_setup_in_mutable_hives(&mut hives);
+        assert_eq!(
+            stats,
+            ReactOsNetworkSetupSeedStats {
+                ndis_service_values: 5,
+                tcpip_service_values: 5,
+                tcpip_parameter_values: 8,
+                afd_service_values: 5,
+            }
+        );
+        assert_eq!(stats.total_values(), 23);
+
+        let ndis = r"\Registry\Machine\System\CurrentControlSet\Services\Ndis";
+        assert_eq!(
+            hive_dword(&hives, ndis, "Type"),
+            nt_config_manager::SERVICE_KERNEL_DRIVER
+        );
+        assert_eq!(
+            hive_dword(&hives, ndis, "Start"),
+            nt_config_manager::SERVICE_BOOT_START
+        );
+        let (ty, data) = hive_value_bytes(&hives, ndis, "ImagePath");
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"system32\drivers\ndis.sys"));
+        let (ty, data) = hive_value_bytes(&hives, ndis, "Group");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("NDIS Wrapper"));
+
+        let tcpip = r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip";
+        assert_eq!(
+            hive_dword(&hives, tcpip, "Type"),
+            nt_config_manager::SERVICE_KERNEL_DRIVER
+        );
+        assert_eq!(
+            hive_dword(&hives, tcpip, "Start"),
+            nt_config_manager::SERVICE_SYSTEM_START
+        );
+        let (ty, data) = hive_value_bytes(&hives, tcpip, "Group");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("PNP_TDI"));
+
+        let tcpip_parameters =
+            r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters";
+        let (ty, data) = hive_value_bytes(&hives, tcpip_parameters, "DataBasePath");
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"%SystemRoot%\System32\drivers\etc"));
+        let (ty, data) = hive_value_bytes(&hives, tcpip_parameters, "Hostname");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("ROSHost"));
+        assert_eq!(hive_dword(&hives, tcpip_parameters, "IPEnableRouter"), 0);
+        assert!(hives
+            .resolve_key(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Adapters"
+            )
+            .is_some());
+        assert!(hives
+            .resolve_key(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+            )
+            .is_some());
+        assert!(hives
+            .resolve_key(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes"
+            )
+            .is_some());
+
+        let afd = r"\Registry\Machine\System\CurrentControlSet\Services\Afd";
+        assert_eq!(
+            hive_dword(&hives, afd, "Type"),
+            nt_config_manager::SERVICE_KERNEL_DRIVER
+        );
+        assert_eq!(
+            hive_dword(&hives, afd, "Start"),
+            nt_config_manager::SERVICE_SYSTEM_START
+        );
+        let (ty, data) = hive_value_bytes(&hives, afd, "ImagePath");
+        assert_eq!(ty, RegistryValueType::ExpandSz);
+        assert_eq!(data, utf16le_sz(r"system32\drivers\afd.sys"));
+        let (ty, data) = hive_value_bytes(&hives, afd, "Group");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("TDI"));
+
+        let first_cell_count = hives.hive(1).expect("system hive").cell_count();
+        assert!(hives.clear_hive_dirty(1));
+        let second_stats = seed_reactos_network_setup_in_mutable_hives(&mut hives);
+        assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
         assert_eq!(
             hives.hive(1).expect("system hive").cell_count(),
             first_cell_count
