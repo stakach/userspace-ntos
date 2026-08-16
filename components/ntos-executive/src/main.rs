@@ -1223,12 +1223,23 @@ pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// Shared word between the executive (broker) and the isolated storage host: the AHCI's
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
 /// INITRD cluster @0x10, size @0x14 out.
-pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_105F_6000;
+pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_1044_0000;
 pub const STORAGE_SHARED_FRAMES: u64 = 8;
 pub const STORAGE_HIVE_IMAGE_OFFSET: u64 = 0x1000;
 pub const STORAGE_IMPORTS_IMAGE_OFFSET: u64 = 0x800;
 pub const STORAGE_HIVE_IMAGE_CAP: usize =
     (STORAGE_SHARED_FRAMES as usize * 0x1000) - STORAGE_HIVE_IMAGE_OFFSET as usize;
+pub const STORAGE_SHARED_END: u64 = STORAGE_SHARED_VADDR + STORAGE_SHARED_FRAMES * 0x1000;
+pub const BOOT_FILE_SECTION_SCRATCH_VA: u64 = 0x0000_0100_1045_0000;
+pub const BOOT_SEC_IMAGE_SCRATCH_VA: u64 = 0x0000_0100_1045_1000;
+pub const BOOT_HIVE_SECTION_SCRATCH_VA: u64 = 0x0000_0100_1045_2000;
+pub const BOOT_SMSS_FILL_SCRATCH_VA: u64 = 0x0000_0100_1045_3000;
+const _: () = assert!(STORAGE_SHARED_VADDR >= WORK_CLUSTER_BASE);
+const _: () = assert!(STORAGE_SHARED_END <= WORK_CLUSTER_BASE + 0x20_0000);
+const _: () = assert!(STORAGE_SHARED_END <= BOOT_FILE_SECTION_SCRATCH_VA);
+const _: () = assert!(BOOT_SEC_IMAGE_SCRATCH_VA >= BOOT_FILE_SECTION_SCRATCH_VA + 0x1000);
+const _: () = assert!(BOOT_HIVE_SECTION_SCRATCH_VA >= BOOT_SEC_IMAGE_SCRATCH_VA + 0x1000);
+const _: () = assert!(BOOT_SMSS_FILL_SCRATCH_VA >= BOOT_HIVE_SECTION_SCRATCH_VA + 0x1000);
 /// A multi-frame file buffer shared between the executive and the storage host: the host reads
 /// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
@@ -2078,6 +2089,7 @@ pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+const _: () = assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
 const ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET: u64 = 0x0c;
@@ -2143,6 +2155,7 @@ const _: () = assert!(HOSTED_PCI_COMMON_BUFFER_LEN <= 0x20_0000);
 /// Driver-host VSpace: where the executive maps the CM_RESOURCE_LIST + common-buffer
 /// descriptor (also mapped at the same vaddr in the host, aliasing the frame).
 pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
+const _: () = assert!(STORAGE_SHARED_END <= RESLIST_VADDR || RESLIST_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 const Q35_PCI_INTX_IOAPIC_ROUTE_MASK: u32 = 0x00FF_0000;
@@ -22603,12 +22616,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let ff = alloc_frame();
     let _ = page_map(
         ff,
-        STORAGE_SHARED_VADDR + 0x2000,
+        BOOT_FILE_SECTION_SCRATCH_VA,
         RW_NX,
         CAP_INIT_THREAD_VSPACE,
     );
     core::ptr::write_volatile(
-        (STORAGE_SHARED_VADDR + 0x2000) as *mut u64,
+        BOOT_FILE_SECTION_SCRATCH_VA as *mut u64,
         0xDEAD_FACE_CAFE_F00D,
     );
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
@@ -22932,7 +22945,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             spawn.pml4,
             spawn.main_tcb,
             &pe,
-            STORAGE_SHARED_VADDR + 0x4000,
+            BOOT_SEC_IMAGE_SCRATCH_VA,
             None,
         );
         si_verdict = v;
@@ -24016,16 +24029,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ldff = alloc_frame();
         let _ = page_map(
             ldff,
-            STORAGE_SHARED_VADDR + 0x3000,
+            BOOT_HIVE_SECTION_SCRATCH_VA,
             RW_NX,
             CAP_INIT_THREAD_VSPACE,
         );
-        let n = (hive_len as u64).min(STORAGE_HIVE_IMAGE_CAP as u64);
+        let n = (hive_len as u64).min(0x1000);
         for i in 0..n {
             let b = core::ptr::read_volatile(
                 (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET + i) as *const u8,
             );
-            core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x3000 + i) as *mut u8, b);
+            core::ptr::write_volatile((BOOT_HIVE_SECTION_SCRATCH_VA + i) as *mut u8, b);
         }
         let ld_fault = make_object(OBJ_ENDPOINT);
         let ld_fault_c = copy_cap(ld_fault);
@@ -26247,7 +26260,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
                 // translation and compare to the file's .text raw bytes. Match => our loader
                 // maps a real 6-section x64 binary correctly.
-                let scratch = STORAGE_SHARED_VADDR + 0x5000;
+                let scratch = BOOT_SMSS_FILL_SCRATCH_VA;
                 let _ = page_map(alloc_frame(), scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
                 let _ = fill_image_page(&pe, 0x1000, scratch);
                 let mut fill_ok = false;

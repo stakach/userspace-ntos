@@ -3679,6 +3679,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   whether `bochsmp.sys` reaches `VideoPortGetAccessRanges`, `HwFindAdapter`, hosted route adoption,
   and real `framebuf` shell paint before retiring the boot-framebuffer backend.
 
+- B3 storage-window layout correction (2026-08-16). Serialized desktop validation
+  `.tmp/run-desktop-b3-display-20260816-105547.log` reached genuine Explorer shell chrome, but it
+  proved the demand-start display path was still not selected: the generated SYSTEM hive failed
+  executive-side decode, `hosted PCI grant discovery selected=0`, and the generic PCI selection gates
+  failed while win32k still consumed the boot-framebuffer display route. The root cause was stale
+  scratch ownership inside the storage shared VA band: old boot demos mapped private scratch frames at
+  `STORAGE_SHARED_VADDR + 0x2000`, `+0x3000`, `+0x4000`, and `+0x5000`, and the enlarged
+  `STORAGE_SHARED_FRAMES=8` window also overlapped the component `IPCBUF`/resource-list tail at
+  `0x105f_b000`/`0x105f_d000`. The retained fix moves storage's shared image/metadata window to its
+  own low work-cluster span, gives the boot demos named non-storage scratch pages, limits the
+  disk-hive demand-page proof to the first page it actually validates, and adds compile-time
+  non-overlap assertions for storage vs. IPC/resource-list VAs. Review adjustment: the next serialized
+  boot should first prove `exec_cm_hive_decoded`, `exec_disk_section_demand_paged`,
+  `exec_hosted_pci_windows_selected_from_registry`, and `exec_generic_pci_registry_selected` are
+  restored, then inspect whether `bochsmp.sys` reaches `VideoPortGetAccessRanges` and
+  `HwFindAdapter`.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same
