@@ -50,6 +50,9 @@ pub const DEVICE_CLASSES_PATH: &str =
 pub const CONTROL_CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
 pub const SERVICE_GROUP_ORDER_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder";
+pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
+pub const NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP: &str = "PNP_TDI";
+pub const NETWORK_TRANSPORT_LOAD_ORDER_GROUP: &str = "TDI";
 
 pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
 pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
@@ -726,6 +729,35 @@ impl ConfigManager {
         self.boot_system_pnp_driver_bindings()
             .into_iter()
             .map(|binding| binding.service)
+            .collect()
+    }
+
+    /// Whether a boot/system driver service is a hosted legacy network-stack driver.
+    ///
+    /// The hosted boot-driver path can start PnP-bound device drivers from imported `Enum`
+    /// devnodes. The only no-devnode device drivers admitted here are the registry-declared NT5
+    /// network wrapper/transport groups; unrelated legacy boot drivers such as boot-bus extenders,
+    /// WDF framework loaders, debug/SAC services, and storage class drivers need their own kernel
+    /// mechanisms before they enter this path.
+    pub fn is_boot_system_legacy_driver(&self, service: &ServiceMetadata) -> bool {
+        service.has_launch_image()
+            && service.driver_service_class() == Some(DriverServiceClass::Device)
+            && service
+                .start_type
+                .is_some_and(|start| start == SERVICE_BOOT_START || start == SERVICE_SYSTEM_START)
+            && service.load_order_group.as_deref().is_some_and(|group| {
+                group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
+                    || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
+                    || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP)
+            })
+            && !self.service_has_devnodes(&service.name)
+    }
+
+    /// Boot/system no-devnode network wrapper/transport drivers selected by service metadata.
+    pub fn boot_system_legacy_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.boot_system_driver_candidates()
+            .into_iter()
+            .filter(|service| self.is_boot_system_legacy_driver(service))
             .collect()
     }
 
@@ -2476,6 +2508,139 @@ mod tests {
         assert_eq!(
             bindings[1].devnodes[0].instance_id,
             r"ROOT\SECOND_BOUND_DEVICE\0000"
+        );
+    }
+
+    #[test]
+    fn boot_system_legacy_driver_candidates_exclude_pnp_bindings() {
+        let mut cm = ConfigManager::new();
+        let group_key = cm.registry_mut().create_key(SERVICE_GROUP_ORDER_PATH);
+        cm.registry_mut().set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(&["NDIS Wrapper", "PNP_TDI", "NDIS", "TDI"]),
+        );
+        cm.register_typed_service(
+            "Ndis",
+            r"system32\drivers\ndis.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        let ndis_key = cm.service_metadata("Ndis").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(ndis_key, "Group", "NDIS Wrapper");
+        cm.register_typed_service(
+            "Tcpip",
+            r"system32\drivers\tcpip.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        let tcpip_key = cm.service_metadata("Tcpip").unwrap().service_key;
+        cm.registry_mut().set_string(tcpip_key, "Group", "PNP_TDI");
+        cm.register_typed_service(
+            "E1000",
+            r"system32\drivers\e1000.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        let e1000_key = cm.service_metadata("E1000").unwrap().service_key;
+        cm.registry_mut().set_string(e1000_key, "Group", "NDIS");
+        cm.register_typed_service(
+            "Afd",
+            r"system32\drivers\afd.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        let afd_key = cm.service_metadata("Afd").unwrap().service_key;
+        cm.registry_mut().set_string(afd_key, "Group", "TDI");
+        cm.register_typed_service(
+            "Npfs",
+            r"system32\drivers\npfs.sys",
+            SERVICE_FILE_SYSTEM_DRIVER,
+            None,
+            None,
+            SERVICE_SYSTEM_START,
+            1,
+        );
+        cm.register_typed_service(
+            "sacdrv",
+            r"system32\drivers\sacdrv.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            0,
+        );
+        let sacdrv_key = cm.service_metadata("sacdrv").unwrap().service_key;
+        cm.registry_mut().set_string(sacdrv_key, "Group", "EMS");
+        cm.register_typed_service(
+            "Wdf01000",
+            r"system32\drivers\wdf01000.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        let wdf_key = cm.service_metadata("Wdf01000").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(wdf_key, "Group", "WdfLoadGroup");
+        cm.register_typed_service(
+            "acpi",
+            r"system32\drivers\acpi.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        let acpi_key = cm.service_metadata("acpi").unwrap().service_key;
+        cm.registry_mut()
+            .set_string(acpi_key, "Group", "Boot Bus Extender");
+        cm.register_typed_service(
+            "Packet",
+            r"system32\drivers\packet.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DISABLED,
+            1,
+        );
+        let packet_key = cm.service_metadata("Packet").unwrap().service_key;
+        cm.registry_mut().set_string(packet_key, "Group", "PNP_TDI");
+        cm.register_devnode(
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            Some("E1000"),
+            Some(r"\Device\NTPNP_PCI0001"),
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[],
+        );
+
+        let names: Vec<String> = cm
+            .boot_system_legacy_driver_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(
+            names,
+            alloc::vec![
+                String::from("Ndis"),
+                String::from("Tcpip"),
+                String::from("Afd")
+            ]
         );
     }
 

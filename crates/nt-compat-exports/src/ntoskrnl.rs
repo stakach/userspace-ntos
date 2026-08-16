@@ -29,6 +29,12 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlInitUnicodeString", Implemented, ""),
     e("RtlCopyUnicodeString", Implemented, ""),
     e("RtlCompareUnicodeString", Implemented, ""),
+    e(
+        "_wcsicmp",
+        Implemented,
+        "bounded UTF-16 case-insensitive CRT compare",
+    ),
+    e("wcsicmp", Implemented, "alias of _wcsicmp"),
     // --- pool (M4 driver-local arena) ---
     e("ExAllocatePoolWithTag", Implemented, ""),
     e("ExFreePoolWithTag", Implemented, ""),

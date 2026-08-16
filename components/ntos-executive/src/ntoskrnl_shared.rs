@@ -95,3 +95,37 @@ pub extern "win64" fn s_wcslen(s: u64) -> u64 {
     }
     n
 }
+
+fn downcase_utf16(unit: u16) -> u16 {
+    match unit {
+        0x0041..=0x005A => unit + 0x20,
+        0x00C0..=0x00D6 | 0x00D8..=0x00DE => unit + 0x20,
+        _ => unit,
+    }
+}
+
+/// `_wcsicmp(const wchar_t*, const wchar_t*)` — case-insensitive UTF-16 compare (bounded).
+pub extern "win64" fn s_wcsicmp(left: u64, right: u64) -> i32 {
+    let mut i = 0u64;
+    unsafe {
+        while i < 32768 {
+            let a = if left == 0 {
+                0
+            } else {
+                core::ptr::read_unaligned((left + i * 2) as *const u16)
+            };
+            let b = if right == 0 {
+                0
+            } else {
+                core::ptr::read_unaligned((right + i * 2) as *const u16)
+            };
+            let fa = downcase_utf16(a);
+            let fb = downcase_utf16(b);
+            if fa != fb || a == 0 || b == 0 {
+                return fa as i32 - fb as i32;
+            }
+            i += 1;
+        }
+    }
+    0
+}

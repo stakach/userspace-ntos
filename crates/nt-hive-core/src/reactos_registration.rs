@@ -498,6 +498,54 @@ impl ReactOsSetupSeedTarget for MutableHiveRgsSeedTarget<'_> {
     }
 }
 
+struct ConfigManagerSetupSeedTarget<'a> {
+    cm: &'a mut nt_config_manager::ConfigManager,
+}
+
+impl ReactOsSetupSeedTarget for ConfigManagerSetupSeedTarget<'_> {
+    fn create_key(&mut self, path: &str) -> bool {
+        self.cm.registry_mut().create_key(path);
+        true
+    }
+
+    fn set_value(
+        &mut self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
+        let key = self.cm.registry_mut().create_key(path);
+        self.cm
+            .registry_mut()
+            .set_value(key, name, value_type, data)
+    }
+
+    fn has_value(&self, path: &str, name: &str) -> bool {
+        self.cm
+            .registry()
+            .open_key(path)
+            .is_some_and(|key| self.cm.registry().query_value(key, name).is_some())
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        self.cm
+            .registry()
+            .open_key(path)
+            .and_then(|key| self.cm.registry().query_value(key, name))
+            .is_some_and(|existing| existing.value_type == value_type && existing.data == data)
+    }
+}
+
 fn seed_key_line<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     current: &str,
@@ -905,6 +953,17 @@ pub fn seed_reactos_network_setup_in_mutable_hives(
     seed_reactos_network_setup_into_target(&mut MutableHiveRgsSeedTarget { hives })
 }
 
+/// Seed ReactOS network setup keys into a Config Manager registry view.
+///
+/// This is the launch-planner companion to [`seed_reactos_network_setup_in_mutable_hives`]: it
+/// keeps boot/system driver selection on Config Manager metadata while using the same setup source
+/// records that live registry callers see through the mounted mutable SYSTEM hive.
+pub fn seed_reactos_network_setup_in_config_manager(
+    cm: &mut nt_config_manager::ConfigManager,
+) -> ReactOsNetworkSetupSeedStats {
+    seed_reactos_network_setup_into_target(&mut ConfigManagerSetupSeedTarget { cm })
+}
+
 /// Seed ReactOS print setup keys from `boot/bootdata/hivesys.inf` into the mounted SYSTEM hive.
 ///
 /// This materializes setup-owned registry data. Print provider initialization still uses ordinary
@@ -1302,6 +1361,56 @@ mod tests {
             first_cell_count
         );
         assert_eq!(hives.hive(1).expect("system hive").dirty_count(), 0);
+    }
+
+    #[test]
+    fn seeds_reactos_network_setup_into_config_manager() {
+        let mut cm = nt_config_manager::ConfigManager::new();
+        let stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(
+            stats,
+            ReactOsNetworkSetupSeedStats {
+                ndis_service_values: 5,
+                tcpip_service_values: 5,
+                tcpip_parameter_values: 8,
+                afd_service_values: 5,
+            }
+        );
+
+        let tcpip = cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip")
+            .expect("Tcpip service");
+        assert_eq!(
+            cm.registry().query_dword(tcpip, "Start"),
+            Some(nt_config_manager::SERVICE_SYSTEM_START)
+        );
+        let tcpip_parameters = cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters")
+            .expect("Tcpip Parameters");
+        assert_eq!(
+            cm.registry()
+                .query_string(tcpip_parameters, "Hostname")
+                .as_deref(),
+            Some("ROSHost")
+        );
+
+        let legacy: Vec<alloc::string::String> = cm
+            .boot_system_legacy_driver_candidates()
+            .into_iter()
+            .map(|service| service.name.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            legacy,
+            alloc::vec![
+                alloc::string::String::from("ndis"),
+                alloc::string::String::from("tcpip"),
+                alloc::string::String::from("afd")
+            ]
+        );
+        let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
     }
 
     #[test]

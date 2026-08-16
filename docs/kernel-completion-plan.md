@@ -39,6 +39,23 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
+`.tmp/run-headless-b3-network-stack-select-20260816.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the boot/system driver selector admitted only
+registry-declared no-devnode NT5 network wrapper/transport groups, the hosted driver image lane was
+sized from real PE `SizeOfImage` plus provider dependencies, and `_wcsicmp`/`wcsicmp` were added to
+the hosted ntoskrnl export surface. The proof launches `Ndis`, `Tcpip`, `Afd`, and `Netio` through
+ordered service metadata without reintroducing service-name launch policy; `Ndis`, `Afd`, and
+`Netio` return successful `DriverEntry` results, while `Tcpip` now reaches its own real
+initialization and fails closed with `STATUS_INVALID_SID` instead of being skipped by the launch
+planner or blocked by dependency-image sizing/import resolution. The full shell path remains green:
+real `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM classes, api0 callbacks, GDI
+user batch flushes, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports
+`786432/786432` non-background pixels with at least 32 distinct non-background colors,
+`exec_win32k_desktop_painted` passes, and the pool gate still has usable headroom
+(`ut-free=66356KiB`, `exec-heap-free=8096KiB`, no image-bank, registry, ASID, or VM allocation
+failures).
+
+Previous accepted desktop proof (2026-08-16):
 `.tmp/run-headless-b3-worker-owner-unmap-20260816.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after hosted thread-pool worker teardown stopped
 issuing `Page_Unmap` against owner caps that are not live mappings. The previous ASID/PTE cleanup
@@ -52,7 +69,7 @@ non-background colors, `exec_win32k_desktop_painted` passes, the pool gate still
 allocation failures), and sparse LiveCD-derived SYSTEM hives report real network setup provisioning
 for the TCPIP/AFD metadata path.
 
-Previous accepted desktop proof (2026-08-16):
+Earlier accepted desktop proof (2026-08-16):
 `.tmp/run-desktop-dependency-closure.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the boot-framebuffer display route was removed,
 the old fixed boot proof scratch aliases were replaced, hosted-video success-path traces were
@@ -1216,12 +1233,16 @@ before unrelated executive traffic monopolises the receive loop.
   `PsTerminateSystemThread` tears down those worker TCBs without replying to the exiting caller. The
   mutable SYSTEM-hive setup seed now materializes ReactOS NDIS/TCPIP/AFD service records plus the
   TCPIP base `Parameters` subtree into sparse LiveCD-derived hives, so winlogon and later network
-  consumers reach ordinary registry data instead of an executive open fallback.
-  The current serialized desktop proof validates that this setup data is provisioned before the
-  shell path, while actual TCPIP/AFD driver activation from registry ordering remains open.
+  consumers reach ordinary registry data instead of an executive open fallback. No-devnode NT5
+  network wrapper/transport groups now enter the same ordered boot/system launch loop as FSD and
+  PnP-bound drivers, while unrelated no-devnode boot drivers remain excluded until their real
+  mechanisms exist.
+  The current serialized desktop proof validates that `Ndis`, `Tcpip`, `Afd`, and `Netio` are
+  selected dynamically from registry metadata and launched through the hosted driver path; `Tcpip`
+  now fails closed from its own initialization with `STATUS_INVALID_SID`.
   Remaining B3 work is broader non-display driver coverage: hosted thread-handle close/wait
-  semantics if ReactOS drivers expose them, TCPIP/AFD activation from the registry metadata,
-  miniport packet data-plane behavior, and multi-device scaling under the same dynamic
+  semantics if ReactOS drivers expose them, the generic SID/security/config surface needed by
+  `tcpip.sys`, miniport packet data-plane behavior, and multi-device scaling under the same dynamic
   devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
@@ -6521,3 +6542,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   frontier is now turning the provisioned TCPIP/AFD metadata into real registry-ordered driver
   activation, then packet data-plane behavior, while preserving the generic hosted-driver wait and
   worker lifecycle mechanisms.
+
+  B3 no-devnode network driver activation slice (2026-08-16): Config Manager now exposes the
+  registry-defined no-devnode NT5 network wrapper/transport boundary as
+  `boot_system_legacy_driver_candidates()`, admitting boot/system device drivers only when they have
+  a launch image, no imported `Enum` devnodes, and a load-order group of `NDIS Wrapper`, `PNP_TDI`,
+  or `TDI`. The host test explicitly excludes unrelated no-devnode boot drivers such as `sacdrv`,
+  `Wdf01000`, and `acpi`, and the executive's ordered boot/system loop continues past the named-pipe
+  provider instead of ending the plan after NPFS. Hosted driver image windows are now planned from
+  real PE `SizeOfImage` plus the ordered provider dependency closure, so larger support-driver
+  combinations either receive enough bounded code-lane frames or fail with a measured
+  `[driver-launch] image window exhausted` diagnostic. The hosted ntoskrnl export surface also now
+  includes bounded `_wcsicmp`/`wcsicmp`, which removes the `sacdrv` import wall without making
+  `sacdrv` eligible for this network path. Serialized headless proof
+  `.tmp/run-headless-b3-network-stack-select-20260816.log` reaches `296/296`, keeps
+  `exec_gdi_user_batch_flushed` and `exec_explorer_shell_chrome_painted` green, and shows the
+  dynamic boot loop launching `Ndis`, `Tcpip`, `Afd`, and `Netio`; `Ndis`, `Afd`, and `Netio`
+  return successful `DriverEntry` statuses, while `Tcpip` reaches a real `PsCreateSystemThread`
+  request and then fails closed with `STATUS_INVALID_SID`. Validation: `cargo fmt --all`,
+  `cargo test -p nt-config-manager boot_system_legacy_driver_candidates_exclude_pnp_bindings`,
+  `cargo test -p nt-hive-core reactos_network -- --nocapture`, `cargo test -p nt-compat-exports`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and the serialized headless boot proof. Review
+  adjustment: B3's active frontier is now the generic security/SID and TCPIP configuration surface
+  that makes `tcpip.sys` return `STATUS_INVALID_SID`; after that, continue into real packet
+  data-plane behavior and repeated-NIC scaling through the same registry/devnode/resource path.

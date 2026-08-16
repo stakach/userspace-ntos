@@ -60,7 +60,9 @@ use nt_video_miniport::{
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
-use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_wcslen};
+use crate::ntoskrnl_shared::{
+    s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_wcsicmp, s_wcslen,
+};
 
 use crate::*;
 
@@ -85,12 +87,14 @@ use crate::*;
 
 // --- component VA layout (identical in the executive-load view + the host-run view) ----------
 
-/// The relocated/loaded FSD image (VIRTUAL layout). npfs.sys is ~62 KiB → SizeOfImage ~0x14000
-/// (20 frames); reserve a generous 64-frame (256 KiB) window in its own 2 MiB PT, well clear of
-/// win32k's windows (which start at 0x0680_0000).
+/// The relocated/loaded hosted driver image (VIRTUAL layout). The old FSD proof used a fixed
+/// 64-frame image window; current hosted drivers size this window from the driver's real
+/// `SizeOfImage` plus mapped provider dependencies, bounded by the component code lane.
 pub const FSD_CODE_VA: u64 = 0x0000_0100_0E00_0000;
-/// FSD image frame budget (SizeOfImage / 0x1000, capped). 64 frames = 256 KiB.
+/// Minimum hosted driver image frame budget retained for tiny FSDs and old fallback callers.
 pub const FSD_IMAGE_FRAMES: u64 = 64;
+/// The component ABI places the pool after the image lane; image mapping must not cross it.
+pub const FSD_IMAGE_MAX_FRAMES: u64 = (FSD_POOL_VADDR - FSD_CODE_VA) / 0x1000;
 
 /// The FSD pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter @+0, data @
 /// +0x1000). Hosted FSD/NDIS boot drivers currently fit comfortably inside one mapped 2 MiB window;
@@ -2198,11 +2202,16 @@ fn component_to_exec_va_for_instance(
     bytes: u64,
 ) -> Option<u64> {
     let win = ExecVaWindow::try_for_instance(instance)?;
+    let image_frames = if inst.image_frames == 0 {
+        FSD_IMAGE_FRAMES
+    } else {
+        inst.image_frames
+    };
     translate_component_range(
         component_va,
         bytes,
         FSD_CODE_VA,
-        FSD_IMAGE_FRAMES * 0x1000,
+        image_frames * 0x1000,
         win.code_va,
     )
     .or_else(|| {
@@ -10504,6 +10513,12 @@ struct PlannedDependencyImage {
     src_size: u32,
 }
 
+struct PlannedHostedImages {
+    dependencies: Vec<PlannedDependencyImage>,
+    primary_image_len: u64,
+    total_image_len: u64,
+}
+
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
@@ -11016,6 +11031,8 @@ fn register_fsd_trampolines() {
     reg.bind("strcpy", s_strcpy as *const () as usize as u64);
     reg.bind("sprintf", s_sprintf as *const () as usize as u64);
     reg.bind("wcslen", s_wcslen as *const () as usize as u64);
+    reg.bind("_wcsicmp", s_wcsicmp as *const () as usize as u64);
+    reg.bind("wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsncmp", s_wcsncmp as *const () as usize as u64);
     reg.bind("wcsncpy", s_wcsncpy as *const () as usize as u64);
     reg.bind("wcscat", s_wcscat as *const () as usize as u64);
@@ -12675,6 +12692,9 @@ pub(crate) struct DriverComponent {
     pub exec_stack_va: u64,
     /// The EXECUTIVE-side ARG-frame VA for THIS instance (buffered-I/O in/out data).
     pub exec_arg_va: u64,
+    /// Number of component image frames mapped at [`FSD_CODE_VA`] for this driver and its support
+    /// provider images.
+    pub image_frames: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
     pub instance: usize,
     /// Canonical executive/I/O route id for this driver binding.
@@ -13004,6 +13024,81 @@ unsafe fn collect_hosted_dependency_closure(
 
 fn align_up_4k(v: u64) -> Option<u64> {
     v.checked_add(0xfff).map(|x| x & !0xfff)
+}
+
+fn frames_for_image_len(len: u64) -> Option<u64> {
+    Some(align_up_4k(len)? / 0x1000)
+}
+
+fn hosted_image_frame_capacity(win: ExecVaWindow) -> u64 {
+    let mut limit = FSD_CODE_VA + FSD_IMAGE_MAX_FRAMES * 0x1000;
+    for next in [
+        FSD_POOL_VADDR,
+        FSD_STACK_VADDR,
+        FSD_AUX_PT_VADDR,
+        FSD_DATA_VADDR,
+        FSD_SHARED_VADDR,
+        FSD_ARG_VADDR,
+    ] {
+        if next > FSD_CODE_VA && next < limit {
+            limit = next;
+        }
+    }
+    for next in [
+        win.pool_va,
+        win.stack_va,
+        win.aux_pt_va,
+        win.data_va,
+        win.shared_va,
+        win.arg_va,
+    ] {
+        if next > win.code_va && next < win.code_va + FSD_IMAGE_MAX_FRAMES * 0x1000 {
+            let component_limit = FSD_CODE_VA + (next - win.code_va);
+            if component_limit < limit {
+                limit = component_limit;
+            }
+        }
+    }
+    (limit - FSD_CODE_VA) / 0x1000
+}
+
+unsafe fn plan_hosted_images(
+    fs: &Fat32,
+    primary_src_va: u64,
+    primary_src_size: u32,
+) -> Option<PlannedHostedImages> {
+    clear_hosted_dependency_images();
+
+    let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
+    raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
+    let mut dependencies = Vec::<PlannedDependencyImage>::new();
+    let mut visiting = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
+    let mut provider_idx = 0usize;
+    while provider_idx < providers.len() {
+        collect_hosted_dependency_closure(
+            fs,
+            providers[provider_idx],
+            &mut visiting,
+            &mut dependencies,
+        )?;
+        provider_idx += 1;
+    }
+
+    let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
+    let mut total_image_len = align_up_4k(primary_image_len)?;
+    let mut idx = 0usize;
+    while idx < dependencies.len() {
+        let dep_image_len =
+            raw_pe_size_of_image(dependencies[idx].src_va, dependencies[idx].src_size)? as u64;
+        total_image_len = total_image_len.checked_add(align_up_4k(dep_image_len)?)?;
+        idx += 1;
+    }
+
+    Some(PlannedHostedImages {
+        dependencies,
+        primary_image_len,
+        total_image_len,
+    })
 }
 
 fn hosted_dependency_path(provider: &str, out: &mut [u8]) -> Option<usize> {
@@ -13373,42 +13468,29 @@ const EXEC_PD_SPAN: u64 = 0x4000_0000; // 1 GiB
 const SEL4_DELETE_FIRST: u64 = 8;
 
 unsafe fn load_hosted_dependency_images(
-    fs: &Fat32,
-    primary_src_va: u64,
-    primary_src_size: u32,
+    plan: &PlannedHostedImages,
     code_va: u64,
     run_va: u64,
     shared_va: u64,
     img_frames: u64,
     rights: &mut [u64],
 ) -> Option<LoadedSupportImages> {
-    clear_hosted_dependency_images();
     clear_support_image_records(shared_va);
 
-    let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
-    raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
-    let mut plan = Vec::<PlannedDependencyImage>::new();
-    let mut visiting = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
-    let mut provider_idx = 0usize;
-    while provider_idx < providers.len() {
-        collect_hosted_dependency_closure(fs, providers[provider_idx], &mut visiting, &mut plan)?;
-        provider_idx += 1;
-    }
-    if plan.is_empty() {
+    if plan.dependencies.is_empty() {
         return Some(LoadedSupportImages {
             count: 0,
             first_entry_rva: 0,
         });
     }
-    let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
-    let mut dep_offset = align_up_4k(primary_image_len)?;
+    let mut dep_offset = align_up_4k(plan.primary_image_len)?;
     let mut support_images = LoadedSupportImages {
         count: 0,
         first_entry_rva: 0,
     };
     let mut idx = 0usize;
-    while idx < plan.len() {
-        let planned = plan[idx];
+    while idx < plan.dependencies.len() {
+        let planned = plan.dependencies[idx];
         let provider_name = planned.provider;
         let provider = provider_name.as_str();
         if support_images.count as u64 >= SH_SUPPORT_RECORD_CAPACITY {
@@ -13541,17 +13623,34 @@ unsafe fn load_driver_reserved(
     print_u64(instance as u64);
     print_str(b"\n");
 
+    let planned_images = plan_hosted_images(fs, src_va, src_size)?;
+
     // The image RUNS at the fixed component VA (FSD_CODE_VA) in its own VSpace; the executive loads
     // its bytes at the per-instance window (win.code_va) so two instances don't collide executive-side.
     let code_va = win.code_va;
     let run_va = FSD_CODE_VA;
-    let img_frames = FSD_IMAGE_FRAMES;
+    let required_frames = frames_for_image_len(planned_images.total_image_len)?;
+    let img_frames = required_frames.max(FSD_IMAGE_FRAMES);
+    let image_capacity = hosted_image_frame_capacity(win);
+    if img_frames > image_capacity {
+        print_str(b"[driver-launch] image window exhausted required=");
+        print_u64(img_frames);
+        print_str(b" capacity=");
+        print_u64(image_capacity);
+        print_str(b"\n");
+        return None;
+    }
 
     // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, POOL in its own
     //    mirrored 2 MiB PT, and DATA + SHARED + ARG in an aux PT.
-    let cpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
-    map_instance_exec_pt(instance, cpt, code_va)?;
+    let code_pts = pts_for(img_frames);
+    let mut cpt_i = 0;
+    while cpt_i < code_pts {
+        let cpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
+        map_instance_exec_pt(instance, cpt, code_va + cpt_i * 0x20_0000)?;
+        cpt_i += 1;
+    }
     let code_base = alloc_frame();
     for _ in 1..img_frames {
         let _ = alloc_frame();
@@ -13604,11 +13703,14 @@ unsafe fn load_driver_reserved(
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
-    let rights = Box::leak(Box::new([RW_NX; FSD_IMAGE_FRAMES as usize]));
+    let mut rights_vec = Vec::new();
+    rights_vec.try_reserve_exact(img_frames as usize).ok()?;
+    for _ in 0..img_frames {
+        rights_vec.push(RW_NX);
+    }
+    let rights = Box::leak(rights_vec.into_boxed_slice());
     let support_images = load_hosted_dependency_images(
-        fs,
-        src_va,
-        src_size,
+        &planned_images,
         code_va,
         run_va,
         win.shared_va,
@@ -13655,6 +13757,7 @@ unsafe fn load_driver_reserved(
         shared_base,
         arg_base,
         fault_ep,
+        img_frames,
         &rights[..img_frames as usize],
     );
     if unsafe { map_fsd_main_stack_exec_alias(instance, stack_frame_base, win.stack_va) }.is_none()
@@ -13682,6 +13785,7 @@ unsafe fn load_driver_reserved(
             exec_pool_va: win.pool_va,
             exec_stack_va: win.stack_va,
             exec_arg_va: win.arg_va,
+            image_frames: img_frames,
             tcb,
             cnode,
             reply_cap,
@@ -13807,6 +13911,7 @@ unsafe fn load_driver_reserved(
         exec_pool_va: win.pool_va,
         exec_stack_va: win.stack_va,
         exec_arg_va: win.arg_va,
+        image_frames: img_frames,
         instance,
         driver_id,
         device_id: 0,
@@ -13852,6 +13957,7 @@ unsafe fn spawn_fsd_component(
     shared: u64,
     arg_base: u64,
     fault_ep: u64,
+    image_frames: u64,
     rights: &[u64],
 ) -> (u64, u64, u64, u64) {
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
@@ -13861,9 +13967,9 @@ unsafe fn spawn_fsd_component(
         Region {
             source: FrameSource::Alias(code_base),
             base_va: FSD_CODE_VA,
-            count: FSD_IMAGE_FRAMES,
+            count: image_frames,
             rights: Rights::PerFrame(rights_static),
-            pts: 1,
+            pts: pts_for(image_frames),
         },
         // Pool arena (own window + PTs, aliased executive frames).
         Region {
@@ -15777,6 +15883,7 @@ pub(crate) struct DriverInstance {
     pub exec_pool_va: u64,
     pub exec_stack_va: u64,
     pub exec_arg_va: u64,
+    pub image_frames: u64,
     pub tcb: u64,
     pub cnode: u64,
     pub reply_cap: u64,
@@ -15797,6 +15904,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_pool_va: 0,
     exec_stack_va: 0,
     exec_arg_va: 0,
+    image_frames: 0,
     tcb: 0,
     cnode: 0,
     reply_cap: 0,
@@ -16333,6 +16441,7 @@ fn register_instance(dc: &DriverComponent) {
         exec_pool_va: dc.exec_pool_va,
         exec_stack_va: dc.exec_stack_va,
         exec_arg_va: dc.exec_arg_va,
+        image_frames: dc.image_frames,
         tcb: dc.tcb,
         cnode: dc.cnode,
         reply_cap: dc.reply_cap,
@@ -18740,7 +18849,12 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
             let rip = regs[nt_user_callback::USER_CONTEXT_RIP];
             print_str(b"[deadman] active-driver-regs rip=");
             print_hex64(rip);
-            if (FSD_CODE_VA..FSD_CODE_VA + FSD_IMAGE_FRAMES * 0x1000).contains(&rip) {
+            let image_frames = if inst.image_frames == 0 {
+                FSD_IMAGE_FRAMES
+            } else {
+                inst.image_frames
+            };
+            if (FSD_CODE_VA..FSD_CODE_VA + image_frames * 0x1000).contains(&rip) {
                 print_str(b" rva=");
                 print_hex64(rip - FSD_CODE_VA);
             }

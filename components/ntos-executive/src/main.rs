@@ -16603,7 +16603,9 @@ fn current_driver_host_can_boot_launch(
             .load_order_group
             .as_deref()
             .is_some_and(|group| group.eq_ignore_ascii_case(FILE_SYSTEM_LOAD_ORDER_GROUP)),
-        Some(DriverServiceClass::Device) => cm.service_has_devnodes(&service.name),
+        Some(DriverServiceClass::Device) => {
+            cm.service_has_devnodes(&service.name) || cm.is_boot_system_legacy_driver(service)
+        }
         None => false,
     }
 }
@@ -16955,6 +16957,7 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
         &mut cm,
         nt_hive_core::CURRENT_CONTROL_SET_TARGET,
     );
+    let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
     Some(cm)
 }
 
@@ -17113,6 +17116,7 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     if counts.services == 0 {
         return None;
     }
+    let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
     Some(cm)
 }
 
@@ -25281,9 +25285,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path. The SYSTEM hive is imported into
     // Config Manager metadata, ordered by ServiceGroupOrder, then narrowed by mechanism: FSD-class
-    // services use the persistent IRP host directly, while device-class services must be bound by
-    // imported Enum devnodes before they enter the boot plan. The named-pipe provider is discovered
-    // by the DEVICE_OBJECT it publishes, not by a compiled-in service or image name.
+    // services use the persistent IRP host directly; device-class services are selected from
+    // imported Enum devnodes, plus the no-devnode NT5 network wrapper/transport groups while that
+    // stack is being activated. The named-pipe provider is discovered by the DEVICE_OBJECT it
+    // publishes, not by a compiled-in service or image name.
     if let Some(fs) = exec_fs() {
         let mut named_pipe_provider = None;
         let mut generic_hw_granted = false;
@@ -25354,7 +25359,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
                 if device_path.as_deref() == Some("\\Device\\NamedPipe") {
                     named_pipe_provider = Some((dc, spec.driver_object_path));
-                    break;
+                    continue;
                 }
                 print_str(b"[driver-launch] service ");
                 print_str(spec.service_name.as_bytes());
