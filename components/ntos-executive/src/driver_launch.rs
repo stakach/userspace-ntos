@@ -12516,12 +12516,40 @@ pub(crate) struct HostedInterruptDelivery {
     pub claimed: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct HostedDeviceResourceState {
+    device_id: u64,
+    driver_id: u64,
+    instance: usize,
+    mmio_va: u64,
+    interrupt_affinity: u64,
+    interface_type: u32,
+    bus_number: u32,
+    address: u32,
+    pci_vendor_device: u32,
+    pci_class_rev: u32,
+    pci_irq: u32,
+    io_port_base: u64,
+    video_memory_phys: u64,
+    video_memory_len: u64,
+    video_memory_caller_va: u64,
+    evidence: HostedHardwareEvidence,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedIoPortFaultGrant {
+    pub(crate) cap: u64,
+    pub(crate) base: u64,
+    pub(crate) len: u64,
+}
+
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut HOSTED_ROOT_PDO_BINDINGS: Option<Vec<HostedRootPdoBinding>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
+static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_DRIVER_DEVICE_POWER_STATE: u32 = 1; // PowerDeviceD0
 
 const HOSTED_MMIO_RESOURCE_KIND: u64 = 1;
@@ -12557,6 +12585,59 @@ unsafe fn hosted_device_bindings_mut() -> &'static mut Vec<HostedDeviceBinding> 
 
 unsafe fn hosted_device_bindings() -> Option<&'static Vec<HostedDeviceBinding>> {
     (*core::ptr::addr_of!(HOSTED_DEVICE_BINDINGS)).as_ref()
+}
+
+unsafe fn hosted_device_resource_states_mut() -> &'static mut Vec<HostedDeviceResourceState> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RESOURCE_STATES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_device_resource_states() -> Option<&'static Vec<HostedDeviceResourceState>> {
+    (*core::ptr::addr_of!(HOSTED_DEVICE_RESOURCE_STATES)).as_ref()
+}
+
+unsafe fn hosted_device_resource_state_by_device_id(
+    device_id: u64,
+) -> Option<HostedDeviceResourceState> {
+    hosted_device_resource_states()?
+        .iter()
+        .copied()
+        .find(|state| state.device_id != 0 && state.device_id == device_id)
+}
+
+unsafe fn hosted_resource_state_uses_io_port_cap(cap: u64) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    hosted_device_resource_states()
+        .map(|states| {
+            states
+                .iter()
+                .any(|state| state.evidence.resource_io_port_cap == cap)
+        })
+        .unwrap_or(false)
+}
+
+unsafe fn remove_hosted_device_resource_state(device_id: u64) -> u64 {
+    let states = hosted_device_resource_states_mut();
+    let Some(index) = states
+        .iter()
+        .position(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return 0;
+    };
+    let state = states.remove(index);
+    let cap = state.evidence.resource_io_port_cap;
+    let cap_still_used = states
+        .iter()
+        .any(|state| state.evidence.resource_io_port_cap == cap);
+    if cap != 0 && !cap_still_used {
+        let _ = crate::cnode_delete_recycle_r(cap);
+    }
+    cap
 }
 
 unsafe fn hosted_root_pdo_bindings_mut() -> &'static mut Vec<HostedRootPdoBinding> {
@@ -12633,20 +12714,25 @@ fn video_port_status(status: u32) -> Result<(), nt_status::NtStatus> {
     }
 }
 
-unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) {
+unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) -> u64 {
+    let removed_io_port_cap = remove_hosted_device_resource_state(binding.device_id);
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
     let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+    removed_io_port_cap
 }
 
 unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
-    revoke_hosted_device_resources(binding);
+    let removed_io_port_cap = revoke_hosted_device_resources(binding);
     if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
         if inst.cnode != 0 {
             let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT);
         }
     }
     let old_ioport_cap = read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64);
-    if old_ioport_cap != 0 {
+    if old_ioport_cap != 0
+        && old_ioport_cap != removed_io_port_cap
+        && !hosted_resource_state_uses_io_port_cap(old_ioport_cap)
+    {
         let _ = crate::cnode_delete_recycle_r(old_ioport_cap);
     }
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, 0);
@@ -12868,17 +12954,17 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
 }
 
-pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
-    let binding = hosted_device_binding_by_device_id(device_id)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)?;
-    let sh = inst.exec_shared_va;
+unsafe fn read_hosted_hardware_evidence_from_shared(
+    binding: HostedDeviceBinding,
+    sh: u64,
+) -> HostedHardwareEvidence {
     let root_pdo_started = unsafe {
         (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
             .as_ref()
             .map(|bus| bus.pdo_started(binding.pdo_object))
             .unwrap_or(false)
     };
-    Some(unsafe {
+    unsafe {
         HostedHardwareEvidence {
             resource_mmio_phys: read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64),
             resource_mmio_len: read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64),
@@ -12985,7 +13071,319 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
                 (sh + SH_VIDEO_REGISTRY_COMMIT_FAILURES) as *const u64,
             ),
         }
+    }
+}
+
+unsafe fn read_hosted_device_resource_state_from_shared(
+    binding: HostedDeviceBinding,
+    sh: u64,
+) -> HostedDeviceResourceState {
+    HostedDeviceResourceState {
+        device_id: binding.device_id,
+        driver_id: binding.driver_id,
+        instance: binding.instance,
+        mmio_va: read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64),
+        interrupt_affinity: read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64),
+        interface_type: read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32),
+        bus_number: read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32),
+        address: read_volatile((sh + SH_RESOURCE_ADDRESS) as *const u32),
+        pci_vendor_device: read_volatile((sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32),
+        pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
+        pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
+        io_port_base: read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64),
+        video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
+        video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
+        video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
+        evidence: read_hosted_hardware_evidence_from_shared(binding, sh),
+    }
+}
+
+unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh: u64) {
+    let state = read_hosted_device_resource_state_from_shared(binding, sh);
+    let states = hosted_device_resource_states_mut();
+    if let Some(index) = states
+        .iter()
+        .position(|slot| slot.device_id != 0 && slot.device_id == binding.device_id)
+    {
+        let old_cap = states[index].evidence.resource_io_port_cap;
+        states[index] = state;
+        if old_cap != 0
+            && old_cap != state.evidence.resource_io_port_cap
+            && !states
+                .iter()
+                .any(|slot| slot.evidence.resource_io_port_cap == old_cap)
+        {
+            let _ = crate::cnode_delete_recycle_r(old_cap);
+        }
+    } else {
+        states.push(state);
+    }
+}
+
+unsafe fn copy_hosted_io_port_cap_to_instance(
+    inst: DriverInstance,
+    state: HostedDeviceResourceState,
+) -> Result<(), nt_status::NtStatus> {
+    let cap = state.evidence.resource_io_port_cap;
+    if cap == 0 {
+        return Ok(());
+    }
+    if inst.cnode == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT);
+    let copy = crate::cnode_copy_at_r(inst.cnode, crate::CT_IO_PORT, cap);
+    if copy != 0 {
+        print_str(b"[driver-launch] IOPort cap restore failed label=");
+        print_u64(copy);
+        print_str(b" device_id=");
+        print_u64(state.device_id);
+        print_str(b" cnode=");
+        print_u64(inst.cnode);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(())
+}
+
+unsafe fn write_hosted_resource_state_projection(
+    sh: u64,
+    state: HostedDeviceResourceState,
+    reset_dpc_queue: bool,
+) {
+    let evidence = state.evidence;
+    write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, evidence.resource_mmio_phys);
+    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, evidence.resource_mmio_len);
+    write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, state.mmio_va);
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
+        evidence.interrupt_vector,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
+        state.interrupt_affinity,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
+        state.interface_type,
+    );
+    write_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *mut u32, state.bus_number);
+    write_volatile((sh + SH_RESOURCE_ADDRESS) as *mut u32, state.address);
+    write_volatile(
+        (sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *mut u32,
+        state.pci_vendor_device,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_PCI_CLASS_REV) as *mut u32,
+        state.pci_class_rev,
+    );
+    write_volatile((sh + SH_RESOURCE_PCI_IRQ) as *mut u32, state.pci_irq);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, state.io_port_base);
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64,
+        evidence.resource_io_port_len,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64,
+        evidence.resource_io_port_cap,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *mut u64,
+        evidence.resource_io_port_component_cap,
+    );
+    write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, state.video_memory_phys);
+    write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, state.video_memory_len);
+    write_volatile(
+        (sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64,
+        state.video_memory_caller_va,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+        evidence.mmio_mapped_phys,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+        evidence.mmio_mapped_len,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+        evidence.interrupt_object,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+        evidence.interrupt_routine,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+        evidence.interrupt_context,
+    );
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, evidence.interrupt_id);
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
+        evidence.interrupt_delivered_vector,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+        evidence.interrupt_isr_claimed,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+        evidence.interrupt_deliveries,
+    );
+    if reset_dpc_queue {
+        clear_dpc_queue_projection(sh);
+    }
+    write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, evidence.dpc_drops);
+    write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, evidence.dpc_deliveries);
+    write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, evidence.dma_common_va);
+    write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, evidence.dma_common_len);
+    write_volatile(
+        (sh + SH_DMA_COMMON_LOGICAL) as *mut u64,
+        evidence.dma_common_logical,
+    );
+    write_volatile((sh + SH_DMA_ADAPTER_ID) as *mut u64, evidence.dma_adapter_id);
+    write_volatile((sh + SH_DMA_ADAPTER_BLOB) as *mut u64, evidence.dma_adapter_blob);
+    write_volatile((sh + SH_DMA_REQUESTED_LEN) as *mut u64, evidence.dma_requested_len);
+    write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, evidence.dma_allocated_va);
+    write_volatile(
+        (sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
+        evidence.dma_allocated_logical,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64,
+        evidence.io_port_out32_faults,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_IN16_CALLS) as *mut u64,
+        evidence.io_port_in16_calls,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_OUT16_CALLS) as *mut u64,
+        evidence.io_port_out16_calls,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_IN16_FAILURES) as *mut u64,
+        evidence.io_port_in16_failures,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_OUT16_FAILURES) as *mut u64,
+        evidence.io_port_out16_failures,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_IN16_DENIED) as *mut u64,
+        evidence.io_port_in16_denied,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_OUT16_DENIED) as *mut u64,
+        evidence.io_port_out16_denied,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+        evidence.io_port_last_in16_status,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+        evidence.io_port_last_out16_status,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+        evidence.io_port_last_in16_port,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+        evidence.io_port_last_out16_port,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+        evidence.io_port_last_in16_value,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+        evidence.io_port_last_out16_value,
+    );
+}
+
+unsafe fn restore_hosted_device_resource_state(
+    binding: HostedDeviceBinding,
+    sh: u64,
+    reset_dpc_queue: bool,
+) -> Result<HostedDeviceResourceState, nt_status::NtStatus> {
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if state.driver_id != binding.driver_id || state.instance != binding.instance {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    copy_hosted_io_port_cap_to_instance(inst, state)?;
+    write_hosted_resource_state_projection(sh, state, reset_dpc_queue);
+    Ok(state)
+}
+
+fn io_port_in_range(port: u16, base: u64, len: u64) -> bool {
+    let port = port as u64;
+    len != 0 && port >= base && port < base.saturating_add(len)
+}
+
+pub(crate) unsafe fn hosted_io_port_fault_grant(
+    shared_va: u64,
+    port: u16,
+) -> Option<HostedIoPortFaultGrant> {
+    let current_cap = read_volatile((shared_va + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    let current_base = read_volatile((shared_va + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+    let current_len = read_volatile((shared_va + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    if current_cap != 0 && io_port_in_range(port, current_base, current_len) {
+        return Some(HostedIoPortFaultGrant {
+            cap: current_cap,
+            base: current_base,
+            len: current_len,
+        });
+    }
+
+    let (instance, inst) = instance_by_shared_va(shared_va)?;
+    let states = hosted_device_resource_states()?;
+    let state = states.iter().copied().find(|state| {
+        state.instance == instance
+            && state.evidence.resource_io_port_cap != 0
+            && io_port_in_range(port, state.io_port_base, state.evidence.resource_io_port_len)
+    })?;
+    copy_hosted_io_port_cap_to_instance(inst, state).ok()?;
+    write_hosted_resource_state_projection(shared_va, state, false);
+    Some(HostedIoPortFaultGrant {
+        cap: state.evidence.resource_io_port_cap,
+        base: state.io_port_base,
+        len: state.evidence.resource_io_port_len,
     })
+}
+
+pub(crate) unsafe fn refresh_hosted_resource_state_for_shared(shared_va: u64) {
+    let cap = read_volatile((shared_va + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    let mmio_phys = read_volatile((shared_va + SH_RESOURCE_MMIO_PHYS) as *const u64);
+    let interrupt_id = read_volatile((shared_va + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+    let Some(state) = hosted_device_resource_states().and_then(|states| {
+        states.iter().copied().find(|state| {
+            (cap != 0 && state.evidence.resource_io_port_cap == cap)
+                || (mmio_phys != 0 && state.evidence.resource_mmio_phys == mmio_phys)
+                || (interrupt_id != 0 && state.evidence.interrupt_id == interrupt_id)
+        })
+    }) else {
+        return;
+    };
+    if let Some(binding) = hosted_device_binding_by_device_id(state.device_id) {
+        refresh_hosted_device_resource_state(binding, shared_va);
+    }
+}
+
+pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    let mut evidence = unsafe { hosted_device_resource_state_by_device_id(device_id)?.evidence };
+    evidence.root_pdo_started = unsafe {
+        (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
+            .as_ref()
+            .map(|bus| bus.pdo_started(binding.pdo_object))
+            .unwrap_or(false)
+    };
+    Some(evidence)
 }
 
 fn clear_hosted_device_binding_by_device_id(device_id: u64) {
@@ -13412,6 +13810,13 @@ fn instance_by_device_id(device_id: u64) -> Option<(usize, DriverInstance)> {
         .copied()
         .enumerate()
         .find(|(_, entry)| entry.used && entry.device_id != 0 && entry.device_id == device_id)
+}
+
+fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
+    let t = unsafe { driver_instances()? };
+    t.iter().copied().enumerate().find(|(_, entry)| {
+        entry.used && entry.exec_shared_va != 0 && entry.exec_shared_va == shared_va
+    })
 }
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {
@@ -14632,6 +15037,7 @@ pub(crate) unsafe fn start_hosted_device(
         record_hosted_resource_usage(binding, sh)?;
         video_port_status(video_status)?;
         apply_hosted_device_interface_state(sh)?;
+        refresh_hosted_device_resource_state(binding, sh);
         return Ok(());
     }
     let mut out = [];
@@ -14657,6 +15063,7 @@ pub(crate) unsafe fn start_hosted_device(
             hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, forwarded_minor as u8);
         nt_status::NtStatus(root_status).to_result()?;
     }
+    refresh_hosted_device_resource_state(binding, sh);
     Ok(())
 }
 
@@ -14677,6 +15084,7 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
     }
 
     let sh = inst.exec_shared_va;
+    restore_hosted_device_resource_state(binding, sh, true)?;
     let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
     let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
@@ -14708,6 +15116,7 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
     )
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     nt_status::NtStatus(status).to_result()?;
+    refresh_hosted_device_resource_state(binding, sh);
 
     Ok(HostedInterruptDelivery {
         interrupt_id: tokens.interrupt_id,

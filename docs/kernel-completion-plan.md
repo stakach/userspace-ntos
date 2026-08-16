@@ -3836,6 +3836,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   now the real NDIS/e1000 data plane and multi-device scaling under the dynamic devnode/resource
   path, not dependency discovery or support-driver handoff scaffolding.
 
+- B3 hosted resource-state cleanup (2026-08-16). Hosted device resource projection moved from one
+  transient per-driver shared-page view to saved per-devnode resource state. `START_DEVICE` now
+  records the successful resource/MMIO/I/O-port/interrupt/DMA
+  projection for the specific FDO/PDO binding, later interrupt delivery restores the owning
+  devnode's projection before dispatching the ISR path, and component I/O-port #GP handling resolves
+  the actual faulting DX port through the saved devnode resource table before servicing `in/out`
+  instructions. This removes another single-active-device assumption on the path toward multiple
+  NICs and other repeated hosted drivers without adding service-name or device-name fallback policy.
+  Validation: `cargo fmt --all`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-b3-resource-state.log`, which reaches `296/296` with
+  `dependency ndis.sys -> reactos\system32\drivers\ndis.sys`, `support_count=1`, registry-selected
+  E1000 generic hardware evidence, `exec_generic_pci_io_port_out32`,
+  `exec_generic_hw_interrupt_delivered`, `exec_generic_hw_dpc_delivered`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's active frontier remains real
+  NDIS/e1000 data-plane behavior; the resource projection no longer assumes only one active hosted
+  devnode per driver instance.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same

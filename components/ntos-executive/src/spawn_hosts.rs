@@ -1601,19 +1601,6 @@ unsafe fn pump_service_io_port_fault(
     }
 
     let sh = ch.shared_va;
-    let port_cap = core::ptr::read_volatile(
-        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_CAP) as *const u64,
-    );
-    let port_base = core::ptr::read_volatile(
-        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_BASE) as *const u64,
-    );
-    let port_len = core::ptr::read_volatile(
-        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LEN) as *const u64,
-    );
-    if port_cap == 0 || port_base == 0 || port_len == 0 {
-        return None;
-    }
-
     let (component_code_va, image_frames) = if ch.code_va != 0 && ch.image_frames != 0 {
         (ch.code_va, ch.image_frames)
     } else if ch.caps.kind == ReqKind::Irp {
@@ -1674,6 +1661,10 @@ unsafe fn pump_service_io_port_fault(
     let mut regs = [0u64; 20];
     crate::win32k_glue::tcb_read_regs20(ch.tcb, &mut regs);
     let port = (regs[6] & 0xFFFF) as u16;
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port)?;
+    let port_cap = grant.cap;
+    let port_base = grant.base;
+    let port_len = grant.len;
     let port_u64 = port as u64;
     let grant_end = port_base.checked_add(port_len)?;
     if port_u64 < port_base || port_u64 >= grant_end {
@@ -1797,6 +1788,7 @@ unsafe fn pump_service_io_port_fault(
             crate::print_str(b"\n");
         }
     }
+    crate::driver_launch::refresh_hosted_resource_state_for_shared(sh);
     Some(fault_ip + insn_len)
 }
 
