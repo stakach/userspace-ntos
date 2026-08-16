@@ -6581,6 +6581,18 @@ extern "win64" fn s_io_get_dma_adapter(
             (ops + 96) as *mut u64,
             s_dma_put_scatter_gather_list as *const () as usize as u64,
         );
+        write_unaligned(
+            (ops + 104) as *mut u64,
+            s_dma_calculate_scatter_gather_list as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 112) as *mut u64,
+            s_dma_build_scatter_gather_list as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 120) as *mut u64,
+            s_dma_build_mdl_from_scatter_gather_list as *const () as usize as u64,
+        );
 
         // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8.
         write_unaligned(adapter as *mut u16, 1);
@@ -6938,15 +6950,10 @@ extern "win64" fn s_dma_allocate_adapter_channel(
         {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        let map_register = pool_alloc_zeroed(0x20);
+        let map_register = dma_allocate_map_register_token(number_of_map_registers);
         if map_register == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
-        write_unaligned(
-            map_register as *mut u64,
-            HOSTED_DMA_MAP_REGISTER_SIGNATURE,
-        );
-        write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
         let routine: extern "win64" fn(u64, u64, u64, u64) -> u32 =
             core::mem::transmute(execution_routine as *const ());
         let action = routine(device_object, 0, map_register, context);
@@ -7150,8 +7157,105 @@ extern "win64" fn s_dma_read_dma_counter(_adapter: u64) -> u32 {
 
 const HOSTED_SG_CONTEXT_SIZE: u64 = 0x30;
 const HOSTED_SG_CONTEXT_SIGNATURE: u64 = 0x5347_4354_5830_3031; // "SGCTX001"
+const HOSTED_SG_CONTEXT_MAP_REGISTER: u64 = 0x08;
+const HOSTED_SG_CONTEXT_MDL: u64 = 0x10;
+const HOSTED_SG_CONTEXT_CURRENT_VA: u64 = 0x18;
+const HOSTED_SG_CONTEXT_LENGTH: u64 = 0x20;
+const HOSTED_SG_CONTEXT_WRITE_TO_DEVICE: u64 = 0x28;
+const HOSTED_SG_CONTEXT_LIST_OWNED: u64 = 0x29;
 const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
 const HOSTED_SG_ELEMENT_OFFSET: u64 = 0x10;
+
+unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
+    if number_of_map_registers == 0 || number_of_map_registers > 64 {
+        return 0;
+    }
+    let map_register = pool_alloc_zeroed(0x20);
+    if map_register == 0 {
+        return 0;
+    }
+    write_unaligned(
+        map_register as *mut u64,
+        HOSTED_DMA_MAP_REGISTER_SIGNATURE,
+    );
+    write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
+    map_register
+}
+
+unsafe fn dma_prepare_one_element_sg_list(
+    adapter: u64,
+    mdl: u64,
+    current_va: u64,
+    length: u32,
+    write_to_device: u8,
+    sg_list: u64,
+    list_owned: u8,
+) -> i32 {
+    if length == 0 || sg_list == 0 || dma_active_adapter_and_grant(adapter).is_none() {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    let map_register = dma_allocate_map_register_token(1);
+    let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
+    if map_register == 0 || sg_context == 0 {
+        if map_register != 0 {
+            pool_free(map_register);
+        }
+        if sg_context != 0 {
+            pool_free(sg_context);
+        }
+        return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+    }
+    let mut mapped_len = length;
+    let logical = s_dma_map_transfer(
+        adapter,
+        mdl,
+        map_register,
+        current_va,
+        &mut mapped_len as *mut u32,
+        write_to_device,
+    ) as u64;
+    if logical == 0 || mapped_len == 0 {
+        pool_free(sg_context);
+        pool_free(map_register);
+        return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+    }
+
+    write_unaligned(sg_context as *mut u64, HOSTED_SG_CONTEXT_SIGNATURE);
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_MAP_REGISTER) as *mut u64,
+        map_register,
+    );
+    write_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *mut u64, mdl);
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *mut u64,
+        current_va,
+    );
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_LENGTH) as *mut u32,
+        mapped_len,
+    );
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_WRITE_TO_DEVICE) as *mut u8,
+        write_to_device,
+    );
+    write_unaligned(
+        (sg_context + HOSTED_SG_CONTEXT_LIST_OWNED) as *mut u8,
+        list_owned,
+    );
+
+    write_unaligned(sg_list as *mut u32, 1);
+    write_unaligned((sg_list + 8) as *mut u64, sg_context);
+    write_unaligned(
+        (sg_list + HOSTED_SG_ELEMENT_OFFSET) as *mut u64,
+        logical,
+    );
+    write_unaligned(
+        (sg_list + HOSTED_SG_ELEMENT_OFFSET + 8) as *mut u32,
+        mapped_len,
+    );
+    write_unaligned((sg_list + HOSTED_SG_ELEMENT_OFFSET + 16) as *mut u64, 0);
+    0
+}
 
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn s_dma_get_scatter_gather_list(
@@ -7168,69 +7272,109 @@ extern "win64" fn s_dma_get_scatter_gather_list(
         if execution_routine == 0 || length == 0 || dma_active_adapter_and_grant(adapter).is_none() {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
-        let map_register = pool_alloc_zeroed(0x20);
-        let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
         let sg_list = pool_alloc_zeroed(HOSTED_SG_LIST_SIZE_ONE);
-        if map_register == 0 || sg_context == 0 || sg_list == 0 {
-            if map_register != 0 {
-                pool_free(map_register);
-            }
-            if sg_context != 0 {
-                pool_free(sg_context);
-            }
-            if sg_list != 0 {
-                pool_free(sg_list);
-            }
+        if sg_list == 0 {
             return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
         }
-        write_unaligned(
-            map_register as *mut u64,
-            HOSTED_DMA_MAP_REGISTER_SIGNATURE,
-        );
-        write_unaligned((map_register + 8) as *mut u32, 1);
-        let mut mapped_len = length;
-        let logical = s_dma_map_transfer(
+        let status = dma_prepare_one_element_sg_list(
             adapter,
             mdl,
-            map_register,
             current_va,
-            &mut mapped_len as *mut u32,
+            length,
             write_to_device,
-        ) as u64;
-        if logical == 0 || mapped_len == 0 {
+            sg_list,
+            1,
+        );
+        if status != 0 {
             pool_free(sg_list);
-            pool_free(sg_context);
-            pool_free(map_register);
-            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+            return status;
         }
-
-        write_unaligned(sg_context as *mut u64, HOSTED_SG_CONTEXT_SIGNATURE);
-        write_unaligned((sg_context + 8) as *mut u64, map_register);
-        write_unaligned((sg_context + 16) as *mut u64, mdl);
-        write_unaligned((sg_context + 24) as *mut u64, current_va);
-        write_unaligned((sg_context + 32) as *mut u32, mapped_len);
-        write_unaligned((sg_context + 40) as *mut u8, write_to_device);
-
-        write_unaligned(sg_list as *mut u32, 1);
-        write_unaligned((sg_list + 8) as *mut u64, sg_context);
-        write_unaligned(
-            (sg_list + HOSTED_SG_ELEMENT_OFFSET) as *mut u64,
-            logical,
-        );
-        write_unaligned(
-            (sg_list + HOSTED_SG_ELEMENT_OFFSET + 8) as *mut u32,
-            mapped_len,
-        );
-        write_unaligned(
-            (sg_list + HOSTED_SG_ELEMENT_OFFSET + 16) as *mut u64,
-            0,
-        );
 
         let routine: extern "win64" fn(u64, u64, u64, u64) =
             core::mem::transmute(execution_routine as *const ());
         routine(device_object, 0, sg_list, context);
         0
     }
+}
+
+extern "win64" fn s_dma_calculate_scatter_gather_list(
+    adapter: u64,
+    _mdl: u64,
+    _current_va: u64,
+    length: u32,
+    scatter_gather_list_size: *mut u32,
+    number_of_map_registers: *mut u32,
+) -> i32 {
+    unsafe {
+        let Some((_grant_va, grant_len, _grant_logical)) = dma_active_adapter_and_grant(adapter)
+        else {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        };
+        if length == 0 || scatter_gather_list_size.is_null() {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        }
+        if length as u64 > grant_len {
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+        write_unaligned(scatter_gather_list_size, HOSTED_SG_LIST_SIZE_ONE as u32);
+        if !number_of_map_registers.is_null() {
+            write_unaligned(number_of_map_registers, 1);
+        }
+        0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn s_dma_build_scatter_gather_list(
+    adapter: u64,
+    device_object: u64,
+    mdl: u64,
+    current_va: u64,
+    length: u32,
+    execution_routine: u64,
+    context: u64,
+    write_to_device: u8,
+    scatter_gather_buffer: u64,
+    scatter_gather_length: u32,
+) -> i32 {
+    unsafe {
+        if execution_routine == 0 || scatter_gather_buffer == 0 {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        }
+        if scatter_gather_length < HOSTED_SG_LIST_SIZE_ONE as u32 {
+            return 0xC000_0023u32 as i32; // STATUS_BUFFER_TOO_SMALL
+        }
+        let status = dma_prepare_one_element_sg_list(
+            adapter,
+            mdl,
+            current_va,
+            length,
+            write_to_device,
+            scatter_gather_buffer,
+            0,
+        );
+        if status != 0 {
+            return status;
+        }
+        let routine: extern "win64" fn(u64, u64, u64, u64) =
+            core::mem::transmute(execution_routine as *const ());
+        routine(device_object, 0, scatter_gather_buffer, context);
+        0
+    }
+}
+
+extern "win64" fn s_dma_build_mdl_from_scatter_gather_list(
+    _adapter: u64,
+    _scatter_gather: u64,
+    _original_mdl: u64,
+    target_mdl: *mut u64,
+) -> i32 {
+    unsafe {
+        if !target_mdl.is_null() {
+            write_unaligned(target_mdl, 0);
+        }
+    }
+    0xC000_00BBu32 as i32 // STATUS_NOT_SUPPORTED
 }
 
 extern "win64" fn s_dma_put_scatter_gather_list(
@@ -7246,14 +7390,16 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         if sg_context == 0
             || read_unaligned(sg_context as *const u64) != HOSTED_SG_CONTEXT_SIGNATURE
         {
-            pool_free(scatter_gather);
             return;
         }
-        let map_register = read_unaligned((sg_context + 8) as *const u64);
-        let mdl = read_unaligned((sg_context + 16) as *const u64);
-        let current_va = read_unaligned((sg_context + 24) as *const u64);
-        let length = read_unaligned((sg_context + 32) as *const u32);
-        let stored_write_to_device = read_unaligned((sg_context + 40) as *const u8);
+        let map_register =
+            read_unaligned((sg_context + HOSTED_SG_CONTEXT_MAP_REGISTER) as *const u64);
+        let mdl = read_unaligned((sg_context + HOSTED_SG_CONTEXT_MDL) as *const u64);
+        let current_va = read_unaligned((sg_context + HOSTED_SG_CONTEXT_CURRENT_VA) as *const u64);
+        let length = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LENGTH) as *const u32);
+        let stored_write_to_device =
+            read_unaligned((sg_context + HOSTED_SG_CONTEXT_WRITE_TO_DEVICE) as *const u8);
+        let list_owned = read_unaligned((sg_context + HOSTED_SG_CONTEXT_LIST_OWNED) as *const u8);
         let direction = if write_to_device != 0 {
             write_to_device
         } else {
@@ -7269,7 +7415,9 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         );
         s_dma_free_map_registers(adapter, map_register, 1);
         pool_free(sg_context);
-        pool_free(scatter_gather);
+        if list_owned != 0 {
+            pool_free(scatter_gather);
+        }
     }
 }
 

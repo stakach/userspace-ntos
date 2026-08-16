@@ -1240,8 +1240,8 @@ before unrelated executive traffic monopolises the receive loop.
   The current serialized desktop proof validates that `Ndis`, `Tcpip`, `Afd`, and `Netio` are
   selected dynamically from registry metadata and launched through the hosted driver path; TCPIP
   creates its service-owned system threads and the desktop paint gate is green again. Hosted WDM DMA
-  now includes NT5 map-register and scatter/gather operations backed by the per-devnode IOMMU grant,
-  so remaining B3 work is real packet traffic over the generic NDIS/e1000 route, receive
+  now includes the NT5 map-register and scatter/gather operation set backed by the per-devnode IOMMU
+  grant, so remaining B3 work is real packet traffic over the generic NDIS/e1000 route, receive
   completion/indication, and repeated-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
@@ -6608,3 +6608,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   NDIS/e1000 route: exercise the new scatter/gather send path, prove TX descriptors reach the real
   NIC with IOMMU-backed packet buffers, then handle receive completion/indication without adding
   service-specific packet scaffolding.
+
+  B3 hosted DMA SG contract completion (2026-08-16): the hosted WDM DMA table now fills the rest of
+  the NT5 scatter/gather entries instead of leaving NULL function slots: `CalculateScatterGatherList`
+  reports the exact one-element list size and map-register count supported by the current bounded
+  per-devnode grant, `BuildScatterGatherList` builds into caller-provided storage through the same
+  `MapTransfer`/bounce-buffer path as `GetScatterGatherList`, and
+  `BuildMdlFromScatterGatherList` is a real fail-closed entry returning `STATUS_NOT_SUPPORTED`.
+  `PutScatterGatherList` now distinguishes allocated lists from caller-owned buffers through the SG
+  context, so cleanup releases map-register tokens and transient DMA records without freeing storage
+  owned by the driver. Validation: `cargo fmt --all`, `cargo test -p nt-dma-manager`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: the next B3 packet-data-plane
+  target is no longer missing WDM SG callbacks; it is observing and plumbing real e1000 TX/RX
+  completion over the generic PCI/IOMMU-backed grant.
