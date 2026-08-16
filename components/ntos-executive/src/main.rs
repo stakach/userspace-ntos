@@ -77,7 +77,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 
-use alloc::alloc::{alloc, dealloc};
+use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -8195,24 +8195,34 @@ unsafe fn shared_image_mapping_alloc_chunk() -> Option<*mut SharedImageMappingCh
     Some(ptr)
 }
 
-unsafe fn shared_image_mapping_free_chunk(ptr: *mut SharedImageMappingChunk) {
-    if ptr.is_null() {
-        return;
+unsafe fn shared_image_mapping_chunk_len(chunk: *mut SharedImageMappingChunk) -> usize {
+    if chunk.is_null() {
+        return 0;
     }
-    core::ptr::drop_in_place(ptr);
-    dealloc(
-        ptr as *mut u8,
-        core::alloc::Layout::new::<SharedImageMappingChunk>(),
-    );
-    SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
+    (*chunk).len.min(SHARED_IMAGE_MAPPING_CHUNK_CAP)
+}
+
+unsafe fn shared_image_mapping_last_nonempty_chunk(
+    chunks: &[*mut SharedImageMappingChunk],
+) -> Option<(usize, usize)> {
+    let mut index = chunks.len();
+    while index != 0 {
+        index -= 1;
+        let len = shared_image_mapping_chunk_len(chunks[index]);
+        if len != 0 {
+            return Some((index, len));
+        }
+    }
+    None
 }
 
 unsafe fn shared_image_mapping_find(pi: u64, page: u64) -> Option<(usize, usize)> {
     let chunks = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()?;
     for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
+        let len = shared_image_mapping_chunk_len(chunk);
         let chunk = &*chunk;
         let mut entry_index = 0usize;
-        while entry_index < chunk.len {
+        while entry_index < len {
             let mapping = chunk.entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page == page {
                 return Some((chunk_index, entry_index));
@@ -8227,24 +8237,28 @@ unsafe fn shared_image_mapping_remove_at(
     chunks: &mut Vec<*mut SharedImageMappingChunk>,
     chunk_index: usize,
     entry_index: usize,
-) -> SharedImageMapping {
+) -> Option<SharedImageMapping> {
+    if chunk_index >= chunks.len()
+        || entry_index >= shared_image_mapping_chunk_len(chunks[chunk_index])
+    {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let removed = (*chunks[chunk_index]).entries[entry_index];
-    let last_chunk_index = chunks.len() - 1;
-    let last_entry_index = (*chunks[last_chunk_index]).len - 1;
+    let Some((last_chunk_index, last_len)) = shared_image_mapping_last_nonempty_chunk(chunks)
+    else {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let last_entry_index = last_len - 1;
     let last = (*chunks[last_chunk_index]).entries[last_entry_index];
     (*chunks[last_chunk_index]).len = last_entry_index;
     if chunk_index != last_chunk_index || entry_index != last_entry_index {
         (*chunks[chunk_index]).entries[entry_index] = last;
     }
     SHARED_IMAGE_MAPPING_LIVE.fetch_sub(1, Ordering::Relaxed);
-    while chunks
-        .last()
-        .is_some_and(|chunk| (**chunk).len == 0)
-    {
-        let chunk = chunks.pop().unwrap();
-        shared_image_mapping_free_chunk(chunk);
-    }
-    removed
+    SHARED_IMAGE_MAPPING_DIRTY.store(true, Ordering::Relaxed);
+    Some(removed)
 }
 
 fn image_map_cap_bank_live_next_totals() -> (u64, u64) {
@@ -8317,7 +8331,7 @@ unsafe fn shared_image_mapping_push_prepared(
     let chunks = shared_image_mapping_chunks_mut();
     let needs_chunk = chunks
         .last()
-        .is_none_or(|chunk| (**chunk).len == SHARED_IMAGE_MAPPING_CHUNK_CAP);
+        .is_none_or(|chunk| chunk.is_null() || (**chunk).len >= SHARED_IMAGE_MAPPING_CHUNK_CAP);
     if needs_chunk {
         if chunks.try_reserve(1).is_err() {
             SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -8331,6 +8345,10 @@ unsafe fn shared_image_mapping_push_prepared(
     let chunk = chunks.last_mut().unwrap();
     let chunk = &mut **chunk;
     let index = chunk.len;
+    if index >= SHARED_IMAGE_MAPPING_CHUNK_CAP {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     chunk.entries[index] = SharedImageMapping {
         pi: pi as u8,
         page,
@@ -8369,9 +8387,10 @@ unsafe fn shared_image_mapping_page_referenced(page: u64) -> bool {
         return false;
     };
     for chunk in chunks.iter().copied() {
+        let len = shared_image_mapping_chunk_len(chunk);
         let chunk = &*chunk;
         let mut index = 0usize;
-        while index < chunk.len {
+        while index < len {
             if chunk.entries[index].page == page {
                 return true;
             }
@@ -8393,12 +8412,15 @@ unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
     let mapping = (*chunks[chunk]).entries[index];
     match mapping.cap {
         SharedImageMappingCap::Root(map_cap) => {
-            let _ = shared_image_mapping_remove_at(chunks, chunk, index);
+            shared_image_mapping_remove_at(chunks, chunk, index)?;
             Some(map_cap)
         }
         SharedImageMappingCap::Bank { cnode, slot } => {
             let map_cap = image_map_cap_bank_take_root(mapping.pi, cnode, slot).ok()?;
-            let _ = shared_image_mapping_remove_at(chunks, chunk, index);
+            if shared_image_mapping_remove_at(chunks, chunk, index).is_none() {
+                let _ = cnode_delete_recycle_r(map_cap);
+                return None;
+            }
             Some(map_cap)
         }
     }
@@ -8425,11 +8447,18 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
     let mut chunk_index = 0usize;
     while chunk_index < chunks.len() {
         let mut entry_index = 0usize;
-        while chunk_index < chunks.len() && entry_index < (*chunks[chunk_index]).len {
+        while chunk_index < chunks.len()
+            && entry_index < shared_image_mapping_chunk_len(chunks[chunk_index])
+        {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
-                let mapping = shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
-                shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
+                if let Some(mapping) =
+                    shared_image_mapping_remove_at(chunks, chunk_index, entry_index)
+                {
+                    shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
+                } else {
+                    entry_index += 1;
+                }
             } else {
                 entry_index += 1;
             }
@@ -8446,12 +8475,19 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
     let mut chunk_index = 0usize;
     while chunk_index < chunks.len() {
         let mut entry_index = 0usize;
-        while chunk_index < chunks.len() && entry_index < (*chunks[chunk_index]).len {
+        while chunk_index < chunks.len()
+            && entry_index < shared_image_mapping_chunk_len(chunks[chunk_index])
+        {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi {
-                let mapping = shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
-                shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
-                removed = removed.saturating_add(1);
+                if let Some(mapping) =
+                    shared_image_mapping_remove_at(chunks, chunk_index, entry_index)
+                {
+                    shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
+                    removed = removed.saturating_add(1);
+                } else {
+                    entry_index += 1;
+                }
             } else {
                 entry_index += 1;
             }

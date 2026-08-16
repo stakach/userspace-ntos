@@ -55,9 +55,25 @@ Hardware evidence now reports persistent `dma_dev_tx/rx` and `dma_dev_cause/fail
 later DPC clearing descriptor `DD` does not erase the proof. Validation for this slice:
 `cargo fmt --all`, `cargo test -p nt-dma-manager`, executive `cargo check --manifest-path
 components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
-Review adjustment: the descriptor-completion/device-model foundation is closed; the remaining B3
-packet frontier is the serialized boot proof and, if RX completion is present but no NDIS receive
-indication follows, the real NDIS protocol bind/OID packet-filter path.
+Review adjustment: the descriptor-completion/device-model foundation and serialized desktop proof
+are closed. The remaining B3 packet frontier is real NDIS receive indication after protocol
+bind/packet-filter setup, TX traffic from the real scatter/gather send route, and repeated-device
+scaling under the same dynamic devnode/resource path.
+
+Latest accepted B3 packet proof (2026-08-17):
+`.tmp/run-desktop-shared-image-stable-chunks-20260817-092332.log` reaches the harness sentinel with
+`298/298` executive-to-isolated-service checks passing after the shared-image mapping registry was
+made stable across late Explorer dependency-load churn. The prior `!@src/main.rs:8216` dependency
+loader stop is gone; process-map caps are still removed and deleted/recycled normally, but mapping
+chunk storage is no longer freed and reused while live image mapping code is still re-entering the
+registry. The proof preserves the B3 hardware model evidence for the registry-selected PCI `E1000`
+path: `dma_desc_addr/ok=128/128`, `dma_dev_tx/rx=0/1`, and `dma_dev_cause/fail=144/0`. It also
+keeps memory/resource gates clean with `image-mapcap-fails=0`, `image-bank-fails=0`,
+`unmap-fails=0`, `ut-fails=0`, `registry=0`, and `asid-fails=0`. The desktop path remains genuine:
+real profile hive load, `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM class
+opens, 887 real user callbacks, 246 GDI user-batch flushes, and
+`exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports `786432/786432` non-background pixels
+with at least 32 distinct non-background colors.
 
 Latest accepted desktop proof (2026-08-16):
 `.tmp/run-headless-b3-dma-packet-desc-timerbind-20260816.log` reaches the harness sentinel with
@@ -1300,9 +1316,9 @@ before unrelated executive traffic monopolises the receive loop.
   creates its service-owned system threads and the desktop paint gate is green again. Hosted WDM DMA
   now includes the NT5 map-register and scatter/gather operation set backed by the per-devnode IOMMU
   grant. Generic descriptor completion and the first e1000 register-profile bus-master model are in
-  place, so remaining B3 work is serialized proof of that path, real NDIS receive indication after
-  protocol bind/packet-filter setup, TX traffic from the real scatter/gather send route, and
-  repeated-device scaling under the same dynamic devnode/resource path.
+  place and proven through the full desktop shell path, so remaining B3 work is real NDIS receive
+  indication after protocol bind/packet-filter setup, TX traffic from the real scatter/gather send
+  route, and repeated-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6846,3 +6862,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: run the serialized desktop proof
   next and inspect whether RX completion reaches NDIS receive indication; if not, continue in the
   real NDIS protocol bind/OID packet-filter path rather than adding packet scaffolding.
+
+  B3 serialized e1000/stable shared-image proof (2026-08-17): the follow-up desktop proof
+  `.tmp/run-desktop-shared-image-stable-chunks-20260817-092332.log` closes the serialized proof for
+  the generic e1000 descriptor-completion slice with `298/298` checks passing. The previous late
+  Explorer dependency-load stop at `!@src/main.rs:8216` was traced to shared-image mapping registry
+  lifetime pressure rather than process launch or Explorer policy. Shared image mapping entries are
+  still removed with swap-delete semantics and their root/banked map caps are deleted or recycled by
+  owner, but the backing mapping chunks now remain stable instead of being deallocated from the tail
+  while user-mode loader paths can re-enter image mapping. The proof keeps the B3 hardware evidence
+  green for the registry-selected PCI `E1000` route: `dma_desc_addr/ok=128/128`,
+  `dma_dev_tx/rx=0/1`, `dma_dev_cause/fail=144/0`, interrupt delivery, DPC dispatch, MMIO, I/O-port,
+  and root-start evidence all pass. The desktop route also remains green with real profile hive
+  load, `userinit.exe`, `explorer.exe`, shell COM class opens, 668 Explorer api0 redirects, 246 GDI
+  batch flushes, `exec_explorer_shell_chrome_painted`, and `786432/786432` non-background pixels.
+  Resource gates remain clean: `image-mapcap-fails=0`, `image-bank-fails=0`, `unmap-fails=0`,
+  `ut-fails=0`, `registry=0`, and `asid-fails=0`. Review adjustment: B3 now moves to the true
+  NDIS data-plane frontier: prove protocol bind/OID packet-filter setup, surface receive indication
+  from the completed RX descriptor, then drive TX traffic from the real scatter/gather send route.
