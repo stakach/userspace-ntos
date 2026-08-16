@@ -330,7 +330,14 @@ pub const SH_RESOURCE_IO_PORT_LEN: u64 = 0x698; // in: granted PCI I/O port leng
 pub const SH_DMA_ALLOC_CURSOR: u64 = 0x6A0; // out: next offset in the granted common-buffer window
 pub const SH_DMA_ALLOC_RECORD_COUNT: u64 = 0x6A8; // out: high-water mark in allocation records
 pub const SH_DMA_ALLOC_RECORD_CAPACITY: u64 = 0x6B0; // out: records available in the shared arena
-pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x18;
+pub const SH_DMA_ALLOC_RECORD_SIZE: u64 = 0x38;
+pub const SH_DMA_ALLOC_RECORD_LOGICAL: u64 = 0x00;
+pub const SH_DMA_ALLOC_RECORD_LEN: u64 = 0x08;
+pub const SH_DMA_ALLOC_RECORD_VA: u64 = 0x10;
+pub const SH_DMA_ALLOC_RECORD_KIND: u64 = 0x18;
+pub const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 0x20;
+pub const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 0x28;
+pub const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 0x30;
 pub const SH_ACTIVE_IRP: u64 = 0x6C0; // out: component VA of the IRP currently inside MajorFunction
 pub const SH_ACTIVE_IOSL: u64 = 0x6C8; // out: component VA of Tail.Overlay.CurrentStackLocation
 pub const SH_ACTIVE_DATA: u64 = 0x6D0; // out: component VA of request SystemBuffer/UserBuffer
@@ -6523,8 +6530,8 @@ extern "win64" fn s_io_get_dma_adapter(
             return 0;
         }
 
-        // DMA_OPERATIONS: Size@0, PutDmaAdapter@8, AllocateCommonBuffer@16,
-        // FreeCommonBuffer@24. Other operations stay NULL until the generic MDL map path exists.
+        // DMA_OPERATIONS: publish the NT5 WDM operations needed by NDIS bus-master DMA. Later
+        // post-NT5 extended entries stay NULL and therefore fail closed if a driver requires them.
         write_unaligned(ops as *mut u32, 0x100);
         write_unaligned(
             (ops + 8) as *mut u64,
@@ -6537,6 +6544,42 @@ extern "win64" fn s_io_get_dma_adapter(
         write_unaligned(
             (ops + 24) as *mut u64,
             s_dma_free_common_buffer as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 32) as *mut u64,
+            s_dma_allocate_adapter_channel as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 40) as *mut u64,
+            s_dma_flush_adapter_buffers as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 48) as *mut u64,
+            s_dma_free_adapter_channel as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 56) as *mut u64,
+            s_dma_free_map_registers as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 64) as *mut u64,
+            s_dma_map_transfer as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 72) as *mut u64,
+            s_dma_get_dma_alignment as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 80) as *mut u64,
+            s_dma_read_dma_counter as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 88) as *mut u64,
+            s_dma_get_scatter_gather_list as *const () as usize as u64,
+        );
+        write_unaligned(
+            (ops + 96) as *mut u64,
+            s_dma_put_scatter_gather_list as *const () as usize as u64,
         );
 
         // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8.
@@ -6572,6 +6615,10 @@ extern "win64" fn s_dma_put_adapter(adapter: u64) {
 }
 
 const HOSTED_DMA_COMMON_ALIGNMENT: u64 = 0x1000;
+const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;
+const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
+const HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE: u64 = 1;
+const HOSTED_DMA_MAP_REGISTER_SIGNATURE: u64 = 0x4D41_5052_4547_3031; // "MAPREG01"
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {
@@ -6616,12 +6663,29 @@ unsafe fn clear_dma_allocation_records(sh: u64) {
     let mut i = 0u64;
     while i < dma_allocation_record_arena_capacity() {
         if let Some(record) = dma_allocation_record(sh, i) {
-            write_volatile(record as *mut u64, 0);
-            write_volatile((record + 8) as *mut u64, 0);
-            write_volatile((record + 16) as *mut u64, 0);
+            clear_dma_allocation_record(record);
         }
         i += 1;
     }
+}
+
+unsafe fn clear_dma_allocation_record(record: u64) {
+    write_volatile(
+        (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
+        0,
+    );
+    write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, 0);
+    write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, 0);
+    write_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *mut u64, 0);
+    write_volatile(
+        (record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64,
+        0,
+    );
+    write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
+    write_volatile(
+        (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
+        0,
+    );
 }
 
 unsafe fn dma_allocation_range_overlaps(
@@ -6635,8 +6699,8 @@ unsafe fn dma_allocation_range_overlaps(
     let capacity = dma_allocation_record_capacity(sh);
     while i < capacity {
         let record = dma_allocation_record(sh, i)?;
-        let logical = read_volatile(record as *const u64);
-        let record_len = read_volatile((record + 8) as *const u64);
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let record_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
         if logical != 0 && record_len != 0 {
             let record_offset = logical.checked_sub(grant_logical)?;
             let record_end = record_offset.checked_add(record_len)?;
@@ -6654,7 +6718,7 @@ unsafe fn first_free_dma_allocation_record(sh: u64) -> Option<u64> {
     let capacity = dma_allocation_record_capacity(sh);
     while i < capacity {
         let record = dma_allocation_record(sh, i)?;
-        if read_volatile((record + 8) as *const u64) == 0 {
+        if read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) == 0 {
             return Some(record);
         }
         i += 1;
@@ -6713,9 +6777,28 @@ extern "win64" fn s_dma_allocate_common_buffer(
         let va = grant_va + offset;
         let logical = grant_logical + offset;
         core::ptr::write_bytes(va as *mut u8, 0, requested as usize);
-        write_volatile(record as *mut u64, logical);
-        write_volatile((record + 8) as *mut u64, requested);
-        write_volatile((record + 16) as *mut u64, va);
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
+            logical,
+        );
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64,
+            requested,
+        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, va);
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_KIND) as *mut u64,
+            HOSTED_DMA_RECORD_KIND_COMMON,
+        );
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64,
+            0,
+        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
+            0,
+        );
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
             requested,
@@ -6760,10 +6843,13 @@ extern "win64" fn s_dma_free_common_buffer(
         let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
         while i < capacity {
             if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
-                let active_logical = read_volatile(record as *const u64);
-                let active_len = read_volatile((record + 8) as *const u64);
-                let active_va = read_volatile((record + 16) as *const u64);
+                let active_logical =
+                    read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+                let active_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+                let active_va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+                let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
                 if active_logical != 0
+                    && kind == HOSTED_DMA_RECORD_KIND_COMMON
                     && logical == active_logical
                     && virtual_address == active_va
                     && length as u64 == active_len
@@ -6772,9 +6858,7 @@ extern "win64" fn s_dma_free_common_buffer(
                         (FSD_SHARED_VADDR + SH_DMA_FREED_LOGICAL) as *mut u64,
                         active_logical,
                     );
-                    write_volatile(record as *mut u64, 0);
-                    write_volatile((record + 8) as *mut u64, 0);
-                    write_volatile((record + 16) as *mut u64, 0);
+                    clear_dma_allocation_record(record);
                     if read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOCATED_LOGICAL) as *const u64)
                         == active_logical
                     {
@@ -6790,6 +6874,402 @@ extern "win64" fn s_dma_free_common_buffer(
             }
             i += 1;
         }
+    }
+}
+
+unsafe fn dma_active_adapter_and_grant(adapter: u64) -> Option<(u64, u64, u64)> {
+    let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+    let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
+    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
+    let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
+    if adapter == 0
+        || adapter != active
+        || grant_va == 0
+        || grant_len == 0
+        || grant_logical == 0
+    {
+        None
+    } else {
+        Some((grant_va, grant_len, grant_logical))
+    }
+}
+
+unsafe fn dma_mdl_transfer_window(mdl: u64, current_va: u64, requested: u64) -> Option<(u64, u64)> {
+    if mdl == 0 || requested == 0 || requested > u32::MAX as u64 {
+        return None;
+    }
+    let start = read_unaligned((mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+    let byte_offset = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32) as u64;
+    let byte_count = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) as u64;
+    if byte_count == 0 {
+        return None;
+    }
+    let base = start.checked_add(byte_offset)?;
+    let end = base.checked_add(byte_count)?;
+    let va = if current_va == 0 { base } else { current_va };
+    if va < base || va >= end {
+        return None;
+    }
+    let length = requested.min(end - va);
+    (length != 0).then_some((va, length))
+}
+
+unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
+    let mut offset = 0u64;
+    while offset < len {
+        let byte = read_volatile((src + offset) as *const u8);
+        write_volatile((dst + offset) as *mut u8, byte);
+        offset += 1;
+    }
+}
+
+extern "win64" fn s_dma_allocate_adapter_channel(
+    adapter: u64,
+    device_object: u64,
+    number_of_map_registers: u32,
+    execution_routine: u64,
+    context: u64,
+) -> i32 {
+    unsafe {
+        if dma_active_adapter_and_grant(adapter).is_none()
+            || number_of_map_registers == 0
+            || number_of_map_registers > 64
+            || execution_routine == 0
+        {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        }
+        let map_register = pool_alloc_zeroed(0x20);
+        if map_register == 0 {
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+        write_unaligned(
+            map_register as *mut u64,
+            HOSTED_DMA_MAP_REGISTER_SIGNATURE,
+        );
+        write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
+        let routine: extern "win64" fn(u64, u64, u64, u64) -> u32 =
+            core::mem::transmute(execution_routine as *const ());
+        let action = routine(device_object, 0, map_register, context);
+        if action == 2 {
+            // DeallocateObject: the caller did not retain the map-register token.
+            pool_free(map_register);
+        }
+        0
+    }
+}
+
+extern "win64" fn s_dma_free_adapter_channel(_adapter: u64) {}
+
+extern "win64" fn s_dma_map_transfer(
+    adapter: u64,
+    mdl: u64,
+    map_register_base: u64,
+    current_va: u64,
+    length: *mut u32,
+    write_to_device: u8,
+) -> i64 {
+    unsafe {
+        let Some((grant_va, grant_len, grant_logical)) = dma_active_adapter_and_grant(adapter) else {
+            return 0;
+        };
+        if map_register_base == 0
+            || read_unaligned(map_register_base as *const u64) != HOSTED_DMA_MAP_REGISTER_SIGNATURE
+            || length.is_null()
+        {
+            return 0;
+        }
+        let requested = read_unaligned(length) as u64;
+        let Some((source_va, mapped_len)) = dma_mdl_transfer_window(mdl, current_va, requested) else {
+            write_unaligned(length, 0);
+            return 0;
+        };
+        let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
+            write_unaligned(length, 0);
+            return 0;
+        };
+
+        let mut offset = 0u64;
+        loop {
+            let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
+                write_unaligned(length, 0);
+                return 0;
+            };
+            let Some(end) = aligned.checked_add(mapped_len) else {
+                write_unaligned(length, 0);
+                return 0;
+            };
+            if end > grant_len {
+                write_unaligned(length, 0);
+                return 0;
+            }
+            if let Some(next_offset) =
+                dma_allocation_range_overlaps(FSD_SHARED_VADDR, grant_logical, aligned, mapped_len)
+            {
+                offset = next_offset;
+                continue;
+            }
+            offset = aligned;
+            break;
+        }
+
+        let bounce_va = grant_va + offset;
+        let logical = grant_logical + offset;
+        if write_to_device != 0 {
+            dma_copy_bytes(bounce_va, source_va, mapped_len);
+        } else {
+            core::ptr::write_bytes(bounce_va as *mut u8, 0, mapped_len as usize);
+        }
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
+            logical,
+        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, mapped_len);
+        write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, bounce_va);
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_KIND) as *mut u64,
+            HOSTED_DMA_RECORD_KIND_MAP_TRANSFER,
+        );
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64,
+            source_va,
+        );
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64,
+            if write_to_device != 0 {
+                HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE
+            } else {
+                0
+            },
+        );
+        write_volatile(
+            (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
+            map_register_base,
+        );
+        let count = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+        let used = ((record - FSD_SHARED_VADDR - SH_DMA_ALLOC_RECORDS) / SH_DMA_ALLOC_RECORD_SIZE)
+            .saturating_add(1);
+        if used > count {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *mut u64,
+                used,
+            );
+        }
+        let cursor = read_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64);
+        let end = offset + mapped_len;
+        if end > cursor {
+            write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
+        }
+        write_unaligned(length, mapped_len as u32);
+        logical as i64
+    }
+}
+
+unsafe fn dma_find_map_record(map_register_base: u64, source_va: u64) -> Option<u64> {
+    let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+    let mut i = 0u64;
+    while i < capacity {
+        let record = dma_allocation_record(FSD_SHARED_VADDR, i)?;
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        let token = read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+        let active_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let active_source = read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+        if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER
+            && token == map_register_base
+            && active_len != 0
+            && (source_va == 0 || source_va == active_source)
+        {
+            return Some(record);
+        }
+        i += 1;
+    }
+    None
+}
+
+extern "win64" fn s_dma_flush_adapter_buffers(
+    adapter: u64,
+    _mdl: u64,
+    map_register_base: u64,
+    current_va: u64,
+    length: u32,
+    write_to_device: u8,
+) -> u8 {
+    unsafe {
+        if dma_active_adapter_and_grant(adapter).is_none() || map_register_base == 0 {
+            return 0;
+        }
+        let Some(record) = dma_find_map_record(map_register_base, current_va) else {
+            return 0;
+        };
+        let mapped_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let bounce_va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let source_va = read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+        if length as u64 > mapped_len || bounce_va == 0 || source_va == 0 {
+            return 0;
+        }
+        if write_to_device == 0 {
+            dma_copy_bytes(source_va, bounce_va, length as u64);
+        }
+        1
+    }
+}
+
+extern "win64" fn s_dma_free_map_registers(
+    _adapter: u64,
+    map_register_base: u64,
+    _number_of_map_registers: u32,
+) {
+    unsafe {
+        if map_register_base == 0 {
+            return;
+        }
+        let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
+        let mut i = 0u64;
+        while i < capacity {
+            if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
+                let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+                let token = read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+                if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
+                    clear_dma_allocation_record(record);
+                }
+            }
+            i += 1;
+        }
+        if read_unaligned(map_register_base as *const u64) == HOSTED_DMA_MAP_REGISTER_SIGNATURE {
+            pool_free(map_register_base);
+        }
+    }
+}
+
+extern "win64" fn s_dma_get_dma_alignment(_adapter: u64) -> u32 {
+    4
+}
+
+extern "win64" fn s_dma_read_dma_counter(_adapter: u64) -> u32 {
+    0
+}
+
+const HOSTED_SG_CONTEXT_SIZE: u64 = 0x30;
+const HOSTED_SG_CONTEXT_SIGNATURE: u64 = 0x5347_4354_5830_3031; // "SGCTX001"
+const HOSTED_SG_LIST_SIZE_ONE: u64 = 0x28;
+const HOSTED_SG_ELEMENT_OFFSET: u64 = 0x10;
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn s_dma_get_scatter_gather_list(
+    adapter: u64,
+    device_object: u64,
+    mdl: u64,
+    current_va: u64,
+    length: u32,
+    execution_routine: u64,
+    context: u64,
+    write_to_device: u8,
+) -> i32 {
+    unsafe {
+        if execution_routine == 0 || length == 0 || dma_active_adapter_and_grant(adapter).is_none() {
+            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        }
+        let map_register = pool_alloc_zeroed(0x20);
+        let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
+        let sg_list = pool_alloc_zeroed(HOSTED_SG_LIST_SIZE_ONE);
+        if map_register == 0 || sg_context == 0 || sg_list == 0 {
+            if map_register != 0 {
+                pool_free(map_register);
+            }
+            if sg_context != 0 {
+                pool_free(sg_context);
+            }
+            if sg_list != 0 {
+                pool_free(sg_list);
+            }
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+        write_unaligned(
+            map_register as *mut u64,
+            HOSTED_DMA_MAP_REGISTER_SIGNATURE,
+        );
+        write_unaligned((map_register + 8) as *mut u32, 1);
+        let mut mapped_len = length;
+        let logical = s_dma_map_transfer(
+            adapter,
+            mdl,
+            map_register,
+            current_va,
+            &mut mapped_len as *mut u32,
+            write_to_device,
+        ) as u64;
+        if logical == 0 || mapped_len == 0 {
+            pool_free(sg_list);
+            pool_free(sg_context);
+            pool_free(map_register);
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+
+        write_unaligned(sg_context as *mut u64, HOSTED_SG_CONTEXT_SIGNATURE);
+        write_unaligned((sg_context + 8) as *mut u64, map_register);
+        write_unaligned((sg_context + 16) as *mut u64, mdl);
+        write_unaligned((sg_context + 24) as *mut u64, current_va);
+        write_unaligned((sg_context + 32) as *mut u32, mapped_len);
+        write_unaligned((sg_context + 40) as *mut u8, write_to_device);
+
+        write_unaligned(sg_list as *mut u32, 1);
+        write_unaligned((sg_list + 8) as *mut u64, sg_context);
+        write_unaligned(
+            (sg_list + HOSTED_SG_ELEMENT_OFFSET) as *mut u64,
+            logical,
+        );
+        write_unaligned(
+            (sg_list + HOSTED_SG_ELEMENT_OFFSET + 8) as *mut u32,
+            mapped_len,
+        );
+        write_unaligned(
+            (sg_list + HOSTED_SG_ELEMENT_OFFSET + 16) as *mut u64,
+            0,
+        );
+
+        let routine: extern "win64" fn(u64, u64, u64, u64) =
+            core::mem::transmute(execution_routine as *const ());
+        routine(device_object, 0, sg_list, context);
+        0
+    }
+}
+
+extern "win64" fn s_dma_put_scatter_gather_list(
+    adapter: u64,
+    scatter_gather: u64,
+    write_to_device: u8,
+) {
+    unsafe {
+        if scatter_gather == 0 {
+            return;
+        }
+        let sg_context = read_unaligned((scatter_gather + 8) as *const u64);
+        if sg_context == 0
+            || read_unaligned(sg_context as *const u64) != HOSTED_SG_CONTEXT_SIGNATURE
+        {
+            pool_free(scatter_gather);
+            return;
+        }
+        let map_register = read_unaligned((sg_context + 8) as *const u64);
+        let mdl = read_unaligned((sg_context + 16) as *const u64);
+        let current_va = read_unaligned((sg_context + 24) as *const u64);
+        let length = read_unaligned((sg_context + 32) as *const u32);
+        let stored_write_to_device = read_unaligned((sg_context + 40) as *const u8);
+        let direction = if write_to_device != 0 {
+            write_to_device
+        } else {
+            stored_write_to_device
+        };
+        let _ = s_dma_flush_adapter_buffers(
+            adapter,
+            mdl,
+            map_register,
+            current_va,
+            length,
+            direction,
+        );
+        s_dma_free_map_registers(adapter, map_register, 1);
+        pool_free(sg_context);
+        pool_free(scatter_gather);
     }
 }
 
@@ -18138,9 +18618,10 @@ unsafe fn record_hosted_resource_usage(
         let Some(record) = dma_allocation_record(sh, record_index) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
-        let logical = read_volatile(record as *const u64);
-        let len = read_volatile((record + 8) as *const u64);
-        let va = read_volatile((record + 16) as *const u64);
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
         if logical != 0 || len != 0 || va != 0 {
             if dma_adapter_id == 0
                 || dma_adapter_blob == 0
@@ -18150,6 +18631,8 @@ unsafe fn record_hosted_resource_usage(
                 || logical < dma_grant_logical
                 || va < dma_grant_va
                 || len == 0
+                || (kind != HOSTED_DMA_RECORD_KIND_COMMON
+                    && kind != HOSTED_DMA_RECORD_KIND_MAP_TRANSFER)
             {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
@@ -18165,15 +18648,38 @@ unsafe fn record_hosted_resource_usage(
             {
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
-            hosted_dma_manager_mut()
-                .register_common_buffer_at(
-                    hosted_dma_owner(binding),
-                    dma_adapter_id,
-                    logical,
-                    len,
-                    va,
-                )
-                .map_err(hosted_dma_status)?;
+            match kind {
+                HOSTED_DMA_RECORD_KIND_COMMON => {
+                    hosted_dma_manager_mut()
+                        .register_common_buffer_at(
+                            hosted_dma_owner(binding),
+                            dma_adapter_id,
+                            logical,
+                            len,
+                            va,
+                        )
+                        .map_err(hosted_dma_status)?;
+                }
+                HOSTED_DMA_RECORD_KIND_MAP_TRANSFER => {
+                    let source_va =
+                        read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+                    let map_register =
+                        read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+                    if source_va == 0 || map_register == 0 {
+                        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    }
+                    hosted_dma_manager_mut()
+                        .register_mapping_at(
+                            hosted_dma_owner(binding),
+                            dma_adapter_id,
+                            logical,
+                            va,
+                            len,
+                        )
+                        .map_err(hosted_dma_status)?;
+                }
+                _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            }
         }
         record_index += 1;
     }

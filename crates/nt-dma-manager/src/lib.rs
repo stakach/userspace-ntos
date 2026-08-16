@@ -374,20 +374,51 @@ impl DmaManager {
         }
         let mapped_length = length.min(max_length);
         let logical_base = self.alloc_logical();
+        self.register_mapping_at(owner, adapter_id, logical_base, backing_va, mapped_length)
+    }
+
+    /// Register a packet-transfer mapping at a caller-selected device logical address.
+    /// Bus/IOMMU brokers use this when the driver-visible IOVA was allocated in a
+    /// component-local map-register table and the canonical manager must learn the same
+    /// address for later device decode/revocation.
+    pub fn register_mapping_at(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        backing_va: u64,
+        length: u64,
+    ) -> Result<MapGrant, DmaError> {
+        let (max_length, dma64) = {
+            let a = self.adapter(adapter_id, owner)?;
+            (a.max_length, a.dma64)
+        };
+        if logical_base == 0 || length == 0 || length > max_length {
+            return Err(DmaError::OutOfRange);
+        }
+        let logical_end = logical_base
+            .checked_add(length)
+            .ok_or(DmaError::OutOfRange)?;
+        if !dma64 && logical_end > 0x1_0000_0000 {
+            return Err(DmaError::OutOfRange);
+        }
+        if self.logical_range_in_use(owner, logical_base, length) {
+            return Err(DmaError::LogicalViolation);
+        }
         let id = self.next_mapping_id;
         self.next_mapping_id += 1;
         self.mappings.push(Mapping {
             id,
             owner,
             logical_base,
-            length: mapped_length,
+            length,
             backing_va,
             active: true,
         });
         Ok(MapGrant {
             mapping_id: id,
             logical_base,
-            mapped_length,
+            mapped_length: length,
         })
     }
 
@@ -398,6 +429,29 @@ impl DmaManager {
             .iter_mut()
             .find(|m| m.id == mapping_id && m.active)
             .ok_or(DmaError::StaleId)?;
+        m.active = false;
+        Ok(())
+    }
+
+    /// Owner-validated mapping release used by hosted bus brokers.
+    pub fn free_mapping_for_owner(
+        &mut self,
+        owner: DmaOwner,
+        mapping_id: u64,
+    ) -> Result<(), DmaError> {
+        let has_other_owner = self
+            .mappings
+            .iter()
+            .any(|m| m.id == mapping_id && m.active && m.owner != owner);
+        let m = self
+            .mappings
+            .iter_mut()
+            .find(|m| m.id == mapping_id && m.active && m.owner == owner)
+            .ok_or(if has_other_owner {
+                DmaError::WrongOwner
+            } else {
+                DmaError::StaleId
+            })?;
         m.active = false;
         Ok(())
     }
@@ -548,6 +602,68 @@ mod tests {
         assert_eq!(d.decode_logical(m.logical_base, 256), Ok(0x5_0000));
         d.free_mapping(m.mapping_id).unwrap();
         assert_eq!(d.free_mapping(m.mapping_id), Err(DmaError::StaleId));
+    }
+
+    #[test]
+    fn broker_registered_transfer_mapping_uses_supplied_logical_address() {
+        let mut d = DmaManager::new();
+        let a = d.register_adapter(owner(), true, 4096, true);
+        let m = d
+            .register_mapping_at(owner(), a, 0x2000, 1536, 1024)
+            .unwrap();
+
+        assert_eq!(m.logical_base, 0x2000);
+        assert_eq!(m.mapped_length, 1024);
+        assert_eq!(d.decode_owner_logical(owner(), 0x2000, 16), Ok(1536));
+        assert_eq!(d.decode_owner_logical(owner(), 0x2200, 32), Ok(2048));
+    }
+
+    #[test]
+    fn registered_transfer_mapping_rejects_overlap_and_bad_owner() {
+        let mut d = DmaManager::new();
+        let owner_a = owner();
+        let owner_b = DmaOwner::new(2, 20);
+        let adapter_a = d.register_adapter(owner_a, true, 4096, true);
+        let adapter_b = d.register_adapter(owner_b, true, 4096, true);
+        d.register_common_buffer_at(owner_a, adapter_a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+        d.register_mapping_at(owner_b, adapter_b, 0x1000, 512, 512)
+            .unwrap();
+
+        assert_eq!(
+            d.register_mapping_at(owner_a, adapter_a, 0x1800, 0x3_0000, 512),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            d.register_mapping_at(owner_b, adapter_a, 0x3000, 0x4_0000, 512),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(d.decode_owner_logical(owner_b, 0x1000, 16), Ok(512));
+    }
+
+    #[test]
+    fn free_mapping_for_owner_validates_owner() {
+        let mut d = DmaManager::new();
+        let owner_a = owner();
+        let owner_b = DmaOwner::new(2, 20);
+        let adapter = d.register_adapter(owner_a, true, 4096, true);
+        let m = d
+            .register_mapping_at(owner_a, adapter, 0x3000, 0x6_0000, 512)
+            .unwrap();
+
+        assert_eq!(
+            d.free_mapping_for_owner(owner_b, m.mapping_id),
+            Err(DmaError::WrongOwner)
+        );
+        assert_eq!(
+            d.decode_owner_logical(owner_a, m.logical_base, 16),
+            Ok(0x6_0000)
+        );
+        d.free_mapping_for_owner(owner_a, m.mapping_id).unwrap();
+        assert_eq!(
+            d.decode_owner_logical(owner_a, m.logical_base, 16),
+            Err(DmaError::LogicalViolation)
+        );
     }
 
     #[test]

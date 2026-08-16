@@ -1238,12 +1238,11 @@ before unrelated executive traffic monopolises the receive loop.
   PnP-bound drivers, while unrelated no-devnode boot drivers remain excluded until their real
   mechanisms exist.
   The current serialized desktop proof validates that `Ndis`, `Tcpip`, `Afd`, and `Netio` are
-  selected dynamically from registry metadata and launched through the hosted driver path; `Tcpip`
-  now fails closed from its own initialization with `STATUS_INVALID_SID`.
-  Remaining B3 work is broader non-display driver coverage: hosted thread-handle close/wait
-  semantics if ReactOS drivers expose them, the generic SID/security/config surface needed by
-  `tcpip.sys`, miniport packet data-plane behavior, and multi-device scaling under the same dynamic
-  devnode/resource path.
+  selected dynamically from registry metadata and launched through the hosted driver path; TCPIP
+  creates its service-owned system threads and the desktop paint gate is green again. Hosted WDM DMA
+  now includes NT5 map-register and scatter/gather operations backed by the per-devnode IOMMU grant,
+  so remaining B3 work is real packet traffic over the generic NDIS/e1000 route, receive
+  completion/indication, and repeated-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6590,3 +6589,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   activation and desktop paint gates are green again; the remaining B3 frontier is real packet
   data-plane behavior and repeated NIC/device scaling through the same dynamic driver, devnode,
   resource, and service metadata paths.
+
+  B3 WDM DMA map-register foundation (2026-08-16): the canonical `nt-dma-manager` can now register
+  packet-transfer mappings at a caller-supplied logical address and release them through an
+  owner-validated path, giving bus/IOMMU brokers the same exact device address that was handed to a
+  hosted driver. The hosted ReactOS driver DMA projection now publishes the NT5
+  `DMA_OPERATIONS` entries used by NDIS bus-master paths: `AllocateAdapterChannel`,
+  `MapTransfer`, `FlushAdapterBuffers`, `FreeMapRegisters`, `GetDmaAlignment`, `ReadDmaCounter`,
+  `GetScatterGatherList`, and `PutScatterGatherList`. Map transfers allocate typed transient
+  records from the per-devnode DMA grant, use the grant as a bounce-buffer map-register window,
+  copy host memory into the IOMMU-visible buffer for device reads, copy back on flush for device
+  writes, and keep common-buffer records distinct from transfer mappings when executive-side
+  evidence is replayed into `nt-dma-manager`. Unsupported post-NT5 extended DMA operations remain
+  NULL rather than growing fallback behavior. Validation: `cargo fmt --all`, `cargo test -p
+  nt-dma-manager`, `cargo test -p nt-wdf-dma`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: B3's next packet-data-plane target is real device traffic over the generic
+  NDIS/e1000 route: exercise the new scatter/gather send path, prove TX descriptors reach the real
+  NIC with IOMMU-backed packet buffers, then handle receive completion/indication without adding
+  service-specific packet scaffolding.
