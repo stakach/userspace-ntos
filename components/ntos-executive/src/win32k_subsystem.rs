@@ -7216,14 +7216,8 @@ impl Win32kRegHandle {
 static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
 
 pub(crate) struct DisplayRegistrySpec<'a> {
-    pub(crate) video_object_number: u32,
-    pub(crate) service_name: &'a [u8],
-    pub(crate) service_key_pattern: &'a [u8],
-    pub(crate) service_registry_path: &'a [u8],
-    pub(crate) installed_display_driver: &'a [u8],
     pub(crate) display_driver_leaf: &'a [u8],
     pub(crate) device_description: &'a [u8],
-    pub(crate) vga_compatible: u32,
     pub(crate) framebuffer_size: u64,
     pub(crate) mode: DisplayModeSpec,
 }
@@ -7233,7 +7227,6 @@ pub(crate) struct DisplayModeSpec {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) stride: u32,
-    pub(crate) bits_per_plane: u32,
 }
 
 fn reg_ascii_eq(a: &[u8], b: &[u8]) -> bool {
@@ -7292,46 +7285,6 @@ fn close_win32k_reg_handle(handle: u64) -> bool {
     } else {
         false
     }
-}
-
-fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
-    let _ = spec.vga_compatible;
-    if spec.service_name.is_empty()
-        || spec.service_key_pattern.is_empty()
-        || spec.service_registry_path.is_empty()
-        || spec.installed_display_driver.is_empty()
-        || spec.display_driver_leaf.is_empty()
-        || spec.device_description.is_empty()
-        || spec.framebuffer_size == 0
-        || spec.mode.width == 0
-        || spec.mode.height == 0
-        || spec.mode.stride == 0
-        || spec.mode.bits_per_plane == 0
-    {
-        return false;
-    }
-    unsafe {
-        crate::video_device::publish_boot_framebuffer_video_device(
-            &crate::video_device::VideoDeviceRegistration {
-                object_number: spec.video_object_number,
-                driver_name: b"bootvid",
-                service_registry_path: spec.service_registry_path,
-                framebuffer_va: WIN32K_FB_VA,
-                framebuffer_size: spec.framebuffer_size,
-                mode: crate::video_device::VideoModeSpec {
-                    width: spec.mode.width,
-                    height: spec.mode.height,
-                    stride: spec.mode.stride,
-                    bits_per_plane: spec.mode.bits_per_plane,
-                },
-                allocate_projection: pool_alloc,
-            },
-        )
-    }
-}
-
-pub(crate) fn publish_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
-    register_display_device_route(spec)
 }
 
 fn strip_ascii_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -10696,8 +10649,7 @@ pub fn record_display_driver(
         FRAMEBUF_VA + entry_rva as u64,
         expd,
         image_len,
-    ) && (crate::video_device::hosted_video_device_route_ready()
-        || register_display_device_route(spec))
+    ) && crate::video_device::hosted_video_device_route_ready()
 }
 
 /// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find

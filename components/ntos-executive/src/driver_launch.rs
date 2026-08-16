@@ -12049,28 +12049,6 @@ pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
 }
 
 #[inline(never)]
-pub(crate) fn register_kernel_io_device(
-    driver_id: u64,
-    device_path: &str,
-    device_type: DeviceType,
-    characteristics: DeviceCharacteristics,
-    flags: DeviceFlags,
-    extension_size: u32,
-) -> Result<(u64, u64), nt_status::NtStatus> {
-    let name = parse_nt_path(device_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let device_id = io_manager_mut().create_device(
-        DriverId(driver_id),
-        Some(&name),
-        device_type,
-        characteristics,
-        flags,
-        extension_size,
-    )?;
-    let object_id = device_object_id(device_id.raw());
-    Ok((device_id.raw(), object_id))
-}
-
-#[inline(never)]
 pub(crate) fn open_io_device(
     device_path: &str,
     desired_access: AccessMask,
@@ -12817,11 +12795,6 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) {
             *slot = EMPTY_HOSTED_DEVICE_BINDING;
         }
     }
-}
-
-#[inline(never)]
-pub(crate) fn destroy_io_driver(driver_id: u64) {
-    destroy_registered_driver(driver_id);
 }
 
 pub(crate) fn device_object_id(device_id: u64) -> u64 {

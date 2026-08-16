@@ -17355,31 +17355,20 @@ fn system_hive_keyboard_layout_file(layout_id: &[u8], out: &mut [u8]) -> Option<
 
 struct SystemHiveDisplayDriverSpec {
     service_name: Vec<u8>,
-    service_key_pattern: Vec<u8>,
-    service_registry_path: Vec<u8>,
-    installed_display_driver: Vec<u8>,
     display_driver_leaf: Vec<u8>,
     device_description: Vec<u8>,
-    vga_compatible: u32,
 }
 
 impl SystemHiveDisplayDriverSpec {
     fn win32k_spec(&self) -> win32k_subsystem::DisplayRegistrySpec<'_> {
         win32k_subsystem::DisplayRegistrySpec {
-            video_object_number: 0,
-            service_name: &self.service_name,
-            service_key_pattern: &self.service_key_pattern,
-            service_registry_path: &self.service_registry_path,
-            installed_display_driver: &self.installed_display_driver,
             display_driver_leaf: &self.display_driver_leaf,
             device_description: &self.device_description,
-            vga_compatible: self.vga_compatible,
             framebuffer_size: FB_SIZE_BYTES.load(Ordering::Relaxed),
             mode: win32k_subsystem::DisplayModeSpec {
                 width: FB_WIDTH.load(Ordering::Relaxed) as u32,
                 height: FB_HEIGHT.load(Ordering::Relaxed) as u32,
                 stride: FB_SCANLINE.load(Ordering::Relaxed) as u32,
-                bits_per_plane: FB_BITS_PER_PLANE.load(Ordering::Relaxed) as u32,
             },
         }
     }
@@ -17498,7 +17487,7 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
         let Some(description_value) = hive.value(device_key, "Device Description") else {
             continue;
         };
-        let Some(vga_compatible) = hive
+        let Some(_vga_compatible) = hive
             .value(device_key, "VgaCompatible")
             .and_then(|(_, data)| registry_dword_from_bytes(&data))
         else {
@@ -17521,20 +17510,14 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
         let Some(device_description) = registry_utf16_ascii_vec(&description_value.1) else {
             continue;
         };
-        let Some((service_key_pattern, service_registry_path)) =
-            registry_build_display_service_paths(&service_name)
-        else {
+        if registry_build_display_service_paths(&service_name).is_none() {
             continue;
-        };
+        }
 
         let spec = SystemHiveDisplayDriverSpec {
             service_name,
-            service_key_pattern,
-            service_registry_path,
-            installed_display_driver,
             display_driver_leaf,
             device_description,
-            vga_compatible,
         };
         unsafe {
             *core::ptr::addr_of_mut!(SYSTEM_HIVE_DISPLAY_DRIVER_SPEC) = Some(spec);
@@ -24768,9 +24751,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // Host win32k's non-native static import DLLs and patch their IAT descriptors before
                 // any routed NtUser/NtGdi dispatch can call them.
                 load_win32k_static_import_drivers(host_pml4);
-                // Publish the display route selected from the real SYSTEM hive before win32k probes
-                // HARDWARE\DEVICEMAP\VIDEO. The display DLL image itself is demand-loaded only when
-                // win32k requests it through SystemLoadGdiDriverInformation.
+                // Record the display route selected from the real SYSTEM hive. The actual
+                // HARDWARE\DEVICEMAP\VIDEO route is published only by the hosted videoprt miniport
+                // after PnP AddDevice/START_DEVICE succeeds.
                 if let Some(display_spec) = system_hive_display_driver_spec() {
                     let display_spec_view = display_spec.win32k_spec();
                     print_str(b"[win32k-svc] display service=");
@@ -24787,11 +24770,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(display_spec_view.mode.stride as u64);
                     print_str(b" size=0x");
                     print_hex(display_spec_view.framebuffer_size as u32);
-                    print_str(b"\n");
-                    let route_published =
-                        win32k_subsystem::publish_display_device_route(&display_spec_view);
-                    print_str(b"[win32k-svc] display route published=");
-                    print_u64(route_published as u64);
                     print_str(b"\n");
                 } else {
                     print_str(
