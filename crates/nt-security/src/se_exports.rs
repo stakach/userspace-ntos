@@ -263,6 +263,10 @@ pub mod se_exports_offset {
     pub const ALIAS_ADMINS_SID: usize = PSID_BASE + 0x58; // 0x110
     /// `PSID SeAliasUsersSid`.
     pub const ALIAS_USERS_SID: usize = PSID_BASE + 0x60; // 0x118
+    /// `PSID SeLocalServiceSid`.
+    pub const LOCAL_SERVICE_SID: usize = PSID_BASE + 0xC8; // 0x180
+    /// `PSID SeNetworkServiceSid`.
+    pub const NETWORK_SERVICE_SID: usize = PSID_BASE + 0xD0; // 0x188
 
     /// Total `SE_EXPORTS` size to reserve (rounded to include all members se.h defines, headroom).
     pub const STRUCT_SIZE: usize = 0x1A0;
@@ -313,6 +317,14 @@ const SID_PLACEMENTS: &[SidPlacement] = &[
     SidPlacement {
         field_offset: se_exports_offset::ALIAS_USERS_SID,
         sid: ALIAS_USERS_SID,
+    },
+    SidPlacement {
+        field_offset: se_exports_offset::LOCAL_SERVICE_SID,
+        sid: LOCAL_SERVICE_SID,
+    },
+    SidPlacement {
+        field_offset: se_exports_offset::NETWORK_SERVICE_SID,
+        sid: NETWORK_SERVICE_SID,
     },
 ];
 
@@ -610,6 +622,8 @@ mod tests {
         check(se_exports_offset::WORLD_SID, WORLD_SID);
         check(se_exports_offset::LOCAL_SYSTEM_SID, LOCAL_SYSTEM_SID);
         check(se_exports_offset::ALIAS_ADMINS_SID, ALIAS_ADMINS_SID);
+        check(se_exports_offset::LOCAL_SERVICE_SID, LOCAL_SERVICE_SID);
+        check(se_exports_offset::NETWORK_SERVICE_SID, NETWORK_SERVICE_SID);
         check(se_exports_offset::CREATOR_OWNER_SID, CREATOR_OWNER_SID);
         check(se_exports_offset::NULL_SID, NULL_SID);
     }
@@ -627,6 +641,8 @@ mod tests {
             se_exports_offset::LOCAL_SYSTEM_SID,
             se_exports_offset::ALIAS_ADMINS_SID,
             se_exports_offset::ALIAS_USERS_SID,
+            se_exports_offset::LOCAL_SERVICE_SID,
+            se_exports_offset::NETWORK_SERVICE_SID,
         ];
         for (i, &o) in sid_offsets.iter().enumerate() {
             assert!(

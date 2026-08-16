@@ -553,15 +553,15 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
         };
 
         if !handler.is_null() {
-            // Build the dispatcher context + call the language handler on the ORIGINAL context (a
-            // handler that executes will RtlUnwindEx against the original, which it re-derives).
+            // Build the dispatcher context with the mutable unwind scratch context. The language
+            // handler still receives the original fault context as argument 3.
             let mut disp = DispatcherContext {
                 control_pc,
                 image_base,
                 function_entry: func as *const u8,
                 establisher_frame: establisher,
                 target_ip: 0,
-                context_record: context, // the ORIGINAL context (handler resumes/unwinds it)
+                context_record: work_ptr,
                 language_handler: handler,
                 handler_data,
                 history_table: core::ptr::null_mut(),
@@ -709,6 +709,36 @@ pub unsafe extern "system" fn rtl_raise_status_from_caller(
 /// # Safety
 /// `context_record` valid; `target_frame`/`target_ip` from the search pass. Reads the live stack.
 pub unsafe fn rtl_unwind_ex(
+    target_frame: u64,
+    target_ip: u64,
+    exception_record: *mut c_void,
+    return_value: u64,
+    context_record: *mut u8,
+    history_table: *mut c_void,
+) {
+    if context_record.is_null() {
+        return;
+    }
+    // ReactOS/NT `RtlUnwindEx` captures the context at the unwind call site into the caller-supplied
+    // scratch record before entering the second pass. C language handlers pass
+    // `DISPATCHER_CONTEXT.ContextRecord` for this exact purpose.
+    unsafe {
+        capture_context(context_record);
+        core::ptr::write_unaligned(context_record.add(CTX_FLAGS) as *mut u32, CONTEXT_FULL);
+    }
+    unsafe {
+        rtl_unwind_ex_from_context(
+            target_frame,
+            target_ip,
+            exception_record,
+            return_value,
+            context_record,
+            history_table,
+        )
+    };
+}
+
+unsafe fn rtl_unwind_ex_from_context(
     target_frame: u64,
     target_ip: u64,
     exception_record: *mut c_void,

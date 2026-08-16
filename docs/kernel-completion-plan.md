@@ -6567,3 +6567,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   adjustment: B3's active frontier is now the generic security/SID and TCPIP configuration surface
   that makes `tcpip.sys` return `STATUS_INVALID_SID`; after that, continue into real packet
   data-plane behavior and repeated-NIC scaling through the same registry/devnode/resource path.
+
+  B3 TCPIP service SID and SEH unwind fix (2026-08-16): the hosted NT security export block now
+  publishes the NT5 `SeLocalServiceSid` and `SeNetworkServiceSid` pointers at their real
+  `SE_EXPORTS` offsets, so `tcpip.sys` can create its NetworkService-owned system threads through
+  the generic hosted-driver thread path instead of failing with `STATUS_INVALID_SID`. The later
+  EventLog/SCM frontier exposed a real ntdll SEH mismatch rather than a kernel object fallback:
+  first-pass exception dispatch now provides the mutable virtual-unwind context through
+  `DISPATCHER_CONTEXT.ContextRecord`, and `RtlUnwindEx` captures the live call-site context into
+  that scratch record before the second pass, matching ReactOS/NT x64 unwind semantics. `RtlUnwind`
+  now delegates to the same capture point instead of pre-capturing a stale wrapper frame. Serialized
+  headless proof `.tmp/run-headless-b3-seh-unwind-eventlog-20260816.log` reaches the harness
+  sentinel with `296/296` checks passing: `tcpip.sys` no longer fails on SID validation, EventLog
+  and SCM advance without the earlier service-start crash, `NtLoadKey` and profile hive paths pass,
+  `userinit.exe` and `explorer.exe` are genuinely spawned, explorer redirects 665 real api0
+  callbacks, shell COM classes are opened, GDI user batches flush, and
+  `exec_explorer_shell_chrome_painted` finishes with the full framebuffer non-background. Validation:
+  `cargo fmt --all`, `cargo test -p nt-ntdll exception`, `cargo test -p nt-security se_exports`,
+  `scripts/build_ntdll_dll.sh`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and the
+  serialized headless boot proof. Review adjustment: B3's registry-ordered NDIS/TCPIP/AFD/NETIO
+  activation and desktop paint gates are green again; the remaining B3 frontier is real packet
+  data-plane behavior and repeated NIC/device scaling through the same dynamic driver, devnode,
+  resource, and service metadata paths.

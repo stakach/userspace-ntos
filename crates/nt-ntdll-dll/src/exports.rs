@@ -23162,8 +23162,8 @@ pub unsafe extern "system" fn rtl_dispatch_exception(
 }
 
 /// `RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD, PVOID ReturnValue)` — the legacy
-/// 4-arg SEH unwind (a thin wrapper over `RtlUnwindEx` with a freshly captured CONTEXT). BATCH 42:
-/// real — captures the CONTEXT, then delegates to [`crate::seh::rtl_unwind_ex`].
+/// 4-arg SEH unwind (a thin wrapper over `RtlUnwindEx` with a stack CONTEXT). BATCH 42:
+/// real — delegates to [`crate::seh::rtl_unwind_ex`], which captures the live call-site CONTEXT.
 ///
 /// # Safety
 /// Called during exception dispatch; `target_frame`/`target_ip` from the search pass.
@@ -23175,10 +23175,9 @@ pub unsafe extern "system" fn rtl_unwind(
     exception_record: *mut c_void,
     return_value: *mut c_void,
 ) {
-    // SAFETY: capture the current context, then unwind to (target_ip, target_frame).
+    // SAFETY: unwind to (target_ip, target_frame). `rtl_unwind_ex` captures the live context.
     unsafe {
         let mut ctx = crate::seh::AlignedContext::zeroed();
-        crate::seh::capture_context(ctx.as_mut_ptr());
         crate::seh::rtl_unwind_ex(
             target_frame as u64,
             target_ip as u64,
