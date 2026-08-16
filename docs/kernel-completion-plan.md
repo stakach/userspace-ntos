@@ -6388,3 +6388,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: next B3 work is timed hosted
   driver waits, `KeWaitForMultipleObjects` per-worker object-list staging, and then a serialized
   desktop boot to prove the generic pump transport gates still hold in the full OS path.
+
+  B3 hosted driver multi-wait broker wiring (2026-08-16): hosted driver
+  `KeWaitForMultipleObjects` now uses the same component-service wait broker as
+  `KeWaitForSingleObject` instead of the old in-component dispatcher poll. Hosted worker TCBs get a
+  per-thread scratch page plus an executive-visible stack alias in their dynamic worker lane; the
+  import trampoline copies the caller's object-pointer array while still in the driver VSpace, and
+  the executive validates the array and every dispatcher object through the live driver instance and
+  worker runtime metadata. `WaitAny` returns `STATUS_WAIT_0 + index`, `WaitAll` consumes all members
+  atomically after a successful readiness scan, duplicate `WaitAll` objects fail with
+  `STATUS_INVALID_PARAMETER_MIX` like ReactOS, zero-timeout polls still return `STATUS_TIMEOUT`, and
+  infinite waits from known worker TCBs park by rotating the hosted-driver reply cap. `KeSetEvent`,
+  `KePulseEvent`, and `KeReleaseSemaphore` now use the same instance-wide worker-stack translation
+  so stack-local dispatcher objects can wake a parked waiter. Finite timed hosted-driver waits remain
+  fail-closed `STATUS_NOT_IMPLEMENTED` until the driver-owned timer queue is implemented.
+  Validation so far: `cargo fmt --all`, `cargo test -p nt-kernel-exec`, and executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: rerun `git diff --check`, commit this slice, then either
+  add real timed hosted-driver waits or run the serialized desktop proof to check the generic pump
+  transport under the full ReactOS boot path.
