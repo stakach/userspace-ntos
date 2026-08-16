@@ -8414,23 +8414,66 @@ const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
     present: bool,
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     exec_va: u64,
     run_va: u64,
     image_len: u32,
 }
 
-impl LoadedDependencyImage {
-    const fn empty() -> LoadedDependencyImage {
-        LoadedDependencyImage {
-            present: false,
-            exec_va: 0,
-            run_va: 0,
-            image_len: 0,
-        }
+static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
+
+unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn clear_hosted_dependency_images() {
+    if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
+        images.clear();
     }
 }
 
-static mut NDIS_DEP_IMAGE: LoadedDependencyImage = LoadedDependencyImage::empty();
+fn hosted_dependency_provider_matches(dep: LoadedDependencyImage, provider: &str) -> bool {
+    dep.present && hosted_ascii_eq_ignore_case_str(&dep.provider, provider)
+}
+
+unsafe fn register_loaded_dependency_image(
+    provider: &str,
+    exec_va: u64,
+    run_va: u64,
+    image_len: u32,
+) -> Option<()> {
+    let mut provider_name = HostedAscii::<HOSTED_DEP_PROVIDER_MAX>::empty();
+    if !provider_name.set_str(provider) {
+        return None;
+    }
+    let images = hosted_dependency_images_mut();
+    if let Some(slot) = images
+        .iter_mut()
+        .find(|slot| hosted_dependency_provider_matches(**slot, provider))
+    {
+        *slot = LoadedDependencyImage {
+            present: true,
+            provider: provider_name,
+            exec_va,
+            run_va,
+            image_len,
+        };
+        return Some(());
+    }
+    images.try_reserve_exact(1).ok()?;
+    images.push(LoadedDependencyImage {
+        present: true,
+        provider: provider_name,
+        exec_va,
+        run_va,
+        image_len,
+    });
+    Some(())
+}
 
 /// Bind the FSD ntoskrnl trampolines into [`FSD_EXPORTS`]. Idempotent (`bind` updates in place).
 fn register_fsd_trampolines() {
@@ -9010,16 +9053,20 @@ fn hosted_kernel_provider_dll(dll: &str) -> bool {
         || ascii_eq_ignore_case(dll, "hal")
 }
 
-fn hosted_ndis_provider_dll(dll: &str) -> bool {
-    ascii_eq_ignore_case(dll, "ndis.sys") || ascii_eq_ignore_case(dll, "ndis")
-}
-
 fn hosted_videoprt_provider_dll(dll: &str) -> bool {
     ascii_eq_ignore_case(dll, "videoprt.sys") || ascii_eq_ignore_case(dll, "videoprt")
 }
 
 fn hosted_dependency_provider_dll(dll: &str) -> bool {
-    hosted_ndis_provider_dll(dll)
+    let bytes = dll.as_bytes();
+    if hosted_kernel_provider_dll(dll) || hosted_videoprt_provider_dll(dll) || bytes.len() <= 4 {
+        return false;
+    }
+    let ext = &bytes[bytes.len() - 4..];
+    ext[0] == b'.'
+        && ascii_upcase_u8(ext[1]) == b'S'
+        && ascii_upcase_u8(ext[2]) == b'Y'
+        && ascii_upcase_u8(ext[3]) == b'S'
 }
 
 fn lookup_videoprt_export(name: &str) -> Option<u64> {
@@ -9090,9 +9137,9 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
         }
         return None;
     }
-    if hosted_ndis_provider_dll(dll) {
+    if hosted_dependency_provider_dll(dll) {
         unsafe {
-            if let Some(addr) = lookup_ndis_dependency_export(name) {
+            if let Some(addr) = lookup_loaded_dependency_export(dll, name) {
                 return Some(addr);
             }
             log_unresolved_driver_import(dll, name);
@@ -10470,11 +10517,11 @@ unsafe fn raw_pe_size_of_image(src_va: u64, src_size: u32) -> Option<u32> {
     raw_u32(layout.src_va, layout.src_size, layout.opt.checked_add(56)?)
 }
 
-unsafe fn raw_pe_find_hosted_dependency<'a>(
+unsafe fn raw_pe_collect_hosted_dependencies(
     src_va: u64,
     src_size: u32,
-    out: &'a mut [u8],
-) -> Option<&'a str> {
+    out: &mut Vec<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>,
+) -> Option<()> {
     let layout = raw_pe_layout(src_va, src_size)?;
     let imp_rva = raw_u32(
         layout.src_va,
@@ -10482,7 +10529,7 @@ unsafe fn raw_pe_find_hosted_dependency<'a>(
         layout.opt.checked_add(112 + 8)?,
     )? as u64;
     if imp_rva == 0 {
-        return None;
+        return Some(());
     }
     let mut desc_rva = imp_rva;
     let mut count = 0u32;
@@ -10492,21 +10539,23 @@ unsafe fn raw_pe_find_hosted_dependency<'a>(
         let name_rva = raw_u32(layout.src_va, layout.src_size, desc.checked_add(12)?)? as u64;
         let first_thunk = raw_u32(layout.src_va, layout.src_size, desc.checked_add(16)?)?;
         if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
-            return None;
+            return Some(());
         }
         let name_off = raw_pe_rva_to_file(&layout, name_rva, 1)?;
         let mut dll_buf = [0u8; HOSTED_DEP_PROVIDER_MAX];
         let dll = read_raw_ascii(layout.src_va, layout.src_size, name_off, &mut dll_buf)?;
-        if !hosted_kernel_provider_dll(dll) && hosted_dependency_provider_dll(dll) {
-            if dll.len() > out.len() {
+        if hosted_dependency_provider_dll(dll) {
+            let mut provider = HostedAscii::<HOSTED_DEP_PROVIDER_MAX>::empty();
+            if !provider.set_str(dll) {
                 return None;
             }
-            let mut i = 0usize;
-            while i < dll.len() {
-                out[i] = dll.as_bytes()[i];
-                i += 1;
+            if !out
+                .iter()
+                .any(|existing| hosted_ascii_eq_ignore_case(existing, &provider))
+            {
+                out.try_reserve_exact(1).ok()?;
+                out.push(provider);
             }
-            return Some(core::str::from_utf8_unchecked(&out[..dll.len()]));
         }
         desc_rva = desc_rva.checked_add(20)?;
         count += 1;
@@ -10630,11 +10679,12 @@ unsafe fn lookup_loaded_pe_export(
     None
 }
 
-unsafe fn lookup_ndis_dependency_export(name: &str) -> Option<u64> {
-    let dep = NDIS_DEP_IMAGE;
-    if !dep.present {
-        return None;
-    }
+unsafe fn lookup_loaded_dependency_export(provider: &str, name: &str) -> Option<u64> {
+    let images = (*core::ptr::addr_of!(HOSTED_DEP_IMAGES)).as_ref()?;
+    let dep = images
+        .iter()
+        .copied()
+        .find(|dep| hosted_dependency_provider_matches(*dep, provider))?;
     lookup_loaded_pe_export(dep.exec_va, dep.run_va, dep.image_len, name)
 }
 
@@ -10892,68 +10942,71 @@ unsafe fn load_hosted_dependency_images(
     img_frames: u64,
     rights: &mut [u64],
 ) -> Option<u64> {
-    NDIS_DEP_IMAGE = LoadedDependencyImage::empty();
+    clear_hosted_dependency_images();
 
-    let mut provider_buf = [0u8; HOSTED_DEP_PROVIDER_MAX];
-    let Some(provider) =
-        raw_pe_find_hosted_dependency(primary_src_va, primary_src_size, &mut provider_buf)
-    else {
+    let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
+    raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
+    if providers.is_empty() {
         return Some(0);
-    };
+    }
     let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
-    let dep_offset = align_up_4k(primary_image_len)?;
-    let dep_frame_offset = dep_offset / 0x1000;
-    if dep_frame_offset >= img_frames {
-        print_str(b"[driver-launch] dependency image window exhausted before ");
+    let mut dep_offset = align_up_4k(primary_image_len)?;
+    let mut first_support_entry = 0u64;
+    let mut idx = 0usize;
+    while idx < providers.len() {
+        let provider_name = providers[idx];
+        let provider = provider_name.as_str();
+        let dep_frame_offset = dep_offset / 0x1000;
+        if dep_frame_offset >= img_frames {
+            print_str(b"[driver-launch] dependency image window exhausted before ");
+            print_str(provider.as_bytes());
+            print_str(b"\n");
+            return None;
+        }
+        let dep_frames = img_frames - dep_frame_offset;
+        let dep_rights = &mut rights[dep_frame_offset as usize..];
+        let mut dep_path = [0u8; HOSTED_DEP_PATH_MAX];
+        let dep_path_len = hosted_dependency_path(provider, &mut dep_path)?;
+        print_str(b"[driver-launch] dependency ");
         print_str(provider.as_bytes());
+        print_str(b" -> ");
+        print_str(&dep_path[..dep_path_len]);
+        print_str(b" offset=0x");
+        print_hex(dep_offset as u32);
         print_str(b"\n");
-        return None;
-    }
-    let dep_frames = img_frames - dep_frame_offset;
-    let dep_rights = &mut rights[dep_frame_offset as usize..];
-    let mut dep_path = [0u8; HOSTED_DEP_PATH_MAX];
-    let dep_path_len = hosted_dependency_path(provider, &mut dep_path)?;
-    print_str(b"[driver-launch] dependency ");
-    print_str(provider.as_bytes());
-    print_str(b" -> ");
-    print_str(&dep_path[..dep_path_len]);
-    print_str(b" offset=0x");
-    print_hex(dep_offset as u32);
-    print_str(b"\n");
 
-    let (dep_src_va, dep_src_size) = load_file_to_pool(fs, &dep_path[..dep_path_len])?;
-    let dep_exec_va = code_va + dep_offset;
-    let dep_run_va = run_va + dep_offset;
-    let (dep_entry_rva, dep_image_len) = load_pe_into(
-        dep_src_va,
-        dep_exec_va,
-        dep_run_va,
-        dep_frames,
-        dep_rights,
-        fsd_export_addr,
-    )?;
-    if dep_image_len as u64 > dep_frames * 0x1000 {
-        return None;
+        let (dep_src_va, dep_src_size) = load_file_to_pool(fs, &dep_path[..dep_path_len])?;
+        let dep_exec_va = code_va + dep_offset;
+        let dep_run_va = run_va + dep_offset;
+        let (dep_entry_rva, dep_image_len) = load_pe_into(
+            dep_src_va,
+            dep_exec_va,
+            dep_run_va,
+            dep_frames,
+            dep_rights,
+            fsd_export_addr,
+        )?;
+        if dep_image_len as u64 > dep_frames * 0x1000 {
+            return None;
+        }
+        register_loaded_dependency_image(provider, dep_exec_va, dep_run_va, dep_image_len)?;
+        let _ = register_system_module(&dep_path[..dep_path_len], dep_exec_va, dep_image_len);
+        print_str(b"[driver-launch] dependency loaded ");
+        print_str(provider.as_bytes());
+        print_str(b" size=");
+        print_u64(dep_src_size as u64);
+        print_str(b" image=0x");
+        print_hex(dep_image_len);
+        print_str(b" entry=0x");
+        print_hex(dep_entry_rva);
+        print_str(b"\n");
+        if first_support_entry == 0 {
+            first_support_entry = dep_offset + dep_entry_rva as u64;
+        }
+        dep_offset = align_up_4k(dep_offset.checked_add(dep_image_len as u64)?)?;
+        idx += 1;
     }
-    if hosted_ndis_provider_dll(provider) {
-        NDIS_DEP_IMAGE = LoadedDependencyImage {
-            present: true,
-            exec_va: dep_exec_va,
-            run_va: dep_run_va,
-            image_len: dep_image_len,
-        };
-    }
-    let _ = register_system_module(&dep_path[..dep_path_len], dep_exec_va, dep_image_len);
-    print_str(b"[driver-launch] dependency loaded ");
-    print_str(provider.as_bytes());
-    print_str(b" size=");
-    print_u64(dep_src_size as u64);
-    print_str(b" image=0x");
-    print_hex(dep_image_len);
-    print_str(b" entry=0x");
-    print_hex(dep_entry_rva);
-    print_str(b"\n");
-    Some(dep_offset + dep_entry_rva as u64)
+    Some(first_support_entry)
 }
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn

@@ -31,7 +31,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Current serialized frontier (2026-08-15): the real desktop/icon path is past shell launch and paint
+Current serialized frontier (2026-08-16): the real desktop/icon path is past shell launch and paint
 scaffolding again on the Rust ntdll, with Dbgk debugger-control proofing now covering live context
 edits, trap-flag single-step, and seL4-backed hardware breakpoints. The executive no longer contains
 live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that still emits those tags
@@ -39,18 +39,20 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
-`.tmp/run-desktop-video-diagnostic-reduction.log` reaches the harness sentinel with `296/296`
+`.tmp/run-desktop-provider-dep-table.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the boot-framebuffer display route was removed,
-the old fixed boot proof scratch aliases were replaced, and hosted-video success-path traces were
-trimmed. The hosted Bochs/videoprt route remains the only display route: it publishes
+the old fixed boot proof scratch aliases were replaced, hosted-video success-path traces were
+trimmed, and hosted `.sys` dependency images moved from a fixed NDIS slot to a provider-keyed loaded
+image table. The hosted Bochs/videoprt route remains the only display route: it publishes
 `\\Device\\Video0` through the hosted I/O Manager path, `PDEVOBJ_lChangeDisplaySettings status=0`,
 and the removed `VideoPortInitialize captured`, `hosted video Initialize device_id`,
 `hosted video StartDevice`, `hosted video FindAdapter device_id`, and successful
 `videoprt-map-memory` trace strings are absent. The storage proof maps checked dynamic aliases
 before copying the real disk hive page, validates source/copy/faulted qwords against the `UNTHIVE1`
-image magic, and passes `exec_disk_section_demand_paged`. The same run reaches real
-`WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM classes, api0 callbacks, GDI user
-batch flushes, and `exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports
+image magic, and passes `exec_disk_section_demand_paged`. The same run loads `ndis.sys` as a real
+dependency image for the registry-selected `e1000.sys`, reaches real `WlxActivateUserShell`,
+`userinit.exe`, `explorer.exe`, shell COM classes, api0 callbacks, GDI user batch flushes, and
+`exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports
 `786432/786432` non-background pixels with at least 32 distinct non-background colors.
 
 Latest accepted desktop proof (2026-08-15):
@@ -3781,6 +3783,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `exec_gdi_user_batch_flushed`, and `exec_explorer_shell_chrome_painted` green. Review adjustment:
   display-route diagnostics are now small enough for the current desktop frontier; B3 should move
   back to real non-display driver coverage rather than adding more display-specific instrumentation.
+
+- B3 hosted dependency image table cleanup (2026-08-16). Hosted driver dependency loading no longer
+  has a fixed `NDIS_DEP_IMAGE` slot or `hosted_ndis_provider_dll` branch. The loader now collects
+  `.sys` providers from the primary driver's PE import table, loads each dependency into the same
+  component image window, registers loaded images by provider name, and resolves dependency imports
+  through that provider-keyed table. `videoprt.sys` remains a port-provider DLL because its exports
+  are backed by the local videoprt surface, while ordinary unsupported provider DLLs still fail
+  closed with unresolved-import diagnostics. The component ABI still initializes the first loaded
+  support driver's `DriverEntry`; broader ordered/recursive multi-support initialization remains a
+  future B3 extension if a registry-selected driver requires it. Validation: `cargo fmt --all`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-provider-dep-table.log`, which reaches `296/296`; the proof shows
+  `dependency ndis.sys -> reactos\system32\drivers\ndis.sys`, `dependency loaded ndis.sys`,
+  `exec_generic_pci_support_driver_entry`, `exec_gdi_user_batch_flushed`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's next non-display target is the
+  remaining support-driver lifetime/ordering boundary and eventual real NDIS data-plane behavior,
+  not another hardcoded dependency identity.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
