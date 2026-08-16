@@ -1183,8 +1183,11 @@ before unrelated executive traffic monopolises the receive loop.
   the physical scanout memory granted to the selected miniport and mapped into hosted win32k.
   Loaded GDI/display driver image records also grow in component-visible win32k pool storage, so
   win32k's hosted trampolines never depend on executive-only heap pointers. The current automated
-  shell-pixel gate proves this route through Explorer shell chrome. Remaining B3 work is broader
-  non-display driver coverage: real miniport data-plane behavior and multi-device scaling under the
+  shell-pixel gate proves this route through Explorer shell chrome. The hosted-driver import
+  resolver now has the real NT/HAL data and routine exports needed to load the ReactOS
+  `ndis.sys`/`tcpip.sys`/`afd.sys` images fail-closed. Remaining B3 work is broader non-display
+  driver coverage: real hosted kernel-thread runtime for `PsCreateSystemThread`, service metadata
+  activation for TCPIP/AFD, miniport packet data-plane behavior, and multi-device scaling under the
   same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
@@ -3870,6 +3873,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `int_delivered=1 int_count=1 dpc=1 dpc_count=1 dpc_drops=0`, and
   `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's next frontier is the real
   packet/data-plane side of NDIS/e1000 rather than merely proving interrupt delivery.
+
+- B3 hosted network dependency import slice (2026-08-16). The hosted driver NT/HAL import surface now
+  covers the ReactOS `tcpip.sys` and `afd.sys` requirements without restoring a generic
+  success-fallback resolver. Pointer-valued kernel exports (`MmSystemRangeStart`, `IoFileObjectType`,
+  `ExEventObjectType`, and `SeExports`) are backed by per-instance DATA cells, raw hosted
+  `KSEMAPHORE` state lives in `nt-kernel-exec` with focused tests, and the FSD trampoline registry
+  now exposes the dispatcher, lookaside, bitmap, security-descriptor/ACL/SID, MDL, object, timer,
+  debug-filter, and CRT helpers those networking images import. Import resolution still fails closed
+  for unknown names and dependency providers still resolve through mapped real `.sys` images such as
+  `ndis.sys`; `PsCreateSystemThread` is intentionally wired to a truthful `STATUS_NOT_IMPLEMENTED`
+  result instead of pretending TCPIP worker threads exist. Validation: `cargo fmt --all`,
+  `cargo test -p nt-kernel-exec`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and import-table review with
+  `objdump -p` against `tcpip.sys`, `afd.sys`, and `ndis.sys`. Review adjustment: the next B3 slice
+  should add a real hosted kernel-thread runtime, then turn on TCPIP/AFD service metadata and follow
+  the resulting NDIS packet path rather than broadening import shims speculatively.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The

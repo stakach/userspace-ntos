@@ -41,7 +41,10 @@ use nt_io_manager::{
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
-use nt_kernel_exec::{kevent, EventKind};
+use nt_kernel_exec::{
+    init_ksemaphore, kevent, ksemaphore_read_state, ksemaphore_release, ksemaphore_try_wait,
+    rtl_bitmap, EventKind, SEMAPHORE_OBJECT,
+};
 use nt_mdl::MdlRegistry;
 use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
@@ -110,6 +113,31 @@ pub const FSD_DATA_FRAMES: u64 = 128;
 /// The component's GS base — a zeroed KPCR placeholder (an FSD, a kernel driver, may read `gs:[..]`).
 pub const FSD_KPCR_VA: u64 = FSD_DATA_VADDR + 0x1000;
 const _: () = assert!(FSD_DATA_VADDR + FSD_DATA_FRAMES * 0x1000 <= FSD_SHARED_VADDR);
+
+const FSD_DATA_MM_SYSTEM_RANGE_START_OFF: u64 = 0x200;
+const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
+const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
+const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
+const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
+const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
+const FSD_DATA_SE_EXPORTS_STRUCT_OFF: u64 = 0x500;
+const FSD_DATA_SE_SID_POOL_OFF: u64 =
+    FSD_DATA_SE_EXPORTS_STRUCT_OFF + nt_security::se_exports::se_exports_offset::STRUCT_SIZE as u64;
+const FSD_DATA_MM_SYSTEM_RANGE_START_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
+const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
+const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
+const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
+const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF;
+const FSD_DATA_SE_EXPORTS_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_CELL_OFF;
+const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
+const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
+const _: () =
+    assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
 /// object out, then the IRP request/reply fields. The arena extends up to the ARG window so hosted
@@ -2766,14 +2794,24 @@ extern "win64" fn s_c_specific_handler(
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
+const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
+const STATUS_SEMAPHORE_LIMIT_EXCEEDED: i32 = 0xC000_0047u32 as i32;
+const STATUS_UNKNOWN_REVISION: i32 = 0xC000_0058u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
+const STATUS_INVALID_ACL: i32 = 0xC000_0077u32 as i32;
+const STATUS_INVALID_SID: i32 = 0xC000_0078u32 as i32;
+const STATUS_INVALID_SECURITY_DESCR: i32 = 0xC000_0079u32 as i32;
+const STATUS_ALLOTTED_SPACE_EXCEEDED: i32 = 0xC000_0099u32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const STATUS_BAD_DESCRIPTOR_FORMAT: i32 = 0xC000_00E7u32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+const STATUS_TIMEOUT_I32: i32 = 0x0000_0102;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 const VP_NO_ERROR: u32 = 0;
@@ -2791,8 +2829,286 @@ const UNICODE_STRING_BUFFER_OFFSET: u64 = 8;
 const ANSI_STRING_LENGTH_OFFSET: u64 = 0;
 const ANSI_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
 const ANSI_STRING_BUFFER_OFFSET: u64 = 8;
+const SECURITY_DESCRIPTOR_REVISION_U64: u64 = 1;
+const SECURITY_DESCRIPTOR_ABSOLUTE_BYTES: usize = 0x28;
+const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 0x14;
+const SD_CONTROL_OFF: u64 = 0x02;
+const SD_OWNER_OFF: u64 = 0x08;
+const SD_GROUP_OFF: u64 = 0x10;
+const SD_SACL_OFF: u64 = 0x18;
+const SD_DACL_OFF: u64 = 0x20;
+const SD_REL_OWNER_OFF: u64 = 0x04;
+const SD_REL_GROUP_OFF: u64 = 0x08;
+const SD_REL_SACL_OFF: u64 = 0x0C;
+const SD_REL_DACL_OFF: u64 = 0x10;
+const SE_OWNER_DEFAULTED: u16 = 0x0001;
+const SE_GROUP_DEFAULTED: u16 = 0x0002;
+const SE_DACL_PRESENT: u16 = 0x0004;
+const SE_DACL_DEFAULTED: u16 = 0x0008;
+const SE_SELF_RELATIVE: u16 = 0x8000;
+const ACL_HEADER_BYTES: usize = 8;
+const ACL_REVISION_MIN: u64 = 2;
+const ACL_REVISION_MAX: u64 = 4;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const KNOWN_ACE_HEADER_BYTES: usize = 8;
+const SID_HEADER_BYTES: usize = 8;
+const SID_MAX_SUB_AUTHORITIES: usize = 15;
+const VALID_INHERIT_FLAGS: u64 = 0x1F;
 
 static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
+
+unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
+    let mm_system_range_start = exec_data_va + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
+    write_volatile(mm_system_range_start as *mut u64, 0xFFFF_0800_0000_0000);
+
+    let io_file_object_type_cell = exec_data_va + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
+    let io_file_object_type_body = exec_data_va + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
+    write_volatile(
+        io_file_object_type_cell as *mut u64,
+        FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA,
+    );
+    write_volatile(io_file_object_type_body as *mut u64, 0x4649_4c45_5459_5045); // "FILETYPE"
+    let ex_event_object_type_cell = exec_data_va + FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF;
+    let ex_event_object_type_body = exec_data_va + FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF;
+    write_volatile(
+        ex_event_object_type_cell as *mut u64,
+        FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA,
+    );
+    write_volatile(ex_event_object_type_body as *mut u64, 0x4556_454e_5459_5045); // "EVENTYPE"
+
+    let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
+    let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
+    let se_sid_pool = exec_data_va + FSD_DATA_SE_SID_POOL_OFF;
+    write_volatile(se_exports_cell as *mut u64, FSD_DATA_SE_EXPORTS_STRUCT_VA);
+    core::ptr::write_bytes(
+        se_exports_struct as *mut u8,
+        0,
+        nt_security::se_exports::se_exports_offset::STRUCT_SIZE,
+    );
+    core::ptr::write_bytes(
+        se_sid_pool as *mut u8,
+        0,
+        nt_security::se_exports::SID_POOL_SIZE,
+    );
+    nt_security::se_exports::build_se_exports(
+        se_exports_struct as *mut u8,
+        se_sid_pool as *mut u8,
+        FSD_DATA_SE_SID_POOL_VA,
+    );
+}
+
+fn fsd_data_export_addr(name: &str) -> Option<u64> {
+    Some(match name {
+        "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
+        "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
+        "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
+        "SeExports" => FSD_DATA_SE_EXPORTS_CELL_VA,
+        _ => return None,
+    })
+}
+
+extern "win64" fn s_strlen(src: u64) -> u64 {
+    if src == 0 {
+        return 0;
+    }
+    let mut n = 0u64;
+    unsafe {
+        while n < 32768 && read_volatile((src + n) as *const u8) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+extern "win64" fn s_strcpy(dst: u64, src: u64) -> u64 {
+    if dst == 0 {
+        return 0;
+    }
+    unsafe {
+        let mut i = 0u64;
+        loop {
+            let b = if src == 0 {
+                0
+            } else {
+                read_volatile((src + i) as *const u8)
+            };
+            write_volatile((dst + i) as *mut u8, b);
+            i += 1;
+            if b == 0 || i >= 32768 {
+                break;
+            }
+        }
+    }
+    dst
+}
+
+unsafe fn sprintf_put(dst: u64, written: &mut usize, byte: u8) {
+    if *written < 4095 {
+        write_volatile((dst + *written as u64) as *mut u8, byte);
+    }
+    *written = (*written).saturating_add(1);
+}
+
+unsafe fn sprintf_uint(
+    dst: u64,
+    written: &mut usize,
+    mut value: u64,
+    radix: u64,
+    width: usize,
+    pad: u8,
+    uppercase: bool,
+) {
+    let mut tmp = [0u8; 32];
+    let mut len = 0usize;
+    loop {
+        let digit = (value % radix) as u8;
+        tmp[len] = if digit < 10 {
+            b'0' + digit
+        } else if uppercase {
+            b'A' + digit - 10
+        } else {
+            b'a' + digit - 10
+        };
+        len += 1;
+        value /= radix;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut pad_count = width.saturating_sub(len);
+    while pad_count != 0 {
+        sprintf_put(dst, written, pad);
+        pad_count -= 1;
+    }
+    while len != 0 {
+        len -= 1;
+        sprintf_put(dst, written, tmp[len]);
+    }
+}
+
+unsafe fn sprintf_str(dst: u64, written: &mut usize, src: u64) {
+    if src == 0 {
+        for &b in b"(null)" {
+            sprintf_put(dst, written, b);
+        }
+        return;
+    }
+    let mut i = 0u64;
+    while i < 1024 {
+        let b = read_volatile((src + i) as *const u8);
+        if b == 0 {
+            break;
+        }
+        sprintf_put(dst, written, b);
+        i += 1;
+    }
+}
+
+/// `int sprintf(char *out, const char *fmt, ...)` — bounded NT-host CRT formatter for the integer
+/// and string forms used by ReactOS networking paths.
+extern "win64" fn s_sprintf(
+    dst: u64,
+    fmt: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+) -> i32 {
+    if dst == 0 || fmt == 0 {
+        return -1;
+    }
+    let args = [a0, a1, a2, a3, a4, a5, a6, a7];
+    let mut argi = 0usize;
+    let mut written = 0usize;
+    let mut pos = 0u64;
+    unsafe {
+        while pos < 4096 {
+            let b = read_volatile((fmt + pos) as *const u8);
+            if b == 0 {
+                break;
+            }
+            pos += 1;
+            if b != b'%' {
+                sprintf_put(dst, &mut written, b);
+                continue;
+            }
+            let mut spec = read_volatile((fmt + pos) as *const u8);
+            if spec == 0 {
+                break;
+            }
+            pos += 1;
+            if spec == b'%' {
+                sprintf_put(dst, &mut written, b'%');
+                continue;
+            }
+            let pad = if spec == b'0' {
+                spec = read_volatile((fmt + pos) as *const u8);
+                pos += 1;
+                b'0'
+            } else {
+                b' '
+            };
+            let mut width = 0usize;
+            while spec.is_ascii_digit() {
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add((spec - b'0') as usize);
+                spec = read_volatile((fmt + pos) as *const u8);
+                pos += 1;
+            }
+            while spec == b'l' || spec == b'I' || spec == b'z' || spec == b't' {
+                spec = read_volatile((fmt + pos) as *const u8);
+                pos += 1;
+            }
+            let arg = if argi < args.len() {
+                let v = args[argi];
+                argi += 1;
+                v
+            } else {
+                0
+            };
+            match spec {
+                b'd' | b'i' => {
+                    let signed = arg as i64;
+                    if signed < 0 {
+                        sprintf_put(dst, &mut written, b'-');
+                        sprintf_uint(
+                            dst,
+                            &mut written,
+                            signed.wrapping_neg() as u64,
+                            10,
+                            width,
+                            pad,
+                            false,
+                        );
+                    } else {
+                        sprintf_uint(dst, &mut written, signed as u64, 10, width, pad, false);
+                    }
+                }
+                b'u' => sprintf_uint(dst, &mut written, arg, 10, width, pad, false),
+                b'x' => sprintf_uint(dst, &mut written, arg, 16, width, pad, false),
+                b'X' => sprintf_uint(dst, &mut written, arg, 16, width, pad, true),
+                b'p' => {
+                    sprintf_put(dst, &mut written, b'0');
+                    sprintf_put(dst, &mut written, b'x');
+                    sprintf_uint(dst, &mut written, arg, 16, width.max(16), b'0', false);
+                }
+                b'c' => sprintf_put(dst, &mut written, arg as u8),
+                b's' => sprintf_str(dst, &mut written, arg),
+                _ => {
+                    sprintf_put(dst, &mut written, b'%');
+                    sprintf_put(dst, &mut written, spec);
+                }
+            }
+        }
+        write_volatile((dst + written.min(4095) as u64) as *mut u8, 0);
+    }
+    written.min(i32::MAX as usize) as i32
+}
 
 const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_FF00_4452_0000;
 const DRIVER_REGISTRY_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
@@ -3846,6 +4162,85 @@ extern "win64" fn s_rtl_unicode_string_to_ansi_string(dst: u64, src: u64, alloca
                 .saturating_sub(1)
         {
             write_unaligned((dst_buf + out_len as u64) as *mut u8, 0);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `VOID RtlFreeAnsiString(PANSI_STRING)`.
+extern "win64" fn s_rtl_free_ansi_string(s: u64) {
+    unsafe {
+        if let Some((_len, _max, buf)) = ansi_string_triplet(s) {
+            if buf != 0 {
+                pool_free(buf);
+            }
+            write_unaligned((s + ANSI_STRING_LENGTH_OFFSET) as *mut u16, 0);
+            write_unaligned((s + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, 0);
+            write_unaligned((s + ANSI_STRING_BUFFER_OFFSET) as *mut u64, 0);
+        }
+    }
+}
+
+/// `BOOLEAN RtlCreateUnicodeString(PUNICODE_STRING, PCWSTR)`.
+extern "win64" fn s_rtl_create_unicode_string(dst: u64, src: u64) -> u8 {
+    if dst == 0 || src == 0 {
+        return 0;
+    }
+    unsafe {
+        let chars = s_wcslen(src);
+        let Some(bytes) = chars.checked_mul(2) else {
+            return 0;
+        };
+        let Some(alloc_len) = bytes.checked_add(2) else {
+            return 0;
+        };
+        if alloc_len > u16::MAX as u64 {
+            return 0;
+        }
+        let buf = pool_alloc(alloc_len);
+        if buf == 0 {
+            return 0;
+        }
+        copy_bytes_unchecked(buf, src, bytes);
+        write_unaligned((buf + bytes) as *mut u16, 0);
+        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, bytes as u16);
+        write_unaligned(
+            (dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+            alloc_len as u16,
+        );
+        write_unaligned((dst + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, buf);
+    }
+    1
+}
+
+/// `NTSTATUS RtlUnicodeToMultiByteN(PCHAR, ULONG, PULONG, PCWCH, ULONG)`.
+extern "win64" fn s_rtl_unicode_to_multibyte_n(
+    dst: u64,
+    dst_max: u32,
+    bytes_out: u64,
+    src: u64,
+    src_bytes: u32,
+) -> i32 {
+    if src_bytes != 0 && src == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let chars = src_bytes / 2;
+    let copy_chars = chars.min(dst_max);
+    unsafe {
+        if bytes_out != 0 {
+            write_unaligned(bytes_out as *mut u32, copy_chars);
+        }
+        if copy_chars != 0 && dst == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let mut i = 0u32;
+        while i < copy_chars {
+            let w = read_unaligned((src + i as u64 * 2) as *const u16);
+            write_unaligned(
+                (dst + i as u64) as *mut u8,
+                if w <= 0x7f { w as u8 } else { b'?' },
+            );
+            i += 1;
         }
     }
     STATUS_SUCCESS
@@ -5152,6 +5547,99 @@ extern "win64" fn s_io_free_irp(irp: u64) {
     }
 }
 
+/// `PIRP IoBuildDeviceIoControlRequest(...)`.
+extern "win64" fn s_io_build_device_io_control_request(
+    io_control_code: u32,
+    device_object: u64,
+    input_buffer: u64,
+    input_buffer_length: u32,
+    output_buffer: u64,
+    output_buffer_length: u32,
+    internal_device_io_control: u8,
+    _event: u64,
+    io_status_block: u64,
+) -> u64 {
+    let irp = s_io_allocate_irp(1, 0);
+    if irp == 0 {
+        return 0;
+    }
+    unsafe {
+        let stack = irp_next_stack_location(irp);
+        if stack == 0 {
+            pool_free(irp);
+            return 0;
+        }
+        let major = if internal_device_io_control != 0 {
+            major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        } else {
+            major::IRP_MJ_DEVICE_CONTROL
+        };
+        let stack_bytes =
+            core::slice::from_raw_parts_mut(stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE);
+        if write_wdm_io_stack_location(
+            stack_bytes,
+            WdmIoStackLocationInit {
+                major,
+                minor: 0,
+                device_object,
+                file_object: 0,
+                parameters: WdmIoStackParameters::DeviceControl {
+                    output_buffer_length,
+                    input_buffer_length,
+                    io_control_code,
+                    type3_input_buffer: input_buffer,
+                },
+            },
+        )
+        .is_err()
+        {
+            pool_free(irp);
+            return 0;
+        }
+        let system_buffer = if input_buffer != 0 {
+            input_buffer
+        } else {
+            output_buffer
+        };
+        write_unaligned((irp + 0x18) as *mut u64, system_buffer);
+        write_unaligned((irp + 0x38) as *mut u64, 0);
+        if io_status_block != 0 {
+            write_unaligned(io_status_block as *mut i32, STATUS_SUCCESS);
+            write_unaligned((io_status_block + 8) as *mut u64, 0);
+        }
+    }
+    irp
+}
+
+/// `BOOLEAN IoCancelIrp(PIRP)`.
+extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
+    if irp == 0 {
+        return 0;
+    }
+    unsafe {
+        write_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
+        write_unaligned(
+            (irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8,
+            DISPATCH_LEVEL,
+        );
+        let routine = read_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
+        write_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64, 0);
+        if routine != 0 {
+            let stack = irp_current_stack_location(irp);
+            let device = if stack != 0 {
+                read_unaligned((stack + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *const u64)
+            } else {
+                0
+            };
+            let f: extern "win64" fn(u64, u64) = core::mem::transmute(routine as *const ());
+            let old = hosted_raise_irql(DISPATCH_LEVEL);
+            f(device, irp);
+            hosted_lower_irql(old);
+        }
+    }
+    1
+}
+
 /// `PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT)`.
 extern "win64" fn s_io_allocate_work_item(device_object: u64) -> u64 {
     unsafe {
@@ -5191,8 +5679,30 @@ extern "win64" fn s_io_free_work_item(work_item: u64) {
     }
 }
 
+/// `VOID IoAcquireCancelSpinLock(PKIRQL)`.
+extern "win64" fn s_io_acquire_cancel_spin_lock(old_irql_out: u64) {
+    unsafe {
+        let old = hosted_raise_irql(DISPATCH_LEVEL);
+        if old_irql_out != 0 {
+            write_unaligned(old_irql_out as *mut u8, old);
+        }
+    }
+}
+
 /// `VOID IoReleaseCancelSpinLock(KIRQL)`.
-extern "win64" fn s_io_release_cancel_spin_lock(_old_irql: u8) {}
+extern "win64" fn s_io_release_cancel_spin_lock(old_irql: u8) {
+    unsafe {
+        hosted_lower_irql(old_irql);
+    }
+}
+
+/// `PDEVICE_OBJECT IoGetRelatedDeviceObject(PFILE_OBJECT)`.
+extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
+    if file_object == 0 {
+        return 0;
+    }
+    unsafe { read_unaligned((file_object + 0x08) as *const u64) }
+}
 
 unsafe fn csq_acquire(csq: u64) -> u8 {
     let acquire = read_unaligned((csq + IO_CSQ_ACQUIRE_LOCK_OFFSET) as *const u64);
@@ -5568,6 +6078,42 @@ extern "win64" fn s_mm_build_mdl_for_nonpaged_pool(mdl: u64) {
     }
 }
 
+/// `VOID MmProbeAndLockPages(PMDL, KPROCESSOR_MODE, LOCK_OPERATION)`.
+extern "win64" fn s_mm_probe_and_lock_pages(mdl: u64, _access_mode: u8, _operation: u32) {
+    unsafe {
+        if mdl == 0 {
+            return;
+        }
+        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
+        let _ = hosted_mdl_registry_mut().build_for_nonpaged(id);
+        let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+            flags | nt_mdl::MDL_PAGES_LOCKED | nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
+        );
+        let start = read_unaligned((mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+        let offset = read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
+            start + offset as u64,
+        );
+    }
+}
+
+/// `VOID MmUnlockPages(PMDL)`.
+extern "win64" fn s_mm_unlock_pages(mdl: u64) {
+    unsafe {
+        if mdl == 0 {
+            return;
+        }
+        let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+            flags & !nt_mdl::MDL_PAGES_LOCKED,
+        );
+    }
+}
+
 /// `PVOID MmMapLockedPagesSpecifyCache(...)` — return the MDL's existing nonpaged mapping.
 extern "win64" fn s_mm_map_locked_pages_specify_cache(
     mdl: u64,
@@ -5594,6 +6140,20 @@ extern "win64" fn s_mm_map_locked_pages_specify_cache(
 /// `PVOID MmMapLockedPages(PMDL, KPROCESSOR_MODE)`.
 extern "win64" fn s_mm_map_locked_pages(mdl: u64, access_mode: u8) -> u64 {
     s_mm_map_locked_pages_specify_cache(mdl, access_mode, 0, 0, 0, 0)
+}
+
+/// `VOID MmUnmapLockedPages(PVOID, PMDL)`.
+extern "win64" fn s_mm_unmap_locked_pages(_base: u64, mdl: u64) {
+    unsafe {
+        if mdl == 0 {
+            return;
+        }
+        let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+        write_unaligned(
+            (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
+            flags & !nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
+        );
+    }
 }
 
 /// `PVOID MmAllocateContiguousMemorySpecifyCache(...)`.
@@ -6223,6 +6783,28 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     }
 }
 
+/// `PVOID IoAllocateErrorLogEntry(PVOID, UCHAR)`.
+extern "win64" fn s_io_allocate_error_log_entry(_io_object: u64, entry_size: u8) -> u64 {
+    unsafe {
+        let size = (entry_size as u64).max(0x30);
+        let entry = pool_alloc(size);
+        if entry != 0 {
+            core::ptr::write_bytes(entry as *mut u8, 0, size as usize);
+            write_unaligned(entry as *mut u8, entry_size);
+        }
+        entry
+    }
+}
+
+/// `VOID IoWriteErrorLogEntry(PVOID)`.
+extern "win64" fn s_io_write_error_log_entry(entry: u64) {
+    unsafe {
+        if entry != 0 {
+            pool_free(entry);
+        }
+    }
+}
+
 // --- REAL VCB internals: the Unicode prefix table (name -> FCB), generic table, ERESOURCE ---------
 //
 // An FSD's DriverEntry runs its OWN `NpInitializeVcb`/`NpCreateRootDcb`, and every create/open runs
@@ -6793,6 +7375,93 @@ extern "win64" fn s_ke_clear_event(event: u64) {
     }
 }
 
+/// `LONG KeResetEvent(PRKEVENT)`.
+extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
+    if event == 0 {
+        return 0;
+    }
+    unsafe { kevent::kevent_reset(event as *mut u8) as i32 }
+}
+
+/// `LONG KePulseEvent(PRKEVENT, KPRIORITY, BOOLEAN)`.
+extern "win64" fn s_ke_pulse_event(event: u64, _increment: i32, _wait: u8) -> i32 {
+    if event == 0 {
+        return 0;
+    }
+    unsafe { kevent::kevent_pulse(event as *mut u8) as i32 }
+}
+
+/// `LONG KeReadStateEvent(PRKEVENT)`.
+extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
+    if event == 0 {
+        return 0;
+    }
+    unsafe { kevent::kevent_read_state(event as *const u8) as i32 }
+}
+
+/// `void KeInitializeSemaphore(PRKSEMAPHORE, LONG, LONG)`.
+extern "win64" fn s_ke_initialize_semaphore(semaphore: u64, count: i32, limit: i32) {
+    if semaphore == 0 {
+        return;
+    }
+    let _ = unsafe { init_ksemaphore(semaphore as *mut u8, count, limit) };
+}
+
+/// `LONG KeReadStateSemaphore(PRKSEMAPHORE)`.
+extern "win64" fn s_ke_read_state_semaphore(semaphore: u64) -> i32 {
+    if semaphore == 0 {
+        return 0;
+    }
+    unsafe { ksemaphore_read_state(semaphore as *const u8) }
+}
+
+/// `LONG KeReleaseSemaphore(PRKSEMAPHORE, KPRIORITY, LONG, BOOLEAN)`.
+extern "win64" fn s_ke_release_semaphore(
+    semaphore: u64,
+    _increment: i32,
+    adjustment: i32,
+    _wait: u8,
+) -> i32 {
+    if semaphore == 0 {
+        return 0;
+    }
+    match unsafe { ksemaphore_release(semaphore as *mut u8, adjustment) } {
+        Ok(previous) => previous,
+        Err(_) => STATUS_SEMAPHORE_LIMIT_EXCEEDED,
+    }
+}
+
+unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
+    if object == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let object_type = read_unaligned(object as *const u8);
+    if object_type == kevent::EVENT_NOTIFICATION_OBJECT
+        || object_type == kevent::EVENT_SYNCHRONIZATION_OBJECT
+    {
+        return Ok(kevent::kevent_read_state(object as *const u8));
+    }
+    if object_type == SEMAPHORE_OBJECT {
+        return Ok(ksemaphore_read_state(object as *const u8) > 0);
+    }
+    Err(STATUS_INVALID_PARAMETER)
+}
+
+unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
+    let object_type = read_unaligned(object as *const u8);
+    if object_type == kevent::EVENT_NOTIFICATION_OBJECT {
+        return true;
+    }
+    if object_type == kevent::EVENT_SYNCHRONIZATION_OBJECT {
+        kevent::kevent_clear(object as *mut u8);
+        return true;
+    }
+    if object_type == SEMAPHORE_OBJECT {
+        return ksemaphore_try_wait(object as *mut u8);
+    }
+    false
+}
+
 /// `NTSTATUS KeWaitForSingleObject(...)` for hosted-driver local dispatcher objects. The current
 /// component transport cannot sleep inside an import trampoline, so unsatisfied waits report timeout
 /// instead of fabricating success.
@@ -6803,20 +7472,121 @@ extern "win64" fn s_ke_wait_for_single_object(
     _alertable: u8,
     _timeout: u64,
 ) -> i32 {
-    const STATUS_SUCCESS: i32 = 0;
-    const STATUS_TIMEOUT: i32 = 0x0000_0102;
-    if object == 0 {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    unsafe {
+        match hosted_dispatcher_ready(object) {
+            Ok(true) => {
+                hosted_dispatcher_consume(object);
+                STATUS_SUCCESS
+            }
+            Ok(false) => STATUS_TIMEOUT_I32,
+            Err(status) => status,
+        }
+    }
+}
+
+/// `NTSTATUS KeWaitForMultipleObjects(ULONG Count, PVOID Object[], WAIT_TYPE, ...)`.
+extern "win64" fn s_ke_wait_for_multiple_objects(
+    count: u32,
+    object_array: u64,
+    wait_type: u32,
+    _wait_reason: u32,
+    _wait_mode: u32,
+    _alertable: u8,
+    _timeout: u64,
+    _wait_block_array: u64,
+) -> i32 {
+    if count == 0 || count > 64 || object_array == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let wait_all = wait_type == 0;
+    unsafe {
+        let mut ready_index = None;
+        let mut index = 0u32;
+        while index < count {
+            let object = read_unaligned((object_array + index as u64 * 8) as *const u64);
+            match hosted_dispatcher_ready(object) {
+                Ok(true) => {
+                    if !wait_all {
+                        ready_index = Some(index);
+                        break;
+                    }
+                }
+                Ok(false) => {
+                    if wait_all {
+                        return STATUS_TIMEOUT_I32;
+                    }
+                }
+                Err(status) => return status,
+            }
+            index += 1;
+        }
+        if wait_all {
+            index = 0;
+            while index < count {
+                let object = read_unaligned((object_array + index as u64 * 8) as *const u64);
+                hosted_dispatcher_consume(object);
+                index += 1;
+            }
+            STATUS_SUCCESS
+        } else if let Some(index) = ready_index {
+            let object = read_unaligned((object_array + index as u64 * 8) as *const u64);
+            hosted_dispatcher_consume(object);
+            index as i32
+        } else {
+            STATUS_TIMEOUT_I32
+        }
+    }
+}
+
+/// `VOID KeInitializeTimerEx(PKTIMER, TIMER_TYPE)`.
+extern "win64" fn s_ke_initialize_timer_ex(timer: u64, timer_type: u32) {
+    if timer == 0 {
+        return;
     }
     unsafe {
-        if !kevent::kevent_read_state(object as *const u8) {
-            return STATUS_TIMEOUT;
-        }
-        if kevent::kevent_kind(object as *const u8) == EventKind::Synchronization {
-            kevent::kevent_clear(object as *mut u8);
+        core::ptr::write_bytes(timer as *mut u8, 0, 0x40);
+        let type_byte = if timer_type == 0 { 8u8 } else { 9u8 };
+        write_unaligned(timer as *mut u8, type_byte);
+        write_unaligned((timer + 2) as *mut u8, 0x0A);
+    }
+}
+
+/// `VOID KeInitializeTimer(PKTIMER)`.
+extern "win64" fn s_ke_initialize_timer(timer: u64) {
+    s_ke_initialize_timer_ex(timer, 0);
+}
+
+/// `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)`.
+extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, interval: u64) -> i32 {
+    unsafe {
+        if interval != 0 {
+            let ticks = read_unaligned(interval as *const i64);
+            if ticks < 0 {
+                let micros = ((ticks.wrapping_neg() as u64) / 10).min(1000) as u32;
+                s_ke_stall_execution_processor(micros);
+            }
         }
     }
     STATUS_SUCCESS
+}
+
+/// `VOID KeQuerySystemTime(PLARGE_INTEGER)`.
+extern "win64" fn s_ke_query_system_time(out: u64) {
+    if out != 0 {
+        unsafe {
+            write_unaligned(out as *mut u64, nt_system_time_100ns());
+        }
+    }
+}
+
+/// `LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER Frequency)`.
+extern "win64" fn s_ke_query_performance_counter(freq_out: u64) -> u64 {
+    if freq_out != 0 {
+        unsafe {
+            write_unaligned(freq_out as *mut u64, 10_000_000);
+        }
+    }
+    monotonic_time_100ns()
 }
 
 const KDPC_DEFERRED_ROUTINE_OFFSET: u64 = 0x18;
@@ -7023,10 +7793,230 @@ extern "win64" fn s_acquire_resource(_res: u64, _wait: u64) -> u64 {
 /// `void ExReleaseResourceLite(PERESOURCE)` / `ExReleaseResourceForThreadLite` — no-op.
 extern "win64" fn s_release_resource(_res: u64) {}
 
+/// `PVOID ExEnterCriticalRegionAndAcquireResourceExclusive(PERESOURCE)`.
+extern "win64" fn s_ex_enter_critical_region_and_acquire_resource_exclusive(res: u64) -> u64 {
+    let _ = s_acquire_resource(res, 1);
+    0
+}
+
+/// `VOID ExReleaseResourceAndLeaveCriticalRegion(PERESOURCE)`.
+extern "win64" fn s_ex_release_resource_and_leave_critical_region(res: u64) {
+    s_release_resource(res);
+}
+
+/// `BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE)`.
+extern "win64" fn s_ex_is_resource_acquired_exclusive_lite(_res: u64) -> u8 {
+    1
+}
+
+/// `USHORT ExQueryDepthSList(PSLIST_HEADER)`.
+extern "win64" fn s_ex_query_depth_slist(head: u64) -> u16 {
+    if head == 0 {
+        return 0;
+    }
+    unsafe { read_unaligned(head as *const u16) }
+}
+
+/// A GENERAL_LOOKASIDE default allocate callback.
+extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u64 {
+    unsafe { pool_alloc(size) }
+}
+
+/// A GENERAL_LOOKASIDE default free callback.
+extern "win64" fn s_lookaside_free(buf: u64) {
+    unsafe {
+        pool_free(buf);
+    }
+}
+
+unsafe fn init_driver_lookaside(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+    pool_type: u32,
+) {
+    if la == 0 {
+        return;
+    }
+    let alloc_fn = if allocate != 0 {
+        allocate
+    } else {
+        s_lookaside_alloc as *const () as usize as u64
+    };
+    let free_fn = if free != 0 {
+        free
+    } else {
+        s_lookaside_free as *const () as usize as u64
+    };
+    nt_kernel_exec::init_general_lookaside(
+        la as *mut u8,
+        la,
+        alloc_fn,
+        free_fn,
+        size as u32,
+        tag as u32,
+        depth as u16,
+        pool_type,
+    );
+}
+
+/// `VOID ExInitializePagedLookasideList(...)`.
+extern "win64" fn s_ex_initialize_paged_lookaside_list(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    _flags: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+) {
+    unsafe {
+        init_driver_lookaside(
+            la,
+            allocate,
+            free,
+            size,
+            tag,
+            depth,
+            nt_kernel_exec::POOL_TYPE_PAGED,
+        );
+    }
+}
+
+/// `VOID ExInitializeNPagedLookasideList(...)`.
+extern "win64" fn s_ex_initialize_npaged_lookaside_list(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    _flags: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+) {
+    unsafe {
+        init_driver_lookaside(
+            la,
+            allocate,
+            free,
+            size,
+            tag,
+            depth,
+            nt_kernel_exec::POOL_TYPE_NONPAGED,
+        );
+    }
+}
+
+/// `VOID ExDeleteNPagedLookasideList(PNPAGED_LOOKASIDE_LIST)`.
+extern "win64" fn s_ex_delete_npaged_lookaside_list(la: u64) {
+    if la != 0 {
+        unsafe {
+            core::ptr::write_bytes(
+                la as *mut u8,
+                0,
+                nt_kernel_exec::general_lookaside::SIZE_OF,
+            );
+        }
+    }
+}
+
 /// `void *memcpy(void *dst, const void *src, size_t n)` — REAL (RtlCopyMemory/RtlMoveMemory
 /// macros compile to this; an unbound no-op silently corrupts every FCB name + file data buffer).
 // memcpy / memset / RtlCompareMemory are pure, driver-agnostic byte primitives —
 // shared with the Subsystem (win32k) class in [`crate::ntoskrnl_shared`] (bound by name below).
+
+/// `VOID RtlInitializeBitMap(PRTL_BITMAP, PULONG, ULONG)`.
+extern "win64" fn s_rtl_initialize_bitmap(bm: u64, buffer: u64, size: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::initialize(bm as *mut u8, buffer, size) };
+    }
+}
+
+/// `VOID RtlClearAllBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_clear_all_bits(bm: u64) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_all(bm as *mut u8) };
+    }
+}
+
+/// `VOID RtlSetAllBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_set_all_bits(bm: u64) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_all(bm as *mut u8) };
+    }
+}
+
+/// `ULONG RtlFindClearBits(PRTL_BITMAP, ULONG, ULONG)`.
+extern "win64" fn s_rtl_find_clear_bits(bm: u64, count: u32, hint: u32) -> u32 {
+    if bm == 0 {
+        return rtl_bitmap::BITMAP_NONE;
+    }
+    unsafe { rtl_bitmap::find_clear_bits(bm as *const u8, count, hint) }
+}
+
+/// `ULONG RtlFindClearBitsAndSet(PRTL_BITMAP, ULONG, ULONG)`.
+extern "win64" fn s_rtl_find_clear_bits_and_set(bm: u64, count: u32, hint: u32) -> u32 {
+    if bm == 0 {
+        return rtl_bitmap::BITMAP_NONE;
+    }
+    unsafe { rtl_bitmap::find_clear_bits_and_set(bm as *mut u8, count, hint) }
+}
+
+/// `ULONG RtlNumberOfSetBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_number_of_set_bits(bm: u64) -> u32 {
+    if bm == 0 {
+        return 0;
+    }
+    unsafe { rtl_bitmap::number_of_set_bits(bm as *const u8) }
+}
+
+/// `BOOLEAN RtlTestBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_test_bit(bm: u64, i: u32) -> u8 {
+    if bm != 0 && unsafe { rtl_bitmap::test_bit(bm as *const u8, i) } {
+        1
+    } else {
+        0
+    }
+}
+
+/// `VOID RtlSetBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_set_bit(bm: u64, i: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_bit(bm as *mut u8, i) };
+    }
+}
+
+/// `VOID RtlClearBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_clear_bit(bm: u64, i: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_bit(bm as *mut u8, i) };
+    }
+}
+
+/// `VOID RtlSetBits(PRTL_BITMAP, ULONG, ULONG)`.
+extern "win64" fn s_rtl_set_bits(bm: u64, start: u32, count: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_bits(bm as *mut u8, start, count) };
+    }
+}
+
+/// `VOID RtlClearBits(PRTL_BITMAP, ULONG, ULONG)`.
+extern "win64" fn s_rtl_clear_bits(bm: u64, start: u32, count: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_bits(bm as *mut u8, start, count) };
+    }
+}
+
+/// `BOOLEAN RtlAreBitsClear(PRTL_BITMAP, ULONG, ULONG)`.
+extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
+    if bm != 0 && unsafe { rtl_bitmap::are_bits_clear(bm as *const u8, start, count) } {
+        1
+    } else {
+        0
+    }
+}
 
 /// `WCHAR RtlUpcaseUnicodeChar(WCHAR)` — ASCII upcase (the pipe namespace is ASCII).
 extern "win64" fn s_rtl_upcase_char(c: u64) -> u64 {
@@ -7036,6 +8026,369 @@ extern "win64" fn s_rtl_upcase_char(c: u64) -> u64 {
     } else {
         w as u64
     }
+}
+
+fn round_up4(value: usize) -> Option<usize> {
+    value.checked_add(3).map(|v| v & !3)
+}
+
+unsafe fn zero_component_bytes(dst: u64, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        write_volatile((dst + i as u64) as *mut u8, 0);
+        i += 1;
+    }
+}
+
+unsafe fn copy_component_bytes(dst: u64, src: u64, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        let byte = read_volatile((src + i as u64) as *const u8);
+        write_volatile((dst + i as u64) as *mut u8, byte);
+        i += 1;
+    }
+}
+
+unsafe fn sid_len_from_ptr(sid: u64) -> Option<usize> {
+    if sid == 0 {
+        return None;
+    }
+    let revision = read_volatile(sid as *const u8);
+    let subauths = read_volatile((sid + 1) as *const u8) as usize;
+    if revision != 1 || subauths > SID_MAX_SUB_AUTHORITIES {
+        return None;
+    }
+    SID_HEADER_BYTES.checked_add(subauths.checked_mul(4)?)
+}
+
+unsafe fn acl_size_from_ptr(acl: u64) -> Option<usize> {
+    if acl == 0 {
+        return None;
+    }
+    let revision = read_volatile(acl as *const u8) as u64;
+    let size = read_unaligned((acl + 2) as *const u16) as usize;
+    if !(ACL_REVISION_MIN..=ACL_REVISION_MAX).contains(&revision) || size < ACL_HEADER_BYTES {
+        return None;
+    }
+    Some(size)
+}
+
+unsafe fn acl_first_free_offset(acl: u64) -> Option<usize> {
+    let acl_size = acl_size_from_ptr(acl)?;
+    let ace_count = read_unaligned((acl + 4) as *const u16) as usize;
+    let mut offset = ACL_HEADER_BYTES;
+    let mut index = 0usize;
+    while index < ace_count {
+        if offset.checked_add(4)? > acl_size {
+            return None;
+        }
+        let ace_size = read_unaligned((acl + offset as u64 + 2) as *const u16) as usize;
+        if ace_size < 4 || offset.checked_add(ace_size)? > acl_size {
+            return None;
+        }
+        offset += ace_size;
+        index += 1;
+    }
+    Some(offset)
+}
+
+unsafe fn sd_component_len_sid(ptr: u64) -> Option<usize> {
+    if ptr == 0 {
+        return Some(0);
+    }
+    round_up4(sid_len_from_ptr(ptr)?)
+}
+
+unsafe fn sd_component_len_acl(ptr: u64) -> Option<usize> {
+    if ptr == 0 {
+        return Some(0);
+    }
+    round_up4(acl_size_from_ptr(ptr)?)
+}
+
+/// `NTSTATUS RtlCreateSecurityDescriptor(PSECURITY_DESCRIPTOR, ULONG)`.
+extern "win64" fn s_rtl_create_security_descriptor(sd: u64, revision: u64) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if revision != SECURITY_DESCRIPTOR_REVISION_U64 {
+        return STATUS_UNKNOWN_REVISION;
+    }
+    unsafe {
+        zero_component_bytes(sd, SECURITY_DESCRIPTOR_ABSOLUTE_BYTES);
+        write_volatile(sd as *mut u8, SECURITY_DESCRIPTOR_REVISION_U64 as u8);
+    }
+    STATUS_SUCCESS
+}
+
+/// `ULONG RtlLengthSid(PSID)`.
+extern "win64" fn s_rtl_length_sid(sid: u64) -> u64 {
+    unsafe { sid_len_from_ptr(sid).unwrap_or(0) as u64 }
+}
+
+/// `NTSTATUS RtlCreateAcl(PACL, ULONG, ULONG)`.
+extern "win64" fn s_rtl_create_acl(acl: u64, acl_size: u64, acl_revision: u64) -> i32 {
+    if acl == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if acl_size < ACL_HEADER_BYTES as u64 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if !(ACL_REVISION_MIN..=ACL_REVISION_MAX).contains(&acl_revision) || acl_size > u16::MAX as u64
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(rounded_size) = round_up4(acl_size as usize) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if rounded_size > u16::MAX as usize {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        write_volatile(acl as *mut u8, acl_revision as u8);
+        write_volatile((acl + 1) as *mut u8, 0);
+        write_unaligned((acl + 2) as *mut u16, rounded_size as u16);
+        write_unaligned((acl + 4) as *mut u16, 0);
+        write_unaligned((acl + 6) as *mut u16, 0);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlAddAccessAllowedAceEx(PACL, ULONG, ULONG, ACCESS_MASK, PSID)`.
+extern "win64" fn s_rtl_add_access_allowed_ace_ex(
+    acl: u64,
+    revision: u64,
+    flags: u64,
+    access_mask: u64,
+    sid: u64,
+) -> i32 {
+    if acl == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Some(sid_len) = (unsafe { sid_len_from_ptr(sid) }) else {
+        return STATUS_INVALID_SID;
+    };
+    unsafe {
+        let acl_revision = read_volatile(acl as *const u8) as u64;
+        if acl_revision > ACL_REVISION_MAX || revision > ACL_REVISION_MAX {
+            return STATUS_REVISION_MISMATCH;
+        }
+        if acl_revision < ACL_REVISION_MIN {
+            return STATUS_INVALID_ACL;
+        }
+        if flags & !VALID_INHERIT_FLAGS != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(acl_size) = acl_size_from_ptr(acl) else {
+            return STATUS_INVALID_ACL;
+        };
+        let Some(first_free) = acl_first_free_offset(acl) else {
+            return STATUS_INVALID_ACL;
+        };
+        let Some(ace_size) = sid_len.checked_add(KNOWN_ACE_HEADER_BYTES) else {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED;
+        };
+        if first_free.checked_add(ace_size).unwrap_or(usize::MAX) > acl_size {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED;
+        }
+        let ace = acl + first_free as u64;
+        write_volatile(ace as *mut u8, ACCESS_ALLOWED_ACE_TYPE);
+        write_volatile((ace + 1) as *mut u8, flags as u8);
+        write_unaligned((ace + 2) as *mut u16, ace_size as u16);
+        write_unaligned((ace + 4) as *mut u32, access_mask as u32);
+        copy_component_bytes(ace + KNOWN_ACE_HEADER_BYTES as u64, sid, sid_len);
+
+        let ace_count = read_unaligned((acl + 4) as *const u16);
+        write_unaligned((acl + 4) as *mut u16, ace_count.wrapping_add(1));
+        if revision > acl_revision {
+            write_volatile(acl as *mut u8, revision as u8);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlAddAccessAllowedAce(PACL, ULONG, ACCESS_MASK, PSID)`.
+extern "win64" fn s_rtl_add_access_allowed_ace(
+    acl: u64,
+    revision: u64,
+    access_mask: u64,
+    sid: u64,
+) -> i32 {
+    s_rtl_add_access_allowed_ace_ex(acl, revision, 0, access_mask, sid)
+}
+
+/// `NTSTATUS RtlSetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN)`.
+extern "win64" fn s_rtl_set_dacl_security_descriptor(
+    sd: u64,
+    dacl_present: u64,
+    dacl: u64,
+    dacl_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if dacl_present != 0 {
+            control |= SE_DACL_PRESENT;
+            write_unaligned((sd + SD_DACL_OFF) as *mut u64, dacl);
+        } else {
+            control &= !SE_DACL_PRESENT;
+            write_unaligned((sd + SD_DACL_OFF) as *mut u64, 0);
+        }
+        if dacl_defaulted != 0 {
+            control |= SE_DACL_DEFAULTED;
+        } else {
+            control &= !SE_DACL_DEFAULTED;
+        }
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlSetOwnerSecurityDescriptor(PSECURITY_DESCRIPTOR, PSID, BOOLEAN)`.
+extern "win64" fn s_rtl_set_owner_security_descriptor(
+    sd: u64,
+    owner: u64,
+    owner_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if owner_defaulted != 0 {
+            control |= SE_OWNER_DEFAULTED;
+        } else {
+            control &= !SE_OWNER_DEFAULTED;
+        }
+        write_unaligned((sd + SD_OWNER_OFF) as *mut u64, owner);
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlSetGroupSecurityDescriptor(PSECURITY_DESCRIPTOR, PSID, BOOLEAN)`.
+extern "win64" fn s_rtl_set_group_security_descriptor(
+    sd: u64,
+    group: u64,
+    group_defaulted: u64,
+) -> i32 {
+    if sd == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    unsafe {
+        if read_volatile(sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION;
+        }
+        let mut control = read_unaligned((sd + SD_CONTROL_OFF) as *const u16);
+        if group_defaulted != 0 {
+            control |= SE_GROUP_DEFAULTED;
+        } else {
+            control &= !SE_GROUP_DEFAULTED;
+        }
+        write_unaligned((sd + SD_GROUP_OFF) as *mut u64, group);
+        write_unaligned((sd + SD_CONTROL_OFF) as *mut u16, control);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS RtlAbsoluteToSelfRelativeSD(PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR, PULONG)`.
+extern "win64" fn s_rtl_absolute_to_self_relative_sd(
+    absolute_sd: u64,
+    self_relative_sd: u64,
+    buffer_length: *mut u32,
+) -> i32 {
+    if absolute_sd == 0 || buffer_length.is_null() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    unsafe {
+        if read_volatile(absolute_sd as *const u8) as u64 != SECURITY_DESCRIPTOR_REVISION_U64 {
+            return STATUS_UNKNOWN_REVISION;
+        }
+        let control = read_unaligned((absolute_sd + SD_CONTROL_OFF) as *const u16);
+        if control & SE_SELF_RELATIVE != 0 {
+            return STATUS_BAD_DESCRIPTOR_FORMAT;
+        }
+
+        let owner = read_unaligned((absolute_sd + SD_OWNER_OFF) as *const u64);
+        let group = read_unaligned((absolute_sd + SD_GROUP_OFF) as *const u64);
+        let sacl = read_unaligned((absolute_sd + SD_SACL_OFF) as *const u64);
+        let dacl = read_unaligned((absolute_sd + SD_DACL_OFF) as *const u64);
+        let Some(owner_len) = sd_component_len_sid(owner) else {
+            return STATUS_INVALID_SID;
+        };
+        let Some(group_len) = sd_component_len_sid(group) else {
+            return STATUS_INVALID_SID;
+        };
+        let Some(sacl_len) = sd_component_len_acl(sacl) else {
+            return STATUS_INVALID_ACL;
+        };
+        let Some(dacl_len) = sd_component_len_acl(dacl) else {
+            return STATUS_INVALID_ACL;
+        };
+        let Some(total_len) = SECURITY_DESCRIPTOR_RELATIVE_BYTES
+            .checked_add(owner_len)
+            .and_then(|v| v.checked_add(group_len))
+            .and_then(|v| v.checked_add(sacl_len))
+            .and_then(|v| v.checked_add(dacl_len))
+        else {
+            return STATUS_ALLOTTED_SPACE_EXCEEDED;
+        };
+
+        let caller_len = read_unaligned(buffer_length);
+        if caller_len < total_len as u32 {
+            write_unaligned(buffer_length, total_len as u32);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        if self_relative_sd == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        zero_component_bytes(self_relative_sd, total_len);
+        copy_component_bytes(self_relative_sd, absolute_sd, 4);
+        let mut current = SECURITY_DESCRIPTOR_RELATIVE_BYTES;
+        if sacl_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, sacl, sacl_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_SACL_OFF) as *mut u32,
+                current as u32,
+            );
+            current += sacl_len;
+        }
+        if dacl_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, dacl, dacl_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_DACL_OFF) as *mut u32,
+                current as u32,
+            );
+            current += dacl_len;
+        }
+        if owner_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, owner, owner_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_OWNER_OFF) as *mut u32,
+                current as u32,
+            );
+            current += owner_len;
+        }
+        if group_len != 0 {
+            copy_component_bytes(self_relative_sd + current as u64, group, group_len);
+            write_unaligned(
+                (self_relative_sd + SD_REL_GROUP_OFF) as *mut u32,
+                current as u32,
+            );
+        }
+        write_unaligned((self_relative_sd + SD_CONTROL_OFF) as *mut u16, control | SE_SELF_RELATIVE);
+        write_unaligned(buffer_length, total_len as u32);
+    }
+    STATUS_SUCCESS
 }
 
 /// `PGENERIC_MAPPING IoGetFileObjectGenericMapping()` — a static all-zero GENERIC_MAPPING is fine for
@@ -7194,6 +8547,88 @@ extern "win64" fn s_obf_reference_object(object: u64) -> u64 {
 
 extern "win64" fn s_obf_dereference_object(_object: u64) -> u64 {
     0
+}
+
+/// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PVOID*, ...)`.
+extern "win64" fn s_ob_reference_object_by_handle(
+    handle: u64,
+    _desired_access: u32,
+    _object_type: u64,
+    _access_mode: u8,
+    object_out: u64,
+    _handle_information: u64,
+) -> i32 {
+    if handle == 0 || object_out == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    unsafe {
+        write_unaligned(object_out as *mut u64, handle);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS ObOpenObjectByPointer(PVOID, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, MODE, PHANDLE)`.
+extern "win64" fn s_ob_open_object_by_pointer(
+    object: u64,
+    _handle_attributes: u32,
+    _passed_access_state: u64,
+    _desired_access: u32,
+    _object_type: u64,
+    _access_mode: u8,
+    handle_out: u64,
+) -> i32 {
+    if object == 0 || handle_out == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        write_unaligned(handle_out as *mut u64, object);
+    }
+    STATUS_SUCCESS
+}
+
+/// `NTSTATUS ObSetSecurityObjectByPointer(PVOID, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR)`.
+extern "win64" fn s_ob_set_security_object_by_pointer(
+    _object: u64,
+    _security_information: u32,
+    security_descriptor: u64,
+) -> i32 {
+    if security_descriptor == 0 {
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    STATUS_SUCCESS
+}
+
+/// `HANDLE PsGetCurrentProcessId()`.
+extern "win64" fn s_ps_get_current_process_id() -> u64 {
+    4
+}
+
+/// `PTEB PsGetCurrentThreadTeb()`.
+extern "win64" fn s_ps_get_current_thread_teb() -> u64 {
+    0
+}
+
+/// `NTSTATUS PsCreateSystemThread(...)`.
+extern "win64" fn s_ps_create_system_thread(
+    handle_out: u64,
+    _desired_access: u32,
+    _object_attributes: u64,
+    _process_handle: u64,
+    _client_id: u64,
+    _start_routine: u64,
+    _start_context: u64,
+) -> i32 {
+    unsafe {
+        if handle_out != 0 {
+            write_unaligned(handle_out as *mut u64, 0);
+        }
+    }
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `VOID PsTerminateSystemThread(NTSTATUS)`.
+extern "win64" fn s_ps_terminate_system_thread(_status: i32) {
+    print_str(b"[driver-thread] PsTerminateSystemThread called without hosted thread runtime\n");
 }
 
 /// `PEPROCESS PsGetCurrentProcess()` / `PsGetCurrentThread()` — a fake non-null object pointer.
@@ -7633,6 +9068,10 @@ extern "win64" fn s_hal_set_bus_data_by_offset(
 
 /// Serial debug print forwarder (`vDbgPrintExWithPrefix` etc.) — swallow.
 extern "win64" fn s_dbg_print() -> i32 {
+    0
+}
+
+extern "win64" fn s_dbg_query_debug_filter_state(_component_id: u32, _level: u32) -> u8 {
     0
 }
 
@@ -8555,75 +9994,84 @@ fn register_fsd_trampolines() {
     // SAFETY: single-threaded executive; the registry is only touched here + in fsd_export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(FSD_EXPORTS) };
     // pool (ExAllocatePool* → the FSD arena)
-    reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_tag as usize as u64);
+    reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_tag as *const () as usize as u64);
     reg.bind(
         "ExAllocatePoolWithQuotaTag",
-        s_ex_alloc_pool_quota_tag as usize as u64,
+        s_ex_alloc_pool_quota_tag as *const () as usize as u64,
     );
-    reg.bind("ExAllocatePool", s_ex_alloc_pool as usize as u64);
-    reg.bind("ExFreePoolWithTag", s_ex_free_pool_tag as usize as u64);
-    reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
+    reg.bind("ExAllocatePool", s_ex_alloc_pool as *const () as usize as u64);
+    reg.bind("ExFreePoolWithTag", s_ex_free_pool_tag as *const () as usize as u64);
+    reg.bind("ExFreePool", s_ex_free_pool as *const () as usize as u64);
     // Rtl string init
     reg.bind(
         "RtlInitUnicodeString",
-        s_rtl_init_unicode_string as usize as u64,
+        s_rtl_init_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlInitEmptyUnicodeString",
-        s_rtl_init_empty_unicode_string as usize as u64,
+        s_rtl_init_empty_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlFreeUnicodeString",
-        s_rtl_free_unicode_string as usize as u64,
+        s_rtl_free_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlCopyUnicodeString",
-        s_rtl_copy_unicode_string as usize as u64,
+        s_rtl_copy_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlCompareUnicodeString",
-        s_rtl_compare_unicode_string as usize as u64,
+        s_rtl_compare_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlUpcaseUnicodeString",
-        s_rtl_upcase_unicode_string as usize as u64,
+        s_rtl_upcase_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlAppendUnicodeStringToString",
-        s_rtl_append_unicode_string_to_string as usize as u64,
+        s_rtl_append_unicode_string_to_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlAppendUnicodeToString",
-        s_rtl_append_unicode_to_string as usize as u64,
+        s_rtl_append_unicode_to_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlIntegerToUnicodeString",
-        s_rtl_integer_to_unicode_string as usize as u64,
+        s_rtl_integer_to_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlUnicodeStringToInteger",
-        s_rtl_unicode_string_to_integer as usize as u64,
+        s_rtl_unicode_string_to_integer as *const () as usize as u64,
     );
     reg.bind(
         "RtlAnsiStringToUnicodeString",
-        s_rtl_ansi_string_to_unicode_string as usize as u64,
+        s_rtl_ansi_string_to_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlUnicodeStringToAnsiString",
-        s_rtl_unicode_string_to_ansi_string as usize as u64,
+        s_rtl_unicode_string_to_ansi_string as *const () as usize as u64,
+    );
+    reg.bind("RtlFreeAnsiString", s_rtl_free_ansi_string as *const () as usize as u64);
+    reg.bind(
+        "RtlCreateUnicodeString",
+        s_rtl_create_unicode_string as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlUnicodeToMultiByteN",
+        s_rtl_unicode_to_multibyte_n as *const () as usize as u64,
     );
     reg.bind(
         "RtlEqualUnicodeString",
-        s_rtl_equal_unicode_string as usize as u64,
+        s_rtl_equal_unicode_string as *const () as usize as u64,
     );
-    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
-    reg.bind("RtlInitString", s_rtl_init_ansi_string as usize as u64);
+    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as *const () as usize as u64);
+    reg.bind("RtlInitString", s_rtl_init_ansi_string as *const () as usize as u64);
     reg.bind(
         "RtlQueryRegistryValues",
-        s_rtl_query_registry_values as usize as u64,
+        s_rtl_query_registry_values as *const () as usize as u64,
     );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
-    reg.bind("IoCreateDevice", s_io_create_device as usize as u64);
+    reg.bind("IoCreateDevice", s_io_create_device as *const () as usize as u64);
     reg.bind(
         "IoDeleteDevice",
         s_io_delete_device as *const () as usize as u64,
@@ -8694,6 +10142,15 @@ fn register_fsd_trampolines() {
     );
     reg.bind("IoFreeIrp", s_io_free_irp as *const () as usize as u64);
     reg.bind(
+        "IoBuildDeviceIoControlRequest",
+        s_io_build_device_io_control_request as *const () as usize as u64,
+    );
+    reg.bind("IoCancelIrp", s_io_cancel_irp as *const () as usize as u64);
+    reg.bind(
+        "IoAcquireCancelSpinLock",
+        s_io_acquire_cancel_spin_lock as *const () as usize as u64,
+    );
+    reg.bind(
         "IoReleaseCancelSpinLock",
         s_io_release_cancel_spin_lock as *const () as usize as u64,
     );
@@ -8712,6 +10169,10 @@ fn register_fsd_trampolines() {
     reg.bind(
         "IoCsqRemoveNextIrp",
         s_io_csq_remove_next_irp as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetRelatedDeviceObject",
+        s_io_get_related_device_object as *const () as usize as u64,
     );
     reg.bind(
         "IofCallDriver",
@@ -8750,6 +10211,14 @@ fn register_fsd_trampolines() {
         s_io_free_work_item as *const () as usize as u64,
     );
     reg.bind(
+        "IoAllocateErrorLogEntry",
+        s_io_allocate_error_log_entry as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoWriteErrorLogEntry",
+        s_io_write_error_log_entry as *const () as usize as u64,
+    );
+    reg.bind(
         "IoAllocateMdl",
         s_io_allocate_mdl as *const () as usize as u64,
     );
@@ -8763,8 +10232,20 @@ fn register_fsd_trampolines() {
         s_mm_build_mdl_for_nonpaged_pool as *const () as usize as u64,
     );
     reg.bind(
+        "MmProbeAndLockPages",
+        s_mm_probe_and_lock_pages as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmUnlockPages",
+        s_mm_unlock_pages as *const () as usize as u64,
+    );
+    reg.bind(
         "MmMapLockedPages",
         s_mm_map_locked_pages as *const () as usize as u64,
+    );
+    reg.bind(
+        "MmUnmapLockedPages",
+        s_mm_unmap_locked_pages as *const () as usize as u64,
     );
     reg.bind(
         "MmMapLockedPagesSpecifyCache",
@@ -8804,7 +10285,7 @@ fn register_fsd_trampolines() {
     );
     reg.bind(
         "IoCreateSymbolicLink",
-        s_io_create_symbolic_link as usize as u64,
+        s_io_create_symbolic_link as *const () as usize as u64,
     );
     reg.bind(
         "IoDeleteSymbolicLink",
@@ -8812,9 +10293,9 @@ fn register_fsd_trampolines() {
     );
     reg.bind(
         "IoRegisterFileSystem",
-        s_io_register_file_system as usize as u64,
+        s_io_register_file_system as *const () as usize as u64,
     );
-    reg.bind("IoCompleteRequest", s_io_complete_request as usize as u64);
+    reg.bind("IoCompleteRequest", s_io_complete_request as *const () as usize as u64);
     // npfs.sys's PE actually imports the fastcall alias `IofCompleteRequest` (the `IoCompleteRequest`
     // macro compiles to it). On x64 there is ONE calling convention, so `Irp`/`PriorityBoost` still
     // arrive in RCX/RDX — the same `extern "win64"` trampoline serves both. Without THIS binding the
@@ -8822,125 +10303,174 @@ fn register_fsd_trampolines() {
     // npfs's `NpCompleteDeferredIrps` "completed" the read IRP into a no-op, so the executive never
     // learned the read finished (never stashed the delivered bytes), and the re-drive fresh read hit
     // the drained queue and returned uninitialized pool (`d0 16 d0 16 …`). BATCH 38 root cause.
-    reg.bind("IofCompleteRequest", s_io_complete_request as usize as u64);
+    reg.bind("IofCompleteRequest", s_io_complete_request as *const () as usize as u64);
     // Rtl Unicode prefix table (nt_kernel_exec::np_prefix) — the VCB name→FCB map
     reg.bind(
         "RtlInitializeUnicodePrefix",
-        s_rtl_init_unicode_prefix as usize as u64,
+        s_rtl_init_unicode_prefix as *const () as usize as u64,
     );
     reg.bind(
         "RtlInsertUnicodePrefix",
-        s_rtl_insert_unicode_prefix as usize as u64,
+        s_rtl_insert_unicode_prefix as *const () as usize as u64,
     );
     reg.bind(
         "RtlFindUnicodePrefix",
-        s_rtl_find_unicode_prefix as usize as u64,
+        s_rtl_find_unicode_prefix as *const () as usize as u64,
     );
     reg.bind(
         "RtlRemoveUnicodePrefix",
-        s_rtl_remove_unicode_prefix as usize as u64,
+        s_rtl_remove_unicode_prefix as *const () as usize as u64,
     );
     reg.bind(
         "RtlInitializeGenericTable",
-        s_rtl_init_generic_table as usize as u64,
+        s_rtl_init_generic_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlDeleteElementGenericTable",
-        s_rtl_delete_element_generic_table as usize as u64,
+        s_rtl_delete_element_generic_table as *const () as usize as u64,
     );
     // ERESOURCE acquire/release (uncontended single-threaded host)
     reg.bind(
         "ExAcquireResourceExclusiveLite",
-        s_acquire_resource as usize as u64,
+        s_acquire_resource as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireResourceSharedLite",
-        s_acquire_resource as usize as u64,
+        s_acquire_resource as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireSharedStarveExclusive",
-        s_acquire_resource as usize as u64,
+        s_acquire_resource as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireSharedWaitForExclusive",
-        s_acquire_resource as usize as u64,
+        s_acquire_resource as *const () as usize as u64,
     );
-    reg.bind("ExReleaseResourceLite", s_release_resource as usize as u64);
+    reg.bind("ExReleaseResourceLite", s_release_resource as *const () as usize as u64);
     reg.bind(
         "ExReleaseResourceForThreadLite",
-        s_release_resource as usize as u64,
+        s_release_resource as *const () as usize as u64,
     );
-    reg.bind("ExDeleteResourceLite", s_zero as usize as u64);
+    reg.bind(
+        "ExEnterCriticalRegionAndAcquireResourceExclusive",
+        s_ex_enter_critical_region_and_acquire_resource_exclusive as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseResourceAndLeaveCriticalRegion",
+        s_ex_release_resource_and_leave_critical_region as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExIsResourceAcquiredExclusiveLite",
+        s_ex_is_resource_acquired_exclusive_lite as *const () as usize as u64,
+    );
+    reg.bind("ExDeleteResourceLite", s_zero as *const () as usize as u64);
+    reg.bind("ExQueryDepthSList", s_ex_query_depth_slist as *const () as usize as u64);
+    reg.bind(
+        "ExInitializePagedLookasideList",
+        s_ex_initialize_paged_lookaside_list as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExInitializeNPagedLookasideList",
+        s_ex_initialize_npaged_lookaside_list as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExDeleteNPagedLookasideList",
+        s_ex_delete_npaged_lookaside_list as *const () as usize as u64,
+    );
     // The driver's OWN consistency bugchecks (npfs' `NpBugCheck`) — caught + reported + unwound,
     // never skipped. Previously an unresolved import resolved to a generic success no-op.
     if crate::KEBUGCHECK_BOUND {
-        reg.bind("KeBugCheckEx", s_ke_bug_check_ex as usize as u64);
+        reg.bind("KeBugCheckEx", s_ke_bug_check_ex as *const () as usize as u64);
     }
-    reg.bind("__C_specific_handler", s_c_specific_handler as usize as u64);
+    reg.bind("__C_specific_handler", s_c_specific_handler as *const () as usize as u64);
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
-    reg.bind("memcpy", s_memcpy as usize as u64);
-    reg.bind("memmove", s_memmove as usize as u64);
-    reg.bind("RtlCopyMemory", s_memcpy as usize as u64);
-    reg.bind("RtlMoveMemory", s_memmove as usize as u64);
-    reg.bind("memset", s_memset as usize as u64);
-    reg.bind("RtlFillMemory", s_memset as usize as u64);
-    reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
-    reg.bind("wcslen", s_wcslen as usize as u64);
-    reg.bind("wcsncmp", s_wcsncmp as usize as u64);
-    reg.bind("wcsncpy", s_wcsncpy as usize as u64);
-    reg.bind("wcscat", s_wcscat as usize as u64);
-    reg.bind("wcscpy", s_wcscpy as usize as u64);
-    reg.bind("wcsncat", s_wcsncat as usize as u64);
+    reg.bind("memcpy", s_memcpy as *const () as usize as u64);
+    reg.bind("memmove", s_memmove as *const () as usize as u64);
+    reg.bind("RtlCopyMemory", s_memcpy as *const () as usize as u64);
+    reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
+    reg.bind("memset", s_memset as *const () as usize as u64);
+    reg.bind("RtlFillMemory", s_memset as *const () as usize as u64);
+    reg.bind("RtlCompareMemory", s_rtl_compare_memory as *const () as usize as u64);
+    reg.bind("strlen", s_strlen as *const () as usize as u64);
+    reg.bind("strcpy", s_strcpy as *const () as usize as u64);
+    reg.bind("sprintf", s_sprintf as *const () as usize as u64);
+    reg.bind("wcslen", s_wcslen as *const () as usize as u64);
+    reg.bind("wcsncmp", s_wcsncmp as *const () as usize as u64);
+    reg.bind("wcsncpy", s_wcsncpy as *const () as usize as u64);
+    reg.bind("wcscat", s_wcscat as *const () as usize as u64);
+    reg.bind("wcscpy", s_wcscpy as *const () as usize as u64);
+    reg.bind("wcsncat", s_wcsncat as *const () as usize as u64);
+    reg.bind(
+        "RtlInitializeBitMap",
+        s_rtl_initialize_bitmap as *const () as usize as u64,
+    );
+    reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as *const () as usize as u64);
+    reg.bind("RtlSetAllBits", s_rtl_set_all_bits as *const () as usize as u64);
+    reg.bind("RtlFindClearBits", s_rtl_find_clear_bits as *const () as usize as u64);
+    reg.bind(
+        "RtlFindClearBitsAndSet",
+        s_rtl_find_clear_bits_and_set as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlNumberOfSetBits",
+        s_rtl_number_of_set_bits as *const () as usize as u64,
+    );
+    reg.bind("RtlTestBit", s_rtl_test_bit as *const () as usize as u64);
+    reg.bind("RtlSetBit", s_rtl_set_bit as *const () as usize as u64);
+    reg.bind("RtlClearBit", s_rtl_clear_bit as *const () as usize as u64);
+    reg.bind("RtlSetBits", s_rtl_set_bits as *const () as usize as u64);
+    reg.bind("RtlClearBits", s_rtl_clear_bits as *const () as usize as u64);
+    reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as *const () as usize as u64);
     reg.bind(
         "RtlCompareMemoryUlong",
-        s_rtl_compare_memory as usize as u64,
+        s_rtl_compare_memory as *const () as usize as u64,
     );
-    reg.bind("RtlCompareString", s_rtl_compare_string as usize as u64);
-    reg.bind("RtlUpcaseUnicodeChar", s_rtl_upcase_char as usize as u64);
-    reg.bind("ZwClose", s_zw_close as usize as u64);
-    reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
-    reg.bind("ZwEnumerateKey", s_zw_enumerate_key as usize as u64);
-    reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
-    reg.bind("ZwSetValueKey", s_zw_set_value_key as usize as u64);
-    reg.bind("ZwCreateFile", s_zw_create_file as usize as u64);
+    reg.bind("RtlCompareString", s_rtl_compare_string as *const () as usize as u64);
+    reg.bind("RtlUpcaseUnicodeChar", s_rtl_upcase_char as *const () as usize as u64);
+    reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
+    reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);
+    reg.bind("ZwEnumerateKey", s_zw_enumerate_key as *const () as usize as u64);
+    reg.bind("ZwQueryValueKey", s_zw_query_value_key as *const () as usize as u64);
+    reg.bind("ZwSetValueKey", s_zw_set_value_key as *const () as usize as u64);
+    reg.bind("ZwCreateFile", s_zw_create_file as *const () as usize as u64);
     reg.bind(
         "ZwQueryInformationFile",
-        s_zw_query_information_file as usize as u64,
+        s_zw_query_information_file as *const () as usize as u64,
     );
-    reg.bind("ZwReadFile", s_zw_read_file as usize as u64);
+    reg.bind("ZwReadFile", s_zw_read_file as *const () as usize as u64);
     reg.bind(
         "ExInterlockedInsertTailList",
-        s_ex_interlocked_insert_tail_list as usize as u64,
+        s_ex_interlocked_insert_tail_list as *const () as usize as u64,
     );
     reg.bind(
         "ExInterlockedInsertHeadList",
-        s_ex_interlocked_insert_head_list as usize as u64,
+        s_ex_interlocked_insert_head_list as *const () as usize as u64,
     );
     reg.bind(
         "ExInterlockedRemoveHeadList",
-        s_ex_interlocked_remove_head_list as usize as u64,
+        s_ex_interlocked_remove_head_list as *const () as usize as u64,
     );
     reg.bind(
         "ExInterlockedAddLargeInteger",
-        s_ex_interlocked_add_large_integer as usize as u64,
+        s_ex_interlocked_add_large_integer as *const () as usize as u64,
     );
     reg.bind(
         "ExInterlockedAddUlong",
-        s_ex_interlocked_add_ulong as usize as u64,
+        s_ex_interlocked_add_ulong as *const () as usize as u64,
     );
     reg.bind(
         "ExpInterlockedPushEntrySList",
-        s_exp_interlocked_push_entry_slist as usize as u64,
+        s_exp_interlocked_push_entry_slist as *const () as usize as u64,
     );
     reg.bind(
         "ExpInterlockedPopEntrySList",
-        s_exp_interlocked_pop_entry_slist as usize as u64,
+        s_exp_interlocked_pop_entry_slist as *const () as usize as u64,
     );
-    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as usize as u64);
+    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as *const () as usize as u64);
     // small-struct init (spinlock/event/timer/dpc/mutex/semaphore/ERESOURCE init)
     reg.bind(
         "ExInitializeResourceLite",
-        s_init_small_struct as usize as u64,
+        s_init_small_struct as *const () as usize as u64,
     );
     reg.bind(
         "KeInitializeSpinLock",
@@ -8966,25 +10496,49 @@ fn register_fsd_trampolines() {
         "KeGetCurrentIrql",
         s_ke_get_current_irql as *const () as usize as u64,
     );
-    reg.bind("KeEnterCriticalRegion", s_void as usize as u64);
-    reg.bind("KeLeaveCriticalRegion", s_void as usize as u64);
+    reg.bind("KeEnterCriticalRegion", s_void as *const () as usize as u64);
+    reg.bind("KeLeaveCriticalRegion", s_void as *const () as usize as u64);
+    reg.bind("KeEnterGuardedRegion", s_void as *const () as usize as u64);
+    reg.bind("KeLeaveGuardedRegion", s_void as *const () as usize as u64);
     reg.bind(
         "KeInitializeEvent",
         s_ke_initialize_event as *const () as usize as u64,
     );
     reg.bind("KeSetEvent", s_ke_set_event as *const () as usize as u64);
     reg.bind(
+        "KeResetEvent",
+        s_ke_reset_event as *const () as usize as u64,
+    );
+    reg.bind(
         "KeClearEvent",
         s_ke_clear_event as *const () as usize as u64,
+    );
+    reg.bind(
+        "KePulseEvent",
+        s_ke_pulse_event as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReadStateEvent",
+        s_ke_read_state_event as *const () as usize as u64,
     );
     reg.bind(
         "KeWaitForSingleObject",
         s_ke_wait_for_single_object as *const () as usize as u64,
     );
-    reg.bind("KeInitializeTimer", s_init_small_struct as usize as u64);
-    reg.bind("KeCancelTimer", s_ke_cancel_timer as usize as u64);
-    reg.bind("KeSetTimer", s_ke_set_timer as usize as u64);
-    reg.bind("KeSetTimerEx", s_ke_set_timer_ex as usize as u64);
+    reg.bind(
+        "KeWaitForMultipleObjects",
+        s_ke_wait_for_multiple_objects as *const () as usize as u64,
+    );
+    reg.bind("KeInitializeTimer", s_ke_initialize_timer as *const () as usize as u64);
+    reg.bind("KeInitializeTimerEx", s_ke_initialize_timer_ex as *const () as usize as u64);
+    reg.bind("KeCancelTimer", s_ke_cancel_timer as *const () as usize as u64);
+    reg.bind("KeSetTimer", s_ke_set_timer as *const () as usize as u64);
+    reg.bind("KeSetTimerEx", s_ke_set_timer_ex as *const () as usize as u64);
+    reg.bind(
+        "KeDelayExecutionThread",
+        s_ke_delay_execution_thread as *const () as usize as u64,
+    );
+    reg.bind("KeQuerySystemTime", s_ke_query_system_time as *const () as usize as u64);
     reg.bind(
         "KeStallExecutionProcessor",
         s_ke_stall_execution_processor as *const () as usize as u64,
@@ -8999,121 +10553,198 @@ fn register_fsd_trampolines() {
     );
     reg.bind(
         "KeQueryTimeIncrement",
-        s_ke_query_time_increment as usize as u64,
+        s_ke_query_time_increment as *const () as usize as u64,
     );
     reg.bind(
         "KeGetRecommendedSharedDataAlignment",
-        s_ke_get_recommended_shared_data_alignment as usize as u64,
+        s_ke_get_recommended_shared_data_alignment as *const () as usize as u64,
     );
     reg.bind(
         "KeRegisterBugCheckCallback",
-        s_ke_register_bug_check_callback as usize as u64,
+        s_ke_register_bug_check_callback as *const () as usize as u64,
     );
     reg.bind(
         "KeDeregisterBugCheckCallback",
-        s_ke_deregister_bug_check_callback as usize as u64,
+        s_ke_deregister_bug_check_callback as *const () as usize as u64,
     );
     reg.bind(
         "KeSynchronizeExecution",
-        s_ke_synchronize_execution as usize as u64,
+        s_ke_synchronize_execution as *const () as usize as u64,
     );
     reg.bind(
         "KeNumberProcessors",
         core::ptr::addr_of!(KE_NUMBER_PROCESSORS_VALUE) as usize as u64,
     );
-    reg.bind("ExInitializeFastMutex", s_init_small_struct as usize as u64);
-    reg.bind("KeInitializeMutex", s_init_small_struct as usize as u64);
-    reg.bind("KeReleaseMutex", s_ke_release_mutex as usize as u64);
-    reg.bind("KeInitializeSemaphore", s_init_small_struct as usize as u64);
-    reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
-    reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
+    reg.bind("ExInitializeFastMutex", s_init_small_struct as *const () as usize as u64);
+    reg.bind("KeInitializeMutex", s_init_small_struct as *const () as usize as u64);
+    reg.bind("KeReleaseMutex", s_ke_release_mutex as *const () as usize as u64);
+    reg.bind(
+        "KeInitializeSemaphore",
+        s_ke_initialize_semaphore as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReadStateSemaphore",
+        s_ke_read_state_semaphore as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseSemaphore",
+        s_ke_release_semaphore as *const () as usize as u64,
+    );
+    reg.bind("ProbeForRead", s_probe_for_read as *const () as usize as u64);
+    reg.bind("ProbeForWrite", s_probe_for_write as *const () as usize as u64);
     // Se / Ob security helpers
     reg.bind(
         "IoGetFileObjectGenericMapping",
-        s_generic_mapping as usize as u64,
+        s_generic_mapping as *const () as usize as u64,
     );
-    reg.bind("SeAssignSecurity", s_se_assign_security as usize as u64);
-    reg.bind("SeAccessCheck", s_se_access_check as usize as u64);
+    reg.bind(
+        "RtlCreateSecurityDescriptor",
+        s_rtl_create_security_descriptor as *const () as usize as u64,
+    );
+    reg.bind("RtlLengthSid", s_rtl_length_sid as *const () as usize as u64);
+    reg.bind("RtlCreateAcl", s_rtl_create_acl as *const () as usize as u64);
+    reg.bind(
+        "RtlAddAccessAllowedAce",
+        s_rtl_add_access_allowed_ace as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlAddAccessAllowedAceEx",
+        s_rtl_add_access_allowed_ace_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlSetDaclSecurityDescriptor",
+        s_rtl_set_dacl_security_descriptor as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlSetOwnerSecurityDescriptor",
+        s_rtl_set_owner_security_descriptor as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlSetGroupSecurityDescriptor",
+        s_rtl_set_group_security_descriptor as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlAbsoluteToSelfRelativeSD",
+        s_rtl_absolute_to_self_relative_sd as *const () as usize as u64,
+    );
+    reg.bind("SeAssignSecurity", s_se_assign_security as *const () as usize as u64);
+    reg.bind("SeAccessCheck", s_se_access_check as *const () as usize as u64);
     reg.bind(
         "SeLockSubjectContext",
-        s_se_lock_subject_context as usize as u64,
+        s_se_lock_subject_context as *const () as usize as u64,
     );
     reg.bind(
         "SeUnlockSubjectContext",
-        s_se_unlock_subject_context as usize as u64,
+        s_se_unlock_subject_context as *const () as usize as u64,
     );
     reg.bind(
         "SeOpenObjectAuditAlarm",
-        s_se_open_object_audit_alarm as usize as u64,
+        s_se_open_object_audit_alarm as *const () as usize as u64,
     );
-    reg.bind("SeAppendPrivileges", s_se_append_privileges as usize as u64);
-    reg.bind("SeFreePrivileges", s_se_free_privileges as usize as u64);
-    reg.bind("SeTokenType", s_se_token_type as usize as u64);
+    reg.bind("SeAppendPrivileges", s_se_append_privileges as *const () as usize as u64);
+    reg.bind("SeFreePrivileges", s_se_free_privileges as *const () as usize as u64);
+    reg.bind("SeTokenType", s_se_token_type as *const () as usize as u64);
     reg.bind(
         "SeCreateClientSecurity",
-        s_se_create_client_security as usize as u64,
+        s_se_create_client_security as *const () as usize as u64,
     );
     reg.bind(
         "SeImpersonateClientEx",
-        s_se_impersonate_client_ex as usize as u64,
+        s_se_impersonate_client_ex as *const () as usize as u64,
     );
     reg.bind(
         "SeQuerySecurityDescriptorInfo",
-        s_se_query_security_descriptor_info as usize as u64,
+        s_se_query_security_descriptor_info as *const () as usize as u64,
     );
     reg.bind(
         "SeSetSecurityDescriptorInfo",
-        s_se_set_security_descriptor_info as usize as u64,
+        s_se_set_security_descriptor_info as *const () as usize as u64,
     );
-    reg.bind("ObLogSecurityDescriptor", s_ob_log_sd as usize as u64);
+    reg.bind("ObLogSecurityDescriptor", s_ob_log_sd as *const () as usize as u64);
     reg.bind(
         "ObDereferenceSecurityDescriptor",
-        s_ob_dereference_security_descriptor as usize as u64,
+        s_ob_dereference_security_descriptor as *const () as usize as u64,
     );
-    reg.bind("ObfReferenceObject", s_obf_reference_object as usize as u64);
+    reg.bind(
+        "ObReferenceObjectByHandle",
+        s_ob_reference_object_by_handle as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObOpenObjectByPointer",
+        s_ob_open_object_by_pointer as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObSetSecurityObjectByPointer",
+        s_ob_set_security_object_by_pointer as *const () as usize as u64,
+    );
+    reg.bind("ObfReferenceObject", s_obf_reference_object as *const () as usize as u64);
     reg.bind(
         "ObfDereferenceObject",
-        s_obf_dereference_object as usize as u64,
+        s_obf_dereference_object as *const () as usize as u64,
     );
     // Ps/Io current-object identity
-    reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
-    reg.bind("PsGetCurrentThread", s_current_process as usize as u64);
-    reg.bind("KeGetCurrentThread", s_current_process as usize as u64);
-    reg.bind("IoGetRequestorProcess", s_current_process as usize as u64);
-    reg.bind("IoThreadToProcess", s_current_process as usize as u64);
+    reg.bind("PsGetCurrentProcess", s_current_process as *const () as usize as u64);
+    reg.bind(
+        "PsGetCurrentProcessId",
+        s_ps_get_current_process_id as *const () as usize as u64,
+    );
+    reg.bind("PsGetCurrentThread", s_current_process as *const () as usize as u64);
+    reg.bind(
+        "PsGetCurrentThreadTeb",
+        s_ps_get_current_thread_teb as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsCreateSystemThread",
+        s_ps_create_system_thread as *const () as usize as u64,
+    );
+    reg.bind(
+        "PsTerminateSystemThread",
+        s_ps_terminate_system_thread as *const () as usize as u64,
+    );
+    reg.bind("KeGetCurrentThread", s_current_process as *const () as usize as u64);
+    reg.bind("IoGetRequestorProcess", s_current_process as *const () as usize as u64);
+    reg.bind("IoThreadToProcess", s_current_process as *const () as usize as u64);
     reg.bind(
         "IoGetCurrentProcess",
-        s_io_get_current_process as usize as u64,
+        s_io_get_current_process as *const () as usize as u64,
     );
     // Debug print forwarders
-    reg.bind("vDbgPrintExWithPrefix", s_dbg_print as usize as u64);
-    reg.bind("vDbgPrintEx", s_dbg_print as usize as u64);
-    reg.bind("DbgPrint", s_dbg_print as usize as u64);
-    reg.bind("DbgPrintEx", s_dbg_print as usize as u64);
+    reg.bind("vDbgPrintExWithPrefix", s_dbg_print as *const () as usize as u64);
+    reg.bind("vDbgPrintEx", s_dbg_print as *const () as usize as u64);
+    reg.bind("DbgPrint", s_dbg_print as *const () as usize as u64);
+    reg.bind("DbgPrintEx", s_dbg_print as *const () as usize as u64);
+    reg.bind(
+        "DbgQueryDebugFilterState",
+        s_dbg_query_debug_filter_state as *const () as usize as u64,
+    );
     reg.bind(
         "ExGetCurrentProcessorCounts",
-        s_ex_get_current_processor_counts as usize as u64,
+        s_ex_get_current_processor_counts as *const () as usize as u64,
     );
     reg.bind(
         "ExGetCurrentProcessorCpuUsage",
-        s_ex_get_current_processor_cpu_usage as usize as u64,
+        s_ex_get_current_processor_cpu_usage as *const () as usize as u64,
     );
     reg.bind(
         "HalTranslateBusAddress",
-        s_hal_translate_bus_address as usize as u64,
+        s_hal_translate_bus_address as *const () as usize as u64,
     );
     reg.bind(
         "HalGetInterruptVector",
-        s_hal_get_interrupt_vector as usize as u64,
+        s_hal_get_interrupt_vector as *const () as usize as u64,
     );
-    reg.bind("HalGetBusData", s_hal_get_bus_data as usize as u64);
+    reg.bind("HalGetBusData", s_hal_get_bus_data as *const () as usize as u64);
     reg.bind(
         "HalGetBusDataByOffset",
-        s_hal_get_bus_data_by_offset as usize as u64,
+        s_hal_get_bus_data_by_offset as *const () as usize as u64,
     );
     reg.bind(
         "HalSetBusDataByOffset",
-        s_hal_set_bus_data_by_offset as usize as u64,
+        s_hal_set_bus_data_by_offset as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeQueryPerformanceCounter",
+        s_ke_query_performance_counter as *const () as usize as u64,
     );
 
     if reg.is_exhausted() {
@@ -9226,6 +10857,9 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
             log_unresolved_driver_import(dll, name);
         }
         return None;
+    }
+    if let Some(addr) = fsd_data_export_addr(name) {
+        return Some(addr);
     }
     // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
     unsafe {
@@ -11317,6 +12951,7 @@ unsafe fn load_driver_reserved(
         let cap = copy_cap(arg_base + i);
         map_instance_exec_frame(instance, cap, win.arg_va + i * 0x1000, RW_NX)?;
     }
+    initialize_hosted_driver_data_exports(win.data_va);
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).

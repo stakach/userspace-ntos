@@ -51,7 +51,10 @@ pub use lookaside::{
 };
 pub use mutant::{map_mutant_access, MutantError, MutantStore};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
-pub use semaphore::{map_semaphore_access, SemaphoreError, SemaphoreStore};
+pub use semaphore::{
+    init_ksemaphore, ksemaphore_read_state, ksemaphore_release, ksemaphore_try_wait,
+    map_semaphore_access, SemaphoreError, SemaphoreStore, SEMAPHORE_OBJECT,
+};
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{map_timer_access, Clock, FakeClock, TimerQueue};
 pub use work_item::WorkQueue;
