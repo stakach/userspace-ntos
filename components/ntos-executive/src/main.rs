@@ -695,7 +695,13 @@ unsafe fn take_registered_thread_page(pi: usize, page: u64, owner: u64) {
     }
 }
 
-unsafe fn release_owned_thread_frame(owner: u64) {
+unsafe fn release_unmapped_owned_thread_frame(owner: u64) {
+    if owner != 0 {
+        vm_frame_release_unmapped(owner);
+    }
+}
+
+unsafe fn release_mapped_owned_thread_frame(owner: u64) {
     if owner != 0 {
         vm_frame_release(owner, 0);
     }
@@ -730,24 +736,24 @@ pub(crate) unsafe fn release_hosted_tp_worker_window_resources(pi: usize, slot: 
         take_registered_thread_page(pi, page, resources.stack_owner[index]);
         recycle_mapped_cap(resources.stack_target[index]);
         recycle_mapped_cap(resources.stack_mirror[index]);
-        release_owned_thread_frame(resources.stack_owner[index]);
+        release_unmapped_owned_thread_frame(resources.stack_owner[index]);
     }
 
     take_registered_thread_page(pi, tp_worker_teb_va(slot), resources.teb_owner);
     recycle_mapped_cap(resources.teb_target);
     recycle_mapped_cap(resources.teb_scratch);
-    release_owned_thread_frame(resources.teb_owner);
+    release_unmapped_owned_thread_frame(resources.teb_owner);
 
     take_registered_thread_page(pi, tp_worker_teb_va(slot) + 0x1000, resources.teb2_owner);
     recycle_mapped_cap(resources.teb2_target);
     recycle_mapped_cap(resources.teb2_scratch);
-    release_owned_thread_frame(resources.teb2_owner);
+    release_unmapped_owned_thread_frame(resources.teb2_owner);
 
     recycle_mapped_cap(resources.acs_target);
-    release_owned_thread_frame(resources.acs_owner);
+    release_mapped_owned_thread_frame(resources.acs_owner);
     recycle_mapped_cap(resources.ipc_target);
     recycle_mapped_cap(resources.tramp_target);
-    release_owned_thread_frame(resources.tramp_owner);
+    release_mapped_owned_thread_frame(resources.tramp_owner);
 }
 
 const fn hosted_thread_layout_is_disjoint(
@@ -10718,11 +10724,9 @@ unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
     Ok(frame)
 }
 
-unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
-    let _ = page_unmap_r(frame);
-    if alias_cap != 0 {
-        let _ = page_unmap_r(alias_cap);
-        let _ = cnode_delete_recycle_r(alias_cap);
+unsafe fn vm_frame_return_to_free_list(frame: u64) {
+    if frame == 0 {
+        return;
     }
     let count = core::ptr::read(core::ptr::addr_of!(VM_FREE_FRAME_N));
     if count < VM_FREE_FRAME_CAPACITY {
@@ -10735,6 +10739,19 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
     } else {
         let _ = cnode_delete_recycle_r(frame);
     }
+}
+
+unsafe fn vm_frame_release_unmapped(frame: u64) {
+    vm_frame_return_to_free_list(frame);
+}
+
+unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
+    let _ = page_unmap_r(frame);
+    if alias_cap != 0 {
+        let _ = page_unmap_r(alias_cap);
+        let _ = cnode_delete_recycle_r(alias_cap);
+    }
+    vm_frame_return_to_free_list(frame);
 }
 
 unsafe fn process_private_pt_caps_release(pi: usize) -> (u64, u64) {

@@ -39,18 +39,18 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
-`.tmp/run-headless-b3-main-stack-alias-20260816.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after hosted driver main stacks were added to the
-per-instance executive alias set used by dispatcher-object translation. The previous
-`KeSetEvent unmapped event` warning for a stack-local hosted driver `KEVENT` is absent, and the
-same run keeps the full shell path green: real `WlxActivateUserShell`, `userinit.exe`,
-`explorer.exe`, shell COM classes, api0 callbacks, GDI user batch flushes, and
-`exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports `786432/786432` non-background pixels
-with at least 32 distinct non-background colors, `exec_win32k_desktop_painted` passes, and the pool
-gate still has usable headroom (`ut-free=77178KiB`, `exec-heap-free=8238KiB`, no pool-accounted
-image-bank, registry, ASID, or VM allocation failures). Non-gating setup-side image-map diagnostics
-remain visible for late helper application loading and should be tracked separately from hosted
-driver dispatcher object aliasing.
+`.tmp/run-headless-b3-worker-owner-unmap-20260816.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after hosted thread-pool worker teardown stopped
+issuing `Page_Unmap` against owner caps that are not live mappings. The previous ASID/PTE cleanup
+gate failure is gone: `exec_vspace_asid_unmap_clears_pte` passes with `unmap error-labels=0`,
+`vm-fail ... unmap-fails=0`, and the VM re-commit selftest remains `0x3f`. The same run keeps the
+full shell path green: real `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM
+classes, api0 callbacks, GDI user batch flushes, and `exec_explorer_shell_chrome_painted`.
+`[explorer-fb]` reports `786432/786432` non-background pixels with at least 32 distinct
+non-background colors, `exec_win32k_desktop_painted` passes, the pool gate still has usable headroom
+(`ut-free=77150KiB`, `exec-heap-free=8589KiB`, no pool-accounted image-bank, registry, ASID, or VM
+allocation failures), and sparse LiveCD-derived SYSTEM hives report real network setup provisioning
+for the TCPIP/AFD metadata path.
 
 Previous accepted desktop proof (2026-08-16):
 `.tmp/run-desktop-dependency-closure.log` reaches the harness sentinel with `296/296`
@@ -1217,10 +1217,12 @@ before unrelated executive traffic monopolises the receive loop.
   mutable SYSTEM-hive setup seed now materializes ReactOS NDIS/TCPIP/AFD service records plus the
   TCPIP base `Parameters` subtree into sparse LiveCD-derived hives, so winlogon and later network
   consumers reach ordinary registry data instead of an executive open fallback.
+  The current serialized desktop proof validates that this setup data is provisioned before the
+  shell path, while actual TCPIP/AFD driver activation from registry ordering remains open.
   Remaining B3 work is broader non-display driver coverage: hosted thread-handle close/wait
-  semantics if ReactOS drivers expose them, serialized proof of TCPIP/AFD activation from the
-  registry metadata, miniport packet data-plane behavior, and multi-device scaling under the same
-  dynamic devnode/resource path.
+  semantics if ReactOS drivers expose them, TCPIP/AFD activation from the registry metadata,
+  miniport packet data-plane behavior, and multi-device scaling under the same dynamic
+  devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6502,3 +6504,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   headless desktop proof and verify the TCPIP Parameters open miss is gone; if TCPIP/AFD now start
   and expose new failures, fix the next missing generic driver/thread/registry mechanism rather than
   adding service-specific success paths.
+
+  B3 hosted worker owner-frame release cleanup (2026-08-16): hosted thread-pool worker teardown now
+  distinguishes owner frame caps from live mapping caps. Worker stack and TEB owner frames are
+  removed from the thread page registry, their target/scratch/mirror mapping caps are recycled, and
+  the owner frames return to the VM free list without an invalid `Page_Unmap`; ACS/trampoline owner
+  frames still use the mapped release path because those owner caps are live mappings. Serialized
+  headless proof `.tmp/run-headless-b3-worker-owner-unmap-20260816.log` reaches the harness sentinel
+  with `296/296` checks passing, keeps `exec_win32k_desktop_painted` and
+  `exec_explorer_shell_chrome_painted` green, and closes the previous
+  `exec_vspace_asid_unmap_clears_pte` failure with `unmap error-labels=0` and
+  `vm-fail ... unmap-fails=0`. The same proof also confirms the sparse SYSTEM hive network setup
+  seed appears during boot before the shell path. Validation: `cargo fmt --all`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+  `git diff --check`, and the serialized headless boot proof. Review adjustment: B3's active
+  frontier is now turning the provisioned TCPIP/AFD metadata into real registry-ordered driver
+  activation, then packet data-plane behavior, while preserving the generic hosted-driver wait and
+  worker lifecycle mechanisms.
