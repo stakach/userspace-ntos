@@ -399,16 +399,40 @@ impl VideoRequestPacketX64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoStatusBlockX64 {
+    pub status: i32,
+    pub information: u64,
+}
+
+impl VideoStatusBlockX64 {
+    pub fn parse(input: &[u8]) -> Result<Self, VideoRequestPacketError> {
+        require_video_request_input(input, VIDEO_STATUS_BLOCK_X64_SIZE)?;
+        Ok(Self {
+            status: read_u32_raw(input, 0) as i32,
+            information: read_u64_raw(input, 8),
+        })
+    }
+
+    pub fn write(&self, output: &mut [u8]) -> Result<usize, VideoRequestPacketError> {
+        require_video_request_input(output, VIDEO_STATUS_BLOCK_X64_SIZE)?;
+        output[..VIDEO_STATUS_BLOCK_X64_SIZE].fill(0);
+        write_u32(output, 0, self.status as u32);
+        write_u64(output, 8, self.information);
+        Ok(VIDEO_STATUS_BLOCK_X64_SIZE)
+    }
+}
+
 pub fn write_video_status_block_x64(
     output: &mut [u8],
     status: i32,
     information: u64,
 ) -> Result<usize, VideoRequestPacketError> {
-    require_video_request_input(output, VIDEO_STATUS_BLOCK_X64_SIZE)?;
-    output[..VIDEO_STATUS_BLOCK_X64_SIZE].fill(0);
-    write_u32(output, 0, status as u32);
-    write_u64(output, 8, information);
-    Ok(VIDEO_STATUS_BLOCK_X64_SIZE)
+    VideoStatusBlockX64 {
+        status,
+        information,
+    }
+    .write(output)
 }
 
 /// NT object/registry identity for a video miniport-created `\Device\Video<N>` route.
@@ -1451,6 +1475,13 @@ mod tests {
         assert_eq!(u32_at(&raw, 0), 0xC000_000D);
         assert_eq!(&raw[4..8], &[0, 0, 0, 0]);
         assert_eq!(u64_at(&raw, 8), 0x1234);
+        assert_eq!(
+            VideoStatusBlockX64::parse(&raw).unwrap(),
+            VideoStatusBlockX64 {
+                status: 0xC000_000Du32 as i32,
+                information: 0x1234,
+            }
+        );
     }
 
     #[test]

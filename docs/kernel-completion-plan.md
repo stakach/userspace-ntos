@@ -3608,6 +3608,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   translate `IOCTL_VIDEO_*` requests into typed `VIDEO_REQUEST_PACKET`s for `HwStartIO` so the
   existing boot-framebuffer bridge can shrink to a compatibility adapter behind the same boundary.
 
+- B3 videoprt `HwInitialize`/`HwStartIO` slice (2026-08-16). `nt-video-miniport` now parses the x64
+  `VIDEO_STATUS_BLOCK` it already wrote in tests, and hosted videoprt devices no longer depend on a
+  synthetic WDM MajorFunction table after `VideoPortInitialize`. The hosted-driver backend detects a
+  videoprt-initialized device and redirects `IRP_MJ_CREATE` to the captured `HwInitialize`, while
+  buffered `IRP_MJ_DEVICE_CONTROL`/`IRP_MJ_INTERNAL_DEVICE_CONTROL` requests build a real
+  `VIDEO_REQUEST_PACKET` in the component, pass the request-owned system buffer to the captured
+  `HwStartIO`, and map the returned VP/Win32 status codes back to NTSTATUS. Only
+  `IOCTL_VIDEO_INIT_WIN32K_CALLBACKS` remains port-owned; map/unmap and the mode-query IOCTLs now
+  reach the miniport, matching ReactOS videoprt's default forwarding path. Validation:
+  `cargo fmt --all`, `cargo test -p nt-video-miniport -- --nocapture`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`. Review adjustment: the next B3 display slice should publish the hosted
+  miniport-created `\\Device\\Video<N>`/DeviceMap route as the primary display device and then retire
+  the temporary boot-framebuffer bridge, or re-express it as a real boot adapter behind the same
+  `VideoPort` boundary.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same

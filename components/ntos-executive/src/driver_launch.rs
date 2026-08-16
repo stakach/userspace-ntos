@@ -47,9 +47,12 @@ use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 use nt_video_miniport::{
-    VideoAccessRangeX64, VideoHwInitializationDataError, VideoHwInitializationDataVersion,
-    VideoHwInitializationDataX64, VideoPortConfigInfoX64, VIDEO_ACCESS_RANGE_X64_SIZE,
-    VIDEO_HW_INITIALIZATION_DATA_X64_SIZE, VIDEO_PORT_CONFIG_INFO_X64_SIZE,
+    write_video_status_block_x64, VideoAccessRangeX64, VideoHwInitializationDataError,
+    VideoHwInitializationDataVersion, VideoHwInitializationDataX64, VideoPortConfigInfoX64,
+    VideoRequestPacketX64, VideoStatusBlockX64, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
+    VIDEO_ACCESS_RANGE_X64_SIZE, VIDEO_HW_INITIALIZATION_DATA_X64_SIZE,
+    VIDEO_PORT_CONFIG_INFO_X64_SIZE, VIDEO_REQUEST_PACKET_X64_SIZE, VIDEO_STATUS_BLOCK_X64_SIZE,
+    VIDEO_WIN32K_CALLBACKS_SIZE_X64,
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
@@ -286,6 +289,9 @@ pub const SH_VIDEO_PORT_INITIALIZED: u64 = 0x9D0; // out: 1 when VideoPortInitia
 pub const SH_VIDEO_FIND_ADAPTER_CALLS: u64 = 0x9D8; // out: HwFindAdapter calls
 pub const SH_VIDEO_FIND_ADAPTER_STATUS: u64 = 0x9E0; // out: last VP_STATUS
 pub const SH_VIDEO_FIND_ADAPTER_AGAIN: u64 = 0x9E4; // out: last Again byte
+pub const SH_VIDEO_HW_INITIALIZE_CALLS: u64 = 0x9E8; // out: HwInitialize calls
+pub const SH_VIDEO_HW_INITIALIZE_OK: u64 = 0x9F0; // out: last HwInitialize BOOLEAN
+pub const SH_VIDEO_HW_START_IO_CALLS: u64 = 0x9F8; // out: HwStartIO calls
 pub const SH_HANDOFF_ARENA_BASE: u64 = 0xA00;
 pub const SH_HANDOFF_ARENA_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
 pub const SH_DPC_QUEUE_BASE: u64 = SH_HANDOFF_ARENA_BASE; // out: queued KDPC pointers
@@ -296,7 +302,7 @@ pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 = SH_DPC_QUEUE_ARENA_BYTES / SH_DPC
 pub const SH_DMA_ALLOC_RECORDS: u64 = SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
-const _: () = assert!(SH_VIDEO_FIND_ADAPTER_AGAIN + 4 <= SH_HANDOFF_ARENA_BASE);
+const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
@@ -339,8 +345,11 @@ pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
 pub const FSD_DISPATCH_CANCEL_PENDING_FILE: u64 = u64::MAX - 0x774;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
+pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
+pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
 
 const POOL_DATA_OFF: u64 = 0x1000;
+const FILE_OPENED_INFORMATION: u64 = 1;
 const STATUS_PENDING: u32 = 0x0000_0103;
 
 const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
@@ -2736,7 +2745,9 @@ const VP_ERROR_INVALID_FUNCTION: u32 = 1;
 const VP_ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const VP_ERROR_DEV_NOT_EXIST: u32 = 55;
 const VP_ERROR_INVALID_PARAMETER: u32 = 87;
+const VP_ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const VP_ERROR_MORE_DATA: u32 = 234;
+const VP_ERROR_IO_PENDING: u32 = 997;
 
 const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
 const UNICODE_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
@@ -7608,6 +7619,15 @@ unsafe fn clear_shared_video_port_initialization() {
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_STATUS) as *mut u32, 0);
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_AGAIN) as *mut u8, 0);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
+        0,
+    );
+    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_OK) as *mut u8, 0);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,
+        0,
+    );
 }
 
 extern "win64" fn s_video_port_zero_memory(destination: u64, length: u32) {
@@ -8863,6 +8883,132 @@ unsafe extern "win64" fn fsd_invalid_device_request(_devobj: u64, irp: u64) -> i
     STATUS_INVALID_DEVICE_REQUEST_I32
 }
 
+unsafe fn component_video_hw_extension() -> Result<u64, i32> {
+    if read_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
+        return Err(0xC000_0010u32 as i32); // STATUS_INVALID_DEVICE_REQUEST
+    }
+    let hw_extension =
+        read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION) as *const u64);
+    if hw_extension == 0 {
+        Err(0xC000_0010u32 as i32) // STATUS_INVALID_DEVICE_REQUEST
+    } else {
+        Ok(hw_extension)
+    }
+}
+
+unsafe fn component_dispatch_video_initialize() -> (i32, u64) {
+    let initialize = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE) as *const u64);
+    let hw_extension = match component_video_hw_extension() {
+        Ok(hw_extension) if initialize != 0 => hw_extension,
+        _ => return (0xC000_0010u32 as i32, 0), // STATUS_INVALID_DEVICE_REQUEST
+    };
+    let init: extern "win64" fn(u64) -> u8 = core::mem::transmute(initialize as *const ());
+    let ok = init(hw_extension);
+    let calls =
+        read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
+        calls.saturating_add(1),
+    );
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_OK) as *mut u8,
+        ok,
+    );
+    if ok != 0 {
+        (0, FILE_OPENED_INFORMATION)
+    } else {
+        (0xC000_0001u32 as i32, 0) // STATUS_UNSUCCESSFUL
+    }
+}
+
+unsafe fn component_dispatch_video_win32k_callbacks(inlen: u64, outlen: u64) -> (i32, u64) {
+    if inlen < 16 {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    if outlen < VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64 {
+        return (STATUS_BUFFER_TOO_SMALL, VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64);
+    }
+    let phys_disp = read_unaligned(FSD_ARG_VADDR as *const u64);
+    let callout = read_unaligned((FSD_ARG_VADDR + 8) as *const u64);
+    let video_device_object = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let mut index = 0u64;
+    while index < VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64 {
+        write_volatile((FSD_ARG_VADDR + index) as *mut u8, 0);
+        index += 1;
+    }
+    write_unaligned(FSD_ARG_VADDR as *mut u64, phys_disp);
+    write_unaligned((FSD_ARG_VADDR + 8) as *mut u64, callout);
+    write_unaligned((FSD_ARG_VADDR + 16) as *mut u32, 0);
+    write_unaligned((FSD_ARG_VADDR + 24) as *mut u64, video_device_object);
+    write_unaligned((FSD_ARG_VADDR + 32) as *mut u32, 0);
+    (0, VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64)
+}
+
+fn video_port_forwarded_status(status: u32) -> i32 {
+    match status {
+        VP_NO_ERROR => 0,
+        VP_ERROR_NOT_ENOUGH_MEMORY => 0xC000_009Au32 as i32, // STATUS_INSUFFICIENT_RESOURCES
+        VP_ERROR_MORE_DATA => STATUS_BUFFER_OVERFLOW as i32,
+        VP_ERROR_INVALID_FUNCTION => 0xC000_0002u32 as i32, // STATUS_NOT_IMPLEMENTED
+        VP_ERROR_INVALID_PARAMETER => 0xC000_000Du32 as i32, // STATUS_INVALID_PARAMETER
+        VP_ERROR_INSUFFICIENT_BUFFER => STATUS_BUFFER_TOO_SMALL,
+        VP_ERROR_DEV_NOT_EXIST => 0xC000_00C0u32 as i32, // STATUS_DEVICE_DOES_NOT_EXIST
+        VP_ERROR_IO_PENDING => STATUS_PENDING as i32,
+        _ => 0xC000_0001u32 as i32, // STATUS_UNSUCCESSFUL
+    }
+}
+
+unsafe fn component_dispatch_video_start_io() -> (i32, u64) {
+    let start_io = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO) as *const u64);
+    let hw_extension = match component_video_hw_extension() {
+        Ok(hw_extension) if start_io != 0 => hw_extension,
+        _ => return (0xC000_0010u32 as i32, 0), // STATUS_INVALID_DEVICE_REQUEST
+    };
+    let ioctl = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+    let inlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
+    let outlen = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+    if ioctl > u32::MAX as u64 || inlen > u32::MAX as u64 || outlen > u32::MAX as u64 {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    match ioctl as u32 {
+        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+            return component_dispatch_video_win32k_callbacks(inlen, outlen);
+        }
+        _ => {}
+    }
+
+    let mut status_raw = [0u8; VIDEO_STATUS_BLOCK_X64_SIZE];
+    if write_video_status_block_x64(&mut status_raw, 0, 0).is_err() {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    let mut vrp_raw = [0u8; VIDEO_REQUEST_PACKET_X64_SIZE];
+    let packet = VideoRequestPacketX64::buffered(
+        ioctl as u32,
+        status_raw.as_mut_ptr() as u64,
+        FSD_ARG_VADDR,
+        inlen as u32,
+        outlen as u32,
+    );
+    if packet.write(&mut vrp_raw).is_err() {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    let start: extern "win64" fn(u64, u64) -> u8 = core::mem::transmute(start_io as *const ());
+    let _accepted = start(hw_extension, vrp_raw.as_mut_ptr() as u64);
+    let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *const u64);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,
+        calls.saturating_add(1),
+    );
+    let status_block = match VideoStatusBlockX64::parse(&status_raw) {
+        Ok(status_block) => status_block,
+        Err(_) => return (0xC000_000Du32 as i32, 0), // STATUS_INVALID_PARAMETER
+    };
+    (
+        video_port_forwarded_status(status_block.status as u32),
+        status_block.information,
+    )
+}
+
 /// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
 /// DriverEntry-preamble → dispatch-loop shape to [`crate::spawn_hosts::component_main`], plugging the
 /// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
@@ -9085,6 +9231,12 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
             again,
         );
         return (0, status as u64);
+    }
+    if major == FSD_DISPATCH_VIDEO_INITIALIZE {
+        return component_dispatch_video_initialize();
+    }
+    if major == FSD_DISPATCH_VIDEO_START_IO {
+        return component_dispatch_video_start_io();
     }
     let mj_base = req.drv + 0x70;
     let handler = read_volatile((mj_base + major * 8) as *const u64);
@@ -11118,20 +11270,53 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let (input_len, output_len) = projection_buffer_extents(irp, ctx.system_buffer.len());
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let fsctl = projection_fsctl(irp);
+        let binding = hosted_device_binding_by_device_id(irp.device_id.raw());
+        let device_object = binding
+            .map(|binding| binding.device_object)
+            .or_else(|| instance(self.instance).map(|inst| inst.device_object))
+            .unwrap_or(0);
         let result = unsafe {
-            dispatch_irp_for_instance(
-                self.instance,
-                irp.major as u64,
-                irp.minor as u64,
-                hosted_device_binding_by_device_id(irp.device_id.raw())
-                    .map(|binding| binding.device_object)
-                    .or_else(|| instance(self.instance).map(|inst| inst.device_object))
-                    .unwrap_or(0),
-                fsctl,
-                irp.user_data,
-                &input,
-                &mut ctx.system_buffer[..output_len],
-            )
+            if let Some(binding) = binding {
+                if let Some((index, inst)) = instance_by_driver_id(binding.driver_id) {
+                    match dispatch_video_irp_for_binding(
+                        index,
+                        inst,
+                        binding,
+                        irp.major as u64,
+                        irp.minor as u64,
+                        fsctl,
+                        irp.user_data,
+                        &input,
+                        &mut ctx.system_buffer[..output_len],
+                    ) {
+                        Ok(Some(result)) => Some(result),
+                        Ok(None) => dispatch_irp_for_instance(
+                            self.instance,
+                            irp.major as u64,
+                            irp.minor as u64,
+                            device_object,
+                            fsctl,
+                            irp.user_data,
+                            &input,
+                            &mut ctx.system_buffer[..output_len],
+                        ),
+                        Err(status) => Some((status.raw(), 0)),
+                    }
+                } else {
+                    None
+                }
+            } else {
+                dispatch_irp_for_instance(
+                    self.instance,
+                    irp.major as u64,
+                    irp.minor as u64,
+                    device_object,
+                    fsctl,
+                    irp.user_data,
+                    &input,
+                    &mut ctx.system_buffer[..output_len],
+                )
+            }
         };
         match result {
             Some((status, information)) => Ok(DispatchOutcome::Completed {
@@ -13065,6 +13250,184 @@ unsafe fn dispatch_video_find_adapter_for_instance(
     }
     nt_status::NtStatus(pr.status).to_result()?;
     Ok(pr.result as u32)
+}
+
+unsafe fn hosted_instance_video_port_initialized(inst: DriverInstance) -> bool {
+    read_volatile((inst.exec_shared_va + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0
+}
+
+unsafe fn dispatch_video_initialize_for_instance(
+    index: usize,
+    inst: DriverInstance,
+    device_object: u64,
+) -> Result<(i32, u64), nt_status::NtStatus> {
+    if !hosted_instance_video_port_initialized(inst) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
+    write_volatile(
+        (sh + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_VIDEO_INITIALIZE,
+    );
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va: ExecVaWindow::try_for_instance(index)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64) != 0,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(index, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    Ok((pr.status, info))
+}
+
+unsafe fn dispatch_video_start_io_for_instance(
+    index: usize,
+    inst: DriverInstance,
+    device_object: u64,
+    ioctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<(i32, u64), nt_status::NtStatus> {
+    if !hosted_instance_video_port_initialized(inst) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let transport_capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
+    if ioctl > u32::MAX as u64
+        || in_data.len() > u32::MAX as usize
+        || out.len() > u32::MAX as usize
+        || in_data.len() > transport_capacity
+        || out.len() > transport_capacity
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let sh = inst.exec_shared_va;
+    let arg = inst.exec_arg_va;
+    let inlen = in_data.len();
+    for i in 0..inlen {
+        write_volatile((arg + i as u64) as *mut u8, in_data[i]);
+    }
+    let transfer_len = inlen.max(out.len());
+    for i in inlen..transfer_len {
+        write_volatile((arg + i as u64) as *mut u8, 0);
+    }
+    write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
+    write_volatile(
+        (sh + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_VIDEO_START_IO,
+    );
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, ioctl);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va: ExecVaWindow::try_for_instance(index)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64) != 0,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(index, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    let copy_len = (info as usize).min(out.len());
+    for i in 0..copy_len {
+        out[i] = read_volatile((arg + i as u64) as *const u8);
+    }
+    Ok((pr.status, info))
+}
+
+unsafe fn dispatch_video_irp_for_binding(
+    index: usize,
+    inst: DriverInstance,
+    binding: HostedDeviceBinding,
+    major: u64,
+    minor: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Result<Option<(i32, u64)>, nt_status::NtStatus> {
+    if !hosted_instance_video_port_initialized(inst) {
+        return Ok(None);
+    }
+    if major > u8::MAX as u64 {
+        return Ok(Some((nt_status::NtStatus::INVALID_PARAMETER.raw(), 0)));
+    }
+    let device_object = binding.device_object;
+    let outcome = match major as u8 {
+        major::IRP_MJ_CREATE => {
+            dispatch_video_initialize_for_instance(index, inst, device_object)?
+        }
+        major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE => (0, 0),
+        major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
+            dispatch_video_start_io_for_instance(
+                index,
+                inst,
+                device_object,
+                fsctl,
+                file_id,
+                in_data,
+                out,
+            )?
+        }
+        _ => (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), 0),
+    };
+    let _ = minor;
+    Ok(Some(outcome))
 }
 
 /// Send `IRP_MN_START_DEVICE` to a hosted FDO. `resource_list` is the caller-selected
