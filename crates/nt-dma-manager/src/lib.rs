@@ -88,6 +88,30 @@ pub struct MapGrant {
     pub mapped_length: u64,
 }
 
+/// Layout for a fixed-size device descriptor ring whose records contain a
+/// little-endian device/logical buffer address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FixedDescriptorLayout {
+    pub stride: usize,
+    pub address_offset: usize,
+    pub length_offset: Option<usize>,
+    pub status_offset: Option<usize>,
+    pub completion_status_mask: u8,
+    pub min_buffer_probe_len: u64,
+}
+
+/// Observation produced from a live descriptor ring.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FixedDescriptorObservation {
+    pub descriptor_count: u64,
+    pub trailing_bytes: u64,
+    pub descriptors_with_device_address: u64,
+    pub descriptors_with_decodable_buffer: u64,
+    pub descriptors_with_length: u64,
+    pub completed_descriptors: u64,
+    pub malformed_descriptors: u64,
+}
+
 /// The canonical DMA state.
 pub struct DmaManager {
     adapters: Vec<Adapter>,
@@ -326,7 +350,12 @@ impl DmaManager {
             .iter()
             .filter(|c| c.active && c.owner == owner)
         {
-            if logical >= cb.logical_base && logical + length <= cb.logical_base + cb.length {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let cb_end = cb
+                .logical_base
+                .checked_add(cb.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= cb.logical_base && end <= cb_end {
                 return Ok(cb.backing_va + (logical - cb.logical_base));
             }
         }
@@ -335,7 +364,12 @@ impl DmaManager {
             .iter()
             .filter(|m| m.active && m.owner == owner)
         {
-            if logical >= m.logical_base && logical + length <= m.logical_base + m.length {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let map_end = m
+                .logical_base
+                .checked_add(m.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= m.logical_base && end <= map_end {
                 return Ok(m.backing_va + (logical - m.logical_base));
             }
         }
@@ -347,16 +381,99 @@ impl DmaManager {
     /// remain unambiguous.
     pub fn decode_logical(&self, logical: u64, length: u64) -> Result<u64, DmaError> {
         for cb in self.common_buffers.iter().filter(|c| c.active) {
-            if logical >= cb.logical_base && logical + length <= cb.logical_base + cb.length {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let cb_end = cb
+                .logical_base
+                .checked_add(cb.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= cb.logical_base && end <= cb_end {
                 return Ok(cb.backing_va + (logical - cb.logical_base));
             }
         }
         for m in self.mappings.iter().filter(|m| m.active) {
-            if logical >= m.logical_base && logical + length <= m.logical_base + m.length {
+            let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+            let map_end = m
+                .logical_base
+                .checked_add(m.length)
+                .ok_or(DmaError::OutOfRange)?;
+            if logical >= m.logical_base && end <= map_end {
                 return Ok(m.backing_va + (logical - m.logical_base));
             }
         }
         Err(DmaError::LogicalViolation)
+    }
+
+    /// Observe a live fixed-size descriptor ring through the same owner-scoped
+    /// logical-address decoder that a simulated device uses. The ring itself must be
+    /// a live DMA object for `owner`; every non-zero descriptor buffer address is
+    /// counted as decodable only if it resolves inside that owner's DMA domain.
+    pub fn observe_fixed_descriptor_ring(
+        &self,
+        owner: DmaOwner,
+        descriptor_logical: u64,
+        descriptor_backing_va: u64,
+        ring: &[u8],
+        layout: FixedDescriptorLayout,
+    ) -> Result<FixedDescriptorObservation, DmaError> {
+        if ring.is_empty()
+            || layout.stride == 0
+            || layout.address_offset.checked_add(8).is_none()
+            || layout.address_offset + 8 > layout.stride
+            || layout
+                .length_offset
+                .map(|offset| offset.checked_add(2).is_none() || offset + 2 > layout.stride)
+                .unwrap_or(false)
+            || layout
+                .status_offset
+                .map(|offset| offset >= layout.stride)
+                .unwrap_or(false)
+            || layout.min_buffer_probe_len == 0
+        {
+            return Err(DmaError::OutOfRange);
+        }
+        let ring_len = ring.len() as u64;
+        let decoded_ring = self.decode_owner_logical(owner, descriptor_logical, ring_len)?;
+        if decoded_ring != descriptor_backing_va {
+            return Err(DmaError::LogicalViolation);
+        }
+
+        let descriptor_count = ring.len() / layout.stride;
+        let mut observation = FixedDescriptorObservation {
+            descriptor_count: descriptor_count as u64,
+            trailing_bytes: (ring.len() % layout.stride) as u64,
+            ..FixedDescriptorObservation::default()
+        };
+        let mut index = 0usize;
+        while index < descriptor_count {
+            let base = index * layout.stride;
+            let address = read_le_u64(&ring[base + layout.address_offset..]);
+            let length = layout
+                .length_offset
+                .map(|offset| read_le_u16(&ring[base + offset..]) as u64)
+                .unwrap_or(layout.min_buffer_probe_len);
+            if length != 0 {
+                observation.descriptors_with_length += 1;
+            }
+            if let Some(offset) = layout.status_offset {
+                if ring[base + offset] & layout.completion_status_mask != 0 {
+                    observation.completed_descriptors += 1;
+                }
+            }
+            if address != 0 {
+                observation.descriptors_with_device_address += 1;
+                let probe_len = if length == 0 {
+                    layout.min_buffer_probe_len
+                } else {
+                    length
+                };
+                match self.decode_owner_logical(owner, address, probe_len) {
+                    Ok(_) => observation.descriptors_with_decodable_buffer += 1,
+                    Err(_) => observation.malformed_descriptors += 1,
+                }
+            }
+            index += 1;
+        }
+        Ok(observation)
     }
 
     /// `MapTransfer` (spec §12.2): map a `[backing_va, backing_va+length)` slice to a
@@ -480,6 +597,16 @@ impl DmaManager {
         }
         (b, m)
     }
+}
+
+fn read_le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn read_le_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 #[cfg(test)]
@@ -677,5 +804,77 @@ mod tests {
             d.decode_logical(g.logical_base, 4),
             Err(DmaError::LogicalViolation)
         );
+    }
+
+    #[test]
+    fn observes_descriptor_ring_with_owner_decoded_buffers() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 8192, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 64, 0x20_0000)
+            .unwrap();
+        d.register_common_buffer_at(owner(), adapter, 0x8000, 4096, 0x30_0000)
+            .unwrap();
+
+        let mut ring = [0u8; 64];
+        ring[0..8].copy_from_slice(&0x8000u64.to_le_bytes());
+        ring[8..10].copy_from_slice(&128u16.to_le_bytes());
+        ring[12] = 1;
+        ring[16..24].copy_from_slice(&0x8800u64.to_le_bytes());
+
+        let observation = d
+            .observe_fixed_descriptor_ring(
+                owner(),
+                0x4000,
+                0x20_0000,
+                &ring,
+                FixedDescriptorLayout {
+                    stride: 16,
+                    address_offset: 0,
+                    length_offset: Some(8),
+                    status_offset: Some(12),
+                    completion_status_mask: 1,
+                    min_buffer_probe_len: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(observation.descriptor_count, 4);
+        assert_eq!(observation.descriptors_with_device_address, 2);
+        assert_eq!(observation.descriptors_with_decodable_buffer, 2);
+        assert_eq!(observation.descriptors_with_length, 1);
+        assert_eq!(observation.completed_descriptors, 1);
+        assert_eq!(observation.malformed_descriptors, 0);
+    }
+
+    #[test]
+    fn descriptor_observation_rejects_unowned_buffers() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 4096, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 16, 0x20_0000)
+            .unwrap();
+
+        let mut ring = [0u8; 16];
+        ring[0..8].copy_from_slice(&0x9000u64.to_le_bytes());
+
+        let observation = d
+            .observe_fixed_descriptor_ring(
+                owner(),
+                0x4000,
+                0x20_0000,
+                &ring,
+                FixedDescriptorLayout {
+                    stride: 16,
+                    address_offset: 0,
+                    length_offset: Some(8),
+                    status_offset: Some(12),
+                    completion_status_mask: 1,
+                    min_buffer_probe_len: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(observation.descriptors_with_device_address, 1);
+        assert_eq!(observation.descriptors_with_decodable_buffer, 0);
+        assert_eq!(observation.malformed_descriptors, 1);
     }
 }

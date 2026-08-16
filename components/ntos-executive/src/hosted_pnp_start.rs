@@ -52,6 +52,18 @@ impl HostedPnpResourceVaAllocator {
         Some(va)
     }
 
+    pub(crate) fn allocate_root_seed_span(&mut self, bytes: u64) -> Option<u64> {
+        let slots = hosted_window_slots_for_bytes(bytes)?;
+        let va = hosted_window_span_va(
+            HOSTED_ROOT_SEED_VA_BASE,
+            HOSTED_ROOT_SEED_VA_LIMIT,
+            self.root_seed_slots,
+            slots,
+        )?;
+        self.root_seed_slots = self.root_seed_slots.checked_add(slots)?;
+        Some(va)
+    }
+
     pub(crate) fn allocate_root_dma_logical(&mut self) -> Option<u64> {
         let logical = HOSTED_ROOT_DMA_LOGICAL_BASE.checked_add(
             self.root_dma_logical_slots
@@ -97,6 +109,7 @@ pub(crate) struct HostedPnpPciResourceWindow {
     pub(crate) dma_frame_base: u64,
     pub(crate) dma_pages: u64,
     pub(crate) dma_va: u64,
+    pub(crate) dma_seed_va: u64,
     pub(crate) dma_logical: u64,
     pub(crate) dma_len: u64,
 }
@@ -116,6 +129,7 @@ impl HostedPnpPciResourceWindow {
         dma_frame_base: u64,
         dma_pages: u64,
         dma_va: u64,
+        dma_seed_va: u64,
         dma_logical: u64,
         dma_len: u64,
     ) -> Option<Self> {
@@ -125,6 +139,7 @@ impl HostedPnpPciResourceWindow {
         let has_dma = dma_frame_base != 0
             || dma_pages != 0
             || dma_va != 0
+            || dma_seed_va != 0
             || dma_logical != 0
             || dma_len != 0;
         if (!has_dma && dma_va != 0)
@@ -132,6 +147,7 @@ impl HostedPnpPciResourceWindow {
                 && (dma_frame_base == 0
                     || dma_pages == 0
                     || dma_va == 0
+                    || dma_seed_va == 0
                     || dma_logical == 0
                     || dma_len == 0))
         {
@@ -150,6 +166,7 @@ impl HostedPnpPciResourceWindow {
             dma_frame_base,
             dma_pages,
             dma_va,
+            dma_seed_va,
             dma_logical,
             dma_len,
         })
@@ -167,12 +184,14 @@ impl HostedPnpPciResourceWindow {
         let has_dma = self.dma_va != 0
             || self.dma_frame_base != 0
             || self.dma_pages != 0
+            || self.dma_seed_va != 0
             || self.dma_logical != 0
             || self.dma_len != 0;
         !has_dma
             || (self.dma_va != 0
                 && self.dma_frame_base != 0
                 && self.dma_pages != 0
+                && self.dma_seed_va != 0
                 && self.dma_logical != 0
                 && self.dma_len != 0)
     }
@@ -289,6 +308,7 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dpc_delivered: bool,
     pub(crate) dma_adapter: bool,
     pub(crate) dma_common: bool,
+    pub(crate) dma_packet_descriptors: bool,
     pub(crate) io_port_out32: bool,
     pub(crate) root_started: bool,
     pub(crate) video_route_published: bool,
@@ -303,6 +323,7 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dpc_delivered_count: u64,
     pub(crate) dma_adapter_count: u64,
     pub(crate) dma_common_count: u64,
+    pub(crate) dma_packet_descriptor_count: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) video_route_attempted_count: u64,
@@ -690,6 +711,7 @@ fn collect_hardware_evidence(
             report.dpc_delivered |= evidence.dpc_delivered();
             report.dma_adapter |= evidence.dma_adapter_created();
             report.dma_common |= evidence.dma_common_allocated();
+            report.dma_packet_descriptors |= evidence.dma_packet_descriptors_observed();
             report.io_port_out32 |= evidence.io_port_out32_serviced();
             report.root_started |= evidence.root_pdo_started;
             if evidence.mmio_mapped() {
@@ -709,6 +731,9 @@ fn collect_hardware_evidence(
             }
             if evidence.dma_common_allocated() {
                 report.dma_common_count += 1;
+            }
+            if evidence.dma_packet_descriptors_observed() {
+                report.dma_packet_descriptor_count += 1;
             }
             if evidence.io_port_out32_serviced() {
                 report.io_port_out32_count += 1;
@@ -919,6 +944,22 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_common_allocated() as u64);
     print_str(b" dma_len=");
     print_u64(evidence.dma_common_len);
+    print_str(b" dma_desc=");
+    print_u64(evidence.dma_packet_descriptors_observed() as u64);
+    print_str(b" dma_desc_rings=");
+    print_u64(evidence.dma_descriptor_rings);
+    print_str(b" dma_desc_addr/ok=");
+    print_u64(evidence.dma_descriptor_addresses);
+    print_str(b"/");
+    print_u64(evidence.dma_descriptor_decodable);
+    print_str(b" dma_desc_len/done=");
+    print_u64(evidence.dma_descriptor_lengths);
+    print_str(b"/");
+    print_u64(evidence.dma_descriptor_completed);
+    print_str(b" dma_desc_bad/fail=");
+    print_u64(evidence.dma_descriptor_malformed);
+    print_str(b"/");
+    print_u64(evidence.dma_descriptor_observation_failures);
     print_str(b" io_out32=");
     print_u64(evidence.io_port_out32_serviced() as u64);
     print_str(b" io_out32_count=");

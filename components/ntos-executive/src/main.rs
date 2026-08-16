@@ -2964,6 +2964,8 @@ const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_BADGED_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static HPET_PROBE_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
 static DELAY_TIMER_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
 static KUSER_CLOCK_INIT_OK: AtomicBool = AtomicBool::new(false);
@@ -11736,6 +11738,44 @@ unsafe fn alloc_seeded_root_dma_mmio_frame(seed_va: u64) -> u64 {
     frame
 }
 
+unsafe fn map_hosted_pci_dma_root_alias(frame_base: u64, pages: u64, alias_va: u64) -> bool {
+    if frame_base == 0 || pages == 0 || alias_va == 0 {
+        return false;
+    }
+    for window in 0..pages.div_ceil(512).max(1) {
+        if !ensure_executive_paging(alias_va + window * 0x20_0000) {
+            return false;
+        }
+    }
+    let mut page = 0u64;
+    while page < pages {
+        let source_cap = frame_base + page;
+        let (map_cap, copy_error) = copy_cap_r(source_cap);
+        let frame_cap = if copy_error == 0 { map_cap } else { source_cap };
+        let map_error = page_map_r(
+            frame_cap,
+            alias_va + page * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        );
+        if map_error != 0 {
+            if copy_error == 0 {
+                let _ = cnode_delete_recycle_r(map_cap);
+            }
+            print_str(b"[driver-launch] hosted PCI DMA root alias map failed page=");
+            print_u64(page);
+            print_str(b"/");
+            print_u64(pages);
+            print_str(b" label=");
+            print_u64(map_error);
+            print_str(b"\n");
+            return false;
+        }
+        page += 1;
+    }
+    true
+}
+
 enum HostedDevnodeGrantKind {
     Pci { dev: u8, func: u8 },
     RootBus,
@@ -11857,6 +11897,7 @@ where
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
             window.dma_va,
+            window.dma_seed_va,
             window.dma_frame_base,
             window.dma_pages,
             window.dma_logical,
@@ -11922,6 +11963,7 @@ where
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
             window.dma_va,
+            0,
             window.dma_frame_base,
             window.dma_pages,
             window.dma_logical,
@@ -13176,6 +13218,19 @@ fn release_reply_pool_cap(cap: u64) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundNotificationInjection {
+    NotArmed,
+    TemporaryNotification,
+    DelayTimerNotification,
+}
+
+impl BoundNotificationInjection {
+    const fn armed(self) -> bool {
+        !matches!(self, Self::NotArmed)
+    }
+}
+
 /// ★ NEGATIVE CONTROL for `spawn_hosts::pump_recv`'s bound-notification screening (Phase 4).
 ///
 /// Reproduce, deterministically and without touching the HPET, the delivery that WALLED npfs on the
@@ -13186,23 +13241,40 @@ fn release_reply_pool_cap(cap: u64) {
 /// reads `label = 0` with MR0 still holding the request tag it just replied with — and suspends +
 /// retires the component.
 ///
-/// Mint a notification badged **`DELAY_TIMER_BADGE`** (the pump screens on exactly that badge, so
-/// this exercises the production path, not a test-only one), bind it to the root TCB, signal it, and
+/// Signal the production delay-timer notification when it already exists. Otherwise, mint a temporary
+/// notification badged **`DELAY_TIMER_BADGE`** (the pump screens on exactly that badge, so this
+/// exercises the production path, not a test-only one), bind it to the root TCB, signal it, and
 /// return. The caller then runs a REAL component dispatch, whose first `pump_recv` takes the
-/// delivery. We unbind immediately: the notification is now Active-and-consumed by that recv, and
-/// leaving a stray binding would let it interact with `delay_timer_init`'s own later bind.
+/// delivery. We unbind only a temporary notification; if the real delay timer is already active,
+/// tearing down the production binding would remove the boot's timer/deadman wake path.
 ///
 /// Deliberately does NOT use the HPET: no comparator is armed, no IOAPIC route is claimed and no IRQ
-/// is left needing an Ack, so the injection cannot perturb the real delay-timer plane (which the
-/// LSA route DOES now initialise — this injection stays independent of it by construction).
-unsafe fn inject_bound_notification_tick() -> bool {
+/// is left needing an Ack, so the temporary injection cannot perturb the real delay-timer plane.
+unsafe fn inject_bound_notification_tick() -> BoundNotificationInjection {
+    let timer_badged = DELAY_TIMER_BADGED_NOTIFICATION.load(Ordering::Relaxed);
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 && timer_badged != 0 {
+        let notification = DELAY_TIMER_NOTIFICATION.load(Ordering::Relaxed);
+        if notification != 0 {
+            let _ = syscall5(
+                SYS_SEND,
+                1,
+                LBL_TCB_BIND_NOTIFICATION << 12,
+                notification,
+                0,
+                0,
+            );
+        }
+        let _ = syscall5(SYS_SEND, timer_badged, 0, 0, 0, 0);
+        return BoundNotificationInjection::DelayTimerNotification;
+    }
+
     let notification = make_object(OBJ_NOTIFICATION);
     if notification == 0 {
-        return false;
+        return BoundNotificationInjection::NotArmed;
     }
     let badged = alloc_slot();
     if badged == 0 {
-        return false;
+        return BoundNotificationInjection::NotArmed;
     }
     let mint = syscall5(
         SYS_SEND,
@@ -13225,13 +13297,22 @@ unsafe fn inject_bound_notification_tick() -> bool {
     // becomes Active with our badge and the next blocking Recv on ANY endpoint returns it.
     let signal = syscall5(SYS_SEND, badged, 0, 0, 0, 0);
     let _ = (mint, bind, signal);
-    true
+    BoundNotificationInjection::TemporaryNotification
 }
 
 /// Undo [`inject_bound_notification_tick`]'s binding once the dispatch under test has consumed the
 /// delivery, so nothing else on the boot can be interrupted by it.
-unsafe fn retract_bound_notification_tick() {
-    let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
+unsafe fn cleanup_bound_notification_tick(
+    injection: BoundNotificationInjection,
+    pending_before: u64,
+) {
+    let pending_after = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
+    if pending_after > pending_before {
+        DELAY_TIMER_TICKS_PENDING.store(pending_after - 1, Ordering::Relaxed);
+    }
+    if injection == BoundNotificationInjection::TemporaryNotification {
+        let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
+    }
 }
 
 fn ioapic_route_pin_mask(pin: u64) -> u32 {
@@ -13256,6 +13337,19 @@ fn select_delay_hpet_route_pin(route_cap: u32, used_mask: u32) -> Option<u64> {
 
 unsafe fn delay_timer_init() -> bool {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 {
+        let notification = DELAY_TIMER_NOTIFICATION.load(Ordering::Relaxed);
+        if notification != 0 {
+            // `delay_timer_shutdown` may temporarily unbind the root TCB when no timed waits are
+            // live. Re-establish the production binding whenever a later wait reuses the timer.
+            let _ = syscall5(
+                SYS_SEND,
+                1,
+                LBL_TCB_BIND_NOTIFICATION << 12,
+                notification,
+                0,
+                0,
+            );
+        }
         return true;
     }
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
@@ -13316,6 +13410,8 @@ unsafe fn delay_timer_init() -> bool {
     let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
+    DELAY_TIMER_NOTIFICATION.store(notification, Ordering::Relaxed);
+    DELAY_TIMER_BADGED_NOTIFICATION.store(badged, Ordering::Relaxed);
     DELAY_TIMER_IOAPIC_PIN.store(pin, Ordering::Relaxed);
     print_str(b"[delay] timer ready pin=");
     print_u64(pin);
@@ -16478,6 +16574,27 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     } else {
                         0
                     };
+                    let dma_seed_va = if needs_dma {
+                        let Some(dma_bytes) = grant.dma_pages.checked_mul(0x1000) else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        let Some(seed_va) = resource_vas.allocate_root_seed_span(dma_bytes) else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        if !map_hosted_pci_dma_root_alias(
+                            grant.dma_frame_base,
+                            grant.dma_pages,
+                            seed_va,
+                        ) {
+                            report.missing_grants += 1;
+                            continue;
+                        }
+                        seed_va
+                    } else {
+                        0
+                    };
                     let Some(window) = HostedPnpPciResourceWindow::new(
                         device.bus,
                         device.dev,
@@ -16491,6 +16608,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         grant.dma_frame_base,
                         grant.dma_pages,
                         dma_va,
+                        dma_seed_va,
                         grant.dma_logical,
                         grant.dma_len,
                     ) else {
@@ -26005,7 +26123,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // ★★ NEGATIVE-CONTROL INJECTION (Phase 4): make a BOUND-NOTIFICATION delivery land
                 // on this dispatch's pump recv, deliberately. See `inject_bound_notification_tick`.
                 let tick_absorbed_before = PUMP_TIMER_TICKS_ABSORBED.load(Ordering::Relaxed);
-                let tick_armed = inject_bound_notification_tick();
+                let tick_pending_before = DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed);
+                let tick_injection = inject_bound_notification_tick();
                 let rt = driver_launch::dispatch_irp_to_driver(
                     dc.driver_id,
                     0, /* IRP_MJ_CREATE */
@@ -26020,8 +26139,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // The injected tick is SYNTHETIC — there is no HPET IRQ to Ack and no delay queue to
                 // service — so consume the latch here instead of leaving the service loop a
                 // spurious `delay_timer_interrupt`.
-                DELAY_TIMER_TICKS_PENDING.store(0, Ordering::Relaxed);
-                retract_bound_notification_tick();
+                cleanup_bound_notification_tick(tick_injection, tick_pending_before);
                 let mut irp_ok = false;
                 if let Some((st, info)) = rt {
                     print_str(b"[driver-launch] lifecycle driver-id=");
@@ -26063,11 +26181,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // component. Observed exactly so on the first LSA-route boot: `[pump] WALL label=0
                 // ip=0x771`, npfs dead mid-boot, the route's `\lsarpc` READ failing ever after.
                 //
-                // THE INJECTION IS THE NEGATIVE CONTROL. It mints a notification badged
-                // `DELAY_TIMER_BADGE`, binds it to the root TCB, signals it, and THEN runs the real
-                // service-selected IRP dispatch above — so the delivery lands on that dispatch's
-                // very first `pump_recv`, which is precisely the shape that walled npfs. Two things
-                // must both hold, and neither can hold without the screening:
+                // THE INJECTION IS THE NEGATIVE CONTROL. It signals the production delay-timer
+                // notification if one already exists, otherwise it mints a temporary notification
+                // badged `DELAY_TIMER_BADGE`, binds it to the root TCB, signals it, and THEN runs
+                // the real service-selected IRP dispatch above — so the delivery lands on that
+                // dispatch's very first `pump_recv`, which is precisely the shape that walled npfs.
+                // Two things must both hold, and neither can hold without the screening:
                 //   * the pump SAW it (`PUMP_TIMER_TICKS_ABSORBED` moved) — otherwise the injection
                 //     did not reproduce the condition and the spec would be vacuous;
                 //   * the dispatch nevertheless COMPLETED with the driver's own answer
@@ -26080,7 +26199,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // `exec_driver_lifecycle_dispatch_via_harness` fail. So the injection reproduces
                 // the real defect, and the spec is not vacuous.
                 print_str(b"[pump-ntfn] injected bound-notification tick: armed=");
-                print_u64(tick_armed as u64);
+                print_u64(tick_injection.armed() as u64);
                 print_str(b" absorbed-by-pump=");
                 print_u64(tick_absorbed);
                 print_str(b" dispatch-still-completed=");
@@ -26088,7 +26207,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(
                     b"exec_pump_screens_bound_notification",
-                    tick_armed && tick_absorbed >= 1 && irp_ok,
+                    tick_injection.armed() && tick_absorbed >= 1 && irp_ok,
                     &mut passed,
                 );
 
@@ -26153,6 +26272,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dpc_delivered = false;
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
+    let mut generic_hw_dma_packet_descriptors = false;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
@@ -26254,6 +26374,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_dpc_delivered |= start_report.dpc_delivered;
                         generic_hw_dma_adapter |= start_report.dma_adapter;
                         generic_hw_dma_common |= start_report.dma_common;
+                        generic_hw_dma_packet_descriptors |= start_report.dma_packet_descriptors;
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -26307,6 +26428,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_root_started);
         print_str(b" io_out32=");
         print_u64(generic_hw_io_out32 as u64);
+        print_str(b" dma_desc=");
+        print_u64(generic_hw_dma_packet_descriptors as u64);
         print_str(b" video_route=");
         print_u64(generic_hw_video_route_published as u64);
         print_str(b" video_route_attempted=");
@@ -26375,6 +26498,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_generic_hw_dpc_delivered",
         generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
+        &mut passed,
+    );
+    check(
+        b"exec_generic_hw_dma_packet_descriptors",
+        generic_hw_dma_common && generic_hw_dma_packet_descriptors,
         &mut passed,
     );
 

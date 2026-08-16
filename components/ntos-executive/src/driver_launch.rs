@@ -28,7 +28,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
-use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner};
+use nt_dma_manager::{
+    DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
+};
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
@@ -15693,6 +15695,14 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_requested_len: u64,
     pub dma_allocated_va: u64,
     pub dma_allocated_logical: u64,
+    pub dma_descriptor_rings: u64,
+    pub dma_descriptor_records: u64,
+    pub dma_descriptor_addresses: u64,
+    pub dma_descriptor_decodable: u64,
+    pub dma_descriptor_lengths: u64,
+    pub dma_descriptor_completed: u64,
+    pub dma_descriptor_malformed: u64,
+    pub dma_descriptor_observation_failures: u64,
     pub root_pdo_started: bool,
     pub video_initialized: bool,
     pub video_find_adapter_calls: u64,
@@ -15743,6 +15753,14 @@ impl HostedHardwareEvidence {
         self.dma_allocated_va != 0 && self.dma_allocated_logical != 0 && self.dma_requested_len != 0
     }
 
+    pub(crate) fn dma_packet_descriptors_observed(self) -> bool {
+        self.dma_descriptor_rings != 0
+            && self.dma_descriptor_decodable >= 2
+            && self.dma_descriptor_decodable == self.dma_descriptor_addresses
+            && self.dma_descriptor_malformed == 0
+            && self.dma_descriptor_observation_failures == 0
+    }
+
     pub(crate) fn io_port_out32_serviced(self) -> bool {
         self.resource_io_port_len != 0
             && self.resource_io_port_cap != 0
@@ -15771,6 +15789,7 @@ struct HostedDeviceResourceState {
     pci_class_rev: u32,
     pci_irq: u32,
     io_port_base: u64,
+    dma_broker_va: u64,
     video_memory_phys: u64,
     video_memory_len: u64,
     video_memory_caller_va: u64,
@@ -16279,6 +16298,14 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             dma_requested_len: read_volatile((sh + SH_DMA_REQUESTED_LEN) as *const u64),
             dma_allocated_va: read_volatile((sh + SH_DMA_ALLOCATED_VA) as *const u64),
             dma_allocated_logical: read_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *const u64),
+            dma_descriptor_rings: 0,
+            dma_descriptor_records: 0,
+            dma_descriptor_addresses: 0,
+            dma_descriptor_decodable: 0,
+            dma_descriptor_lengths: 0,
+            dma_descriptor_completed: 0,
+            dma_descriptor_malformed: 0,
+            dma_descriptor_observation_failures: 0,
             root_pdo_started,
             video_initialized: read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0,
             video_find_adapter_calls: read_volatile(
@@ -16332,6 +16359,9 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
         pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
         io_port_base: read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64),
+        dma_broker_va: hosted_device_resource_state_by_device_id(binding.device_id)
+            .map(|state| state.dma_broker_va)
+            .unwrap_or(0),
         video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
         video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
         video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
@@ -16615,15 +16645,154 @@ pub(crate) unsafe fn refresh_hosted_resource_state_for_shared(shared_va: u64) {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct HostedDmaPacketDescriptorEvidence {
+    rings: u64,
+    records: u64,
+    addresses: u64,
+    decodable: u64,
+    lengths: u64,
+    completed: u64,
+    malformed: u64,
+    failures: u64,
+}
+
+const HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT: FixedDescriptorLayout = FixedDescriptorLayout {
+    stride: 16,
+    address_offset: 0,
+    length_offset: Some(8),
+    status_offset: Some(12),
+    completion_status_mask: 1,
+    min_buffer_probe_len: 1,
+};
+
+unsafe fn observe_hosted_dma_packet_descriptors(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) -> HostedDmaPacketDescriptorEvidence {
+    let mut evidence = HostedDmaPacketDescriptorEvidence::default();
+    if state.dma_broker_va == 0
+        || state.evidence.dma_common_va == 0
+        || state.evidence.dma_common_logical == 0
+        || state.evidence.dma_common_len == 0
+    {
+        return evidence;
+    }
+    let record_capacity = dma_allocation_record_capacity(sh);
+    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if record_capacity == 0 || record_count > record_capacity {
+        evidence.failures = evidence.failures.saturating_add(1);
+        return evidence;
+    }
+    let owner = hosted_dma_owner(binding);
+    let grant_va = state.evidence.dma_common_va;
+    let grant_logical = state.evidence.dma_common_logical;
+    let grant_len = state.evidence.dma_common_len;
+    let mut index = 0u64;
+    while index < record_count {
+        let Some(record) = dma_allocation_record(sh, index) else {
+            evidence.failures = evidence.failures.saturating_add(1);
+            return evidence;
+        };
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if kind != HOSTED_DMA_RECORD_KIND_COMMON || logical == 0 || va == 0 || len < 16 {
+            index += 1;
+            continue;
+        }
+        let Some(logical_offset) = logical.checked_sub(grant_logical) else {
+            evidence.failures = evidence.failures.saturating_add(1);
+            index += 1;
+            continue;
+        };
+        let Some(va_offset) = va.checked_sub(grant_va) else {
+            evidence.failures = evidence.failures.saturating_add(1);
+            index += 1;
+            continue;
+        };
+        if logical_offset != va_offset || logical_offset > grant_len || len > grant_len - logical_offset
+        {
+            evidence.failures = evidence.failures.saturating_add(1);
+            index += 1;
+            continue;
+        }
+        let Some(alias_va) = state.dma_broker_va.checked_add(va_offset) else {
+            evidence.failures = evidence.failures.saturating_add(1);
+            index += 1;
+            continue;
+        };
+        if len > usize::MAX as u64 {
+            evidence.failures = evidence.failures.saturating_add(1);
+            index += 1;
+            continue;
+        }
+        let ring = core::slice::from_raw_parts(alias_va as *const u8, len as usize);
+        match hosted_dma_manager_mut().observe_fixed_descriptor_ring(
+            owner,
+            logical,
+            va,
+            ring,
+            HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT,
+        ) {
+            Ok(observation) => {
+                if observation.descriptors_with_decodable_buffer != 0
+                    || observation.completed_descriptors != 0
+                {
+                    evidence.rings = evidence.rings.saturating_add(1);
+                    evidence.records = evidence
+                        .records
+                        .saturating_add(observation.descriptor_count);
+                    evidence.addresses = evidence
+                        .addresses
+                        .saturating_add(observation.descriptors_with_device_address);
+                    evidence.decodable = evidence
+                        .decodable
+                        .saturating_add(observation.descriptors_with_decodable_buffer);
+                    evidence.lengths = evidence
+                        .lengths
+                        .saturating_add(observation.descriptors_with_length);
+                    evidence.completed = evidence
+                        .completed
+                        .saturating_add(observation.completed_descriptors);
+                    evidence.malformed = evidence
+                        .malformed
+                        .saturating_add(observation.malformed_descriptors);
+                }
+            }
+            Err(_) => {
+                evidence.failures = evidence.failures.saturating_add(1);
+            }
+        }
+        index += 1;
+    }
+    evidence
+}
+
 pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
     let binding = hosted_device_binding_by_device_id(device_id)?;
-    let mut evidence = unsafe { hosted_device_resource_state_by_device_id(device_id)?.evidence };
+    let state = unsafe { hosted_device_resource_state_by_device_id(device_id)? };
+    let mut evidence = state.evidence;
     evidence.root_pdo_started = unsafe {
         (*core::ptr::addr_of!(HOSTED_ROOT_BUS))
             .as_ref()
             .map(|bus| bus.pdo_started(binding.pdo_object))
             .unwrap_or(false)
     };
+    if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
+        let descriptors =
+            unsafe { observe_hosted_dma_packet_descriptors(binding, state, inst.exec_shared_va) };
+        evidence.dma_descriptor_rings = descriptors.rings;
+        evidence.dma_descriptor_records = descriptors.records;
+        evidence.dma_descriptor_addresses = descriptors.addresses;
+        evidence.dma_descriptor_decodable = descriptors.decodable;
+        evidence.dma_descriptor_lengths = descriptors.lengths;
+        evidence.dma_descriptor_completed = descriptors.completed;
+        evidence.dma_descriptor_malformed = descriptors.malformed;
+        evidence.dma_descriptor_observation_failures = descriptors.failures;
+    }
     Some(evidence)
 }
 
@@ -18600,6 +18769,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     interrupt_latched: bool,
     interrupt_affinity: u64,
     dma_va: u64,
+    dma_broker_va: u64,
     dma_frame_base: u64,
     dma_pages: u64,
     dma_logical: u64,
@@ -18636,6 +18806,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             || dma_pages == 0
             || dma_logical == 0
             || dma_len == 0)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if has_dma
+        && bus_identity.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS
+        && dma_broker_va == 0
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -18892,6 +19068,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
     write_volatile((sh + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
     clear_dma_allocation_records(sh);
+    refresh_hosted_device_resource_state(binding, sh);
+    if let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id == binding.device_id)
+    {
+        state.dma_broker_va = dma_broker_va;
+    }
     Ok(())
 }
 

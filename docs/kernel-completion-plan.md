@@ -41,6 +41,24 @@ invariants from the real workload. The latest ntdll loader-list cleanup also rem
 `userinit.exe` to `explorer.exe` shell path without adding kernel launch policy.
 
 Latest accepted desktop proof (2026-08-16):
+`.tmp/run-headless-b3-dma-packet-desc-timerbind-20260816.log` reaches the harness sentinel with
+`297/297` executive-to-isolated-service checks passing after the generic hosted DMA descriptor
+observation slice and timer proof binding cleanup. The production delay-timer notification remains
+bound when the lifecycle proof injects a bound-notification tick after timer initialization, so
+`exec_pump_screens_bound_notification` passes without breaking the real timer route. The same proof
+keeps the full desktop stack green: real profile hive copy/load, `WlxActivateUserShell`,
+`userinit.exe`, `explorer.exe`, shell COM class opens, 887 real user callbacks, 246 GDI user-batch
+flushes, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports `786432/786432`
+non-background pixels with at least 32 distinct non-background colors. The B3 hardware evidence now
+also proves generic fixed DMA packet descriptor observation for the registry-selected PCI `E1000`
+path: `dma_desc=1`, `dma_desc_rings=1`, and `dma_desc_addr/ok=128/128`, with
+`exec_generic_hw_dma_packet_descriptors` passing. Validation for this slice: `cargo fmt --all`,
+`cargo test -p nt-dma-manager`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and the
+serialized headless boot proof. Review adjustment: B3 can continue at real TX/RX completion and
+packet indication over the observed descriptor rings instead of descriptor discovery.
+
+Previous accepted desktop proof (2026-08-16):
 `.tmp/run-headless-ntdll-rtlpc-20260816.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after `RtlPcToFileHeader` was moved to ReactOS/NT-style
 direct `InLoadOrderModuleList` lookup and `LdrFindEntryForAddress` was hardened to trust
@@ -6661,3 +6679,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   descriptor completion and interrupt/DPC delivery over the existing PCI/IOMMU grants. If it still
   stalls, capture the first exact miniport wait/poll site and implement the next missing generic NT
   or bus primitive.
+
+  B3 generic hosted DMA packet-descriptor observation (2026-08-16): `nt-dma-manager` now has a
+  reusable fixed-descriptor-ring observer that decodes descriptor-owned device addresses back through
+  owner-scoped DMA mappings, counts length/status fields, and rejects malformed or unowned buffers
+  instead of accepting NIC-specific evidence. The hosted PCI DMA grant now publishes both the
+  component VA and a root/broker alias VA for the same grant frames, so executive evidence can inspect
+  driver-owned common buffers without reaching through the hosted component's VSpace. Hosted hardware
+  evidence scans real common-buffer allocation records, observes descriptor rings through the broker
+  alias, and reports aggregate descriptor counters through the existing PnP hardware proof. The
+  lifecycle bound-notification proof was also tightened: when the HPET delay timer has already been
+  initialized, the proof signals the production timer notification and leaves it bound instead of
+  unbinding the real timer route during cleanup. Validation: `cargo fmt --all`,
+  `cargo test -p nt-dma-manager`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, `git diff --check`, and
+  serialized headless boot proof `.tmp/run-headless-b3-dma-packet-desc-timerbind-20260816.log`.
+  The boot proof passes `exec_pump_screens_bound_notification`,
+  `exec_generic_hw_dma_packet_descriptors`, and `exec_explorer_shell_chrome_painted`, with E1000
+  evidence `dma_desc=1`, `dma_desc_rings=1`, and `dma_desc_addr/ok=128/128`. Review adjustment:
+  B3's descriptor-discovery step is closed. Continue with real TX/RX completion and packet
+  indication over the observed descriptor rings, keeping the path generic across multiple NICs and
+  any other hosted bus-master driver.
