@@ -194,6 +194,8 @@ pub struct HostedDispatcherWaiter {
     pub reply_cap: u64,
     pub objects: Vec<DispatcherObject>,
     pub wait_all: bool,
+    pub deadline_100ns: Option<u64>,
+    sequence: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -201,6 +203,13 @@ pub struct HostedDispatcherWake {
     pub thread_handle: u64,
     pub reply_cap: u64,
     pub wait_status_index: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HostedDispatcherTimeout {
+    pub thread_handle: u64,
+    pub reply_cap: u64,
+    pub deadline_100ns: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -223,6 +232,7 @@ pub enum HostedDispatcherWaitError {
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct HostedDispatcherWaitQueue {
     waiters: Vec<HostedDispatcherWaiter>,
+    next_sequence: u64,
 }
 
 impl HostedDispatcherWaitQueue {
@@ -233,6 +243,7 @@ impl HostedDispatcherWaitQueue {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             waiters: Vec::with_capacity(capacity),
+            next_sequence: 0,
         }
     }
 
@@ -246,6 +257,31 @@ impl HostedDispatcherWaitQueue {
         objects: &[DispatcherObject],
         wait_all: bool,
         timeout: DispatcherWaitTimeout,
+    ) -> Result<HostedDispatcherWaitAdmission, HostedDispatcherWaitError> {
+        self.admit_with_deadline(
+            events,
+            semaphores,
+            mutants,
+            thread_handle,
+            reply_cap,
+            objects,
+            wait_all,
+            timeout,
+            None,
+        )
+    }
+
+    pub fn admit_with_deadline(
+        &mut self,
+        events: &mut EventStore,
+        semaphores: &mut SemaphoreStore,
+        mutants: &mut MutantStore,
+        thread_handle: u64,
+        reply_cap: u64,
+        objects: &[DispatcherObject],
+        wait_all: bool,
+        timeout: DispatcherWaitTimeout,
+        deadline_100ns: Option<u64>,
     ) -> Result<HostedDispatcherWaitAdmission, HostedDispatcherWaitError> {
         if thread_handle == 0 {
             return Err(HostedDispatcherWaitError::InvalidThread);
@@ -290,7 +326,13 @@ impl HostedDispatcherWaitQueue {
             reply_cap,
             objects: parked_objects,
             wait_all,
+            deadline_100ns: match timeout {
+                DispatcherWaitTimeout::Blocking => deadline_100ns,
+                DispatcherWaitTimeout::Infinite | DispatcherWaitTimeout::Poll => None,
+            },
+            sequence: self.next_sequence,
         });
+        self.next_sequence = self.next_sequence.wrapping_add(1);
         Ok(HostedDispatcherWaitAdmission::Parked)
     }
 
@@ -337,6 +379,34 @@ impl HostedDispatcherWaitQueue {
             .iter()
             .position(|waiter| waiter.thread_handle == thread_handle)?;
         Some(self.waiters.remove(index))
+    }
+
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.waiters
+            .iter()
+            .filter_map(|waiter| waiter.deadline_100ns)
+            .min()
+    }
+
+    pub fn pop_due(&mut self, now_100ns: u64) -> Option<HostedDispatcherTimeout> {
+        let index = self
+            .waiters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, waiter)| {
+                waiter
+                    .deadline_100ns
+                    .filter(|deadline| *deadline <= now_100ns)
+                    .map(|deadline| (index, deadline, waiter.sequence))
+            })
+            .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
+            .map(|(index, _, _)| index)?;
+        let waiter = self.waiters.remove(index);
+        Some(HostedDispatcherTimeout {
+            thread_handle: waiter.thread_handle,
+            reply_cap: waiter.reply_cap,
+            deadline_100ns: waiter.deadline_100ns.unwrap_or(u64::MAX),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -477,6 +547,107 @@ mod tests {
         );
         assert!(!events.read_state(1));
         assert_eq!(semaphores.query(2), Some((0, 1)));
+    }
+
+    #[test]
+    fn timed_waits_report_next_deadline_and_pop_due_fifo() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Notification, false);
+        events.initialize(2, EventKind::Notification, false);
+        let mut waits = HostedDispatcherWaitQueue::new();
+        assert_eq!(
+            waits.admit_with_deadline(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                0x9000,
+                0x60,
+                &[DispatcherObject::Event(1)],
+                false,
+                DispatcherWaitTimeout::Blocking,
+                Some(30),
+            ),
+            Ok(HostedDispatcherWaitAdmission::Parked)
+        );
+        assert_eq!(
+            waits.admit_with_deadline(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                0x9001,
+                0x61,
+                &[DispatcherObject::Event(2)],
+                false,
+                DispatcherWaitTimeout::Blocking,
+                Some(20),
+            ),
+            Ok(HostedDispatcherWaitAdmission::Parked)
+        );
+        assert_eq!(
+            waits.admit_with_deadline(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                0x9002,
+                0x62,
+                &[DispatcherObject::Event(1)],
+                false,
+                DispatcherWaitTimeout::Blocking,
+                Some(20),
+            ),
+            Ok(HostedDispatcherWaitAdmission::Parked)
+        );
+        assert_eq!(waits.next_deadline(), Some(20));
+        assert_eq!(waits.pop_due(19), None);
+        assert_eq!(
+            waits.pop_due(20),
+            Some(HostedDispatcherTimeout {
+                thread_handle: 0x9001,
+                reply_cap: 0x61,
+                deadline_100ns: 20,
+            })
+        );
+        assert_eq!(
+            waits.pop_due(20),
+            Some(HostedDispatcherTimeout {
+                thread_handle: 0x9002,
+                reply_cap: 0x62,
+                deadline_100ns: 20,
+            })
+        );
+        assert_eq!(waits.next_deadline(), Some(30));
+    }
+
+    #[test]
+    fn signaled_timed_wait_wakes_normally_before_timeout() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Notification, false);
+        let mut waits = HostedDispatcherWaitQueue::new();
+        assert_eq!(
+            waits.admit_with_deadline(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                0x9000,
+                0x63,
+                &[DispatcherObject::Event(1)],
+                false,
+                DispatcherWaitTimeout::Blocking,
+                Some(50),
+            ),
+            Ok(HostedDispatcherWaitAdmission::Parked)
+        );
+        let _ = events.set(1);
+        assert_eq!(
+            waits.pop_ready(&mut events, &mut semaphores, &mut mutants),
+            Some(HostedDispatcherWake {
+                thread_handle: 0x9000,
+                reply_cap: 0x63,
+                wait_status_index: 0,
+            })
+        );
+        assert_eq!(waits.pop_due(50), None);
+        assert_eq!(waits.next_deadline(), None);
     }
 
     #[test]

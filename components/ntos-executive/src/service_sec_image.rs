@@ -1309,6 +1309,17 @@ unsafe fn clear_service_delay_drain_context() {
     SERVICE_DELAY_DRAIN_HANDLER.store(0, Ordering::Release);
 }
 
+pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
+        as *mut nt_delay_execution::Queue<DELAY_WAITER_N>;
+    if handler_ptr.is_null() || queue_ptr.is_null() || !delay_timer_init() {
+        return false;
+    }
+    delay_timer_rearm(&*queue_ptr);
+    true
+}
+
 pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     if DELAY_TIMER_HANDLER.load(Ordering::Acquire) == 0 {
         return false;

@@ -6407,3 +6407,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`. Review adjustment: rerun `git diff --check`, commit this slice, then either
   add real timed hosted-driver waits or run the serialized desktop proof to check the generic pump
   transport under the full ReactOS boot path.
+
+  B3 hosted driver timed-wait broker wiring (2026-08-16): finite hosted-driver
+  `KeWaitForSingleObject` and `KeWaitForMultipleObjects` calls now park as real timed waits instead
+  of failing closed. The component trampolines still dereference the caller's timeout pointer inside
+  the driver VSpace, but now send both the timeout class and raw `LARGE_INTEGER` value through the
+  bounded four-register component-service transport. The executive converts NT relative/absolute due
+  times through the shared delay-time helper, records per-wait monotonic deadlines with FIFO
+  sequencing, and completes due hosted-driver waits from the existing HPET delay-timer interrupt
+  path using the same reply-cap rotation/recycle path as event and semaphore wakeups. Timer rearm
+  now includes hosted-driver deadlines in the global min calculation and avoids shutdown while any
+  hosted-driver timed waiter remains live; driver-instance teardown also re-arms after removing
+  timed waiters. Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: the B3 wait-broker frontier is
+  now ready for a serialized `./run.sh --desktop` proof to see whether TCPIP/AFD and explorer
+  advance further, then fix the next generic kernel mechanism exposed by that boot rather than
+  adding service-specific launch or wait fallbacks.

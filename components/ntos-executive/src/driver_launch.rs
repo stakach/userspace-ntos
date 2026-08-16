@@ -530,6 +530,7 @@ static HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_PARKED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_WOKEN: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SET_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_PULSE_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_RELEASE_SEMAPHORE_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -7670,17 +7671,18 @@ unsafe fn hosted_dispatcher_wait_consume(
     }
 }
 
-unsafe fn hosted_wait_timeout_code(timeout: u64) -> u64 {
+unsafe fn hosted_wait_timeout_payload(timeout: u64) -> (u64, u64) {
     let timeout_value = if timeout == 0 {
         None
     } else {
         Some(read_unaligned(timeout as *const i64))
     };
-    match classify_dispatcher_wait_timeout(timeout_value) {
+    let timeout_code = match classify_dispatcher_wait_timeout(timeout_value) {
         DispatcherWaitTimeout::Infinite => 0,
         DispatcherWaitTimeout::Poll => 1,
         DispatcherWaitTimeout::Blocking => 2,
-    }
+    };
+    (timeout_code, timeout_value.unwrap_or(0) as u64)
 }
 
 fn hosted_wait_timeout_from_code(code: u64) -> DispatcherWaitTimeout {
@@ -7688,6 +7690,26 @@ fn hosted_wait_timeout_from_code(code: u64) -> DispatcherWaitTimeout {
         1 => DispatcherWaitTimeout::Poll,
         0 => DispatcherWaitTimeout::Infinite,
         _ => DispatcherWaitTimeout::Blocking,
+    }
+}
+
+fn hosted_driver_deadline_from_timeout(
+    timeout_code: u64,
+    timeout_arg: u64,
+) -> Result<Option<u64>, i32> {
+    match hosted_wait_timeout_from_code(timeout_code) {
+        DispatcherWaitTimeout::Poll => Err(STATUS_TIMEOUT_I32),
+        DispatcherWaitTimeout::Infinite => Ok(None),
+        DispatcherWaitTimeout::Blocking => {
+            match nt_delay_execution::due_time(
+                timeout_arg as i64,
+                crate::monotonic_time_100ns(),
+                crate::nt_system_time_100ns(),
+            ) {
+                nt_delay_execution::Due::Immediate => Err(STATUS_TIMEOUT_I32),
+                nt_delay_execution::Due::Monotonic100ns(deadline) => Ok(Some(deadline)),
+            }
+        }
     }
 }
 
@@ -7700,14 +7722,14 @@ extern "win64" fn s_ke_wait_for_single_object(
     timeout: u64,
 ) -> i32 {
     let packed_wait = (wait_reason as u64) | ((wait_mode as u64) << 32) | ((alertable as u64) << 40);
-    let timeout_code = unsafe { hosted_wait_timeout_code(timeout) };
+    let (timeout_code, timeout_arg) = unsafe { hosted_wait_timeout_payload(timeout) };
     let (_label, status, _, _, _) = unsafe {
         call_on4(
-            (FSD_SERVICE_KE_WAIT_SINGLE_LABEL << 12) | 3,
+            (FSD_SERVICE_KE_WAIT_SINGLE_LABEL << 12) | 4,
             object,
             packed_wait,
             timeout_code,
-            0,
+            timeout_arg,
         )
     };
     status as u32 as i32
@@ -7833,8 +7855,14 @@ fn park_hosted_driver_wait(
     objects: Vec<u64>,
     wait_all: bool,
     api_multiple: bool,
+    deadline_100ns: Option<u64>,
 ) -> Option<u64> {
     if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
+        return None;
+    }
+    if deadline_100ns.is_some()
+        && !unsafe { crate::service_sec_image::rearm_registered_delay_timer() }
+    {
         return None;
     }
     let waiters = unsafe { hosted_driver_waiters_mut() };
@@ -7865,6 +7893,8 @@ fn park_hosted_driver_wait(
         objects,
         wait_all,
         api_multiple,
+        deadline_100ns,
+        sequence: HOSTED_DRIVER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     });
     if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh) {
         let _ = waiters.pop();
@@ -7881,7 +7911,98 @@ fn park_hosted_driver_wait(
     } else {
         HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
     }
+    if deadline_100ns.is_some() {
+        let _ = unsafe { crate::service_sec_image::rearm_registered_delay_timer() };
+    }
     Some(fresh)
+}
+
+unsafe fn reply_hosted_driver_waiter(waiter: HostedDriverRawWaiter, status: i32) -> bool {
+    let instance = waiter.instance;
+    let replied = crate::spawn_hosts::pump_reply_on(
+        waiter.reply_cap,
+        1,
+        status as u32 as u64,
+        0,
+        0,
+        0,
+    );
+    let _ = hosted_driver_thread_table_mut(instance)
+        .and_then(|table| table.set_ready(waiter.thread_handle).ok());
+    if replied {
+        return_hosted_driver_reply_spare(instance, waiter.reply_cap);
+    } else {
+        let _ = cnode_delete_recycle_r(waiter.reply_cap);
+    }
+    replied
+}
+
+fn record_hosted_driver_wait_wake_error(api_multiple: bool) {
+    if api_multiple {
+        HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_hosted_driver_wait_woken(api_multiple: bool) {
+    if api_multiple {
+        HOSTED_DRIVER_WAIT_MULTIPLE_WOKEN.fetch_add(1, Ordering::Relaxed);
+    } else {
+        HOSTED_DRIVER_WAIT_SINGLE_WOKEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_hosted_driver_wait_timeout(api_multiple: bool) {
+    if api_multiple {
+        HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+            .as_ref()?
+            .iter()
+            .filter_map(|waiter| waiter.deadline_100ns)
+            .min()
+    }
+}
+
+pub(crate) unsafe fn hosted_driver_wait_wake_due(now_100ns: u64) -> u64 {
+    let mut woken = 0u64;
+    loop {
+        let due_index = {
+            let Some(waiters) = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
+                return woken;
+            };
+            waiters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, waiter)| {
+                    waiter
+                        .deadline_100ns
+                        .filter(|deadline| *deadline <= now_100ns)
+                        .map(|deadline| (index, deadline, waiter.sequence))
+                })
+                .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
+                .map(|(index, _, _)| index)
+        };
+        let Some(index) = due_index else {
+            break;
+        };
+        let waiter = hosted_driver_waiters_mut().remove(index);
+        let api_multiple = waiter.api_multiple;
+        if reply_hosted_driver_waiter(waiter, STATUS_TIMEOUT_I32) {
+            record_hosted_driver_wait_timeout(api_multiple);
+            woken += 1;
+        } else {
+            record_hosted_driver_wait_wake_error(api_multiple);
+        }
+    }
+    woken
 }
 
 fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
@@ -7908,29 +8029,9 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
             match unsafe { hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all) } {
                 Ok(Some(status)) => status,
                 _ => {
-                    if wait_is_multiple {
-                        HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let replied = unsafe {
-                        crate::spawn_hosts::pump_reply_on(
-                            waiter.reply_cap,
-                            1,
-                            STATUS_INVALID_PARAMETER as u32 as u64,
-                            0,
-                            0,
-                            0,
-                        )
-                    };
+                    record_hosted_driver_wait_wake_error(wait_is_multiple);
                     unsafe {
-                        let _ = hosted_driver_thread_table_mut(instance)
-                            .and_then(|table| table.set_ready(waiter.thread_handle).ok());
-                        if replied {
-                            return_hosted_driver_reply_spare(instance, waiter.reply_cap);
-                        } else {
-                            let _ = cnode_delete_recycle_r(waiter.reply_cap);
-                        }
+                        let _ = reply_hosted_driver_waiter(waiter, STATUS_INVALID_PARAMETER);
                     }
                     continue;
                 }
@@ -7939,65 +8040,22 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
             hosted_dispatcher_wait_consume(&waiter.objects, waiter.wait_all, ready_status)
         };
         if !consumed {
-            if wait_is_multiple {
-                HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            }
-            let replied = unsafe {
-                crate::spawn_hosts::pump_reply_on(
-                    waiter.reply_cap,
-                    1,
-                    STATUS_INVALID_PARAMETER as u32 as u64,
-                    0,
-                    0,
-                    0,
-                )
-            };
+            record_hosted_driver_wait_wake_error(wait_is_multiple);
             unsafe {
-                let _ = hosted_driver_thread_table_mut(instance)
-                    .and_then(|table| table.set_ready(waiter.thread_handle).ok());
-                if replied {
-                    return_hosted_driver_reply_spare(instance, waiter.reply_cap);
-                } else {
-                    let _ = cnode_delete_recycle_r(waiter.reply_cap);
-                }
+                let _ = reply_hosted_driver_waiter(waiter, STATUS_INVALID_PARAMETER);
             }
             continue;
         }
-        let replied = unsafe {
-            crate::spawn_hosts::pump_reply_on(
-                waiter.reply_cap,
-                1,
-                ready_status as u64,
-                0,
-                0,
-                0,
-            )
-        };
-        unsafe {
-            let _ = hosted_driver_thread_table_mut(instance)
-                .and_then(|table| table.set_ready(waiter.thread_handle).ok());
-            if replied {
-                return_hosted_driver_reply_spare(instance, waiter.reply_cap);
-            } else {
-                let _ = cnode_delete_recycle_r(waiter.reply_cap);
-            }
-        }
+        let replied = unsafe { reply_hosted_driver_waiter(waiter, ready_status as i32) };
         if replied {
-            if wait_is_multiple {
-                HOSTED_DRIVER_WAIT_MULTIPLE_WOKEN.fetch_add(1, Ordering::Relaxed);
-            } else {
-                HOSTED_DRIVER_WAIT_SINGLE_WOKEN.fetch_add(1, Ordering::Relaxed);
-            }
+            record_hosted_driver_wait_woken(wait_is_multiple);
             woken += 1;
         } else {
-            if wait_is_multiple {
-                HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            }
+            record_hosted_driver_wait_wake_error(wait_is_multiple);
         }
+    }
+    if woken != 0 {
+        let _ = unsafe { crate::service_sec_image::rearm_registered_delay_timer() };
     }
     woken
 }
@@ -8007,9 +8065,9 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     count: u32,
     object_array: u64,
     wait_type: u32,
-    wait_reason: u32,
-    wait_mode: u32,
-    alertable: u8,
+    _wait_reason: u32,
+    _wait_mode: u32,
+    _alertable: u8,
     timeout: u64,
     _wait_block_array: u64,
 ) -> i32 {
@@ -8035,18 +8093,15 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     } else {
         object_array
     };
-    let packed_wait = (wait_type as u64)
-        | ((wait_reason as u64) << 32)
-        | (((wait_mode as u64) & 0xff) << 48)
-        | (((alertable as u64) & 0xff) << 56);
-    let timeout_code = unsafe { hosted_wait_timeout_code(timeout) };
+    let (timeout_code, timeout_arg) = unsafe { hosted_wait_timeout_payload(timeout) };
+    let packed_wait = (wait_type as u64) | (timeout_code << 32);
     let (_label, status, _, _, _) = unsafe {
         call_on4(
             (FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL << 12) | 4,
             service_array,
             count as u64,
             packed_wait,
-            timeout_code,
+            timeout_arg,
         )
     };
     status as u32 as i32
@@ -15746,6 +15801,8 @@ struct HostedDriverRawWaiter {
     objects: Vec<u64>,
     wait_all: bool,
     api_multiple: bool,
+    deadline_100ns: Option<u64>,
+    sequence: u64,
 }
 
 #[derive(Default)]
@@ -15934,11 +15991,13 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
 
 fn clear_hosted_driver_waits_for_instance(instance: usize) {
     unsafe {
+        let mut removed = false;
         if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
             let mut index = 0usize;
             while index < waiters.len() {
                 if waiters[index].instance == instance {
                     let waiter = waiters.remove(index);
+                    removed |= waiter.deadline_100ns.is_some();
                     if waiter.reply_cap != 0 {
                         let _ = cnode_delete_recycle_r(waiter.reply_cap);
                     }
@@ -15955,6 +16014,9 @@ fn clear_hosted_driver_waits_for_instance(instance: usize) {
                     }
                 }
             }
+        }
+        if removed {
+            let _ = crate::service_sec_image::rearm_registered_delay_timer();
         }
     }
 }
@@ -16461,6 +16523,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
     object: u64,
     _packed_wait: u64,
     timeout_code: u64,
+    timeout_arg: u64,
     caller_badge: u64,
     active_reply_cap: u64,
 ) -> HostedDriverWaitServiceResult {
@@ -16494,70 +16557,60 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                 HostedDriverWaitServiceResult::Reply(STATUS_SUCCESS)
             }
             Ok(false) => {
-                match hosted_wait_timeout_from_code(timeout_code) {
-                    DispatcherWaitTimeout::Poll => {
-                    HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                        HostedDriverWaitServiceResult::Reply(STATUS_TIMEOUT_I32)
-                    }
-                    DispatcherWaitTimeout::Blocking => {
-                    HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                    if request <= 8 {
-                            print_str(b"[driver-wait] KeWaitForSingleObject timed wait fail-closed inst=");
-                        print_u64(instance as u64);
-                        if caller_badge != 0 {
-                            print_str(b" badge=");
-                            print_u64(caller_badge);
+                let deadline_100ns =
+                    match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg) {
+                        Ok(deadline) => deadline,
+                        Err(status) => {
+                            if status == STATUS_TIMEOUT_I32 {
+                                HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return HostedDriverWaitServiceResult::Reply(status);
                         }
-                        print_str(b" object=0x");
-                        print_hex((object >> 32) as u32);
-                        print_hex(object as u32);
-                        print_str(b"\n");
-                    }
-                        HostedDriverWaitServiceResult::Reply(STATUS_NOT_IMPLEMENTED)
-                    }
-                    DispatcherWaitTimeout::Infinite => {
-                        HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                        let Some(runtime) = runtime else {
-                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                            return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
-                        };
-                        let mut objects = Vec::new();
-                        if objects.try_reserve_exact(1).is_err() {
-                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                            return HostedDriverWaitServiceResult::Reply(
-                                STATUS_INSUFFICIENT_RESOURCES,
-                            );
-                        }
-                        objects.push(exec_object);
-                        let Some(fresh_reply_cap) = park_hosted_driver_wait(
-                            instance,
-                            runtime.handle,
-                            active_reply_cap,
-                            objects,
-                            false,
-                            false,
-                        ) else {
-                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                            return HostedDriverWaitServiceResult::Reply(
-                                STATUS_INSUFFICIENT_RESOURCES,
-                            );
-                        };
-                        if request <= 8 {
-                            print_str(b"[driver-wait] KeWaitForSingleObject parked inst=");
-                            print_u64(instance as u64);
-                            print_str(b" badge=");
-                            print_u64(caller_badge);
-                            print_str(b" handle=0x");
-                            print_hex((runtime.handle >> 32) as u32);
-                            print_hex(runtime.handle as u32);
-                            print_str(b" object=0x");
-                            print_hex((object >> 32) as u32);
-                            print_hex(object as u32);
-                            print_str(b"\n");
-                        }
-                        HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
-                    }
+                    };
+                HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
+                let Some(runtime) = runtime else {
+                    HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+                };
+                let mut objects = Vec::new();
+                if objects.try_reserve_exact(1).is_err() {
+                    HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
                 }
+                objects.push(exec_object);
+                let Some(fresh_reply_cap) = park_hosted_driver_wait(
+                    instance,
+                    runtime.handle,
+                    active_reply_cap,
+                    objects,
+                    false,
+                    false,
+                    deadline_100ns,
+                ) else {
+                    HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+                };
+                if request <= 8 {
+                    print_str(b"[driver-wait] KeWaitForSingleObject parked inst=");
+                    print_u64(instance as u64);
+                    print_str(b" badge=");
+                    print_u64(caller_badge);
+                    print_str(b" handle=0x");
+                    print_hex((runtime.handle >> 32) as u32);
+                    print_hex(runtime.handle as u32);
+                    print_str(b" object=0x");
+                    print_hex((object >> 32) as u32);
+                    print_hex(object as u32);
+                    if let Some(deadline) = deadline_100ns {
+                        print_str(b" deadline=");
+                        print_u64(deadline);
+                    }
+                    print_str(b"\n");
+                }
+                HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
             }
             Err(status) => {
                 HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -16587,12 +16640,13 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
     object_array: u64,
     count: u32,
     packed_wait: u64,
-    timeout_code: u64,
+    timeout_arg: u64,
     caller_badge: u64,
     active_reply_cap: u64,
 ) -> HostedDriverWaitServiceResult {
     let request = HOSTED_DRIVER_WAIT_MULTIPLE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
     let wait_type = packed_wait as u32;
+    let timeout_code = packed_wait >> 32;
     if count == 0
         || count > HOSTED_DRIVER_WAIT_OBJECT_MAX
         || object_array == 0
@@ -16680,64 +16734,61 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                 HOSTED_DRIVER_WAIT_MULTIPLE_READY.fetch_add(1, Ordering::Relaxed);
                 HostedDriverWaitServiceResult::Reply(status as i32)
             }
-            Ok(None) => match hosted_wait_timeout_from_code(timeout_code) {
-                DispatcherWaitTimeout::Poll => {
-                    HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                    HostedDriverWaitServiceResult::Reply(STATUS_TIMEOUT_I32)
-                }
-                DispatcherWaitTimeout::Blocking => {
-                    HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                    if request <= 8 {
-                        print_str(
-                            b"[driver-wait] KeWaitForMultipleObjects timed wait fail-closed inst=",
-                        );
-                        print_u64(instance as u64);
-                        if caller_badge != 0 {
-                            print_str(b" badge=");
-                            print_u64(caller_badge);
+            Ok(None) => {
+                let deadline_100ns =
+                    match hosted_driver_deadline_from_timeout(timeout_code, timeout_arg) {
+                        Ok(deadline) => deadline,
+                        Err(status) => {
+                            if status == STATUS_TIMEOUT_I32 {
+                                HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            return HostedDriverWaitServiceResult::Reply(status);
                         }
-                        print_str(b" count=");
-                        print_u64(count as u64);
-                        print_str(b"\n");
-                    }
-                    HostedDriverWaitServiceResult::Reply(STATUS_NOT_IMPLEMENTED)
-                }
-                DispatcherWaitTimeout::Infinite => {
-                    HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                    let Some(runtime) = runtime else {
-                        HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
                     };
-                    let Some(fresh_reply_cap) = park_hosted_driver_wait(
-                        instance,
-                        runtime.handle,
-                        active_reply_cap,
-                        objects,
-                        wait_all,
-                        true,
-                    ) else {
-                        HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                        return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
-                    };
-                    if request <= 8 {
-                        print_str(b"[driver-wait] KeWaitForMultipleObjects parked inst=");
-                        print_u64(instance as u64);
-                        print_str(b" badge=");
-                        print_u64(caller_badge);
-                        print_str(b" handle=0x");
-                        print_hex((runtime.handle >> 32) as u32);
-                        print_hex(runtime.handle as u32);
-                        print_str(b" count=");
-                        print_u64(count as u64);
-                        if wait_all {
-                            print_str(b" wait=all\n");
-                        } else {
-                            print_str(b" wait=any\n");
-                        }
+                HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
+                let Some(runtime) = runtime else {
+                    HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+                };
+                let Some(fresh_reply_cap) = park_hosted_driver_wait(
+                    instance,
+                    runtime.handle,
+                    active_reply_cap,
+                    objects,
+                    wait_all,
+                    true,
+                    deadline_100ns,
+                ) else {
+                    HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                    return HostedDriverWaitServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+                };
+                if request <= 8 {
+                    print_str(b"[driver-wait] KeWaitForMultipleObjects parked inst=");
+                    print_u64(instance as u64);
+                    print_str(b" badge=");
+                    print_u64(caller_badge);
+                    print_str(b" handle=0x");
+                    print_hex((runtime.handle >> 32) as u32);
+                    print_hex(runtime.handle as u32);
+                    print_str(b" count=");
+                    print_u64(count as u64);
+                    if wait_all {
+                        print_str(b" wait=all");
+                    } else {
+                        print_str(b" wait=any");
                     }
-                    HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
+                    if let Some(deadline) = deadline_100ns {
+                        print_str(b" deadline=");
+                        print_u64(deadline);
+                    }
+                    print_str(b"\n");
                 }
-            },
+                HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
+            }
             Err(status) => {
                 HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                 HostedDriverWaitServiceResult::Reply(status)

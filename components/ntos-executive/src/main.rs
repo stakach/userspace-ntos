@@ -13343,6 +13343,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         u64::MAX => None,
         deadline => Some(deadline),
     };
+    let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     // The deadman joins the same `min()` as every real waiter — it is a deadline like any other, so
     // the arm/disarm path (and `exec_delay_timer_disarms`' invariants) are untouched by it.
     let deadman_deadline = watchdog_deadline();
@@ -13355,6 +13356,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .chain(io_completion_deadline)
         .chain(pipe_name_deadline)
         .chain(user_timer_deadline)
+        .chain(hosted_driver_deadline)
         .chain(deadman_deadline)
         .min();
     if let Some(deadline) = deadline {
@@ -13378,6 +13380,8 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
             6
         } else if user_timer_deadline == Some(deadline) {
             7
+        } else if hosted_driver_deadline == Some(deadline) {
+            9
         } else {
             5 // the deadman
         };
@@ -13692,6 +13696,7 @@ unsafe fn delay_timer_interrupt(
         + io_completion_wake_due(handler, now_100ns)
         + pipe_name_wait_wake_due(handler, now_100ns)
         + user_timer_wake_due(handler, now_100ns)
+        + driver_launch::hosted_driver_wait_wake_due(now_100ns)
         + watchdog_tick;
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
@@ -13741,11 +13746,13 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
     let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
     let user_timer_deadline = USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed);
+    let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || queue.len() != 0
         || completion_deadline.is_some()
         || pipe_name_deadline.is_some()
         || user_timer_deadline != u64::MAX
+        || hosted_driver_deadline.is_some()
     {
         return;
     }
