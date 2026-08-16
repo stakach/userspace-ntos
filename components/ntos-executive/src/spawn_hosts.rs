@@ -1528,6 +1528,29 @@ unsafe fn component_pump_loop(
                 }
             }
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_REGISTRY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, out1, out2) = crate::driver_launch::service_hosted_driver_registry(
+                ch,
+                msg.m0,
+                msg.m1,
+                msg.m2,
+                msg.m3,
+                msg.badge,
+                *reply_cap,
+            );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                3,
+                status as u32 as u64,
+                out1,
+                out2,
+                0
+            );
+            continue;
         } else if label == 6 {
             outcome.faults += 1;
             if !pump_service_vm_fault(

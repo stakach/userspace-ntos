@@ -6770,3 +6770,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `exec_generic_hw_dma_packet_descriptors` red. The next B3 slice should inspect the generic
   hosted registry and `IoGetDeviceProperty`/`RtlQueryRegistryValues` path that feeds ReactOS NDIS
   adapter-class `Linkage\Export`; do not restore per-image or synthetic registry answers.
+
+  B3 hosted driver registry-service broker (2026-08-16): hosted ntoskrnl registry imports no longer
+  call the Configuration Manager client directly from the driver component's imported function body.
+  `IoOpenDeviceRegistryKey`, hosted `ZwOpenKey`, `ZwClose`, `ZwEnumerateKey`, `ZwQueryValueKey`,
+  `ZwSetValueKey`, and `RtlQueryRegistryValues` now marshal bounded path/value/data records through
+  the existing component pump using a generic registry service label. The executive side owns CM
+  client calls and hosted registry-handle lifetime, so ReactOS drivers can use the real CM namespace
+  without jumping from isolated driver code into rootserver ring-channel internals. Validation:
+  `cargo fmt --all`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and serialized headless boot
+  `.tmp/run-headless-b3-registry-broker-20260816.log`. The boot reached genuine explorer shell chrome
+  with `298/298` checks passing; the generic hardware gates for registry selection, PCI AddDevice,
+  PCI I/O port writes, and DMA packet descriptor observation are green. Review adjustment: the
+  rootserver `RingChannel::raw` wall during E1000 registry queries is closed. Continue B3 at real
+  TX/RX completion and packet delivery over the generic NDIS/e1000 route; do not restore synthetic
+  registry answers.

@@ -455,6 +455,7 @@ pub const FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL: u64 = 0x775;
 pub const FSD_SERVICE_KE_PULSE_EVENT_LABEL: u64 = 0x776;
 pub const FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL: u64 = 0x777;
 pub const FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL: u64 = 0x778;
+pub const FSD_SERVICE_REGISTRY_LABEL: u64 = 0x779;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -474,6 +475,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
             | FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL
             | FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
+            | FSD_SERVICE_REGISTRY_LABEL
     )
 }
 
@@ -3292,6 +3294,26 @@ const HOSTED_INSTANCE_PATH_MAX: usize = 128;
 const HOSTED_DRIVER_KEY_NAME_MAX: usize = 128;
 const HOSTED_REGISTRY_PATH_MAX: usize = 384;
 const HOSTED_REGISTRY_VALUE_SCRATCH_MAX: usize = 2048;
+const HOSTED_REGISTRY_ARG_KEY_LEN: u64 = 0;
+const HOSTED_REGISTRY_ARG_VALUE_LEN: u64 = 4;
+const HOSTED_REGISTRY_ARG_VALUE_TYPE: u64 = 8;
+const HOSTED_REGISTRY_ARG_DATA_LEN: u64 = 12;
+const HOSTED_REGISTRY_ARG_KEY_OFF: u64 = 16;
+const HOSTED_REGISTRY_ARG_VALUE_OFF: u64 =
+    HOSTED_REGISTRY_ARG_KEY_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
+const HOSTED_REGISTRY_ARG_DATA_OFF: u64 =
+    HOSTED_REGISTRY_ARG_VALUE_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
+const HOSTED_REGISTRY_ARG_DATA_CAP: u64 = HOSTED_REGISTRY_VALUE_SCRATCH_MAX as u64;
+const _: () = assert!(
+    HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_FRAMES * 0x1000
+);
+const HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY: u64 = 1;
+const HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 2;
+const HOSTED_REGISTRY_OP_CLOSE: u64 = 3;
+const HOSTED_REGISTRY_OP_ENUMERATE_KEY: u64 = 4;
+const HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE: u64 = 5;
+const HOSTED_REGISTRY_OP_QUERY_PATH_VALUE: u64 = 6;
+const HOSTED_REGISTRY_OP_SET_HANDLE_VALUE: u64 = 7;
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
 type HostedRegistryIdentityId = usize;
@@ -4050,6 +4072,114 @@ unsafe fn copy_bytes_unchecked(dst: u64, src: u64, len: u64) {
         );
         off += 1;
     }
+}
+
+unsafe fn write_registry_arg_ascii<const N: usize>(
+    len_off: u64,
+    buf_off: u64,
+    value: &HostedAscii<N>,
+) -> bool {
+    if value.len > u32::MAX as usize {
+        return false;
+    }
+    write_volatile((FSD_ARG_VADDR + len_off) as *mut u32, value.len as u32);
+    let mut i = 0usize;
+    while i < value.len {
+        write_volatile((FSD_ARG_VADDR + buf_off + i as u64) as *mut u8, value.bytes[i]);
+        i += 1;
+    }
+    true
+}
+
+unsafe fn read_registry_arg_ascii_at<const N: usize>(
+    arg: u64,
+    len_off: u64,
+    buf_off: u64,
+    allow_empty: bool,
+) -> Option<HostedAscii<N>> {
+    let len = read_volatile((arg + len_off) as *const u32) as usize;
+    if len == 0 {
+        return if allow_empty {
+            Some(HostedAscii::empty())
+        } else {
+            None
+        };
+    }
+    if len > N {
+        return None;
+    }
+    let mut out = HostedAscii::<N>::empty();
+    let mut i = 0usize;
+    while i < len {
+        let b = read_volatile((arg + buf_off + i as u64) as *const u8);
+        if b == 0 || b > 0x7f || !out.push_byte(b) {
+            return None;
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+unsafe fn write_registry_arg_data(data: u64, data_len: u32) -> i32 {
+    if data_len as u64 > HOSTED_REGISTRY_ARG_DATA_CAP {
+        return STATUS_INVALID_BUFFER_SIZE as i32;
+    }
+    if data_len != 0 {
+        if data == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        copy_bytes_unchecked(
+            FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_DATA_OFF,
+            data,
+            data_len as u64,
+        );
+    }
+    write_volatile(
+        (FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32,
+        data_len,
+    );
+    STATUS_SUCCESS
+}
+
+unsafe fn hosted_registry_broker_call(
+    op: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> (i32, u64, u64) {
+    let (_label, status, out1, out2, _) =
+        call_on4((FSD_SERVICE_REGISTRY_LABEL << 12) | 4, op, a1, a2, a3);
+    (status as u32 as i32, out1, out2)
+}
+
+unsafe fn broker_query_registry_path_value(
+    key_path: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    value_name: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+) -> (i32, u32, u32) {
+    if key_path.is_empty()
+        || !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_KEY_LEN,
+            HOSTED_REGISTRY_ARG_KEY_OFF,
+            key_path,
+        )
+        || !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_VALUE_LEN,
+            HOSTED_REGISTRY_ARG_VALUE_OFF,
+            value_name,
+        )
+    {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let (status, value_type, data_len) =
+        hosted_registry_broker_call(HOSTED_REGISTRY_OP_QUERY_PATH_VALUE, 0, 0, 0);
+    (status, value_type as u32, data_len as u32)
+}
+
+unsafe fn registry_arg_data_slice(len: u32) -> &'static [u8] {
+    core::slice::from_raw_parts(
+        (FSD_ARG_VADDR + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
+        len as usize,
+    )
 }
 
 /// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
@@ -5093,10 +5223,6 @@ unsafe fn driver_registry_handle_slot(handle: u64) -> Option<DriverRegistryHandl
     }
 }
 
-unsafe fn driver_registry_handle_live(handle: u64) -> bool {
-    driver_registry_handle_slot(handle).is_some()
-}
-
 /// `NTSTATUS IoOpenDeviceRegistryKey(PDEVICE_OBJECT, ULONG, ACCESS_MASK, PHANDLE)`.
 extern "win64" fn s_io_open_device_registry_key(
     pdo: u64,
@@ -5107,36 +5233,15 @@ extern "win64" fn s_io_open_device_registry_key(
     if handle_out == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    if unsafe { !hosted_pdo_known(pdo) } {
-        unsafe {
-            write_unaligned(handle_out as *mut u64, 0);
-        }
-        return STATUS_INVALID_PARAMETER;
-    }
     unsafe {
-        let Some(identity) = hosted_registry_identity_by_pdo_object(pdo) else {
-            write_unaligned(handle_out as *mut u64, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if !identity.has_driver_key() {
-            write_unaligned(handle_out as *mut u64, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let Some(path) = hosted_driver_key_cm_path(&identity) else {
-            write_unaligned(handle_out as *mut u64, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if !crate::config_manager_open_key(path.as_str()) {
-            write_unaligned(handle_out as *mut u64, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let Some(handle) = allocate_cm_registry_handle(path) else {
-            write_unaligned(handle_out as *mut u64, 0);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        };
-        write_unaligned(handle_out as *mut u64, handle);
+        let (status, handle, _) =
+            hosted_registry_broker_call(HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY, pdo, 0, 0);
+        write_unaligned(
+            handle_out as *mut u64,
+            if status == STATUS_SUCCESS { handle } else { 0 },
+        );
+        status
     }
-    STATUS_SUCCESS
 }
 
 const DEVICE_PROPERTY_DRIVER_KEY_NAME: u32 = 0x7;
@@ -7893,22 +7998,23 @@ extern "win64" fn s_rtl_query_registry_values(
                 let value_name = wide_cstr_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(name);
                 let mut value_found = false;
                 if let (Some(key_path), Some(value_name)) = (cm_registry_path.as_ref(), value_name) {
-                    let mut data = [0u8; HOSTED_REGISTRY_VALUE_SCRATCH_MAX];
-                    match crate::config_manager_query_value(
-                        key_path.as_str(),
-                        value_name.as_str(),
-                        &mut data,
-                    ) {
-                        Ok((value_type, n)) => {
-                            let status =
-                                write_rtl_direct_registry_value(value_type, &data[..n], entry_context);
+                    let (status, value_type, data_len) =
+                        broker_query_registry_path_value(key_path, &value_name);
+                    match status {
+                        STATUS_SUCCESS => {
+                            let data = registry_arg_data_slice(data_len);
+                            let status = write_rtl_direct_registry_value(
+                                value_type,
+                                data,
+                                entry_context,
+                            );
                             if status < 0 {
                                 return status;
                             }
                             value_found = true;
                         }
-                        Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
-                        Err(status) => return status,
+                        STATUS_OBJECT_NAME_NOT_FOUND => {}
+                        status => return status,
                     }
                 }
                 if !value_found && entry_context != 0 && default_data != 0 && default_length != 0 {
@@ -9948,13 +10054,9 @@ extern "win64" fn s_io_get_current_process() -> u64 {
 
 /// `NTSTATUS ZwClose(HANDLE)`.
 extern "win64" fn s_zw_close(handle: u64) -> i32 {
-    unsafe {
-        if close_driver_registry_handle(handle) {
-            STATUS_SUCCESS
-        } else {
-            STATUS_INVALID_HANDLE
-        }
-    }
+    let (status, _, _) =
+        unsafe { hosted_registry_broker_call(HOSTED_REGISTRY_OP_CLOSE, handle, 0, 0) };
+    status
 }
 
 unsafe fn write_key_value_partial_raw(
@@ -10081,23 +10183,18 @@ extern "win64" fn s_zw_open_key(
         else {
             return STATUS_INVALID_PARAMETER;
         };
-        let root_slot = if root == 0 {
-            None
-        } else {
-            match driver_registry_handle_slot(root) {
-                Some(slot) => Some(slot),
-                None => return STATUS_INVALID_HANDLE,
-            }
-        };
-        let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if !crate::config_manager_open_key(path.as_str()) {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        let Some(handle) = allocate_cm_registry_handle(path) else {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        };
+        if !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_KEY_LEN,
+            HOSTED_REGISTRY_ARG_KEY_OFF,
+            &name,
+        ) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let (status, handle, _) =
+            hosted_registry_broker_call(HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY, root, 0, 0);
+        if status != STATUS_SUCCESS {
+            return status;
+        }
         write_unaligned(handle_out as *mut u64, handle);
     }
     STATUS_SUCCESS
@@ -10113,27 +10210,22 @@ extern "win64" fn s_zw_enumerate_key(
     result_length: u64,
 ) -> i32 {
     unsafe {
-        let Some(slot) = driver_registry_handle_slot(handle) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        if slot.kind != DriverRegistryHandleKind::CmKey {
-            return STATUS_INVALID_HANDLE;
-        }
         if key_information_class != KEY_BASIC_INFORMATION_CLASS {
             if result_length != 0 {
                 write_unaligned(result_length as *mut u32, 0);
             }
             return STATUS_NOT_SUPPORTED;
         }
-        let mut name = [0u8; HOSTED_REGISTRY_PATH_MAX * 2];
-        match crate::config_manager_enumerate_key(slot.path.as_str(), index, &mut name) {
-            Ok(n) => write_key_basic_information(
-                &name[..n],
+        let (status, name_len, _) =
+            hosted_registry_broker_call(HOSTED_REGISTRY_OP_ENUMERATE_KEY, handle, index as u64, 0);
+        match status {
+            STATUS_SUCCESS => write_key_basic_information(
+                registry_arg_data_slice(name_len as u32),
                 key_information,
                 length,
                 result_length,
             ),
-            Err(status) => {
+            status => {
                 if result_length != 0 {
                     write_unaligned(result_length as *mut u32, 0);
                 }
@@ -10153,39 +10245,39 @@ extern "win64" fn s_zw_query_value_key(
     result_length: u64,
 ) -> i32 {
     unsafe {
-        let Some(slot) = driver_registry_handle_slot(handle) else {
-            return STATUS_INVALID_HANDLE;
-        };
         let value_name =
             match unicode_string_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(value_name, true) {
                 Some(value_name) => value_name,
                 None => return STATUS_INVALID_PARAMETER,
             };
-        if slot.kind != DriverRegistryHandleKind::CmKey {
-            return STATUS_INVALID_HANDLE;
-        }
         if key_value_information_class != KEY_VALUE_PARTIAL_INFORMATION_CLASS {
             if result_length != 0 {
                 write_unaligned(result_length as *mut u32, 0);
             }
             return STATUS_NOT_SUPPORTED;
         }
-        let mut data = [0u8; HOSTED_REGISTRY_VALUE_SCRATCH_MAX];
-        match crate::config_manager_query_value(slot.path.as_str(), value_name.as_str(), &mut data) {
-            Ok((value_type, n)) => {
-                return write_key_value_partial_raw(
-                    value_type,
-                    &data[..n],
-                    key_value_information,
-                    length,
-                    result_length,
-                );
-            }
-            Err(status) => {
+        if !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_VALUE_LEN,
+            HOSTED_REGISTRY_ARG_VALUE_OFF,
+            &value_name,
+        ) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let (status, value_type, data_len) =
+            hosted_registry_broker_call(HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE, handle, 0, 0);
+        match status {
+            STATUS_SUCCESS => write_key_value_partial_raw(
+                value_type as u32,
+                registry_arg_data_slice(data_len as u32),
+                key_value_information,
+                length,
+                result_length,
+            ),
+            status => {
                 if result_length != 0 {
                     write_unaligned(result_length as *mut u32, 0);
                 }
-                return status;
+                status
             }
         }
     }
@@ -10194,18 +10286,37 @@ extern "win64" fn s_zw_query_value_key(
 /// `NTSTATUS ZwSetValueKey(...)`.
 extern "win64" fn s_zw_set_value_key(
     handle: u64,
-    _value_name: u64,
+    value_name: u64,
     _title_index: u32,
-    _typ: u32,
-    _data: u64,
-    _data_size: u32,
+    typ: u32,
+    data: u64,
+    data_size: u32,
 ) -> i32 {
     unsafe {
-        if !driver_registry_handle_live(handle) {
-            return STATUS_INVALID_HANDLE;
+        let Some(value_name) =
+            unicode_string_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(value_name, true)
+        else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_VALUE_LEN,
+            HOSTED_REGISTRY_ARG_VALUE_OFF,
+            &value_name,
+        ) {
+            return STATUS_INVALID_PARAMETER;
         }
+        let status = write_registry_arg_data(data, data_size);
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        let (status, _, _) = hosted_registry_broker_call(
+            HOSTED_REGISTRY_OP_SET_HANDLE_VALUE,
+            handle,
+            typ as u64,
+            data_size as u64,
+        );
+        status
     }
-    STATUS_NOT_SUPPORTED
 }
 
 extern "win64" fn s_zw_create_file(
@@ -17749,6 +17860,229 @@ fn instance_for_pump_channel(
         return None;
     }
     Some((instance, inst))
+}
+
+unsafe fn hosted_pdo_known_at(sh: u64, pdo: u64) -> bool {
+    pdo != 0
+        && (hosted_device_binding_by_pdo_object(pdo).is_some()
+            || read_volatile((sh + SH_REQ_FILEID) as *const u64) == pdo)
+}
+
+unsafe fn hosted_registry_identity_by_pdo_object_at(
+    sh: u64,
+    pdo: u64,
+) -> Option<HostedDriverRegistryIdentity> {
+    if let Some(identity_id) = hosted_registry_identity_id_by_pdo_object(pdo) {
+        if let Some(identity) = hosted_registry_identity(identity_id) {
+            return Some(identity);
+        }
+    }
+    let inflight_pdo = read_volatile((sh + SH_REQ_FILEID) as *const u64);
+    if inflight_pdo == pdo {
+        shared_registry_identity_at(sh)
+    } else {
+        None
+    }
+}
+
+unsafe fn service_hosted_driver_open_registry_path(
+    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+) -> (i32, u64, u64) {
+    if path.is_empty() {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    if !crate::config_manager_open_key(path.as_str()) {
+        return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+    }
+    let Some(handle) = allocate_cm_registry_handle(path) else {
+        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+    };
+    (STATUS_SUCCESS, handle, 0)
+}
+
+unsafe fn service_hosted_driver_query_registry_value(
+    arg: u64,
+    key_path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+    value_name: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+) -> (i32, u64, u64) {
+    if key_path.is_empty() {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let data = core::slice::from_raw_parts_mut(
+        (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *mut u8,
+        HOSTED_REGISTRY_VALUE_SCRATCH_MAX,
+    );
+    match crate::config_manager_query_value(key_path.as_str(), value_name.as_str(), data) {
+        Ok((value_type, n)) => {
+            write_volatile(
+                (arg + HOSTED_REGISTRY_ARG_VALUE_TYPE) as *mut u32,
+                value_type,
+            );
+            write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, n as u32);
+            (STATUS_SUCCESS, value_type as u64, n as u64)
+        }
+        Err(status) => {
+            write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, 0);
+            (status, 0, 0)
+        }
+    }
+}
+
+pub(crate) fn service_hosted_driver_registry(
+    ch: &crate::spawn_hosts::PumpChannel,
+    op: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    _caller_badge: u64,
+    active_reply_cap: u64,
+) -> (i32, u64, u64) {
+    let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let arg = inst.exec_arg_va;
+    if arg == 0 {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    unsafe {
+        write_volatile((arg + HOSTED_REGISTRY_ARG_VALUE_TYPE) as *mut u32, 0);
+        write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, 0);
+        match op {
+            HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY => {
+                let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_KEY_LEN,
+                    HOSTED_REGISTRY_ARG_KEY_OFF,
+                    true,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                let root_slot = if a1 == 0 {
+                    None
+                } else {
+                    match driver_registry_handle_slot(a1) {
+                        Some(slot) if slot.kind == DriverRegistryHandleKind::CmKey => Some(slot),
+                        _ => return (STATUS_INVALID_HANDLE, 0, 0),
+                    }
+                };
+                let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name)
+                else {
+                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                };
+                service_hosted_driver_open_registry_path(path)
+            }
+            HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY => {
+                if !hosted_pdo_known_at(inst.exec_shared_va, a1) {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                }
+                let Some(identity) =
+                    hosted_registry_identity_by_pdo_object_at(inst.exec_shared_va, a1)
+                else {
+                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                };
+                if !identity.has_driver_key() {
+                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                }
+                let Some(path) = hosted_driver_key_cm_path(&identity) else {
+                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                };
+                service_hosted_driver_open_registry_path(path)
+            }
+            HOSTED_REGISTRY_OP_CLOSE => {
+                if close_driver_registry_handle(a1) {
+                    (STATUS_SUCCESS, 0, 0)
+                } else {
+                    (STATUS_INVALID_HANDLE, 0, 0)
+                }
+            }
+            HOSTED_REGISTRY_OP_ENUMERATE_KEY => {
+                let Some(slot) = driver_registry_handle_slot(a1) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                if slot.kind != DriverRegistryHandleKind::CmKey {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                let data = core::slice::from_raw_parts_mut(
+                    (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *mut u8,
+                    HOSTED_REGISTRY_VALUE_SCRATCH_MAX,
+                );
+                match crate::config_manager_enumerate_key(slot.path.as_str(), a2 as u32, data) {
+                    Ok(n) => {
+                        write_volatile(
+                            (arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32,
+                            n as u32,
+                        );
+                        (STATUS_SUCCESS, n as u64, 0)
+                    }
+                    Err(status) => (status, 0, 0),
+                }
+            }
+            HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE => {
+                let Some(slot) = driver_registry_handle_slot(a1) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                if slot.kind != DriverRegistryHandleKind::CmKey {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_VALUE_LEN,
+                    HOSTED_REGISTRY_ARG_VALUE_OFF,
+                    true,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                service_hosted_driver_query_registry_value(arg, slot.path, value_name)
+            }
+            HOSTED_REGISTRY_OP_QUERY_PATH_VALUE => {
+                let Some(key_path) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_KEY_LEN,
+                    HOSTED_REGISTRY_ARG_KEY_OFF,
+                    false,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_VALUE_LEN,
+                    HOSTED_REGISTRY_ARG_VALUE_OFF,
+                    true,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                service_hosted_driver_query_registry_value(arg, key_path, value_name)
+            }
+            HOSTED_REGISTRY_OP_SET_HANDLE_VALUE => {
+                let Some(slot) = driver_registry_handle_slot(a1) else {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                };
+                if slot.kind != DriverRegistryHandleKind::CmKey {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                if a3 > HOSTED_REGISTRY_ARG_DATA_CAP {
+                    return (STATUS_INVALID_BUFFER_SIZE as i32, 0, 0);
+                }
+                let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_VALUE_LEN,
+                    HOSTED_REGISTRY_ARG_VALUE_OFF,
+                    true,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                let data = core::slice::from_raw_parts(
+                    (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
+                    a3 as usize,
+                );
+                match crate::config_manager_set_value(slot.path.as_str(), value_name.as_str(), a2 as u32, data) {
+                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                    Err(status) => (status, 0, 0),
+                }
+            }
+            _ => (STATUS_INVALID_PARAMETER, 0, 0),
+        }
+    }
 }
 
 unsafe fn spawn_hosted_driver_worker_thread(
