@@ -102,7 +102,7 @@ pub(crate) fn build_devnode_pci_resource_grant(
     dma_len: u64,
     granted_mmio_len: u32,
 ) -> Option<DevnodePciResourceGrant> {
-    let assignment = assign_resources(
+    let mut assignment = assign_resources(
         device,
         int_vector,
         int_latched,
@@ -113,13 +113,14 @@ pub(crate) fn build_devnode_pci_resource_grant(
     if mmio_len == 0 || mmio_len > u32::MAX as u64 {
         return None;
     }
+    assignment.mmio_len = mmio_len;
     let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut resource_list,
         device.bus as u32,
         &assignment,
         assignment.mmio_phys,
-        mmio_len as u32,
+        assignment.mmio_len as u32,
     )?;
     resource_list.truncate(n);
     Some(DevnodePciResourceGrant {
@@ -145,7 +146,7 @@ where
     C: AsRef<str>,
 {
     let profile = root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)?;
-    let assignment = assign_root_bus_resources(
+    let mut assignment = assign_root_bus_resources(
         instance_id,
         hardware_ids,
         compatible_ids,
@@ -159,13 +160,14 @@ where
     if mmio_len == 0 || mmio_len > u32::MAX as u64 {
         return None;
     }
+    assignment.mmio_len = mmio_len;
     let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut resource_list,
         0,
         &assignment,
         assignment.mmio_phys,
-        mmio_len as u32,
+        assignment.mmio_len as u32,
     )?;
     resource_list.truncate(n);
     Some(DevnodeRootResourceGrant {

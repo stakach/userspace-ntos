@@ -60,6 +60,7 @@ pub(crate) struct GrantedCaps {
     pub irq_ntfn: Option<u64>,
     pub result_ntfn: Option<u64>,
     pub fault_ep: Option<u64>,
+    pub io_port: Option<u64>,
 }
 
 // =============================================================================================
@@ -263,6 +264,9 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
     if let Some(c) = d.granted.fault_ep {
         let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, c, 0);
     }
+    if let Some(c) = d.granted.io_port {
+        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IO_PORT, c, 0);
+    }
     // TCB.
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
@@ -366,6 +370,7 @@ pub(crate) unsafe fn spawn_isr(
             irq_ntfn: Some(irq_cap),
             result_ntfn: Some(result_cap),
             fault_ep: None,
+            io_port: None,
         },
         prio,
         gs_base: None,
@@ -558,6 +563,7 @@ pub(crate) unsafe fn spawn_storage_host(
             irq_ntfn: None,
             result_ntfn: Some(result_cap),
             fault_ep: Some(fault_ep),
+            io_port: None,
         },
         prio,
         gs_base: None,
@@ -758,6 +764,7 @@ pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
 /// Hosted hardware-driver inline `out dx,eax` faults serviced through a PnP-granted IOPort cap.
 pub(crate) static HOSTED_IO_PORT_OUT32_FAULTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IO_PORT_UNHANDLED_GPS: AtomicU64 = AtomicU64::new(0);
 
 // ── ★ NESTING OBSERVABILITY (Phase 2). These counters are NOT correlation state — nothing reads
 // them to decide where a message goes. That is the whole point: the 32-deep `DISPATCH_TOKEN_STACK`
@@ -833,6 +840,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
     label == ch.dispatch_label
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
@@ -1310,6 +1319,12 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             let status = pump_service_gdi_driver_load();
             pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
+        } else if label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = pump_service_video_device_io_control();
+            pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u64);
+            continue;
         } else if label == 6 {
             outcome.faults += 1;
             if !pump_service_vm_fault(
@@ -1333,7 +1348,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             pump_reply_recv_into!(ch, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.io_port_faults {
-            if let Some(next_ip) = pump_service_io_port_out32_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, msg, 1, next_ip);
                 continue;
             }
@@ -1395,6 +1410,11 @@ unsafe fn pump_service_user_callback(
 #[inline(never)]
 unsafe fn pump_service_gdi_driver_load() -> i32 {
     crate::win32k_glue::service_gdi_driver_load()
+}
+
+#[inline(never)]
+unsafe fn pump_service_video_device_io_control() -> u32 {
+    crate::win32k_subsystem::service_video_device_io_control()
 }
 
 #[inline(never)]
@@ -1566,13 +1586,15 @@ unsafe fn pump_service_generic_fault(
 }
 
 #[inline(never)]
-unsafe fn pump_service_io_port_out32_fault(
+unsafe fn pump_service_io_port_fault(
     ch: &PumpChannel,
     fault_ip: u64,
     exception_number: u64,
 ) -> Option<u64> {
     const X86_GP_EXCEPTION: u64 = 13;
+    const IN_DX_EAX: u8 = 0xED;
     const OUT_DX_EAX: u8 = 0xEF;
+    const OPERAND_SIZE_PREFIX: u8 = 0x66;
 
     if exception_number != X86_GP_EXCEPTION || ch.tcb == 0 {
         return None;
@@ -1588,7 +1610,7 @@ unsafe fn pump_service_io_port_out32_fault(
     let port_len = core::ptr::read_volatile(
         (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LEN) as *const u64,
     );
-    if port_cap == 0 || port_base == 0 || port_len == 0 || ch.exec_code_va == 0 {
+    if port_cap == 0 || port_base == 0 || port_len == 0 {
         return None;
     }
 
@@ -1603,53 +1625,179 @@ unsafe fn pump_service_io_port_out32_fault(
         return None;
     };
     let image_len = image_frames.checked_mul(0x1000)?;
-    if fault_ip < component_code_va || fault_ip >= component_code_va.checked_add(image_len)? {
-        return None;
-    }
-    let offset = fault_ip - component_code_va;
-    let exec_ip = ch.exec_code_va.checked_add(offset)?;
-    if core::ptr::read_volatile(exec_ip as *const u8) != OUT_DX_EAX {
-        return None;
-    }
+    let exec_ip = if fault_ip >= component_code_va
+        && fault_ip < component_code_va.checked_add(image_len)?
+    {
+        if ch.exec_code_va == 0 {
+            return None;
+        }
+        let offset = fault_ip - component_code_va;
+        ch.exec_code_va.checked_add(offset)?
+    } else {
+        let executive_len = crate::IMAGE_FRAMES_COUNT
+            .load(Ordering::Relaxed)
+            .checked_mul(0x1000)?;
+        if fault_ip < crate::IMAGE_BASE || fault_ip >= crate::IMAGE_BASE.checked_add(executive_len)?
+        {
+            return None;
+        }
+        fault_ip
+    };
+    let b0 = core::ptr::read_volatile(exec_ip as *const u8);
+    let b1 = core::ptr::read_volatile((exec_ip + 1) as *const u8);
+    let (is_in, bits, insn_len) = match (b0, b1) {
+        (OUT_DX_EAX, _) => (false, 32u8, 1u64),
+        (IN_DX_EAX, _) => (true, 32u8, 1u64),
+        (OPERAND_SIZE_PREFIX, OUT_DX_EAX) => (false, 16u8, 2u64),
+        (OPERAND_SIZE_PREFIX, IN_DX_EAX) => (true, 16u8, 2u64),
+        _ => {
+            let count = HOSTED_IO_PORT_UNHANDLED_GPS.fetch_add(1, Ordering::Relaxed);
+            if count < 8 {
+                let b2 = core::ptr::read_volatile((exec_ip + 2) as *const u8);
+                let b3 = core::ptr::read_volatile((exec_ip + 3) as *const u8);
+                crate::print_str(b"[pump] unhandled IOPort GP ip=0x");
+                crate::print_hex((fault_ip >> 32) as u32);
+                crate::print_hex(fault_ip as u32);
+                crate::print_str(b" exec=0x");
+                crate::print_hex((exec_ip >> 32) as u32);
+                crate::print_hex(exec_ip as u32);
+                crate::print_str(b" bytes=0x");
+                crate::print_hex(
+                    ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | b3 as u32,
+                );
+                crate::print_str(b"\n");
+            }
+            return None;
+        }
+    };
 
     let mut regs = [0u64; 20];
     crate::win32k_glue::tcb_read_regs20(ch.tcb, &mut regs);
     let port = (regs[6] & 0xFFFF) as u16;
-    let value = regs[3] as u32;
     let port_u64 = port as u64;
     let grant_end = port_base.checked_add(port_len)?;
-    if port_u64 < port_base || port_u64.checked_add(4)? > grant_end {
+    if port_u64 < port_base || port_u64 >= grant_end {
+        if bits == 16 {
+            let offset = if is_in {
+                crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_DENIED
+            } else {
+                crate::driver_launch::SH_RESOURCE_IO_PORT_OUT16_DENIED
+            };
+            let local = core::ptr::read_volatile((sh + offset) as *const u64);
+            core::ptr::write_volatile((sh + offset) as *mut u64, local.saturating_add(1));
+        }
         return None;
     }
 
-    let io = crate::io_out32(port_cap, port, value);
-    if io != 0 {
-        crate::print_str(b"[pump] IOPortOut32 failed label=");
-        crate::print_u64(io);
-        crate::print_str(b" port=0x");
-        crate::print_hex(port as u32);
-        crate::print_str(b"\n");
+    if bits == 16 {
+        let call_offset = if is_in {
+            crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_CALLS
+        } else {
+            crate::driver_launch::SH_RESOURCE_IO_PORT_OUT16_CALLS
+        };
+        let calls = core::ptr::read_volatile((sh + call_offset) as *const u64);
+        core::ptr::write_volatile((sh + call_offset) as *mut u64, calls.saturating_add(1));
+        if is_in {
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+                port as u64,
+            );
+            let (value, io) = crate::io_in16_r(port_cap, port);
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                io,
+            );
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                value as u64,
+            );
+            if io != 0 {
+                let failures = core::ptr::read_volatile(
+                    (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_FAILURES) as *const u64,
+                )
+                .saturating_add(1);
+                core::ptr::write_volatile(
+                    (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_FAILURES) as *mut u64,
+                    failures,
+                );
+                crate::print_str(b"[pump] IOPortIn16 failed label=");
+                crate::print_u64(io);
+                crate::print_str(b" port=0x");
+                crate::print_hex(port as u32);
+                crate::print_str(b"\n");
+                return None;
+            }
+            regs[3] = (regs[3] & !0xFFFF) | value as u64;
+            if crate::win32k_glue::tcb_write_regs20(ch.tcb, &regs, false) != 0 {
+                return None;
+            }
+        } else {
+            let value = regs[3] as u16;
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+                port as u64,
+            );
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+                value as u64,
+            );
+            let io = crate::io_out16(port_cap, port, value);
+            core::ptr::write_volatile(
+                (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                io,
+            );
+            if io != 0 {
+                let failures = core::ptr::read_volatile(
+                    (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT16_FAILURES) as *const u64,
+                )
+                .saturating_add(1);
+                core::ptr::write_volatile(
+                    (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT16_FAILURES) as *mut u64,
+                    failures,
+                );
+                crate::print_str(b"[pump] IOPortOut16 failed label=");
+                crate::print_u64(io);
+                crate::print_str(b" port=0x");
+                crate::print_hex(port as u32);
+                crate::print_str(b" value=0x");
+                crate::print_hex(value as u32);
+                crate::print_str(b"\n");
+                return None;
+            }
+        }
+    } else if is_in {
         return None;
-    }
+    } else {
+        let value = regs[3] as u32;
+        let io = crate::io_out32(port_cap, port, value);
+        if io != 0 {
+            crate::print_str(b"[pump] IOPortOut32 failed label=");
+            crate::print_u64(io);
+            crate::print_str(b" port=0x");
+            crate::print_hex(port as u32);
+            crate::print_str(b"\n");
+            return None;
+        }
 
-    let local = core::ptr::read_volatile(
-        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
-    );
-    core::ptr::write_volatile(
-        (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64,
-        local.saturating_add(1),
-    );
-    let global = HOSTED_IO_PORT_OUT32_FAULTS.fetch_add(1, Ordering::Relaxed);
-    if crate::DEBUG_TRACE && global < 16 {
-        crate::print_str(b"[pump] serviced IOPortOut32 port=0x");
-        crate::print_hex(port as u32);
-        crate::print_str(b" value=0x");
-        crate::print_hex(value);
-        crate::print_str(b" ip=0x");
-        crate::print_hex(fault_ip as u32);
-        crate::print_str(b"\n");
+        let local = core::ptr::read_volatile(
+            (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
+        );
+        core::ptr::write_volatile(
+            (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64,
+            local.saturating_add(1),
+        );
+        let global = HOSTED_IO_PORT_OUT32_FAULTS.fetch_add(1, Ordering::Relaxed);
+        if crate::DEBUG_TRACE && global < 16 {
+            crate::print_str(b"[pump] serviced IOPortOut32 port=0x");
+            crate::print_hex(port as u32);
+            crate::print_str(b" value=0x");
+            crate::print_hex(value);
+            crate::print_str(b" ip=0x");
+            crate::print_hex(fault_ip as u32);
+            crate::print_str(b"\n");
+        }
     }
-    Some(fault_ip + 1)
+    Some(fault_ip + insn_len)
 }
 
 #[inline(never)]

@@ -2108,6 +2108,7 @@ pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
 pub const CT_FAULT: u64 = 6; // a user thread's own cap to its fault endpoint
 pub const CT_WAIT_NTFN: u64 = 7; // a waiter thread's cap to the wait notification it parks on
+pub const CT_IO_PORT: u64 = 8; // a hosted hardware driver's PnP-granted I/O-port cap
 pub const CT_IRQ_NTFN: u64 = 3; // the ISR host's cap to the IRQ notification
 pub const CT_RESULT_NTFN: u64 = 4; // the ISR host's cap to the result notification
 const CN_RADIX: u32 = 5;
@@ -11451,7 +11452,13 @@ unsafe fn mint_badged(src: u64, badge: u64) -> u64 {
 // resource exhaustion (or a bad precondition) silently leaves a page unmapped/zero. These mirror
 // the same register layout via seL4_Call and hand back the reply's error label so callers can
 // detect and react. The reply's message-info comes back in rsi; its label is `reply >> 12`.
-unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
+pub(crate) unsafe fn untyped_retype_r(
+    untyped: u64,
+    obj: u64,
+    bits: u32,
+    num: u32,
+    dest: u64,
+) -> u64 {
     note_retype_attempt(untyped);
     let size_num = ((bits as u64) << 32) | (num as u64);
     let reply: u64;
@@ -11515,7 +11522,7 @@ unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
     }
     label
 }
-unsafe fn cnode_copy_at_r(cnode: u64, dest: u64, src: u64) -> u64 {
+pub(crate) unsafe fn cnode_copy_at_r(cnode: u64, dest: u64, src: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -11811,6 +11818,11 @@ where
             window.mmio_va,
             window.mmio_frame_base,
             window.mmio_pages,
+            if grant.device.base_class() == nt_pnp::PCI_CLASS_DISPLAY {
+                win32k_subsystem::WIN32K_FB_VA
+            } else {
+                0
+            },
             grant.assignment.int_vector,
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
@@ -11875,6 +11887,7 @@ where
             window.mmio_va,
             window.mmio_frame_base,
             window.mmio_pages,
+            0,
             grant.assignment.int_vector,
             grant.assignment.int_latched,
             grant.assignment.int_affinity,
@@ -12065,7 +12078,7 @@ unsafe fn cnode_delete_r(idx: u64) -> u64 {
     reply >> 12
 }
 
-unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
+pub(crate) unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
@@ -12081,7 +12094,7 @@ unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
     reply >> 12
 }
 
-unsafe fn cnode_delete_recycle_r(idx: u64) -> u64 {
+pub(crate) unsafe fn cnode_delete_recycle_r(idx: u64) -> u64 {
     let label = cnode_delete_r(idx);
     if label == 0 {
         recycle_deleted_root_slot(idx);
@@ -16038,11 +16051,7 @@ impl HostedPciHardwareGrant {
         dma: Option<HostedPciDmaGrant>,
     ) -> Option<Self> {
         let mem_bar = device.first_memory_bar()?;
-        if mmio_frame_base == 0
-            || mmio_pages == 0
-            || mem_bar.size == 0
-            || mem_bar.size > mmio_pages.saturating_mul(0x1000)
-        {
+        if mmio_frame_base == 0 || mmio_pages == 0 || mem_bar.size == 0 {
             return None;
         }
         let (dma_frame_base, dma_pages, dma_logical, dma_len) = match dma {
@@ -16272,19 +16281,20 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                 };
                 let interrupt_vector = hosted_pci_interrupt_vector(device).unwrap_or(0);
                 let mmio_pages = mem_bar.size.div_ceil(0x1000).max(1);
-                let mmio_frame_base = claim_device_frame_caps(bi, mem_bar.base, mmio_pages);
-                if mmio_frame_base == 0 {
+                let Some(mmio_run) = existing_boot_framebuffer_cap_run(mem_bar.base, mmio_pages)
+                    .or_else(|| claim_device_frame_caps(bi, mem_bar.base, mmio_pages))
+                else {
                     report.claim_failures += 1;
                     continue;
-                }
+                };
                 if hosted_pci_driver_needs_dma(device) {
                     let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
                     if let Some(dma) = dma_grant {
                         report.dma_grants += 1;
                         let Some(grant) = HostedPciHardwareGrant::for_device(
                             device,
-                            mmio_frame_base,
-                            mmio_pages,
+                            mmio_run.base,
+                            mmio_run.pages,
                             interrupt_vector,
                             false,
                             Some(dma),
@@ -16315,8 +16325,8 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.dma_not_required += 1;
                     let Some(grant) = HostedPciHardwareGrant::for_device(
                         device,
-                        mmio_frame_base,
-                        mmio_pages,
+                        mmio_run.base,
+                        mmio_run.pages,
                         interrupt_vector,
                         false,
                         None,
@@ -16388,12 +16398,20 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         || grant.dma_pages != 0
                         || grant.dma_logical != 0
                         || grant.dma_len != 0;
-                    let Some(mmio_va) = resource_vas.allocate_component_window() else {
+                    let Some(mmio_bytes) = grant.mmio_pages.checked_mul(0x1000) else {
+                        report.pci_va_exhausted = true;
+                        continue;
+                    };
+                    let Some(mmio_va) = resource_vas.allocate_component_span(mmio_bytes) else {
                         report.pci_va_exhausted = true;
                         continue;
                     };
                     let dma_va = if needs_dma {
-                        let Some(dma_va) = resource_vas.allocate_component_window() else {
+                        let Some(dma_bytes) = grant.dma_pages.checked_mul(0x1000) else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        let Some(dma_va) = resource_vas.allocate_component_span(dma_bytes) else {
                             report.pci_va_exhausted = true;
                             continue;
                         };
@@ -16438,7 +16456,14 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                 {
                     continue;
                 }
-                let Some((mmio_va, dma_va)) = resource_vas.allocate_component_window_pair() else {
+                let Some(mmio_va) =
+                    resource_vas.allocate_component_span(profile.mmio_len.max(1))
+                else {
+                    report.root_va_exhausted = true;
+                    continue;
+                };
+                let Some(dma_va) = resource_vas.allocate_component_span(0x1000)
+                else {
                     report.root_va_exhausted = true;
                     continue;
                 };
@@ -21470,6 +21495,7 @@ pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// (the display DLL's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA so GDI writes pixels to the real fb).
 static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static FB_PADDR: AtomicU64 = AtomicU64::new(0);
 static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static FB_SCANLINE: AtomicU64 = AtomicU64::new(0);
@@ -22067,22 +22093,37 @@ unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u
     0
 }
 
+#[derive(Clone, Copy)]
+struct DeviceFrameCapRun {
+    base: u64,
+    pages: u64,
+}
+
+fn existing_boot_framebuffer_cap_run(paddr: u64, requested_pages: u64) -> Option<DeviceFrameCapRun> {
+    if requested_pages == 0 || FB_PADDR.load(Ordering::Relaxed) != paddr {
+        return None;
+    }
+    let base = FB_FRAME_BASE.load(Ordering::Relaxed);
+    let pages = FB_FRAME_COUNT.load(Ordering::Relaxed).min(requested_pages);
+    (base != 0 && pages != 0).then_some(DeviceFrameCapRun { base, pages })
+}
+
 /// Claim BAR frame caps without mapping them into the executive. The hosted-driver resource broker
 /// copies these caps into the target component and maps them at the per-devnode resource window.
-unsafe fn claim_device_frame_caps(bi: &BootInfo, paddr: u64, n: u64) -> u64 {
+unsafe fn claim_device_frame_caps(bi: &BootInfo, paddr: u64, n: u64) -> Option<DeviceFrameCapRun> {
     if n == 0 {
-        return 0;
+        return None;
     }
     let count = bi.untyped.end - bi.untyped.start;
     for i in 0..count {
         let d = bi.untyped_list[i as usize];
         if d.is_device == 1 && d.paddr == paddr {
             let Some(base) = try_alloc_slot_run(n) else {
-                return 0;
+                return None;
             };
             let mut page = 0u64;
             while page < n {
-                let err = untyped_retype(
+                let err = untyped_retype_from_r(
                     bi.untyped.start + i,
                     OBJ_X86_4K_PAGE,
                     PAGING_BITS,
@@ -22090,14 +22131,24 @@ unsafe fn claim_device_frame_caps(bi: &BootInfo, paddr: u64, n: u64) -> u64 {
                     base + page,
                 );
                 if err != 0 {
-                    return 0;
+                    print_str(b"[driver-launch] device frame cap claim failed paddr=0x");
+                    print_hex((paddr >> 32) as u32);
+                    print_hex(paddr as u32);
+                    print_str(b" page=");
+                    print_u64(page);
+                    print_str(b"/");
+                    print_u64(n);
+                    print_str(b" err=");
+                    print_u64(err);
+                    print_str(b"\n");
+                    return None;
                 }
                 page += 1;
             }
-            return base;
+            return Some(DeviceFrameCapRun { base, pages: n });
         }
     }
-    0
+    None
 }
 
 /// Invoke `X86Page::GetAddress` on a frame cap and return its physical address. The
@@ -23174,6 +23225,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // frames into win32k's VSpace (the display DLL draws pixels there -> the real framebuffer).
             FB_FRAME_BASE.store(base_slot, Ordering::Relaxed);
             FB_FRAME_COUNT.store(n_pages, Ordering::Relaxed);
+            FB_PADDR.store(fb_paddr, Ordering::Relaxed);
             FB_WIDTH.store(fb_w, Ordering::Relaxed);
             FB_HEIGHT.store(fb_h, Ordering::Relaxed);
             FB_SCANLINE.store(fb_scan, Ordering::Relaxed);
@@ -24177,6 +24229,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     irq_ntfn: None,
                     result_ntfn: Some(kmdf_result_badged),
                     fault_ep: Some(kmdf_fault),
+                    io_port: None,
                 },
                 prio: 100,
                 gs_base: None,
@@ -24296,6 +24349,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
                 let _ = alloc_frame();
             }
+            // Dedicated cross-AS video IOCTL staging. EngDeviceIoControl runs in win32k, but hosted
+            // miniport IRPs are executive-owned and must cross the component boundary explicitly.
+            let video_ioctl_base = alloc_frame();
+            for _ in 1..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
+                let _ = alloc_frame();
+            }
             // Bulk provider argument staging for large GDI client buffers.
             let bulk_arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
@@ -24360,6 +24419,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(arg_base + i),
                     win32k_subsystem::WIN32K_ARG_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            for i in 0..win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES {
+                let _ = page_map(
+                    copy_cap(video_ioctl_base + i),
+                    win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -24573,6 +24640,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 };
                 n += 1;
+                // Video IOCTL staging (aux PT window).
+                regions[n] = Region {
+                    source: FrameSource::Alias(video_ioctl_base),
+                    base_va: win32k_subsystem::WIN32K_VIDEO_IOCTL_VADDR,
+                    count: win32k_subsystem::WIN32K_VIDEO_IOCTL_FRAMES,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: 0,
+                };
+                n += 1;
                 // Bulk provider argument staging (own PT window, aliased frames).
                 regions[n] = Region {
                     source: FrameSource::Alias(bulk_arg_base),
@@ -24605,6 +24681,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         irq_ntfn: None,
                         result_ntfn: None,
                         fault_ep: Some(w_fault),
+                        io_port: None,
                     },
                     prio: 100,
                     // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed

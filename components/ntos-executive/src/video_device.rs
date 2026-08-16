@@ -21,8 +21,9 @@ use nt_io_manager::{
 use nt_status::NtStatus;
 use nt_video_miniport::{
     BootFramebufferMiniport, FramebufferMapping, VideoMiniportError, VideoPort,
-    VideoDeviceIdentity, IOCTL_VIDEO_MAP_VIDEO_MEMORY, VIDEO_DEVICE_MAP_KEY,
-    VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE,
+    VideoDeviceIdentity, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS, IOCTL_VIDEO_MAP_VIDEO_MEMORY,
+    IOCTL_VIDEO_UNMAP_VIDEO_MEMORY, VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE,
+    VIDEO_WIN32K_CALLBACKS_SIZE_X64,
 };
 
 pub(crate) use nt_video_miniport::VideoModeSpec;
@@ -263,9 +264,11 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
 ) -> bool {
     let Some(route_info) = crate::driver_launch::hosted_video_route_info(reg.device_id) else {
+        print_hosted_video_publish_failure(b"route-info", None);
         return false;
     };
     if !ensure_video_objects(reg.allocate_projection) {
+        print_hosted_video_publish_failure(b"objects", None);
         return false;
     }
     let Some(metadata) = video_registration_metadata_from_paths(
@@ -275,15 +278,20 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         reg.service_registry_path,
         reg.allocate_projection,
     ) else {
+        print_hosted_video_publish_failure(b"metadata", None);
         return false;
     };
-    let Some((file_handle, file_id, file_object_id)) =
-        open_video_device_route(route_info.device_id, metadata)
-    else {
-        return false;
-    };
+    let (file_handle, file_id, file_object_id) =
+        match open_video_device_route(route_info.device_id, metadata) {
+            Ok(route) => route,
+            Err(status) => {
+                print_hosted_video_publish_failure(b"open", Some(status));
+                return false;
+            }
+        };
     if !rewrite_video_file_projection(file_id) {
         let _ = crate::driver_launch::close_io_handle(file_handle);
+        print_hosted_video_publish_failure(b"file-projection", None);
         return false;
     }
     teardown_video_io_route();
@@ -302,10 +310,21 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         teardown_video_io_route();
         (*addr_of_mut!(VIDEO_STATE)).metadata = None;
         (*addr_of_mut!(VIDEO_STATE)).ready = false;
+        print_hosted_video_publish_failure(b"devicemap", None);
         return false;
     }
     (*addr_of_mut!(VIDEO_STATE)).ready = true;
     true
+}
+
+fn print_hosted_video_publish_failure(stage: &[u8], status: Option<NtStatus>) {
+    crate::print_str(b"[video-device] hosted publish failed stage=");
+    crate::print_str(stage);
+    if let Some(status) = status {
+        crate::print_str(b" status=0x");
+        crate::print_hex(status.raw() as u32);
+    }
+    crate::print_str(b"\n");
 }
 
 #[inline(never)]
@@ -446,6 +465,13 @@ pub(crate) fn video_device_map_published() -> bool {
     unsafe { video_state_snapshot().map_published() }
 }
 
+pub(crate) fn hosted_video_device_route_ready() -> bool {
+    unsafe {
+        let state = video_state_snapshot();
+        state.projected_ready() && matches!(state.route.backend, VideoRouteBackend::HostedIoManager)
+    }
+}
+
 pub(crate) unsafe fn query_video_device_map_value_owned(
     name: &[u8],
 ) -> Result<(u32, Vec<u8>), i32> {
@@ -552,7 +578,7 @@ unsafe fn ensure_video_io_route(metadata: VideoRegistrationMetadata) -> bool {
         crate::driver_launch::destroy_io_driver(driver_id);
         return false;
     };
-    let Some((file_handle, file_id, file_object_id)) =
+    let Ok((file_handle, file_id, file_object_id)) =
         open_video_device_route(device_id, metadata)
     else {
         teardown_video_driver_route(driver_id);
@@ -620,21 +646,19 @@ unsafe fn register_video_device_route(
 unsafe fn open_video_device_route(
     device_id: u64,
     metadata: VideoRegistrationMetadata,
-) -> Option<(u64, u64, u64)> {
-    let device_path = core::str::from_utf8(metadata.device_path()).ok()?;
-    let Ok((file_handle, file_id, opened_device_id, file_object_id)) =
+) -> Result<(u64, u64, u64), NtStatus> {
+    let device_path =
+        core::str::from_utf8(metadata.device_path()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    let (file_handle, file_id, opened_device_id, file_object_id) =
         crate::driver_launch::open_io_device(
             device_path,
             nt_types::AccessMask::GENERIC_READ | nt_types::AccessMask::GENERIC_WRITE,
-        )
-    else {
-        return None;
-    };
+        )?;
     if opened_device_id != device_id {
         let _ = crate::driver_launch::close_io_handle(file_handle);
-        return None;
+        return Err(NtStatus::INVALID_DEVICE_REQUEST);
     }
-    Some((file_handle, file_id, file_object_id))
+    Ok((file_handle, file_id, file_object_id))
 }
 
 #[inline(never)]
@@ -898,6 +922,20 @@ pub(crate) unsafe fn video_device_io_control(
     } else {
         return 1;
     };
+    if let Some(information) = dispatch_video_port_owned_control(
+        ioctl as u32,
+        input,
+        output,
+        objects.device,
+    ) {
+        match information {
+            Ok(information) if information <= u32::MAX as usize => {
+                set_ret(information as u32);
+                return 0;
+            }
+            _ => return 1,
+        }
+    }
     match state.route.backend {
         VideoRouteBackend::BootFramebuffer => {
             let Some(port) = state.port else {
@@ -933,5 +971,36 @@ pub(crate) unsafe fn video_device_io_control(
             _ => 1,
         },
         VideoRouteBackend::Empty => 1,
+    }
+}
+
+fn dispatch_video_port_owned_control(
+    ioctl: u32,
+    input: &[u8],
+    output: &mut [u8],
+    video_device_object: u64,
+) -> Option<Result<usize, VideoMiniportError>> {
+    match ioctl {
+        IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+            if input.len() < 16 {
+                return Some(Err(VideoMiniportError::BufferTooSmall { needed: 16 }));
+            }
+            if output.len() < VIDEO_WIN32K_CALLBACKS_SIZE_X64 {
+                return Some(Err(VideoMiniportError::BufferTooSmall {
+                    needed: VIDEO_WIN32K_CALLBACKS_SIZE_X64,
+                }));
+            }
+            let mut phys_disp = [0u8; 8];
+            phys_disp.copy_from_slice(&input[..8]);
+            let mut callout = [0u8; 8];
+            callout.copy_from_slice(&input[8..16]);
+            output[..VIDEO_WIN32K_CALLBACKS_SIZE_X64].fill(0);
+            output[..8].copy_from_slice(&phys_disp);
+            output[8..16].copy_from_slice(&callout);
+            output[24..32].copy_from_slice(&video_device_object.to_le_bytes());
+            Some(Ok(VIDEO_WIN32K_CALLBACKS_SIZE_X64))
+        }
+        IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Some(Ok(0)),
+        _ => None,
     }
 }

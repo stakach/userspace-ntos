@@ -117,11 +117,20 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
 pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
 pub const WIN32K_ARG_FRAMES: u64 = 4;
+/// Dedicated cross-address-space video-control window. `EngDeviceIoControl` runs in the win32k
+/// component, but hosted miniport IRPs are executive-owned; this window carries bounded METHOD_BUFFERED
+/// input/output bytes without reusing the live syscall ARG frame or the user-callback shared page.
+pub const WIN32K_VIDEO_IOCTL_VADDR: u64 = 0x0000_0100_071C_0000;
+pub const WIN32K_VIDEO_IOCTL_FRAMES: u64 = 4;
+pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize) * 0x1000;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
 /// scalar argument tails. `NtGdiStretchDIBitsInternal` can receive DIB payloads far larger than the
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
 pub const WIN32K_BULK_ARG_VADDR: u64 = 0x0000_0100_0720_0000;
 pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
+const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
+const _: () =
+    assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
@@ -612,6 +621,25 @@ pub const W32_USER_CALLBACK_RESUME_LABEL: u64 = 0x773;
 /// cannot do executive-owned filesystem/capability work in win32k's VSpace, so it sends the bounded
 /// driver leaf through the shared page and waits while the executive performs the real load.
 pub const W32_GDI_LOAD_LABEL: u64 = 0x774;
+/// A component-side `EngDeviceIoControl` request. The display driver and win32k run in the win32k
+/// component, while hosted video miniport IRPs belong to the executive's generic IO manager.
+pub const W32_VIDEO_IOCTL_LABEL: u64 = 0x775;
+
+const VIDEO_IOCTL_HDEV: u64 = 0x00;
+const VIDEO_IOCTL_CODE: u64 = 0x08;
+const VIDEO_IOCTL_IN_LEN: u64 = 0x10;
+const VIDEO_IOCTL_OUT_LEN: u64 = 0x18;
+const VIDEO_IOCTL_STATUS: u64 = 0x20;
+const VIDEO_IOCTL_BYTES_RETURNED: u64 = 0x28;
+const VIDEO_IOCTL_IN_BUF: u64 = 0x100;
+const VIDEO_IOCTL_IN_CAP: usize = 0x1000;
+const VIDEO_IOCTL_OUT_BUF: u64 = VIDEO_IOCTL_IN_BUF + VIDEO_IOCTL_IN_CAP as u64;
+const VIDEO_IOCTL_OUT_CAP: usize =
+    WIN32K_VIDEO_IOCTL_BYTES - VIDEO_IOCTL_OUT_BUF as usize;
+const _: () = assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
+static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
+static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
+static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
@@ -7163,6 +7191,7 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const WIN32K_REG_HANDLE_BASE: u64 = 0x5A5A_1000;
+static WIN32K_VIDEO_REG_QUERY_TRACE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Win32kRegHandleTarget {
@@ -7285,7 +7314,7 @@ fn register_display_device_route(spec: &DisplayRegistrySpec<'_>) -> bool {
         crate::video_device::publish_boot_framebuffer_video_device(
             &crate::video_device::VideoDeviceRegistration {
                 object_number: spec.video_object_number,
-                driver_name: spec.service_name,
+                driver_name: b"bootvid",
                 service_registry_path: spec.service_registry_path,
                 framebuffer_va: WIN32K_FB_VA,
                 framebuffer_size: spec.framebuffer_size,
@@ -7504,10 +7533,28 @@ unsafe fn query_video_device_map_value(
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    match crate::video_device::query_video_device_map_value_owned(name) {
+    let ready = crate::video_device::video_device_map_published();
+    let status = match crate::video_device::query_video_device_map_value_owned(name) {
         Ok((value_type, data)) => emit_kvpi_bytes(kvi, length, result_len, value_type, &data),
         Err(status) => status,
+    };
+    let trace = WIN32K_VIDEO_REG_QUERY_TRACE.fetch_add(1, Ordering::Relaxed);
+    if trace < 16 {
+        print_str(b"[win32k-reg] video devicemap query name=");
+        print_str(name);
+        print_str(b" published=");
+        print_u64(ready as u64);
+        print_str(b" len=");
+        print_u64(length);
+        print_str(b" status=0x");
+        print_hex(status as u32);
+        if !result_len.is_null() {
+            print_str(b" result_len=");
+            print_u64(read_unaligned(result_len) as u64);
+        }
+        print_str(b"\n");
     }
+    status
 }
 
 /// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
@@ -7553,24 +7600,154 @@ extern "win64" fn s_io_get_device_object_pointer(
     unsafe { crate::video_device::video_get_device_object_pointer(name, fileobj_out, devobj_out) }
 }
 
+#[inline]
+unsafe fn write_eng_device_io_control_bytes_returned(bytes_ret: *mut u32, value: u32) {
+    if !bytes_ret.is_null() {
+        write_unaligned(bytes_ret, value);
+    }
+}
+
+#[inline(never)]
+unsafe fn request_video_device_io_control(
+    hdev: u64,
+    ioctl: u32,
+    in_buf: u64,
+    in_len: u32,
+    out_buf: u64,
+    out_len: u32,
+    bytes_ret: *mut u32,
+) -> u32 {
+    write_eng_device_io_control_bytes_returned(bytes_ret, 0);
+    let in_len = in_len as u64;
+    let out_len = out_len as u64;
+    let invalid = in_len > VIDEO_IOCTL_IN_CAP as u64
+        || out_len > VIDEO_IOCTL_OUT_CAP as u64
+        || (in_len != 0 && in_buf == 0)
+        || (out_len != 0 && out_buf == 0);
+    let seq = WIN32K_VIDEO_IOCTL_REQUEST_TRACE.fetch_add(1, Ordering::Relaxed);
+    if seq < 64 {
+        print_str(b"[win32k-video-ioctl-request] hdev=0x");
+        print_hex((hdev >> 32) as u32);
+        print_hex(hdev as u32);
+        print_str(b" ioctl=0x");
+        print_hex(ioctl as u32);
+        print_str(b" in/out=");
+        print_u64(in_len);
+        print_str(b"/");
+        print_u64(out_len);
+        print_str(b" inbuf=0x");
+        print_hex((in_buf >> 32) as u32);
+        print_hex(in_buf as u32);
+        print_str(b" outbuf=0x");
+        print_hex((out_buf >> 32) as u32);
+        print_hex(out_buf as u32);
+        print_str(b" bytes=0x");
+        print_hex(((bytes_ret as u64) >> 32) as u32);
+        print_hex((bytes_ret as u64) as u32);
+        print_str(b" invalid=");
+        print_u64(invalid as u64);
+        print_str(b"\n");
+    }
+    if invalid {
+        return 1;
+    }
+
+    let sh = WIN32K_VIDEO_IOCTL_VADDR;
+    for index in 0..in_len as usize {
+        let value = read_volatile((in_buf + index as u64) as *const u8);
+        write_volatile((sh + VIDEO_IOCTL_IN_BUF + index as u64) as *mut u8, value);
+    }
+    for index in 0..out_len as usize {
+        write_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *mut u8, 0);
+    }
+    write_volatile((sh + VIDEO_IOCTL_HDEV) as *mut u64, hdev);
+    write_volatile((sh + VIDEO_IOCTL_CODE) as *mut u64, ioctl as u64);
+    write_volatile((sh + VIDEO_IOCTL_IN_LEN) as *mut u64, in_len);
+    write_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *mut u64, out_len);
+    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, 1);
+    write_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32, 0);
+
+    let _ = crate::driver_launch::call_on(W32_VIDEO_IOCTL_LABEL << 12);
+    let status = read_volatile((sh + VIDEO_IOCTL_STATUS) as *const u32);
+    let bytes_returned = read_volatile((sh + VIDEO_IOCTL_BYTES_RETURNED) as *const u32);
+    let copy_len = core::cmp::min(bytes_returned as u64, out_len) as usize;
+    if status == 0 {
+        for index in 0..copy_len {
+            let value = read_volatile((sh + VIDEO_IOCTL_OUT_BUF + index as u64) as *const u8);
+            write_volatile((out_buf + index as u64) as *mut u8, value);
+        }
+    }
+    write_eng_device_io_control_bytes_returned(bytes_ret, bytes_returned);
+    status
+}
+
+#[inline(never)]
+pub(crate) unsafe fn service_video_device_io_control() -> u32 {
+    let sh = WIN32K_VIDEO_IOCTL_VADDR;
+    let hdev = read_volatile((sh + VIDEO_IOCTL_HDEV) as *const u64);
+    let ioctl = read_volatile((sh + VIDEO_IOCTL_CODE) as *const u64);
+    let in_len = read_volatile((sh + VIDEO_IOCTL_IN_LEN) as *const u64);
+    let out_len = read_volatile((sh + VIDEO_IOCTL_OUT_LEN) as *const u64);
+    let mut bytes_returned = 0u32;
+    let status = if ioctl > u32::MAX as u64
+        || in_len > VIDEO_IOCTL_IN_CAP as u64
+        || out_len > VIDEO_IOCTL_OUT_CAP as u64
+    {
+        1
+    } else {
+        crate::video_device::video_device_io_control(
+            hdev,
+            ioctl,
+            sh + VIDEO_IOCTL_IN_BUF,
+            in_len,
+            sh + VIDEO_IOCTL_OUT_BUF,
+            out_len,
+            &mut bytes_returned as *mut u32,
+        )
+    };
+    if status != 0 {
+        bytes_returned = 0;
+    }
+    write_volatile((sh + VIDEO_IOCTL_STATUS) as *mut u32, status);
+    write_volatile(
+        (sh + VIDEO_IOCTL_BYTES_RETURNED) as *mut u32,
+        bytes_returned,
+    );
+    let seq = WIN32K_VIDEO_IOCTL_TRACE.fetch_add(1, Ordering::Relaxed);
+    if seq < 64 {
+        print_str(b"[win32k-video-ioctl] hdev=0x");
+        print_hex((hdev >> 32) as u32);
+        print_hex(hdev as u32);
+        print_str(b" ioctl=0x");
+        print_hex(ioctl as u32);
+        print_str(b" in/out=");
+        print_u64(in_len);
+        print_str(b"/");
+        print_u64(out_len);
+        print_str(b" status=");
+        print_u64(status as u64);
+        print_str(b" bytes=");
+        print_u64(bytes_returned as u64);
+        print_str(b"\n");
+    }
+    status
+}
+
 /// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in
 /// `load_into`, so both the display DLL's imported calls and win32k's own internal calls route into
 /// the executive-owned video-device boundary). Returns 0 (ERROR_SUCCESS) on handled, nonzero on
-/// unhandled. win64: rcx=hDev, rdx=ioctl, r8=inbuf, r9=inlen, stack: outbuf, outlen, bytesret.
+/// unhandled. win64: rcx=hDev, edx=ioctl, r8=inbuf, r9d=inlen, stack: outbuf, outlen(ULONG),
+/// bytesret.
 extern "win64" fn s_eng_device_io_control(
     hdev: u64,
-    ioctl: u64,
+    ioctl: u32,
     in_buf: u64,
-    in_len: u64,
+    in_len: u32,
     out_buf: u64,
-    out_len: u64,
+    out_len: u32,
     bytes_ret: *mut u32,
 ) -> u32 {
-    unsafe {
-        crate::video_device::video_device_io_control(
-            hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret,
-        )
-    }
+    unsafe { request_video_device_io_control(hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret) }
 }
 
 /// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
@@ -8612,6 +8789,41 @@ unsafe fn pe_c_string_eq_slice(ptr: u64, expected: &[u8]) -> bool {
         }
         k += 1;
     }
+}
+
+fn import_name_eq(import_name: &[u8], expected: &[u8]) -> bool {
+    import_name.len() == expected.len()
+        && import_name
+            .iter()
+            .zip(expected.iter())
+            .all(|(&actual, &expected)| actual == expected)
+}
+
+unsafe fn trace_gdi_driver_import(import_name: &[u8], slot: u64, addr: u64, direct: bool) {
+    if !import_name_eq(import_name, b"EngDeviceIoControl") {
+        return;
+    }
+    let seq = GDI_DRIVER_IMPORT_TRACE.fetch_add(1, Ordering::Relaxed);
+    if seq >= 16 {
+        return;
+    }
+    print_str(b"[win32k-gdidrv-import] ");
+    print_str(import_name);
+    print_str(b" slot=0x");
+    print_hex((slot >> 32) as u32);
+    print_hex(slot as u32);
+    print_str(b" addr=0x");
+    print_hex((addr >> 32) as u32);
+    print_hex(addr as u32);
+    print_str(b" direct=");
+    print_u64(direct as u64);
+    print_str(b"\n");
+}
+
+unsafe fn log_unresolved_gdi_driver_import(import_name: &[u8]) {
+    print_str(b"[win32k-gdidrv-import] unresolved ");
+    print_str(import_name);
+    print_str(b"\n");
 }
 
 /// Runs in the EXECUTIVE. `src_va`/`src_size` name the raw win32k.sys staged in WIN32KBUF; the
@@ -10484,7 +10696,8 @@ pub fn record_display_driver(
         FRAMEBUF_VA + entry_rva as u64,
         expd,
         image_len,
-    ) && register_display_device_route(spec)
+    ) && (crate::video_device::hosted_video_device_route_ready()
+        || register_display_device_route(spec))
 }
 
 /// Record the loaded keyboard-layout DLL info. win32k uses the export directory to find
@@ -10727,14 +10940,31 @@ pub unsafe fn load_driver_into(
                     let name_ptr = dst_va + name_rva + 2;
                     let cstr_len = image_c_string_len(dst_va, name_rva + 2, cap, 63)?;
                     let import_name = core::slice::from_raw_parts(name_ptr as *const u8, cstr_len);
-                    let addr = if is_dxgthk && dxgthk_base != 0 {
-                        pe_export_lookup(dxgthk_base, import_name)
+                    let (addr, direct) = if import_name_eq(import_name, b"EngDeviceIoControl") {
+                        (s_eng_device_io_control as usize as u64, true)
+                    } else if is_dxgthk {
+                        if dxgthk_base == 0 {
+                            log_unresolved_gdi_driver_import(import_name);
+                            return None;
+                        }
+                        let addr = pe_export_lookup(dxgthk_base, import_name);
+                        if addr == 0 {
+                            log_unresolved_gdi_driver_import(import_name);
+                            return None;
+                        }
+                        (addr, false)
                     } else if is_win32k {
-                        pe_export_lookup(WIN32K_CODE_VA, import_name)
+                        let addr = pe_export_lookup(WIN32K_CODE_VA, import_name);
+                        if addr == 0 {
+                            log_unresolved_gdi_driver_import(import_name);
+                            return None;
+                        }
+                        (addr, false)
                     } else {
                         let name = core::str::from_utf8_unchecked(import_name);
-                        export_addr(name)
+                        (export_addr(name), false)
                     };
+                    trace_gdi_driver_import(import_name, slots + k * 8, addr, direct);
                     write_unaligned((slots + k * 8) as *mut u64, addr);
                 }
                 k += 1;

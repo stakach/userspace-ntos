@@ -271,6 +271,23 @@ pub const SH_ACTIVE_IOSL: u64 = 0x6C8; // out: component VA of Tail.Overlay.Curr
 pub const SH_ACTIVE_DATA: u64 = 0x6D0; // out: component VA of request SystemBuffer/UserBuffer
 pub const SH_ACTIVE_DATA_CAP: u64 = 0x6D8; // out: bytes allocated for SH_ACTIVE_DATA
 pub const SH_ACTIVE_FILE_OBJECT: u64 = 0x6E0; // out: component VA of the IRP FILE_OBJECT, if any
+pub const SH_RESOURCE_IO_PORT_IN16_CALLS: u64 = 0x6E8; // out: VideoPortReadPortUshort calls
+pub const SH_RESOURCE_IO_PORT_OUT16_CALLS: u64 = 0x6F0; // out: VideoPortWritePortUshort calls
+pub const SH_RESOURCE_IO_PORT_IN16_FAILURES: u64 = 0x6F8; // out: failed inw invocations
+pub const SH_RESOURCE_IO_PORT_OUT16_FAILURES: u64 = 0x700; // out: failed outw invocations
+pub const SH_RESOURCE_IO_PORT_IN16_DENIED: u64 = 0x708; // out: inw outside assigned NT range
+pub const SH_RESOURCE_IO_PORT_OUT16_DENIED: u64 = 0x710; // out: outw outside assigned NT range
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_STATUS: u64 = 0x718; // out: last inw invocation label
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS: u64 = 0x720; // out: last outw invocation label
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_PORT: u64 = 0x728; // out: last inw port number
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_PORT: u64 = 0x730; // out: last outw port number
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_VALUE: u64 = 0x738; // out: last inw value
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE: u64 = 0x740; // out: last outw value
+pub const SH_RESOURCE_IO_PORT_COMPONENT_CAP: u64 = 0x748; // in: component-CNode IOPort cap slot
+pub const SH_VIDEO_MEMORY_PHYS: u64 = 0x750; // in: caller-visible video memory physical base
+pub const SH_VIDEO_MEMORY_LEN: u64 = 0x758; // in: caller-visible video memory bytes
+pub const SH_VIDEO_MEMORY_CALLER_VA: u64 = 0x760; // in: VA mapped in the EngDeviceIoControl caller
+pub const SH_VIDEO_MEMORY_MAPPED_VA: u64 = 0x768; // out: last VideoPortMapMemory caller VA
 pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
 pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
@@ -292,7 +309,14 @@ pub const SH_VIDEO_FIND_ADAPTER_AGAIN: u64 = 0x9E4; // out: last Again byte
 pub const SH_VIDEO_HW_INITIALIZE_CALLS: u64 = 0x9E8; // out: HwInitialize calls
 pub const SH_VIDEO_HW_INITIALIZE_OK: u64 = 0x9F0; // out: last HwInitialize BOOLEAN
 pub const SH_VIDEO_HW_START_IO_CALLS: u64 = 0x9F8; // out: HwStartIO calls
-pub const SH_HANDOFF_ARENA_BASE: u64 = 0xA00;
+pub const SH_VIDEO_REGISTRY_SET_CALLS: u64 = 0xA00; // out: staged VideoPortSetRegistryParameters writes
+pub const SH_VIDEO_REGISTRY_SET_FAILURES: u64 = 0xA08; // out: rejected stage attempts
+pub const SH_VIDEO_REGISTRY_SET_BYTES: u64 = 0xA10; // out: bytes used in the ARG-frame registry log
+pub const SH_VIDEO_REGISTRY_SET_OVERFLOW: u64 = 0xA18; // out: ARG-frame capacity failures
+pub const SH_VIDEO_REGISTRY_COMMIT_STATUS: u64 = 0xA20; // out: last executive-side Config Manager status
+pub const SH_VIDEO_REGISTRY_COMMIT_FAILURES: u64 = 0xA28; // out: failed executive-side commits
+pub const SH_VIDEO_DISPI_SELECTED_INDEX: u64 = 0xA30; // out: last Bochs DISPI index-port write
+pub const SH_HANDOFF_ARENA_BASE: u64 = 0xA38;
 pub const SH_HANDOFF_ARENA_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
 pub const SH_DPC_QUEUE_BASE: u64 = SH_HANDOFF_ARENA_BASE; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
@@ -306,7 +330,8 @@ const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
-const _: () = assert!(SH_ACTIVE_FILE_OBJECT + 8 <= SH_RESOURCE_IO_PORT_CAP);
+const _: () = assert!(SH_VIDEO_MEMORY_MAPPED_VA + 8 <= SH_RESOURCE_IO_PORT_CAP);
+const _: () = assert!(SH_VIDEO_DISPI_SELECTED_INDEX + 8 <= SH_HANDOFF_ARENA_BASE);
 const SH_REGISTRY_IDENTITY_PRESENT: u32 = 0x1;
 const SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY: u32 = 0x2;
 const SH_REGISTRY_IDENTITY_HAS_EXPORT: u32 = 0x4;
@@ -3075,18 +3100,19 @@ unsafe fn write_shared_registry_ascii<const N: usize>(
     Ok(())
 }
 
-unsafe fn read_shared_registry_ascii<const N: usize>(
+unsafe fn read_shared_registry_ascii_at<const N: usize>(
+    sh: u64,
     len_off: u64,
     buf_off: u64,
 ) -> Option<HostedAscii<N>> {
-    let len = read_volatile((FSD_SHARED_VADDR + len_off) as *const u16) as usize;
+    let len = read_volatile((sh + len_off) as *const u16) as usize;
     if len > N {
         return None;
     }
     let mut out = HostedAscii::<N>::empty();
     let mut i = 0usize;
     while i < len {
-        let b = read_volatile((FSD_SHARED_VADDR + buf_off + i as u64) as *const u8);
+        let b = read_volatile((sh + buf_off + i as u64) as *const u8);
         if b == 0 || b > 0x7f || !out.push_byte(b) {
             return None;
         }
@@ -3140,7 +3166,11 @@ unsafe fn publish_shared_registry_identity_at(
 }
 
 unsafe fn shared_registry_identity() -> Option<HostedDriverRegistryIdentity> {
-    let flags = read_volatile((FSD_SHARED_VADDR + SH_REGISTRY_IDENTITY_FLAGS) as *const u32);
+    shared_registry_identity_at(FSD_SHARED_VADDR)
+}
+
+unsafe fn shared_registry_identity_at(sh: u64) -> Option<HostedDriverRegistryIdentity> {
+    let flags = read_volatile((sh + SH_REGISTRY_IDENTITY_FLAGS) as *const u32);
     if (flags & SH_REGISTRY_IDENTITY_PRESENT) == 0 {
         return None;
     }
@@ -3149,7 +3179,8 @@ unsafe fn shared_registry_identity() -> Option<HostedDriverRegistryIdentity> {
     {
         return None;
     }
-    let instance_path = read_shared_registry_ascii::<HOSTED_INSTANCE_PATH_MAX>(
+    let instance_path = read_shared_registry_ascii_at::<HOSTED_INSTANCE_PATH_MAX>(
+        sh,
         SH_REGISTRY_INSTANCE_LEN,
         SH_REGISTRY_INSTANCE_BUF,
     )?;
@@ -3157,7 +3188,8 @@ unsafe fn shared_registry_identity() -> Option<HostedDriverRegistryIdentity> {
         return None;
     }
     let driver_key_name = if (flags & SH_REGISTRY_IDENTITY_HAS_DRIVER_KEY) != 0 {
-        let key = read_shared_registry_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(
+        let key = read_shared_registry_ascii_at::<HOSTED_DRIVER_KEY_NAME_MAX>(
+            sh,
             SH_REGISTRY_DRIVER_KEY_LEN,
             SH_REGISTRY_DRIVER_KEY_BUF,
         )?;
@@ -3169,7 +3201,8 @@ unsafe fn shared_registry_identity() -> Option<HostedDriverRegistryIdentity> {
         HostedAscii::empty()
     };
     let export_name = if (flags & SH_REGISTRY_IDENTITY_HAS_EXPORT) != 0 {
-        let export = read_shared_registry_ascii::<HOSTED_EXPORT_NAME_MAX>(
+        let export = read_shared_registry_ascii_at::<HOSTED_EXPORT_NAME_MAX>(
+            sh,
             SH_REGISTRY_EXPORT_LEN,
             SH_REGISTRY_EXPORT_BUF,
         )?;
@@ -4054,7 +4087,11 @@ unsafe fn unicode_string_parts(us: u64) -> Option<(u64, u16)> {
 }
 
 unsafe fn clear_shared_path_len(len_off: u64) {
-    write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, 0);
+    clear_shared_path_len_at(FSD_SHARED_VADDR, len_off);
+}
+
+unsafe fn clear_shared_path_len_at(sh: u64, len_off: u64) {
+    write_volatile((sh + len_off) as *mut u16, 0);
 }
 
 unsafe fn clear_shared_device_interface_state_at(sh: u64) {
@@ -4691,7 +4728,11 @@ fn build_hosted_interface_link(
 }
 
 unsafe fn shared_device_name_ascii() -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
-    let len = read_volatile((FSD_SHARED_VADDR + SH_DEVICE_NAME_LEN) as *const u16) as usize;
+    shared_device_name_ascii_at(FSD_SHARED_VADDR)
+}
+
+unsafe fn shared_device_name_ascii_at(sh: u64) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
+    let len = read_volatile((sh + SH_DEVICE_NAME_LEN) as *const u16) as usize;
     if len == 0 || len > HOSTED_EXPORT_NAME_MAX * 2 || (len & 1) != 0 {
         return None;
     }
@@ -4699,11 +4740,8 @@ unsafe fn shared_device_name_ascii() -> Option<HostedAscii<HOSTED_EXPORT_NAME_MA
     let chars = len / 2;
     let mut i = 0usize;
     while i < chars {
-        let lo =
-            read_volatile((FSD_SHARED_VADDR + SH_DEVICE_NAME_BUF + (i * 2) as u64) as *const u8);
-        let hi = read_volatile(
-            (FSD_SHARED_VADDR + SH_DEVICE_NAME_BUF + (i * 2 + 1) as u64) as *const u8,
-        );
+        let lo = read_volatile((sh + SH_DEVICE_NAME_BUF + (i * 2) as u64) as *const u8);
+        let hi = read_volatile((sh + SH_DEVICE_NAME_BUF + (i * 2 + 1) as u64) as *const u8);
         if hi != 0 || lo == 0 || lo > 0x7f || !out.push_byte(lo) {
             return None;
         }
@@ -7602,10 +7640,15 @@ struct HostedVideoPortInitialization {
 static mut HOSTED_VIDEO_PORT_INITIALIZATION: Option<HostedVideoPortInitialization> = None;
 static mut HOSTED_VIDEO_PORT_INITIALIZE_CALLS: u64 = 0;
 static HOSTED_VIDEO_NEXT_OBJECT_NUMBER: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PORT_MAP_MEMORY_TRACE: AtomicU64 = AtomicU64::new(0);
 const VIDEO_MEMORY_SPACE_IO: u32 = 0x1;
 const VIDEO_PORT_REGISTRY_VALUE_MAX: usize = 4096;
 const VIDEO_INTERRUPT_MODE_LATCHED: u32 = 0;
 const VIDEO_INTERRUPT_MODE_LEVEL_SENSITIVE: u32 = 1;
+const VBE_DISPI_IOPORT_INDEX: u64 = 0x01CE;
+const VBE_DISPI_IOPORT_DATA: u64 = 0x01CF;
+const VBE_DISPI_INDEX_VIDEO_MEMORY_64K: u16 = 0x0A;
+const VIDEO_MEMORY_64K_UNIT: u64 = 64 * 1024;
 
 unsafe fn clear_shared_video_port_initialization() {
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION) as *mut u64, 0);
@@ -7630,6 +7673,28 @@ unsafe fn clear_shared_video_port_initialization() {
         (FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO_CALLS) as *mut u64,
         0,
     );
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
+        0,
+    );
+}
+
+unsafe fn clear_shared_io_port_evidence_at(sh: u64) {
+    write_volatile((sh + SH_RESOURCE_IO_PORT_IN16_CALLS) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_OUT16_CALLS) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_IN16_FAILURES) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_OUT16_FAILURES) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_IN16_DENIED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_OUT16_DENIED) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+        0,
+    );
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64, 0);
 }
 
 extern "win64" fn s_video_port_zero_memory(destination: u64, length: u32) {
@@ -7702,11 +7767,43 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     range_within_grant(grant_start, grant_len, start, len)
 }
 
+unsafe fn hosted_video_memory_caller_va(start: u64, len: u64) -> Option<u64> {
+    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_PHYS) as *const u64);
+    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
+    let caller_va = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_CALLER_VA) as *const u64);
+    if grant_start == 0
+        || grant_len == 0
+        || caller_va == 0
+        || !hosted_memory_range_granted(start, len)
+        || !range_within_grant(grant_start, grant_len, start, len)
+    {
+        return None;
+    }
+    Some(caller_va + (start - grant_start))
+}
+
+unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
+    let bytes = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
+    let units = bytes / VIDEO_MEMORY_64K_UNIT;
+    if units == 0 {
+        None
+    } else {
+        Some(units.min(u16::MAX as u64) as u16)
+    }
+}
+
 unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
     let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
     let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
     let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
     cap != 0 && range_within_grant(grant_start, grant_len, start, len)
+}
+
+unsafe fn bump_shared_io_counter(offset: u64) -> u64 {
+    let ptr = (FSD_SHARED_VADDR + offset) as *mut u64;
+    let next = read_volatile(ptr).saturating_add(1);
+    write_volatile(ptr, next);
+    next
 }
 
 unsafe fn hosted_video_range_granted(range: VideoAccessRangeX64) -> bool {
@@ -7887,13 +7984,44 @@ extern "win64" fn s_video_port_map_memory(
                 0
             }
         } else {
-            s_mm_map_io_space(physical_address, requested_len as u64, 0)
+            match hosted_video_memory_caller_va(physical_address, requested_len as u64) {
+                Some(caller_va) => {
+                    write_volatile(
+                        (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+                        physical_address,
+                    );
+                    write_volatile(
+                        (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+                        requested_len as u64,
+                    );
+                    caller_va
+                }
+                None => 0,
+            }
         };
+        let trace = VIDEO_PORT_MAP_MEMORY_TRACE.fetch_add(1, Ordering::Relaxed);
+        if trace < 64 {
+            print_str(b"[videoprt-map-memory] phys=0x");
+            print_hex((physical_address >> 32) as u32);
+            print_hex(physical_address as u32);
+            print_str(b" len=");
+            print_u64(requested_len as u64);
+            print_str(b" space=");
+            print_u64(space as u64);
+            print_str(b" mapped=0x");
+            print_hex((mapped >> 32) as u32);
+            print_hex(mapped as u32);
+            print_str(b"\n");
+        }
         if mapped == 0 {
             write_unaligned(virtual_address as *mut u64, 0);
             return VP_ERROR_INVALID_PARAMETER;
         }
         write_unaligned(virtual_address as *mut u64, mapped);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_VIDEO_MEMORY_MAPPED_VA) as *mut u64,
+            mapped,
+        );
     }
     VP_NO_ERROR
 }
@@ -7922,10 +8050,62 @@ extern "win64" fn s_video_port_write_register_ushort(register: u64, value: u16) 
 
 extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
     unsafe {
-        if hosted_io_range_granted(port, 1) {
-            let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
-            crate::io_in16(cap, port as u16)
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            port,
+        );
+        let cap =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64);
+        if cap != 0 && hosted_io_range_granted(port, 1) {
+            if port == VBE_DISPI_IOPORT_DATA
+                && read_volatile(
+                    (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64,
+                ) as u16
+                    == VBE_DISPI_INDEX_VIDEO_MEMORY_64K
+            {
+                if let Some(value) = hosted_video_memory_64k_units() {
+                    write_volatile(
+                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                        0,
+                    );
+                    write_volatile(
+                        (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                        value as u64,
+                    );
+                    return value;
+                }
+            }
+            let (value, status) = crate::io_in16_r(cap, port as u16);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                status,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                value as u64,
+            );
+            if status != 0 {
+                let failures = bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_FAILURES);
+                if failures <= 4 {
+                    print_str(b"[driver-launch] VideoPortReadPortUshort failed label=");
+                    print_u64(status);
+                    print_str(b" port=0x");
+                    print_hex(port as u32);
+                    print_str(b"\n");
+                }
+            }
+            value
         } else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                u64::MAX,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                0,
+            );
             0
         }
     }
@@ -7933,9 +8113,47 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
 
 extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
     unsafe {
-        if hosted_io_range_granted(port, 1) {
-            let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
-            let _ = crate::io_out16(cap, port as u16, value);
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            port,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            value as u64,
+        );
+        let cap =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64);
+        if cap != 0 && hosted_io_range_granted(port, 1) {
+            let status = crate::io_out16(cap, port as u16, value);
+            if status == 0 && port == VBE_DISPI_IOPORT_INDEX {
+                write_volatile(
+                    (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64,
+                    value as u64,
+                );
+            }
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                status,
+            );
+            if status != 0 {
+                let failures = bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_FAILURES);
+                if failures <= 4 {
+                    print_str(b"[driver-launch] VideoPortWritePortUshort failed label=");
+                    print_u64(status);
+                    print_str(b" port=0x");
+                    print_hex(port as u32);
+                    print_str(b" value=0x");
+                    print_hex(value as u32);
+                    print_str(b"\n");
+                }
+            }
+        } else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                u64::MAX,
+            );
         }
     }
 }
@@ -7975,6 +8193,71 @@ fn hosted_video_registry_key_path(
         return None;
     }
     Some(path)
+}
+
+unsafe fn clear_video_registry_parameter_log_at(sh: u64) {
+    write_volatile((sh + SH_VIDEO_REGISTRY_SET_CALLS) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_REGISTRY_SET_FAILURES) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_REGISTRY_SET_BYTES) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_REGISTRY_SET_OVERFLOW) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_VIDEO_REGISTRY_COMMIT_FAILURES) as *mut u64, 0);
+}
+
+unsafe fn bump_video_registry_stage_counter(offset: u64) -> u64 {
+    let value = read_volatile((FSD_SHARED_VADDR + offset) as *const u64).saturating_add(1);
+    write_volatile((FSD_SHARED_VADDR + offset) as *mut u64, value);
+    value
+}
+
+unsafe fn stage_video_registry_parameter(
+    name: &HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
+    value_data: u64,
+    value_length: u32,
+) -> Result<(), u32> {
+    let value_len = value_length as usize;
+    if value_len > VIDEO_PORT_REGISTRY_VALUE_MAX {
+        return Err(VP_ERROR_MORE_DATA);
+    }
+    let capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
+    let used = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_REGISTRY_SET_BYTES) as *const u64) as usize;
+    let record_len = align_up_u64(
+        8u64.saturating_add(name.len as u64)
+            .saturating_add(value_len as u64),
+        8,
+    ) as usize;
+    if record_len > capacity || used > capacity || used.saturating_add(record_len) > capacity {
+        bump_video_registry_stage_counter(SH_VIDEO_REGISTRY_SET_OVERFLOW);
+        return Err(VP_ERROR_MORE_DATA);
+    }
+
+    let base = FSD_ARG_VADDR + used as u64;
+    write_unaligned(base as *mut u32, name.len as u32);
+    write_unaligned((base + 4) as *mut u32, value_length);
+    let mut i = 0usize;
+    while i < name.len {
+        write_volatile((base + 8 + i as u64) as *mut u8, name.bytes[i]);
+        i += 1;
+    }
+    let data_base = base + 8 + name.len as u64;
+    let mut j = 0usize;
+    while j < value_len {
+        let b = read_unaligned((value_data + j as u64) as *const u8);
+        write_volatile((data_base + j as u64) as *mut u8, b);
+        j += 1;
+    }
+    let pad_end = base + record_len as u64;
+    let mut p = data_base + value_len as u64;
+    while p < pad_end {
+        write_volatile(p as *mut u8, 0);
+        p += 1;
+    }
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_REGISTRY_SET_BYTES) as *mut u64,
+        used as u64 + record_len as u64,
+    );
+    bump_video_registry_stage_counter(SH_VIDEO_REGISTRY_SET_CALLS);
+    Ok(())
 }
 
 fn hosted_ascii_push_decimal_u32<const N: usize>(dst: &mut HostedAscii<N>, mut value: u32) -> bool {
@@ -8021,21 +8304,13 @@ extern "win64" fn s_video_port_set_registry_parameters(
         let Some(name) = wide_cstr_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(value_name) else {
             return VP_ERROR_INVALID_PARAMETER;
         };
-        let mut data = [0u8; VIDEO_PORT_REGISTRY_VALUE_MAX];
-        let mut i = 0usize;
-        while i < value_length as usize {
-            data[i] = read_unaligned((value_data + i as u64) as *const u8);
-            i += 1;
-        }
-        match crate::config_manager_set_value(
-            key_path.as_str(),
-            name.as_str(),
-            REG_BINARY,
-            &data[..value_length as usize],
-        ) {
+        let _ = key_path;
+        match stage_video_registry_parameter(&name, value_data, value_length) {
             Ok(()) => VP_NO_ERROR,
-            Err(status) if status == STATUS_INSUFFICIENT_RESOURCES => VP_ERROR_NOT_ENOUGH_MEMORY,
-            Err(_) => VP_ERROR_INVALID_PARAMETER,
+            Err(status) => {
+                bump_video_registry_stage_counter(SH_VIDEO_REGISTRY_SET_FAILURES);
+                status
+            }
         }
     }
 }
@@ -10024,6 +10299,8 @@ pub(crate) struct DriverComponent {
     pub device_id: u64,
     /// The component host's TCB — used to `TCB_Suspend` it if its pump WALLS (transport risk R2).
     pub tcb: u64,
+    /// The component host's CNode — dynamic PnP grants install hardware caps here.
+    pub cnode: u64,
     /// The DEDICATED MCS reply object backing this component's `Call` dispatch transport.
     pub reply_cap: u64,
 }
@@ -10863,7 +11140,7 @@ unsafe fn load_driver_reserved(
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
-    let (pml4, tcb) = spawn_fsd_component(
+    let (pml4, tcb, cnode) = spawn_fsd_component(
         code_base,
         pool_base,
         data_base,
@@ -11000,6 +11277,7 @@ unsafe fn load_driver_reserved(
         driver_id,
         device_id: 0,
         tcb,
+        cnode,
         reply_cap,
     };
     let device_id = match register_io_device(driver_id, &dc) {
@@ -11041,7 +11319,7 @@ unsafe fn spawn_fsd_component(
     arg_base: u64,
     fault_ep: u64,
     rights: &[u64],
-) -> (u64, u64) {
+) -> (u64, u64, u64) {
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
@@ -11106,23 +11384,132 @@ unsafe fn spawn_fsd_component(
             irq_ntfn: None,
             result_ntfn: None,
             fault_ep: Some(fault_ep),
+            io_port: None,
         },
         prio: 100,
         gs_base: Some(FSD_KPCR_VA),
         caps: HostCaps::default(),
     };
     let sc = spawn_component(&d);
-    (sc.pml4, sc.tcb)
+    (sc.pml4, sc.tcb, sc.cnode)
 }
 
-/// Ensure the page table covering `page` exists in `pml4` (SYS_SEND page_map can't report a
-/// missing-PT error). Idempotent-ish: builds one PT per 2 MiB region touched (tracked in a small
-/// static bitmap keyed by the 2 MiB index within the pool/demand window). Mirrors the win32k
-/// `ensure_w32_client_paging` mechanism.
-pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, page & !0x1F_FFFF, pml4);
+const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
+const HOSTED_PAGING_LEVEL_PD: u8 = 2;
+const HOSTED_PAGING_LEVEL_PT: u8 = 3;
+const HOSTED_PAGING_PDPT_SPAN: u64 = 0x80_0000_0000;
+const HOSTED_PAGING_PD_SPAN: u64 = 0x4000_0000;
+const HOSTED_PAGING_PT_SPAN: u64 = 0x20_0000;
+
+#[derive(Clone, Copy)]
+struct HostedPagingMapping {
+    pml4: u64,
+    level: u8,
+    base: u64,
+}
+
+static mut HOSTED_PAGING_MAPPINGS: Option<Vec<HostedPagingMapping>> = None;
+
+unsafe fn hosted_paging_mappings_mut() -> &'static mut Vec<HostedPagingMapping> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    match slot {
+        Some(mappings) => mappings,
+        None => {
+            print_str(b"[driver-launch] hosted paging state unavailable\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+fn hosted_paging_base(page: u64, span: u64) -> u64 {
+    page & !(span - 1)
+}
+
+unsafe fn ensure_hosted_paging_level(
+    pml4: u64,
+    page: u64,
+    level: u8,
+    span: u64,
+    object_type: u64,
+    map_label: u64,
+    name: &[u8],
+) -> bool {
+    let base = hosted_paging_base(page, span);
+    let mappings = hosted_paging_mappings_mut();
+    if mappings
+        .iter()
+        .any(|mapping| mapping.pml4 == pml4 && mapping.level == level && mapping.base == base)
+    {
+        return true;
+    }
+
+    let cap = alloc_slot();
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, cap);
+    if retype != 0 {
+        print_str(b"[driver-launch] hosted paging ");
+        print_str(name);
+        print_str(b" retype failed base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" label=");
+        print_u64(retype);
+        print_str(b"\n");
+        return false;
+    }
+
+    let map = paging_struct_map_r(cap, map_label, base, pml4);
+    if map == SEL4_DELETE_FIRST {
+        let _ = cnode_delete_recycle_r(cap);
+    } else if map != 0 {
+        print_str(b"[driver-launch] hosted paging ");
+        print_str(name);
+        print_str(b" map failed base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" label=");
+        print_u64(map);
+        print_str(b"\n");
+        return false;
+    }
+
+    mappings.push(HostedPagingMapping { pml4, level, base });
+    true
+}
+
+/// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
+/// Device resource windows can span multiple 2 MiB leaves and may sit outside the image skeleton's
+/// original 1 GiB page directory, so this builds every level down to the leaf PT.
+pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) -> bool {
+    ensure_hosted_paging_level(
+        pml4,
+        page,
+        HOSTED_PAGING_LEVEL_PDPT,
+        HOSTED_PAGING_PDPT_SPAN,
+        OBJ_X86_PDPT,
+        LBL_X86_PDPT_MAP,
+        b"pdpt",
+    ) && ensure_hosted_paging_level(
+        pml4,
+        page,
+        HOSTED_PAGING_LEVEL_PD,
+        HOSTED_PAGING_PD_SPAN,
+        OBJ_X86_PAGE_DIRECTORY,
+        LBL_X86_PAGE_DIRECTORY_MAP,
+        b"pd",
+    ) && ensure_hosted_paging_level(
+        pml4,
+        page,
+        HOSTED_PAGING_LEVEL_PT,
+        HOSTED_PAGING_PT_SPAN,
+        OBJ_X86_PAGE_TABLE,
+        LBL_X86_PAGE_TABLE_MAP,
+        b"pt",
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -11625,13 +12012,21 @@ fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> 
     let io = io_manager_mut();
     let mut dispatch = MajorFunctionTable::new();
     dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(0)));
-    io.create_driver_peer_with_major_table(
+    match io.create_driver_peer_with_major_table(
         &name,
         Box::new(HostedDriverBackend { instance }),
         dispatch,
-    )
-    .ok()
-    .map(|driver_id| driver_id.raw())
+    ) {
+        Ok(driver_id) => Some(driver_id.raw()),
+        Err(status) => {
+            print_str(b"[driver-launch] IoManager driver publish failed status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b" for ");
+            print_str(driver_object_path.as_bytes());
+            print_str(b"\n");
+            None
+        }
+    }
 }
 
 #[inline(never)]
@@ -11819,7 +12214,20 @@ pub(crate) struct HostedHardwareEvidence {
     pub resource_mmio_len: u64,
     pub resource_io_port_len: u64,
     pub resource_io_port_cap: u64,
+    pub resource_io_port_component_cap: u64,
     pub io_port_out32_faults: u64,
+    pub io_port_in16_calls: u64,
+    pub io_port_out16_calls: u64,
+    pub io_port_in16_failures: u64,
+    pub io_port_out16_failures: u64,
+    pub io_port_in16_denied: u64,
+    pub io_port_out16_denied: u64,
+    pub io_port_last_in16_status: u64,
+    pub io_port_last_out16_status: u64,
+    pub io_port_last_in16_port: u64,
+    pub io_port_last_out16_port: u64,
+    pub io_port_last_in16_value: u64,
+    pub io_port_last_out16_value: u64,
     pub mmio_mapped_phys: u64,
     pub mmio_mapped_len: u64,
     pub interrupt_vector: u32,
@@ -11841,6 +12249,17 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_allocated_va: u64,
     pub dma_allocated_logical: u64,
     pub root_pdo_started: bool,
+    pub video_initialized: bool,
+    pub video_find_adapter_calls: u64,
+    pub video_find_adapter_status: u32,
+    pub video_find_adapter_again: u8,
+    pub video_hw_initialize_calls: u64,
+    pub video_hw_initialize_ok: u8,
+    pub video_hw_start_io_calls: u64,
+    pub video_registry_set_calls: u64,
+    pub video_registry_set_bytes: u64,
+    pub video_registry_commit_status: i32,
+    pub video_registry_commit_failures: u64,
 }
 
 impl HostedHardwareEvidence {
@@ -12017,6 +12436,11 @@ unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) {
 
 unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
     revoke_hosted_device_resources(binding);
+    if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
+        if inst.cnode != 0 {
+            let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT);
+        }
+    }
     let old_ioport_cap = read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64);
     if old_ioport_cap != 0 {
         let _ = crate::cnode_delete_recycle_r(old_ioport_cap);
@@ -12028,6 +12452,10 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64, 0);
+    write_volatile((sh + SH_VIDEO_MEMORY_MAPPED_VA) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
@@ -12047,7 +12475,10 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
+    clear_shared_io_port_evidence_at(sh);
+    write_volatile((sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64, 0);
     clear_shared_device_interface_state_at(sh);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
@@ -12249,8 +12680,47 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
             resource_mmio_len: read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64),
             resource_io_port_len: read_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *const u64),
             resource_io_port_cap: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64),
+            resource_io_port_component_cap: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64,
+            ),
             io_port_out32_faults: read_volatile(
                 (sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
+            ),
+            io_port_in16_calls: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_IN16_CALLS) as *const u64,
+            ),
+            io_port_out16_calls: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_OUT16_CALLS) as *const u64,
+            ),
+            io_port_in16_failures: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_IN16_FAILURES) as *const u64,
+            ),
+            io_port_out16_failures: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_OUT16_FAILURES) as *const u64,
+            ),
+            io_port_in16_denied: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_IN16_DENIED) as *const u64,
+            ),
+            io_port_out16_denied: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_OUT16_DENIED) as *const u64,
+            ),
+            io_port_last_in16_status: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *const u64,
+            ),
+            io_port_last_out16_status: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *const u64,
+            ),
+            io_port_last_in16_port: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *const u64,
+            ),
+            io_port_last_out16_port: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *const u64,
+            ),
+            io_port_last_in16_value: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *const u64,
+            ),
+            io_port_last_out16_value: read_volatile(
+                (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *const u64,
             ),
             mmio_mapped_phys: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
             mmio_mapped_len: read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
@@ -12279,6 +12749,37 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
             dma_allocated_va: read_volatile((sh + SH_DMA_ALLOCATED_VA) as *const u64),
             dma_allocated_logical: read_volatile((sh + SH_DMA_ALLOCATED_LOGICAL) as *const u64),
             root_pdo_started,
+            video_initialized: read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0,
+            video_find_adapter_calls: read_volatile(
+                (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
+            ),
+            video_find_adapter_status: read_volatile(
+                (sh + SH_VIDEO_FIND_ADAPTER_STATUS) as *const u32,
+            ),
+            video_find_adapter_again: read_volatile(
+                (sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8,
+            ),
+            video_hw_initialize_calls: read_volatile(
+                (sh + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64,
+            ),
+            video_hw_initialize_ok: read_volatile(
+                (sh + SH_VIDEO_HW_INITIALIZE_OK) as *const u8,
+            ),
+            video_hw_start_io_calls: read_volatile(
+                (sh + SH_VIDEO_HW_START_IO_CALLS) as *const u64,
+            ),
+            video_registry_set_calls: read_volatile(
+                (sh + SH_VIDEO_REGISTRY_SET_CALLS) as *const u64,
+            ),
+            video_registry_set_bytes: read_volatile(
+                (sh + SH_VIDEO_REGISTRY_SET_BYTES) as *const u64,
+            ),
+            video_registry_commit_status: read_volatile(
+                (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *const i32,
+            ),
+            video_registry_commit_failures: read_volatile(
+                (sh + SH_VIDEO_REGISTRY_COMMIT_FAILURES) as *const u64,
+            ),
         }
     })
 }
@@ -12371,6 +12872,7 @@ pub(crate) struct DriverInstance {
     pub exec_pool_va: u64,
     pub exec_arg_va: u64,
     pub tcb: u64,
+    pub cnode: u64,
     pub reply_cap: u64,
     pub driver_id: u64,
     pub device_id: u64,
@@ -12389,6 +12891,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_pool_va: 0,
     exec_arg_va: 0,
     tcb: 0,
+    cnode: 0,
     reply_cap: 0,
     driver_id: 0,
     device_id: 0,
@@ -12602,6 +13105,7 @@ fn register_instance(dc: &DriverComponent) {
         exec_pool_va: dc.exec_pool_va,
         exec_arg_va: dc.exec_arg_va,
         tcb: dc.tcb,
+        cnode: dc.cnode,
         reply_cap: dc.reply_cap,
         driver_id: dc.driver_id,
         device_id: dc.device_id,
@@ -12741,6 +13245,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+    clear_video_registry_parameter_log_at(sh);
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
@@ -12828,7 +13333,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
     write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
-    clear_shared_path_len(SH_DEVICE_NAME_LEN);
+    clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
@@ -12867,7 +13372,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     Ok(AddDeviceDispatchResult {
         pdo_object,
         fdo_object,
-        fdo_name: shared_device_name_ascii(),
+        fdo_name: shared_device_name_ascii_at(sh),
     })
 }
 
@@ -12897,7 +13402,7 @@ unsafe fn dispatch_add_device_for_instance(
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
     write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
-    clear_shared_path_len(SH_DEVICE_NAME_LEN);
+    clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: inst.fault_ep,
@@ -12935,7 +13440,7 @@ unsafe fn dispatch_add_device_for_instance(
     Ok(AddDeviceDispatchResult {
         pdo_object,
         fdo_object,
-        fdo_name: shared_device_name_ascii(),
+        fdo_name: shared_device_name_ascii_at(sh),
     })
 }
 
@@ -13077,6 +13582,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     mmio_va: u64,
     mmio_frame_base: u64,
     mmio_pages: u64,
+    video_memory_caller_va: u64,
     interrupt_vector: u32,
     interrupt_latched: bool,
     interrupt_affinity: u64,
@@ -13124,6 +13630,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if video_memory_caller_va != 0
+        && (!hosted_instance_video_port_initialized(inst) || (video_memory_caller_va & 0xFFF) != 0)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let owner = hosted_resource_owner(binding);
     let mmio_resource_id =
         hosted_mmio_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
@@ -13139,13 +13650,34 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     }
     let mut page = 0u64;
     while page < mmio_pages {
-        let err = page_map_r(
-            copy_cap(mmio_frame_base + page),
-            mmio_va + page * 0x1000,
-            RW_NX,
-            inst.pml4,
-        );
+        let source_cap = mmio_frame_base + page;
+        let (map_cap, copy_error) = copy_cap_r(source_cap);
+        let frame_cap = if copy_error == 0 {
+            map_cap
+        } else {
+            source_cap
+        };
+        let err = page_map_r(frame_cap, mmio_va + page * 0x1000, RW_NX, inst.pml4);
         if err != 0 {
+            if copy_error == 0 {
+                let _ = cnode_delete_recycle_r(map_cap);
+            }
+            print_str(b"[driver-launch] hosted MMIO map failed label=");
+            print_u64(err);
+            print_str(b" copy=");
+            print_u64(copy_error);
+            print_str(b" device_id=");
+            print_u64(device_id);
+            print_str(b" page=");
+            print_u64(page);
+            print_str(b"/");
+            print_u64(mmio_pages);
+            print_str(b" va=0x");
+            print_hex(((mmio_va + page * 0x1000) >> 32) as u32);
+            print_hex((mmio_va + page * 0x1000) as u32);
+            print_str(b" frame_cap=");
+            print_u64(source_cap);
+            print_str(b"\n");
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         page += 1;
@@ -13163,13 +13695,34 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         }
         let mut dma_page = 0u64;
         while dma_page < dma_pages {
-            let err = page_map_r(
-                copy_cap(dma_frame_base + dma_page),
-                dma_va + dma_page * 0x1000,
-                RW_NX,
-                inst.pml4,
-            );
+            let source_cap = dma_frame_base + dma_page;
+            let (map_cap, copy_error) = copy_cap_r(source_cap);
+            let frame_cap = if copy_error == 0 {
+                map_cap
+            } else {
+                source_cap
+            };
+            let err = page_map_r(frame_cap, dma_va + dma_page * 0x1000, RW_NX, inst.pml4);
             if err != 0 {
+                if copy_error == 0 {
+                    let _ = cnode_delete_recycle_r(map_cap);
+                }
+                print_str(b"[driver-launch] hosted DMA map failed label=");
+                print_u64(err);
+                print_str(b" copy=");
+                print_u64(copy_error);
+                print_str(b" device_id=");
+                print_u64(device_id);
+                print_str(b" page=");
+                print_u64(dma_page);
+                print_str(b"/");
+                print_u64(dma_pages);
+                print_str(b" va=0x");
+                print_hex(((dma_va + dma_page * 0x1000) >> 32) as u32);
+                print_hex((dma_va + dma_page * 0x1000) as u32);
+                print_str(b" frame_cap=");
+                print_u64(source_cap);
+                print_str(b"\n");
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
             dma_page += 1;
@@ -13208,11 +13761,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     }
 
     let mut io_port_cap = 0u64;
+    let mut io_port_component_cap = 0u64;
     if io_port_len != 0 {
         let Some(cap) = try_alloc_slot() else {
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         };
-        let issue = crate::issue_ioport_cap(cap, io_port_base as u16, io_port_last as u16);
+        let cap_last = io_port_last.saturating_add(1).min(u16::MAX as u64);
+        let issue = crate::issue_ioport_cap(cap, io_port_base as u16, cap_last as u16);
         if issue != 0 {
             recycle_deleted_root_slot(cap);
             print_str(b"[driver-launch] IOPortControl_Issue failed label=");
@@ -13220,11 +13775,29 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             print_str(b" range=0x");
             print_hex(io_port_base as u32);
             print_str(b"..0x");
-            print_hex(io_port_last as u32);
+            print_hex(cap_last as u32);
+            print_str(b"\n");
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if inst.cnode == 0 {
+            let _ = cnode_delete_recycle_r(cap);
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT);
+        let copy = crate::cnode_copy_at_r(inst.cnode, crate::CT_IO_PORT, cap);
+        if copy != 0 {
+            let _ = cnode_delete_recycle_r(cap);
+            print_str(b"[driver-launch] IOPort cap component copy failed label=");
+            print_u64(copy);
+            print_str(b" cnode=");
+            print_u64(inst.cnode);
+            print_str(b" slot=");
+            print_u64(crate::CT_IO_PORT);
             print_str(b"\n");
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         io_port_cap = cap;
+        io_port_component_cap = crate::CT_IO_PORT;
     }
 
     let sh = inst.exec_shared_va;
@@ -13236,7 +13809,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         io_port_len as u64,
     );
     write_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *mut u64, io_port_cap);
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *mut u64,
+        io_port_component_cap,
+    );
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
+    clear_shared_io_port_evidence_at(sh);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, mmio_va);
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
@@ -13269,6 +13847,19 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     );
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    if video_memory_caller_va != 0 {
+        write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, mmio_phys);
+        write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, mapped_len);
+        write_volatile(
+            (sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64,
+            video_memory_caller_va,
+        );
+    } else {
+        write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, 0);
+        write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, 0);
+        write_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64, 0);
+    }
+    write_volatile((sh + SH_VIDEO_MEMORY_MAPPED_VA) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
@@ -13490,6 +14081,99 @@ unsafe fn hosted_instance_video_port_initialized(inst: DriverInstance) -> bool {
     read_volatile((inst.exec_shared_va + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0
 }
 
+unsafe fn commit_video_registry_parameters_for_instance(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    let sh = inst.exec_shared_va;
+    let arg = inst.exec_arg_va;
+    let count = read_volatile((sh + SH_VIDEO_REGISTRY_SET_CALLS) as *const u64);
+    if count == 0 {
+        return Ok(());
+    }
+    let used = read_volatile((sh + SH_VIDEO_REGISTRY_SET_BYTES) as *const u64);
+    let capacity = FSD_ARG_FRAMES * 0x1000;
+    if used > capacity {
+        write_volatile(
+            (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32,
+            nt_status::NtStatus::INVALID_PARAMETER.raw(),
+        );
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let identity =
+        shared_registry_identity_at(sh).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let key_path =
+        hosted_video_registry_key_path(identity).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mut offset = 0u64;
+    let mut committed = 0u64;
+    while committed < count {
+        if offset + 8 > used {
+            write_volatile(
+                (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32,
+                nt_status::NtStatus::INVALID_PARAMETER.raw(),
+            );
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let name_len = read_unaligned((arg + offset) as *const u32) as usize;
+        let value_len = read_unaligned((arg + offset + 4) as *const u32) as usize;
+        if name_len == 0
+            || name_len > HOSTED_DRIVER_KEY_NAME_MAX
+            || value_len > VIDEO_PORT_REGISTRY_VALUE_MAX
+        {
+            write_volatile(
+                (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32,
+                nt_status::NtStatus::INVALID_PARAMETER.raw(),
+            );
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let record_len = align_up_u64(
+            8u64.saturating_add(name_len as u64)
+                .saturating_add(value_len as u64),
+            8,
+        );
+        if offset.saturating_add(record_len) > used {
+            write_volatile(
+                (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32,
+                nt_status::NtStatus::INVALID_PARAMETER.raw(),
+            );
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let mut name = HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty();
+        let mut i = 0usize;
+        while i < name_len {
+            let b = read_volatile((arg + offset + 8 + i as u64) as *const u8);
+            if b == 0 || b > 0x7f || !name.push_byte(b) {
+                write_volatile(
+                    (sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32,
+                    nt_status::NtStatus::INVALID_PARAMETER.raw(),
+                );
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+            i += 1;
+        }
+        let data_base = arg + offset + 8 + name_len as u64;
+        let data = core::slice::from_raw_parts(data_base as *const u8, value_len);
+        match crate::config_manager_set_value(key_path.as_str(), name.as_str(), REG_BINARY, data) {
+            Ok(()) => {
+                write_volatile((sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32, 0);
+            }
+            Err(status) => {
+                let failures =
+                    read_volatile((sh + SH_VIDEO_REGISTRY_COMMIT_FAILURES) as *const u64)
+                        .saturating_add(1);
+                write_volatile(
+                    (sh + SH_VIDEO_REGISTRY_COMMIT_FAILURES) as *mut u64,
+                    failures,
+                );
+                write_volatile((sh + SH_VIDEO_REGISTRY_COMMIT_STATUS) as *mut i32, status);
+                return Err(nt_status::NtStatus(status));
+            }
+        }
+        offset += record_len;
+        committed += 1;
+    }
+    Ok(())
+}
+
 unsafe fn dispatch_video_initialize_for_instance(
     index: usize,
     inst: DriverInstance,
@@ -13539,6 +14223,9 @@ unsafe fn dispatch_video_initialize_for_instance(
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    if pr.status == 0 {
+        commit_video_registry_parameters_for_instance(inst)?;
     }
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
     Ok((pr.status, info))
@@ -13644,7 +14331,24 @@ unsafe fn dispatch_video_irp_for_binding(
     let device_object = binding.device_object;
     let outcome = match major as u8 {
         major::IRP_MJ_CREATE => {
-            dispatch_video_initialize_for_instance(index, inst, device_object)?
+            let result = dispatch_video_initialize_for_instance(index, inst, device_object)?;
+            print_str(b"[driver-launch] hosted video Initialize device_id=");
+            print_u64(binding.device_id);
+            print_str(b" status=0x");
+            print_hex(result.0 as u32);
+            print_str(b" info=");
+            print_u64(result.1);
+            print_str(b" calls=");
+            print_u64(read_volatile(
+                (inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64,
+            ));
+            print_str(b" ok=");
+            print_u64(
+                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_OK) as *const u8)
+                    as u64,
+            );
+            print_str(b"\n");
+            result
         }
         major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE => (0, 0),
         major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
@@ -13687,7 +14391,25 @@ pub(crate) unsafe fn start_hosted_device(
         0xC000_0010u32 as i32,
     );
     clear_shared_device_interface_state_at(sh);
-    if read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0 {
+    let video_initialized = read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0;
+    if video_initialized
+        || read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64) != 0
+        || read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64) != 0
+        || read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64) != 0
+    {
+        print_str(b"[driver-launch] hosted video StartDevice device_id=");
+        print_u64(device_id);
+        print_str(b" initialized=");
+        print_u64(video_initialized as u64);
+        print_str(b" find=0x");
+        print_hex64(read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64));
+        print_str(b" init=0x");
+        print_hex64(read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64));
+        print_str(b" startio=0x");
+        print_hex64(read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64));
+        print_str(b"\n");
+    }
+    if video_initialized {
         let root_status = hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, IRP_MN_START_DEVICE as u8);
         write_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64, IRP_MN_START_DEVICE);
         write_volatile(
@@ -13696,6 +14418,15 @@ pub(crate) unsafe fn start_hosted_device(
         );
         nt_status::NtStatus(root_status).to_result()?;
         let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
+        print_str(b"[driver-launch] hosted video FindAdapter device_id=");
+        print_u64(device_id);
+        print_str(b" status=0x");
+        print_hex(video_status);
+        print_str(b" calls=");
+        print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64));
+        print_str(b" again=");
+        print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8) as u64);
+        print_str(b"\n");
         record_hosted_resource_usage(binding, sh)?;
         video_port_status(video_status)?;
         apply_hosted_device_interface_state(sh)?;
@@ -13847,6 +14578,13 @@ pub(crate) fn hosted_video_route_info(device_id: u64) -> Option<HostedVideoRoute
         driver_object_path,
         device_path,
     })
+}
+
+pub(crate) fn hosted_device_video_port_initialized(device_id: u64) -> bool {
+    hosted_device_binding_by_device_id(device_id)
+        .and_then(|binding| instance_by_driver_id(binding.driver_id))
+        .map(|(_, inst)| unsafe { hosted_instance_video_port_initialized(inst) })
+        .unwrap_or(false)
 }
 
 pub(crate) fn hosted_driver_video_port_initialized(driver_id: u64) -> bool {

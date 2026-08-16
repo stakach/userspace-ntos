@@ -30,29 +30,16 @@ pub(crate) struct HostedPnpResourceVaAllocator {
 }
 
 impl HostedPnpResourceVaAllocator {
-    pub(crate) fn allocate_component_window(&mut self) -> Option<u64> {
-        let va = hosted_window_slot_va(
+    pub(crate) fn allocate_component_span(&mut self, bytes: u64) -> Option<u64> {
+        let slots = hosted_window_slots_for_bytes(bytes)?;
+        let va = hosted_window_span_va(
             HOSTED_RESOURCE_COMPONENT_VA_BASE,
             HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
             self.component_slots,
+            slots,
         )?;
-        self.component_slots = self.component_slots.checked_add(1)?;
+        self.component_slots = self.component_slots.checked_add(slots)?;
         Some(va)
-    }
-
-    pub(crate) fn allocate_component_window_pair(&mut self) -> Option<(u64, u64)> {
-        let first = hosted_window_slot_va(
-            HOSTED_RESOURCE_COMPONENT_VA_BASE,
-            HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
-            self.component_slots,
-        )?;
-        let second = hosted_window_slot_va(
-            HOSTED_RESOURCE_COMPONENT_VA_BASE,
-            HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
-            self.component_slots.checked_add(1)?,
-        )?;
-        self.component_slots = self.component_slots.checked_add(2)?;
-        Some((first, second))
     }
 
     pub(crate) fn allocate_root_seed_window(&mut self) -> Option<u64> {
@@ -78,6 +65,21 @@ impl HostedPnpResourceVaAllocator {
 fn hosted_window_slot_va(base: u64, limit: u64, slot: u64) -> Option<u64> {
     let va = base.checked_add(slot.checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)?)?;
     let end = va.checked_add(HOSTED_RESOURCE_WINDOW_STRIDE)?;
+    (end <= limit).then_some(va)
+}
+
+fn hosted_window_slots_for_bytes(bytes: u64) -> Option<u64> {
+    let bytes = bytes.max(1);
+    Some(bytes.checked_add(HOSTED_RESOURCE_WINDOW_STRIDE - 1)? / HOSTED_RESOURCE_WINDOW_STRIDE)
+}
+
+fn hosted_window_span_va(base: u64, limit: u64, slot: u64, slots: u64) -> Option<u64> {
+    if slots == 0 {
+        return None;
+    }
+    let va = base.checked_add(slot.checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)?)?;
+    let len = slots.checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)?;
+    let end = va.checked_add(len)?;
     (end <= limit).then_some(va)
 }
 
@@ -579,10 +581,15 @@ unsafe fn try_publish_hosted_video_route(
     instance_id: &str,
     report: &mut HostedPnpStartReport,
 ) {
-    if driver_launch::hosted_video_route_info(device_id).is_none() {
+    if !driver_launch::hosted_device_video_port_initialized(device_id) {
         return;
     }
     report.video_route_attempted_count += 1;
+    let Some(_route) = driver_launch::hosted_video_route_info(device_id) else {
+        remember_error(report, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        print_hosted_video_route_published(service_name, instance_id, device_id, false);
+        return;
+    };
     let Some(service_registry_path) = hosted_display_service_registry_path(service_name) else {
         remember_error(report, nt_status::NtStatus::INVALID_PARAMETER);
         print_hosted_video_route_published(service_name, instance_id, device_id, false);
@@ -592,7 +599,7 @@ unsafe fn try_publish_hosted_video_route(
         &crate::video_device::HostedVideoDeviceRegistration {
             device_id,
             service_registry_path: service_registry_path.as_slice(),
-            allocate_projection: driver_launch::pool_alloc,
+            allocate_projection: crate::win32k_subsystem::pool_alloc_export,
         },
     );
     report.video_route_published |= published;
@@ -909,7 +916,57 @@ fn print_hardware_evidence(
     print_u64(evidence.io_port_out32_serviced() as u64);
     print_str(b" io_out32_count=");
     print_u64(evidence.io_port_out32_faults);
+    print_str(b" io_cap=");
+    print_u64(evidence.resource_io_port_cap);
+    print_str(b"/");
+    print_u64(evidence.resource_io_port_component_cap);
+    print_str(b" io_in16=");
+    print_u64(evidence.io_port_in16_calls);
+    print_str(b"/");
+    print_u64(evidence.io_port_in16_failures);
+    print_str(b" io_out16=");
+    print_u64(evidence.io_port_out16_calls);
+    print_str(b"/");
+    print_u64(evidence.io_port_out16_failures);
+    print_str(b" io16_denied=");
+    print_u64(evidence.io_port_in16_denied);
+    print_str(b"/");
+    print_u64(evidence.io_port_out16_denied);
+    print_str(b" io16_last_status=");
+    print_u64(evidence.io_port_last_in16_status);
+    print_str(b"/");
+    print_u64(evidence.io_port_last_out16_status);
+    print_str(b" io16_last_port=0x");
+    print_hex(evidence.io_port_last_in16_port as u32);
+    print_str(b"/0x");
+    print_hex(evidence.io_port_last_out16_port as u32);
+    print_str(b" io16_last_value=0x");
+    print_hex(evidence.io_port_last_in16_value as u32);
+    print_str(b"/0x");
+    print_hex(evidence.io_port_last_out16_value as u32);
     print_str(b" root_started=");
     print_u64(evidence.root_pdo_started as u64);
+    print_str(b" video_init=");
+    print_u64(evidence.video_initialized as u64);
+    print_str(b" video_find=");
+    print_u64(evidence.video_find_adapter_calls);
+    print_str(b" video_find_status=0x");
+    print_hex(evidence.video_find_adapter_status);
+    print_str(b" video_again=");
+    print_u64(evidence.video_find_adapter_again as u64);
+    print_str(b" video_hwinit=");
+    print_u64(evidence.video_hw_initialize_calls);
+    print_str(b" video_hwinit_ok=");
+    print_u64(evidence.video_hw_initialize_ok as u64);
+    print_str(b" video_startio=");
+    print_u64(evidence.video_hw_start_io_calls);
+    print_str(b" video_reg_set=");
+    print_u64(evidence.video_registry_set_calls);
+    print_str(b"/");
+    print_u64(evidence.video_registry_set_bytes);
+    print_str(b" video_reg_status=0x");
+    print_hex(evidence.video_registry_commit_status as u32);
+    print_str(b" video_reg_failures=");
+    print_u64(evidence.video_registry_commit_failures);
     print_str(b"\n");
 }
