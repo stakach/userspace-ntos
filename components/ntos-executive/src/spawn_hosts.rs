@@ -838,6 +838,8 @@ static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
     label == ch.dispatch_label
+        || (label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall)
@@ -962,6 +964,19 @@ fn pump_deadman_tripped() -> bool {
 macro_rules! pump_reply_recv_into {
     ($ch:expr, $msg:ident, $len:expr, $r0:expr) => {{
         $msg = pump_reply_recv($ch, $len as u64, $r0 as u64);
+    }};
+}
+
+macro_rules! pump_reply_recv4_into {
+    ($ch:expr, $msg:ident, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+        $msg = pump_reply_recv4(
+            $ch,
+            $len as u64,
+            $r0 as u64,
+            $r1 as u64,
+            $r2 as u64,
+            $r3 as u64,
+        );
     }};
 }
 
@@ -1102,6 +1117,17 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
 /// r12 so the next component `Call` binds to the same kernel reply object.
 #[inline(never)]
 unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -> PumpMessage {
+    pump_reply_recv4(ch, reply_msginfo, reply_r0, 0, 0, 0)
+}
+
+unsafe fn pump_reply_recv4(
+    ch: &PumpChannel,
+    reply_msginfo: u64,
+    reply_r0: u64,
+    reply_r1: u64,
+    reply_r2: u64,
+    reply_r3: u64,
+) -> PumpMessage {
     let badge: u64;
     let mi: u64;
     let m0: u64;
@@ -1114,9 +1140,9 @@ unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -
         inout("rdi") ch.fault_ep => badge,
         inout("rsi") reply_msginfo => mi,
         inout("r10") reply_r0 => m0,
-        inout("r8") 0u64 => m1,
-        inout("r9") 0u64 => m2,
-        inout("r15") 0u64 => m3,
+        inout("r8") reply_r1 => m1,
+        inout("r9") reply_r2 => m2,
+        inout("r15") reply_r3 => m3,
         in("r12") ch.reply_cap,
         in("r13") ch.reply_cap,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
@@ -1324,6 +1350,19 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
         {
             let status = pump_service_video_device_io_control();
             pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u64);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle) = crate::driver_launch::service_hosted_driver_ps_create_system_thread(
+                ch,
+                msg.m0,
+                msg.m1,
+                msg.m2,
+                msg.m3,
+                msg.m4,
+            );
+            pump_reply_recv4_into!(ch, msg, 2, status as u32 as u64, handle, 0, 0);
             continue;
         } else if label == 6 {
             outcome.faults += 1;

@@ -404,6 +404,7 @@ const DISPATCH_LEVEL: u8 = 2;
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
+pub const FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL: u64 = 0x772;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -464,6 +465,8 @@ static mut DATA_TRACE_COUNT: u32 = 0;
 /// Hosted-driver IRP dispatch sequence. This always increments; the print policy below is bounded.
 static FSD_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 const FSD_DISPATCH_TRACE_CAP: u64 = 256;
+static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_MAJOR: AtomicU64 = AtomicU64::new(0);
@@ -8626,18 +8629,33 @@ extern "win64" fn s_ps_get_current_thread_teb() -> u64 {
 extern "win64" fn s_ps_create_system_thread(
     handle_out: u64,
     _desired_access: u32,
-    _object_attributes: u64,
-    _process_handle: u64,
-    _client_id: u64,
-    _start_routine: u64,
-    _start_context: u64,
+    object_attributes: u64,
+    process_handle: u64,
+    client_id: u64,
+    start_routine: u64,
+    start_context: u64,
 ) -> i32 {
+    if handle_out == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (_label, status, handle, _, _) = unsafe {
+        call_on5(
+            (FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL << 12) | 5,
+            start_routine,
+            start_context,
+            object_attributes,
+            process_handle,
+            client_id,
+        )
+    };
     unsafe {
-        if handle_out != 0 {
+        if status as i32 == STATUS_SUCCESS {
+            write_unaligned(handle_out as *mut u64, handle);
+        } else {
             write_unaligned(handle_out as *mut u64, 0);
         }
     }
-    STATUS_NOT_IMPLEMENTED
+    status as u32 as i32
 }
 
 /// `VOID PsTerminateSystemThread(NTSTATUS)`.
@@ -11368,10 +11386,22 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
 ///   physically cannot publish a second completion before being replied to.
 ///
 /// Returns `(label, mr0..mr3)` of the executive's reply — the label distinguishes a dispatch request
-/// from win32k's callback-resume signal. Outgoing message length is whatever `msginfo` encodes (we
-/// only ever send a bare label, length 0).
+/// from win32k's callback-resume signal. Outgoing message length is whatever `msginfo` encodes; the
+/// completion path sends a bare label, while component-service requests carry their arguments in
+/// MR0..MR4.
 #[inline(never)]
 pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
+    call_on4(msginfo, 0, 0, 0, 0)
+}
+
+#[inline(never)]
+pub(crate) unsafe fn call_on4(
+    msginfo: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (u64, u64, u64, u64, u64) {
     let reply_info: u64;
     let m0: u64;
     let m1: u64;
@@ -11382,14 +11412,27 @@ pub(crate) unsafe fn call_on(msginfo: u64) -> (u64, u64, u64, u64, u64) {
         in("rdx") crate::SYS_CALL as u64,
         inout("rdi") crate::CT_FAULT => _,
         inout("rsi") msginfo => reply_info,
-        inout("r10") 0u64 => m0,
-        inout("r8") 0u64 => m1,
-        inout("r9") 0u64 => m2,
-        inout("r15") 0u64 => m3,
+        inout("r10") arg0 => m0,
+        inout("r8") arg1 => m1,
+        inout("r9") arg2 => m2,
+        inout("r15") arg3 => m3,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
     (reply_info >> 12, m0, m1, m2, m3)
+}
+
+#[inline(never)]
+unsafe fn call_on5(
+    msginfo: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+) -> (u64, u64, u64, u64, u64) {
+    core::ptr::write_volatile((crate::IPCBUF_VADDR + 8 + 4 * 8) as *mut u64, arg4);
+    call_on4(msginfo, arg0, arg1, arg2, arg3)
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT and invoke the FSD's
@@ -15466,6 +15509,53 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     t.iter().copied().enumerate().find(|(_, entry)| {
         entry.used && entry.exec_shared_va != 0 && entry.exec_shared_va == shared_va
     })
+}
+
+pub(crate) fn service_hosted_driver_ps_create_system_thread(
+    ch: &crate::spawn_hosts::PumpChannel,
+    start_routine: u64,
+    start_context: u64,
+    object_attributes: u64,
+    process_handle: u64,
+    client_id: u64,
+) -> (i32, u64) {
+    let request = HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some((instance, inst)) = instance_by_shared_va(ch.shared_va) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
+    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != ch.reply_cap {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    if start_routine == 0 {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    if request <= 8 {
+        print_str(b"[driver-thread] PsCreateSystemThread request inst=");
+        print_u64(instance as u64);
+        print_str(b" start=0x");
+        print_hex((start_routine >> 32) as u32);
+        print_hex(start_routine as u32);
+        print_str(b" ctx=0x");
+        print_hex((start_context >> 32) as u32);
+        print_hex(start_context as u32);
+        if object_attributes != 0 || process_handle != 0 || client_id != 0 {
+            print_str(b" unsupported attrs/process/client=");
+            print_hex((object_attributes >> 32) as u32);
+            print_hex(object_attributes as u32);
+            print_str(b"/");
+            print_hex((process_handle >> 32) as u32);
+            print_hex(process_handle as u32);
+            print_str(b"/");
+            print_hex((client_id >> 32) as u32);
+            print_hex(client_id as u32);
+        }
+        print_str(b"\n");
+    }
+    HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+    (STATUS_NOT_IMPLEMENTED, 0)
 }
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {

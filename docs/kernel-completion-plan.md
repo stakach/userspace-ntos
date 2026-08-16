@@ -1193,11 +1193,12 @@ before unrelated executive traffic monopolises the receive loop.
   unsatisfied blocking waits fail closed until a real hosted wait broker can park and resume worker
   TCBs. The host-testable `nt-kernel-exec` model now includes hosted driver system-thread handle
   records plus a dispatcher wait queue that admits, parks, wakes, and cancels blocking waits without
-  consuming dispatcher state during readiness scans. Remaining B3 work is broader non-display driver
-  coverage: executive seL4 wiring for `PsCreateSystemThread`, reply-cap rotation around parked
-  hosted-driver waits, metadata-driven TCPIP/AFD activation once hosted waits can block/resume,
-  miniport packet data-plane behavior, and multi-device scaling under the same dynamic
-  devnode/resource path.
+  consuming dispatcher state during readiness scans. `PsCreateSystemThread` now crosses a real
+  component-service label and is answered by the executive, but still returns fail-closed until the
+  seL4 worker TCB startup half exists. Remaining B3 work is broader non-display driver coverage:
+  TCB-backed hosted driver system threads, reply-cap rotation around parked hosted-driver waits,
+  metadata-driven TCPIP/AFD activation once hosted waits can block/resume, miniport packet
+  data-plane behavior, and multi-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6327,6 +6328,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   used by native waits, returns immediate satisfaction or poll timeout without parking, stores only
   true blocking/infinite waiters, rejects duplicate parked thread/reply identities, scans readiness
   without consuming event/semaphore/mutant state, and consumes exactly once when waking a waiter.
-  This is the reusable model the next executive slice should bind to component reply-cap parking and
-  seL4 TCB startup; `PsCreateSystemThread` remains fail-closed until that wiring exists. Validation:
-  `cargo fmt --all` and `cargo test -p nt-kernel-exec`.
+  This is the reusable model the executive is now binding to component-service transport, reply-cap
+  parking, and seL4 TCB startup; `PsCreateSystemThread` remains fail-closed until the TCB startup
+  half exists. Validation: `cargo fmt --all` and `cargo test -p nt-kernel-exec`.
+
+  B3 hosted driver system-thread service transport (2026-08-16): hosted driver
+  `PsCreateSystemThread` no longer decides entirely inside the component import trampoline. The
+  trampoline now sends the NT argument shape over a dedicated component-service label on the same
+  fault endpoint as IRP dispatch; the shared pump accepts that label for IRP components, supports
+  multi-register replies, verifies the request against the dynamically registered driver instance,
+  and returns an honest failure without minting a handle until real seL4 TCB startup is wired. This
+  keeps the kernel boundary clean for the next B3 step: allocate the system-thread handle, stack,
+  IPC buffer, CNode, TCB, and reply-cap/wait-broker state from the executive only. Validation:
+  `cargo fmt --all`, `cargo test -p nt-kernel-exec`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
