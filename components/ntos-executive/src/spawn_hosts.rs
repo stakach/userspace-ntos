@@ -854,7 +854,7 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
 /// badges on the root TCB's bound notification while preserving normal blocking behavior when the
 /// endpoint is still idle.
 #[inline(never)]
-unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
+unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<PumpMessage> {
     PUMP_TIMER_FAIR_POLLS.fetch_add(1, Ordering::Relaxed);
     let badge: u64;
     let mi: u64;
@@ -871,7 +871,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
         lateout("r8") m1,
         lateout("r9") m2,
         lateout("r15") m3,
-        in("r12") ch.reply_cap,
+        in("r12") reply_cap,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -965,15 +965,16 @@ fn pump_deadman_tripped() -> bool {
 }
 
 macro_rules! pump_reply_recv_into {
-    ($ch:expr, $msg:ident, $len:expr, $r0:expr) => {{
-        $msg = pump_reply_recv($ch, $len as u64, $r0 as u64);
+    ($ch:expr, $reply_cap:expr, $msg:ident, $len:expr, $r0:expr) => {{
+        $msg = pump_reply_recv($ch, $reply_cap, $len as u64, $r0 as u64);
     }};
 }
 
 macro_rules! pump_reply_recv4_into {
-    ($ch:expr, $msg:ident, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+    ($ch:expr, $reply_cap:expr, $msg:ident, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
         $msg = pump_reply_recv4(
             $ch,
+            $reply_cap,
             $len as u64,
             $r0 as u64,
             $r1 as u64,
@@ -1046,7 +1047,7 @@ impl PumpLoopOutcome {
 /// post-loop tests), fall back to acknowledging the IRQ line and let the ordinary loop drain the
 /// coalesced tick later.
 #[inline(never)]
-unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
+unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
     loop {
         // (This recv pairs a component `Call`, so the kernel writes `executive.reply_to = component`.
         // Harmless since Phase 3: no executive reply reads `reply_to` any more.)
@@ -1065,7 +1066,7 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
             lateout("r8") m1,
             lateout("r9") m2,
             lateout("r15") m3,
-            in("r12") ch.reply_cap,
+            in("r12") reply_cap,
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
@@ -1087,7 +1088,7 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if let Some(polled) = pump_try_recv_after_timer(ch) {
+            if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
                 crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
                 return polled;
             }
@@ -1120,12 +1121,18 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
 /// entry. The send half targets the reply cap in r13; the receive half offers the same reply cap in
 /// r12 so the next component `Call` binds to the same kernel reply object.
 #[inline(never)]
-unsafe fn pump_reply_recv(ch: &PumpChannel, reply_msginfo: u64, reply_r0: u64) -> PumpMessage {
-    pump_reply_recv4(ch, reply_msginfo, reply_r0, 0, 0, 0)
+unsafe fn pump_reply_recv(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    reply_msginfo: u64,
+    reply_r0: u64,
+) -> PumpMessage {
+    pump_reply_recv4(ch, reply_cap, reply_msginfo, reply_r0, 0, 0, 0)
 }
 
 unsafe fn pump_reply_recv4(
     ch: &PumpChannel,
+    reply_cap: u64,
     reply_msginfo: u64,
     reply_r0: u64,
     reply_r1: u64,
@@ -1147,8 +1154,8 @@ unsafe fn pump_reply_recv4(
         inout("r8") reply_r1 => m1,
         inout("r9") reply_r2 => m2,
         inout("r15") reply_r3 => m3,
-        in("r12") ch.reply_cap,
-        in("r13") ch.reply_cap,
+        in("r12") reply_cap,
+        in("r13") reply_cap,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -1167,7 +1174,7 @@ unsafe fn pump_reply_recv4(
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if let Some(polled) = pump_try_recv_after_timer(ch) {
+        if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
             crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
             return polled;
         }
@@ -1177,7 +1184,7 @@ unsafe fn pump_reply_recv4(
                 b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
             );
         }
-        return pump_recv(ch);
+        return pump_recv(ch, reply_cap);
     }
     let m4 = if (mi & 0x7F) > 4 {
         crate::get_recv_mr(4)
@@ -1193,6 +1200,47 @@ unsafe fn pump_reply_recv4(
         m3,
         m4,
     }
+}
+
+/// Reply to a component `Call` that was deliberately parked outside the immediate pump
+/// reply+receive step. Hosted-driver waits use this when an event/semaphore producer wakes a worker
+/// that the wait service previously left blocked on its bound reply object.
+pub(crate) unsafe fn pump_reply_on(
+    reply_cap: u64,
+    msginfo: u64,
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+) -> bool {
+    let label: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") crate::SYS_CALL as u64 => _,
+        inout("rdi") reply_cap => _,
+        inout("rsi") msginfo => label,
+        inout("r10") r0 => _,
+        inout("r8") r1 => _,
+        inout("r9") r2 => _,
+        inout("r15") r3 => _,
+        in("r13") crate::SYS_REPLY_HANDOFF_MAGIC,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    let error = label >> 12;
+    if error == 0 {
+        return true;
+    }
+    if PUMP_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::print_str(b"[pump-reply] UNBOUND parked component reply cptr=");
+        crate::print_u64(reply_cap);
+        crate::print_str(b" label=");
+        crate::print_u64(error);
+        crate::print_str(b" mi=");
+        crate::print_u64(msginfo);
+        crate::print_str(b"\n");
+    }
+    false
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
@@ -1256,12 +1304,13 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
     let request_tag = pump_request_tag(ch, resume_user_callback);
     let owns_depth = pump_enter_depth(ch, resume_user_callback);
-    let first = if let Some(msg) = pump_deliver_initial_request(ch, request_tag) {
+    let mut reply_cap = ch.reply_cap;
+    let first = if let Some(msg) = pump_deliver_initial_request(ch, reply_cap, request_tag) {
         msg
     } else {
-        pump_recv(ch)
+        pump_recv(ch, reply_cap)
     };
-    let outcome = component_pump_loop(ch, first);
+    let outcome = component_pump_loop(ch, first, &mut reply_cap);
     pump_leave_depth(owns_depth, outcome.callback_suspended);
     pump_suspend_walled_component(ch, outcome);
     pump_result_from_outcome(ch, outcome)
@@ -1293,7 +1342,11 @@ fn pump_enter_depth(ch: &PumpChannel, resume_user_callback: bool) -> bool {
 }
 
 #[inline(never)]
-unsafe fn pump_deliver_initial_request(ch: &PumpChannel, request_tag: u64) -> Option<PumpMessage> {
+unsafe fn pump_deliver_initial_request(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    request_tag: u64,
+) -> Option<PumpMessage> {
     // ★ ONE composite reply+receive hands over the request. `RecvFirst` means the component has not
     // yet issued the Call we would be answering (mid-DriverEntry), so the caller performs a plain
     // receive instead.
@@ -1301,11 +1354,15 @@ unsafe fn pump_deliver_initial_request(ch: &PumpChannel, request_tag: u64) -> Op
         return None;
     }
     PUMP_CALL_REQUESTS[ch.caps.kind as usize].fetch_add(1, Ordering::Relaxed);
-    Some(pump_reply_recv(ch, REQUEST_TAG_LEN, request_tag))
+    Some(pump_reply_recv(ch, reply_cap, REQUEST_TAG_LEN, request_tag))
 }
 
 #[inline(never)]
-unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopOutcome {
+unsafe fn component_pump_loop(
+    ch: &PumpChannel,
+    first: PumpMessage,
+    reply_cap: &mut u64,
+) -> PumpLoopOutcome {
     let mut msg = first;
     let mut outcome = PumpLoopOutcome::new();
     let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded -> wall).
@@ -1339,6 +1396,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             // Answer the callback in place: the RESUME tag on the component's outstanding Call.
             pump_reply_recv_into!(
                 ch,
+                *reply_cap,
                 msg,
                 REQUEST_TAG_LEN,
                 crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
@@ -1348,13 +1406,13 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             && ch.caps.kind == ReqKind::Syscall
         {
             let status = pump_service_gdi_driver_load();
-            pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u32 as u64);
+            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
             let status = pump_service_video_device_io_control();
-            pump_reply_recv_into!(ch, msg, REQUEST_TAG_LEN, status as u64);
+            pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u64);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -1367,16 +1425,56 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 msg.m3,
                 msg.m4,
                 msg.badge,
+                *reply_cap,
             );
-            pump_reply_recv4_into!(ch, msg, 2, status as u32 as u64, handle, 0, 0);
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                handle,
+                0,
+                0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_SET_EVENT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let previous = crate::driver_launch::service_hosted_driver_ke_set_event(
+                ch,
+                msg.m0,
+                *reply_cap,
+                msg.badge,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u32 as u64);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let previous = crate::driver_launch::service_hosted_driver_ke_release_semaphore(
+                ch,
+                msg.m0,
+                msg.m1 as u32 as i32,
+                *reply_cap,
+                msg.badge,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u32 as u64);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_WAIT_SINGLE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let status = crate::driver_launch::service_hosted_driver_ke_wait_single(
-                ch, msg.m0, msg.m1, msg.m2, msg.badge,
-            );
-            pump_reply_recv_into!(ch, msg, 1, status as u32 as u64);
+            match crate::driver_launch::service_hosted_driver_ke_wait_single(
+                ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+            ) {
+                crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+                }
+                crate::driver_launch::HostedDriverWaitServiceResult::Parked { fresh_reply_cap } => {
+                    *reply_cap = fresh_reply_cap;
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == 6 {
             outcome.faults += 1;
@@ -1398,11 +1496,11 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
             // re-registers `R`. A nested demand fault therefore rides the SAME reply object as the
             // dispatch it happened inside, which is exactly Fix B's guarantee (the outer client's
             // REPLY_MAIN binding is untouched) with no second transport to keep gated.
-            pump_reply_recv_into!(ch, msg, 0, 0);
+            pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
             continue;
         } else if label == 3 && ch.caps.io_port_faults {
             if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
-                pump_reply_recv_into!(ch, msg, 1, next_ip);
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
             }
             outcome.wall(msg);
@@ -1429,7 +1527,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 skips += 1;
                 // UserException(3) reply: len 1, MR0 = the resume FaultIP (past `CD 2C`). This is
                 // the ONLY non-zero-length reply the component pump ever emits (risk R4).
-                pump_reply_recv_into!(ch, msg, 1, msg.m0 + 2);
+                pump_reply_recv_into!(ch, *reply_cap, msg, 1, msg.m0 + 2);
                 continue;
             }
             // Not a skippable int-0x2c — fall through to the wall.

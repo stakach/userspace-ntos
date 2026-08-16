@@ -2119,7 +2119,7 @@ const ISR_DONE_BADGE: u64 = 0x80;
 const SYS_REPLY_RECV: i64 = -2;
 pub const SYS_NB_SEND_RECV: i64 = -3;
 pub const SYS_NB_RECV: i64 = -8;
-const SYS_REPLY_HANDOFF_MAGIC: u64 = 0x4e54_4f53_5245_5431;
+pub(crate) const SYS_REPLY_HANDOFF_MAGIC: u64 = 0x4e54_4f53_5245_5431;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
@@ -2325,6 +2325,19 @@ pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
             slots.push(rf);
         }
         slots[i]
+    }
+}
+
+pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
+    if reply_cap == 0 {
+        return;
+    }
+    unsafe {
+        let slots = fsd_reply_slots_mut();
+        while slots.len() <= i {
+            slots.push(0);
+        }
+        slots[i] = reply_cap;
     }
 }
 

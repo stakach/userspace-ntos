@@ -6372,3 +6372,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   a shared-frame array race. Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`,
   executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  B3 hosted driver single-wait broker wiring (2026-08-16): the executive now owns a per-instance
+  hosted-driver reply-spare pool and raw dispatcher waiter table, separate from the hosted-user
+  wait/pipe/dbgk reply pool. Infinite `KeWaitForSingleObject` requests from hosted worker TCBs
+  withhold the currently bound component reply cap, rotate the pump to a fresh driver-owned cap,
+  mark the host-tested system-thread handle waiting, and later resume the worker through a
+  component-plane reply when `KeSetEvent` or `KeReleaseSemaphore` makes the raw
+  `KEVENT`/`KSEMAPHORE` header ready. Zero-timeout polls still return `STATUS_TIMEOUT`; finite timed
+  waits remain fail-closed `STATUS_NOT_IMPLEMENTED` until a driver-owned timer queue exists.
+  Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: next B3 work is timed hosted
+  driver waits, `KeWaitForMultipleObjects` per-worker object-list staging, and then a serialized
+  desktop boot to prove the generic pump transport gates still hold in the full OS path.

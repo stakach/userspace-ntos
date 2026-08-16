@@ -430,6 +430,8 @@ const DISPATCH_LEVEL: u8 = 2;
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 pub const FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL: u64 = 0x772;
 pub const FSD_SERVICE_KE_WAIT_SINGLE_LABEL: u64 = 0x773;
+pub const FSD_SERVICE_KE_SET_EVENT_LABEL: u64 = 0x774;
+pub const FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL: u64 = 0x775;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -442,7 +444,10 @@ pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
 pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
     matches!(
         label,
-        FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL | FSD_SERVICE_KE_WAIT_SINGLE_LABEL
+        FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
+            | FSD_SERVICE_KE_WAIT_SINGLE_LABEL
+            | FSD_SERVICE_KE_SET_EVENT_LABEL
+            | FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
     )
 }
 
@@ -507,6 +512,11 @@ static HOSTED_DRIVER_WAIT_SINGLE_REJECTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_READY: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_BLOCKING: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_PARKED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_WOKEN: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SET_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_RELEASE_SEMAPHORE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_MAJOR: AtomicU64 = AtomicU64::new(0);
@@ -7472,11 +7482,21 @@ extern "win64" fn s_ke_initialize_event(event: u64, event_type: u32, state: u8) 
 }
 
 /// `LONG KeSetEvent(PRKEVENT, KPRIORITY, BOOLEAN)`.
-extern "win64" fn s_ke_set_event(event: u64, _increment: i32, _wait: u8) -> i32 {
+extern "win64" fn s_ke_set_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
     }
-    unsafe { kevent::kevent_set(event as *mut u8) as i32 }
+    let packed = (increment as u32 as u64) | ((wait as u64) << 32);
+    let (_label, previous, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_SET_EVENT_LABEL << 12) | 3,
+            event,
+            packed,
+            0,
+            0,
+        )
+    };
+    previous as u32 as i32
 }
 
 /// `void KeClearEvent(PRKEVENT)`.
@@ -7531,17 +7551,24 @@ extern "win64" fn s_ke_read_state_semaphore(semaphore: u64) -> i32 {
 /// `LONG KeReleaseSemaphore(PRKSEMAPHORE, KPRIORITY, LONG, BOOLEAN)`.
 extern "win64" fn s_ke_release_semaphore(
     semaphore: u64,
-    _increment: i32,
+    increment: i32,
     adjustment: i32,
-    _wait: u8,
+    wait: u8,
 ) -> i32 {
     if semaphore == 0 {
         return 0;
     }
-    match unsafe { ksemaphore_release(semaphore as *mut u8, adjustment) } {
-        Ok(previous) => previous,
-        Err(_) => STATUS_SEMAPHORE_LIMIT_EXCEEDED,
-    }
+    let packed = (increment as u32 as u64) | ((wait as u64) << 32);
+    let (_label, previous, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL << 12) | 4,
+            semaphore,
+            adjustment as u32 as u64,
+            packed,
+            0,
+        )
+    };
+    previous as u32 as i32
 }
 
 unsafe fn hosted_dispatcher_ready(object: u64) -> Result<bool, i32> {
@@ -7627,6 +7654,112 @@ extern "win64" fn s_ke_wait_for_single_object(
         )
     };
     status as u32 as i32
+}
+
+pub(crate) enum HostedDriverWaitServiceResult {
+    Reply(i32),
+    Parked { fresh_reply_cap: u64 },
+}
+
+fn park_hosted_driver_single_wait(
+    instance: usize,
+    thread_handle: u64,
+    active_reply_cap: u64,
+    object: u64,
+) -> Option<u64> {
+    let waiters = unsafe { hosted_driver_waiters_mut() };
+    if waiters.iter().any(|waiter| {
+        waiter.instance == instance
+            && (waiter.thread_handle == thread_handle || waiter.reply_cap == active_reply_cap)
+    }) {
+        return None;
+    }
+    if waiters.len() == waiters.capacity() && waiters.try_reserve(4).is_err() {
+        return None;
+    }
+    let fresh = unsafe { take_hosted_driver_reply_spare(instance)? };
+    let set_waiting = unsafe {
+        hosted_driver_thread_table_mut(instance)
+            .and_then(|table| table.set_waiting(thread_handle).ok())
+    };
+    if set_waiting.is_none() {
+        unsafe {
+            return_hosted_driver_reply_spare(instance, fresh);
+        }
+        return None;
+    }
+    waiters.push(HostedDriverRawWaiter {
+        instance,
+        thread_handle,
+        reply_cap: active_reply_cap,
+        object,
+    });
+    if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh) {
+        let _ = waiters.pop();
+        unsafe {
+            let _ = hosted_driver_thread_table_mut(instance)
+                .and_then(|table| table.set_ready(thread_handle).ok());
+            return_hosted_driver_reply_spare(instance, fresh);
+        }
+        return None;
+    }
+    HOSTED_DRIVER_WAIT_SINGLE_PARKED.fetch_add(1, Ordering::Relaxed);
+    Some(fresh)
+}
+
+fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
+    let mut woken = 0u64;
+    loop {
+        let ready_index = unsafe {
+            let Some(waiters) = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
+                return woken;
+            };
+            waiters.iter().position(|waiter| {
+                waiter.instance == instance
+                    && matches!(hosted_dispatcher_ready(waiter.object), Ok(true))
+            })
+        };
+        let Some(index) = ready_index else {
+            break;
+        };
+        let waiter = unsafe { hosted_driver_waiters_mut().remove(index) };
+        let consumed = unsafe { hosted_dispatcher_consume(waiter.object) };
+        if !consumed {
+            HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                let _ = hosted_driver_thread_table_mut(instance)
+                    .and_then(|table| table.set_ready(waiter.thread_handle).ok());
+                return_hosted_driver_reply_spare(instance, waiter.reply_cap);
+            }
+            continue;
+        }
+        let replied = unsafe {
+            crate::spawn_hosts::pump_reply_on(
+                waiter.reply_cap,
+                1,
+                STATUS_SUCCESS as u32 as u64,
+                0,
+                0,
+                0,
+            )
+        };
+        unsafe {
+            let _ = hosted_driver_thread_table_mut(instance)
+                .and_then(|table| table.set_ready(waiter.thread_handle).ok());
+            if replied {
+                return_hosted_driver_reply_spare(instance, waiter.reply_cap);
+            } else {
+                let _ = cnode_delete_recycle_r(waiter.reply_cap);
+            }
+        }
+        if replied {
+            HOSTED_DRIVER_WAIT_SINGLE_WOKEN.fetch_add(1, Ordering::Relaxed);
+            woken += 1;
+        } else {
+            HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    woken
 }
 
 /// `NTSTATUS KeWaitForMultipleObjects(ULONG Count, PVOID Object[], WAIT_TYPE, ...)`.
@@ -15366,8 +15499,23 @@ struct HostedDriverThreadSpawn {
     sched_context: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HostedDriverRawWaiter {
+    instance: usize,
+    thread_handle: u64,
+    reply_cap: u64,
+    object: u64,
+}
+
+#[derive(Default)]
+struct HostedDriverReplyPool {
+    spares: Vec<u64>,
+}
+
 static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = None;
 static mut HOSTED_DRIVER_THREAD_RUNTIMES: Option<Vec<HostedDriverThreadRuntime>> = None;
+static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
+static mut HOSTED_DRIVER_REPLY_POOLS: Option<Vec<HostedDriverReplyPool>> = None;
 
 unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
     let slot = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
@@ -15413,6 +15561,94 @@ unsafe fn hosted_driver_thread_runtimes_mut() -> &'static mut Vec<HostedDriverTh
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_driver_reply_pools_mut() -> &'static mut Vec<HostedDriverReplyPool> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_REPLY_POOLS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_driver_reply_pool_mut(instance: usize) -> &'static mut HostedDriverReplyPool {
+    let pools = hosted_driver_reply_pools_mut();
+    while pools.len() <= instance {
+        pools.push(HostedDriverReplyPool::default());
+    }
+    &mut pools[instance]
+}
+
+unsafe fn allocate_hosted_driver_reply_cap() -> Option<u64> {
+    let cap = alloc_slot();
+    if cap == 0 || untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
+        if cap != 0 {
+            recycle_deleted_root_slot(cap);
+        }
+        return None;
+    }
+    Some(cap)
+}
+
+unsafe fn take_hosted_driver_reply_spare(instance: usize) -> Option<u64> {
+    if let Some(cap) = hosted_driver_reply_pool_mut(instance).spares.pop() {
+        return Some(cap);
+    }
+    allocate_hosted_driver_reply_cap()
+}
+
+unsafe fn return_hosted_driver_reply_spare(instance: usize, cap: u64) {
+    if cap == 0 {
+        return;
+    }
+    let pool = hosted_driver_reply_pool_mut(instance);
+    if !pool.spares.contains(&cap) {
+        pool.spares.push(cap);
+    }
+}
+
+fn hosted_driver_runtime_by_badge(
+    instance: usize,
+    badge: u64,
+) -> Option<HostedDriverThreadRuntime> {
+    if badge == 0 {
+        return None;
+    }
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
+            .as_ref()?
+            .iter()
+            .copied()
+            .find(|rt| rt.instance == instance && rt.badge == badge)
+    }
+}
+
+fn rotate_hosted_driver_active_reply(
+    instance: usize,
+    expected_active: u64,
+    fresh: u64,
+) -> bool {
+    if expected_active == 0 || fresh == 0 {
+        return false;
+    }
+    let table = unsafe { driver_instances_mut() };
+    if instance >= table.len()
+        || !table[instance].used
+        || table[instance].reply_cap != expected_active
+    {
+        return false;
+    }
+    table[instance].reply_cap = fresh;
+    crate::replace_fsd_reply_slot(instance, fresh);
+    true
+}
+
 unsafe fn delete_hosted_driver_thread_mechanism(
     tcb: u64,
     sched_context: u64,
@@ -15450,6 +15686,33 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
                     HostedDriverThreadTable::with_first_handle(hosted_driver_thread_first_handle(
                         instance,
                     ));
+            }
+        }
+    }
+}
+
+fn clear_hosted_driver_waits_for_instance(instance: usize) {
+    unsafe {
+        if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
+            let mut index = 0usize;
+            while index < waiters.len() {
+                if waiters[index].instance == instance {
+                    let waiter = waiters.remove(index);
+                    if waiter.reply_cap != 0 {
+                        let _ = cnode_delete_recycle_r(waiter.reply_cap);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if let Some(pools) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_REPLY_POOLS)).as_mut() {
+            if let Some(pool) = pools.get_mut(instance) {
+                for cap in pool.spares.drain(..) {
+                    if cap != 0 {
+                        let _ = cnode_delete_recycle_r(cap);
+                    }
+                }
             }
         }
     }
@@ -15699,6 +15962,7 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) {
+    clear_hosted_driver_waits_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
     clear_hosted_device_bindings_for_instance(i);
     if let Some(inst) = instance(i) {
@@ -15786,9 +16050,10 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
 
 fn instance_for_pump_channel(
     ch: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
 ) -> Option<(usize, DriverInstance)> {
     let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
-    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != ch.reply_cap {
+    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != active_reply_cap {
         return None;
     }
     Some((instance, inst))
@@ -15931,11 +16196,12 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
     _packed_wait: u64,
     timeout_code: u64,
     caller_badge: u64,
-) -> i32 {
+    active_reply_cap: u64,
+) -> HostedDriverWaitServiceResult {
     let request = HOSTED_DRIVER_WAIT_SINGLE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let Some((instance, inst)) = instance_for_pump_channel(ch) else {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
     let Some(exec_object) = component_to_exec_va_for_instance(instance, inst, object, 0x20) else {
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -15951,23 +16217,25 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
             print_hex(object as u32);
             print_str(b"\n");
         }
-        return STATUS_INVALID_PARAMETER;
+        return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
     unsafe {
         match hosted_dispatcher_ready(exec_object) {
             Ok(true) => {
                 hosted_dispatcher_consume(exec_object);
                 HOSTED_DRIVER_WAIT_SINGLE_READY.fetch_add(1, Ordering::Relaxed);
-                STATUS_SUCCESS
+                HostedDriverWaitServiceResult::Reply(STATUS_SUCCESS)
             }
             Ok(false) => {
-                let status = hosted_unsatisfied_wait_status_from_code(timeout_code);
-                if status == STATUS_TIMEOUT_I32 {
+                match hosted_wait_timeout_from_code(timeout_code) {
+                    DispatcherWaitTimeout::Poll => {
                     HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                } else {
+                        HostedDriverWaitServiceResult::Reply(STATUS_TIMEOUT_I32)
+                    }
+                    DispatcherWaitTimeout::Blocking => {
                     HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
                     if request <= 8 {
-                        print_str(b"[driver-wait] KeWaitForSingleObject blocking wait fail-closed inst=");
+                            print_str(b"[driver-wait] KeWaitForSingleObject timed wait fail-closed inst=");
                         print_u64(instance as u64);
                         if caller_badge != 0 {
                             print_str(b" badge=");
@@ -15978,15 +16246,134 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                         print_hex(object as u32);
                         print_str(b"\n");
                     }
+                        HostedDriverWaitServiceResult::Reply(STATUS_NOT_IMPLEMENTED)
+                    }
+                    DispatcherWaitTimeout::Infinite => {
+                        HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
+                        let Some(runtime) = hosted_driver_runtime_by_badge(instance, caller_badge)
+                        else {
+                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                            return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
+                        };
+                        let Some(fresh_reply_cap) = park_hosted_driver_single_wait(
+                            instance,
+                            runtime.handle,
+                            active_reply_cap,
+                            exec_object,
+                        ) else {
+                            HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                            return HostedDriverWaitServiceResult::Reply(
+                                STATUS_INSUFFICIENT_RESOURCES,
+                            );
+                        };
+                        if request <= 8 {
+                            print_str(b"[driver-wait] KeWaitForSingleObject parked inst=");
+                            print_u64(instance as u64);
+                            print_str(b" badge=");
+                            print_u64(caller_badge);
+                            print_str(b" handle=0x");
+                            print_hex((runtime.handle >> 32) as u32);
+                            print_hex(runtime.handle as u32);
+                            print_str(b" object=0x");
+                            print_hex((object >> 32) as u32);
+                            print_hex(object as u32);
+                            print_str(b"\n");
+                        }
+                        HostedDriverWaitServiceResult::Parked { fresh_reply_cap }
+                    }
                 }
-                status
             }
             Err(status) => {
                 HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
-                status
+                HostedDriverWaitServiceResult::Reply(status)
             }
         }
     }
+}
+
+pub(crate) fn service_hosted_driver_ke_set_event(
+    ch: &crate::spawn_hosts::PumpChannel,
+    event: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> i32 {
+    let request = HOSTED_DRIVER_SET_EVENT_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if event == 0 {
+        return 0;
+    }
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return 0;
+    };
+    let Some(exec_event) = component_to_exec_va_for_instance(instance, inst, event, 0x20) else {
+        if request <= 8 {
+            print_str(b"[driver-wait] KeSetEvent unmapped event inst=");
+            print_u64(instance as u64);
+            if caller_badge != 0 {
+                print_str(b" badge=");
+                print_u64(caller_badge);
+            }
+            print_str(b" event=0x");
+            print_hex((event >> 32) as u32);
+            print_hex(event as u32);
+            print_str(b"\n");
+        }
+        return 0;
+    };
+    let previous = unsafe { kevent::kevent_set(exec_event as *mut u8) as i32 };
+    let woken = wake_hosted_driver_waiters_for_instance(instance);
+    if woken != 0 && request <= 8 {
+        print_str(b"[driver-wait] KeSetEvent woke=");
+        print_u64(woken);
+        print_str(b" inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+    }
+    previous
+}
+
+pub(crate) fn service_hosted_driver_ke_release_semaphore(
+    ch: &crate::spawn_hosts::PumpChannel,
+    semaphore: u64,
+    adjustment: i32,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> i32 {
+    let request = HOSTED_DRIVER_RELEASE_SEMAPHORE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if semaphore == 0 {
+        return 0;
+    }
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(exec_semaphore) = component_to_exec_va_for_instance(instance, inst, semaphore, 0x20)
+    else {
+        if request <= 8 {
+            print_str(b"[driver-wait] KeReleaseSemaphore unmapped semaphore inst=");
+            print_u64(instance as u64);
+            if caller_badge != 0 {
+                print_str(b" badge=");
+                print_u64(caller_badge);
+            }
+            print_str(b" semaphore=0x");
+            print_hex((semaphore >> 32) as u32);
+            print_hex(semaphore as u32);
+            print_str(b"\n");
+        }
+        return STATUS_INVALID_PARAMETER;
+    };
+    let previous = match unsafe { ksemaphore_release(exec_semaphore as *mut u8, adjustment) } {
+        Ok(previous) => previous,
+        Err(_) => return STATUS_SEMAPHORE_LIMIT_EXCEEDED,
+    };
+    let woken = wake_hosted_driver_waiters_for_instance(instance);
+    if woken != 0 && request <= 8 {
+        print_str(b"[driver-wait] KeReleaseSemaphore woke=");
+        print_u64(woken);
+        print_str(b" inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+    }
+    previous
 }
 
 pub(crate) fn service_hosted_driver_ps_create_system_thread(
@@ -15997,9 +16384,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     process_handle: u64,
     client_id: u64,
     caller_badge: u64,
+    active_reply_cap: u64,
 ) -> (i32, u64) {
     let request = HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let Some((instance, inst)) = instance_for_pump_channel(ch) else {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
     };
