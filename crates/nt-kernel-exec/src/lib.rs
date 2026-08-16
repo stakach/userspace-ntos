@@ -16,6 +16,7 @@ mod completion;
 pub mod dbg;
 mod dispatcher_wait;
 mod dpc;
+mod driver_thread;
 mod event;
 pub mod gdi_bitmap;
 mod interrupt;
@@ -43,6 +44,11 @@ pub use dispatcher_wait::{
     DispatcherObject, DispatcherWaitResult, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
+pub use driver_thread::{
+    HostedDispatcherWaitAdmission, HostedDispatcherWaitError, HostedDispatcherWaitQueue,
+    HostedDispatcherWaiter, HostedDispatcherWake, HostedDriverThread, HostedDriverThreadError,
+    HostedDriverThreadState, HostedDriverThreadTable, HOSTED_DRIVER_THREAD_HANDLE_BASE,
+};
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};

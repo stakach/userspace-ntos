@@ -1191,9 +1191,12 @@ before unrelated executive traffic monopolises the receive loop.
   `KeWaitForMultipleObjects` now distinguish true zero-timeout polls from blocking or infinite waits:
   ready dispatcher objects still complete normally, unsatisfied polls return `STATUS_TIMEOUT`, and
   unsatisfied blocking waits fail closed until a real hosted wait broker can park and resume worker
-  TCBs. Remaining B3 work is broader non-display driver coverage: real hosted kernel-thread runtime
-  for `PsCreateSystemThread`, metadata-driven TCPIP/AFD activation once hosted waits can
-  block/resume, miniport packet data-plane behavior, and multi-device scaling under the same dynamic
+  TCBs. The host-testable `nt-kernel-exec` model now includes hosted driver system-thread handle
+  records plus a dispatcher wait queue that admits, parks, wakes, and cancels blocking waits without
+  consuming dispatcher state during readiness scans. Remaining B3 work is broader non-display driver
+  coverage: executive seL4 wiring for `PsCreateSystemThread`, reply-cap rotation around parked
+  hosted-driver waits, metadata-driven TCPIP/AFD activation once hosted waits can block/resume,
+  miniport packet data-plane behavior, and multi-device scaling under the same dynamic
   devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
@@ -6315,3 +6318,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   spinning lwIP mailbox and semaphore loops on fabricated timeouts. Validation: `cargo fmt --all`,
   `cargo test -p nt-kernel-exec`, executive `cargo check` for `x86_64-unknown-none`, and
   `git diff --check`.
+
+  B3 hosted driver wait-broker model (2026-08-16): `nt-kernel-exec` now carries the
+  host-testable mechanism model for hosted kernel-driver system threads and blocking dispatcher
+  waits. `HostedDriverThreadTable` mints unique nonzero system-thread handles, records start routine
+  and context, attaches a real TCB once the executive creates it, and tracks ready/running/waiting/
+  terminated states. `HostedDispatcherWaitQueue` admits waits through the same dispatcher poll logic
+  used by native waits, returns immediate satisfaction or poll timeout without parking, stores only
+  true blocking/infinite waiters, rejects duplicate parked thread/reply identities, scans readiness
+  without consuming event/semaphore/mutant state, and consumes exactly once when waking a waiter.
+  This is the reusable model the next executive slice should bind to component reply-cap parking and
+  seL4 TCB startup; `PsCreateSystemThread` remains fail-closed until that wiring exists. Validation:
+  `cargo fmt --all` and `cargo test -p nt-kernel-exec`.

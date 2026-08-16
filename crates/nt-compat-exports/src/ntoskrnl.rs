@@ -48,12 +48,12 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e(
         "KeInitializeEvent",
         Partial,
-        "local event state only; no dispatcher wait queue",
+        "event state via nt-kernel-exec; hosted wait-broker wiring is executive-owned",
     ),
     e(
         "KeSetEvent",
         Partial,
-        "returns previous state; wakes no waiters (no KeWaitForSingleObject)",
+        "returns previous state; hosted wait-broker wake wiring is executive-owned",
     ),
     e("KeClearEvent", Partial, "local event state only"),
     e(
