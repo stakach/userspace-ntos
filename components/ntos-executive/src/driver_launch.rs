@@ -48,11 +48,10 @@ use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 use nt_video_miniport::{
     write_video_status_block_x64, VideoAccessRangeX64, VideoHwInitializationDataError,
-    VideoHwInitializationDataVersion, VideoHwInitializationDataX64, VideoPortConfigInfoX64,
-    VideoRequestPacketX64, VideoStatusBlockX64, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
-    VIDEO_ACCESS_RANGE_X64_SIZE, VIDEO_HW_INITIALIZATION_DATA_X64_SIZE,
-    VIDEO_PORT_CONFIG_INFO_X64_SIZE, VIDEO_REQUEST_PACKET_X64_SIZE, VIDEO_STATUS_BLOCK_X64_SIZE,
-    VIDEO_WIN32K_CALLBACKS_SIZE_X64,
+    VideoHwInitializationDataX64, VideoPortConfigInfoX64, VideoRequestPacketX64,
+    VideoStatusBlockX64, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS, VIDEO_ACCESS_RANGE_X64_SIZE,
+    VIDEO_HW_INITIALIZATION_DATA_X64_SIZE, VIDEO_PORT_CONFIG_INFO_X64_SIZE,
+    VIDEO_REQUEST_PACKET_X64_SIZE, VIDEO_STATUS_BLOCK_X64_SIZE, VIDEO_WIN32K_CALLBACKS_SIZE_X64,
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
@@ -7640,7 +7639,6 @@ struct HostedVideoPortInitialization {
 static mut HOSTED_VIDEO_PORT_INITIALIZATION: Option<HostedVideoPortInitialization> = None;
 static mut HOSTED_VIDEO_PORT_INITIALIZE_CALLS: u64 = 0;
 static HOSTED_VIDEO_NEXT_OBJECT_NUMBER: AtomicU64 = AtomicU64::new(0);
-static VIDEO_PORT_MAP_MEMORY_TRACE: AtomicU64 = AtomicU64::new(0);
 const VIDEO_MEMORY_SPACE_IO: u32 = 0x1;
 const VIDEO_PORT_REGISTRY_VALUE_MAX: usize = 4096;
 const VIDEO_INTERRUPT_MODE_LATCHED: u32 = 0;
@@ -7999,21 +7997,15 @@ extern "win64" fn s_video_port_map_memory(
                 None => 0,
             }
         };
-        let trace = VIDEO_PORT_MAP_MEMORY_TRACE.fetch_add(1, Ordering::Relaxed);
-        if trace < 64 {
-            print_str(b"[videoprt-map-memory] phys=0x");
+        if mapped == 0 {
+            print_str(b"[videoprt-map-memory] failed phys=0x");
             print_hex((physical_address >> 32) as u32);
             print_hex(physical_address as u32);
             print_str(b" len=");
             print_u64(requested_len as u64);
             print_str(b" space=");
             print_u64(space as u64);
-            print_str(b" mapped=0x");
-            print_hex((mapped >> 32) as u32);
-            print_hex(mapped as u32);
             print_str(b"\n");
-        }
-        if mapped == 0 {
             write_unaligned(virtual_address as *mut u64, 0);
             return VP_ERROR_INVALID_PARAMETER;
         }
@@ -8345,14 +8337,6 @@ fn video_hw_initialization_error_status(error: VideoHwInitializationDataError) -
     }
 }
 
-fn video_hw_initialization_version_code(version: VideoHwInitializationDataVersion) -> u32 {
-    match version {
-        VideoHwInitializationDataVersion::Nt4 => 4,
-        VideoHwInitializationDataVersion::Windows2000 => 2000,
-        VideoHwInitializationDataVersion::WindowsXpOrLater => 2003,
-    }
-}
-
 extern "win64" fn s_video_port_initialize(
     context1: u64,
     context2: u64,
@@ -8400,15 +8384,6 @@ extern "win64" fn s_video_port_initialize(
                     data.hw_device_extension_size,
                 );
                 write_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *mut u32, 1);
-                print_str(b"[videoprt] VideoPortInitialize captured size=");
-                print_u64(data.hw_init_data_size as u64);
-                print_str(b" version=");
-                print_u64(video_hw_initialization_version_code(data.version()) as u64);
-                print_str(b" pnp=");
-                print_u64(data.is_pnp_miniport() as u64);
-                print_str(b" legacy=");
-                print_u64(data.requires_legacy_detection(hw_context) as u64);
-                print_str(b"\n");
                 STATUS_SUCCESS
             }
             Err(error) => {
@@ -14305,22 +14280,24 @@ unsafe fn dispatch_video_irp_for_binding(
     let outcome = match major as u8 {
         major::IRP_MJ_CREATE => {
             let result = dispatch_video_initialize_for_instance(index, inst, device_object)?;
-            print_str(b"[driver-launch] hosted video Initialize device_id=");
-            print_u64(binding.device_id);
-            print_str(b" status=0x");
-            print_hex(result.0 as u32);
-            print_str(b" info=");
-            print_u64(result.1);
-            print_str(b" calls=");
-            print_u64(read_volatile(
+            let initialize_calls = read_volatile(
                 (inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64,
-            ));
-            print_str(b" ok=");
-            print_u64(
-                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_OK) as *const u8)
-                    as u64,
             );
-            print_str(b"\n");
+            let initialize_ok =
+                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_OK) as *const u8);
+            if result.0 != 0 || initialize_ok == 0 {
+                print_str(b"[driver-launch] hosted video Initialize failed device_id=");
+                print_u64(binding.device_id);
+                print_str(b" status=0x");
+                print_hex(result.0 as u32);
+                print_str(b" info=");
+                print_u64(result.1);
+                print_str(b" calls=");
+                print_u64(initialize_calls);
+                print_str(b" ok=");
+                print_u64(initialize_ok as u64);
+                print_str(b"\n");
+            }
             result
         }
         major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE => (0, 0),
@@ -14365,21 +14342,19 @@ pub(crate) unsafe fn start_hosted_device(
     );
     clear_shared_device_interface_state_at(sh);
     let video_initialized = read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0;
-    if video_initialized
-        || read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64) != 0
-        || read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64) != 0
-        || read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64) != 0
+    let video_find_adapter = read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64);
+    let video_initialize = read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64);
+    let video_start_io = read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64);
+    if !video_initialized && (video_find_adapter != 0 || video_initialize != 0 || video_start_io != 0)
     {
-        print_str(b"[driver-launch] hosted video StartDevice device_id=");
+        print_str(b"[driver-launch] hosted video callbacks without initialization device_id=");
         print_u64(device_id);
-        print_str(b" initialized=");
-        print_u64(video_initialized as u64);
         print_str(b" find=0x");
-        print_hex64(read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64));
+        print_hex64(video_find_adapter);
         print_str(b" init=0x");
-        print_hex64(read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64));
+        print_hex64(video_initialize);
         print_str(b" startio=0x");
-        print_hex64(read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64));
+        print_hex64(video_start_io);
         print_str(b"\n");
     }
     if video_initialized {
@@ -14391,15 +14366,18 @@ pub(crate) unsafe fn start_hosted_device(
         );
         nt_status::NtStatus(root_status).to_result()?;
         let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
-        print_str(b"[driver-launch] hosted video FindAdapter device_id=");
-        print_u64(device_id);
-        print_str(b" status=0x");
-        print_hex(video_status);
-        print_str(b" calls=");
-        print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64));
-        print_str(b" again=");
-        print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8) as u64);
-        print_str(b"\n");
+        let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
+        if video_status != VP_NO_ERROR || again != 0 {
+            print_str(b"[driver-launch] hosted video FindAdapter returned device_id=");
+            print_u64(device_id);
+            print_str(b" status=0x");
+            print_hex(video_status);
+            print_str(b" calls=");
+            print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64));
+            print_str(b" again=");
+            print_u64(again as u64);
+            print_str(b"\n");
+        }
         record_hosted_resource_usage(binding, sh)?;
         video_port_status(video_status)?;
         apply_hosted_device_interface_state(sh)?;

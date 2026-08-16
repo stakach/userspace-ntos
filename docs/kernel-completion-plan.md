@@ -39,14 +39,16 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
-`.tmp/run-desktop-boot-proof-alias.log` reaches the harness sentinel with `296/296`
-executive-to-isolated-service checks passing after the boot-framebuffer display route was removed and
-the old fixed boot proof scratch aliases were replaced. The hosted Bochs/videoprt route remains the
-only display route: it publishes `\\Device\\Video0` through the hosted I/O Manager path, mode
-enumeration returns `bytes=320`, `VideoPortMapMemory` maps `phys=0x80000000 len=3145728` to
-`WIN32K_FB_VA`, and `PDEVOBJ_lChangeDisplaySettings status=0`. The storage proof now maps checked
-dynamic aliases before copying the real disk hive page, validates source/copy/faulted qwords against
-the `UNTHIVE1` image magic, and passes `exec_disk_section_demand_paged`. The same run reaches real
+`.tmp/run-desktop-video-diagnostic-reduction.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the boot-framebuffer display route was removed,
+the old fixed boot proof scratch aliases were replaced, and hosted-video success-path traces were
+trimmed. The hosted Bochs/videoprt route remains the only display route: it publishes
+`\\Device\\Video0` through the hosted I/O Manager path, `PDEVOBJ_lChangeDisplaySettings status=0`,
+and the removed `VideoPortInitialize captured`, `hosted video Initialize device_id`,
+`hosted video StartDevice`, `hosted video FindAdapter device_id`, and successful
+`videoprt-map-memory` trace strings are absent. The storage proof maps checked dynamic aliases
+before copying the real disk hive page, validates source/copy/faulted qwords against the `UNTHIVE1`
+image magic, and passes `exec_disk_section_demand_paged`. The same run reaches real
 `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM classes, api0 callbacks, GDI user
 batch flushes, and `exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports
 `786432/786432` non-background pixels with at least 32 distinct non-background colors.
@@ -1176,9 +1178,10 @@ before unrelated executive traffic monopolises the receive loop.
   boot-framebuffer-backed Video0 route has been removed; the BOOTBOOT framebuffer remains only as
   the physical scanout memory granted to the selected miniport and mapped into hosted win32k.
   Loaded GDI/display driver image records also grow in component-visible win32k pool storage, so
-  win32k's hosted trampolines never depend on executive-only heap pointers. Remaining display debt
-  is an automated shell-pixel regression gate and trimming bounded diagnostics after the hosted
-  route stabilizes.
+  win32k's hosted trampolines never depend on executive-only heap pointers. The current automated
+  shell-pixel gate proves this route through Explorer shell chrome. Remaining B3 work is broader
+  non-display driver coverage: real dependency images such as `ndis.sys`, registry-selected
+  miniport start, and multi-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -3764,6 +3767,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   fixed proof-alias debt are closed for the current B3 display frontier; remaining work is reducing
   proof-only diagnostics and continuing real NT subsystem coverage without adding fallback success
   paths.
+
+- B3 hosted-video diagnostic reduction (2026-08-16). The hosted videoprt display path no longer
+  prints success traces for every proven callback. `VideoPortInitialize`, `HwInitialize`,
+  `HwFindAdapter`, and `VideoPortMapMemory` still publish their counters and shared-frame evidence,
+  but success is now represented by the normal proof gates and final summaries; live serial output is
+  reserved for invalid initialization data, failed framebuffer mappings, failed `HwInitialize`, and
+  anomalous `HwFindAdapter` retry/status returns. Validation: `cargo fmt --all`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-video-diagnostic-reduction.log`, which reaches `296/296` with
+  `exec_disk_section_demand_paged`, `exec_video_device_objects_registered`,
+  `exec_gdi_user_batch_flushed`, and `exec_explorer_shell_chrome_painted` green. Review adjustment:
+  display-route diagnostics are now small enough for the current desktop frontier; B3 should move
+  back to real non-display driver coverage rather than adding more display-specific instrumentation.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
