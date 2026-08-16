@@ -11,7 +11,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use nt_config_abi::{opcode, CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest};
+use nt_config_abi::{
+    opcode, CmEnumerateKeyRequest, CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest,
+};
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
 /// `out_buf` for future variable-length replies).
@@ -56,6 +58,16 @@ impl<B: Backend> ConfigClient<B> {
     /// Whether a key exists at `path`.
     pub fn open_key(&mut self, path: &str) -> bool {
         self.key_op(opcode::CM_OP_OPEN_KEY, path).status == STATUS_SUCCESS
+    }
+
+    /// Enumerate an immediate subkey name by index into `out` as UTF-16LE bytes without a NUL.
+    pub fn enumerate_key(&mut self, path: &str, index: u32, out: &mut [u8]) -> Result<usize, i32> {
+        let r = self.enumerate_key_op(path, index, out);
+        if r.status == STATUS_SUCCESS {
+            Ok(r.information as usize)
+        } else {
+            Err(r.status)
+        }
     }
 
     /// Set a DWORD value on a key (created if absent).
@@ -130,6 +142,21 @@ impl<B: Backend> ConfigClient<B> {
         self.backend.call(op, &buf, &mut [])
     }
 
+    fn enumerate_key_op(&mut self, path: &str, index: u32, out: &mut [u8]) -> CmReply {
+        let path_bytes = utf16_bytes(path);
+        let hdr = CmEnumerateKeyRequest {
+            abi_size: core::mem::size_of::<CmEnumerateKeyRequest>() as u16,
+            _pad: 0,
+            index,
+            path_offset: core::mem::size_of::<CmEnumerateKeyRequest>() as u32,
+            path_len_bytes: path_bytes.len() as u32,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(hdr.as_bytes());
+        buf.extend_from_slice(&path_bytes);
+        self.backend.call(opcode::CM_OP_ENUMERATE_KEY, &buf, out)
+    }
+
     fn value_op(&mut self, op: u16, key_path: &str, name: &str, dword: u32) -> CmReply {
         let key_bytes = utf16_bytes(key_path);
         let name_bytes = utf16_bytes(name);
@@ -186,6 +213,8 @@ impl<B: Backend> ConfigClient<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::string::String;
     use nt_config_manager::{
         encode_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_WIN32_SHARE_PROCESS,
     };
@@ -267,6 +296,32 @@ mod tests {
             Ok((1, expected.len()))
         );
         assert_eq!(&out[..expected.len()], expected.as_slice());
+    }
+
+    #[test]
+    fn enumerate_key_returns_case_preserved_subkey_names() {
+        let mut c = client();
+        let parent = r"\Registry\Machine\System\CurrentControlSet\Services";
+        assert!(c.create_key(&format!(r"{}\Tcpip", parent)).is_ok());
+        assert!(c.create_key(&format!(r"{}\Ndis", parent)).is_ok());
+        let mut out = [0u8; 32];
+        let n0 = c.enumerate_key(parent, 0, &mut out).unwrap();
+        let first = String::from_utf16_lossy(
+            &out[..n0]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        );
+        let n1 = c.enumerate_key(parent, 1, &mut out).unwrap();
+        let second = String::from_utf16_lossy(
+            &out[..n1]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(first, "Tcpip");
+        assert_eq!(second, "Ndis");
+        assert!(c.enumerate_key(parent, 2, &mut out).is_err());
     }
 
     #[test]

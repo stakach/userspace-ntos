@@ -2989,7 +2989,6 @@ const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 const STATUS_BAD_DESCRIPTOR_FORMAT: i32 = 0xC000_00E7u32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_TIMEOUT_I32: i32 = 0x0000_0102;
-const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 const VP_NO_ERROR: u32 = 0;
 const VP_ERROR_INVALID_FUNCTION: u32 = 1;
@@ -3291,7 +3290,8 @@ const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_FF00_4452_0000;
 const DRIVER_REGISTRY_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
 const HOSTED_INSTANCE_PATH_MAX: usize = 128;
 const HOSTED_DRIVER_KEY_NAME_MAX: usize = 128;
-const HOSTED_REGISTRY_PATH_MAX: usize = 192;
+const HOSTED_REGISTRY_PATH_MAX: usize = 384;
+const HOSTED_REGISTRY_VALUE_SCRATCH_MAX: usize = 2048;
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
 type HostedRegistryIdentityId = usize;
@@ -3352,6 +3352,23 @@ impl<const N: usize> HostedAscii<N> {
         true
     }
 
+    fn push_ascii<const M: usize>(&mut self, src: &HostedAscii<M>) -> bool {
+        if self.len + src.len > N {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < src.len {
+            let b = src.bytes[i];
+            if b > 0x7f || b == 0 {
+                return false;
+            }
+            self.bytes[self.len + i] = b;
+            i += 1;
+        }
+        self.len += src.len;
+        true
+    }
+
     fn set_str(&mut self, src: &str) -> bool {
         self.clear();
         self.push_str(src)
@@ -3367,6 +3384,14 @@ impl<const N: usize> HostedAscii<N> {
 
     fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+
+    fn starts_with_byte(&self, b: u8) -> bool {
+        self.len != 0 && self.bytes[0] == b
+    }
+
+    fn ends_with_byte(&self, b: u8) -> bool {
+        self.len != 0 && self.bytes[self.len - 1] == b
     }
 }
 
@@ -3398,8 +3423,7 @@ impl HostedDriverRegistryIdentity {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DriverRegistryHandleKind {
-    DriverKey,
-    LinkageKey,
+    CmKey,
 }
 
 #[derive(Clone, Copy)]
@@ -3436,14 +3460,14 @@ const EMPTY_HOSTED_REGISTRY_IDENTITY_SLOT: HostedRegistryIdentitySlot =
 struct DriverRegistryHandleSlot {
     handle: u64,
     kind: DriverRegistryHandleKind,
-    identity: HostedDriverRegistryIdentity,
+    path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     used: bool,
 }
 
 const EMPTY_DRIVER_REGISTRY_HANDLE_SLOT: DriverRegistryHandleSlot = DriverRegistryHandleSlot {
     handle: 0,
-    kind: DriverRegistryHandleKind::DriverKey,
-    identity: EMPTY_HOSTED_DRIVER_REGISTRY_IDENTITY,
+    kind: DriverRegistryHandleKind::CmKey,
+    path: HostedAscii::empty(),
     used: false,
 };
 
@@ -3724,45 +3748,6 @@ unsafe fn shared_registry_identity_at(sh: u64) -> Option<HostedDriverRegistryIde
     })
 }
 
-fn hosted_linkage_path_matches<const N: usize>(
-    path: &HostedAscii<N>,
-    driver_key: &HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
-) -> bool {
-    const PREFIX: &[u8] = b"Class\\";
-    const SUFFIX: &[u8] = b"\\Linkage";
-    let expected_len = PREFIX.len() + driver_key.len + SUFFIX.len();
-    if driver_key.is_empty() || path.len != expected_len {
-        return false;
-    }
-    let mut i = 0usize;
-    while i < PREFIX.len() {
-        if ascii_upcase_u8(path.bytes[i]) != ascii_upcase_u8(PREFIX[i]) {
-            return false;
-        }
-        i += 1;
-    }
-    let mut key_idx = 0usize;
-    while key_idx < driver_key.len {
-        if ascii_upcase_u8(path.bytes[PREFIX.len() + key_idx])
-            != ascii_upcase_u8(driver_key.bytes[key_idx])
-        {
-            return false;
-        }
-        key_idx += 1;
-    }
-    let suffix_start = PREFIX.len() + driver_key.len;
-    let mut suffix_idx = 0usize;
-    while suffix_idx < SUFFIX.len() {
-        if ascii_upcase_u8(path.bytes[suffix_start + suffix_idx])
-            != ascii_upcase_u8(SUFFIX[suffix_idx])
-        {
-            return false;
-        }
-        suffix_idx += 1;
-    }
-    true
-}
-
 unsafe fn unicode_string_triplet(us: u64) -> Option<(u16, u16, u64)> {
     if us == 0 {
         return None;
@@ -3899,6 +3884,94 @@ unsafe fn object_attributes_root_and_name<const N: usize>(
         unicode_string_to_hosted_ascii(name, true)?
     };
     Some((root, name))
+}
+
+fn hosted_driver_key_cm_path(
+    identity: &HostedDriverRegistryIdentity,
+) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    if !identity.has_driver_key() {
+        return None;
+    }
+    let key = identity.driver_key_name.as_str();
+    let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+    if ascii_prefix_eq_ignore_case(key, r"\Registry\") {
+        if !path.push_str(key) {
+            return None;
+        }
+    } else {
+        if !path.push_str(r"\Registry\Machine\System\CurrentControlSet\Control\") {
+            return None;
+        }
+        if !ascii_prefix_eq_ignore_case(key, r"Class\") && !path.push_str("Class\\") {
+            return None;
+        }
+        if !path.push_ascii(&identity.driver_key_name) {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn cm_registry_path_from_object_attributes(
+    root_slot: Option<&DriverRegistryHandleSlot>,
+    name: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    if name.starts_with_byte(b'\\') {
+        let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+        return path.push_ascii(name).then_some(path);
+    }
+
+    let root = root_slot?;
+    if root.kind != DriverRegistryHandleKind::CmKey || root.path.is_empty() {
+        return None;
+    }
+    if name.is_empty() {
+        return Some(root.path);
+    }
+
+    let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+    if !path.push_ascii(&root.path) {
+        return None;
+    }
+    if !path.ends_with_byte(b'\\') && !path.push_byte(b'\\') {
+        return None;
+    }
+    path.push_ascii(name).then_some(path)
+}
+
+fn cm_registry_path_from_rtl_path(
+    relative_to: u32,
+    path: &HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
+) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    if path.starts_with_byte(b'\\') {
+        let mut out = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+        return out.push_ascii(path).then_some(out);
+    }
+
+    let mut out = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+    match relative_to & 0x0000_ffff {
+        0 => {}
+        1 => {
+            if !out.push_str(r"\Registry\Machine\System\CurrentControlSet\Services") {
+                return None;
+            }
+        }
+        2 => {
+            if !out.push_str(r"\Registry\Machine\System\CurrentControlSet\Control") {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    if !path.is_empty() {
+        if !out.is_empty() && !out.ends_with_byte(b'\\') && !out.push_byte(b'\\') {
+            return None;
+        }
+        if !out.push_ascii(path) {
+            return None;
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn hex_digit(value: u8) -> u8 {
@@ -4958,11 +5031,8 @@ unsafe fn release_hosted_registry_identity(identity_id: HostedRegistryIdentityId
     }
 }
 
-unsafe fn allocate_driver_registry_handle(
-    kind: DriverRegistryHandleKind,
-    identity: HostedDriverRegistryIdentity,
-) -> Option<u64> {
-    if !identity.used {
+unsafe fn allocate_cm_registry_handle(path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>) -> Option<u64> {
+    if path.is_empty() {
         return None;
     }
     let table = driver_registry_handles_mut();
@@ -4974,8 +5044,8 @@ unsafe fn allocate_driver_registry_handle(
             let handle = DRIVER_REGISTRY_HANDLE_BASE | idx as u64;
             *slot = DriverRegistryHandleSlot {
                 handle,
-                kind,
-                identity,
+                kind: DriverRegistryHandleKind::CmKey,
+                path,
                 used: true,
             };
             return Some(handle);
@@ -4988,8 +5058,8 @@ unsafe fn allocate_driver_registry_handle(
     let handle = DRIVER_REGISTRY_HANDLE_BASE | idx as u64;
     table.push(DriverRegistryHandleSlot {
         handle,
-        kind,
-        identity,
+        kind: DriverRegistryHandleKind::CmKey,
+        path,
         used: true,
     });
     Some(handle)
@@ -5052,9 +5122,15 @@ extern "win64" fn s_io_open_device_registry_key(
             write_unaligned(handle_out as *mut u64, 0);
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
-        let Some(handle) =
-            allocate_driver_registry_handle(DriverRegistryHandleKind::DriverKey, identity)
-        else {
+        let Some(path) = hosted_driver_key_cm_path(&identity) else {
+            write_unaligned(handle_out as *mut u64, 0);
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if !crate::config_manager_open_key(path.as_str()) {
+            write_unaligned(handle_out as *mut u64, 0);
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        let Some(handle) = allocate_cm_registry_handle(path) else {
             write_unaligned(handle_out as *mut u64, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         };
@@ -5174,41 +5250,6 @@ unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRe
     } else {
         None
     }
-}
-
-unsafe fn hosted_registry_identity_by_linkage_path<const N: usize>(
-    path: &HostedAscii<N>,
-) -> Option<HostedDriverRegistryIdentity> {
-    if let Some(inflight) = shared_registry_identity() {
-        if inflight.has_linkage_export()
-            && hosted_linkage_path_matches(path, &inflight.driver_key_name)
-        {
-            return Some(inflight);
-        }
-    }
-    let inflight_id = read_volatile(core::ptr::addr_of!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID));
-    if let Some(inflight) = hosted_registry_identity(inflight_id) {
-        if inflight.has_linkage_export()
-            && hosted_linkage_path_matches(path, &inflight.driver_key_name)
-        {
-            return Some(inflight);
-        }
-    }
-    if let Some(bindings) = hosted_device_bindings() {
-        for binding in bindings.iter().copied() {
-            if !binding.used {
-                continue;
-            }
-            if let Some(identity) = hosted_registry_identity(binding.registry_identity_id) {
-                if identity.has_linkage_export()
-                    && hosted_linkage_path_matches(path, &identity.driver_key_name)
-                {
-                    return Some(identity);
-                }
-            }
-        }
-    }
-    None
 }
 
 unsafe fn hosted_device_object_known(device_object: u64) -> bool {
@@ -7801,7 +7842,11 @@ const RTL_QUERY_REGISTRY_NOVALUE: u32 = 0x0000_0008;
 const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
 const REG_NONE: u32 = 0;
 const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
 const REG_BINARY: u32 = 3;
+const REG_DWORD: u32 = 4;
+const REG_MULTI_SZ: u32 = 7;
+const KEY_BASIC_INFORMATION_CLASS: u32 = 0;
 const KEY_VALUE_PARTIAL_INFORMATION_CLASS: u32 = 2;
 
 /// `NTSTATUS RtlQueryRegistryValues(...)` for hosted FSD service parameters.
@@ -7810,7 +7855,7 @@ const KEY_VALUE_PARTIAL_INFORMATION_CLASS: u32 = 2;
 /// initialization for optional service parameters and defaults, so the explicit hosted behavior is:
 /// apply caller-provided defaults, report missing required values, and enumerate empty optional keys.
 extern "win64" fn s_rtl_query_registry_values(
-    _relative_to: u32,
+    relative_to: u32,
     path: u64,
     query_table: u64,
     context: u64,
@@ -7821,6 +7866,9 @@ extern "win64" fn s_rtl_query_registry_values(
     }
     unsafe {
         let registry_path = wide_cstr_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(path);
+        let cm_registry_path = registry_path
+            .as_ref()
+            .and_then(|path| cm_registry_path_from_rtl_path(relative_to, path));
         let mut idx = 0u64;
         while idx < 64 {
             let entry = query_table + idx * RTL_QUERY_REGISTRY_TABLE_SIZE;
@@ -7842,34 +7890,31 @@ extern "win64" fn s_rtl_query_registry_values(
                 if name == 0 || routine != 0 || (flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let linkage_export = registry_path
-                    .as_ref()
-                    .and_then(|registry_path| {
-                        hosted_registry_identity_by_linkage_path(registry_path)
-                    })
-                    .filter(|identity| {
-                        wide_cstr_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(name)
-                            .as_ref()
-                            .is_some_and(|value_name| {
-                                hosted_ascii_eq_ignore_case_str(value_name, "Export")
-                            })
-                            && identity.has_linkage_export()
-                    });
-                if let Some(identity) = linkage_export {
-                    if entry_context == 0 {
-                        return STATUS_INVALID_PARAMETER;
+                let value_name = wide_cstr_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(name);
+                let mut value_found = false;
+                if let (Some(key_path), Some(value_name)) = (cm_registry_path.as_ref(), value_name) {
+                    let mut data = [0u8; HOSTED_REGISTRY_VALUE_SCRATCH_MAX];
+                    match crate::config_manager_query_value(
+                        key_path.as_str(),
+                        value_name.as_str(),
+                        &mut data,
+                    ) {
+                        Ok((value_type, n)) => {
+                            let status =
+                                write_rtl_direct_registry_value(value_type, &data[..n], entry_context);
+                            if status < 0 {
+                                return status;
+                            }
+                            value_found = true;
+                        }
+                        Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
+                        Err(status) => return status,
                     }
-                    let status = write_allocated_unicode_string_from_ascii(
-                        entry_context,
-                        &identity.export_name,
-                    );
-                    if status < 0 {
-                        return status;
-                    }
-                } else if entry_context != 0 && default_data != 0 && default_length != 0 {
+                }
+                if !value_found && entry_context != 0 && default_data != 0 && default_length != 0 {
                     let copy_len = (default_length as u64).min(4096);
                     copy_bytes_unchecked(entry_context, default_data, copy_len);
-                } else if (flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
+                } else if !value_found && (flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
                     return STATUS_OBJECT_NAME_NOT_FOUND;
                 }
                 idx += 1;
@@ -9912,14 +9957,14 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
     }
 }
 
-unsafe fn write_key_value_partial_sz<const N: usize>(
-    value: &HostedAscii<N>,
+unsafe fn write_key_value_partial_raw(
+    value_type: u32,
+    data_bytes: &[u8],
     key_value_information: u64,
     length: u32,
     result_length: u64,
 ) -> i32 {
-    let data_len = (value.len.saturating_add(1)).saturating_mul(2);
-    let need = 12usize.saturating_add(data_len);
+    let need = 12usize.saturating_add(data_bytes.len());
     if result_length != 0 {
         write_unaligned(result_length as *mut u32, need as u32);
     }
@@ -9927,16 +9972,93 @@ unsafe fn write_key_value_partial_sz<const N: usize>(
         return STATUS_BUFFER_TOO_SMALL;
     }
     write_unaligned(key_value_information as *mut u32, 0);
-    write_unaligned((key_value_information + 4) as *mut u32, REG_SZ);
-    write_unaligned((key_value_information + 8) as *mut u32, data_len as u32);
+    write_unaligned((key_value_information + 4) as *mut u32, value_type);
+    write_unaligned((key_value_information + 8) as *mut u32, data_bytes.len() as u32);
     let data = key_value_information + 12;
     let mut i = 0usize;
-    while i < value.len {
-        write_unaligned((data + (i as u64) * 2) as *mut u16, value.bytes[i] as u16);
+    while i < data_bytes.len() {
+        write_unaligned((data + i as u64) as *mut u8, data_bytes[i]);
         i += 1;
     }
-    write_unaligned((data + (value.len as u64) * 2) as *mut u16, 0);
     STATUS_SUCCESS
+}
+
+unsafe fn write_key_basic_information(
+    name_utf16: &[u8],
+    key_information: u64,
+    length: u32,
+    result_length: u64,
+) -> i32 {
+    let need = 16usize.saturating_add(name_utf16.len());
+    if result_length != 0 {
+        write_unaligned(result_length as *mut u32, need as u32);
+    }
+    if need > u32::MAX as usize || key_information == 0 || length < need as u32 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    write_unaligned(key_information as *mut u64, 0);
+    write_unaligned((key_information + 8) as *mut u32, 0);
+    write_unaligned((key_information + 12) as *mut u32, name_utf16.len() as u32);
+    let name = key_information + 16;
+    let mut i = 0usize;
+    while i < name_utf16.len() {
+        write_unaligned((name + i as u64) as *mut u8, name_utf16[i]);
+        i += 1;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn write_allocated_unicode_string_from_utf16le_data(us: u64, data: &[u8]) -> i32 {
+    if us == 0 || (data.len() & 1) != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut string_len = data.len();
+    if string_len >= 2 && data[string_len - 2] == 0 && data[string_len - 1] == 0 {
+        string_len -= 2;
+    }
+    if string_len > u16::MAX as usize - 2 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let alloc_len = string_len + 2;
+    let buf = pool_alloc(alloc_len as u64);
+    if buf == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let mut i = 0usize;
+    while i < string_len {
+        write_unaligned((buf + i as u64) as *mut u8, data[i]);
+        i += 1;
+    }
+    write_unaligned((buf + string_len as u64) as *mut u16, 0);
+    write_unaligned(
+        (us + UNICODE_STRING_LENGTH_OFFSET) as *mut u16,
+        string_len as u16,
+    );
+    write_unaligned(
+        (us + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+        alloc_len as u16,
+    );
+    write_unaligned((us + UNICODE_STRING_BUFFER_OFFSET) as *mut u64, buf);
+    STATUS_SUCCESS
+}
+
+unsafe fn write_rtl_direct_registry_value(value_type: u32, data: &[u8], entry_context: u64) -> i32 {
+    if entry_context == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match value_type {
+        REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ => {
+            write_allocated_unicode_string_from_utf16le_data(entry_context, data)
+        }
+        REG_DWORD if data.len() == 4 => {
+            write_unaligned(
+                entry_context as *mut u32,
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            );
+            STATUS_SUCCESS
+        }
+        _ => STATUS_NOT_SUPPORTED,
+    }
 }
 
 /// `NTSTATUS ZwOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)`.
@@ -9959,19 +10081,21 @@ extern "win64" fn s_zw_open_key(
         else {
             return STATUS_INVALID_PARAMETER;
         };
-        let Some(root_slot) = driver_registry_handle_slot(root) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        let kind = if name.is_empty() {
-            root_slot.kind
-        } else if root_slot.kind == DriverRegistryHandleKind::DriverKey
-            && hosted_ascii_eq_ignore_case_str(&name, "Linkage")
-        {
-            DriverRegistryHandleKind::LinkageKey
+        let root_slot = if root == 0 {
+            None
         } else {
+            match driver_registry_handle_slot(root) {
+                Some(slot) => Some(slot),
+                None => return STATUS_INVALID_HANDLE,
+            }
+        };
+        let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        let Some(handle) = allocate_driver_registry_handle(kind, root_slot.identity) else {
+        if !crate::config_manager_open_key(path.as_str()) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let Some(handle) = allocate_cm_registry_handle(path) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         write_unaligned(handle_out as *mut u64, handle);
@@ -9982,21 +10106,41 @@ extern "win64" fn s_zw_open_key(
 /// `NTSTATUS ZwEnumerateKey(...)`.
 extern "win64" fn s_zw_enumerate_key(
     handle: u64,
-    _index: u32,
-    _key_information_class: u32,
-    _key_information: u64,
-    _length: u32,
+    index: u32,
+    key_information_class: u32,
+    key_information: u64,
+    length: u32,
     result_length: u64,
 ) -> i32 {
     unsafe {
-        if !driver_registry_handle_live(handle) {
+        let Some(slot) = driver_registry_handle_slot(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if slot.kind != DriverRegistryHandleKind::CmKey {
             return STATUS_INVALID_HANDLE;
         }
-        if result_length != 0 {
-            write_unaligned(result_length as *mut u32, 0);
+        if key_information_class != KEY_BASIC_INFORMATION_CLASS {
+            if result_length != 0 {
+                write_unaligned(result_length as *mut u32, 0);
+            }
+            return STATUS_NOT_SUPPORTED;
+        }
+        let mut name = [0u8; HOSTED_REGISTRY_PATH_MAX * 2];
+        match crate::config_manager_enumerate_key(slot.path.as_str(), index, &mut name) {
+            Ok(n) => write_key_basic_information(
+                &name[..n],
+                key_information,
+                length,
+                result_length,
+            ),
+            Err(status) => {
+                if result_length != 0 {
+                    write_unaligned(result_length as *mut u32, 0);
+                }
+                status
+            }
         }
     }
-    STATUS_NO_MORE_ENTRIES
 }
 
 /// `NTSTATUS ZwQueryValueKey(...)` against a hosted driver registry handle.
@@ -10013,28 +10157,38 @@ extern "win64" fn s_zw_query_value_key(
             return STATUS_INVALID_HANDLE;
         };
         let value_name =
-            match unicode_string_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(value_name, false) {
+            match unicode_string_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(value_name, true) {
                 Some(value_name) => value_name,
                 None => return STATUS_INVALID_PARAMETER,
             };
-        if slot.kind == DriverRegistryHandleKind::LinkageKey
-            && key_value_information_class == KEY_VALUE_PARTIAL_INFORMATION_CLASS
-            && hosted_ascii_eq_ignore_case_str(&value_name, "Export")
-        {
-            if slot.identity.has_linkage_export() {
-                return write_key_value_partial_sz(
-                    &slot.identity.export_name,
+        if slot.kind != DriverRegistryHandleKind::CmKey {
+            return STATUS_INVALID_HANDLE;
+        }
+        if key_value_information_class != KEY_VALUE_PARTIAL_INFORMATION_CLASS {
+            if result_length != 0 {
+                write_unaligned(result_length as *mut u32, 0);
+            }
+            return STATUS_NOT_SUPPORTED;
+        }
+        let mut data = [0u8; HOSTED_REGISTRY_VALUE_SCRATCH_MAX];
+        match crate::config_manager_query_value(slot.path.as_str(), value_name.as_str(), &mut data) {
+            Ok((value_type, n)) => {
+                return write_key_value_partial_raw(
+                    value_type,
+                    &data[..n],
                     key_value_information,
                     length,
                     result_length,
                 );
             }
-        }
-        if result_length != 0 {
-            write_unaligned(result_length as *mut u32, 0);
+            Err(status) => {
+                if result_length != 0 {
+                    write_unaligned(result_length as *mut u32, 0);
+                }
+                return status;
+            }
         }
     }
-    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 /// `NTSTATUS ZwSetValueKey(...)`.

@@ -12,12 +12,17 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use nt_config_abi::{opcode, read_utf16, CmKeyRequest, CmRawValueRequest, CmReply, CmValueRequest};
+use nt_config_abi::{
+    opcode, read_utf16, CmEnumerateKeyRequest, CmKeyRequest, CmRawValueRequest, CmReply,
+    CmValueRequest,
+};
 use nt_config_manager::{ConfigManager, RegistryValueType};
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
 
@@ -98,6 +103,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_DWORD => self.op_query_dword(in_buf),
             opcode::CM_OP_SET_VALUE => self.op_set_value(in_buf),
             opcode::CM_OP_QUERY_VALUE => self.op_query_value(in_buf, out_buf),
+            opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -124,6 +130,32 @@ impl CmServer {
             Some(key) => reply(STATUS_SUCCESS, key),
             None => reply(STATUS_OBJECT_NAME_NOT_FOUND, 0),
         }
+    }
+
+    fn op_enumerate_key(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmEnumerateKeyRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let Some(path) = decode(buf, req.path_offset, req.path_len_bytes) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let Some(key) = self.cm.registry().open_key(&path) else {
+            return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+        };
+        let subkeys = self.cm.registry().enum_subkeys(key);
+        let Some(name) = subkeys.get(req.index as usize) else {
+            return reply(STATUS_NO_MORE_ENTRIES, 0);
+        };
+        let mut name_bytes = Vec::with_capacity(name.len() * 2);
+        for unit in name.encode_utf16() {
+            name_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let needed = name_bytes.len();
+        if out_buf.len() < needed {
+            return reply_with_info(STATUS_BUFFER_TOO_SMALL, needed as u32, 0, 0);
+        }
+        out_buf[..needed].copy_from_slice(&name_bytes);
+        reply_with_info(STATUS_SUCCESS, needed as u32, 0, 0)
     }
 
     fn op_set_dword(&mut self, buf: &[u8]) -> CmReply {

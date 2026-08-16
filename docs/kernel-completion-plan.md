@@ -6714,3 +6714,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   the desktop workload or an external device stimulus produces real packet traffic; the next B3
   target is to drive the generic NIC route until transfer-mapping descriptors or receive
   indications are observed, then gate on those non-synthetic facts.
+
+  B3 CM-backed hosted driver registry binding (2026-08-16): hosted driver registry handles are now
+  real Configuration Manager key handles instead of executive-local driver/linkage identity handles.
+  `IoOpenDeviceRegistryKey` resolves the devnode's driver-key name to the imported
+  `CurrentControlSet\Control\Class` key and fails if CM has no such key. Hosted `ZwOpenKey`,
+  `ZwEnumerateKey`, and `ZwQueryValueKey` now operate on absolute or root-relative CM paths, and
+  hosted `RtlQueryRegistryValues(RTL_REGISTRY_CONTROL/SERVICES, ...)` direct-value queries normalize
+  through the same CM namespace. The old synthetic `Linkage\Export` registry answer was removed.
+  `nt-config-abi`/client/server gained a generic path-addressed subkey-enumeration operation, and
+  the generated SYSTEM hive now carries the E1000 class `DriverDesc`, `Linkage\RootDevice`, TCPIP
+  `Linkage\Bind`, and `Parameters\Interfaces\E1000_0000` DHCP metadata required by the ReactOS
+  NDIS/TCPIP bind path. Validation: `cargo fmt --all`, `cargo test -p nt-config-client`,
+  `cargo test -p nt-hive-core`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: rerun the serialized B3 desktop/headless proof next and inspect whether TCPIP
+  now reaches adapter registration and produces SG map-transfer descriptors; any remaining failure
+  should be fixed as a generic NDIS/IO/DMA primitive, not by adding per-image registry fallbacks.

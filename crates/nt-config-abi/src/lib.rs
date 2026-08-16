@@ -25,6 +25,8 @@ pub mod opcode {
     pub const CM_OP_SET_VALUE: u16 = 0x2122;
     /// Query a typed raw value. Reply `detail0` = REG_* type, `information` = data bytes.
     pub const CM_OP_QUERY_VALUE: u16 = 0x2123;
+    /// Enumerate an existing key's immediate subkey name by index. Reply `information` = name bytes.
+    pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
 }
 
 /// The reply every Configuration Manager op returns (field-for-field over `SurtCqe`).
@@ -43,6 +45,18 @@ pub struct CmReply {
 pub struct CmKeyRequest {
     pub abi_size: u16,
     pub _pad: u16,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+}
+
+/// `enumerate_key`: a key path plus zero-based subkey index. The returned payload is the selected
+/// subkey name as UTF-16LE bytes without a terminating NUL.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CmEnumerateKeyRequest {
+    pub abi_size: u16,
+    pub _pad: u16,
+    pub index: u32,
     pub path_offset: u32,
     pub path_len_bytes: u32,
 }
@@ -102,6 +116,7 @@ macro_rules! wire {
     };
 }
 wire!(CmKeyRequest);
+wire!(CmEnumerateKeyRequest);
 wire!(CmValueRequest);
 wire!(CmRawValueRequest);
 

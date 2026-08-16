@@ -12752,6 +12752,17 @@ pub(crate) unsafe fn config_manager_open_key(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) unsafe fn config_manager_enumerate_key(
+    path: &str,
+    index: u32,
+    out: &mut [u8],
+) -> Result<usize, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.enumerate_key(path, index, out)
+}
+
 pub(crate) unsafe fn config_manager_set_dword(
     key_path: &str,
     name: &str,

@@ -15,6 +15,8 @@ const NET_CLASS_GUID: &str = "{4D36E972-E325-11CE-BFC1-08002BE10318}";
 const E1000_DRIVER_KEY: &str = r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0000";
 const E1000_INSTANCE_ID: &str = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
 const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
+const E1000_INTERFACE_NAME: &str = "E1000_0000";
+const E1000_DRIVER_DESC: &str = "ReactOS Intel PRO/1000 Adapter";
 const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf";
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
@@ -143,6 +145,21 @@ fn install_network_stack_services(hive: &mut Hive) {
     hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Adapters");
     hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Interfaces");
     hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\PersistentRoutes");
+
+    let linkage = hive.create_key(r"ControlSet001\Services\Tcpip\Linkage");
+    hive.set_value(
+        linkage,
+        "Bind",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(&[E1000_EXPORT_NAME]),
+    );
+
+    let interface = hive.create_key(&format!(
+        r"ControlSet001\Services\Tcpip\Parameters\Interfaces\{}",
+        E1000_INTERFACE_NAME
+    ));
+    hive.set_dword(interface, "EnableDHCP", 1);
+    hive.set_dword(interface, "InterfaceMetric", 0);
 
     // afd_reg.inf installs AFD as a system-start kernel driver in the TDI group.
     install_kernel_driver_service(
@@ -695,14 +712,29 @@ fn build_hive() -> Hive {
         encode_multi_sz(&[r"PCI\CC_020000", r"PCI\CC_0200"]),
     );
 
-    let linkage_path =
-        r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage";
-    let linkage = hive.create_key(linkage_path);
+    let class_key = hive.create_key(&format!(
+        r"ControlSet001\Control\Class\{}",
+        E1000_DRIVER_KEY
+    ));
+    hive.set_value(
+        class_key,
+        "DriverDesc",
+        RegistryValueType::Sz,
+        utf16le_sz(E1000_DRIVER_DESC),
+    );
+    let linkage_path = format!(r"ControlSet001\Control\Class\{}\Linkage", E1000_DRIVER_KEY);
+    let linkage = hive.create_key(&linkage_path);
     hive.set_value(
         linkage,
         "Export",
         RegistryValueType::Sz,
         utf16le_sz(E1000_EXPORT_NAME),
+    );
+    hive.set_value(
+        linkage,
+        "RootDevice",
+        RegistryValueType::Sz,
+        utf16le_sz(E1000_INTERFACE_NAME),
     );
 
     let bochs = bochs_display_install_from_staged_inf()
@@ -811,6 +843,17 @@ mod tests {
             ))
         );
 
+        let class_key = hive
+            .open_key(r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000")
+            .expect("network class key");
+        assert_eq!(
+            hive.query_value(class_key, "DriverDesc"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_DRIVER_DESC).as_slice()
+            ))
+        );
+
         let linkage = hive
             .open_key(
                 r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage",
@@ -821,6 +864,13 @@ mod tests {
             Some((
                 RegistryValueType::Sz,
                 utf16le_sz(E1000_EXPORT_NAME).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(linkage, "RootDevice"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_INTERFACE_NAME).as_slice()
             ))
         );
     }
@@ -880,6 +930,24 @@ mod tests {
             Some((RegistryValueType::Sz, utf16le_sz("ROSHost").as_slice()))
         );
         assert_eq!(hive.query_dword(tcpip_params, "IPEnableRouter"), Some(0));
+        let tcpip_linkage = hive
+            .open_key(r"ControlSet001\Services\Tcpip\Linkage")
+            .expect("Tcpip Linkage");
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Bind"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[E1000_EXPORT_NAME]).as_slice()
+            ))
+        );
+        let tcpip_interface = hive
+            .open_key(r"ControlSet001\Services\Tcpip\Parameters\Interfaces\E1000_0000")
+            .expect("Tcpip interface");
+        assert_eq!(hive.query_dword(tcpip_interface, "EnableDHCP"), Some(1));
+        assert_eq!(
+            hive.query_dword(tcpip_interface, "InterfaceMetric"),
+            Some(0)
+        );
 
         let afd = hive
             .open_key(r"ControlSet001\Services\Afd")
@@ -1020,6 +1088,13 @@ mod tests {
             Some((
                 RegistryValueType::Sz,
                 utf16le_sz(E1000_EXPORT_NAME).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(linkage, "RootDevice"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(E1000_INTERFACE_NAME).as_slice()
             ))
         );
     }
