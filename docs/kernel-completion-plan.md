@@ -6424,3 +6424,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   now ready for a serialized `./run.sh --desktop` proof to see whether TCPIP/AFD and explorer
   advance further, then fix the next generic kernel mechanism exposed by that boot rather than
   adding service-specific launch or wait fallbacks.
+
+  B3 serialized desktop proof after timed waits (2026-08-16): a display-mode
+  `./run.sh --desktop` sample in `.tmp/run-desktop-20260816-192232.log` was manually stopped after
+  reaching genuine explorer activity. Because display mode intentionally keeps QEMU alive until the
+  window is closed, this was not a headless sentinel run, but the trace advanced past the earlier
+  profile/userinit failures into real hosted `ndis.sys`/`e1000.sys` startup, Bochs display PnP, real
+  explorer process launch, nested USER callbacks, DIB/text/icon GDI calls, and shell-chrome paint
+  traffic. Review adjustment: the next generic B3 cleanup is hosted system-thread lifecycle
+  completion, starting with `PsTerminateSystemThread`, then hosted thread-handle close/wait
+  semantics if ReactOS drivers expose those gaps.
+
+  B3 hosted driver system-thread termination (2026-08-16): hosted driver
+  `PsTerminateSystemThread` no longer parks forever inside the component import trampoline. The
+  trampoline now enters a dedicated component-service label, and the executive validates the active
+  driver instance plus worker badge, marks the host-tested system-thread handle terminated, rotates
+  the pump to a fresh driver-owned reply cap, removes the worker runtime record, tears down the
+  worker TCB/CNode/sched-context mechanism, and deliberately withholds the reply to the exiting
+  worker. The host-tested `HostedDriverThreadTable` now rejects any attempt to reattach, wait, ready,
+  or terminate an already terminated thread, preserving the terminal lifecycle state instead of
+  reviving stale worker identities. Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun a serialized desktop gate;
+  if drivers now progress into closing returned system-thread handles, implement hosted-driver
+  `ZwClose`/thread-object release semantics rather than accepting `STATUS_INVALID_HANDLE`.

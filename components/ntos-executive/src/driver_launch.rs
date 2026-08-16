@@ -437,6 +437,7 @@ pub const FSD_SERVICE_KE_SET_EVENT_LABEL: u64 = 0x774;
 pub const FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL: u64 = 0x775;
 pub const FSD_SERVICE_KE_PULSE_EVENT_LABEL: u64 = 0x776;
 pub const FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL: u64 = 0x777;
+pub const FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL: u64 = 0x778;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -455,6 +456,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_KE_PULSE_EVENT_LABEL
             | FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
             | FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL
+            | FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
     )
 }
 
@@ -513,6 +515,9 @@ static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS: AtomicU64 = AtomicU64::new(0
 static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_TERMINATIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WORKER_ALIAS_NEXT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_REJECTS: AtomicU64 = AtomicU64::new(0);
@@ -7848,6 +7853,11 @@ pub(crate) enum HostedDriverWaitServiceResult {
     Parked { fresh_reply_cap: u64 },
 }
 
+pub(crate) enum HostedDriverThreadTerminateServiceResult {
+    Reply(i32),
+    Terminated { fresh_reply_cap: u64 },
+}
+
 fn park_hosted_driver_wait(
     instance: usize,
     thread_handle: u64,
@@ -9211,8 +9221,19 @@ extern "win64" fn s_ps_create_system_thread(
 }
 
 /// `VOID PsTerminateSystemThread(NTSTATUS)`.
-extern "win64" fn s_ps_terminate_system_thread(_status: i32) {
-    print_str(b"[driver-thread] PsTerminateSystemThread parked hosted worker\n");
+extern "win64" fn s_ps_terminate_system_thread(status: i32) {
+    let (_label, reply_status, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL << 12) | 1,
+            status as u32 as u64,
+            0,
+            0,
+            0,
+        )
+    };
+    print_str(b"[driver-thread] PsTerminateSystemThread unexpectedly returned status=0x");
+    print_hex(reply_status as u32);
+    print_str(b"\n");
     loop {
         crate::yield_now();
     }
@@ -15927,6 +15948,17 @@ fn hosted_driver_runtime_by_badge(
     }
 }
 
+unsafe fn remove_hosted_driver_thread_runtime(
+    instance: usize,
+    handle: u64,
+) -> Option<HostedDriverThreadRuntime> {
+    let runtimes = hosted_driver_thread_runtimes_mut();
+    let index = runtimes
+        .iter()
+        .position(|rt| rt.instance == instance && rt.handle == handle)?;
+    Some(runtimes.remove(index))
+}
+
 fn rotate_hosted_driver_active_reply(
     instance: usize,
     expected_active: u64,
@@ -15945,6 +15977,30 @@ fn rotate_hosted_driver_active_reply(
     table[instance].reply_cap = fresh;
     crate::replace_fsd_reply_slot(instance, fresh);
     true
+}
+
+unsafe fn cancel_hosted_driver_waits_for_thread(instance: usize, thread_handle: u64) -> u64 {
+    let mut removed = 0u64;
+    let mut removed_timed = false;
+    if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
+        let mut index = 0usize;
+        while index < waiters.len() {
+            if waiters[index].instance == instance && waiters[index].thread_handle == thread_handle {
+                let waiter = waiters.remove(index);
+                removed += 1;
+                removed_timed |= waiter.deadline_100ns.is_some();
+                if waiter.reply_cap != 0 {
+                    let _ = cnode_delete_recycle_r(waiter.reply_cap);
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+    if removed_timed {
+        let _ = crate::service_sec_image::rearm_registered_delay_timer();
+    }
+    removed
 }
 
 unsafe fn delete_hosted_driver_thread_mechanism(
@@ -17094,6 +17150,100 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_str(b"\n");
     }
     (STATUS_SUCCESS, handle)
+}
+
+pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
+    ch: &crate::spawn_hosts::PumpChannel,
+    exit_status: i32,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> HostedDriverThreadTerminateServiceResult {
+    let request =
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some((instance, _inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    };
+    let Some(runtime) = hosted_driver_runtime_by_badge(instance, caller_badge) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        if request <= 8 {
+            print_str(b"[driver-thread] PsTerminateSystemThread unknown caller inst=");
+            print_u64(instance as u64);
+            print_str(b" badge=");
+            print_u64(caller_badge);
+            print_str(b"\n");
+        }
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    };
+    let Some(thread) = (unsafe {
+        hosted_driver_thread_table_mut(instance).and_then(|table| table.get(runtime.handle))
+    }) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_HANDLE);
+    };
+    if thread.tcb != runtime.tcb || thread.exit_status.is_some() {
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_HANDLE);
+    }
+
+    let Some(fresh_reply_cap) = (unsafe { take_hosted_driver_reply_spare(instance) }) else {
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh_reply_cap) {
+        unsafe {
+            return_hosted_driver_reply_spare(instance, fresh_reply_cap);
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(STATUS_INVALID_PARAMETER);
+    }
+
+    let terminated = unsafe {
+        hosted_driver_thread_table_mut(instance)
+            .ok_or(HostedDriverThreadError::InvalidHandle)
+            .and_then(|table| table.terminate(runtime.handle, exit_status))
+    };
+    if let Err(error) = terminated {
+        let _ = rotate_hosted_driver_active_reply(instance, fresh_reply_cap, active_reply_cap);
+        unsafe {
+            return_hosted_driver_reply_spare(instance, fresh_reply_cap);
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_TERMINATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return HostedDriverThreadTerminateServiceResult::Reply(hosted_driver_thread_error_status(
+            error,
+        ));
+    }
+
+    let canceled_waits = unsafe { cancel_hosted_driver_waits_for_thread(instance, runtime.handle) };
+    let runtime = unsafe { remove_hosted_driver_thread_runtime(instance, runtime.handle) }
+        .unwrap_or(runtime);
+    unsafe {
+        delete_hosted_driver_thread_mechanism(
+            runtime.tcb,
+            runtime.sched_context,
+            runtime.cnode,
+            runtime.raw_cnode,
+        );
+        let _ = cnode_delete_recycle_r(active_reply_cap);
+    }
+    HOSTED_DRIVER_SYSTEM_THREAD_TERMINATIONS.fetch_add(1, Ordering::Relaxed);
+    if request <= 16 {
+        print_str(b"[driver-thread] PsTerminateSystemThread inst=");
+        print_u64(instance as u64);
+        print_str(b" badge=");
+        print_u64(caller_badge);
+        print_str(b" handle=0x");
+        print_hex((runtime.handle >> 32) as u32);
+        print_hex(runtime.handle as u32);
+        print_str(b" status=0x");
+        print_hex(exit_status as u32);
+        if canceled_waits != 0 {
+            print_str(b" canceled-waits=");
+            print_u64(canceled_waits);
+        }
+        print_str(b"\n");
+    }
+    HostedDriverThreadTerminateServiceResult::Terminated { fresh_reply_cap }
 }
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {

@@ -160,6 +160,9 @@ impl HostedDriverThreadTable {
         let thread = self
             .get_mut(handle)
             .ok_or(HostedDriverThreadError::InvalidHandle)?;
+        if thread.state == HostedDriverThreadState::Terminated {
+            return Err(HostedDriverThreadError::AlreadyTerminated);
+        }
         thread.state = HostedDriverThreadState::Terminated;
         thread.exit_status = Some(status);
         Ok(())
@@ -456,6 +459,32 @@ mod tests {
             HostedDriverThreadState::Terminated
         );
         assert_eq!(table.get(first).unwrap().exit_status, Some(0x1234));
+    }
+
+    #[test]
+    fn terminated_threads_cannot_be_resumed_through_wait_state() {
+        let mut table = HostedDriverThreadTable::with_first_handle(0x9000);
+        let handle = table.create(0x1000, 0xAAAA).unwrap();
+        table.attach_tcb(handle, 0xCC).unwrap();
+        table.terminate(handle, 0).unwrap();
+
+        assert_eq!(
+            table.set_waiting(handle),
+            Err(HostedDriverThreadError::AlreadyTerminated)
+        );
+        assert_eq!(
+            table.set_ready(handle),
+            Err(HostedDriverThreadError::AlreadyTerminated)
+        );
+        assert_eq!(
+            table.attach_tcb(handle, 0xDD),
+            Err(HostedDriverThreadError::AlreadyTerminated)
+        );
+        assert_eq!(
+            table.terminate(handle, 1),
+            Err(HostedDriverThreadError::AlreadyTerminated)
+        );
+        assert_eq!(table.get(handle).unwrap().exit_status, Some(0));
     }
 
     #[test]

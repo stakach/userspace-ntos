@@ -1438,6 +1438,26 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            match crate::driver_launch::service_hosted_driver_ps_terminate_system_thread(
+                ch,
+                msg.m0 as u32 as i32,
+                msg.badge,
+                *reply_cap,
+            ) {
+                crate::driver_launch::HostedDriverThreadTerminateServiceResult::Reply(status) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+                }
+                crate::driver_launch::HostedDriverThreadTerminateServiceResult::Terminated {
+                    fresh_reply_cap,
+                } => {
+                    *reply_cap = fresh_reply_cap;
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_SET_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
