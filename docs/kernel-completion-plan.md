@@ -39,12 +39,12 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload.
 
 Latest accepted desktop proof (2026-08-16):
-`.tmp/run-desktop-support-records.log` reaches the harness sentinel with `296/296`
+`.tmp/run-desktop-dependency-closure.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the boot-framebuffer display route was removed,
 the old fixed boot proof scratch aliases were replaced, hosted-video success-path traces were
 trimmed, and hosted `.sys` dependency images moved from a fixed NDIS slot to a provider-keyed loaded
-image table with bounded support-driver records. The hosted Bochs/videoprt route remains the only
-display route: it publishes
+image table with bounded support-driver records and ordered provider-closure planning. The hosted
+Bochs/videoprt route remains the only display route: it publishes
 `\\Device\\Video0` through the hosted I/O Manager path, `PDEVOBJ_lChangeDisplaySettings status=0`,
 and the removed `VideoPortInitialize captured`, `hosted video Initialize device_id`,
 `hosted video StartDevice`, `hosted video FindAdapter device_id`, and successful
@@ -1184,9 +1184,8 @@ before unrelated executive traffic monopolises the receive loop.
   Loaded GDI/display driver image records also grow in component-visible win32k pool storage, so
   win32k's hosted trampolines never depend on executive-only heap pointers. The current automated
   shell-pixel gate proves this route through Explorer shell chrome. Remaining B3 work is broader
-  non-display driver coverage: ordered/recursive dependency closure when a registry-selected driver
-  requires it, real miniport data-plane behavior, and multi-device scaling under the same dynamic
-  devnode/resource path.
+  non-display driver coverage: real miniport data-plane behavior and multi-device scaling under the
+  same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -3817,9 +3816,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
   `.tmp/run-desktop-support-records.log`, which reaches `296/296` with
   `support_count=1`, `exec_generic_pci_support_driver_entry`, `exec_gdi_user_batch_flushed`, and
-  `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's next dependency frontier is
-  recursive/topological provider closure only when real imported providers require it; otherwise
-  continue toward real NDIS/e1000 data-plane behavior under the dynamic devnode/resource path.
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: the next dependency-frontier cleanup
+  is the ordered provider closure captured in the following B3 entry.
+
+- B3 hosted dependency closure cleanup (2026-08-16). Hosted dependency discovery now builds an
+  ordered provider closure instead of loading only the primary driver's direct `.sys` imports. The
+  planner reads each supported provider's raw PE imports from the ReactOS driver directory, rejects
+  dependency cycles, de-duplicates shared providers case-insensitively, enforces the shared support
+  record capacity, and emits dependencies in postorder so a provider's own imported `.sys` images are
+  already mapped and registered before its IAT is snapped. The existing resolver still fails closed
+  for unsupported providers, ordinal imports, and missing exports; no kernel shim or name-specific
+  fallback was added. Validation: `cargo fmt --all`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-dependency-closure.log`, which reaches `296/296` with
+  `dependency ndis.sys -> reactos\system32\drivers\ndis.sys`, `support_count=1`,
+  `exec_generic_pci_support_driver_entry`, `exec_gdi_user_batch_flushed`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's active non-display frontier is
+  now the real NDIS/e1000 data plane and multi-device scaling under the dynamic devnode/resource
+  path, not dependency discovery or support-driver handoff scaffolding.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The

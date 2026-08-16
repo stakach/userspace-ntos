@@ -8437,6 +8437,13 @@ struct LoadedSupportImages {
     first_entry_rva: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PlannedDependencyImage {
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    src_va: u64,
+    src_size: u32,
+}
+
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
@@ -8485,6 +8492,23 @@ unsafe fn write_support_image_record(
     write_volatile((record + SH_SUPPORT_RECORD_STATUS) as *mut i32, 0);
     write_volatile((record + SH_SUPPORT_RECORD_VERDICT) as *mut u32, 0);
     Some(())
+}
+
+fn dependency_plan_contains(
+    plan: &[PlannedDependencyImage],
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+) -> bool {
+    plan.iter()
+        .any(|planned| hosted_ascii_eq_ignore_case(&planned.provider, provider))
+}
+
+fn dependency_name_list_contains(
+    names: &[HostedAscii<HOSTED_DEP_PROVIDER_MAX>],
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+) -> bool {
+    names
+        .iter()
+        .any(|existing| hosted_ascii_eq_ignore_case(existing, provider))
 }
 
 fn hosted_dependency_provider_matches(dep: LoadedDependencyImage, provider: &str) -> bool {
@@ -10618,6 +10642,83 @@ unsafe fn raw_pe_collect_hosted_dependencies(
     None
 }
 
+unsafe fn collect_hosted_dependency_closure(
+    fs: &Fat32,
+    provider_name: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    visiting: &mut Vec<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>,
+    plan: &mut Vec<PlannedDependencyImage>,
+) -> Option<()> {
+    if dependency_plan_contains(plan, &provider_name) {
+        return Some(());
+    }
+    if dependency_name_list_contains(visiting, &provider_name) {
+        print_str(b"[driver-launch] dependency cycle at ");
+        print_str(provider_name.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
+    if visiting.len() as u64 >= SH_SUPPORT_RECORD_CAPACITY {
+        print_str(b"[driver-launch] dependency recursion capacity exhausted before ");
+        print_str(provider_name.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
+
+    visiting.try_reserve_exact(1).ok()?;
+    visiting.push(provider_name);
+
+    let mut dep_path = [0u8; HOSTED_DEP_PATH_MAX];
+    let dep_path_len = match hosted_dependency_path(provider_name.as_str(), &mut dep_path) {
+        Some(len) => len,
+        None => {
+            let _ = visiting.pop();
+            return None;
+        }
+    };
+    let (src_va, src_size) = match load_file_to_pool(fs, &dep_path[..dep_path_len]) {
+        Some(loaded) => loaded,
+        None => {
+            print_str(b"[driver-launch] dependency source missing ");
+            print_str(provider_name.as_bytes());
+            print_str(b"\n");
+            let _ = visiting.pop();
+            return None;
+        }
+    };
+
+    let mut nested = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
+    if raw_pe_collect_hosted_dependencies(src_va, src_size, &mut nested).is_none() {
+        let _ = visiting.pop();
+        return None;
+    }
+    let mut idx = 0usize;
+    while idx < nested.len() {
+        if collect_hosted_dependency_closure(fs, nested[idx], visiting, plan).is_none() {
+            let _ = visiting.pop();
+            return None;
+        }
+        idx += 1;
+    }
+    let _ = visiting.pop();
+
+    if dependency_plan_contains(plan, &provider_name) {
+        return Some(());
+    }
+    if plan.len() as u64 >= SH_SUPPORT_RECORD_CAPACITY {
+        print_str(b"[driver-launch] dependency support record capacity exhausted before ");
+        print_str(provider_name.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
+    plan.try_reserve_exact(1).ok()?;
+    plan.push(PlannedDependencyImage {
+        provider: provider_name,
+        src_va,
+        src_size,
+    });
+    Some(())
+}
+
 fn align_up_4k(v: u64) -> Option<u64> {
     v.checked_add(0xfff).map(|x| x & !0xfff)
 }
@@ -11003,7 +11104,14 @@ unsafe fn load_hosted_dependency_images(
 
     let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
     raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
-    if providers.is_empty() {
+    let mut plan = Vec::<PlannedDependencyImage>::new();
+    let mut visiting = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
+    let mut provider_idx = 0usize;
+    while provider_idx < providers.len() {
+        collect_hosted_dependency_closure(fs, providers[provider_idx], &mut visiting, &mut plan)?;
+        provider_idx += 1;
+    }
+    if plan.is_empty() {
         return Some(LoadedSupportImages {
             count: 0,
             first_entry_rva: 0,
@@ -11016,8 +11124,9 @@ unsafe fn load_hosted_dependency_images(
         first_entry_rva: 0,
     };
     let mut idx = 0usize;
-    while idx < providers.len() {
-        let provider_name = providers[idx];
+    while idx < plan.len() {
+        let planned = plan[idx];
+        let provider_name = planned.provider;
         let provider = provider_name.as_str();
         if support_images.count as u64 >= SH_SUPPORT_RECORD_CAPACITY {
             print_str(b"[driver-launch] dependency support record capacity exhausted before ");
@@ -11044,11 +11153,10 @@ unsafe fn load_hosted_dependency_images(
         print_hex(dep_offset as u32);
         print_str(b"\n");
 
-        let (dep_src_va, dep_src_size) = load_file_to_pool(fs, &dep_path[..dep_path_len])?;
         let dep_exec_va = code_va + dep_offset;
         let dep_run_va = run_va + dep_offset;
         let (dep_entry_rva, dep_image_len) = load_pe_into(
-            dep_src_va,
+            planned.src_va,
             dep_exec_va,
             dep_run_va,
             dep_frames,
@@ -11063,7 +11171,7 @@ unsafe fn load_hosted_dependency_images(
         print_str(b"[driver-launch] dependency loaded ");
         print_str(provider.as_bytes());
         print_str(b" size=");
-        print_u64(dep_src_size as u64);
+        print_u64(planned.src_size as u64);
         print_str(b" image=0x");
         print_hex(dep_image_len);
         print_str(b" entry=0x");
