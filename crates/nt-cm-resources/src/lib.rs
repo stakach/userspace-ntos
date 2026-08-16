@@ -54,6 +54,10 @@ pub const INTERFACE_TYPE_INTERNAL: i32 = 0;
 
 /// Size of one `CM_PARTIAL_RESOURCE_DESCRIPTOR` (WDK `#pragma pack(4)`).
 pub const PARTIAL_DESCRIPTOR_SIZE: usize = 20;
+/// Total encoded size of a one-memory `CM_RESOURCE_LIST`.
+pub const MEMORY_LIST_SIZE: usize = 40;
+/// Total encoded size of a one-memory + one-port `CM_RESOURCE_LIST`.
+pub const MEMORY_PORT_LIST_SIZE: usize = 60;
 /// Total encoded size of a one-memory + one-interrupt `CM_RESOURCE_LIST`.
 pub const MEMORY_INTERRUPT_LIST_SIZE: usize = 60;
 /// Total encoded size of a one-memory + one-port + one-interrupt `CM_RESOURCE_LIST`.
@@ -97,6 +101,67 @@ pub struct InterruptDescriptor {
     pub share: u8,
 }
 
+fn build_list_header(buf: &mut [u8], total_size: usize, bus_number: u32, count: u32) -> Option<()> {
+    if buf.len() < total_size {
+        return None;
+    }
+    for b in buf.iter_mut().take(total_size) {
+        *b = 0;
+    }
+    w32(buf, 0, 1);
+    w32(buf, 4, INTERFACE_TYPE_INTERNAL as u32);
+    w32(buf, 8, bus_number);
+    w16(buf, 12, 1);
+    w16(buf, 14, 1);
+    w32(buf, 16, count);
+    Some(())
+}
+
+fn write_memory_descriptor(buf: &mut [u8], offset: usize, mem: MemoryDescriptor) {
+    buf[offset] = CM_RESOURCE_TYPE_MEMORY;
+    buf[offset + 1] = mem.share;
+    w16(buf, offset + 2, mem.flags);
+    w64(buf, offset + 4, mem.start);
+    w32(buf, offset + 12, mem.length);
+}
+
+fn write_port_descriptor(buf: &mut [u8], offset: usize, port: PortDescriptor) {
+    buf[offset] = CM_RESOURCE_TYPE_PORT;
+    buf[offset + 1] = port.share;
+    w16(buf, offset + 2, port.flags);
+    w64(buf, offset + 4, port.start);
+    w32(buf, offset + 12, port.length);
+}
+
+fn write_interrupt_descriptor(buf: &mut [u8], offset: usize, int: InterruptDescriptor) {
+    buf[offset] = CM_RESOURCE_TYPE_INTERRUPT;
+    buf[offset + 1] = int.share;
+    w16(buf, offset + 2, int.flags);
+    w32(buf, offset + 4, int.level);
+    w32(buf, offset + 8, int.vector);
+    w64(buf, offset + 12, int.affinity);
+}
+
+/// Encode a `CM_RESOURCE_LIST` with a single memory descriptor into `buf`.
+pub fn build_memory_list(buf: &mut [u8], bus_number: u32, mem: MemoryDescriptor) -> Option<usize> {
+    build_list_header(buf, MEMORY_LIST_SIZE, bus_number, 1)?;
+    write_memory_descriptor(buf, 20, mem);
+    Some(MEMORY_LIST_SIZE)
+}
+
+/// Encode a `CM_RESOURCE_LIST` with memory + port descriptors into `buf`.
+pub fn build_memory_port_list(
+    buf: &mut [u8],
+    bus_number: u32,
+    mem: MemoryDescriptor,
+    port: PortDescriptor,
+) -> Option<usize> {
+    build_list_header(buf, MEMORY_PORT_LIST_SIZE, bus_number, 2)?;
+    write_memory_descriptor(buf, 20, mem);
+    write_port_descriptor(buf, 40, port);
+    Some(MEMORY_PORT_LIST_SIZE)
+}
+
 /// Encode a `CM_RESOURCE_LIST` with a single memory + single interrupt descriptor
 /// into `buf` (which must be at least [`MEMORY_INTERRUPT_LIST_SIZE`] bytes). Returns
 /// the number of bytes written, or `None` if the buffer is too small.
@@ -106,36 +171,9 @@ pub fn build_memory_interrupt_list(
     mem: MemoryDescriptor,
     int: InterruptDescriptor,
 ) -> Option<usize> {
-    if buf.len() < MEMORY_INTERRUPT_LIST_SIZE {
-        return None;
-    }
-    for b in buf.iter_mut().take(MEMORY_INTERRUPT_LIST_SIZE) {
-        *b = 0;
-    }
-    // CM_RESOURCE_LIST.Count = 1
-    w32(buf, 0, 1);
-    // CM_FULL_RESOURCE_DESCRIPTOR
-    w32(buf, 4, INTERFACE_TYPE_INTERNAL as u32); // InterfaceType
-    w32(buf, 8, bus_number); // BusNumber
-                             // CM_PARTIAL_RESOURCE_LIST
-    w16(buf, 12, 1); // Version
-    w16(buf, 14, 1); // Revision
-    w32(buf, 16, 2); // Count = 2 descriptors
-                     // [0] Memory descriptor @ 20
-    let m = 20;
-    buf[m] = CM_RESOURCE_TYPE_MEMORY;
-    buf[m + 1] = mem.share;
-    w16(buf, m + 2, mem.flags);
-    w64(buf, m + 4, mem.start); // u.Memory.Start
-    w32(buf, m + 12, mem.length); // u.Memory.Length
-                                  // [1] Interrupt descriptor @ 40
-    let i = 40;
-    buf[i] = CM_RESOURCE_TYPE_INTERRUPT;
-    buf[i + 1] = int.share;
-    w16(buf, i + 2, int.flags);
-    w32(buf, i + 4, int.level); // u.Interrupt.Level
-    w32(buf, i + 8, int.vector); // u.Interrupt.Vector
-    w64(buf, i + 12, int.affinity); // u.Interrupt.Affinity
+    build_list_header(buf, MEMORY_INTERRUPT_LIST_SIZE, bus_number, 2)?;
+    write_memory_descriptor(buf, 20, mem);
+    write_interrupt_descriptor(buf, 40, int);
     Some(MEMORY_INTERRUPT_LIST_SIZE)
 }
 
@@ -148,43 +186,10 @@ pub fn build_memory_port_interrupt_list(
     port: PortDescriptor,
     int: InterruptDescriptor,
 ) -> Option<usize> {
-    if buf.len() < MEMORY_PORT_INTERRUPT_LIST_SIZE {
-        return None;
-    }
-    for b in buf.iter_mut().take(MEMORY_PORT_INTERRUPT_LIST_SIZE) {
-        *b = 0;
-    }
-    // CM_RESOURCE_LIST.Count = 1
-    w32(buf, 0, 1);
-    // CM_FULL_RESOURCE_DESCRIPTOR
-    w32(buf, 4, INTERFACE_TYPE_INTERNAL as u32);
-    w32(buf, 8, bus_number);
-    // CM_PARTIAL_RESOURCE_LIST
-    w16(buf, 12, 1);
-    w16(buf, 14, 1);
-    w32(buf, 16, 3); // Count = 3 descriptors
-                     // [0] Memory descriptor @ 20
-    let m = 20;
-    buf[m] = CM_RESOURCE_TYPE_MEMORY;
-    buf[m + 1] = mem.share;
-    w16(buf, m + 2, mem.flags);
-    w64(buf, m + 4, mem.start);
-    w32(buf, m + 12, mem.length);
-    // [1] Port descriptor @ 40
-    let p = 40;
-    buf[p] = CM_RESOURCE_TYPE_PORT;
-    buf[p + 1] = port.share;
-    w16(buf, p + 2, port.flags);
-    w64(buf, p + 4, port.start);
-    w32(buf, p + 12, port.length);
-    // [2] Interrupt descriptor @ 60
-    let i = 60;
-    buf[i] = CM_RESOURCE_TYPE_INTERRUPT;
-    buf[i + 1] = int.share;
-    w16(buf, i + 2, int.flags);
-    w32(buf, i + 4, int.level);
-    w32(buf, i + 8, int.vector);
-    w64(buf, i + 12, int.affinity);
+    build_list_header(buf, MEMORY_PORT_INTERRUPT_LIST_SIZE, bus_number, 3)?;
+    write_memory_descriptor(buf, 20, mem);
+    write_port_descriptor(buf, 40, port);
+    write_interrupt_descriptor(buf, 60, int);
     Some(MEMORY_PORT_INTERRUPT_LIST_SIZE)
 }
 
@@ -313,6 +318,60 @@ mod tests {
         assert_eq!(int.vector, 5);
         assert_eq!(int.level, 5);
         assert_eq!(int.affinity, 1);
+    }
+
+    #[test]
+    fn encodes_memory_only_list() {
+        let mut buf = [0xCCu8; MEMORY_LIST_SIZE];
+        let n = build_memory_list(
+            &mut buf,
+            2,
+            MemoryDescriptor {
+                start: 0xE000_0000,
+                length: 0x1000,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+        )
+        .unwrap();
+        assert_eq!(n, MEMORY_LIST_SIZE);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 1);
+        assert_eq!(buf[20], CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(
+            u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            0xE000_0000
+        );
+        assert_eq!(u32::from_le_bytes(buf[32..36].try_into().unwrap()), 0x1000);
+    }
+
+    #[test]
+    fn encodes_memory_port_without_interrupt() {
+        let mut buf = [0xCCu8; MEMORY_PORT_LIST_SIZE];
+        let n = build_memory_port_list(
+            &mut buf,
+            0,
+            MemoryDescriptor {
+                start: 0xE000_0000,
+                length: 0x1000,
+                flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+            PortDescriptor {
+                start: 0x1CE,
+                length: 2,
+                flags: CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+        )
+        .unwrap();
+        assert_eq!(n, MEMORY_PORT_LIST_SIZE);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 2);
+        assert_eq!(buf[20], CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(buf[40], CM_RESOURCE_TYPE_PORT);
+        assert_eq!(u64::from_le_bytes(buf[44..52].try_into().unwrap()), 0x1CE);
+        assert_eq!(u32::from_le_bytes(buf[52..56].try_into().unwrap()), 2);
     }
 
     #[test]

@@ -83,7 +83,9 @@ use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
-use nt_config_manager::{DriverServiceClass, SERVICE_DISABLED, SERVICE_SYSTEM_START};
+use nt_config_manager::{
+    DriverServiceClass, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_SYSTEM_START,
+};
 use nt_hive_core::{
     apply_ccs_alias, HiveKind, MutableHiveSet, RegistryValueCopyProvenance,
     RegistryValueCopyProvenanceTable, ResolvedHiveKey, ResolvedHiveValue,
@@ -1222,7 +1224,7 @@ pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
 /// INITRD cluster @0x10, size @0x14 out.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_105F_6000;
-pub const STORAGE_SHARED_FRAMES: u64 = 2;
+pub const STORAGE_SHARED_FRAMES: u64 = 8;
 pub const STORAGE_HIVE_IMAGE_OFFSET: u64 = 0x1000;
 pub const STORAGE_IMPORTS_IMAGE_OFFSET: u64 = 0x800;
 pub const STORAGE_HIVE_IMAGE_CAP: usize =
@@ -15843,6 +15845,7 @@ impl InlineDriverLaunchPlanShape {
 
 static mut SYSTEM_BOOT_DRIVER_PLAN: Option<InlineDriverLaunchPlan> = None;
 static mut CONFIG_BOOT_PNP_DRIVER_PLAN: Option<InlineDriverLaunchPlan> = None;
+static mut CONFIG_DEMAND_PNP_DRIVER_PLAN: Option<InlineDriverLaunchPlan> = None;
 
 unsafe fn system_boot_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
     let slot = &mut *core::ptr::addr_of_mut!(SYSTEM_BOOT_DRIVER_PLAN);
@@ -15854,6 +15857,14 @@ unsafe fn system_boot_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
 
 unsafe fn config_boot_pnp_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
     let slot = &mut *core::ptr::addr_of_mut!(CONFIG_BOOT_PNP_DRIVER_PLAN);
+    if slot.is_none() {
+        *slot = Some(InlineDriverLaunchPlan::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn config_demand_pnp_driver_plan_mut() -> &'static mut InlineDriverLaunchPlan {
+    let slot = &mut *core::ptr::addr_of_mut!(CONFIG_DEMAND_PNP_DRIVER_PLAN);
     if slot.is_none() {
         *slot = Some(InlineDriverLaunchPlan::new());
     }
@@ -16018,7 +16029,6 @@ impl HostedPciHardwareGrant {
             || mmio_pages == 0
             || mem_bar.size == 0
             || mem_bar.size > mmio_pages.saturating_mul(0x1000)
-            || interrupt_vector == 0
         {
             return None;
         }
@@ -16066,6 +16076,7 @@ struct HostedPciGrantDiscoveryReport {
     existing_grants: u64,
     claimed_grants: u64,
     dma_grants: u64,
+    dma_not_required: u64,
     dma_failures: u64,
     missing_memory_bar: u64,
     missing_interrupt: u64,
@@ -16078,6 +16089,13 @@ fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
     } else {
         Some(device.irq_line as u32)
     }
+}
+
+fn hosted_pci_driver_needs_dma(device: &nt_pnp::PciDevice) -> bool {
+    matches!(
+        device.base_class(),
+        nt_pnp::PCI_CLASS_NETWORK | nt_pnp::PCI_CLASS_STORAGE
+    )
 }
 
 fn hosted_pci_request_id(device: &nt_pnp::PciDevice) -> u64 {
@@ -16239,48 +16257,62 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.missing_memory_bar += 1;
                     continue;
                 };
-                let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) else {
-                    report.missing_interrupt += 1;
-                    continue;
-                };
+                let interrupt_vector = hosted_pci_interrupt_vector(device).unwrap_or(0);
                 let mmio_pages = mem_bar.size.div_ceil(0x1000).max(1);
                 let mmio_frame_base = claim_device_frame_caps(bi, mem_bar.base, mmio_pages);
                 if mmio_frame_base == 0 {
                     report.claim_failures += 1;
                     continue;
                 }
-                let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
-                if let Some(dma) = dma_grant {
-                    report.dma_grants += 1;
+                if hosted_pci_driver_needs_dma(device) {
+                    let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
+                    if let Some(dma) = dma_grant {
+                        report.dma_grants += 1;
+                        let Some(grant) = HostedPciHardwareGrant::for_device(
+                            device,
+                            mmio_frame_base,
+                            mmio_pages,
+                            interrupt_vector,
+                            false,
+                            Some(dma),
+                        ) else {
+                            report.claim_failures += 1;
+                            continue;
+                        };
+                        grants.push(grant);
+                        report.claimed_grants += 1;
+                    } else {
+                        report.dma_failures += 1;
+                        print_str(b"[driver-launch] hosted PCI DMA grant failed bus=");
+                        print_u64(device.bus as u64);
+                        print_str(b" dev=");
+                        print_u64(device.dev as u64);
+                        print_str(b" func=");
+                        print_u64(device.func as u64);
+                        print_str(b" mint=");
+                        print_u64(dma_iommu.mint_err);
+                        print_str(b" iopt=");
+                        print_u64(dma_iommu.iopt_err);
+                        print_str(b" map=");
+                        print_u64(dma_iommu.map_io_err);
+                        print_str(b"\n");
+                        report.claim_failures += 1;
+                    }
+                } else {
+                    report.dma_not_required += 1;
                     let Some(grant) = HostedPciHardwareGrant::for_device(
                         device,
                         mmio_frame_base,
                         mmio_pages,
                         interrupt_vector,
                         false,
-                        Some(dma),
+                        None,
                     ) else {
                         report.claim_failures += 1;
                         continue;
                     };
                     grants.push(grant);
                     report.claimed_grants += 1;
-                } else {
-                    report.dma_failures += 1;
-                    print_str(b"[driver-launch] hosted PCI DMA grant failed bus=");
-                    print_u64(device.bus as u64);
-                    print_str(b" dev=");
-                    print_u64(device.dev as u64);
-                    print_str(b" func=");
-                    print_u64(device.func as u64);
-                    print_str(b" mint=");
-                    print_u64(dma_iommu.mint_err);
-                    print_str(b" iopt=");
-                    print_u64(dma_iommu.iopt_err);
-                    print_str(b" map=");
-                    print_u64(dma_iommu.map_io_err);
-                    print_str(b"\n");
-                    report.claim_failures += 1;
                 }
             }
         }
@@ -16841,14 +16873,25 @@ fn config_hive_boot_system_driver_launch_spec() -> Option<ConfigHiveDriverLaunch
     })
 }
 
-fn count_config_hive_boot_system_pnp_driver_launch_shape() -> InlineDriverLaunchPlanShape {
+fn config_hive_pnp_driver_bindings_for_start(
+    cm: &nt_config_manager::ConfigManager,
+    start_type: u32,
+) -> Vec<nt_config_manager::PnpDriverBinding> {
+    if start_type == SERVICE_DEMAND_START {
+        cm.demand_start_pnp_driver_bindings()
+    } else {
+        cm.boot_system_pnp_driver_bindings()
+    }
+}
+
+fn count_config_hive_pnp_driver_launch_shape(start_type: u32) -> InlineDriverLaunchPlanShape {
     let heap_mark = allocator::mark();
     let mut shape = InlineDriverLaunchPlanShape::default();
     if let Some(cm) = config_hive_config_manager() {
-        for binding in cm.boot_system_pnp_driver_bindings() {
+        for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
             if let Some(header_string_bytes) = inline_driver_launch_spec_header_shape_from_service_metadata(
                 &binding.service,
-                SERVICE_SYSTEM_START,
+                start_type,
             )
             {
                 let devnodes = count_inline_devnodes_from_records(&cm, &binding.devnodes);
@@ -16869,12 +16912,17 @@ fn count_config_hive_boot_system_pnp_driver_launch_shape() -> InlineDriverLaunch
     shape
 }
 
-fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
-    let required = count_config_hive_boot_system_pnp_driver_launch_shape();
-    let plan = unsafe { config_boot_pnp_driver_plan_mut() };
+fn config_hive_pnp_driver_launch_plan_for_start(
+    start_type: u32,
+    plan: &'static mut InlineDriverLaunchPlan,
+    label: &[u8],
+) -> &'static InlineDriverLaunchPlan {
+    let required = count_config_hive_pnp_driver_launch_shape(start_type);
     plan.clear();
     if !plan.reserve_shape(required) {
-        print_str(b"[driver-launch] config PnP launch plan reserve failed specs=");
+        print_str(b"[driver-launch] ");
+        print_str(label);
+        print_str(b" launch plan reserve failed specs=");
         print_u64(required.specs as u64);
         print_str(b" devnodes=");
         print_u64(required.devnodes as u64);
@@ -16887,10 +16935,10 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
     }
     let heap_mark = allocator::mark();
     if let Some(cm) = config_hive_config_manager() {
-        for binding in cm.boot_system_pnp_driver_bindings() {
+        for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
             if inline_driver_launch_spec_header_shape_from_service_metadata(
                 &binding.service,
-                SERVICE_SYSTEM_START,
+                start_type,
             )
             .is_none()
             {
@@ -16899,11 +16947,13 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
             if let Some(spec) = inline_driver_launch_spec_from_pnp_binding(
                 &cm,
                 binding,
-                SERVICE_SYSTEM_START,
+                start_type,
                 plan,
             ) {
                 if !plan.push(spec) {
-                    print_str(b"[driver-launch] config PnP launch plan capacity raced specs=");
+                    print_str(b"[driver-launch] ");
+                    print_str(label);
+                    print_str(b" launch plan capacity raced specs=");
                     print_u64(required.specs as u64);
                     print_str(b" devnodes=");
                     print_u64(required.devnodes as u64);
@@ -16915,7 +16965,9 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
                     break;
                 }
             } else {
-                print_str(b"[driver-launch] config PnP launch plan fill failed specs=");
+                print_str(b"[driver-launch] ");
+                print_str(label);
+                print_str(b" launch plan fill failed specs=");
                 print_u64(required.specs as u64);
                 print_str(b" devnodes=");
                 print_u64(required.devnodes as u64);
@@ -16930,6 +16982,22 @@ fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaun
     }
     unsafe { allocator::reset_to(heap_mark) };
     plan
+}
+
+fn config_hive_boot_system_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+    config_hive_pnp_driver_launch_plan_for_start(
+        SERVICE_SYSTEM_START,
+        unsafe { config_boot_pnp_driver_plan_mut() },
+        b"config boot/system PnP",
+    )
+}
+
+fn config_hive_demand_pnp_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
+    config_hive_pnp_driver_launch_plan_for_start(
+        SERVICE_DEMAND_START,
+        unsafe { config_demand_pnp_driver_plan_mut() },
+        b"config demand PnP",
+    )
 }
 
 fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
@@ -23404,7 +23472,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
             check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
             // Shared storage run: page 0 carries AHCI IOVA + verdict/size metadata + imports.bin;
-            // page 1 carries the generated SYSTEM.DAT hive.
+            // the remaining pages carry the generated SYSTEM.DAT hive.
             let shared_start = alloc_frame();
             for _ in 1..STORAGE_SHARED_FRAMES {
                 let _ = alloc_frame();
@@ -24894,6 +24962,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan();
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan();
+    let config_demand_pnp_plan = config_hive_demand_pnp_driver_launch_plan();
     let scm_service_selection = system_hive_service_selection_report();
     print_str(b"[scm-select] auto-win32 count=");
     print_u64(scm_service_selection.auto_win32_count);
@@ -24964,7 +25033,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
         bi,
         &pci_devices,
-        &[system_boot_driver_plan, config_pnp_plan],
+        &[
+            system_boot_driver_plan,
+            config_pnp_plan,
+            config_demand_pnp_plan,
+        ],
         &mut hosted_pci_hardware_grants,
     );
     print_str(b"[driver-launch] hosted PCI grant discovery selected=");
@@ -24975,6 +25048,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_grant_discovery.claimed_grants);
     print_str(b" dma=");
     print_u64(hosted_pci_grant_discovery.dma_grants);
+    print_str(b" dma-not-required=");
+    print_u64(hosted_pci_grant_discovery.dma_not_required);
     print_str(b" dma-failures=");
     print_u64(hosted_pci_grant_discovery.dma_failures);
     print_str(b" missing-mmio=");
@@ -24991,14 +25066,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 + hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.missing_memory_bar == 0
             && hosted_pci_grant_discovery.missing_interrupt == 0
-            && hosted_pci_grant_discovery.dma_grants == hosted_pci_grant_discovery.claimed_grants
+            && hosted_pci_grant_discovery.dma_grants
+                + hosted_pci_grant_discovery.dma_not_required
+                == hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.dma_failures == 0
             && hosted_pci_grant_discovery.claim_failures == 0,
         &mut passed,
     );
     let hosted_pci_window_publish = publish_hosted_pnp_context_for_launch_plans(
         &pci_devices,
-        &[system_boot_driver_plan, config_pnp_plan],
+        &[
+            system_boot_driver_plan,
+            config_pnp_plan,
+            config_demand_pnp_plan,
+        ],
         hosted_pci_hardware_grants.as_slice(),
     );
     print_str(b"[driver-launch] hosted resource windows pci-selected=");
@@ -25925,96 +26006,106 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_pci_started = 0u64;
     let mut generic_pci_io_out32 = false;
     let mut generic_pci_first_error = 0u32;
-    if !config_pnp_plan.as_slice().is_empty() {
+    let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
+    if config_pnp_launch_plans
+        .iter()
+        .any(|plan| !plan.as_slice().is_empty())
+    {
         if let Some(fs) = exec_fs() {
-            for proof_pnp_spec in config_pnp_plan.as_slice() {
-                let proof_pnp_devnodes = config_pnp_plan.devnodes_for(proof_pnp_spec);
-                let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(proof_pnp_devnodes);
-                let spec_devnodes = proof_pnp_spec.devnode_count as u64;
-                generic_hw_selected += spec_devnodes;
-                generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
-                generic_pci_registry_selected |= spec_has_pci_devnode;
-                if spec_has_pci_devnode {
-                    generic_pci_selected += spec_devnodes;
-                }
-                print_str(b"[driver-launch] launching PnP service ");
-                print_str(proof_pnp_spec.service_name.as_bytes());
-                print_str(b" from config hive path=");
-                print_str(proof_pnp_spec.image_path.as_bytes());
-                print_str(b" object=");
-                print_str(proof_pnp_spec.driver_object_path.as_bytes());
-                print_str(b" devnodes=");
-                print_u64(proof_pnp_spec.devnode_count as u64);
-                print_str(b"\n");
-
-                if let Some(dc) = load_driver(
-                    &fs,
-                    proof_pnp_spec.image_path.as_bytes(),
-                    proof_pnp_spec.class,
-                    proof_pnp_spec.driver_object_path.as_str(),
-                ) {
-                    let pci_support_ready = spec_has_pci_devnode
-                        && dc.support_status == 0
-                        && (dc.support_verdict & V_SUCCESS) != 0;
-                    generic_pci_support_driver_entry |= pci_support_ready;
-                    let start_report = start_inline_driver_service_devnodes(
-                        &dc,
-                        proof_pnp_spec,
-                        config_pnp_plan,
-                        HostedPnpStartOptions::hardware_proof(),
-                    );
-                    generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
-                    generic_hw_add_device |= start_report.add_device;
-                    generic_hw_attempted += start_report.attempted;
-                    generic_hw_add_device_count += start_report.add_device_count;
-                    generic_hw_started += start_report.started;
-                    if generic_hw_first_error == 0 && start_report.first_error != 0 {
-                        generic_hw_first_error = start_report.first_error;
-                    }
+            for proof_pnp_plan in config_pnp_launch_plans {
+                for proof_pnp_spec in proof_pnp_plan.as_slice() {
+                    let proof_pnp_devnodes = proof_pnp_plan.devnodes_for(proof_pnp_spec);
+                    let spec_has_pci_devnode =
+                        inline_launch_spec_has_pci_devnode(proof_pnp_devnodes);
+                    let spec_devnodes = proof_pnp_spec.devnode_count as u64;
+                    generic_hw_selected += spec_devnodes;
+                    generic_hw_registry_selected |= proof_pnp_spec.devnode_count != 0;
+                    generic_pci_registry_selected |= spec_has_pci_devnode;
                     if spec_has_pci_devnode {
-                        generic_pci_add_device |= start_report.add_device;
-                        generic_pci_attempted += start_report.attempted;
-                        generic_pci_add_device_count += start_report.add_device_count;
-                        generic_pci_started += start_report.started;
-                        if pci_support_ready {
-                            generic_pci_support_ready += start_report.attempted;
-                        }
-                        generic_pci_io_out32 |= start_report.io_port_out32;
-                        if generic_pci_first_error == 0 && start_report.first_error != 0 {
-                            generic_pci_first_error = start_report.first_error;
-                        }
-                    } else {
-                        generic_root_attempted += start_report.attempted;
-                        generic_root_started += start_report.started;
+                        generic_pci_selected += spec_devnodes;
                     }
-                    generic_hw_start_ok |= start_report.start_ok;
-                    generic_hw_granted |= start_report.resource_granted;
-                    generic_hw_mmio_mapped |= start_report.mmio_mapped;
-                    generic_hw_interrupt_connected |= start_report.interrupt_connected;
-                    generic_hw_interrupt_delivered |= start_report.interrupt_delivered;
-                    generic_hw_interrupt_acknowledged |= start_report.interrupt_acknowledged;
-                    generic_hw_dpc_delivered |= start_report.dpc_delivered;
-                    generic_hw_dma_adapter |= start_report.dma_adapter;
-                    generic_hw_dma_common |= start_report.dma_common;
-                    generic_hw_io_out32 |= start_report.io_port_out32;
-                    generic_hw_root_started |= start_report.root_started;
-                    generic_hw_video_route_published |= start_report.video_route_published;
-                    generic_hw_video_route_attempted += start_report.video_route_attempted_count;
-                    generic_hw_video_route_published_count +=
-                        start_report.video_route_published_count;
-                } else {
-                    print_str(
-                        b"[driver-launch] registry-selected PnP driver launch returned None service=",
-                    );
+                    print_str(b"[driver-launch] launching PnP service ");
                     print_str(proof_pnp_spec.service_name.as_bytes());
-                    print_str(b" (not staged / load failed)\n");
+                    print_str(b" from config hive path=");
+                    print_str(proof_pnp_spec.image_path.as_bytes());
+                    print_str(b" object=");
+                    print_str(proof_pnp_spec.driver_object_path.as_bytes());
+                    print_str(b" devnodes=");
+                    print_u64(proof_pnp_spec.devnode_count as u64);
+                    print_str(b"\n");
+
+                    if let Some(dc) = load_driver(
+                        &fs,
+                        proof_pnp_spec.image_path.as_bytes(),
+                        proof_pnp_spec.class,
+                        proof_pnp_spec.driver_object_path.as_str(),
+                    ) {
+                        let pci_support_ready = spec_has_pci_devnode
+                            && ((dc.support_status == 0 && (dc.support_verdict & V_SUCCESS) != 0)
+                                || driver_launch::hosted_driver_video_port_initialized(
+                                    dc.driver_id,
+                                ));
+                        generic_pci_support_driver_entry |= pci_support_ready;
+                        let start_report = start_inline_driver_service_devnodes(
+                            &dc,
+                            proof_pnp_spec,
+                            proof_pnp_plan,
+                            HostedPnpStartOptions::hardware_proof(),
+                        );
+                        generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
+                        generic_hw_add_device |= start_report.add_device;
+                        generic_hw_attempted += start_report.attempted;
+                        generic_hw_add_device_count += start_report.add_device_count;
+                        generic_hw_started += start_report.started;
+                        if generic_hw_first_error == 0 && start_report.first_error != 0 {
+                            generic_hw_first_error = start_report.first_error;
+                        }
+                        if spec_has_pci_devnode {
+                            generic_pci_add_device |= start_report.add_device;
+                            generic_pci_attempted += start_report.attempted;
+                            generic_pci_add_device_count += start_report.add_device_count;
+                            generic_pci_started += start_report.started;
+                            if pci_support_ready {
+                                generic_pci_support_ready += start_report.attempted;
+                            }
+                            generic_pci_io_out32 |= start_report.io_port_out32;
+                            if generic_pci_first_error == 0 && start_report.first_error != 0 {
+                                generic_pci_first_error = start_report.first_error;
+                            }
+                        } else {
+                            generic_root_attempted += start_report.attempted;
+                            generic_root_started += start_report.started;
+                        }
+                        generic_hw_start_ok |= start_report.start_ok;
+                        generic_hw_granted |= start_report.resource_granted;
+                        generic_hw_mmio_mapped |= start_report.mmio_mapped;
+                        generic_hw_interrupt_connected |= start_report.interrupt_connected;
+                        generic_hw_interrupt_delivered |= start_report.interrupt_delivered;
+                        generic_hw_interrupt_acknowledged |= start_report.interrupt_acknowledged;
+                        generic_hw_dpc_delivered |= start_report.dpc_delivered;
+                        generic_hw_dma_adapter |= start_report.dma_adapter;
+                        generic_hw_dma_common |= start_report.dma_common;
+                        generic_hw_io_out32 |= start_report.io_port_out32;
+                        generic_hw_root_started |= start_report.root_started;
+                        generic_hw_video_route_published |= start_report.video_route_published;
+                        generic_hw_video_route_attempted +=
+                            start_report.video_route_attempted_count;
+                        generic_hw_video_route_published_count +=
+                            start_report.video_route_published_count;
+                    } else {
+                        print_str(
+                            b"[driver-launch] registry-selected PnP driver launch returned None service=",
+                        );
+                        print_str(proof_pnp_spec.service_name.as_bytes());
+                        print_str(b" (not staged / load failed)\n");
+                    }
                 }
             }
         } else {
             print_str(b"[driver-launch] registry-selected PnP driver proof has no filesystem\n");
         }
     } else {
-        print_str(b"[driver-launch] config hive has no boot/system PnP driver binding\n");
+        print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
     }
     if generic_hw_selected != 0 {
         print_str(b"[driver-launch] config PnP hardware summary selected=");

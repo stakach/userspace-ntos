@@ -729,10 +729,8 @@ impl ConfigManager {
             .collect()
     }
 
-    /// Boot/system device-class driver bindings: selected service metadata plus the imported
-    /// `Enum` devnodes that bind to each service.
-    pub fn boot_system_pnp_driver_bindings(&self) -> Vec<PnpDriverBinding> {
-        self.boot_system_driver_candidates()
+    fn pnp_driver_bindings_by_start(&self, start_types: &[u32]) -> Vec<PnpDriverBinding> {
+        self.service_candidates_by_start_and_type(start_types, SERVICE_DRIVER_TYPE_MASK)
             .into_iter()
             .filter_map(|service| {
                 if service.driver_service_class() != Some(DriverServiceClass::Device) {
@@ -749,6 +747,25 @@ impl ConfigManager {
                     Some(PnpDriverBinding { service, devnodes })
                 }
             })
+            .collect()
+    }
+
+    /// Boot/system device-class driver bindings: selected service metadata plus the imported
+    /// `Enum` devnodes that bind to each service.
+    pub fn boot_system_pnp_driver_bindings(&self) -> Vec<PnpDriverBinding> {
+        self.pnp_driver_bindings_by_start(&[SERVICE_BOOT_START, SERVICE_SYSTEM_START])
+    }
+
+    /// Demand-start device-class driver bindings selected by installed `Enum` devnodes.
+    pub fn demand_start_pnp_driver_bindings(&self) -> Vec<PnpDriverBinding> {
+        self.pnp_driver_bindings_by_start(&[SERVICE_DEMAND_START])
+    }
+
+    /// Demand-start device-class drivers selected by installed `Enum` devnodes.
+    pub fn demand_start_pnp_driver_candidates(&self) -> Vec<ServiceMetadata> {
+        self.demand_start_pnp_driver_bindings()
+            .into_iter()
+            .map(|binding| binding.service)
             .collect()
     }
 
@@ -2459,6 +2476,51 @@ mod tests {
         assert_eq!(
             bindings[1].devnodes[0].instance_id,
             r"ROOT\SECOND_BOUND_DEVICE\0000"
+        );
+    }
+
+    #[test]
+    fn demand_start_pnp_driver_candidates_require_enum_binding() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "BochsMp",
+            r"system32\drivers\bochsmp.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            Some("{4D36E968-E325-11CE-BFC1-08002BE10318}"),
+            SERVICE_DEMAND_START,
+            0,
+        );
+        cm.register_typed_service(
+            "UnboundDemand",
+            r"system32\drivers\unbound.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_DEMAND_START,
+            0,
+        );
+        cm.register_devnode(
+            r"PCI\VEN_1234&DEV_1111\3&11583659&0&08",
+            Some("BochsMp"),
+            Some(r"\Device\NTPNP_PCI0002"),
+            &[r"PCI\VEN_1234&DEV_1111"],
+            &[r"PCI\CC_030000", r"PCI\CC_0300"],
+        );
+
+        let names: Vec<String> = cm
+            .demand_start_pnp_driver_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(names, alloc::vec![String::from("BochsMp")]);
+        let bindings = cm.demand_start_pnp_driver_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].service.name, "BochsMp");
+        assert_eq!(bindings[0].devnodes.len(), 1);
+        assert_eq!(
+            bindings[0].devnodes[0].instance_id,
+            r"PCI\VEN_1234&DEV_1111\3&11583659&0&08"
         );
     }
 

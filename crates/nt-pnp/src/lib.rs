@@ -32,7 +32,7 @@ pub use nt_cm_resources::{
     InterruptDescriptor, MemoryDescriptor, PortDescriptor, CM_RESOURCE_INTERRUPT_LATCHED,
     CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_BAR,
     CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, MEMORY_INTERRUPT_LIST_SIZE,
-    MEMORY_PORT_INTERRUPT_LIST_SIZE,
+    MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
@@ -429,6 +429,8 @@ pub struct ResourceAssignment {
     pub io_port_base: u64,
     /// The device I/O port range length. `0` means no port resource is granted.
     pub io_port_len: u32,
+    /// Flags for the port resource descriptor. `0` when no port resource is granted.
+    pub io_port_flags: u16,
     /// The interrupt vector/level assigned to the device (translated form).
     pub int_vector: u32,
     /// True = latched (edge/MSI), false = level-sensitive.
@@ -586,6 +588,7 @@ where
         mmio_len: profile.mmio_len,
         io_port_base: 0,
         io_port_len: 0,
+        io_port_flags: 0,
         int_vector,
         int_latched,
         int_affinity,
@@ -593,11 +596,23 @@ where
     })
 }
 
-/// Assign resources to a device bound to `class`, from its enumerated BARs + IRQ. `int_vector` is
-/// the translated interrupt vector the executive has arranged for this device (e.g. the MSI vector
-/// it programmed); `dma_len` is the common-buffer size the driver needs (0 for none). Returns
-/// `None` if the device exposes no memory BAR (nothing to grant). This is the arbitration step —
-/// trivial for a single device with one MMIO BAR.
+fn legacy_pci_io_port_range(device: &PciDevice) -> Option<(u64, u32, u16)> {
+    // QEMU's std VGA/Bochs display adapter exposes the framebuffer as a PCI memory BAR but its
+    // Bochs DISPI control registers are the legacy 0x1CE/0x1CF I/O ports, not a PCI BAR.
+    if device.vendor == 0x1234
+        && device.device == 0x1111
+        && device.base_class() == PCI_CLASS_DISPLAY
+    {
+        Some((0x01CE, 2, CM_RESOURCE_PORT_IO))
+    } else {
+        None
+    }
+}
+
+/// Assign resources to a device bound to `class`, from its enumerated BARs, optional legacy port
+/// resources, and optional IRQ. `int_vector` is the translated interrupt vector the executive has
+/// arranged for this device; `0` means the bus assigned no interrupt. `dma_len` is the common-buffer
+/// size the driver needs (`0` for none). Returns `None` if the device exposes no memory BAR.
 pub fn assign_resources(
     device: &PciDevice,
     int_vector: u32,
@@ -606,20 +621,25 @@ pub fn assign_resources(
     dma_len: u64,
 ) -> Option<ResourceAssignment> {
     let mem_bar = device.first_memory_bar()?;
-    let (io_port_base, io_port_len) = match device.first_io_bar() {
+    let (io_port_base, io_port_len, io_port_flags) = match device.first_io_bar() {
         Some(port_bar) => {
             if port_bar.size > u32::MAX as u64 {
                 return None;
             }
-            (port_bar.base, port_bar.size as u32)
+            (
+                port_bar.base,
+                port_bar.size as u32,
+                CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
+            )
         }
-        None => (0, 0),
+        None => legacy_pci_io_port_range(device).unwrap_or((0, 0, 0)),
     };
     Some(ResourceAssignment {
         mmio_phys: mem_bar.base,
         mmio_len: mem_bar.size,
         io_port_base,
         io_port_len,
+        io_port_flags,
         int_vector,
         int_latched,
         int_affinity,
@@ -632,9 +652,9 @@ pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = MEMORY_PORT_INTERRUPT_LIST_SIZE;
 
 /// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
 /// `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; callers should pass the
-/// translated physical address for real WDM drivers that call `MmMapIoSpace`. If the assignment has
-/// an I/O BAR, the list contains memory + port + interrupt; otherwise it contains memory +
-/// interrupt. Returns the byte length written.
+/// translated physical address for real WDM drivers that call `MmMapIoSpace`. The list contains
+/// exactly the assigned memory, optional port, and optional interrupt descriptors. Returns the byte
+/// length written.
 pub fn assignment_to_cm_list(
     buf: &mut [u8],
     bus_number: u32,
@@ -648,7 +668,13 @@ pub fn assignment_to_cm_list(
         flags: CM_RESOURCE_MEMORY_READ_WRITE,
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
     };
-    let int = InterruptDescriptor {
+    let port = (assign.io_port_len != 0).then_some(PortDescriptor {
+        start: assign.io_port_base,
+        length: assign.io_port_len,
+        flags: assign.io_port_flags,
+        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+    });
+    let int = (assign.int_vector != 0).then_some(InterruptDescriptor {
         level: assign.int_vector,
         vector: assign.int_vector,
         affinity: assign.int_affinity,
@@ -658,22 +684,16 @@ pub fn assignment_to_cm_list(
             CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
         },
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-    };
-    if assign.io_port_len != 0 {
-        nt_cm_resources::build_memory_port_interrupt_list(
-            buf,
-            bus_number,
-            mem,
-            PortDescriptor {
-                start: assign.io_port_base,
-                length: assign.io_port_len,
-                flags: CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
-                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-            },
-            int,
-        )
-    } else {
-        nt_cm_resources::build_memory_interrupt_list(buf, bus_number, mem, int)
+    });
+    match (port, int) {
+        (Some(port), Some(int)) => {
+            nt_cm_resources::build_memory_port_interrupt_list(buf, bus_number, mem, port, int)
+        }
+        (Some(port), None) => nt_cm_resources::build_memory_port_list(buf, bus_number, mem, port),
+        (None, Some(int)) => {
+            nt_cm_resources::build_memory_interrupt_list(buf, bus_number, mem, int)
+        }
+        (None, None) => nt_cm_resources::build_memory_list(buf, bus_number, mem),
     }
 }
 
@@ -943,6 +963,10 @@ mod tests {
         assert_eq!(assign.mmio_len, 0x2_0000);
         assert_eq!(assign.io_port_base, 0xC000);
         assert_eq!(assign.io_port_len, 0x40);
+        assert_eq!(
+            assign.io_port_flags,
+            CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR
+        );
         assert_eq!(assign.int_vector, 5);
         assert!(assign.int_latched);
         assert_eq!(assign.dma_len, 0x1000);
@@ -962,6 +986,39 @@ mod tests {
         assert_eq!(int.vector, 5);
         assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LATCHED);
         assert_eq!(int.affinity, 1);
+    }
+
+    #[test]
+    fn bochs_display_gets_legacy_dispi_ports_without_interrupt() {
+        let regs = vec![
+            ((1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_1234),
+            ((1, 0, PCI_CFG_CLASS_REV), 0x0300_0000),
+            ((1, 0, PCI_CFG_BAR0), 0xE000_0000),
+            ((1, 0, PCI_CFG_INTERRUPT), 0x0000_00FF),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![((1, 0, PCI_CFG_BAR0), 0xFF00_0000)],
+        };
+        let dev =
+            enumerate_function(0, 1, 0, |o| m.read(1, 0, o), |o, v| m.write(1, 0, o, v)).unwrap();
+        let assign = assign_resources(&dev, 0, false, 1, 0).unwrap();
+        assert_eq!(assign.mmio_phys, 0xE000_0000);
+        assert_eq!(assign.mmio_len, 0x0100_0000);
+        assert_eq!(assign.io_port_base, 0x01CE);
+        assert_eq!(assign.io_port_len, 2);
+        assert_eq!(assign.io_port_flags, CM_RESOURCE_PORT_IO);
+        assert_eq!(assign.int_vector, 0);
+        assert_eq!(assign.dma_len, 0);
+
+        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let n = assignment_to_cm_list(&mut buf, 0, &assign, assign.mmio_phys, 0x1000).unwrap();
+        assert_eq!(n, MEMORY_PORT_LIST_SIZE);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 2);
+        assert_eq!(buf[20], nt_cm_resources::CM_RESOURCE_TYPE_MEMORY);
+        assert_eq!(buf[40], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
+        assert_eq!(u64::from_le_bytes(buf[44..52].try_into().unwrap()), 0x01CE);
+        assert_eq!(u32::from_le_bytes(buf[52..56].try_into().unwrap()), 2);
     }
 
     #[test]
@@ -1000,6 +1057,7 @@ mod tests {
         assert_eq!(assignment.mmio_len, 0x1000);
         assert_eq!(assignment.io_port_base, 0);
         assert_eq!(assignment.io_port_len, 0);
+        assert_eq!(assignment.io_port_flags, 0);
         assert_eq!(assignment.int_vector, 5);
         assert!(!assignment.int_latched);
         assert_eq!(assignment.int_affinity, 1);

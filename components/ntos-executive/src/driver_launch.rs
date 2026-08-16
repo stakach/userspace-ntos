@@ -13091,7 +13091,6 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || mmio_va == 0
         || mmio_frame_base == 0
         || mmio_pages == 0
-        || interrupt_vector == 0
         || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -13128,8 +13127,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     let owner = hosted_resource_owner(binding);
     let mmio_resource_id =
         hosted_mmio_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let interrupt_resource_id =
-        hosted_interrupt_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let interrupt_resource_id = if interrupt_vector != 0 {
+        hosted_interrupt_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+    } else {
+        0
+    };
     clear_hosted_resource_projection(binding, inst.exec_shared_va);
     let mapped_len = mmio_len.min(mmio_pages.saturating_mul(0x1000));
     for window in 0..mmio_pages.div_ceil(512).max(1) {
@@ -13190,18 +13192,20 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         nt_hal_abi::MM_NON_CACHED,
         nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
     );
-    rm.assign_interrupt(
-        owner,
-        interrupt_resource_id,
-        interrupt_vector,
-        interrupt_vector as u8,
-        interrupt_affinity as u32,
-        if interrupt_latched {
-            nt_hal_abi::INT_MODE_LATCHED
-        } else {
-            nt_hal_abi::INT_MODE_LEVEL_SENSITIVE
-        },
-    );
+    if interrupt_vector != 0 {
+        rm.assign_interrupt(
+            owner,
+            interrupt_resource_id,
+            interrupt_vector,
+            interrupt_vector as u8,
+            interrupt_affinity as u32,
+            if interrupt_latched {
+                nt_hal_abi::INT_MODE_LATCHED
+            } else {
+                nt_hal_abi::INT_MODE_LEVEL_SENSITIVE
+            },
+        );
+    }
 
     let mut io_port_cap = 0u64;
     if io_port_len != 0 {
