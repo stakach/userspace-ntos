@@ -4,10 +4,10 @@
 //! host, and path-dep builds (the executive) don't build bins, so this is invisible there.
 
 use nt_config_manager::{
-    encode_multi_sz, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER,
-    SERVICE_SYSTEM_START,
+    encode_multi_sz, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
+    SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
 };
-use nt_hive_core::{encode_image, Hive, HiveKind, RegistryValueType};
+use nt_hive_core::{encode_image, CellId, Hive, HiveKind, RegistryValueType};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -20,6 +20,15 @@ const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
 const BOCHS_PDO_NAME: &str = r"\Device\NTPNP_PCI0002";
 const GENERATED_HIVE_STORAGE_WINDOW: usize = 7 * 4096;
+
+const GENERATED_SERVICE_GROUP_ORDER: &[&str] = &[
+    "Video",
+    "File System",
+    "NDIS Wrapper",
+    "PNP_TDI",
+    "NDIS",
+    "TDI",
+];
 
 #[derive(Debug)]
 struct InfEntry {
@@ -54,6 +63,96 @@ fn utf16le_sz(s: &str) -> Vec<u8> {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     bytes
+}
+
+fn set_sz(hive: &mut Hive, key: CellId, name: &str, value: &str) {
+    hive.set_value(key, name, RegistryValueType::Sz, utf16le_sz(value));
+}
+
+fn set_expand_sz(hive: &mut Hive, key: CellId, name: &str, value: &str) {
+    hive.set_value(key, name, RegistryValueType::ExpandSz, utf16le_sz(value));
+}
+
+fn install_service_group_order(hive: &mut Hive) {
+    let key = hive.create_key(r"ControlSet001\Control\ServiceGroupOrder");
+    hive.set_value(
+        key,
+        "List",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(GENERATED_SERVICE_GROUP_ORDER),
+    );
+}
+
+fn install_kernel_driver_service(
+    hive: &mut Hive,
+    service_name: &str,
+    image_path: &str,
+    start_type: u32,
+    error_control: u32,
+    group: Option<&str>,
+) -> CellId {
+    let key = hive.create_key(&format!(r"ControlSet001\Services\{}", service_name));
+    set_expand_sz(hive, key, "ImagePath", image_path);
+    hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
+    hive.set_dword(key, "Start", start_type);
+    hive.set_dword(key, "ErrorControl", error_control);
+    if let Some(group) = group {
+        set_sz(hive, key, "Group", group);
+    }
+    key
+}
+
+fn install_network_stack_services(hive: &mut Hive) {
+    // ReactOS hivesys.inf marks NDIS as boot-start in the `NDIS Wrapper` group. It is not PnP-bound
+    // here; hosted E1000 loads the real ndis.sys image as its dependency until the support-driver
+    // lifecycle grows into a standalone boot-driver service.
+    install_kernel_driver_service(
+        hive,
+        "Ndis",
+        r"system32\drivers\ndis.sys",
+        SERVICE_BOOT_START,
+        1,
+        Some("NDIS Wrapper"),
+    );
+
+    // nettcpip.inf installs TCPIP as a system-start kernel driver in PNP_TDI with these base
+    // Parameters values. Keeping them in the generated SYSTEM hive lets the next B3 slice activate
+    // TCPIP through the same service metadata without adding kernel-side service-name policy.
+    install_kernel_driver_service(
+        hive,
+        "Tcpip",
+        r"system32\drivers\tcpip.sys",
+        SERVICE_SYSTEM_START,
+        1,
+        Some("PNP_TDI"),
+    );
+    let params = hive.create_key(r"ControlSet001\Services\Tcpip\Parameters");
+    set_expand_sz(
+        hive,
+        params,
+        "DataBasePath",
+        r"%SystemRoot%\System32\drivers\etc",
+    );
+    set_sz(hive, params, "Domain", "");
+    set_sz(hive, params, "Hostname", "ROSHost");
+    set_sz(hive, params, "NameServer", "");
+    hive.set_dword(params, "ForwardBroadcasts", 0);
+    hive.set_dword(params, "IPEnableRouter", 0);
+    set_sz(hive, params, "SearchList", "");
+    hive.set_dword(params, "EnableSecurityFilters", 0);
+    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Adapters");
+    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Interfaces");
+    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\PersistentRoutes");
+
+    // afd_reg.inf installs AFD as a system-start kernel driver in the TDI group.
+    install_kernel_driver_service(
+        hive,
+        "Afd",
+        r"system32\drivers\afd.sys",
+        SERVICE_SYSTEM_START,
+        1,
+        Some("TDI"),
+    );
 }
 
 fn workspace_relative_path(relative: &str) -> PathBuf {
@@ -487,6 +586,8 @@ fn build_hive() -> Hive {
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
     hive.set_dword(key, "Answer", 42);
 
+    install_service_group_order(&mut hive);
+
     // Driver-launch proof fixture. The executive must discover this through service metadata just
     // like a boot/system driver, not through a compiled-in driver list.
     let key = hive.create_key(r"ControlSet001\Services\IrpFsdTest");
@@ -558,6 +659,8 @@ fn build_hive() -> Hive {
         RegistryValueType::Sz,
         utf16le_sz(NET_CLASS_GUID),
     );
+
+    install_network_stack_services(&mut hive);
 
     let devnode_path = format!(r"ControlSet001\Enum\{}", E1000_INSTANCE_ID);
     let devnode = hive.create_key(&devnode_path);
@@ -720,6 +823,117 @@ mod tests {
                 utf16le_sz(E1000_EXPORT_NAME).as_slice()
             ))
         );
+    }
+
+    #[test]
+    fn generated_hive_declares_network_stack_driver_services() {
+        let hive = build_hive();
+        let group_key = hive
+            .open_key(r"ControlSet001\Control\ServiceGroupOrder")
+            .expect("service group order");
+        assert_eq!(
+            hive.query_value(group_key, "List"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(GENERATED_SERVICE_GROUP_ORDER).as_slice()
+            ))
+        );
+
+        let ndis = hive
+            .open_key(r"ControlSet001\Services\Ndis")
+            .expect("Ndis service");
+        assert_eq!(hive.query_dword(ndis, "Type"), Some(SERVICE_KERNEL_DRIVER));
+        assert_eq!(hive.query_dword(ndis, "Start"), Some(SERVICE_BOOT_START));
+        assert_eq!(
+            hive.query_value(ndis, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\ndis.sys").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(ndis, "Group"),
+            Some((RegistryValueType::Sz, utf16le_sz("NDIS Wrapper").as_slice()))
+        );
+
+        let tcpip = hive
+            .open_key(r"ControlSet001\Services\Tcpip")
+            .expect("Tcpip service");
+        assert_eq!(hive.query_dword(tcpip, "Type"), Some(SERVICE_KERNEL_DRIVER));
+        assert_eq!(hive.query_dword(tcpip, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(tcpip, "Group"),
+            Some((RegistryValueType::Sz, utf16le_sz("PNP_TDI").as_slice()))
+        );
+        let tcpip_params = hive
+            .open_key(r"ControlSet001\Services\Tcpip\Parameters")
+            .expect("Tcpip Parameters");
+        assert_eq!(
+            hive.query_value(tcpip_params, "DataBasePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"%SystemRoot%\System32\drivers\etc").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_params, "Hostname"),
+            Some((RegistryValueType::Sz, utf16le_sz("ROSHost").as_slice()))
+        );
+        assert_eq!(hive.query_dword(tcpip_params, "IPEnableRouter"), Some(0));
+
+        let afd = hive
+            .open_key(r"ControlSet001\Services\Afd")
+            .expect("Afd service");
+        assert_eq!(hive.query_dword(afd, "Type"), Some(SERVICE_KERNEL_DRIVER));
+        assert_eq!(hive.query_dword(afd, "Start"), Some(SERVICE_SYSTEM_START));
+        assert_eq!(
+            hive.query_value(afd, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\afd.sys").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(afd, "Group"),
+            Some((RegistryValueType::Sz, utf16le_sz("TDI").as_slice()))
+        );
+    }
+
+    #[test]
+    fn generated_hive_orders_network_drivers_through_config_manager() {
+        let hive = build_hive();
+        let mut cm = nt_config_manager::ConfigManager::new();
+        assert_ne!(
+            nt_hive_core::import_control_set_services_into_config_manager(
+                &hive,
+                &mut cm,
+                nt_hive_core::CURRENT_CONTROL_SET_TARGET
+            ),
+            0
+        );
+        assert_eq!(
+            nt_hive_core::import_control_set_service_group_order_into_config_manager(
+                &hive,
+                &mut cm,
+                nt_hive_core::CURRENT_CONTROL_SET_TARGET
+            ),
+            1
+        );
+        let names: Vec<String> = cm
+            .boot_system_driver_candidates()
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+
+        let position = |name: &str| {
+            names
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(name))
+                .expect("driver service present")
+        };
+        assert!(position("Ndis") < position("Tcpip"));
+        assert!(position("Tcpip") < position("E1000"));
+        assert!(position("E1000") < position("Afd"));
     }
 
     #[test]

@@ -16902,6 +16902,11 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     {
         return None;
     }
+    let _ = nt_hive_core::import_control_set_service_group_order_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
     let _ = nt_hive_core::import_control_set_enum_into_config_manager(
         &hive,
         &mut cm,

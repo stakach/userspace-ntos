@@ -1185,10 +1185,12 @@ before unrelated executive traffic monopolises the receive loop.
   win32k's hosted trampolines never depend on executive-only heap pointers. The current automated
   shell-pixel gate proves this route through Explorer shell chrome. The hosted-driver import
   resolver now has the real NT/HAL data and routine exports needed to load the ReactOS
-  `ndis.sys`/`tcpip.sys`/`afd.sys` images fail-closed. Remaining B3 work is broader non-display
-  driver coverage: real hosted kernel-thread runtime for `PsCreateSystemThread`, service metadata
-  activation for TCPIP/AFD, miniport packet data-plane behavior, and multi-device scaling under the
-  same dynamic devnode/resource path.
+  `ndis.sys`/`tcpip.sys`/`afd.sys` images fail-closed. The generated SYSTEM hive also carries
+  ReactOS-derived NDIS/TCPIP/AFD service records and the network load-order groups through the same
+  Config Manager ordering path used by real REGF hives. Remaining B3 work is broader non-display
+  driver coverage: real hosted kernel-thread runtime for `PsCreateSystemThread`, metadata-driven
+  TCPIP/AFD activation once hosted waits can block/resume, miniport packet data-plane behavior, and
+  multi-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6286,3 +6288,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `cargo test -p nt-fs`, `cargo test -p nt-process`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`.
+
+  B3 generated network service metadata (2026-08-16): the generated SYSTEM hive now includes the
+  ReactOS network driver service metadata for `Ndis`, `Tcpip`, and `Afd`, plus the relevant
+  `Control\ServiceGroupOrder` groups (`NDIS Wrapper`, `PNP_TDI`, `NDIS`, `TDI`) and TCPIP base
+  `Parameters` values from `nettcpip.inf`. The generated-hive Config Manager import now pulls in
+  `ServiceGroupOrder`, matching the real REGF import path, so service ordering is registry-owned
+  for proof hives too. Tests prove raw service values, encoded-hive fit, and ordered
+  Config Manager selection (`Ndis` before `Tcpip`, `Tcpip` before `E1000`, `E1000` before `Afd`).
+  This does not add a kernel-side service-name launch path: NDIS is present as boot metadata but not
+  PnP-bound, and TCPIP/AFD activation remains blocked on real hosted system-thread and dispatcher
+  wait support. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`, and
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`.
