@@ -2285,13 +2285,14 @@ static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_TRANSPORT_PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 
-/// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): ONE dedicated MCS reply object
-/// per launched Family-A IRP driver instance. These back the `Call`(component) to `reply_on`
+/// ★ COMPONENT-DISPATCH TRANSPORT (`docs/transport-migration.md`): active MCS reply object per
+/// launched Family-A IRP driver instance. These back the `Call`(component) to `reply_on`
 /// (executive) transport that replaces the hand-rolled Send/Recv dispatch pair.
 ///
-/// One object per component is sufficient at any nesting depth: a component host has one TCB, so it
-/// is blocked in at most one `Call` at a time. These reply objects are dedicated, never entered into
-/// `WAIT_REPLY_POOL`, never rotated, and never stolen by wait/pipe/dbgk/iocp parking.
+/// FSD reply objects stay separate from the hosted-user `WAIT_REPLY_POOL`. Driver dispatch and
+/// immediate component-service calls reuse the instance's active reply object; hosted driver waits
+/// that need to park a worker must rotate through a driver-owned reply pool instead of stealing from
+/// the user-process wait/pipe/dbgk/iocp pool.
 static mut REPLY_FSD_SLOTS: Option<Vec<u64>> = None;
 
 /// The dedicated reply object backing driver instance `i`'s dispatch transport (0 = none).

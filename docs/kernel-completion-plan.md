@@ -6358,3 +6358,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   instead of returning to hosted driver code. Validation: `cargo fmt --all`,
   `cargo test -p nt-kernel-exec`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 hosted `KeWaitForSingleObject` service transport (2026-08-16): hosted driver
+  `KeWaitForSingleObject` now crosses the component-service endpoint instead of deciding wholly
+  inside the import trampoline. The trampoline pre-classifies the caller's timeout pointer while it
+  is still in the driver's VSpace, sends the dispatcher object pointer over a bounded four-register
+  service call, and the executive validates the request against the dynamic driver instance before
+  translating the component pointer through the instance's image, pool, DATA, SHARED, or ARG aliases.
+  Ready events/semaphores are consumed by the executive and zero-timeout polls still return
+  `STATUS_TIMEOUT`; true blocking waits remain a fail-closed `STATUS_NOT_IMPLEMENTED` until the next
+  slice adds driver-owned reply-cap rotation and wait-queue parking. `KeWaitForMultipleObjects`
+  remains on the old in-component path until it has per-worker scratch/object-list staging, avoiding
+  a shared-frame array race. Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.

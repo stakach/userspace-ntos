@@ -429,6 +429,7 @@ const DISPATCH_LEVEL: u8 = 2;
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 pub const FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL: u64 = 0x772;
+pub const FSD_SERVICE_KE_WAIT_SINGLE_LABEL: u64 = 0x773;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -437,6 +438,13 @@ pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
 pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
 pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
 pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
+
+pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
+    matches!(
+        label,
+        FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL | FSD_SERVICE_KE_WAIT_SINGLE_LABEL
+    )
+}
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const FILE_OPENED_INFORMATION: u64 = 1;
@@ -494,6 +502,11 @@ static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS: AtomicU64 = AtomicU64::new(0)
 static HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WORKER_ALIAS_NEXT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_REJECTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_READY: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WAIT_SINGLE_BLOCKING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_MAJOR: AtomicU64 = AtomicU64::new(0);
@@ -2123,6 +2136,75 @@ fn component_pool_to_exec_va(exec_pool_va: u64, component_va: u64, bytes: u64) -
         return None;
     }
     exec_pool_va.checked_add(component_va - FSD_POOL_VADDR)
+}
+
+fn translate_component_range(
+    component_va: u64,
+    bytes: u64,
+    component_base: u64,
+    component_len: u64,
+    exec_base: u64,
+) -> Option<u64> {
+    if exec_base == 0 || component_va < component_base {
+        return None;
+    }
+    let end = component_va.checked_add(bytes)?;
+    if end > component_base.checked_add(component_len)? {
+        return None;
+    }
+    exec_base.checked_add(component_va - component_base)
+}
+
+fn component_to_exec_va_for_instance(
+    instance: usize,
+    inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    let win = ExecVaWindow::try_for_instance(instance)?;
+    translate_component_range(
+        component_va,
+        bytes,
+        FSD_CODE_VA,
+        FSD_IMAGE_FRAMES * 0x1000,
+        win.code_va,
+    )
+    .or_else(|| {
+        translate_component_range(
+            component_va,
+            bytes,
+            FSD_POOL_VADDR,
+            FSD_POOL_FRAMES * 0x1000,
+            inst.exec_pool_va,
+        )
+    })
+    .or_else(|| {
+        translate_component_range(
+            component_va,
+            bytes,
+            FSD_DATA_VADDR,
+            FSD_DATA_FRAMES * 0x1000,
+            win.data_va,
+        )
+    })
+    .or_else(|| {
+        translate_component_range(
+            component_va,
+            bytes,
+            FSD_SHARED_VADDR,
+            FSD_SHARED_FRAMES * 0x1000,
+            inst.exec_shared_va,
+        )
+    })
+    .or_else(|| {
+        translate_component_range(
+            component_va,
+            bytes,
+            FSD_ARG_VADDR,
+            FSD_ARG_FRAMES * 0x1000,
+            inst.exec_arg_va,
+        )
+    })
 }
 
 fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
@@ -7493,39 +7575,58 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     false
 }
 
-unsafe fn hosted_unsatisfied_wait_status(timeout: u64) -> i32 {
+unsafe fn hosted_wait_timeout_code(timeout: u64) -> u64 {
     let timeout_value = if timeout == 0 {
         None
     } else {
         Some(read_unaligned(timeout as *const i64))
     };
     match classify_dispatcher_wait_timeout(timeout_value) {
+        DispatcherWaitTimeout::Infinite => 0,
+        DispatcherWaitTimeout::Poll => 1,
+        DispatcherWaitTimeout::Blocking => 2,
+    }
+}
+
+fn hosted_wait_timeout_from_code(code: u64) -> DispatcherWaitTimeout {
+    match code {
+        1 => DispatcherWaitTimeout::Poll,
+        0 => DispatcherWaitTimeout::Infinite,
+        _ => DispatcherWaitTimeout::Blocking,
+    }
+}
+
+fn hosted_unsatisfied_wait_status_from_code(timeout_code: u64) -> i32 {
+    match hosted_wait_timeout_from_code(timeout_code) {
         DispatcherWaitTimeout::Poll => STATUS_TIMEOUT_I32,
         DispatcherWaitTimeout::Infinite | DispatcherWaitTimeout::Blocking => STATUS_NOT_IMPLEMENTED,
     }
 }
 
-/// `NTSTATUS KeWaitForSingleObject(...)` for hosted-driver local dispatcher objects. The current
-/// component transport cannot yet park and resume an arbitrary hosted driver TCB inside an import
-/// trampoline. Ready objects complete normally; unsatisfied zero-timeout polls report timeout, while
-/// blocking waits fail closed until the hosted system-thread wait broker is wired.
+unsafe fn hosted_unsatisfied_wait_status(timeout: u64) -> i32 {
+    hosted_unsatisfied_wait_status_from_code(hosted_wait_timeout_code(timeout))
+}
+
+/// `NTSTATUS KeWaitForSingleObject(...)` for hosted-driver local dispatcher objects.
 extern "win64" fn s_ke_wait_for_single_object(
     object: u64,
-    _wait_reason: u32,
-    _wait_mode: u32,
-    _alertable: u8,
+    wait_reason: u32,
+    wait_mode: u32,
+    alertable: u8,
     timeout: u64,
 ) -> i32 {
-    unsafe {
-        match hosted_dispatcher_ready(object) {
-            Ok(true) => {
-                hosted_dispatcher_consume(object);
-                STATUS_SUCCESS
-            }
-            Ok(false) => hosted_unsatisfied_wait_status(timeout),
-            Err(status) => status,
-        }
-    }
+    let packed_wait = (wait_reason as u64) | ((wait_mode as u64) << 32) | ((alertable as u64) << 40);
+    let timeout_code = unsafe { hosted_wait_timeout_code(timeout) };
+    let (_label, status, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_WAIT_SINGLE_LABEL << 12) | 3,
+            object,
+            packed_wait,
+            timeout_code,
+            0,
+        )
+    };
+    status as u32 as i32
 }
 
 /// `NTSTATUS KeWaitForMultipleObjects(ULONG Count, PVOID Object[], WAIT_TYPE, ...)`.
@@ -15683,6 +15784,16 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     })
 }
 
+fn instance_for_pump_channel(
+    ch: &crate::spawn_hosts::PumpChannel,
+) -> Option<(usize, DriverInstance)> {
+    let (instance, inst) = instance_by_shared_va(ch.shared_va)?;
+    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != ch.reply_cap {
+        return None;
+    }
+    Some((instance, inst))
+}
+
 unsafe fn spawn_hosted_driver_worker_thread(
     inst: DriverInstance,
     component_slot: usize,
@@ -15814,6 +15925,70 @@ unsafe fn spawn_hosted_driver_worker_thread(
     })
 }
 
+pub(crate) fn service_hosted_driver_ke_wait_single(
+    ch: &crate::spawn_hosts::PumpChannel,
+    object: u64,
+    _packed_wait: u64,
+    timeout_code: u64,
+    caller_badge: u64,
+) -> i32 {
+    let request = HOSTED_DRIVER_WAIT_SINGLE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some((instance, inst)) = instance_for_pump_channel(ch) else {
+        HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(exec_object) = component_to_exec_va_for_instance(instance, inst, object, 0x20) else {
+        HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        if request <= 8 {
+            print_str(b"[driver-wait] KeWaitForSingleObject unmapped object inst=");
+            print_u64(instance as u64);
+            if caller_badge != 0 {
+                print_str(b" badge=");
+                print_u64(caller_badge);
+            }
+            print_str(b" object=0x");
+            print_hex((object >> 32) as u32);
+            print_hex(object as u32);
+            print_str(b"\n");
+        }
+        return STATUS_INVALID_PARAMETER;
+    };
+    unsafe {
+        match hosted_dispatcher_ready(exec_object) {
+            Ok(true) => {
+                hosted_dispatcher_consume(exec_object);
+                HOSTED_DRIVER_WAIT_SINGLE_READY.fetch_add(1, Ordering::Relaxed);
+                STATUS_SUCCESS
+            }
+            Ok(false) => {
+                let status = hosted_unsatisfied_wait_status_from_code(timeout_code);
+                if status == STATUS_TIMEOUT_I32 {
+                    HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
+                    if request <= 8 {
+                        print_str(b"[driver-wait] KeWaitForSingleObject blocking wait fail-closed inst=");
+                        print_u64(instance as u64);
+                        if caller_badge != 0 {
+                            print_str(b" badge=");
+                            print_u64(caller_badge);
+                        }
+                        print_str(b" object=0x");
+                        print_hex((object >> 32) as u32);
+                        print_hex(object as u32);
+                        print_str(b"\n");
+                    }
+                }
+                status
+            }
+            Err(status) => {
+                HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                status
+            }
+        }
+    }
+}
+
 pub(crate) fn service_hosted_driver_ps_create_system_thread(
     ch: &crate::spawn_hosts::PumpChannel,
     start_routine: u64,
@@ -15824,14 +15999,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     caller_badge: u64,
 ) -> (i32, u64) {
     let request = HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let Some((instance, inst)) = instance_by_shared_va(ch.shared_va) else {
+    let Some((instance, inst)) = instance_for_pump_channel(ch) else {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
     };
-    if inst.fault_ep != ch.fault_ep || inst.pml4 != ch.pml4 || inst.reply_cap != ch.reply_cap {
-        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-        return (STATUS_INVALID_PARAMETER, 0);
-    }
     if start_routine == 0 {
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);

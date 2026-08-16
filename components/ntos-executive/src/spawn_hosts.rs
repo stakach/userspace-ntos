@@ -632,10 +632,10 @@ pub(crate) struct PumpChannel {
     /// The component host's TCB. Needed ONLY to `TCB_Suspend` it on a WALL (risk R2 — see the wall
     /// tail of [`component_pump_inner`]). 0 = cannot suspend.
     pub tcb: u64,
-    /// ★ This component's DEDICATED MCS reply object — the server side of the `Call` transport, and
-    /// now MANDATORY (a zero here means the channel has no transport at all). `R_win32k`
-    /// (`REPLY_W32`) and `R_fsd[inst]` (`REPLY_FSD`) are DISTINCT objects that are never pooled,
-    /// never stolen and never rotated (risk R5/R7).
+    /// ★ This component's active MCS reply object — the server side of the `Call` transport, and now
+    /// MANDATORY (a zero here means the channel has no transport at all). `R_win32k` (`REPLY_W32`)
+    /// and `R_fsd[inst]` (`REPLY_FSD`) are distinct from the hosted-user wait reply pool. FSD worker
+    /// parking needs driver-owned rotation around this active object.
     pub reply_cap: u64,
     /// win32k only (0 for the FSD): the client process-index for `client_attach`/foreign-frame sharing.
     pub client_pi: u64,
@@ -838,7 +838,7 @@ static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
     label == ch.dispatch_label
-        || (label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
+        || (crate::driver_launch::is_fsd_component_service_label(label)
             && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
@@ -1369,6 +1369,14 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 msg.badge,
             );
             pump_reply_recv4_into!(ch, msg, 2, status as u32 as u64, handle, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_WAIT_SINGLE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = crate::driver_launch::service_hosted_driver_ke_wait_single(
+                ch, msg.m0, msg.m1, msg.m2, msg.badge,
+            );
+            pump_reply_recv_into!(ch, msg, 1, status as u32 as u64);
             continue;
         } else if label == 6 {
             outcome.faults += 1;
