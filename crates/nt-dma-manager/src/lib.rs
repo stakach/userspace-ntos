@@ -73,6 +73,12 @@ struct Mapping {
     active: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LogicalRangeKind {
+    CommonBuffer,
+    TransferMapping,
+}
+
 /// The result of `alloc_common_buffer`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CommonBufferGrant {
@@ -107,8 +113,12 @@ pub struct FixedDescriptorObservation {
     pub trailing_bytes: u64,
     pub descriptors_with_device_address: u64,
     pub descriptors_with_decodable_buffer: u64,
+    pub descriptors_with_common_buffer: u64,
+    pub descriptors_with_transfer_mapping: u64,
     pub descriptors_with_length: u64,
     pub completed_descriptors: u64,
+    pub completed_common_buffer_descriptors: u64,
+    pub completed_transfer_mapping_descriptors: u64,
     pub malformed_descriptors: u64,
 }
 
@@ -345,6 +355,16 @@ impl DmaManager {
         logical: u64,
         length: u64,
     ) -> Result<u64, DmaError> {
+        self.decode_owner_logical_with_kind(owner, logical, length)
+            .map(|decoded| decoded.0)
+    }
+
+    fn decode_owner_logical_with_kind(
+        &self,
+        owner: DmaOwner,
+        logical: u64,
+        length: u64,
+    ) -> Result<(u64, LogicalRangeKind), DmaError> {
         for cb in self
             .common_buffers
             .iter()
@@ -356,7 +376,10 @@ impl DmaManager {
                 .checked_add(cb.length)
                 .ok_or(DmaError::OutOfRange)?;
             if logical >= cb.logical_base && end <= cb_end {
-                return Ok(cb.backing_va + (logical - cb.logical_base));
+                return Ok((
+                    cb.backing_va + (logical - cb.logical_base),
+                    LogicalRangeKind::CommonBuffer,
+                ));
             }
         }
         for m in self
@@ -370,7 +393,10 @@ impl DmaManager {
                 .checked_add(m.length)
                 .ok_or(DmaError::OutOfRange)?;
             if logical >= m.logical_base && end <= map_end {
-                return Ok(m.backing_va + (logical - m.logical_base));
+                return Ok((
+                    m.backing_va + (logical - m.logical_base),
+                    LogicalRangeKind::TransferMapping,
+                ));
             }
         }
         Err(DmaError::LogicalViolation)
@@ -459,6 +485,10 @@ impl DmaManager {
                     observation.completed_descriptors += 1;
                 }
             }
+            let completed = layout
+                .status_offset
+                .map(|offset| ring[base + offset] & layout.completion_status_mask != 0)
+                .unwrap_or(false);
             if address != 0 {
                 observation.descriptors_with_device_address += 1;
                 let probe_len = if length == 0 {
@@ -466,8 +496,21 @@ impl DmaManager {
                 } else {
                     length
                 };
-                match self.decode_owner_logical(owner, address, probe_len) {
-                    Ok(_) => observation.descriptors_with_decodable_buffer += 1,
+                match self.decode_owner_logical_with_kind(owner, address, probe_len) {
+                    Ok((_, LogicalRangeKind::CommonBuffer)) => {
+                        observation.descriptors_with_decodable_buffer += 1;
+                        observation.descriptors_with_common_buffer += 1;
+                        if completed {
+                            observation.completed_common_buffer_descriptors += 1;
+                        }
+                    }
+                    Ok((_, LogicalRangeKind::TransferMapping)) => {
+                        observation.descriptors_with_decodable_buffer += 1;
+                        observation.descriptors_with_transfer_mapping += 1;
+                        if completed {
+                            observation.completed_transfer_mapping_descriptors += 1;
+                        }
+                    }
                     Err(_) => observation.malformed_descriptors += 1,
                 }
             }
@@ -841,8 +884,57 @@ mod tests {
         assert_eq!(observation.descriptor_count, 4);
         assert_eq!(observation.descriptors_with_device_address, 2);
         assert_eq!(observation.descriptors_with_decodable_buffer, 2);
+        assert_eq!(observation.descriptors_with_common_buffer, 2);
+        assert_eq!(observation.descriptors_with_transfer_mapping, 0);
         assert_eq!(observation.descriptors_with_length, 1);
         assert_eq!(observation.completed_descriptors, 1);
+        assert_eq!(observation.completed_common_buffer_descriptors, 1);
+        assert_eq!(observation.completed_transfer_mapping_descriptors, 0);
+        assert_eq!(observation.malformed_descriptors, 0);
+    }
+
+    #[test]
+    fn descriptor_observation_classifies_transfer_mappings() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 8192, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 64, 0x20_0000)
+            .unwrap();
+        d.register_mapping_at(owner(), adapter, 0x9000, 0x50_0000, 512)
+            .unwrap();
+
+        let mut ring = [0u8; 32];
+        ring[0..8].copy_from_slice(&0x9000u64.to_le_bytes());
+        ring[8..10].copy_from_slice(&128u16.to_le_bytes());
+        ring[12] = 1;
+        ring[16..24].copy_from_slice(&0x9080u64.to_le_bytes());
+        ring[24..26].copy_from_slice(&64u16.to_le_bytes());
+
+        let observation = d
+            .observe_fixed_descriptor_ring(
+                owner(),
+                0x4000,
+                0x20_0000,
+                &ring,
+                FixedDescriptorLayout {
+                    stride: 16,
+                    address_offset: 0,
+                    length_offset: Some(8),
+                    status_offset: Some(12),
+                    completion_status_mask: 1,
+                    min_buffer_probe_len: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(observation.descriptor_count, 2);
+        assert_eq!(observation.descriptors_with_device_address, 2);
+        assert_eq!(observation.descriptors_with_decodable_buffer, 2);
+        assert_eq!(observation.descriptors_with_common_buffer, 0);
+        assert_eq!(observation.descriptors_with_transfer_mapping, 2);
+        assert_eq!(observation.descriptors_with_length, 2);
+        assert_eq!(observation.completed_descriptors, 1);
+        assert_eq!(observation.completed_common_buffer_descriptors, 0);
+        assert_eq!(observation.completed_transfer_mapping_descriptors, 1);
         assert_eq!(observation.malformed_descriptors, 0);
     }
 

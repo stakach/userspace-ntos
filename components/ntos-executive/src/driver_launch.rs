@@ -15699,8 +15699,12 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_descriptor_records: u64,
     pub dma_descriptor_addresses: u64,
     pub dma_descriptor_decodable: u64,
+    pub dma_descriptor_common_buffers: u64,
+    pub dma_descriptor_transfer_mappings: u64,
     pub dma_descriptor_lengths: u64,
     pub dma_descriptor_completed: u64,
+    pub dma_descriptor_completed_common_buffers: u64,
+    pub dma_descriptor_completed_transfer_mappings: u64,
     pub dma_descriptor_malformed: u64,
     pub dma_descriptor_observation_failures: u64,
     pub root_pdo_started: bool,
@@ -16302,8 +16306,12 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             dma_descriptor_records: 0,
             dma_descriptor_addresses: 0,
             dma_descriptor_decodable: 0,
+            dma_descriptor_common_buffers: 0,
+            dma_descriptor_transfer_mappings: 0,
             dma_descriptor_lengths: 0,
             dma_descriptor_completed: 0,
+            dma_descriptor_completed_common_buffers: 0,
+            dma_descriptor_completed_transfer_mappings: 0,
             dma_descriptor_malformed: 0,
             dma_descriptor_observation_failures: 0,
             root_pdo_started,
@@ -16651,8 +16659,12 @@ struct HostedDmaPacketDescriptorEvidence {
     records: u64,
     addresses: u64,
     decodable: u64,
+    common_buffers: u64,
+    transfer_mappings: u64,
     lengths: u64,
     completed: u64,
+    completed_common_buffers: u64,
+    completed_transfer_mappings: u64,
     malformed: u64,
     failures: u64,
 }
@@ -16751,12 +16763,24 @@ unsafe fn observe_hosted_dma_packet_descriptors(
                     evidence.decodable = evidence
                         .decodable
                         .saturating_add(observation.descriptors_with_decodable_buffer);
+                    evidence.common_buffers = evidence
+                        .common_buffers
+                        .saturating_add(observation.descriptors_with_common_buffer);
+                    evidence.transfer_mappings = evidence
+                        .transfer_mappings
+                        .saturating_add(observation.descriptors_with_transfer_mapping);
                     evidence.lengths = evidence
                         .lengths
                         .saturating_add(observation.descriptors_with_length);
                     evidence.completed = evidence
                         .completed
                         .saturating_add(observation.completed_descriptors);
+                    evidence.completed_common_buffers = evidence.completed_common_buffers.saturating_add(
+                        observation.completed_common_buffer_descriptors,
+                    );
+                    evidence.completed_transfer_mappings = evidence
+                        .completed_transfer_mappings
+                        .saturating_add(observation.completed_transfer_mapping_descriptors);
                     evidence.malformed = evidence
                         .malformed
                         .saturating_add(observation.malformed_descriptors);
@@ -16788,8 +16812,12 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
         evidence.dma_descriptor_records = descriptors.records;
         evidence.dma_descriptor_addresses = descriptors.addresses;
         evidence.dma_descriptor_decodable = descriptors.decodable;
+        evidence.dma_descriptor_common_buffers = descriptors.common_buffers;
+        evidence.dma_descriptor_transfer_mappings = descriptors.transfer_mappings;
         evidence.dma_descriptor_lengths = descriptors.lengths;
         evidence.dma_descriptor_completed = descriptors.completed;
+        evidence.dma_descriptor_completed_common_buffers = descriptors.completed_common_buffers;
+        evidence.dma_descriptor_completed_transfer_mappings = descriptors.completed_transfer_mappings;
         evidence.dma_descriptor_malformed = descriptors.malformed;
         evidence.dma_descriptor_observation_failures = descriptors.failures;
     }

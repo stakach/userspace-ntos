@@ -26273,6 +26273,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_adapter = false;
     let mut generic_hw_dma_common = false;
     let mut generic_hw_dma_packet_descriptors = false;
+    let mut generic_hw_dma_descriptor_common_count = 0u64;
+    let mut generic_hw_dma_descriptor_mapping_count = 0u64;
+    let mut generic_hw_dma_descriptor_completed_mapping_count = 0u64;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
@@ -26375,6 +26378,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_dma_adapter |= start_report.dma_adapter;
                         generic_hw_dma_common |= start_report.dma_common;
                         generic_hw_dma_packet_descriptors |= start_report.dma_packet_descriptors;
+                        generic_hw_dma_descriptor_common_count = generic_hw_dma_descriptor_common_count
+                            .saturating_add(start_report.dma_packet_descriptor_common_count);
+                        generic_hw_dma_descriptor_mapping_count = generic_hw_dma_descriptor_mapping_count
+                            .saturating_add(start_report.dma_packet_descriptor_mapping_count);
+                        generic_hw_dma_descriptor_completed_mapping_count =
+                            generic_hw_dma_descriptor_completed_mapping_count.saturating_add(
+                                start_report.dma_packet_descriptor_completed_mapping_count,
+                            );
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -26430,6 +26441,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_hw_io_out32 as u64);
         print_str(b" dma_desc=");
         print_u64(generic_hw_dma_packet_descriptors as u64);
+        print_str(b" dma_desc_common/map=");
+        print_u64(generic_hw_dma_descriptor_common_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_descriptor_mapping_count);
+        print_str(b" dma_desc_done_map=");
+        print_u64(generic_hw_dma_descriptor_completed_mapping_count);
         print_str(b" video_route=");
         print_u64(generic_hw_video_route_published as u64);
         print_str(b" video_route_attempted=");

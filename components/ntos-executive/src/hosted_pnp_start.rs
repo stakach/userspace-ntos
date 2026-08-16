@@ -324,6 +324,9 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_adapter_count: u64,
     pub(crate) dma_common_count: u64,
     pub(crate) dma_packet_descriptor_count: u64,
+    pub(crate) dma_packet_descriptor_common_count: u64,
+    pub(crate) dma_packet_descriptor_mapping_count: u64,
+    pub(crate) dma_packet_descriptor_completed_mapping_count: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) video_route_attempted_count: u64,
@@ -735,6 +738,15 @@ fn collect_hardware_evidence(
             if evidence.dma_packet_descriptors_observed() {
                 report.dma_packet_descriptor_count += 1;
             }
+            report.dma_packet_descriptor_common_count = report
+                .dma_packet_descriptor_common_count
+                .saturating_add(evidence.dma_descriptor_common_buffers);
+            report.dma_packet_descriptor_mapping_count = report
+                .dma_packet_descriptor_mapping_count
+                .saturating_add(evidence.dma_descriptor_transfer_mappings);
+            report.dma_packet_descriptor_completed_mapping_count = report
+                .dma_packet_descriptor_completed_mapping_count
+                .saturating_add(evidence.dma_descriptor_completed_transfer_mappings);
             if evidence.io_port_out32_serviced() {
                 report.io_port_out32_count += 1;
             }
@@ -952,10 +964,18 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_descriptor_addresses);
     print_str(b"/");
     print_u64(evidence.dma_descriptor_decodable);
+    print_str(b" dma_desc_common/map=");
+    print_u64(evidence.dma_descriptor_common_buffers);
+    print_str(b"/");
+    print_u64(evidence.dma_descriptor_transfer_mappings);
     print_str(b" dma_desc_len/done=");
     print_u64(evidence.dma_descriptor_lengths);
     print_str(b"/");
     print_u64(evidence.dma_descriptor_completed);
+    print_str(b" dma_desc_done_common/map=");
+    print_u64(evidence.dma_descriptor_completed_common_buffers);
+    print_str(b"/");
+    print_u64(evidence.dma_descriptor_completed_transfer_mappings);
     print_str(b" dma_desc_bad/fail=");
     print_u64(evidence.dma_descriptor_malformed);
     print_str(b"/");

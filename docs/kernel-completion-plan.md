@@ -6700,3 +6700,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   B3's descriptor-discovery step is closed. Continue with real TX/RX completion and packet
   indication over the observed descriptor rings, keeping the path generic across multiple NICs and
   any other hosted bus-master driver.
+
+  B3 DMA descriptor role classification (2026-08-16): the generic fixed-descriptor observer now
+  classifies every decodable descriptor target as either a persistent common-buffer allocation or a
+  transient transfer mapping. The observation result separately counts common-buffer descriptors,
+  map-transfer descriptors, completed common-buffer descriptors, and completed map-transfer
+  descriptors, so the hosted hardware proof can distinguish receive-ring/common-buffer setup from
+  true packet transfer mappings without knowing about `e1000.sys`. The executive and PnP hardware
+  reports now surface those role counters as `dma_desc_common/map` and
+  `dma_desc_done_common/map`. Validation: `cargo fmt --all`, `cargo test -p nt-dma-manager`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: no new boot gate is added until
+  the desktop workload or an external device stimulus produces real packet traffic; the next B3
+  target is to drive the generic NIC route until transfer-mapping descriptors or receive
+  indications are observed, then gate on those non-synthetic facts.
