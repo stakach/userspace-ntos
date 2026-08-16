@@ -347,6 +347,7 @@ pub const FSD_DISPATCH_CANCEL_PENDING_FILE: u64 = u64::MAX - 0x774;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
 pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
 pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
+pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const FILE_OPENED_INFORMATION: u64 = 1;
@@ -7600,6 +7601,7 @@ struct HostedVideoPortInitialization {
 
 static mut HOSTED_VIDEO_PORT_INITIALIZATION: Option<HostedVideoPortInitialization> = None;
 static mut HOSTED_VIDEO_PORT_INITIALIZE_CALLS: u64 = 0;
+static HOSTED_VIDEO_NEXT_OBJECT_NUMBER: AtomicU64 = AtomicU64::new(0);
 const VIDEO_MEMORY_SPACE_IO: u32 = 0x1;
 const VIDEO_PORT_REGISTRY_VALUE_MAX: usize = 4096;
 const VIDEO_INTERRUPT_MODE_LATCHED: u32 = 0;
@@ -8883,6 +8885,84 @@ unsafe extern "win64" fn fsd_invalid_device_request(_devobj: u64, irp: u64) -> i
     STATUS_INVALID_DEVICE_REQUEST_I32
 }
 
+fn component_video_device_name(number: u32, units: &mut [u16]) -> Option<usize> {
+    let prefix = b"\\Device\\Video";
+    if units.len() < prefix.len() + 10 {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < prefix.len() {
+        units[len] = prefix[len] as u16;
+        len += 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut value = number;
+    let mut digits = 1usize;
+    tmp[tmp.len() - 1] = b'0' + (value % 10) as u8;
+    value /= 10;
+    while value != 0 {
+        digits += 1;
+        tmp[tmp.len() - digits] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    let mut index = tmp.len() - digits;
+    while index < tmp.len() {
+        units[len] = tmp[index] as u16;
+        len += 1;
+        index += 1;
+    }
+    Some(len)
+}
+
+unsafe fn component_dispatch_video_add_device(drv: u64) -> (i32, u64) {
+    let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
+        0,
+        0,
+        DeviceType::UNKNOWN.0,
+        pool_alloc,
+        pool_free,
+    ) {
+        Ok(projection) => projection,
+        Err(status) => return (status, 0),
+    };
+    let pdo = projection.device_object();
+    write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, pdo);
+    write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
+
+    let object_number = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+    if object_number > u32::MAX as u64 {
+        return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
+    }
+    let mut name_units = [0u16; 32];
+    let Some(unit_count) = component_video_device_name(object_number as u32, &mut name_units)
+    else {
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    };
+    let name_len = unit_count * 2;
+    let mut unicode = [0u8; 16];
+    write_unaligned(unicode.as_mut_ptr() as *mut u16, name_len as u16);
+    write_unaligned((unicode.as_mut_ptr() as u64 + 2) as *mut u16, name_len as u16);
+    write_unaligned(
+        (unicode.as_mut_ptr() as u64 + 8) as *mut u64,
+        name_units.as_mut_ptr() as u64,
+    );
+    let mut device_object = 0u64;
+    let status = s_io_create_device(
+        drv,
+        0,
+        unicode.as_mut_ptr() as u64,
+        nt_video_miniport::FILE_DEVICE_VIDEO as u64,
+        0,
+        1,
+        (&mut device_object as *mut u64) as u64,
+    );
+    if status == 0 {
+        (0, device_object)
+    } else {
+        (status, 0)
+    }
+}
+
 unsafe fn component_video_hw_extension() -> Result<u64, i32> {
     if read_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *const u32) == 0 {
         return Err(0xC000_0010u32 as i32); // STATUS_INVALID_DEVICE_REQUEST
@@ -9179,6 +9259,9 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let status = add(req.drv, pdo);
         let fdo = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
         return (status, fdo);
+    }
+    if major == FSD_DISPATCH_VIDEO_ADD_DEVICE {
+        return component_dispatch_video_add_device(req.drv);
     }
     if major == FSD_DISPATCH_VIDEO_FIND_ADAPTER {
         let find_adapter =
@@ -12654,11 +12737,112 @@ struct AddDeviceDispatchResult {
     fdo_name: Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>>,
 }
 
+fn hosted_video_device_path(
+    number: u32,
+) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
+    let mut path = HostedAscii::<HOSTED_EXPORT_NAME_MAX>::empty();
+    if path.push_str(r"\Device\Video") && hosted_ascii_push_decimal_u32(&mut path, number) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn allocate_hosted_video_object_number() -> Option<u32> {
+    let mut attempts = 0u64;
+    while attempts <= u32::MAX as u64 {
+        let candidate = HOSTED_VIDEO_NEXT_OBJECT_NUMBER.fetch_add(1, Ordering::Relaxed);
+        if candidate > u32::MAX as u64 {
+            return None;
+        }
+        let number = candidate as u32;
+        let path = hosted_video_device_path(number)?;
+        if device_id_by_name(path.as_str()).is_none() {
+            return Some(number);
+        }
+        attempts += 1;
+    }
+    None
+}
+
+unsafe fn dispatch_video_add_device_for_instance(
+    index: usize,
+    inst: DriverInstance,
+    object_number: u32,
+) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
+    if inst.driver_object == 0 || !hosted_instance_video_port_initialized(inst) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let sh = inst.exec_shared_va;
+    write_volatile(
+        (sh + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_VIDEO_ADD_DEVICE,
+    );
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, object_number as u64);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
+    clear_shared_path_len(SH_DEVICE_NAME_LEN);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va: ExecVaWindow::try_for_instance(index)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64) != 0,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(index, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    nt_status::NtStatus(pr.status).to_result()?;
+    let fdo_object = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    let pdo_object = read_volatile((sh + SH_REQ_FILEID) as *const u64);
+    if fdo_object == 0 || pdo_object == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(AddDeviceDispatchResult {
+        pdo_object,
+        fdo_object,
+        fdo_name: shared_device_name_ascii(),
+    })
+}
+
 unsafe fn dispatch_add_device_for_instance(
     index: usize,
     inst: DriverInstance,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
-    if inst.driver_object == 0 || inst.add_device == 0 {
+    if inst.driver_object == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if inst.add_device == 0 {
+        if hosted_instance_video_port_initialized(inst) {
+            let number = allocate_hosted_video_object_number()
+                .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+            return dispatch_video_add_device_for_instance(index, inst, number);
+        }
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
 
@@ -12785,10 +12969,15 @@ where
             return Err(status);
         }
     };
+    let device_type = if hosted_instance_video_port_initialized(inst) {
+        DeviceType(nt_video_miniport::FILE_DEVICE_VIDEO)
+    } else {
+        DeviceType::UNKNOWN
+    };
     let device_id = match io_manager_mut().create_device(
         DriverId(driver_id),
         fdo_name.as_ref(),
-        DeviceType::UNKNOWN,
+        device_type,
         DeviceCharacteristics::empty(),
         DeviceFlags::BUFFERED_IO,
         0,

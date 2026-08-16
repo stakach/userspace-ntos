@@ -3619,9 +3619,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   reach the miniport, matching ReactOS videoprt's default forwarding path. Validation:
   `cargo fmt --all`, `cargo test -p nt-video-miniport -- --nocapture`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-  x86_64-unknown-none`. Review adjustment: the next B3 display slice should publish the hosted
-  miniport-created `\\Device\\Video<N>`/DeviceMap route as the primary display device and then retire
-  the temporary boot-framebuffer bridge, or re-express it as a real boot adapter behind the same
+  x86_64-unknown-none`. Review adjustment: the next B3 display slice should move AddDevice off the
+  synthetic WDM MajorFunction path and publish the miniport-created `\\Device\\Video<N>` route
+  dynamically.
+
+- B3 videoprt dynamic AddDevice slice (2026-08-16). Hosted videoprt PnP miniports now get a
+  port-owned AddDevice path even when ReactOS `VideoPortInitialize` captured no miniport
+  `DriverExtension->AddDevice` entrypoint. The executive allocates a free `\\Device\\Video<N>` name
+  by querying the live I/O Manager namespace, then dispatches a videoprt AddDevice request through
+  the same isolated component pump used for unload, WDM AddDevice, and miniport callbacks. The
+  component builds a WDM-shaped PDO, creates a named `FILE_DEVICE_VIDEO` FDO through the existing
+  `IoCreateDevice` import shim, and returns both objects through the shared frame. The executive then
+  registers the PDO/FDO with the normal hosted-device binding table and preserves the video device
+  type in the I/O Manager record. No static Video0 identity or fallback success path is used by this
+  new route; collisions remain real namespace failures. Validation: `cargo fmt --all`,
+  `cargo test -p nt-video-miniport -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: the next B3 display slice should publish the hosted
+  miniport route into `HARDWARE\\DEVICEMAP\\VIDEO` as the primary display path, then retire the
+  temporary boot-framebuffer bridge or re-express it as a real boot adapter behind the same
   `VideoPort` boundary.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
