@@ -8407,7 +8407,9 @@ unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
 unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) {
     match cap {
         SharedImageMappingCap::Root(map_cap) => {
-            let _ = page_unmap_r(map_cap);
+            // Final teardown owns the process-map cap and discards it. Deleting the cap is the
+            // authoritative revoke path; explicit Page_Unmap is only for paths that keep and
+            // remap the same cap, such as protect/COW transitions.
             let _ = cnode_delete_recycle_r(map_cap);
         }
         SharedImageMappingCap::Bank { cnode, slot } => {

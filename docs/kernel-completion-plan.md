@@ -6786,3 +6786,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   rootserver `RingChannel::raw` wall during E1000 registry queries is closed. Continue B3 at real
   TX/RX completion and packet delivery over the generic NDIS/e1000 route; do not restore synthetic
   registry answers.
+
+  B3 mutable SYSTEM dynamic NIC binding materialization (2026-08-16): the installed-boot network
+  seed now shares the same target-based binding writer as the live Config Manager path, so the
+  mutable SYSTEM hive receives TCPIP linkage, per-interface DHCP/default-address parameters, adapter
+  class values, and `Control\Network` connection records derived from CM's current PnP NIC bindings.
+  The executive captures the dynamic CM snapshot only for the real storage-backed SYSTEM hive path;
+  early self-test handlers that do not own mounted hives skip the installed-boot binding seed instead
+  of fabricating a registry view. This removes the previous generated-hive-only identity gap while
+  preserving ordinary CM/registry opens for ReactOS services and hosted drivers. The same validation
+  pass also fixed shared-image final teardown: root process-map caps are now revoked by cap deletion,
+  matching the banked-cap teardown path, and explicit `Page_Unmap` remains only on paths that keep
+  and remap a live mapping cap. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core reactos_network -- --nocapture`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized headless boot
+  `.tmp/run-headless-b3-dynamic-mutable-network-unmapfix-20260816.log`. The boot reports
+  `[network-setup] ... tcpip-linkage=3 tcpip-ifaces=5 net-adapter-class=6 net-connections=3`,
+  `exec_vspace_asid_unmap_clears_pte` with `unmap error-labels=0`, `unmap-fails=0`, genuine explorer
+  shell chrome pixels, and `298/298` checks passing. Review adjustment: B3 registry materialization
+  is closed for the current dynamic NIC path; continue at real TX/RX completion and packet indication
+  over the generic NDIS/e1000 route.

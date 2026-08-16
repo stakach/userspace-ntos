@@ -351,6 +351,17 @@ impl nt_hive_core::ReactOsSetupSeedTarget for ExecJournalReactOsSetupSeedTarget<
             .and_then(|key| self.handler.mutable_hives.query_value(key, name))
             .is_some_and(|(ty, existing)| ty == value_type && existing == data)
     }
+
+    fn query_value(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Option<(nt_hive_core::RegistryValueType, alloc::vec::Vec<u8>)> {
+        self.handler
+            .mutable_registry_key_by_path(path)
+            .and_then(|key| self.handler.mutable_hives.query_value(key, name))
+            .map(|(ty, data)| (ty, data.to_vec()))
+    }
 }
 
 #[used]
@@ -2950,14 +2961,29 @@ impl ExecNtHandler {
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
+    fn network_setup_config_manager_snapshot(&self) -> Option<nt_config_manager::ConfigManager> {
+        // Early executive self-tests construct a handler before the storage-backed hives are mounted.
+        // The installed-boot network seed belongs only to the real SYSTEM hive path.
+        self.hive.as_ref()?;
+        Self::pnp_config_manager_snapshot()
+    }
+
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
     /// normally materialize. This publishes installed-boot service and TCPIP parameter metadata into
     /// the mounted mutable SYSTEM hive; registry consumers and Config Manager still perform ordinary
     /// opens, queries, ordering, and driver selection.
     fn provision_reactos_network_setup(&mut self) {
+        let cm = self.network_setup_config_manager_snapshot();
         let (stats, changed, failed, last_status) = {
             let mut target = ExecJournalReactOsSetupSeedTarget::new(self);
-            let stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
+            let mut stats = nt_hive_core::seed_reactos_network_setup_into_target(&mut target);
+            if let Some(cm) = cm.as_ref() {
+                nt_hive_core::seed_reactos_network_bindings_from_config_manager_into_target(
+                    &mut target,
+                    cm,
+                    &mut stats,
+                );
+            }
             (stats, target.changed(), target.failed, target.last_status)
         };
         if !changed {

@@ -362,6 +362,126 @@ fn set_setup_expand_sz<T: ReactOsSetupSeedTarget>(
     target.set_value(path, name, RegistryValueType::ExpandSz, utf16le_sz(value))
 }
 
+fn decode_setup_multi_sz(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    for unit in bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    {
+        if unit == 0 {
+            if current.is_empty() {
+                break;
+            }
+            out.push(
+                char::decode_utf16(current.drain(..))
+                    .map(|r| r.unwrap_or('\u{FFFD}'))
+                    .collect(),
+            );
+        } else {
+            current.push(unit);
+        }
+    }
+    if !current.is_empty() {
+        out.push(
+            char::decode_utf16(current)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect(),
+        );
+    }
+    out
+}
+
+fn set_setup_value_if_missing<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value_type: RegistryValueType,
+    data: Vec<u8>,
+) -> bool {
+    if target.has_value(path, name) {
+        return false;
+    }
+    target.set_value(path, name, value_type, data)
+}
+
+fn set_setup_sz_if_missing<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: &str,
+) -> bool {
+    set_setup_value_if_missing(target, path, name, RegistryValueType::Sz, utf16le_sz(value))
+}
+
+fn set_setup_dword_if_missing<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: u32,
+) -> bool {
+    set_setup_value_if_missing(
+        target,
+        path,
+        name,
+        RegistryValueType::Dword,
+        dword_bytes(value),
+    )
+}
+
+fn set_setup_multi_sz_if_missing<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    values: &[&str],
+) -> bool {
+    set_setup_value_if_missing(
+        target,
+        path,
+        name,
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(values),
+    )
+}
+
+fn append_setup_multi_sz_values<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    values: &[String],
+) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    let existing = target.query_value(path, name);
+    let mut merged = match existing.as_ref() {
+        Some((RegistryValueType::MultiSz, data)) => decode_setup_multi_sz(data),
+        Some(_) => return false,
+        None if target.has_value(path, name) => return false,
+        None => Vec::new(),
+    };
+    let mut changed = existing.is_none();
+    for value in values {
+        if !merged
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            merged.push(value.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    let refs: Vec<&str> = merged.iter().map(|value| value.as_str()).collect();
+    target.set_value(
+        path,
+        name,
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(&refs),
+    )
+}
+
 fn strip_line_comment(line: &str) -> &str {
     line.split_once("//").map_or(line, |(head, _)| head)
 }
@@ -422,6 +542,9 @@ pub trait ReactOsSetupSeedTarget {
         value_type: RegistryValueType,
         data: &[u8],
     ) -> bool;
+    fn query_value(&self, _path: &str, _name: &str) -> Option<(RegistryValueType, Vec<u8>)> {
+        None
+    }
 }
 
 struct OverlayRgsSeedTarget<'a> {
@@ -466,6 +589,17 @@ impl ReactOsSetupSeedTarget for OverlayRgsSeedTarget<'_> {
             self.overlay
                 .value(index, name)
                 .is_some_and(|(ty, existing)| ty == value_type as u32 && existing == data)
+        })
+    }
+
+    fn query_value(&self, path: &str, name: &str) -> Option<(RegistryValueType, Vec<u8>)> {
+        self.overlay.find(path).and_then(|index| {
+            self.overlay.value(index, name).map(|(ty, data)| {
+                (
+                    RegistryValueType::from_u32(ty).unwrap_or(RegistryValueType::Binary),
+                    data.to_vec(),
+                )
+            })
         })
     }
 }
@@ -514,6 +648,13 @@ impl ReactOsSetupSeedTarget for MutableHiveRgsSeedTarget<'_> {
             .and_then(|key| self.hives.query_value(key, name))
             .is_some_and(|(ty, existing)| ty == value_type && existing == data)
     }
+
+    fn query_value(&self, path: &str, name: &str) -> Option<(RegistryValueType, Vec<u8>)> {
+        self.hives
+            .resolve_key(path)
+            .and_then(|key| self.hives.query_value(key, name))
+            .map(|(ty, data)| (ty, data.to_vec()))
+    }
 }
 
 struct ConfigManagerSetupSeedTarget<'a> {
@@ -561,6 +702,14 @@ impl ReactOsSetupSeedTarget for ConfigManagerSetupSeedTarget<'_> {
             .open_key(path)
             .and_then(|key| self.cm.registry().query_value(key, name))
             .is_some_and(|existing| existing.value_type == value_type && existing.data == data)
+    }
+
+    fn query_value(&self, path: &str, name: &str) -> Option<(RegistryValueType, Vec<u8>)> {
+        self.cm
+            .registry()
+            .open_key(path)
+            .and_then(|key| self.cm.registry().query_value(key, name))
+            .map(|value| (value.value_type, value.data.clone()))
     }
 }
 
@@ -988,103 +1137,6 @@ fn collect_reactos_network_adapter_bindings(
     out
 }
 
-fn set_cm_value_if_missing(
-    cm: &mut nt_config_manager::ConfigManager,
-    path: &str,
-    name: &str,
-    value_type: RegistryValueType,
-    data: Vec<u8>,
-) -> bool {
-    let key = cm.registry_mut().create_key(path);
-    if cm.registry().query_value(key, name).is_some() {
-        return false;
-    }
-    cm.registry_mut().set_value(key, name, value_type, data)
-}
-
-fn set_cm_sz_if_missing(
-    cm: &mut nt_config_manager::ConfigManager,
-    path: &str,
-    name: &str,
-    value: &str,
-) -> bool {
-    set_cm_value_if_missing(cm, path, name, RegistryValueType::Sz, utf16le_sz(value))
-}
-
-fn set_cm_dword_if_missing(
-    cm: &mut nt_config_manager::ConfigManager,
-    path: &str,
-    name: &str,
-    value: u32,
-) -> bool {
-    set_cm_value_if_missing(
-        cm,
-        path,
-        name,
-        RegistryValueType::Dword,
-        value.to_le_bytes().to_vec(),
-    )
-}
-
-fn set_cm_multi_sz_if_missing(
-    cm: &mut nt_config_manager::ConfigManager,
-    path: &str,
-    name: &str,
-    values: &[&str],
-) -> bool {
-    set_cm_value_if_missing(
-        cm,
-        path,
-        name,
-        RegistryValueType::MultiSz,
-        nt_config_manager::encode_multi_sz(values),
-    )
-}
-
-fn append_cm_multi_sz_values(
-    cm: &mut nt_config_manager::ConfigManager,
-    path: &str,
-    name: &str,
-    values: &[String],
-) -> bool {
-    if values.is_empty() {
-        return false;
-    }
-    let key = cm.registry_mut().create_key(path);
-    let existing_value = cm.registry().query_value(key, name);
-    if existing_value.is_some()
-        && existing_value
-            .and_then(|value| value.as_multi_string())
-            .is_none()
-    {
-        return false;
-    }
-    let mut merged = cm
-        .registry()
-        .query_multi_string(key, name)
-        .unwrap_or_default();
-    let mut changed = existing_value.is_none();
-    for value in values {
-        if !merged
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(value))
-        {
-            merged.push(value.clone());
-            changed = true;
-        }
-    }
-    if !changed {
-        return false;
-    }
-    let refs: Vec<&str> = merged.iter().map(|value| value.as_str()).collect();
-    cm.registry_mut().set_value(
-        key,
-        name,
-        RegistryValueType::MultiSz,
-        nt_config_manager::encode_multi_sz(&refs),
-    )
-}
-
 fn network_connection_name(index: usize) -> String {
     if index == 0 {
         String::from("Local Area Connection")
@@ -1100,11 +1152,11 @@ fn adapter_protocol_tcpip_parameters_path(interface_name: &str) -> String {
     )
 }
 
-fn seed_reactos_network_bindings_in_config_manager(
-    cm: &mut nt_config_manager::ConfigManager,
+fn seed_reactos_network_bindings_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    adapters: &[ReactOsNetworkAdapterBinding],
     stats: &mut ReactOsNetworkSetupSeedStats,
 ) {
-    let adapters = collect_reactos_network_adapter_bindings(cm);
     if adapters.is_empty() {
         return;
     }
@@ -1122,110 +1174,130 @@ fn seed_reactos_network_bindings_in_config_manager(
         .map(|adapter| adapter.interface_name.clone())
         .collect();
 
-    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Bind", &device_names) {
+    if append_setup_multi_sz_values(target, TCPIP_LINKAGE_PATH, "Bind", &device_names) {
         stats.tcpip_linkage_values += 1;
     }
-    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Export", &tcpip_export_names) {
+    if append_setup_multi_sz_values(target, TCPIP_LINKAGE_PATH, "Export", &tcpip_export_names) {
         stats.tcpip_linkage_values += 1;
     }
-    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Route", &route_names) {
+    if append_setup_multi_sz_values(target, TCPIP_LINKAGE_PATH, "Route", &route_names) {
         stats.tcpip_linkage_values += 1;
     }
 
-    if set_cm_sz_if_missing(cm, CONTROL_NETWORK_NET_CLASS_PATH, "", "Network Adapters") {
+    if set_setup_sz_if_missing(
+        target,
+        CONTROL_NETWORK_NET_CLASS_PATH,
+        "",
+        "Network Adapters",
+    ) {
         stats.network_connection_values += 1;
     }
-    if set_cm_sz_if_missing(cm, CONTROL_NETWORK_NET_CLASS_PATH, "Class", "Net") {
+    if set_setup_sz_if_missing(target, CONTROL_NETWORK_NET_CLASS_PATH, "Class", "Net") {
         stats.network_connection_values += 1;
     }
 
     for (index, adapter) in adapters.iter().enumerate() {
-        cm.registry_mut().create_key(&adapter.class_key_path);
-        if set_cm_sz_if_missing(
-            cm,
+        target.create_key(&adapter.class_key_path);
+        if set_setup_sz_if_missing(
+            target,
             &adapter.class_key_path,
             "NetCfgInstanceId",
             &adapter.interface_name,
         ) {
             stats.network_adapter_class_values += 1;
         }
-        if set_cm_sz_if_missing(
-            cm,
+        if set_setup_sz_if_missing(
+            target,
             &adapter.class_key_path,
             "DriverDesc",
             &adapter.driver_desc,
         ) {
             stats.network_adapter_class_values += 1;
         }
-        if set_cm_sz_if_missing(
-            cm,
+        if set_setup_sz_if_missing(
+            target,
             &adapter.class_key_path,
             "ComponentId",
             &adapter.component_id,
         ) {
             stats.network_adapter_class_values += 1;
         }
-        if set_cm_sz_if_missing(
-            cm,
+        if set_setup_sz_if_missing(
+            target,
             &adapter.linkage_key_path,
             "Export",
             &adapter.device_name,
         ) {
             stats.network_adapter_class_values += 1;
         }
-        if set_cm_sz_if_missing(
-            cm,
+        if set_setup_sz_if_missing(
+            target,
             &adapter.linkage_key_path,
             "RootDevice",
             &adapter.interface_name,
         ) {
             stats.network_adapter_class_values += 1;
         }
-        if set_cm_sz_if_missing(cm, &adapter.linkage_key_path, "UpperBind", "Tcpip") {
+        if set_setup_sz_if_missing(target, &adapter.linkage_key_path, "UpperBind", "Tcpip") {
             stats.network_adapter_class_values += 1;
         }
 
         let interface_path = join_key_path(TCPIP_INTERFACES_PATH, &adapter.interface_name);
-        if set_cm_multi_sz_if_missing(cm, &interface_path, "DefaultGateway", &["0.0.0.0"]) {
+        if set_setup_multi_sz_if_missing(target, &interface_path, "DefaultGateway", &["0.0.0.0"]) {
             stats.tcpip_interface_values += 1;
         }
-        if set_cm_multi_sz_if_missing(cm, &interface_path, "IPAddress", &["0.0.0.0"]) {
+        if set_setup_multi_sz_if_missing(target, &interface_path, "IPAddress", &["0.0.0.0"]) {
             stats.tcpip_interface_values += 1;
         }
-        if set_cm_multi_sz_if_missing(cm, &interface_path, "SubnetMask", &["0.0.0.0"]) {
+        if set_setup_multi_sz_if_missing(target, &interface_path, "SubnetMask", &["0.0.0.0"]) {
             stats.tcpip_interface_values += 1;
         }
-        if set_cm_dword_if_missing(cm, &interface_path, "EnableDHCP", 1) {
+        if set_setup_dword_if_missing(target, &interface_path, "EnableDHCP", 1) {
             stats.tcpip_interface_values += 1;
         }
-        if set_cm_dword_if_missing(cm, &interface_path, "InterfaceMetric", 0) {
+        if set_setup_dword_if_missing(target, &interface_path, "InterfaceMetric", 0) {
             stats.tcpip_interface_values += 1;
         }
 
-        cm.registry_mut()
-            .create_key(&adapter_protocol_tcpip_parameters_path(
-                &adapter.interface_name,
-            ));
+        target.create_key(&adapter_protocol_tcpip_parameters_path(
+            &adapter.interface_name,
+        ));
 
         let connection_path = join_key_path(
             &join_key_path(CONTROL_NETWORK_NET_CLASS_PATH, &adapter.interface_name),
             "Connection",
         );
-        if set_cm_sz_if_missing(
-            cm,
+        if set_setup_sz_if_missing(
+            target,
             &connection_path,
             "Name",
             &network_connection_name(index),
         ) {
             stats.network_connection_values += 1;
         }
-        if set_cm_sz_if_missing(cm, &connection_path, "PnpInstanceID", &adapter.instance_id) {
+        if set_setup_sz_if_missing(
+            target,
+            &connection_path,
+            "PnpInstanceID",
+            &adapter.instance_id,
+        ) {
             stats.network_connection_values += 1;
         }
-        if set_cm_dword_if_missing(cm, &connection_path, "ShowIcon", 1) {
+        if set_setup_dword_if_missing(target, &connection_path, "ShowIcon", 1) {
             stats.network_connection_values += 1;
         }
     }
+}
+
+/// Seed TCPIP/linkage/interface registry state for the network adapters discovered by Config
+/// Manager into any setup target.
+pub fn seed_reactos_network_bindings_from_config_manager_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    cm: &nt_config_manager::ConfigManager,
+    stats: &mut ReactOsNetworkSetupSeedStats,
+) {
+    let adapters = collect_reactos_network_adapter_bindings(cm);
+    seed_reactos_network_bindings_into_target(target, &adapters, stats);
 }
 
 pub fn seed_reactos_print_setup_into_target<T: ReactOsSetupSeedTarget>(
@@ -1396,7 +1468,12 @@ pub fn seed_reactos_network_setup_in_config_manager(
 ) -> ReactOsNetworkSetupSeedStats {
     let mut stats =
         seed_reactos_network_setup_into_target(&mut ConfigManagerSetupSeedTarget { cm });
-    seed_reactos_network_bindings_in_config_manager(cm, &mut stats);
+    let adapters = collect_reactos_network_adapter_bindings(cm);
+    seed_reactos_network_bindings_into_target(
+        &mut ConfigManagerSetupSeedTarget { cm },
+        &adapters,
+        &mut stats,
+    );
     stats
 }
 
@@ -1857,8 +1934,7 @@ mod tests {
         assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
     }
 
-    #[test]
-    fn seeds_reactos_network_bindings_for_multiple_config_manager_nics() {
+    fn config_manager_with_two_e1000_nics() -> nt_config_manager::ConfigManager {
         let mut cm = nt_config_manager::ConfigManager::new();
         cm.register_typed_service(
             "E1000",
@@ -1897,6 +1973,12 @@ mod tests {
             );
         }
         assert_eq!(cm.index_registry_devnodes(), 2);
+        cm
+    }
+
+    #[test]
+    fn seeds_reactos_network_bindings_for_multiple_config_manager_nics() {
+        let mut cm = config_manager_with_two_e1000_nics();
 
         let stats = seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(
@@ -1995,6 +2077,81 @@ mod tests {
 
         let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
+    }
+
+    #[test]
+    fn seeds_reactos_network_bindings_from_config_manager_into_mutable_system_hive() {
+        let cm = config_manager_with_two_e1000_nics();
+        let mut hives = MutableHiveSet::new();
+        hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));
+
+        let mut stats = {
+            let mut target = MutableHiveRgsSeedTarget { hives: &mut hives };
+            let mut stats = seed_reactos_network_setup_into_target(&mut target);
+            seed_reactos_network_bindings_from_config_manager_into_target(
+                &mut target,
+                &cm,
+                &mut stats,
+            );
+            stats
+        };
+        assert_eq!(
+            stats,
+            ReactOsNetworkSetupSeedStats {
+                ndis_service_values: 5,
+                tcpip_service_values: 5,
+                tcpip_parameter_values: 8,
+                tcpip_linkage_values: 3,
+                tcpip_interface_values: 10,
+                network_adapter_class_values: 12,
+                network_connection_values: 8,
+                afd_service_values: 5,
+            }
+        );
+        assert_eq!(stats.total_values(), 56);
+
+        let tcpip_linkage = r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Linkage";
+        let (ty, data) = hive_value_bytes(&hives, tcpip_linkage, "Bind");
+        assert_eq!(ty, RegistryValueType::MultiSz);
+        assert_eq!(
+            decode_setup_multi_sz(data),
+            alloc::vec![
+                alloc::string::String::from(r"\Device\E1000_0000"),
+                alloc::string::String::from(r"\Device\E1000_0001")
+            ]
+        );
+
+        let interface = r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\E1000_0001";
+        let (ty, data) = hive_value_bytes(&hives, interface, "IPAddress");
+        assert_eq!(ty, RegistryValueType::MultiSz);
+        assert_eq!(
+            decode_setup_multi_sz(data),
+            alloc::vec![alloc::string::String::from("0.0.0.0")]
+        );
+        assert_eq!(hive_dword(&hives, interface, "EnableDHCP"), 1);
+
+        let connection = r"\Registry\Machine\System\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}\E1000_0001\Connection";
+        let (ty, data) = hive_value_bytes(&hives, connection, "Name");
+        assert_eq!(ty, RegistryValueType::Sz);
+        assert_eq!(data, utf16le_sz("Local Area Connection 2"));
+
+        let first_cell_count = hives.hive(1).expect("system hive").cell_count();
+        assert!(hives.clear_hive_dirty(1));
+        stats = ReactOsNetworkSetupSeedStats::default();
+        {
+            let mut target = MutableHiveRgsSeedTarget { hives: &mut hives };
+            seed_reactos_network_bindings_from_config_manager_into_target(
+                &mut target,
+                &cm,
+                &mut stats,
+            );
+        }
+        assert_eq!(stats, ReactOsNetworkSetupSeedStats::default());
+        assert_eq!(
+            hives.hive(1).expect("system hive").cell_count(),
+            first_cell_count
+        );
+        assert_eq!(hives.hive(1).expect("system hive").dirty_count(), 0);
     }
 
     #[test]

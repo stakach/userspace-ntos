@@ -26,6 +26,7 @@ pub use reactos_registration::{
     seed_reactos_explorer_shell_com_classes,
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes_into_target,
+    seed_reactos_network_bindings_from_config_manager_into_target,
     seed_reactos_network_setup_in_config_manager, seed_reactos_network_setup_in_mutable_hives,
     seed_reactos_network_setup_into_target, seed_reactos_print_setup_in_mutable_hives,
     seed_reactos_print_setup_into_target, seed_reactos_user_profile_shell_folders_in_mutable_hives,
