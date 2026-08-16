@@ -3635,10 +3635,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   new route; collisions remain real namespace failures. Validation: `cargo fmt --all`,
   `cargo test -p nt-video-miniport -- --nocapture`, `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
-  Review adjustment: the next B3 display slice should publish the hosted
-  miniport route into `HARDWARE\\DEVICEMAP\\VIDEO` as the primary display path, then retire the
-  temporary boot-framebuffer bridge or re-express it as a real boot adapter behind the same
-  `VideoPort` boundary.
+  Review adjustment: the next B3 display slice should let the video-device boundary adopt a live
+  hosted `FILE_DEVICE_VIDEO` route as its primary DeviceMap/IOCTL target, then retire the temporary
+  boot-framebuffer bridge or re-express it as a real boot adapter behind the same `VideoPort`
+  boundary.
+
+- B3 hosted videoprt route adoption slice (2026-08-16). The video-device boundary can now adopt a
+  live hosted videoprt miniport route after real AddDevice/resource-grant/START_DEVICE succeeds. The
+  executive exposes a read-only route-info query that accepts only named `FILE_DEVICE_VIDEO` I/O
+  Manager records backed by a hosted binding whose component called `VideoPortInitialize`; non-video
+  drivers are ignored. `video_device.rs` now distinguishes boot-framebuffer and hosted-I/O backends:
+  win32k still receives projected WDM file/device objects in its own VSpace, but once a hosted route
+  is adopted, `EngDeviceIoControl` dispatches through the real I/O Manager handle and reaches the
+  hosted `HwStartIO` path instead of the boot framebuffer adapter. DeviceMap metadata is rebuilt from
+  the live hosted `\\Device\\Video<N>` name and published through the same
+  `HARDWARE\\DEVICEMAP\\VIDEO` query path. PnP start reports now treat videoprt-initialized drivers
+  as PnP-ready even when the WDM AddDevice slot is correctly zero, and the generic hardware summary
+  records hosted video route attempts/publications. Validation: `cargo fmt --all`,
+  `cargo test -p nt-video-miniport -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: the next B3 display slice should validate this path in a serialized boot and
+  then address the remaining caller-address-space mapping gap for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`
+  before removing the boot-framebuffer backend.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The

@@ -289,6 +289,7 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_common: bool,
     pub(crate) io_port_out32: bool,
     pub(crate) root_started: bool,
+    pub(crate) video_route_published: bool,
     pub(crate) attempted: u64,
     pub(crate) add_device_count: u64,
     pub(crate) started: u64,
@@ -302,6 +303,8 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_common_count: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
+    pub(crate) video_route_attempted_count: u64,
+    pub(crate) video_route_published_count: u64,
     pub(crate) first_error: u32,
 }
 
@@ -345,7 +348,8 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
     options: HostedPnpStartOptions,
 ) -> HostedPnpStartReport {
     let mut report = HostedPnpStartReport {
-        driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0 && dc.add_device != 0,
+        driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
+            && (dc.add_device != 0 || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
         ..HostedPnpStartReport::default()
     };
     let class_guid = if spec.class_guid_present {
@@ -390,7 +394,8 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
     options: HostedPnpStartOptions,
 ) -> Result<HostedPnpStartReport, nt_status::NtStatus> {
     let mut report = HostedPnpStartReport {
-        driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0 && dc.add_device != 0,
+        driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
+            && (dc.add_device != 0 || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
         ..HostedPnpStartReport::default()
     };
     let class_guid = spec.class_guid.as_deref();
@@ -503,6 +508,9 @@ unsafe fn start_one_devnode<H, C>(
                 start_status_raw,
                 report,
             );
+            if start_status_raw == 0 {
+                try_publish_hosted_video_route(device_id, service_name, devnode.instance_id, report);
+            }
         }
         Err(status) => {
             remember_error(report, status);
@@ -545,6 +553,55 @@ fn remember_error(report: &mut HostedPnpStartReport, status: nt_status::NtStatus
     if report.first_error == 0 {
         report.first_error = status.raw() as u32;
     }
+}
+
+fn hosted_display_service_registry_path(service_name: &str) -> Option<Vec<u8>> {
+    if service_name.is_empty() || !service_name.as_bytes().iter().all(|byte| byte.is_ascii()) {
+        return None;
+    }
+    let prefix = b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
+    let suffix = b"\\Device0";
+    let len = prefix
+        .len()
+        .checked_add(service_name.len())?
+        .checked_add(suffix.len())?;
+    let mut path = Vec::new();
+    path.try_reserve_exact(len).ok()?;
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(service_name.as_bytes());
+    path.extend_from_slice(suffix);
+    Some(path)
+}
+
+unsafe fn try_publish_hosted_video_route(
+    device_id: u64,
+    service_name: &str,
+    instance_id: &str,
+    report: &mut HostedPnpStartReport,
+) {
+    if driver_launch::hosted_video_route_info(device_id).is_none() {
+        return;
+    }
+    report.video_route_attempted_count += 1;
+    let Some(service_registry_path) = hosted_display_service_registry_path(service_name) else {
+        remember_error(report, nt_status::NtStatus::INVALID_PARAMETER);
+        print_hosted_video_route_published(service_name, instance_id, device_id, false);
+        return;
+    };
+    let published = crate::video_device::publish_hosted_video_device_route(
+        &crate::video_device::HostedVideoDeviceRegistration {
+            device_id,
+            service_registry_path: service_registry_path.as_slice(),
+            allocate_projection: driver_launch::pool_alloc,
+        },
+    );
+    report.video_route_published |= published;
+    if published {
+        report.video_route_published_count += 1;
+    } else {
+        remember_error(report, nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    print_hosted_video_route_published(service_name, instance_id, device_id, published);
 }
 
 unsafe fn inject_proof_interrupt(
@@ -689,6 +746,23 @@ fn print_add_device_failure(
     print_str(service_name.as_bytes());
     print_str(b" devnode=");
     print_str(instance_id.as_bytes());
+    print_str(b"\n");
+}
+
+fn print_hosted_video_route_published(
+    service_name: &str,
+    instance_id: &str,
+    device_id: u64,
+    published: bool,
+) {
+    print_str(b"[video-device] hosted route service=");
+    print_str(service_name.as_bytes());
+    print_str(b" devnode=");
+    print_str(instance_id.as_bytes());
+    print_str(b" device_id=");
+    print_u64(device_id);
+    print_str(b" published=");
+    print_u64(published as u64);
     print_str(b"\n");
 }
 

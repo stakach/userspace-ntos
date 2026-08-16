@@ -12330,6 +12330,38 @@ pub(crate) fn device_object_id(device_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
+fn nt_path_ascii(path: &NtPath) -> Option<Vec<u8>> {
+    let units = path.to_units();
+    let mut out = Vec::new();
+    out.try_reserve_exact(units.len()).ok()?;
+    for unit in units {
+        if unit == 0 || unit > 0x7f {
+            return None;
+        }
+        out.push(unit as u8);
+    }
+    Some(out)
+}
+
+fn hosted_video_object_number_from_path(path: &[u8]) -> Option<u32> {
+    let prefix = nt_video_miniport::VIDEO_DEVICE_PATH_PREFIX.as_bytes();
+    if path.len() <= prefix.len()
+        || !path[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        return None;
+    }
+    let mut value = 0u32;
+    for &digit in &path[prefix.len()..] {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add((digit - b'0') as u32)?;
+    }
+    Some(value)
+}
+
 /// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
 #[derive(Clone, Copy)]
 pub(crate) struct DriverInstance {
@@ -12590,6 +12622,15 @@ pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
         .driver(DriverId(driver_id))
         .map(|driver| driver.object_id.0)
         .unwrap_or(0)
+}
+
+pub(crate) struct HostedVideoRouteInfo {
+    pub(crate) driver_id: u64,
+    pub(crate) device_id: u64,
+    pub(crate) device_object_id: u64,
+    pub(crate) object_number: u32,
+    pub(crate) driver_object_path: Vec<u8>,
+    pub(crate) device_path: Vec<u8>,
 }
 
 fn clear_instance(i: usize) {
@@ -13776,6 +13817,38 @@ pub(crate) fn device_id_by_name(path: &str) -> Option<u64> {
     io_manager_mut()
         .device_id_by_name(&path)
         .map(|device_id| device_id.raw())
+}
+
+pub(crate) fn hosted_video_route_info(device_id: u64) -> Option<HostedVideoRouteInfo> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)?;
+    if unsafe { !hosted_instance_video_port_initialized(inst) } {
+        return None;
+    }
+    let io = io_manager_mut();
+    let device = io.device(nt_io_manager::DeviceId(device_id))?;
+    if device.device_type.0 != nt_video_miniport::FILE_DEVICE_VIDEO {
+        return None;
+    }
+    let device_path = nt_path_ascii(device.name.as_ref()?)?;
+    let object_number = hosted_video_object_number_from_path(&device_path)?;
+    let device_object_id = device.object_id.0;
+    let driver = io.driver(DriverId(binding.driver_id))?;
+    let driver_object_path = nt_path_ascii(&driver.name)?;
+    Some(HostedVideoRouteInfo {
+        driver_id: binding.driver_id,
+        device_id,
+        device_object_id,
+        object_number,
+        driver_object_path,
+        device_path,
+    })
+}
+
+pub(crate) fn hosted_driver_video_port_initialized(driver_id: u64) -> bool {
+    instance_by_driver_id(driver_id)
+        .map(|(_, inst)| unsafe { hosted_instance_video_port_initialized(inst) })
+        .unwrap_or(false)
 }
 
 /// Whether the driver-declared `\Device\NamedPipe` route is ready to serve IRPs.

@@ -25048,8 +25048,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let mut generic_hw_dma_common = false;
         let mut generic_hw_io_out32 = false;
         let mut generic_hw_root_started = false;
+        let mut generic_hw_video_route_published = false;
         let mut generic_hw_attempted = 0u64;
         let mut generic_hw_started = 0u64;
+        let mut generic_hw_video_route_attempted = 0u64;
+        let mut generic_hw_video_route_published_count = 0u64;
         let mut generic_hw_first_error = 0u32;
         for spec in system_boot_driver_plan.as_slice() {
             let spec_devnodes = system_boot_driver_plan.devnodes_for(spec);
@@ -25092,8 +25095,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_dma_common |= start_report.dma_common;
                     generic_hw_io_out32 |= start_report.io_port_out32;
                     generic_hw_root_started |= start_report.root_started;
+                    generic_hw_video_route_published |= start_report.video_route_published;
                     generic_hw_attempted += start_report.attempted;
                     generic_hw_started += start_report.started;
+                    generic_hw_video_route_attempted += start_report.video_route_attempted_count;
+                    generic_hw_video_route_published_count +=
+                        start_report.video_route_published_count;
                     if generic_hw_first_error == 0 && start_report.first_error != 0 {
                         generic_hw_first_error = start_report.first_error;
                     }
@@ -25137,6 +25144,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(generic_hw_io_out32 as u64);
             print_str(b" root_started=");
             print_u64(generic_hw_root_started as u64);
+            print_str(b" video_route=");
+            print_u64(generic_hw_video_route_published as u64);
+            print_str(b" video_route_attempted=");
+            print_u64(generic_hw_video_route_attempted);
+            print_str(b" video_route_published=");
+            print_u64(generic_hw_video_route_published_count);
             print_str(b"\n");
         }
         if let Some((dc, driver_object_path)) = named_pipe_provider {
@@ -25892,10 +25905,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_common = false;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
+    let mut generic_hw_video_route_published = false;
     let mut generic_hw_selected = 0u64;
     let mut generic_hw_attempted = 0u64;
     let mut generic_hw_add_device_count = 0u64;
     let mut generic_hw_started = 0u64;
+    let mut generic_hw_video_route_attempted = 0u64;
+    let mut generic_hw_video_route_published_count = 0u64;
     let mut generic_hw_first_error = 0u32;
     let mut generic_root_attempted = 0u64;
     let mut generic_root_started = 0u64;
@@ -25982,6 +25998,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_hw_dma_common |= start_report.dma_common;
                     generic_hw_io_out32 |= start_report.io_port_out32;
                     generic_hw_root_started |= start_report.root_started;
+                    generic_hw_video_route_published |= start_report.video_route_published;
+                    generic_hw_video_route_attempted += start_report.video_route_attempted_count;
+                    generic_hw_video_route_published_count +=
+                        start_report.video_route_published_count;
                 } else {
                     print_str(
                         b"[driver-launch] registry-selected PnP driver launch returned None service=",
@@ -26027,6 +26047,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_root_started);
         print_str(b" io_out32=");
         print_u64(generic_hw_io_out32 as u64);
+        print_str(b" video_route=");
+        print_u64(generic_hw_video_route_published as u64);
+        print_str(b" video_route_attempted=");
+        print_u64(generic_hw_video_route_attempted);
+        print_str(b" video_route_published=");
+        print_u64(generic_hw_video_route_published_count);
         print_str(b"\n");
     }
     check(
