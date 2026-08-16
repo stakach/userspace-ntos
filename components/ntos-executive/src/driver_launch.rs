@@ -243,9 +243,11 @@ pub const SH_DPC_QUEUE_TAIL: u64 = 0x478; // out: bounded KDPC queue producer in
 pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: failed inserts due to full queue
 pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
 pub const SH_DPC_QUEUE_CAPACITY: u64 = 0x490; // out: active KDPC queue entries in the shared arena
-pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: optional support DriverEntry RVA relative to image base
-pub const SH_SUPPORT_DE_STATUS: u64 = 0x4B8; // out: support DriverEntry NTSTATUS
-pub const SH_SUPPORT_VERDICT: u64 = 0x4C0; // out: support DriverEntry verdict bits
+pub const SH_SUPPORT_ENTRY_COUNT: u64 = 0x498; // in: dependency support records to initialize
+pub const SH_SUPPORT_ENTRY_CAPACITY: u64 = 0x4A0; // in: dependency support record capacity
+pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: first support DriverEntry RVA, legacy mirror
+pub const SH_SUPPORT_DE_STATUS: u64 = 0x4B8; // out: aggregate support DriverEntry NTSTATUS
+pub const SH_SUPPORT_VERDICT: u64 = 0x4C0; // out: aggregate support DriverEntry verdict bits
 pub const SH_RESOURCE_INTERFACE_TYPE: u64 = 0x4C8; // in: granted INTERFACE_TYPE for bus APIs
 pub const SH_RESOURCE_BUS_NUMBER: u64 = 0x4D0; // in: granted bus number
 pub const SH_RESOURCE_ADDRESS: u64 = 0x4D8; // in: DevicePropertyAddress value
@@ -317,15 +319,24 @@ pub const SH_VIDEO_REGISTRY_COMMIT_FAILURES: u64 = 0xA28; // out: failed executi
 pub const SH_VIDEO_DISPI_SELECTED_INDEX: u64 = 0xA30; // out: last Bochs DISPI index-port write
 pub const SH_HANDOFF_ARENA_BASE: u64 = 0xA38;
 pub const SH_HANDOFF_ARENA_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
-pub const SH_DPC_QUEUE_BASE: u64 = SH_HANDOFF_ARENA_BASE; // out: queued KDPC pointers
+pub const SH_SUPPORT_RECORD_CAPACITY: u64 = 16;
+pub const SH_SUPPORT_RECORD_SIZE: u64 = 0x10;
+pub const SH_SUPPORT_RECORD_ENTRY_RVA: u64 = 0x00;
+pub const SH_SUPPORT_RECORD_STATUS: u64 = 0x08;
+pub const SH_SUPPORT_RECORD_VERDICT: u64 = 0x0C;
+pub const SH_SUPPORT_RECORDS: u64 = SH_HANDOFF_ARENA_BASE; // in/out: support DriverEntry records
+pub const SH_SUPPORT_RECORD_BYTES: u64 = SH_SUPPORT_RECORD_CAPACITY * SH_SUPPORT_RECORD_SIZE;
+pub const SH_DPC_QUEUE_BASE: u64 = SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
 pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
-    ((SH_HANDOFF_ARENA_LIMIT - SH_HANDOFF_ARENA_BASE) / 8) & !0x7;
+    ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
 pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 = SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
 pub const SH_DMA_ALLOC_RECORDS: u64 = SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
+const _: () = assert!(SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES <= SH_HANDOFF_ARENA_LIMIT);
+const _: () = assert!(SH_DPC_QUEUE_BASE > SH_SUPPORT_RECORDS);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
@@ -8420,6 +8431,12 @@ struct LoadedDependencyImage {
     image_len: u32,
 }
 
+#[derive(Clone, Copy)]
+struct LoadedSupportImages {
+    count: u32,
+    first_entry_rva: u64,
+}
+
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
@@ -8434,6 +8451,40 @@ unsafe fn clear_hosted_dependency_images() {
     if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
         images.clear();
     }
+}
+
+unsafe fn clear_support_image_records(shared_va: u64) {
+    write_volatile((shared_va + SH_SUPPORT_ENTRY_COUNT) as *mut u32, 0);
+    write_volatile(
+        (shared_va + SH_SUPPORT_ENTRY_CAPACITY) as *mut u32,
+        SH_SUPPORT_RECORD_CAPACITY as u32,
+    );
+    write_volatile((shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64, 0);
+    write_volatile((shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
+    write_volatile((shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
+    let mut index = 0u64;
+    while index < SH_SUPPORT_RECORD_CAPACITY {
+        let record = shared_va + SH_SUPPORT_RECORDS + index * SH_SUPPORT_RECORD_SIZE;
+        write_volatile((record + SH_SUPPORT_RECORD_ENTRY_RVA) as *mut u64, 0);
+        write_volatile((record + SH_SUPPORT_RECORD_STATUS) as *mut i32, 0);
+        write_volatile((record + SH_SUPPORT_RECORD_VERDICT) as *mut u32, 0);
+        index += 1;
+    }
+}
+
+unsafe fn write_support_image_record(
+    shared_va: u64,
+    index: u32,
+    entry_rva: u64,
+) -> Option<()> {
+    if index as u64 >= SH_SUPPORT_RECORD_CAPACITY {
+        return None;
+    }
+    let record = shared_va + SH_SUPPORT_RECORDS + index as u64 * SH_SUPPORT_RECORD_SIZE;
+    write_volatile((record + SH_SUPPORT_RECORD_ENTRY_RVA) as *mut u64, entry_rva);
+    write_volatile((record + SH_SUPPORT_RECORD_STATUS) as *mut i32, 0);
+    write_volatile((record + SH_SUPPORT_RECORD_VERDICT) as *mut u32, 0);
+    Some(())
 }
 
 fn hosted_dependency_provider_matches(dep: LoadedDependencyImage, provider: &str) -> bool {
@@ -9419,6 +9470,10 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
             pool: pool_alloc,
             support_entry_rva_off: SH_SUPPORT_ENTRY_RVA,
+            support_count_off: SH_SUPPORT_ENTRY_COUNT,
+            support_records_off: SH_SUPPORT_RECORDS,
+            support_record_capacity: SH_SUPPORT_RECORD_CAPACITY,
+            support_record_size: SH_SUPPORT_RECORD_SIZE,
             support_status_off: SH_SUPPORT_DE_STATUS,
             support_verdict_off: SH_SUPPORT_VERDICT,
             default_major_function: fsd_invalid_device_request as *const () as u64,
@@ -10939,23 +10994,37 @@ unsafe fn load_hosted_dependency_images(
     primary_src_size: u32,
     code_va: u64,
     run_va: u64,
+    shared_va: u64,
     img_frames: u64,
     rights: &mut [u64],
-) -> Option<u64> {
+) -> Option<LoadedSupportImages> {
     clear_hosted_dependency_images();
+    clear_support_image_records(shared_va);
 
     let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
     raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
     if providers.is_empty() {
-        return Some(0);
+        return Some(LoadedSupportImages {
+            count: 0,
+            first_entry_rva: 0,
+        });
     }
     let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
     let mut dep_offset = align_up_4k(primary_image_len)?;
-    let mut first_support_entry = 0u64;
+    let mut support_images = LoadedSupportImages {
+        count: 0,
+        first_entry_rva: 0,
+    };
     let mut idx = 0usize;
     while idx < providers.len() {
         let provider_name = providers[idx];
         let provider = provider_name.as_str();
+        if support_images.count as u64 >= SH_SUPPORT_RECORD_CAPACITY {
+            print_str(b"[driver-launch] dependency support record capacity exhausted before ");
+            print_str(provider.as_bytes());
+            print_str(b"\n");
+            return None;
+        }
         let dep_frame_offset = dep_offset / 0x1000;
         if dep_frame_offset >= img_frames {
             print_str(b"[driver-launch] dependency image window exhausted before ");
@@ -11000,13 +11069,16 @@ unsafe fn load_hosted_dependency_images(
         print_str(b" entry=0x");
         print_hex(dep_entry_rva);
         print_str(b"\n");
-        if first_support_entry == 0 {
-            first_support_entry = dep_offset + dep_entry_rva as u64;
+        let support_entry_rva = dep_offset + dep_entry_rva as u64;
+        write_support_image_record(shared_va, support_images.count, support_entry_rva)?;
+        if support_images.first_entry_rva == 0 {
+            support_images.first_entry_rva = support_entry_rva;
         }
+        support_images.count += 1;
         dep_offset = align_up_4k(dep_offset.checked_add(dep_image_len as u64)?)?;
         idx += 1;
     }
-    Some(first_support_entry)
+    Some(support_images)
 }
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
@@ -11141,8 +11213,16 @@ unsafe fn load_driver_reserved(
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
     let rights = Box::leak(Box::new([RW_NX; FSD_IMAGE_FRAMES as usize]));
-    let support_entry_rva =
-        load_hosted_dependency_images(fs, src_va, src_size, code_va, run_va, img_frames, rights)?;
+    let support_images = load_hosted_dependency_images(
+        fs,
+        src_va,
+        src_size,
+        code_va,
+        run_va,
+        win.shared_va,
+        img_frames,
+        rights,
+    )?;
     let (entry_rva, image_len) =
         load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
     let _ = register_system_module(path, code_va, image_len);
@@ -11153,8 +11233,16 @@ unsafe fn load_driver_reserved(
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
     write_volatile(
+        (win.shared_va + SH_SUPPORT_ENTRY_COUNT) as *mut u32,
+        support_images.count,
+    );
+    write_volatile(
+        (win.shared_va + SH_SUPPORT_ENTRY_CAPACITY) as *mut u32,
+        SH_SUPPORT_RECORD_CAPACITY as u32,
+    );
+    write_volatile(
         (win.shared_va + SH_SUPPORT_ENTRY_RVA) as *mut u64,
-        support_entry_rva,
+        support_images.first_entry_rva,
     );
     write_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *mut i32, 0);
     write_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *mut u32, 0);
@@ -11261,7 +11349,9 @@ unsafe fn load_driver_reserved(
     print_str(b" devobj=0x");
     print_hex((devobj >> 32) as u32);
     print_hex(devobj as u32);
-    if support_entry_rva != 0 {
+    if support_images.count != 0 {
+        print_str(b" support_count=");
+        print_u64(support_images.count as u64);
         print_str(b" support_status=0x");
         print_hex(support_status as u32);
         print_str(b" support_verdict=0x");

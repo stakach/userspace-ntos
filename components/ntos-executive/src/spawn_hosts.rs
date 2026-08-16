@@ -1931,6 +1931,15 @@ pub(crate) struct DriverObjectSpec {
     /// `code_va`. `u64::MAX` disables support-driver initialization for hosted kinds that do not use
     /// dependency images.
     pub support_entry_rva_off: u64,
+    /// Optional shared-frame offset containing the number of support records to initialize.
+    pub support_count_off: u64,
+    /// Optional shared-frame offset containing support records. Each record is
+    /// `[entry_rva: u64, status: i32, verdict: u32]`.
+    pub support_records_off: u64,
+    /// Maximum support records available at `support_records_off`.
+    pub support_record_capacity: u64,
+    /// Bytes between support records.
+    pub support_record_size: u64,
     /// Optional shared-frame offset receiving the support image `DriverEntry` status.
     pub support_status_off: u64,
     /// Optional shared-frame offset receiving support image verdict bits.
@@ -1947,6 +1956,134 @@ pub(crate) struct DispatchReq {
     /// The dispatch selector: IRP major (Irp) or SSN (Syscall).
     pub sel: u64,
     pub drv: u64,
+}
+
+const STATUS_INVALID_PARAMETER_I32: i32 = 0xC000_000D_u32 as i32;
+
+unsafe fn component_support_count(
+    shared_va: u64,
+    spec: DriverObjectSpec,
+    legacy_entry_rva: u64,
+) -> u64 {
+    if spec.support_count_off == u64::MAX {
+        if legacy_entry_rva == 0 {
+            0
+        } else {
+            1
+        }
+    } else {
+        core::ptr::read_volatile((shared_va + spec.support_count_off) as *const u32) as u64
+    }
+}
+
+unsafe fn component_support_record_offsets(
+    spec: DriverObjectSpec,
+    index: u64,
+) -> Option<(u64, u64, u64)> {
+    if spec.support_records_off != u64::MAX
+        && spec.support_record_size >= 0x10
+        && index < spec.support_record_capacity
+    {
+        let record = spec.support_records_off + index * spec.support_record_size;
+        return Some((record, record + 0x08, record + 0x0C));
+    }
+    if index == 0
+        && spec.support_entry_rva_off != u64::MAX
+        && spec.support_status_off != u64::MAX
+        && spec.support_verdict_off != u64::MAX
+    {
+        return Some((
+            spec.support_entry_rva_off,
+            spec.support_status_off,
+            spec.support_verdict_off,
+        ));
+    }
+    None
+}
+
+unsafe fn component_write_support_aggregate(
+    shared_va: u64,
+    spec: DriverObjectSpec,
+    status: i32,
+    verdict: u32,
+) {
+    if spec.support_status_off != u64::MAX {
+        core::ptr::write_volatile((shared_va + spec.support_status_off) as *mut i32, status);
+    }
+    if spec.support_verdict_off != u64::MAX {
+        core::ptr::write_volatile((shared_va + spec.support_verdict_off) as *mut u32, verdict);
+    }
+}
+
+unsafe fn component_run_support_entries(
+    shared_va: u64,
+    code_va: u64,
+    spec: DriverObjectSpec,
+    legacy_entry_rva: u64,
+) -> i32 {
+    let support_count = component_support_count(shared_va, spec, legacy_entry_rva);
+    if support_count == 0 {
+        component_write_support_aggregate(shared_va, spec, 0, 0);
+        return 0;
+    }
+    if spec.support_record_capacity != 0 && support_count > spec.support_record_capacity {
+        component_write_support_aggregate(
+            shared_va,
+            spec,
+            STATUS_INVALID_PARAMETER_I32,
+            crate::driver_launch::V_ENTERED,
+        );
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+
+    let mut aggregate_verdict = 0u32;
+    let mut aggregate_status = 0i32;
+    let mut index = 0u64;
+    while index < support_count {
+        let Some((entry_rva_off, status_off, verdict_off)) =
+            component_support_record_offsets(spec, index)
+        else {
+            aggregate_status = STATUS_INVALID_PARAMETER_I32;
+            break;
+        };
+        let entry_rva = if spec.support_records_off == u64::MAX {
+            legacy_entry_rva
+        } else {
+            core::ptr::read_volatile((shared_va + entry_rva_off) as *const u64)
+        };
+        if entry_rva == 0 {
+            aggregate_status = STATUS_INVALID_PARAMETER_I32;
+            break;
+        }
+
+        let verdict_va = shared_va + verdict_off;
+        let status_va = shared_va + status_off;
+        let mut verdict = crate::driver_launch::V_ENTERED;
+        aggregate_verdict |= crate::driver_launch::V_ENTERED;
+        core::ptr::write_volatile(verdict_va as *mut u32, verdict);
+
+        let (support_drv, support_reg_path) = component_driver_entry_context(spec);
+        let support_entry = code_va + entry_rva;
+        let support_de: extern "win64" fn(u64, u64) -> i32 =
+            core::mem::transmute(support_entry as *const ());
+        aggregate_status = support_de(support_drv, support_reg_path);
+        core::ptr::write_volatile(status_va as *mut i32, aggregate_status);
+        verdict |= crate::driver_launch::V_RETURNED;
+        aggregate_verdict |= crate::driver_launch::V_RETURNED;
+        if aggregate_status == 0 {
+            verdict |= crate::driver_launch::V_SUCCESS;
+        }
+        core::ptr::write_volatile(verdict_va as *mut u32, verdict);
+        if aggregate_status != 0 {
+            break;
+        }
+        index += 1;
+    }
+    if aggregate_status == 0 && index == support_count {
+        aggregate_verdict |= crate::driver_launch::V_SUCCESS;
+    }
+    component_write_support_aggregate(shared_va, spec, aggregate_status, aggregate_verdict);
+    aggregate_status
 }
 
 /// The component-side shared entry (Family A): read the DriverEntry RVA from the shared frame, build
@@ -1977,36 +2114,9 @@ pub(crate) unsafe fn component_main(
     } else {
         core::ptr::read_volatile((shared_va + spec.support_entry_rva_off) as *const u64)
     };
-    let mut status = 0;
-    if support_entry_rva != 0 {
-        let (support_drv, support_reg_path) = component_driver_entry_context(spec);
-        if spec.support_verdict_off != u64::MAX {
-            core::ptr::write_volatile(
-                (shared_va + spec.support_verdict_off) as *mut u32,
-                crate::driver_launch::V_ENTERED,
-            );
-        }
-        let support_entry = code_va + support_entry_rva;
-        let support_de: extern "win64" fn(u64, u64) -> i32 =
-            core::mem::transmute(support_entry as *const ());
-        status = support_de(support_drv, support_reg_path);
-        if spec.support_status_off != u64::MAX {
-            core::ptr::write_volatile((shared_va + spec.support_status_off) as *mut i32, status);
-        }
-        if spec.support_verdict_off != u64::MAX {
-            let mut support_v =
-                core::ptr::read_volatile((shared_va + spec.support_verdict_off) as *const u32);
-            support_v |= crate::driver_launch::V_RETURNED;
-            if status == 0 {
-                support_v |= crate::driver_launch::V_SUCCESS;
-            }
-            core::ptr::write_volatile(
-                (shared_va + spec.support_verdict_off) as *mut u32,
-                support_v,
-            );
-        }
-    }
+    let mut status = component_run_support_entries(shared_va, code_va, spec, support_entry_rva);
 
+    let mut primary_ran = false;
     if status == 0 {
         core::ptr::write_volatile(
             (shared_va + SH_VERDICT_H) as *mut u32,
@@ -2014,20 +2124,23 @@ pub(crate) unsafe fn component_main(
         );
         let entry = code_va + entry_rva as u64;
         let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
+        primary_ran = true;
         status = de(drv, reg_path);
     }
 
     let mj_base = drv + spec.mj;
     let mj_create = core::ptr::read_unaligned(mj_base as *const u64);
     let mut v = core::ptr::read_volatile((shared_va + SH_VERDICT_H) as *const u32);
-    v |= crate::driver_launch::V_RETURNED;
-    if status == 0 {
-        v |= crate::driver_launch::V_SUCCESS;
-    }
-    if mj_create != 0
-        && (spec.default_major_function == 0 || mj_create != spec.default_major_function)
-    {
-        v |= crate::driver_launch::V_MJ;
+    if primary_ran {
+        v |= crate::driver_launch::V_RETURNED;
+        if status == 0 {
+            v |= crate::driver_launch::V_SUCCESS;
+        }
+        if mj_create != 0
+            && (spec.default_major_function == 0 || mj_create != spec.default_major_function)
+        {
+            v |= crate::driver_launch::V_MJ;
+        }
     }
     core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, v);
     core::ptr::write_volatile((shared_va + SH_DE_STATUS_H) as *mut i32, status);
