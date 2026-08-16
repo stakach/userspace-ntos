@@ -7427,22 +7427,35 @@ unsafe fn ldr_entry_contains_address(entry: u64, address: u64) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn find_ldr_entry_for_address(address: u64) -> u64 {
+unsafe fn ldr_entry_is_threaded(ldr: u64, entry: u64, head_off: u64, node_off: u64) -> bool {
+    if ldr == 0 || entry == 0 {
+        return false;
+    }
+    let head = ldr + head_off;
+    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    let mut guard = 0usize;
+    while cur != 0 && cur != head && guard < 4096 {
+        if cur.saturating_sub(node_off) == entry {
+            return true;
+        }
+        cur = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+        guard += 1;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_ldr_entry_for_address_in_list(address: u64, head_off: u64, node_off: u64) -> u64 {
     let ldr = unsafe { current_peb_ldr() };
     if ldr == 0 {
         return 0;
     }
-    // EntryInProgress is at PEB_LDR_DATA+0x40.
-    let in_progress = unsafe { core::ptr::read_unaligned((ldr + 0x40) as *const u64) };
-    if unsafe { ldr_entry_contains_address(in_progress, address) } {
-        return in_progress;
-    }
 
-    let head = ldr + 0x20; // PEB_LDR_DATA.InMemoryOrderModuleList
+    let head = ldr + head_off;
     let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
     let mut guard = 0usize;
     while cur != 0 && cur != head && guard < 4096 {
-        let entry = cur.saturating_sub(LDR_IN_MEMORY_ORDER_LINKS);
+        let entry = cur.saturating_sub(node_off);
         if unsafe { ldr_entry_contains_address(entry, address) } {
             return entry;
         }
@@ -7450,6 +7463,36 @@ unsafe fn find_ldr_entry_for_address(address: u64) -> u64 {
         guard += 1;
     }
     0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_ldr_entry_for_address(address: u64) -> u64 {
+    let ldr = unsafe { current_peb_ldr() };
+    if ldr == 0 {
+        return 0;
+    }
+    // `LdrFindEntryForAddress` checks EntryInProgress first, but our process loader always threads
+    // an entry before calling its initializers. Do not trust a clobbered transient pointer unless it
+    // is one of the published loader-list entries.
+    let in_progress = unsafe { core::ptr::read_unaligned((ldr + 0x40) as *const u64) };
+    if unsafe {
+        ldr_entry_is_threaded(
+            ldr,
+            in_progress,
+            0x20, // PEB_LDR_DATA.InMemoryOrderModuleList
+            LDR_IN_MEMORY_ORDER_LINKS,
+        ) && ldr_entry_contains_address(in_progress, address)
+    } {
+        return in_progress;
+    }
+
+    unsafe {
+        find_ldr_entry_for_address_in_list(
+            address,
+            0x20, // PEB_LDR_DATA.InMemoryOrderModuleList
+            LDR_IN_MEMORY_ORDER_LINKS,
+        )
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -16774,7 +16817,14 @@ pub unsafe extern "system" fn rtl_pc_to_file_header(
 ) -> *mut c_void {
     #[cfg(target_arch = "x86_64")]
     let image_base = unsafe {
-        let entry = find_ldr_entry_for_address(pc_value as u64);
+        // ReactOS' `RtlPcToFileHeader` walks InLoadOrder directly; it does not consult
+        // PEB_LDR_DATA.EntryInProgress. Keeping this path list-only avoids letting stale transient
+        // loader state break `GetModuleHandleEx(...FROM_ADDRESS...)`.
+        let entry = find_ldr_entry_for_address_in_list(
+            pc_value as u64,
+            0x10, // PEB_LDR_DATA.InLoadOrderModuleList
+            LDR_IN_LOAD_ORDER_LINKS,
+        );
         if entry == 0 {
             core::ptr::null_mut()
         } else {

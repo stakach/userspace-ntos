@@ -36,9 +36,30 @@ scaffolding again on the Rust ntdll, with Dbgk debugger-control proofing now cov
 edits, trap-flag single-step, and seL4-backed hardware breakpoints. The executive no longer contains
 live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that still emits those tags
 is using a stale binary or stale branch state. The callback/transport gates now assert live
-invariants from the real workload.
+invariants from the real workload. The latest ntdll loader-list cleanup also removes the stale
+`PEB_LDR_DATA.EntryInProgress` dependency from `RtlPcToFileHeader`, which unblocked the dynamic
+`userinit.exe` to `explorer.exe` shell path without adding kernel launch policy.
 
 Latest accepted desktop proof (2026-08-16):
+`.tmp/run-headless-ntdll-rtlpc-20260816.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after `RtlPcToFileHeader` was moved to ReactOS/NT-style
+direct `InLoadOrderModuleList` lookup and `LdrFindEntryForAddress` was hardened to trust
+`EntryInProgress` only when it is one of the published loader-list entries. The previous
+`userinit.exe` quiesce in `GetModuleHandleEx(...FROM_ADDRESS...)` is gone: `WlxActivateUserShell`
+reads the real `Userinit` SOFTWARE value, `userinit.exe` and `explorer.exe` spawn dynamically,
+Explorer opens shell COM classes, redirects 668 real api0 callbacks, installs client WndProcs,
+flushes 246 GDI user batches, and `exec_explorer_shell_chrome_painted` passes. `[explorer-fb]`
+reports `786432/786432` non-background pixels with at least 32 distinct non-background colors, and
+the pool gate remains healthy (`ut-free=69651KiB`, `exec-heap-free=8623KiB`, no image-bank,
+registry, ASID, or VM allocation failures). The same proof keeps the B3 driver frontier alive:
+registry-ordered `Ndis`, `Tcpip`, `Afd`, and `Netio` all return successful `DriverEntry` results,
+the PCI `E1000` devnode starts through generic AddDevice/StartDevice, and the evidence includes
+MMIO, interrupt/DPC, DMA common-buffer, and 32-bit port-output activity. Validation for this slice:
+`cargo fmt --all`, `cargo test -p nt-ntdll`, `./scripts/build_ntdll_dll.sh`, and the serialized
+headless boot proof. Review adjustment: B3 can now continue at the real packet data-plane frontier
+instead of treating userinit/explorer launch as a kernel-side special case.
+
+Previous accepted B3 network proof (2026-08-16):
 `.tmp/run-headless-b3-network-stack-select-20260816.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the boot/system driver selector admitted only
 registry-declared no-devnode NT5 network wrapper/transport groups, the hosted driver image lane was
