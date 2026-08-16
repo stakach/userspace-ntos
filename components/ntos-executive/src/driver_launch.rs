@@ -432,6 +432,7 @@ pub const FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL: u64 = 0x772;
 pub const FSD_SERVICE_KE_WAIT_SINGLE_LABEL: u64 = 0x773;
 pub const FSD_SERVICE_KE_SET_EVENT_LABEL: u64 = 0x774;
 pub const FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL: u64 = 0x775;
+pub const FSD_SERVICE_KE_PULSE_EVENT_LABEL: u64 = 0x776;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -447,6 +448,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
         FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             | FSD_SERVICE_KE_WAIT_SINGLE_LABEL
             | FSD_SERVICE_KE_SET_EVENT_LABEL
+            | FSD_SERVICE_KE_PULSE_EVENT_LABEL
             | FSD_SERVICE_KE_RELEASE_SEMAPHORE_LABEL
     )
 }
@@ -516,6 +518,7 @@ static HOSTED_DRIVER_WAIT_SINGLE_PARKED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_WOKEN: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_SINGLE_WAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SET_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_PULSE_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_RELEASE_SEMAPHORE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
@@ -7517,11 +7520,21 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
 }
 
 /// `LONG KePulseEvent(PRKEVENT, KPRIORITY, BOOLEAN)`.
-extern "win64" fn s_ke_pulse_event(event: u64, _increment: i32, _wait: u8) -> i32 {
+extern "win64" fn s_ke_pulse_event(event: u64, increment: i32, wait: u8) -> i32 {
     if event == 0 {
         return 0;
     }
-    unsafe { kevent::kevent_pulse(event as *mut u8) as i32 }
+    let packed = (increment as u32 as u64) | ((wait as u64) << 32);
+    let (_label, previous, _, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_KE_PULSE_EVENT_LABEL << 12) | 3,
+            event,
+            packed,
+            0,
+            0,
+        )
+    };
+    previous as u32 as i32
 }
 
 /// `LONG KeReadStateEvent(PRKEVENT)`.
@@ -16323,6 +16336,52 @@ pub(crate) fn service_hosted_driver_ke_set_event(
     let woken = wake_hosted_driver_waiters_for_instance(instance);
     if woken != 0 && request <= 8 {
         print_str(b"[driver-wait] KeSetEvent woke=");
+        print_u64(woken);
+        print_str(b" inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+    }
+    previous
+}
+
+pub(crate) fn service_hosted_driver_ke_pulse_event(
+    ch: &crate::spawn_hosts::PumpChannel,
+    event: u64,
+    active_reply_cap: u64,
+    caller_badge: u64,
+) -> i32 {
+    let request = HOSTED_DRIVER_PULSE_EVENT_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if event == 0 {
+        return 0;
+    }
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return 0;
+    };
+    let Some(exec_event) = component_to_exec_va_for_instance(instance, inst, event, 0x20) else {
+        if request <= 8 {
+            print_str(b"[driver-wait] KePulseEvent unmapped event inst=");
+            print_u64(instance as u64);
+            if caller_badge != 0 {
+                print_str(b" badge=");
+                print_u64(caller_badge);
+            }
+            print_str(b" event=0x");
+            print_hex((event >> 32) as u32);
+            print_hex(event as u32);
+            print_str(b"\n");
+        }
+        return 0;
+    };
+    let previous = unsafe { kevent::kevent_read_state(exec_event as *const u8) as i32 };
+    unsafe {
+        kevent::kevent_set(exec_event as *mut u8);
+    }
+    let woken = wake_hosted_driver_waiters_for_instance(instance);
+    unsafe {
+        kevent::kevent_clear(exec_event as *mut u8);
+    }
+    if woken != 0 && request <= 8 {
+        print_str(b"[driver-wait] KePulseEvent woke=");
         print_u64(woken);
         print_str(b" inst=");
         print_u64(instance as u64);

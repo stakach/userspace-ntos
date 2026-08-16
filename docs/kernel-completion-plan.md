@@ -6378,9 +6378,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   wait/pipe/dbgk reply pool. Infinite `KeWaitForSingleObject` requests from hosted worker TCBs
   withhold the currently bound component reply cap, rotate the pump to a fresh driver-owned cap,
   mark the host-tested system-thread handle waiting, and later resume the worker through a
-  component-plane reply when `KeSetEvent` or `KeReleaseSemaphore` makes the raw
-  `KEVENT`/`KSEMAPHORE` header ready. Zero-timeout polls still return `STATUS_TIMEOUT`; finite timed
-  waits remain fail-closed `STATUS_NOT_IMPLEMENTED` until a driver-owned timer queue exists.
+  component-plane reply when `KeSetEvent`, `KePulseEvent`, or `KeReleaseSemaphore` makes the raw
+  `KEVENT`/`KSEMAPHORE` header ready. Pulse is handled as set-wake-clear at the executive boundary,
+  so parked waiters observe the pulse while the final inline event state remains clear. Zero-timeout
+  polls still return `STATUS_TIMEOUT`; finite timed waits remain fail-closed `STATUS_NOT_IMPLEMENTED`
+  until a driver-owned timer queue exists.
   Validation: `cargo fmt --all`, `cargo test -p nt-kernel-exec`, executive
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: next B3 work is timed hosted
