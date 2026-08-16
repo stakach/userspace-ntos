@@ -620,25 +620,32 @@ unsafe fn inject_proof_interrupt(
 ) {
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
         if evidence.mmio_mapped() && evidence.interrupt_connected() {
-            let Some(window) = root_window_for_evidence(evidence) else {
-                return;
-            };
-            core::ptr::write_volatile(
-                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *mut u32,
-                0,
-            );
-            core::ptr::write_volatile(
-                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET) as *mut u32,
-                1,
-            );
+            let ack_window = root_window_for_evidence(evidence);
+            if let Some(window) = ack_window {
+                core::ptr::write_volatile(
+                    (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *mut u32,
+                    0,
+                );
+                core::ptr::write_volatile(
+                    (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET) as *mut u32,
+                    1,
+                );
+            }
             match driver_launch::inject_hosted_device_interrupt(device_id) {
                 Ok(delivery) => {
-                    let ack = core::ptr::read_volatile(
-                        (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET) as *const u32,
-                    );
-                    report.interrupt_acknowledged |= ack == 1;
-                    if ack == 1 {
-                        report.interrupt_acknowledged_count += 1;
+                    let ack = ack_window
+                        .map(|window| {
+                            core::ptr::read_volatile(
+                                (window.mmio_seed_va + ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET)
+                                    as *const u32,
+                            )
+                        })
+                        .unwrap_or(0);
+                    if ack_window.is_some() {
+                        report.interrupt_acknowledged |= ack == 1;
+                        if ack == 1 {
+                            report.interrupt_acknowledged_count += 1;
+                        }
                     }
                     print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
                 }

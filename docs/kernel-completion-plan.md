@@ -3855,6 +3855,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   NDIS/e1000 data-plane behavior; the resource projection no longer assumes only one active hosted
   devnode per driver instance.
 
+- B3 generic hosted interrupt injection cleanup (2026-08-16). The config-PnP proof interrupt path no
+  longer requires a root proof-device MMIO acknowledgement window before dispatching a connected
+  hosted interrupt. The executive now delivers the test interrupt to any hosted devnode that has
+  connected through `IoConnectInterrupt`; the root DMA proof window is used only as optional
+  acknowledgement instrumentation for the synthetic root device. This restores the real
+  registry-selected ReactOS E1000/NDIS ISR path without service-specific branching: E1000's
+  `ndis.sys` service routine calls the miniport ISR, the miniport claims a pending cause, and the
+  NDIS KDPC bottom half runs through the generic DPC queue. Validation: `cargo fmt --all`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-b3-generic-interrupt-inject.log`, which reaches `296/296` with
+  `generic hardware interrupt delivery service=E1000 ... claimed=1`, E1000 evidence
+  `int_delivered=1 int_count=1 dpc=1 dpc_count=1 dpc_drops=0`, and
+  `exec_explorer_shell_chrome_painted` green. Review adjustment: B3's next frontier is the real
+  packet/data-plane side of NDIS/e1000 rather than merely proving interrupt delivery.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same
