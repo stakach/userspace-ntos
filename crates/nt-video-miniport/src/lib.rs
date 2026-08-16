@@ -30,6 +30,7 @@ pub const VIDEO_WIN32K_CALLBACKS_SIZE_X64: usize = 40;
 pub const VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE: usize = 64;
 pub const VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE: usize = 140;
 pub const VIDEO_HW_INITIALIZATION_DATA_X64_SIZE: usize = 144;
+pub const VIDEO_ACCESS_RANGE_X64_SIZE: usize = 16;
 pub const VIDEO_REQUEST_PACKET_X64_SIZE: usize = 48;
 pub const VIDEO_STATUS_BLOCK_X64_SIZE: usize = 16;
 
@@ -157,6 +158,71 @@ impl VideoHwInitializationDataX64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoRequestPacketError {
     BufferTooSmall { needed: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoAccessRangeError {
+    BufferTooSmall { needed: usize },
+}
+
+/// x64 `VIDEO_ACCESS_RANGE` used by `VideoPortGetAccessRanges` and
+/// `VideoPortVerifyAccessRanges`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoAccessRangeX64 {
+    pub range_start: u64,
+    pub range_length: u32,
+    pub range_in_io_space: bool,
+    pub range_visible: bool,
+    pub range_shareable: bool,
+    pub range_passive: u8,
+}
+
+impl VideoAccessRangeX64 {
+    pub fn memory(range_start: u64, range_length: u32) -> Self {
+        Self {
+            range_start,
+            range_length,
+            range_in_io_space: false,
+            range_visible: false,
+            range_shareable: false,
+            range_passive: 0,
+        }
+    }
+
+    pub fn io(range_start: u64, range_length: u32) -> Self {
+        Self {
+            range_start,
+            range_length,
+            range_in_io_space: true,
+            range_visible: false,
+            range_shareable: false,
+            range_passive: 0,
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, VideoAccessRangeError> {
+        require_video_access_range_input(input, VIDEO_ACCESS_RANGE_X64_SIZE)?;
+        Ok(Self {
+            range_start: read_u64_raw(input, 0),
+            range_length: read_u32_raw(input, 8),
+            range_in_io_space: input[12] != 0,
+            range_visible: input[13] != 0,
+            range_shareable: input[14] != 0,
+            range_passive: input[15],
+        })
+    }
+
+    pub fn write(&self, output: &mut [u8]) -> Result<usize, VideoAccessRangeError> {
+        require_video_access_range_input(output, VIDEO_ACCESS_RANGE_X64_SIZE)?;
+        output[..VIDEO_ACCESS_RANGE_X64_SIZE].fill(0);
+        write_u64(output, 0, self.range_start);
+        write_u32(output, 8, self.range_length);
+        output[12] = self.range_in_io_space as u8;
+        output[13] = self.range_visible as u8;
+        output[14] = self.range_shareable as u8;
+        output[15] = self.range_passive;
+        Ok(VIDEO_ACCESS_RANGE_X64_SIZE)
+    }
 }
 
 /// x64 `VIDEO_REQUEST_PACKET` passed by videoprt to a miniport `HwStartIO`.
@@ -730,6 +796,17 @@ fn require_video_request_input(input: &[u8], needed: usize) -> Result<(), VideoR
     }
 }
 
+fn require_video_access_range_input(
+    input: &[u8],
+    needed: usize,
+) -> Result<(), VideoAccessRangeError> {
+    if input.len() < needed {
+        Err(VideoAccessRangeError::BufferTooSmall { needed })
+    } else {
+        Ok(())
+    }
+}
+
 fn millimeters_at_default_dpi(pixels: u32) -> u32 {
     ((pixels as u64 * 254 + (DEFAULT_DPI as u64 * 5)) / (DEFAULT_DPI as u64 * 10)) as u32
 }
@@ -1080,6 +1157,45 @@ mod tests {
         assert_eq!(
             VideoHwInitializationDataX64::parse(&data[..VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE]),
             Err(VideoHwInitializationDataError::MissingRequiredCallback)
+        );
+    }
+
+    #[test]
+    fn video_access_range_uses_x64_layout() {
+        let range = VideoAccessRangeX64 {
+            range_start: 0x0000_0000_F000_0000,
+            range_length: 0x1000,
+            range_in_io_space: true,
+            range_visible: false,
+            range_shareable: true,
+            range_passive: 2,
+        };
+        let mut raw = [0xCCu8; VIDEO_ACCESS_RANGE_X64_SIZE];
+        assert_eq!(range.write(&mut raw).unwrap(), VIDEO_ACCESS_RANGE_X64_SIZE);
+
+        assert_eq!(u64_at(&raw, 0), 0x0000_0000_F000_0000);
+        assert_eq!(u32_at(&raw, 8), 0x1000);
+        assert_eq!(raw[12], 1);
+        assert_eq!(raw[13], 0);
+        assert_eq!(raw[14], 1);
+        assert_eq!(raw[15], 2);
+        assert_eq!(VideoAccessRangeX64::parse(&raw).unwrap(), range);
+    }
+
+    #[test]
+    fn video_access_range_rejects_small_buffers() {
+        let mut raw = [0u8; VIDEO_ACCESS_RANGE_X64_SIZE - 1];
+        assert_eq!(
+            VideoAccessRangeX64::memory(0xE000_0000, 0x1000).write(&mut raw),
+            Err(VideoAccessRangeError::BufferTooSmall {
+                needed: VIDEO_ACCESS_RANGE_X64_SIZE
+            })
+        );
+        assert_eq!(
+            VideoAccessRangeX64::parse(&raw),
+            Err(VideoAccessRangeError::BufferTooSmall {
+                needed: VIDEO_ACCESS_RANGE_X64_SIZE
+            })
         );
     }
 

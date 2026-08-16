@@ -2119,7 +2119,9 @@ const IRQ_VECTOR: u64 = 11;
 // x86 I/O-port invocation labels + the IOPortControl cap slot (canonical slot 7).
 const SLOT_IO_PORT_CONTROL: u64 = 7;
 const LBL_IOPORT_CONTROL_ISSUE: u64 = 57;
+const LBL_IOPORT_IN16: u64 = 59;
 const LBL_IOPORT_IN32: u64 = 60;
+const LBL_IOPORT_OUT16: u64 = 62;
 const LBL_IOPORT_OUT32: u64 = 63;
 // PCI configuration-space access ports (0xCF8 address, 0xCFC data).
 const PCI_CONFIG_ADDR: u16 = 0xCF8;

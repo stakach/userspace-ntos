@@ -47,8 +47,9 @@ use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 use nt_video_miniport::{
-    VideoHwInitializationDataError, VideoHwInitializationDataVersion,
-    VideoHwInitializationDataX64, VIDEO_HW_INITIALIZATION_DATA_X64_SIZE,
+    VideoAccessRangeX64, VideoHwInitializationDataError, VideoHwInitializationDataVersion,
+    VideoHwInitializationDataX64, VIDEO_ACCESS_RANGE_X64_SIZE,
+    VIDEO_HW_INITIALIZATION_DATA_X64_SIZE,
 };
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
@@ -2718,6 +2719,12 @@ const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
+const VP_NO_ERROR: u32 = 0;
+const VP_ERROR_INVALID_FUNCTION: u32 = 1;
+const VP_ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const VP_ERROR_DEV_NOT_EXIST: u32 = 55;
+const VP_ERROR_INVALID_PARAMETER: u32 = 87;
+const VP_ERROR_MORE_DATA: u32 = 234;
 
 const UNICODE_STRING_LENGTH_OFFSET: u64 = 0;
 const UNICODE_STRING_MAXIMUM_LENGTH_OFFSET: u64 = 2;
@@ -6342,6 +6349,7 @@ const RTL_QUERY_REGISTRY_NOVALUE: u32 = 0x0000_0008;
 const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
 const REG_NONE: u32 = 0;
 const REG_SZ: u32 = 1;
+const REG_BINARY: u32 = 3;
 const KEY_VALUE_PARTIAL_INFORMATION_CLASS: u32 = 2;
 
 /// `NTSTATUS RtlQueryRegistryValues(...)` for hosted FSD service parameters.
@@ -7562,12 +7570,15 @@ struct HostedVideoPortInitialization {
     calls: u64,
     driver_object: u64,
     registry_path: u64,
+    registry_path_ascii: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     hw_context: u64,
     data: VideoHwInitializationDataX64,
 }
 
 static mut HOSTED_VIDEO_PORT_INITIALIZATION: Option<HostedVideoPortInitialization> = None;
 static mut HOSTED_VIDEO_PORT_INITIALIZE_CALLS: u64 = 0;
+const VIDEO_MEMORY_SPACE_IO: u32 = 0x1;
+const VIDEO_PORT_REGISTRY_VALUE_MAX: usize = 4096;
 
 extern "win64" fn s_video_port_zero_memory(destination: u64, length: u32) {
     if destination != 0 && length != 0 {
@@ -7586,6 +7597,395 @@ extern "win64" fn s_video_port_allocate_pool(
 
 extern "win64" fn s_video_port_free_pool(_hw_device_extension: u64, ptr: u64) {
     s_ex_free_pool(ptr);
+}
+
+fn range_within_grant(grant_start: u64, grant_len: u64, start: u64, len: u64) -> bool {
+    if grant_len == 0 || len == 0 || start < grant_start {
+        return false;
+    }
+    let offset = start - grant_start;
+    offset <= grant_len && len <= grant_len - offset
+}
+
+unsafe fn component_write_video_access_range(ptr: u64, range: VideoAccessRangeX64) {
+    let mut raw = [0u8; VIDEO_ACCESS_RANGE_X64_SIZE];
+    let _ = range.write(&mut raw);
+    let mut i = 0usize;
+    while i < raw.len() {
+        write_unaligned((ptr + i as u64) as *mut u8, raw[i]);
+        i += 1;
+    }
+}
+
+unsafe fn component_zero_video_access_range(ptr: u64) {
+    let mut i = 0usize;
+    while i < VIDEO_ACCESS_RANGE_X64_SIZE {
+        write_unaligned((ptr + i as u64) as *mut u8, 0);
+        i += 1;
+    }
+}
+
+unsafe fn component_read_video_access_range(ptr: u64) -> VideoAccessRangeX64 {
+    let mut raw = [0u8; VIDEO_ACCESS_RANGE_X64_SIZE];
+    let mut i = 0usize;
+    while i < raw.len() {
+        raw[i] = read_unaligned((ptr + i as u64) as *const u8);
+        i += 1;
+    }
+    VideoAccessRangeX64 {
+        range_start: u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]),
+        range_length: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        range_in_io_space: raw[12] != 0,
+        range_visible: raw[13] != 0,
+        range_shareable: raw[14] != 0,
+        range_passive: raw[15],
+    }
+}
+
+unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
+    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
+    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+    range_within_grant(grant_start, grant_len, start, len)
+}
+
+unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
+    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+    cap != 0 && range_within_grant(grant_start, grant_len, start, len)
+}
+
+unsafe fn hosted_video_range_granted(range: VideoAccessRangeX64) -> bool {
+    let len = range.range_length as u64;
+    if range.range_in_io_space {
+        hosted_io_range_granted(range.range_start, len)
+    } else {
+        hosted_memory_range_granted(range.range_start, len)
+    }
+}
+
+unsafe fn hosted_videoprt_pci_identity_matches(vendor_id: u64, device_id: u64) -> bool {
+    if vendor_id == 0 && device_id == 0 {
+        return true;
+    }
+    if read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+        != HOSTED_INTERFACE_TYPE_PCIBUS
+    {
+        return false;
+    }
+    let vendor_device =
+        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
+    let granted_vendor = (vendor_device & 0xFFFF) as u16;
+    let granted_device = (vendor_device >> 16) as u16;
+    if vendor_id != 0 && read_unaligned(vendor_id as *const u16) != granted_vendor {
+        return false;
+    }
+    if device_id != 0 && read_unaligned(device_id as *const u16) != granted_device {
+        return false;
+    }
+    true
+}
+
+/// `VP_STATUS VideoPortGetAccessRanges(...)` — publish the hardware ranges already granted by the
+/// executive PnP/resource path. Short legacy I/O grants are not returned as assigned ranges because
+/// ReactOS' Bochs miniport explicitly claims and verifies its two DISPI ports when the second range
+/// is empty.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn s_video_port_get_access_ranges(
+    _hw_device_extension: u64,
+    num_requested_resources: u32,
+    requested_resources: u64,
+    num_access_ranges: u32,
+    access_ranges: u64,
+    vendor_id: u64,
+    device_id: u64,
+    slot: u64,
+) -> u32 {
+    unsafe {
+        if !hosted_resource_identity_active()
+            || access_ranges == 0
+            || num_access_ranges == 0
+        {
+            return VP_ERROR_INVALID_PARAMETER;
+        }
+        if num_requested_resources != 0 || requested_resources != 0 {
+            return VP_ERROR_INVALID_FUNCTION;
+        }
+        if !hosted_videoprt_pci_identity_matches(vendor_id, device_id) {
+            return VP_ERROR_DEV_NOT_EXIST;
+        }
+        let mmio_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
+        let mmio_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        if mmio_phys == 0 || mmio_len == 0 || mmio_len > u32::MAX as u64 {
+            return VP_ERROR_DEV_NOT_EXIST;
+        }
+        let io_base = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+        let io_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+        let publish_io = io_len == 0x1000;
+        let required_ranges = if publish_io { 2 } else { 1 };
+        if num_access_ranges < required_ranges {
+            return VP_ERROR_MORE_DATA;
+        }
+
+        component_write_video_access_range(
+            access_ranges,
+            VideoAccessRangeX64::memory(mmio_phys, mmio_len as u32),
+        );
+        if num_access_ranges > 1 {
+            let second = access_ranges + VIDEO_ACCESS_RANGE_X64_SIZE as u64;
+            if publish_io {
+                if io_base > u16::MAX as u64 || io_len > u32::MAX as u64 {
+                    return VP_ERROR_INVALID_PARAMETER;
+                }
+                component_write_video_access_range(
+                    second,
+                    VideoAccessRangeX64::io(io_base, io_len as u32),
+                );
+            } else {
+                component_zero_video_access_range(second);
+            }
+        }
+        if slot != 0
+            && read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+                == HOSTED_INTERFACE_TYPE_PCIBUS
+        {
+            let (_address, dev, func) = hosted_pci_device_function();
+            write_unaligned(slot as *mut u32, dev | (func << 5));
+        }
+    }
+    VP_NO_ERROR
+}
+
+/// `VP_STATUS VideoPortVerifyAccessRanges(...)` — accept only ranges that fit wholly inside the
+/// current hosted resource grant.
+extern "win64" fn s_video_port_verify_access_ranges(
+    _hw_device_extension: u64,
+    num_access_ranges: u32,
+    access_ranges: u64,
+) -> u32 {
+    if num_access_ranges == 0 {
+        return VP_NO_ERROR;
+    }
+    if access_ranges == 0 {
+        return VP_ERROR_INVALID_PARAMETER;
+    }
+    unsafe {
+        if !hosted_resource_identity_active() {
+            return VP_ERROR_DEV_NOT_EXIST;
+        }
+        let mut idx = 0u32;
+        while idx < num_access_ranges {
+            let ptr = access_ranges + idx as u64 * VIDEO_ACCESS_RANGE_X64_SIZE as u64;
+            let range = component_read_video_access_range(ptr);
+            if !hosted_video_range_granted(range) {
+                return VP_ERROR_INVALID_PARAMETER;
+            }
+            idx += 1;
+        }
+    }
+    VP_NO_ERROR
+}
+
+/// `PVOID VideoPortGetDeviceBase(...)`.
+extern "win64" fn s_video_port_get_device_base(
+    _hw_device_extension: u64,
+    io_address: u64,
+    number_of_uchars: u32,
+    in_io_space: u8,
+) -> u64 {
+    if number_of_uchars == 0 {
+        return 0;
+    }
+    unsafe {
+        if (in_io_space as u32 & VIDEO_MEMORY_SPACE_IO) != 0 {
+            if hosted_io_range_granted(io_address, number_of_uchars as u64) {
+                io_address
+            } else {
+                0
+            }
+        } else {
+            s_mm_map_io_space(io_address, number_of_uchars as u64, 0)
+        }
+    }
+}
+
+/// `VP_STATUS VideoPortMapMemory(...)`.
+extern "win64" fn s_video_port_map_memory(
+    _hw_device_extension: u64,
+    physical_address: u64,
+    length: u64,
+    in_io_space: u64,
+    virtual_address: u64,
+) -> u32 {
+    if length == 0 || in_io_space == 0 || virtual_address == 0 {
+        return VP_ERROR_INVALID_PARAMETER;
+    }
+    unsafe {
+        let requested_len = read_unaligned(length as *const u32);
+        let space = read_unaligned(in_io_space as *const u32);
+        if requested_len == 0 {
+            return VP_ERROR_INVALID_PARAMETER;
+        }
+        let mapped = if (space & VIDEO_MEMORY_SPACE_IO) != 0 {
+            if hosted_io_range_granted(physical_address, requested_len as u64) {
+                physical_address
+            } else {
+                0
+            }
+        } else {
+            s_mm_map_io_space(physical_address, requested_len as u64, 0)
+        };
+        if mapped == 0 {
+            write_unaligned(virtual_address as *mut u64, 0);
+            return VP_ERROR_INVALID_PARAMETER;
+        }
+        write_unaligned(virtual_address as *mut u64, mapped);
+    }
+    VP_NO_ERROR
+}
+
+/// `VP_STATUS VideoPortUnmapMemory(...)`.
+extern "win64" fn s_video_port_unmap_memory(
+    _hw_device_extension: u64,
+    virtual_address: u64,
+    _process_handle: u64,
+) -> u32 {
+    if virtual_address != 0 {
+        s_mm_unmap_io_space(virtual_address, 0);
+    }
+    VP_NO_ERROR
+}
+
+extern "win64" fn s_video_port_read_register_ushort(register: u64) -> u16 {
+    unsafe { read_volatile(register as *const u16) }
+}
+
+extern "win64" fn s_video_port_write_register_ushort(register: u64, value: u16) {
+    unsafe {
+        write_volatile(register as *mut u16, value);
+    }
+}
+
+extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
+    unsafe {
+        if hosted_io_range_granted(port, 1) {
+            let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+            crate::io_in16(cap, port as u16)
+        } else {
+            0
+        }
+    }
+}
+
+extern "win64" fn s_video_port_write_port_ushort(port: u64, value: u16) {
+    unsafe {
+        if hosted_io_range_granted(port, 1) {
+            let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+            let _ = crate::io_out16(cap, port as u16, value);
+        }
+    }
+}
+
+fn hosted_video_registry_key_path(
+    identity: HostedDriverRegistryIdentity,
+) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    unsafe {
+        if let Some(initialization) = HOSTED_VIDEO_PORT_INITIALIZATION {
+            if !initialization.registry_path_ascii.is_empty() {
+                let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+                if path.push_str(initialization.registry_path_ascii.as_str())
+                    && path.push_str(r"\Device")
+                    && hosted_ascii_push_decimal_u32(
+                        &mut path,
+                        initialization.data.starting_device_number,
+                    )
+                {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    if !identity.has_driver_key() {
+        return None;
+    }
+    let key = identity.driver_key_name.as_str();
+    let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+    if !path.push_str(r"\Registry\Machine\System\CurrentControlSet\Control\") {
+        return None;
+    }
+    if ascii_prefix_eq_ignore_case(key, r"Class\") {
+        if !path.push_str(key) {
+            return None;
+        }
+    } else if !path.push_str(r"Class\") || !path.push_str(key) {
+        return None;
+    }
+    Some(path)
+}
+
+fn hosted_ascii_push_decimal_u32<const N: usize>(dst: &mut HostedAscii<N>, mut value: u32) -> bool {
+    let mut tmp = [0u8; 10];
+    let mut len = 1usize;
+    tmp[tmp.len() - 1] = b'0' + (value % 10) as u8;
+    value /= 10;
+    while value != 0 {
+        len += 1;
+        tmp[tmp.len() - len] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    let mut i = tmp.len() - len;
+    while i < tmp.len() {
+        if !dst.push_byte(tmp[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `VP_STATUS VideoPortSetRegistryParameters(...)` — write REG_BINARY hardware information under
+/// the active hosted display driver's class key.
+extern "win64" fn s_video_port_set_registry_parameters(
+    _hw_device_extension: u64,
+    value_name: u64,
+    value_data: u64,
+    value_length: u32,
+) -> u32 {
+    if value_name == 0 || (value_length != 0 && value_data == 0) {
+        return VP_ERROR_INVALID_PARAMETER;
+    }
+    if value_length as usize > VIDEO_PORT_REGISTRY_VALUE_MAX {
+        return VP_ERROR_MORE_DATA;
+    }
+    unsafe {
+        let Some(identity) = shared_registry_identity() else {
+            return VP_ERROR_DEV_NOT_EXIST;
+        };
+        let Some(key_path) = hosted_video_registry_key_path(identity) else {
+            return VP_ERROR_DEV_NOT_EXIST;
+        };
+        let Some(name) = wide_cstr_to_hosted_ascii::<HOSTED_DRIVER_KEY_NAME_MAX>(value_name) else {
+            return VP_ERROR_INVALID_PARAMETER;
+        };
+        let mut data = [0u8; VIDEO_PORT_REGISTRY_VALUE_MAX];
+        let mut i = 0usize;
+        while i < value_length as usize {
+            data[i] = read_unaligned((value_data + i as u64) as *const u8);
+            i += 1;
+        }
+        match crate::config_manager_set_value(
+            key_path.as_str(),
+            name.as_str(),
+            REG_BINARY,
+            &data[..value_length as usize],
+        ) {
+            Ok(()) => VP_NO_ERROR,
+            Err(status) if status == STATUS_INSUFFICIENT_RESOURCES => VP_ERROR_NOT_ENOUGH_MEMORY,
+            Err(_) => VP_ERROR_INVALID_PARAMETER,
+        }
+    }
 }
 
 unsafe fn read_video_hw_initialization_data(
@@ -7640,10 +8040,14 @@ extern "win64" fn s_video_port_initialize(
         }
         match read_video_hw_initialization_data(hw_initialization_data) {
             Ok(data) => {
+                let registry_path_ascii =
+                    unicode_string_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(context2, true)
+                        .unwrap_or_else(HostedAscii::empty);
                 HOSTED_VIDEO_PORT_INITIALIZATION = Some(HostedVideoPortInitialization {
                     calls: HOSTED_VIDEO_PORT_INITIALIZE_CALLS,
                     driver_object: context1,
                     registry_path: context2,
+                    registry_path_ascii,
                     hw_context,
                     data,
                 });
@@ -8297,6 +8701,32 @@ fn hosted_dependency_provider_dll(dll: &str) -> bool {
 fn lookup_videoprt_export(name: &str) -> Option<u64> {
     match name {
         "VideoPortInitialize" => Some(s_video_port_initialize as *const () as usize as u64),
+        "VideoPortGetAccessRanges" => {
+            Some(s_video_port_get_access_ranges as *const () as usize as u64)
+        }
+        "VideoPortVerifyAccessRanges" => {
+            Some(s_video_port_verify_access_ranges as *const () as usize as u64)
+        }
+        "VideoPortGetDeviceBase" => {
+            Some(s_video_port_get_device_base as *const () as usize as u64)
+        }
+        "VideoPortMapMemory" => Some(s_video_port_map_memory as *const () as usize as u64),
+        "VideoPortUnmapMemory" => Some(s_video_port_unmap_memory as *const () as usize as u64),
+        "VideoPortReadPortUshort" => {
+            Some(s_video_port_read_port_ushort as *const () as usize as u64)
+        }
+        "VideoPortWritePortUshort" => {
+            Some(s_video_port_write_port_ushort as *const () as usize as u64)
+        }
+        "VideoPortReadRegisterUshort" => {
+            Some(s_video_port_read_register_ushort as *const () as usize as u64)
+        }
+        "VideoPortWriteRegisterUshort" => {
+            Some(s_video_port_write_register_ushort as *const () as usize as u64)
+        }
+        "VideoPortSetRegistryParameters" => {
+            Some(s_video_port_set_registry_parameters as *const () as usize as u64)
+        }
         "VideoPortAllocatePool" => Some(s_video_port_allocate_pool as *const () as usize as u64),
         "VideoPortFreePool" => Some(s_video_port_free_pool as *const () as usize as u64),
         "VideoPortZeroMemory" | "VideoPortZeroDeviceMemory" => {

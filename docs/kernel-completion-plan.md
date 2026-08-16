@@ -3575,6 +3575,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   AddDevice/StartDevice to call the captured `HwFindAdapter`, `HwInitialize`, and `HwStartIO` through
   the typed VRP boundary.
 
+- B3 videoprt resource-export slice (2026-08-16). `nt-video-miniport` now owns the host-tested x64
+  `VIDEO_ACCESS_RANGE` layout, and the executive binds the staged ReactOS `bochsmp.sys`
+  `videoprt.sys` import set to real local behavior instead of unresolved scaffolding:
+  `VideoPortGetAccessRanges` publishes only the current PnP-granted MMIO range plus a full-size I/O
+  assignment when one exists, `VideoPortVerifyAccessRanges` validates requested memory/port ranges
+  against the same grant, `VideoPortGetDeviceBase`/`VideoPortMapMemory` route to the existing MMIO
+  projection or I/O-port token, `VideoPortRead/Write{Port,Register}Ushort` use real volatile MMIO or
+  seL4 IOPort-cap U16 calls, and `VideoPortSetRegistryParameters` writes REG_BINARY hardware info
+  under the captured miniport service `RegistryPath\\Device<N>` through the config-manager client.
+  Unsupported requested-resource descriptor translation still fails explicitly with
+  `ERROR_INVALID_FUNCTION`; no success fallback was added. Validation: `cargo fmt --all`,
+  `cargo test -p nt-video-miniport -- --nocapture`, `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  Review adjustment: the next B3 display slice should allocate the videoprt adapter/device
+  projection and drive the captured callbacks in order (`HwFindAdapter`, `HwInitialize`, then
+  `HwStartIO` for typed `VIDEO_REQUEST_PACKET`s), after which the temporary boot-framebuffer adapter
+  can be retired behind the same `VideoPort` boundary.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same
