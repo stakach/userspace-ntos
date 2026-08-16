@@ -74,9 +74,20 @@ struct Mapping {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum LogicalRangeKind {
+pub enum DmaLogicalRangeKind {
     CommonBuffer,
     TransferMapping,
+}
+
+/// One descriptor completed through an owner-scoped DMA translation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FixedDescriptorCompletion {
+    pub descriptor_index: u64,
+    pub descriptor_backing_va: u64,
+    pub buffer_logical: u64,
+    pub buffer_backing_va: u64,
+    pub transfer_length: u64,
+    pub range_kind: DmaLogicalRangeKind,
 }
 
 /// The result of `alloc_common_buffer`.
@@ -286,6 +297,32 @@ impl DmaManager {
         })
     }
 
+    /// Idempotently learn a broker-provided common buffer. Exact live replays return the
+    /// existing grant; overlaps or mismatched metadata still fail.
+    pub fn ensure_common_buffer_at(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        length: u64,
+        backing_va: u64,
+    ) -> Result<CommonBufferGrant, DmaError> {
+        if let Some(existing) = self.common_buffers.iter().find(|c| {
+            c.active
+                && c.owner == owner
+                && c.adapter_id == adapter_id
+                && c.logical_base == logical_base
+                && c.length == length
+                && c.backing_va == backing_va
+        }) {
+            return Ok(CommonBufferGrant {
+                common_buffer_id: existing.id,
+                logical_base,
+            });
+        }
+        self.register_common_buffer_at(owner, adapter_id, logical_base, length, backing_va)
+    }
+
     fn logical_range_in_use(&self, owner: DmaOwner, logical_base: u64, length: u64) -> bool {
         let Some(end) = logical_base.checked_add(length) else {
             return true;
@@ -364,7 +401,7 @@ impl DmaManager {
         owner: DmaOwner,
         logical: u64,
         length: u64,
-    ) -> Result<(u64, LogicalRangeKind), DmaError> {
+    ) -> Result<(u64, DmaLogicalRangeKind), DmaError> {
         for cb in self
             .common_buffers
             .iter()
@@ -378,7 +415,7 @@ impl DmaManager {
             if logical >= cb.logical_base && end <= cb_end {
                 return Ok((
                     cb.backing_va + (logical - cb.logical_base),
-                    LogicalRangeKind::CommonBuffer,
+                    DmaLogicalRangeKind::CommonBuffer,
                 ));
             }
         }
@@ -395,7 +432,7 @@ impl DmaManager {
             if logical >= m.logical_base && end <= map_end {
                 return Ok((
                     m.backing_va + (logical - m.logical_base),
-                    LogicalRangeKind::TransferMapping,
+                    DmaLogicalRangeKind::TransferMapping,
                 ));
             }
         }
@@ -497,14 +534,14 @@ impl DmaManager {
                     length
                 };
                 match self.decode_owner_logical_with_kind(owner, address, probe_len) {
-                    Ok((_, LogicalRangeKind::CommonBuffer)) => {
+                    Ok((_, DmaLogicalRangeKind::CommonBuffer)) => {
                         observation.descriptors_with_decodable_buffer += 1;
                         observation.descriptors_with_common_buffer += 1;
                         if completed {
                             observation.completed_common_buffer_descriptors += 1;
                         }
                     }
-                    Ok((_, LogicalRangeKind::TransferMapping)) => {
+                    Ok((_, DmaLogicalRangeKind::TransferMapping)) => {
                         observation.descriptors_with_decodable_buffer += 1;
                         observation.descriptors_with_transfer_mapping += 1;
                         if completed {
@@ -517,6 +554,85 @@ impl DmaManager {
             index += 1;
         }
         Ok(observation)
+    }
+
+    /// Complete one fixed-size device descriptor after validating both the descriptor
+    /// ring and the descriptor-owned buffer through the owner-scoped DMA decoder.
+    ///
+    /// This is the device side of a bus-master write-back: callers may write a final
+    /// length first (for receive descriptors whose length is produced by hardware),
+    /// then OR the descriptor status byte with `status_bits`.
+    pub fn complete_fixed_descriptor_at(
+        &self,
+        owner: DmaOwner,
+        descriptor_logical: u64,
+        descriptor_backing_va: u64,
+        ring: &mut [u8],
+        layout: FixedDescriptorLayout,
+        descriptor_index: usize,
+        write_length: Option<u16>,
+        status_bits: u8,
+    ) -> Result<FixedDescriptorCompletion, DmaError> {
+        if ring.is_empty()
+            || layout.stride == 0
+            || layout.address_offset.checked_add(8).is_none()
+            || layout.address_offset + 8 > layout.stride
+            || layout
+                .length_offset
+                .map(|offset| offset.checked_add(2).is_none() || offset + 2 > layout.stride)
+                .unwrap_or(false)
+            || layout
+                .status_offset
+                .map(|offset| offset >= layout.stride)
+                .unwrap_or(true)
+            || layout.min_buffer_probe_len == 0
+            || status_bits == 0
+        {
+            return Err(DmaError::OutOfRange);
+        }
+        let ring_len = ring.len() as u64;
+        let decoded_ring = self.decode_owner_logical(owner, descriptor_logical, ring_len)?;
+        if decoded_ring != descriptor_backing_va {
+            return Err(DmaError::LogicalViolation);
+        }
+
+        let descriptor_count = ring.len() / layout.stride;
+        if descriptor_index >= descriptor_count {
+            return Err(DmaError::OutOfRange);
+        }
+        let base = descriptor_index * layout.stride;
+        let address = read_le_u64(&ring[base + layout.address_offset..]);
+        if address == 0 {
+            return Err(DmaError::LogicalViolation);
+        }
+        let descriptor_length = layout
+            .length_offset
+            .map(|offset| read_le_u16(&ring[base + offset..]) as u64)
+            .unwrap_or(layout.min_buffer_probe_len);
+        let transfer_length = match write_length {
+            Some(length) if length != 0 => length as u64,
+            Some(_) => return Err(DmaError::OutOfRange),
+            None if descriptor_length != 0 => descriptor_length,
+            None => layout.min_buffer_probe_len,
+        };
+        let (buffer_backing_va, range_kind) =
+            self.decode_owner_logical_with_kind(owner, address, transfer_length)?;
+
+        if let Some(length) = write_length {
+            let offset = layout.length_offset.ok_or(DmaError::OutOfRange)?;
+            ring[base + offset..base + offset + 2].copy_from_slice(&length.to_le_bytes());
+        }
+        let status_offset = layout.status_offset.ok_or(DmaError::OutOfRange)?;
+        ring[base + status_offset] |= status_bits;
+
+        Ok(FixedDescriptorCompletion {
+            descriptor_index: descriptor_index as u64,
+            descriptor_backing_va: descriptor_backing_va + base as u64,
+            buffer_logical: address,
+            buffer_backing_va,
+            transfer_length,
+            range_kind,
+        })
     }
 
     /// `MapTransfer` (spec §12.2): map a `[backing_va, backing_va+length)` slice to a
@@ -580,6 +696,32 @@ impl DmaManager {
             logical_base,
             mapped_length: length,
         })
+    }
+
+    /// Idempotently learn a broker-provided packet-transfer mapping. Exact live
+    /// replays return the existing grant; overlaps or mismatched metadata still fail.
+    pub fn ensure_mapping_at(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        logical_base: u64,
+        backing_va: u64,
+        length: u64,
+    ) -> Result<MapGrant, DmaError> {
+        if let Some(existing) = self.mappings.iter().find(|m| {
+            m.active
+                && m.owner == owner
+                && m.logical_base == logical_base
+                && m.length == length
+                && m.backing_va == backing_va
+        }) {
+            return Ok(MapGrant {
+                mapping_id: existing.id,
+                logical_base,
+                mapped_length: length,
+            });
+        }
+        self.register_mapping_at(owner, adapter_id, logical_base, backing_va, length)
     }
 
     /// `FreeMapRegisters` / `PutScatterGatherList` — release a mapping (spec §12.4).
@@ -703,6 +845,24 @@ mod tests {
     }
 
     #[test]
+    fn broker_common_buffer_replay_is_idempotent() {
+        let mut d = DmaManager::new();
+        let a = d.register_adapter(owner(), true, 4096, true);
+        let first = d
+            .ensure_common_buffer_at(owner(), a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+        let replay = d
+            .ensure_common_buffer_at(owner(), a, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_eq!(
+            d.ensure_common_buffer_at(owner(), a, 0x1000, 4096, 0x3_0000),
+            Err(DmaError::LogicalViolation)
+        );
+    }
+
+    #[test]
     fn logical_addresses_are_scoped_to_dma_owner() {
         let mut d = DmaManager::new();
         let owner_a = owner();
@@ -809,6 +969,24 @@ mod tests {
             Err(DmaError::WrongOwner)
         );
         assert_eq!(d.decode_owner_logical(owner_b, 0x1000, 16), Ok(512));
+    }
+
+    #[test]
+    fn broker_transfer_mapping_replay_is_idempotent() {
+        let mut d = DmaManager::new();
+        let a = d.register_adapter(owner(), true, 4096, true);
+        let first = d
+            .ensure_mapping_at(owner(), a, 0x3000, 0x6_0000, 512)
+            .unwrap();
+        let replay = d
+            .ensure_mapping_at(owner(), a, 0x3000, 0x6_0000, 512)
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_eq!(
+            d.ensure_mapping_at(owner(), a, 0x3000, 0x6_1000, 512),
+            Err(DmaError::LogicalViolation)
+        );
     }
 
     #[test]
@@ -968,5 +1146,124 @@ mod tests {
         assert_eq!(observation.descriptors_with_device_address, 1);
         assert_eq!(observation.descriptors_with_decodable_buffer, 0);
         assert_eq!(observation.malformed_descriptors, 1);
+    }
+
+    #[test]
+    fn completes_receive_descriptor_after_owner_decode() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 8192, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 16, 0x20_0000)
+            .unwrap();
+        d.register_common_buffer_at(owner(), adapter, 0x8000, 2048, 0x30_0000)
+            .unwrap();
+
+        let layout = FixedDescriptorLayout {
+            stride: 16,
+            address_offset: 0,
+            length_offset: Some(8),
+            status_offset: Some(12),
+            completion_status_mask: 1,
+            min_buffer_probe_len: 1,
+        };
+        let mut ring = [0u8; 16];
+        ring[0..8].copy_from_slice(&0x8000u64.to_le_bytes());
+
+        let completion = d
+            .complete_fixed_descriptor_at(
+                owner(),
+                0x4000,
+                0x20_0000,
+                &mut ring,
+                layout,
+                0,
+                Some(64),
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(completion.descriptor_index, 0);
+        assert_eq!(completion.descriptor_backing_va, 0x20_0000);
+        assert_eq!(completion.buffer_logical, 0x8000);
+        assert_eq!(completion.buffer_backing_va, 0x30_0000);
+        assert_eq!(completion.transfer_length, 64);
+        assert_eq!(completion.range_kind, DmaLogicalRangeKind::CommonBuffer);
+        assert_eq!(read_le_u16(&ring[8..]), 64);
+        assert_eq!(ring[12], 3);
+
+        let observation = d
+            .observe_fixed_descriptor_ring(owner(), 0x4000, 0x20_0000, &ring, layout)
+            .unwrap();
+        assert_eq!(observation.completed_descriptors, 1);
+        assert_eq!(observation.completed_common_buffer_descriptors, 1);
+    }
+
+    #[test]
+    fn completes_transfer_mapping_descriptor_after_owner_decode() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 8192, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 16, 0x20_0000)
+            .unwrap();
+        d.register_mapping_at(owner(), adapter, 0x9000, 0x50_0000, 512)
+            .unwrap();
+
+        let layout = FixedDescriptorLayout {
+            stride: 16,
+            address_offset: 0,
+            length_offset: Some(8),
+            status_offset: Some(12),
+            completion_status_mask: 1,
+            min_buffer_probe_len: 1,
+        };
+        let mut ring = [0u8; 16];
+        ring[0..8].copy_from_slice(&0x9000u64.to_le_bytes());
+        ring[8..10].copy_from_slice(&128u16.to_le_bytes());
+
+        let completion = d
+            .complete_fixed_descriptor_at(owner(), 0x4000, 0x20_0000, &mut ring, layout, 0, None, 1)
+            .unwrap();
+
+        assert_eq!(completion.range_kind, DmaLogicalRangeKind::TransferMapping);
+        assert_eq!(completion.transfer_length, 128);
+        assert_eq!(ring[12], 1);
+
+        let observation = d
+            .observe_fixed_descriptor_ring(owner(), 0x4000, 0x20_0000, &ring, layout)
+            .unwrap();
+        assert_eq!(observation.completed_descriptors, 1);
+        assert_eq!(observation.completed_transfer_mapping_descriptors, 1);
+    }
+
+    #[test]
+    fn descriptor_completion_rejects_unowned_buffer() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 4096, true);
+        d.register_common_buffer_at(owner(), adapter, 0x4000, 16, 0x20_0000)
+            .unwrap();
+
+        let mut ring = [0u8; 16];
+        ring[0..8].copy_from_slice(&0x9000u64.to_le_bytes());
+
+        assert_eq!(
+            d.complete_fixed_descriptor_at(
+                owner(),
+                0x4000,
+                0x20_0000,
+                &mut ring,
+                FixedDescriptorLayout {
+                    stride: 16,
+                    address_offset: 0,
+                    length_offset: Some(8),
+                    status_offset: Some(12),
+                    completion_status_mask: 1,
+                    min_buffer_probe_len: 1,
+                },
+                0,
+                Some(60),
+                3,
+            ),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(ring[8], 0);
+        assert_eq!(ring[12], 0);
     }
 }

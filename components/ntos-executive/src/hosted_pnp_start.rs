@@ -10,7 +10,7 @@ const HOSTED_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = 0x0000_0100_1600_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u64;
 const HOSTED_ROOT_SEED_VA_BASE: u64 = 0x0000_0100_1100_0000;
-const HOSTED_ROOT_SEED_VA_LIMIT: u64 = 0x0000_0100_1200_0000;
+const HOSTED_ROOT_SEED_VA_LIMIT: u64 = HOSTED_RESOURCE_COMPONENT_VA_BASE;
 const HOSTED_ROOT_DMA_LOGICAL_BASE: u64 = 0x0010_0000;
 
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
@@ -104,6 +104,7 @@ pub(crate) struct HostedPnpPciResourceWindow {
     pub(crate) mmio_frame_base: u64,
     pub(crate) mmio_pages: u64,
     pub(crate) mmio_va: u64,
+    pub(crate) mmio_seed_va: u64,
     pub(crate) interrupt_vector: u32,
     pub(crate) interrupt_latched: bool,
     pub(crate) dma_frame_base: u64,
@@ -124,6 +125,7 @@ impl HostedPnpPciResourceWindow {
         mmio_frame_base: u64,
         mmio_pages: u64,
         mmio_va: u64,
+        mmio_seed_va: u64,
         interrupt_vector: u32,
         interrupt_latched: bool,
         dma_frame_base: u64,
@@ -133,7 +135,7 @@ impl HostedPnpPciResourceWindow {
         dma_logical: u64,
         dma_len: u64,
     ) -> Option<Self> {
-        if mmio_va == 0 {
+        if mmio_va == 0 || mmio_seed_va == 0 {
             return None;
         }
         let has_dma = dma_frame_base != 0
@@ -161,6 +163,7 @@ impl HostedPnpPciResourceWindow {
             mmio_frame_base,
             mmio_pages,
             mmio_va,
+            mmio_seed_va,
             interrupt_vector,
             interrupt_latched,
             dma_frame_base,
@@ -327,6 +330,10 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_packet_descriptor_common_count: u64,
     pub(crate) dma_packet_descriptor_mapping_count: u64,
     pub(crate) dma_packet_descriptor_completed_mapping_count: u64,
+    pub(crate) dma_device_tx_completion_count: u64,
+    pub(crate) dma_device_rx_completion_count: u64,
+    pub(crate) dma_device_interrupt_cause_count: u64,
+    pub(crate) dma_device_model_failure_count: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) video_route_attempted_count: u64,
@@ -747,6 +754,18 @@ fn collect_hardware_evidence(
             report.dma_packet_descriptor_completed_mapping_count = report
                 .dma_packet_descriptor_completed_mapping_count
                 .saturating_add(evidence.dma_descriptor_completed_transfer_mappings);
+            report.dma_device_tx_completion_count = report
+                .dma_device_tx_completion_count
+                .saturating_add(evidence.dma_device_tx_completions);
+            report.dma_device_rx_completion_count = report
+                .dma_device_rx_completion_count
+                .saturating_add(evidence.dma_device_rx_completions);
+            report.dma_device_interrupt_cause_count = report
+                .dma_device_interrupt_cause_count
+                .saturating_add(evidence.dma_device_interrupt_causes);
+            report.dma_device_model_failure_count = report
+                .dma_device_model_failure_count
+                .saturating_add(evidence.dma_device_model_failures);
             if evidence.io_port_out32_serviced() {
                 report.io_port_out32_count += 1;
             }
@@ -980,6 +999,14 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_descriptor_malformed);
     print_str(b"/");
     print_u64(evidence.dma_descriptor_observation_failures);
+    print_str(b" dma_dev_tx/rx=");
+    print_u64(evidence.dma_device_tx_completions);
+    print_str(b"/");
+    print_u64(evidence.dma_device_rx_completions);
+    print_str(b" dma_dev_cause/fail=");
+    print_u64(evidence.dma_device_interrupt_causes);
+    print_str(b"/");
+    print_u64(evidence.dma_device_model_failures);
     print_str(b" io_out32=");
     print_u64(evidence.io_port_out32_serviced() as u64);
     print_str(b" io_out32_count=");

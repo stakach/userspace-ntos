@@ -11740,7 +11740,7 @@ unsafe fn alloc_seeded_root_dma_mmio_frame(seed_va: u64) -> u64 {
     frame
 }
 
-unsafe fn map_hosted_pci_dma_root_alias(frame_base: u64, pages: u64, alias_va: u64) -> bool {
+unsafe fn map_hosted_pci_resource_root_alias(frame_base: u64, pages: u64, alias_va: u64) -> bool {
     if frame_base == 0 || pages == 0 || alias_va == 0 {
         return false;
     }
@@ -11764,7 +11764,7 @@ unsafe fn map_hosted_pci_dma_root_alias(frame_base: u64, pages: u64, alias_va: u
             if copy_error == 0 {
                 let _ = cnode_delete_recycle_r(map_cap);
             }
-            print_str(b"[driver-launch] hosted PCI DMA root alias map failed page=");
+            print_str(b"[driver-launch] hosted PCI resource root alias map failed page=");
             print_u64(page);
             print_str(b"/");
             print_u64(pages);
@@ -11888,6 +11888,7 @@ where
             grant.assignment.io_port_base,
             grant.assignment.io_port_len,
             window.mmio_va,
+            window.mmio_seed_va,
             window.mmio_frame_base,
             window.mmio_pages,
             if grant.device.base_class() == nt_pnp::PCI_CLASS_DISPLAY {
@@ -11958,6 +11959,7 @@ where
             0,
             0,
             window.mmio_va,
+            window.mmio_seed_va,
             window.mmio_frame_base,
             window.mmio_pages,
             0,
@@ -16574,6 +16576,19 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         report.pci_va_exhausted = true;
                         continue;
                     };
+                    let Some(mmio_seed_va) = resource_vas.allocate_root_seed_span(mmio_bytes)
+                    else {
+                        report.pci_va_exhausted = true;
+                        continue;
+                    };
+                    if !map_hosted_pci_resource_root_alias(
+                        grant.mmio_frame_base,
+                        grant.mmio_pages,
+                        mmio_seed_va,
+                    ) {
+                        report.missing_grants += 1;
+                        continue;
+                    }
                     let dma_va = if needs_dma {
                         let Some(dma_bytes) = grant.dma_pages.checked_mul(0x1000) else {
                             report.pci_va_exhausted = true;
@@ -16596,7 +16611,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                             report.pci_va_exhausted = true;
                             continue;
                         };
-                        if !map_hosted_pci_dma_root_alias(
+                        if !map_hosted_pci_resource_root_alias(
                             grant.dma_frame_base,
                             grant.dma_pages,
                             seed_va,
@@ -16616,6 +16631,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         grant.mmio_frame_base,
                         grant.mmio_pages,
                         mmio_va,
+                        mmio_seed_va,
                         grant.interrupt_vector,
                         grant.interrupt_latched,
                         grant.dma_frame_base,
@@ -26358,6 +26374,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_descriptor_common_count = 0u64;
     let mut generic_hw_dma_descriptor_mapping_count = 0u64;
     let mut generic_hw_dma_descriptor_completed_mapping_count = 0u64;
+    let mut generic_hw_dma_device_tx_completion_count = 0u64;
+    let mut generic_hw_dma_device_rx_completion_count = 0u64;
+    let mut generic_hw_dma_device_interrupt_cause_count = 0u64;
+    let mut generic_hw_dma_device_model_failure_count = 0u64;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
@@ -26468,6 +26488,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_hw_dma_descriptor_completed_mapping_count.saturating_add(
                                 start_report.dma_packet_descriptor_completed_mapping_count,
                             );
+                        generic_hw_dma_device_tx_completion_count =
+                            generic_hw_dma_device_tx_completion_count
+                                .saturating_add(start_report.dma_device_tx_completion_count);
+                        generic_hw_dma_device_rx_completion_count =
+                            generic_hw_dma_device_rx_completion_count
+                                .saturating_add(start_report.dma_device_rx_completion_count);
+                        generic_hw_dma_device_interrupt_cause_count =
+                            generic_hw_dma_device_interrupt_cause_count
+                                .saturating_add(start_report.dma_device_interrupt_cause_count);
+                        generic_hw_dma_device_model_failure_count =
+                            generic_hw_dma_device_model_failure_count
+                                .saturating_add(start_report.dma_device_model_failure_count);
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -26529,6 +26561,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_hw_dma_descriptor_mapping_count);
         print_str(b" dma_desc_done_map=");
         print_u64(generic_hw_dma_descriptor_completed_mapping_count);
+        print_str(b" dma_dev_tx/rx=");
+        print_u64(generic_hw_dma_device_tx_completion_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_device_rx_completion_count);
+        print_str(b" dma_dev_cause/fail=");
+        print_u64(generic_hw_dma_device_interrupt_cause_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_device_model_failure_count);
         print_str(b" video_route=");
         print_u64(generic_hw_video_route_published as u64);
         print_str(b" video_route_attempted=");

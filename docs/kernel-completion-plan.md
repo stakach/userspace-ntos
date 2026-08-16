@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-16
+Last updated: 2026-08-17
 
 ## Objective
 
@@ -39,6 +39,25 @@ is using a stale binary or stale branch state. The callback/transport gates now 
 invariants from the real workload. The latest ntdll loader-list cleanup also removes the stale
 `PEB_LDR_DATA.EntryInProgress` dependency from `RtlPcToFileHeader`, which unblocked the dynamic
 `userinit.exe` to `explorer.exe` shell path without adding kernel launch policy.
+
+Current B3 packet-model slice (2026-08-17): the generic hosted PCI resource window now publishes a
+root-side MMIO alias alongside the component BAR mapping, using the same growable resource alias
+allocator as DMA and root-bus proof windows. The root alias lets the executive act as a
+bus-mastering device model from recorded per-devnode resources instead of reading through a hosted
+component VSpace or matching a service name. `nt-dma-manager` now has host-tested exact replay for
+broker-provided common buffers/map-transfer mappings and a descriptor-completion primitive that
+validates the descriptor ring plus descriptor-owned buffer through the owner-scoped DMA decoder
+before writing hardware completion bits. The executive replays runtime DMA allocation records
+idempotently, decodes e1000 TX/RX ring registers from the MMIO alias, completes TX descriptors from
+`TDH..TDT`, stages one bounded RX Ethernet frame at `RDH`, advances `RDH`, and raises e1000
+interrupt cause bits through the hardware cause-set register before dispatching the connected ISR.
+Hardware evidence now reports persistent `dma_dev_tx/rx` and `dma_dev_cause/fail` counters so a
+later DPC clearing descriptor `DD` does not erase the proof. Validation for this slice:
+`cargo fmt --all`, `cargo test -p nt-dma-manager`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Review adjustment: the descriptor-completion/device-model foundation is closed; the remaining B3
+packet frontier is the serialized boot proof and, if RX completion is present but no NDIS receive
+indication follows, the real NDIS protocol bind/OID packet-filter path.
 
 Latest accepted desktop proof (2026-08-16):
 `.tmp/run-headless-b3-dma-packet-desc-timerbind-20260816.log` reaches the harness sentinel with
@@ -1280,8 +1299,10 @@ before unrelated executive traffic monopolises the receive loop.
   selected dynamically from registry metadata and launched through the hosted driver path; TCPIP
   creates its service-owned system threads and the desktop paint gate is green again. Hosted WDM DMA
   now includes the NT5 map-register and scatter/gather operation set backed by the per-devnode IOMMU
-  grant, so remaining B3 work is real packet traffic over the generic NDIS/e1000 route, receive
-  completion/indication, and repeated-device scaling under the same dynamic devnode/resource path.
+  grant. Generic descriptor completion and the first e1000 register-profile bus-master model are in
+  place, so remaining B3 work is serialized proof of that path, real NDIS receive indication after
+  protocol bind/packet-filter setup, TX traffic from the real scatter/gather send route, and
+  repeated-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6807,3 +6828,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   shell chrome pixels, and `298/298` checks passing. Review adjustment: B3 registry materialization
   is closed for the current dynamic NIC path; continue at real TX/RX completion and packet indication
   over the generic NDIS/e1000 route.
+
+  B3 generic e1000 descriptor-completion model (2026-08-17): `nt-dma-manager` now provides
+  host-tested idempotent broker-record replay for common buffers and map-transfer mappings, plus a
+  fixed-descriptor completion primitive that validates the descriptor ring and target buffer through
+  the owner-scoped DMA decoder before writing hardware-visible length/status fields. Hosted PCI PnP
+  windows now allocate a root-side MMIO alias for each granted BAR from the same growable resource
+  alias arena used for DMA aliases, preserving per-devnode identity and avoiding component-VSpace
+  reads. The executive replays runtime DMA records before interrupt injection, decodes e1000
+  `TDH/TDT` and `RDH/RDT` state from the BAR alias, completes TX descriptors that point at real
+  transfer mappings, stages one bounded RX Ethernet frame into the descriptor-owned common buffer,
+  advances `RDH`, and raises e1000 cause bits through the real cause-set register before dispatching
+  the connected ISR/DPC. Hardware evidence now prints persistent `dma_dev_tx/rx` and
+  `dma_dev_cause/fail` counters, separate from live descriptor status observation that ReactOS may
+  clear after DPC consumption. Validation: `cargo fmt --all`, `cargo test -p nt-dma-manager`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: run the serialized desktop proof
+  next and inspect whether RX completion reaches NDIS receive indication; if not, continue in the
+  real NDIS protocol bind/OID packet-filter path rather than adding packet scaffolding.

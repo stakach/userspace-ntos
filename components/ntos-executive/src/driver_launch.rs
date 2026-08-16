@@ -15972,6 +15972,10 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_descriptor_completed_transfer_mappings: u64,
     pub dma_descriptor_malformed: u64,
     pub dma_descriptor_observation_failures: u64,
+    pub dma_device_tx_completions: u64,
+    pub dma_device_rx_completions: u64,
+    pub dma_device_interrupt_causes: u64,
+    pub dma_device_model_failures: u64,
     pub root_pdo_started: bool,
     pub video_initialized: bool,
     pub video_find_adapter_calls: u64,
@@ -16050,6 +16054,7 @@ struct HostedDeviceResourceState {
     driver_id: u64,
     instance: usize,
     mmio_va: u64,
+    mmio_broker_va: u64,
     interrupt_affinity: u64,
     interface_type: u32,
     bus_number: u32,
@@ -16579,6 +16584,10 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             dma_descriptor_completed_transfer_mappings: 0,
             dma_descriptor_malformed: 0,
             dma_descriptor_observation_failures: 0,
+            dma_device_tx_completions: 0,
+            dma_device_rx_completions: 0,
+            dma_device_interrupt_causes: 0,
+            dma_device_model_failures: 0,
             root_pdo_started,
             video_initialized: read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0,
             video_find_adapter_calls: read_volatile(
@@ -16619,11 +16628,22 @@ unsafe fn read_hosted_device_resource_state_from_shared(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> HostedDeviceResourceState {
+    let previous_state = hosted_device_resource_state_by_device_id(binding.device_id);
+    let mut evidence = read_hosted_hardware_evidence_from_shared(binding, sh);
+    if let Some(previous) = previous_state {
+        evidence.dma_device_tx_completions = previous.evidence.dma_device_tx_completions;
+        evidence.dma_device_rx_completions = previous.evidence.dma_device_rx_completions;
+        evidence.dma_device_interrupt_causes = previous.evidence.dma_device_interrupt_causes;
+        evidence.dma_device_model_failures = previous.evidence.dma_device_model_failures;
+    }
     HostedDeviceResourceState {
         device_id: binding.device_id,
         driver_id: binding.driver_id,
         instance: binding.instance,
         mmio_va: read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64),
+        mmio_broker_va: previous_state
+            .map(|state| state.mmio_broker_va)
+            .unwrap_or(0),
         interrupt_affinity: read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64),
         interface_type: read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32),
         bus_number: read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32),
@@ -16632,13 +16652,13 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
         pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
         io_port_base: read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64),
-        dma_broker_va: hosted_device_resource_state_by_device_id(binding.device_id)
+        dma_broker_va: previous_state
             .map(|state| state.dma_broker_va)
             .unwrap_or(0),
         video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
         video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
         video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
-        evidence: read_hosted_hardware_evidence_from_shared(binding, sh),
+        evidence,
     }
 }
 
@@ -17058,6 +17078,370 @@ unsafe fn observe_hosted_dma_packet_descriptors(
         index += 1;
     }
     evidence
+}
+
+#[derive(Clone, Copy, Default)]
+struct HostedDmaPacketModelReport {
+    tx_completed: u64,
+    rx_completed: u64,
+    interrupt_causes: u64,
+    failures: u64,
+}
+
+const E1000_VENDOR_INTEL: u32 = 0x8086;
+const E1000_DEVICE_82540EM: u32 = 0x100e;
+const E1000_PCI_CLASS_NETWORK_ETHERNET: u32 = 0x020000;
+const E1000_REG_ICS: u64 = 0x00c8;
+const E1000_REG_RCTL: u64 = 0x0100;
+const E1000_REG_TCTL: u64 = 0x0400;
+const E1000_REG_RDBAL: u64 = 0x2800;
+const E1000_REG_RDBAH: u64 = 0x2804;
+const E1000_REG_RDLEN: u64 = 0x2808;
+const E1000_REG_RDH: u64 = 0x2810;
+const E1000_REG_RDT: u64 = 0x2818;
+const E1000_REG_TDBAL: u64 = 0x3800;
+const E1000_REG_TDBAH: u64 = 0x3804;
+const E1000_REG_TDLEN: u64 = 0x3808;
+const E1000_REG_TDH: u64 = 0x3810;
+const E1000_REG_TDT: u64 = 0x3818;
+const E1000_IMS_TXDW: u32 = 1 << 0;
+const E1000_IMS_TXQE: u32 = 1 << 1;
+const E1000_IMS_RXDMT0: u32 = 1 << 4;
+const E1000_IMS_RXT0: u32 = 1 << 7;
+const E1000_RCTL_EN: u32 = 1 << 1;
+const E1000_TCTL_EN: u32 = 1 << 1;
+const E1000_RX_DESCRIPTOR_DONE: u8 = 0x01;
+const E1000_RX_DESCRIPTOR_DONE_EOP: u8 = 0x03;
+const E1000_TX_DESCRIPTOR_DONE: u8 = 0x01;
+const HOSTED_E1000_RX_STIMULUS_LEN: u16 = 60;
+
+fn hosted_e1000_profile_matches(state: HostedDeviceResourceState) -> bool {
+    if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS {
+        return false;
+    }
+    let vendor = state.pci_vendor_device & 0xffff;
+    let device = (state.pci_vendor_device >> 16) & 0xffff;
+    let pci_class = (state.pci_class_rev >> 8) & 0x00ff_ffff;
+    vendor == E1000_VENDOR_INTEL
+        && device == E1000_DEVICE_82540EM
+        && pci_class == E1000_PCI_CLASS_NETWORK_ETHERNET
+}
+
+unsafe fn hosted_mmio_read_u32(state: HostedDeviceResourceState, offset: u64) -> Option<u32> {
+    if state.mmio_broker_va == 0
+        || offset.checked_add(4)? > state.evidence.resource_mmio_len
+    {
+        return None;
+    }
+    Some(read_volatile(
+        (state.mmio_broker_va + offset) as *const u32,
+    ))
+}
+
+unsafe fn hosted_mmio_write_u32(
+    state: HostedDeviceResourceState,
+    offset: u64,
+    value: u32,
+) -> bool {
+    let Some(end) = offset.checked_add(4) else {
+        return false;
+    };
+    if state.mmio_broker_va == 0 || end > state.evidence.resource_mmio_len {
+        return false;
+    }
+    write_volatile((state.mmio_broker_va + offset) as *mut u32, value);
+    true
+}
+
+unsafe fn hosted_mmio_read_u64_split(
+    state: HostedDeviceResourceState,
+    low_offset: u64,
+    high_offset: u64,
+) -> Option<u64> {
+    let low = hosted_mmio_read_u32(state, low_offset)? as u64;
+    let high = hosted_mmio_read_u32(state, high_offset)? as u64;
+    Some(low | (high << 32))
+}
+
+unsafe fn hosted_dma_alias_for_component_va(
+    state: HostedDeviceResourceState,
+    component_va: u64,
+    len: u64,
+) -> Option<u64> {
+    let grant_va = state.evidence.dma_common_va;
+    let grant_len = state.evidence.dma_common_len;
+    if grant_va == 0 || grant_len == 0 || state.dma_broker_va == 0 || len == 0 {
+        return None;
+    }
+    let offset = component_va.checked_sub(grant_va)?;
+    if offset > grant_len || len > grant_len - offset {
+        return None;
+    }
+    state.dma_broker_va.checked_add(offset)
+}
+
+unsafe fn hosted_dma_record_alias_for_logical_range(
+    sh: u64,
+    state: HostedDeviceResourceState,
+    logical: u64,
+    len: u64,
+    required_kind: u64,
+) -> Option<(u64, u64)> {
+    if logical == 0 || len == 0 || state.dma_broker_va == 0 {
+        return None;
+    }
+    let capacity = dma_allocation_record_capacity(sh);
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if capacity == 0 || count > capacity {
+        return None;
+    }
+    let end = logical.checked_add(len)?;
+    let mut index = 0u64;
+    while index < count {
+        let record = dma_allocation_record(sh, index)?;
+        let record_logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let record_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let record_va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let record_kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if record_kind == required_kind && record_logical != 0 && record_len != 0 && record_va != 0
+        {
+            let record_end = record_logical.checked_add(record_len)?;
+            if logical >= record_logical && end <= record_end {
+                let component_va = record_va.checked_add(logical - record_logical)?;
+                let alias = hosted_dma_alias_for_component_va(state, component_va, len)?;
+                return Some((component_va, alias));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn write_hosted_e1000_rx_stimulus_frame(alias_va: u64, len: u16) {
+    let len = len as usize;
+    let frame = core::slice::from_raw_parts_mut(alias_va as *mut u8, len);
+    for byte in frame.iter_mut() {
+        *byte = 0;
+    }
+    let prefix = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination: broadcast
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // source: locally administered
+        0x08, 0x06, // EtherType: ARP
+        0x00, 0x01, // hardware type: Ethernet
+        0x08, 0x00, // protocol type: IPv4
+        0x06, 0x04, // address sizes
+        0x00, 0x01, // opcode: request
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // sender MAC
+        10, 0, 2, 2, // sender IPv4
+        0, 0, 0, 0, 0, 0, // target MAC
+        10, 0, 2, 15, // target IPv4
+    ];
+    let copy_len = prefix.len().min(frame.len());
+    frame[..copy_len].copy_from_slice(&prefix[..copy_len]);
+}
+
+unsafe fn drive_hosted_e1000_tx_descriptors(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) -> HostedDmaPacketModelReport {
+    let mut report = HostedDmaPacketModelReport::default();
+    let tctl = hosted_mmio_read_u32(state, E1000_REG_TCTL).unwrap_or(0);
+    if tctl & E1000_TCTL_EN == 0 {
+        return report;
+    }
+    let ring_logical =
+        hosted_mmio_read_u64_split(state, E1000_REG_TDBAL, E1000_REG_TDBAH).unwrap_or(0);
+    let ring_len = hosted_mmio_read_u32(state, E1000_REG_TDLEN).unwrap_or(0) as u64;
+    let head = hosted_mmio_read_u32(state, E1000_REG_TDH).unwrap_or(0) as usize;
+    let tail = hosted_mmio_read_u32(state, E1000_REG_TDT).unwrap_or(0) as usize;
+    let Some((ring_component_va, ring_alias_va)) = hosted_dma_record_alias_for_logical_range(
+        sh,
+        state,
+        ring_logical,
+        ring_len,
+        HOSTED_DMA_RECORD_KIND_COMMON,
+    ) else {
+        return report;
+    };
+    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64
+        || ring_len > usize::MAX as u64
+    {
+        report.failures = report.failures.saturating_add(1);
+        return report;
+    }
+    let descriptor_count = (ring_len as usize) / HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
+    if descriptor_count == 0 || head >= descriptor_count || tail >= descriptor_count {
+        report.failures = report.failures.saturating_add(1);
+        return report;
+    }
+    let ring = core::slice::from_raw_parts_mut(ring_alias_va as *mut u8, ring_len as usize);
+    let mut index = head;
+    let mut visited = 0usize;
+    while index != tail && visited < descriptor_count {
+        let base = index * HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
+        let address = read_unaligned((ring.as_ptr().add(base)) as *const u64);
+        let length = read_unaligned((ring.as_ptr().add(base + 8)) as *const u16);
+        if address != 0 && length != 0 {
+            match hosted_dma_manager_mut().complete_fixed_descriptor_at(
+                hosted_dma_owner(binding),
+                ring_logical,
+                ring_component_va,
+                ring,
+                HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT,
+                index,
+                None,
+                E1000_TX_DESCRIPTOR_DONE,
+            ) {
+                Ok(_) => {
+                    report.tx_completed = report.tx_completed.saturating_add(1);
+                }
+                Err(_) => {
+                    report.failures = report.failures.saturating_add(1);
+                    break;
+                }
+            }
+        }
+        index = (index + 1) % descriptor_count;
+        visited += 1;
+    }
+    if report.tx_completed != 0 {
+        let _ = hosted_mmio_write_u32(state, E1000_REG_TDH, tail as u32);
+        report.interrupt_causes |= (E1000_IMS_TXDW | E1000_IMS_TXQE) as u64;
+    }
+    report
+}
+
+unsafe fn drive_hosted_e1000_rx_descriptor(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) -> HostedDmaPacketModelReport {
+    let mut report = HostedDmaPacketModelReport::default();
+    let rctl = hosted_mmio_read_u32(state, E1000_REG_RCTL).unwrap_or(0);
+    if rctl & E1000_RCTL_EN == 0 {
+        return report;
+    }
+    let ring_logical =
+        hosted_mmio_read_u64_split(state, E1000_REG_RDBAL, E1000_REG_RDBAH).unwrap_or(0);
+    let ring_len = hosted_mmio_read_u32(state, E1000_REG_RDLEN).unwrap_or(0) as u64;
+    let head = hosted_mmio_read_u32(state, E1000_REG_RDH).unwrap_or(0) as usize;
+    let tail = hosted_mmio_read_u32(state, E1000_REG_RDT).unwrap_or(0) as usize;
+    let Some((ring_component_va, ring_alias_va)) = hosted_dma_record_alias_for_logical_range(
+        sh,
+        state,
+        ring_logical,
+        ring_len,
+        HOSTED_DMA_RECORD_KIND_COMMON,
+    ) else {
+        return report;
+    };
+    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64
+        || ring_len > usize::MAX as u64
+    {
+        report.failures = report.failures.saturating_add(1);
+        return report;
+    }
+    let descriptor_count = (ring_len as usize) / HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
+    if descriptor_count == 0 || head >= descriptor_count || tail >= descriptor_count {
+        report.failures = report.failures.saturating_add(1);
+        return report;
+    }
+    if head == tail {
+        return report;
+    }
+    let ring = core::slice::from_raw_parts_mut(ring_alias_va as *mut u8, ring_len as usize);
+    let base = head * HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
+    if ring[base + 12] & E1000_RX_DESCRIPTOR_DONE != 0 {
+        return report;
+    }
+    match hosted_dma_manager_mut().complete_fixed_descriptor_at(
+        hosted_dma_owner(binding),
+        ring_logical,
+        ring_component_va,
+        ring,
+        HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT,
+        head,
+        Some(HOSTED_E1000_RX_STIMULUS_LEN),
+        E1000_RX_DESCRIPTOR_DONE_EOP,
+    ) {
+        Ok(completion) => {
+            if let Some(buffer_alias) = hosted_dma_alias_for_component_va(
+                state,
+                completion.buffer_backing_va,
+                HOSTED_E1000_RX_STIMULUS_LEN as u64,
+            ) {
+                write_hosted_e1000_rx_stimulus_frame(buffer_alias, HOSTED_E1000_RX_STIMULUS_LEN);
+                let new_head = ((head + 1) % descriptor_count) as u32;
+                let _ = hosted_mmio_write_u32(state, E1000_REG_RDH, new_head);
+                report.rx_completed = 1;
+                report.interrupt_causes |= (E1000_IMS_RXT0 | E1000_IMS_RXDMT0) as u64;
+            } else {
+                report.failures = report.failures.saturating_add(1);
+            }
+        }
+        Err(_) => {
+            report.failures = report.failures.saturating_add(1);
+        }
+    }
+    report
+}
+
+unsafe fn drive_hosted_e1000_packet_model(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) -> Result<HostedDmaPacketModelReport, nt_status::NtStatus> {
+    if !hosted_e1000_profile_matches(state) {
+        return Ok(HostedDmaPacketModelReport::default());
+    }
+    replay_hosted_dma_allocation_records(binding, sh)?;
+    let mut report = drive_hosted_e1000_tx_descriptors(binding, state, sh);
+    let rx = drive_hosted_e1000_rx_descriptor(binding, state, sh);
+    report.tx_completed = report.tx_completed.saturating_add(rx.tx_completed);
+    report.rx_completed = report.rx_completed.saturating_add(rx.rx_completed);
+    report.interrupt_causes |= rx.interrupt_causes;
+    report.failures = report.failures.saturating_add(rx.failures);
+    if report.interrupt_causes != 0 {
+        if !hosted_mmio_write_u32(state, E1000_REG_ICS, report.interrupt_causes as u32) {
+            report.failures = report.failures.saturating_add(1);
+        }
+    }
+    Ok(report)
+}
+
+unsafe fn record_hosted_dma_packet_model_report(
+    device_id: u64,
+    report: HostedDmaPacketModelReport,
+) {
+    if report.tx_completed == 0
+        && report.rx_completed == 0
+        && report.interrupt_causes == 0
+        && report.failures == 0
+    {
+        return;
+    }
+    if let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id == device_id)
+    {
+        state.evidence.dma_device_tx_completions = state
+            .evidence
+            .dma_device_tx_completions
+            .saturating_add(report.tx_completed);
+        state.evidence.dma_device_rx_completions = state
+            .evidence
+            .dma_device_rx_completions
+            .saturating_add(report.rx_completed);
+        state.evidence.dma_device_interrupt_causes = state
+            .evidence
+            .dma_device_interrupt_causes
+            .saturating_add(report.interrupt_causes);
+        state.evidence.dma_device_model_failures = state
+            .evidence
+            .dma_device_model_failures
+            .saturating_add(report.failures);
+    }
 }
 
 pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {
@@ -19278,6 +19662,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     io_port_base: u64,
     io_port_len: u32,
     mmio_va: u64,
+    mmio_broker_va: u64,
     mmio_frame_base: u64,
     mmio_pages: u64,
     video_memory_caller_va: u64,
@@ -19294,6 +19679,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     if mmio_phys == 0
         || mmio_len == 0
         || mmio_va == 0
+        || mmio_broker_va == 0
         || mmio_frame_base == 0
         || mmio_pages == 0
         || interrupt_affinity > u32::MAX as u64
@@ -19589,8 +19975,101 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .iter_mut()
         .find(|state| state.device_id == binding.device_id)
     {
+        state.mmio_broker_va = mmio_broker_va;
         state.dma_broker_va = dma_broker_va;
     }
+    Ok(())
+}
+
+unsafe fn replay_hosted_dma_allocation_records(
+    binding: HostedDeviceBinding,
+    sh: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
+    let dma_adapter_blob = read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64);
+    let dma_grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let dma_grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
+    let dma_grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    if dma_adapter_blob != 0 && dma_adapter_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let record_capacity = dma_allocation_record_capacity(sh);
+    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut record_index = 0u64;
+    while record_index < record_count {
+        let Some(record) = dma_allocation_record(sh, record_index) else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if logical != 0 || len != 0 || va != 0 {
+            if dma_adapter_id == 0
+                || dma_adapter_blob == 0
+                || dma_grant_va == 0
+                || dma_grant_len == 0
+                || dma_grant_logical == 0
+                || logical < dma_grant_logical
+                || va < dma_grant_va
+                || len == 0
+                || (kind != HOSTED_DMA_RECORD_KIND_COMMON
+                    && kind != HOSTED_DMA_RECORD_KIND_MAP_TRANSFER)
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            let logical_offset = logical
+                .checked_sub(dma_grant_logical)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            let va_offset = va
+                .checked_sub(dma_grant_va)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if logical_offset != va_offset
+                || logical_offset > dma_grant_len
+                || len > dma_grant_len - logical_offset
+            {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+            match kind {
+                HOSTED_DMA_RECORD_KIND_COMMON => {
+                    hosted_dma_manager_mut()
+                        .ensure_common_buffer_at(
+                            hosted_dma_owner(binding),
+                            dma_adapter_id,
+                            logical,
+                            len,
+                            va,
+                        )
+                        .map_err(hosted_dma_status)?;
+                }
+                HOSTED_DMA_RECORD_KIND_MAP_TRANSFER => {
+                    let source_va =
+                        read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+                    let map_register =
+                        read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+                    if source_va == 0 || map_register == 0 {
+                        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    }
+                    hosted_dma_manager_mut()
+                        .ensure_mapping_at(
+                            hosted_dma_owner(binding),
+                            dma_adapter_id,
+                            logical,
+                            va,
+                            len,
+                        )
+                        .map_err(hosted_dma_status)?;
+                }
+                _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            }
+        }
+        record_index += 1;
+    }
+
     Ok(())
 }
 
@@ -19645,92 +20124,7 @@ unsafe fn record_hosted_resource_usage(
         write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
     }
 
-    let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
-    let dma_adapter_blob = read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64);
-    let dma_grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
-    let dma_grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
-    let dma_grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
-    if dma_adapter_blob != 0 && dma_adapter_id == 0 {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-
-    let record_capacity = dma_allocation_record_capacity(sh);
-    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
-    if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let mut record_index = 0u64;
-    while record_index < record_count {
-        let Some(record) = dma_allocation_record(sh, record_index) else {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        };
-        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
-        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
-        let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
-        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-        if logical != 0 || len != 0 || va != 0 {
-            if dma_adapter_id == 0
-                || dma_adapter_blob == 0
-                || dma_grant_va == 0
-                || dma_grant_len == 0
-                || dma_grant_logical == 0
-                || logical < dma_grant_logical
-                || va < dma_grant_va
-                || len == 0
-                || (kind != HOSTED_DMA_RECORD_KIND_COMMON
-                    && kind != HOSTED_DMA_RECORD_KIND_MAP_TRANSFER)
-            {
-                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            }
-            let logical_offset = logical
-                .checked_sub(dma_grant_logical)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            let va_offset = va
-                .checked_sub(dma_grant_va)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            if logical_offset != va_offset
-                || logical_offset > dma_grant_len
-                || len > dma_grant_len - logical_offset
-            {
-                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            }
-            match kind {
-                HOSTED_DMA_RECORD_KIND_COMMON => {
-                    hosted_dma_manager_mut()
-                        .register_common_buffer_at(
-                            hosted_dma_owner(binding),
-                            dma_adapter_id,
-                            logical,
-                            len,
-                            va,
-                        )
-                        .map_err(hosted_dma_status)?;
-                }
-                HOSTED_DMA_RECORD_KIND_MAP_TRANSFER => {
-                    let source_va =
-                        read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
-                    let map_register =
-                        read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
-                    if source_va == 0 || map_register == 0 {
-                        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-                    }
-                    hosted_dma_manager_mut()
-                        .register_mapping_at(
-                            hosted_dma_owner(binding),
-                            dma_adapter_id,
-                            logical,
-                            va,
-                            len,
-                        )
-                        .map_err(hosted_dma_status)?;
-                }
-                _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-            }
-        }
-        record_index += 1;
-    }
-
-    Ok(())
+    replay_hosted_dma_allocation_records(binding, sh)
 }
 
 unsafe fn dispatch_video_find_adapter_for_instance(
@@ -20218,7 +20612,8 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
     }
 
     let sh = inst.exec_shared_va;
-    restore_hosted_device_resource_state(binding, sh, true)?;
+    let state = restore_hosted_device_resource_state(binding, sh, true)?;
+    let packet_model_report = drive_hosted_e1000_packet_model(binding, state, sh)?;
     let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
     let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
@@ -20251,6 +20646,7 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     nt_status::NtStatus(status).to_result()?;
     refresh_hosted_device_resource_state(binding, sh);
+    record_hosted_dma_packet_model_report(device_id, packet_model_report);
 
     Ok(HostedInterruptDelivery {
         interrupt_id: tokens.interrupt_id,
