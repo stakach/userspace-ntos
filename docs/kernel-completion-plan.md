@@ -1194,9 +1194,10 @@ before unrelated executive traffic monopolises the receive loop.
   TCBs. The host-testable `nt-kernel-exec` model now includes hosted driver system-thread handle
   records plus a dispatcher wait queue that admits, parks, wakes, and cancels blocking waits without
   consuming dispatcher state during readiness scans. `PsCreateSystemThread` now crosses a real
-  component-service label and is answered by the executive, but still returns fail-closed until the
-  seL4 worker TCB startup half exists. Remaining B3 work is broader non-display driver coverage:
-  TCB-backed hosted driver system threads, reply-cap rotation around parked hosted-driver waits,
+  component-service label and is backed by executive-owned system-thread handles plus real seL4
+  worker TCB startup for the NT5 null-object-attributes/null-process-handle/null-client-id shape used
+  by boot drivers. Remaining B3 work is broader non-display driver coverage: reply-cap rotation
+  around parked hosted-driver waits, hosted-driver `PsTerminateSystemThread` lifecycle service,
   metadata-driven TCPIP/AFD activation once hosted waits can block/resume, miniport packet
   data-plane behavior, and multi-device scaling under the same dynamic devnode/resource path.
   Root-bus proof resource
@@ -6341,4 +6342,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   keeps the kernel boundary clean for the next B3 step: allocate the system-thread handle, stack,
   IPC buffer, CNode, TCB, and reply-cap/wait-broker state from the executive only. Validation:
   `cargo fmt --all`, `cargo test -p nt-kernel-exec`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 hosted driver worker TCB startup (2026-08-16): the supported boot-driver
+  `PsCreateSystemThread` shape now creates real hosted system-thread machinery instead of returning
+  the earlier fail-closed placeholder. The executive verifies the request against the dynamically
+  registered driver instance, mints a per-instance system-thread handle from the host-tested
+  `HostedDriverThreadTable`, allocates an independent driver-VSpace stack, IPC buffer, guarded CNode,
+  badged fault endpoint cap, sched context, and trampoline, publishes runtime ownership before
+  resuming the TCB, and tears the mechanism down during driver-instance cleanup or failed startup.
+  Driver launch now registers a provisional transport record before `DriverEntry` runs so
+  boot-driver thread creation during initialization still resolves through the same dynamic instance
+  table that later IRP dispatch uses. Blocking hosted-driver waits remain fail-closed until
+  reply-cap parking/rotation is wired, and `PsTerminateSystemThread` currently parks the worker
+  instead of returning to hosted driver code. Validation: `cargo fmt --all`,
+  `cargo test -p nt-kernel-exec`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

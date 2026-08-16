@@ -44,6 +44,7 @@ use nt_io_manager::{
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
+    HostedDriverThreadError, HostedDriverThreadTable, HOSTED_DRIVER_THREAD_HANDLE_BASE,
     SEMAPHORE_OBJECT,
 };
 use nt_mdl::MdlRegistry;
@@ -114,6 +115,29 @@ pub const FSD_DATA_FRAMES: u64 = 128;
 /// The component's GS base — a zeroed KPCR placeholder (an FSD, a kernel driver, may read `gs:[..]`).
 pub const FSD_KPCR_VA: u64 = FSD_DATA_VADDR + 0x1000;
 const _: () = assert!(FSD_DATA_VADDR + FSD_DATA_FRAMES * 0x1000 <= FSD_SHARED_VADDR);
+
+/// Hosted kernel-driver worker threads share the driver's isolated VSpace but get their own stack,
+/// IPC buffer, and entry trampoline. The component-side lane is per VSpace, so the same slot VAs are
+/// reusable across drivers; the executive-side alias lane below is globally allocated.
+pub const FSD_WORKER_VADDR: u64 = 0x0000_0100_1100_0000;
+pub const FSD_WORKER_STRIDE: u64 = 0x0000_0000_0020_0000;
+pub const FSD_WORKER_STACK_FRAMES: u64 = 32;
+const FSD_WORKER_IPCBUF_OFFSET: u64 = 0x0004_0000;
+const FSD_WORKER_TRAMP_OFFSET: u64 = 0x0004_1000;
+const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
+const FSD_WORKER_BADGE_BASE: u64 = 0x0000_0000_0001_0000;
+const _: () = assert!(FSD_WORKER_VADDR > crate::WORK_CLUSTER_BASE + 0x20_0000);
+const _: () = assert!(FSD_WORKER_VADDR & (FSD_WORKER_STRIDE - 1) == 0);
+const _: () = assert!(FSD_WORKER_STRIDE & 0x1f_ffff == 0);
+const _: () = assert!(
+    FSD_WORKER_BADGE_BASE
+        > crate::TP_WORKER_AUX_BADGE_BASE
+            + (crate::MAX_PI * crate::TP_WORKER_SLOT_COUNT) as u64
+);
+const _: () = assert!(
+    FSD_WORKER_TRAMP_OFFSET + 0x1000 <= FSD_WORKER_STRIDE
+        && FSD_WORKER_STACK_FRAMES * 0x1000 <= FSD_WORKER_IPCBUF_OFFSET
+);
 
 const FSD_DATA_MM_SYSTEM_RANGE_START_OFF: u64 = 0x200;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF: u64 = 0x208;
@@ -467,6 +491,9 @@ static FSD_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 const FSD_DISPATCH_TRACE_CAP: u64 = 256;
 static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DRIVER_WORKER_ALIAS_NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FSD_ACTIVE_DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_INST: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_MAJOR: AtomicU64 = AtomicU64::new(0);
@@ -8660,7 +8687,10 @@ extern "win64" fn s_ps_create_system_thread(
 
 /// `VOID PsTerminateSystemThread(NTSTATUS)`.
 extern "win64" fn s_ps_terminate_system_thread(_status: i32) {
-    print_str(b"[driver-thread] PsTerminateSystemThread called without hosted thread runtime\n");
+    print_str(b"[driver-thread] PsTerminateSystemThread parked hosted worker\n");
+    loop {
+        crate::yield_now();
+    }
 }
 
 /// `PEPROCESS PsGetCurrentProcess()` / `PsGetCurrentThread()` — a fake non-null object pointer.
@@ -13074,6 +13104,21 @@ unsafe fn load_driver_reserved(
         print_str(b"\n");
         return None;
     }
+    register_instance_transport(
+        instance,
+        DriverInstance {
+            fault_ep,
+            pml4,
+            exec_shared_va: win.shared_va,
+            exec_pool_va: win.pool_va,
+            exec_arg_va: win.arg_va,
+            tcb,
+            cnode,
+            reply_cap,
+            used: true,
+            ..EMPTY_INSTANCE
+        },
+    );
 
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
@@ -15195,6 +15240,34 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
 /// The live-driver instance table (indexed by [`DriverComponent::instance`]).
 static mut DRIVER_INSTANCES: Option<Vec<DriverInstance>> = None;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct HostedDriverThreadRuntime {
+    instance: usize,
+    handle: u64,
+    tcb: u64,
+    badge: u64,
+    component_slot: usize,
+    exec_alias_slot: u64,
+    raw_cnode: u64,
+    cnode: u64,
+    sched_context: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HostedDriverThreadSpawn {
+    tcb: u64,
+    badge: u64,
+    component_slot: usize,
+    exec_alias_slot: u64,
+    raw_cnode: u64,
+    cnode: u64,
+    sched_context: u64,
+}
+
+static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = None;
+static mut HOSTED_DRIVER_THREAD_RUNTIMES: Option<Vec<HostedDriverThreadRuntime>> = None;
+
 unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
     let slot = &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES);
     if slot.is_none() {
@@ -15205,6 +15278,92 @@ unsafe fn driver_instances_mut() -> &'static mut Vec<DriverInstance> {
 
 unsafe fn driver_instances() -> Option<&'static Vec<DriverInstance>> {
     (*core::ptr::addr_of!(DRIVER_INSTANCES)).as_ref()
+}
+
+fn hosted_driver_thread_first_handle(instance: usize) -> u64 {
+    HOSTED_DRIVER_THREAD_HANDLE_BASE
+        .saturating_add(((instance as u64).saturating_add(1)) << 16)
+}
+
+unsafe fn hosted_driver_thread_tables_mut() -> &'static mut Vec<HostedDriverThreadTable> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_TABLES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_driver_thread_table_mut(
+    instance: usize,
+) -> Option<&'static mut HostedDriverThreadTable> {
+    let tables = hosted_driver_thread_tables_mut();
+    while tables.len() <= instance {
+        let first_handle = hosted_driver_thread_first_handle(tables.len());
+        tables.push(HostedDriverThreadTable::with_first_handle(first_handle));
+    }
+    tables.get_mut(instance)
+}
+
+unsafe fn hosted_driver_thread_runtimes_mut() -> &'static mut Vec<HostedDriverThreadRuntime> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_RUNTIMES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn delete_hosted_driver_thread_mechanism(
+    tcb: u64,
+    sched_context: u64,
+    cnode: u64,
+    raw_cnode: u64,
+) {
+    let _ = tcb_suspend_r(tcb);
+    let _ = cnode_delete_recycle_r(sched_context);
+    let _ = cnode_delete_recycle_r(tcb);
+    let _ = cnode_delete_recycle_r(cnode);
+    let _ = cnode_delete_recycle_r(raw_cnode);
+}
+
+fn clear_hosted_driver_threads_for_instance(instance: usize) {
+    unsafe {
+        if let Some(runtimes) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_mut() {
+            let mut index = 0usize;
+            while index < runtimes.len() {
+                if runtimes[index].instance == instance {
+                    let rt = runtimes.remove(index);
+                    delete_hosted_driver_thread_mechanism(
+                        rt.tcb,
+                        rt.sched_context,
+                        rt.cnode,
+                        rt.raw_cnode,
+                    );
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if let Some(tables) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_TABLES)).as_mut() {
+            if instance < tables.len() {
+                tables[instance] =
+                    HostedDriverThreadTable::with_first_handle(hosted_driver_thread_first_handle(
+                        instance,
+                    ));
+            }
+        }
+    }
+}
+
+fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
+    match error {
+        HostedDriverThreadError::InvalidStartRoutine | HostedDriverThreadError::InvalidHandle => {
+            STATUS_INVALID_PARAMETER
+        }
+        HostedDriverThreadError::AlreadyTerminated => STATUS_INVALID_HANDLE,
+        HostedDriverThreadError::ExhaustedHandleSpace | HostedDriverThreadError::NoCapacity => {
+            STATUS_INSUFFICIENT_RESOURCES
+        }
+    }
 }
 
 unsafe fn driver_exec_mapped_caps_mut() -> &'static mut Vec<Vec<u64>> {
@@ -15381,6 +15540,18 @@ unsafe fn map_instance_exec_frame(
 /// Record a launched driver in [`DRIVER_INSTANCES`] (called by [`load_driver`]). "Ready" iff it
 /// parked at its dispatch loop with a control DEVICE_OBJECT (an FSD; a filter/device without an
 /// IoCreateDevice may still be ready — see [`register_instance_ready`]).
+fn register_instance_transport(i: usize, inst: DriverInstance) {
+    let t = unsafe { driver_instances_mut() };
+    while t.len() <= i {
+        t.push(EMPTY_INSTANCE);
+    }
+    t[i] = DriverInstance {
+        ready: false,
+        used: true,
+        ..inst
+    };
+}
+
 fn register_instance(dc: &DriverComponent) {
     // SAFETY: single-threaded executive; the table is written here + read in dispatch_irp.
     let t = unsafe { driver_instances_mut() };
@@ -15427,6 +15598,7 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) {
+    clear_hosted_driver_threads_for_instance(i);
     clear_hosted_device_bindings_for_instance(i);
     if let Some(inst) = instance(i) {
         unsafe {
@@ -15511,6 +15683,137 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     })
 }
 
+unsafe fn spawn_hosted_driver_worker_thread(
+    inst: DriverInstance,
+    component_slot: usize,
+    start_routine: u64,
+    start_context: u64,
+) -> Option<HostedDriverThreadSpawn> {
+    let component_base = FSD_WORKER_VADDR.checked_add(
+        (component_slot as u64).checked_mul(FSD_WORKER_STRIDE)?,
+    )?;
+    let stack_base = component_base;
+    let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
+    let tramp_va = component_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
+    let exec_alias_slot = HOSTED_DRIVER_WORKER_ALIAS_NEXT.fetch_add(1, Ordering::Relaxed);
+    let exec_base = FSD_WORKER_EXEC_ALIAS_BASE
+        .checked_add(exec_alias_slot.checked_mul(FSD_WORKER_STRIDE)?)?;
+    let badge = FSD_WORKER_BADGE_BASE.checked_add(exec_alias_slot)?;
+
+    if !ensure_paging(stack_base, inst.pml4) || !crate::ensure_executive_paging(exec_base) {
+        return None;
+    }
+
+    let mut i = 0u64;
+    while i < FSD_WORKER_STACK_FRAMES {
+        let owner = alloc_frame();
+        let target = copy_cap(owner);
+        let page = stack_base + i * 0x1000;
+        if page_map_r(target, page, RW_NX, inst.pml4) != 0 {
+            return None;
+        }
+        i += 1;
+    }
+
+    let ipcbuf = alloc_frame();
+    if page_map_r(ipcbuf, ipcbuf_va, RW_NX, inst.pml4) != 0 {
+        return None;
+    }
+
+    let tramp = alloc_frame();
+    let tramp_exec = copy_cap(tramp);
+    if page_map_r(tramp_exec, exec_base, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_recycle_r(tramp_exec);
+        return None;
+    }
+    let trampoline = nt_thread_start::Amd64ThreadContext {
+        rip: start_routine,
+        rsp: 0,
+        rcx: start_context,
+        rdx: 0,
+    }
+    .call_trampoline();
+    for (j, &byte) in trampoline.iter().enumerate() {
+        write_volatile((exec_base + j as u64) as *mut u8, byte);
+    }
+    let tramp_target = copy_cap(tramp);
+    if page_map_r(tramp_target, tramp_va, 2, inst.pml4) != 0 {
+        let _ = page_unmap_r(tramp_exec);
+        let _ = cnode_delete_recycle_r(tramp_exec);
+        return None;
+    }
+    let _ = page_unmap_r(tramp_exec);
+    let _ = cnode_delete_recycle_r(tramp_exec);
+
+    let raw = alloc_slot();
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw) != 0 {
+        recycle_deleted_root_slot(raw);
+        return None;
+    }
+    let cnode = alloc_slot();
+    if cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE) != 0 {
+        recycle_deleted_root_slot(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        return None;
+    }
+    let pml4_copy = cnode_copy_at_r(cnode, CT_PML4, inst.pml4);
+    let fault_mint = cnode_mint_r(cnode, CT_FAULT, inst.fault_ep, badge);
+    if pml4_copy != 0 || fault_mint != 0 {
+        let _ = cnode_delete_recycle_r(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        return None;
+    }
+
+    let tcb = alloc_slot();
+    let tcb_retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let set_space = if tcb_retype == 0 {
+        tcb_set_space_r(tcb, CT_FAULT, cnode, inst.pml4)
+    } else {
+        u64::MAX
+    };
+    let set_ipc = if tcb_retype == 0 && set_space == 0 {
+        tcb_set_ipc_buffer_r(tcb, ipcbuf_va, ipcbuf)
+    } else {
+        u64::MAX
+    };
+    let stack_top = stack_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 16;
+    let set_regs = if tcb_retype == 0 && set_space == 0 && set_ipc == 0 {
+        tcb_write_registers_r(tcb, tramp_va, stack_top, 0)
+    } else {
+        u64::MAX
+    };
+    if tcb_retype != 0 || set_space != 0 || set_ipc != 0 || set_regs != 0 {
+        if tcb_retype == 0 {
+            let _ = cnode_delete_recycle_r(tcb);
+        } else {
+            recycle_deleted_root_slot(tcb);
+        }
+        let _ = cnode_delete_recycle_r(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        return None;
+    }
+    let _ = tcb_set_gs_base(tcb, FSD_KPCR_VA);
+    let _ = tcb_set_priority(tcb, 100);
+    let sched_context = match attach_sched_context(tcb) {
+        Ok(sc) => sc,
+        Err(_) => {
+            let _ = cnode_delete_recycle_r(tcb);
+            let _ = cnode_delete_recycle_r(cnode);
+            let _ = cnode_delete_recycle_r(raw);
+            return None;
+        }
+    };
+    Some(HostedDriverThreadSpawn {
+        tcb,
+        badge,
+        component_slot,
+        exec_alias_slot,
+        raw_cnode: raw,
+        cnode,
+        sched_context,
+    })
+}
+
 pub(crate) fn service_hosted_driver_ps_create_system_thread(
     ch: &crate::spawn_hosts::PumpChannel,
     start_routine: u64,
@@ -15518,6 +15821,7 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
     object_attributes: u64,
     process_handle: u64,
     client_id: u64,
+    caller_badge: u64,
 ) -> (i32, u64) {
     let request = HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
     let Some((instance, inst)) = instance_by_shared_va(ch.shared_va) else {
@@ -15532,17 +15836,12 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    if request <= 8 {
-        print_str(b"[driver-thread] PsCreateSystemThread request inst=");
-        print_u64(instance as u64);
-        print_str(b" start=0x");
-        print_hex((start_routine >> 32) as u32);
-        print_hex(start_routine as u32);
-        print_str(b" ctx=0x");
-        print_hex((start_context >> 32) as u32);
-        print_hex(start_context as u32);
-        if object_attributes != 0 || process_handle != 0 || client_id != 0 {
-            print_str(b" unsupported attrs/process/client=");
+    if object_attributes != 0 || process_handle != 0 || client_id != 0 {
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        if request <= 8 {
+            print_str(b"[driver-thread] PsCreateSystemThread unsupported shape inst=");
+            print_u64(instance as u64);
+            print_str(b" attrs/process/client=");
             print_hex((object_attributes >> 32) as u32);
             print_hex(object_attributes as u32);
             print_str(b"/");
@@ -15551,11 +15850,128 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             print_str(b"/");
             print_hex((client_id >> 32) as u32);
             print_hex(client_id as u32);
+            print_str(b"\n");
         }
+        return (STATUS_NOT_IMPLEMENTED, 0);
+    }
+
+    let (component_slot, handle) = unsafe {
+        let Some(table) = hosted_driver_thread_table_mut(instance) else {
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (STATUS_INSUFFICIENT_RESOURCES, 0);
+        };
+        let component_slot = table.len();
+        let handle = match table.create(start_routine, start_context) {
+            Ok(handle) => handle,
+            Err(error) => {
+                HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+                return (hosted_driver_thread_error_status(error), 0);
+            }
+        };
+        (component_slot, handle)
+    };
+
+    let Some(spawn) = (unsafe {
+        spawn_hosted_driver_worker_thread(inst, component_slot, start_routine, start_context)
+    }) else {
+        unsafe {
+            if let Some(table) = hosted_driver_thread_table_mut(instance) {
+                let _ = table.remove(handle);
+            }
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INSUFFICIENT_RESOURCES, 0);
+    };
+
+    let attach = unsafe {
+        hosted_driver_thread_table_mut(instance)
+            .ok_or(HostedDriverThreadError::InvalidHandle)
+            .and_then(|table| table.attach_tcb(handle, spawn.tcb))
+    };
+    if let Err(error) = attach {
+        unsafe {
+            if let Some(table) = hosted_driver_thread_table_mut(instance) {
+                let _ = table.remove(handle);
+            }
+            delete_hosted_driver_thread_mechanism(
+                spawn.tcb,
+                spawn.sched_context,
+                spawn.cnode,
+                spawn.raw_cnode,
+            );
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        return (hosted_driver_thread_error_status(error), 0);
+    }
+
+    unsafe {
+        hosted_driver_thread_runtimes_mut().push(HostedDriverThreadRuntime {
+            instance,
+            handle,
+            tcb: spawn.tcb,
+            badge: spawn.badge,
+            component_slot: spawn.component_slot,
+            exec_alias_slot: spawn.exec_alias_slot,
+            raw_cnode: spawn.raw_cnode,
+            cnode: spawn.cnode,
+            sched_context: spawn.sched_context,
+        });
+    }
+    if tcb_resume(spawn.tcb) != 0 {
+        unsafe {
+            if let Some(table) = hosted_driver_thread_table_mut(instance) {
+                let _ = table.remove(handle);
+            }
+            let runtimes = hosted_driver_thread_runtimes_mut();
+            if let Some(index) = runtimes
+                .iter()
+                .position(|rt| rt.instance == instance && rt.handle == handle)
+            {
+                let rt = runtimes.remove(index);
+                delete_hosted_driver_thread_mechanism(
+                    rt.tcb,
+                    rt.sched_context,
+                    rt.cnode,
+                    rt.raw_cnode,
+                );
+            } else {
+                delete_hosted_driver_thread_mechanism(
+                    spawn.tcb,
+                    spawn.sched_context,
+                    spawn.cnode,
+                    spawn.raw_cnode,
+                );
+            }
+        }
+        HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+        HOSTED_DRIVER_SYSTEM_THREAD_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return (STATUS_INSUFFICIENT_RESOURCES, 0);
+    }
+    HOSTED_DRIVER_SYSTEM_THREAD_SPAWNS.fetch_add(1, Ordering::Relaxed);
+    if request <= 8 {
+        print_str(b"[driver-thread] PsCreateSystemThread request inst=");
+        print_u64(instance as u64);
+        if caller_badge != 0 {
+            print_str(b" badge=");
+            print_u64(caller_badge);
+        }
+        print_str(b" start=0x");
+        print_hex((start_routine >> 32) as u32);
+        print_hex(start_routine as u32);
+        print_str(b" ctx=0x");
+        print_hex((start_context >> 32) as u32);
+        print_hex(start_context as u32);
+        print_str(b" handle=0x");
+        print_hex((handle >> 32) as u32);
+        print_hex(handle as u32);
+        print_str(b" tcb=0x");
+        print_hex(spawn.tcb as u32);
+        print_str(b" worker-badge=");
+        print_u64(spawn.badge);
         print_str(b"\n");
     }
-    HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
-    (STATUS_NOT_IMPLEMENTED, 0)
+    (STATUS_SUCCESS, handle)
 }
 
 fn instance_by_device_object(device_object: u64) -> Option<(usize, DriverInstance)> {

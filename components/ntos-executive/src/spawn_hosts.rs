@@ -911,6 +911,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
         0
     };
     Some(PumpMessage {
+        badge,
         mi,
         m0,
         m1,
@@ -922,6 +923,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel) -> Option<PumpMessage> {
 
 #[derive(Clone, Copy)]
 struct PumpMessage {
+    badge: u64,
     mi: u64,
     m0: u64,
     m1: u64,
@@ -939,6 +941,7 @@ impl PumpMessage {
     #[inline]
     const fn deadman_wall() -> Self {
         Self {
+            badge: 0,
             mi: 0,
             m0: 0,
             m1: 0,
@@ -1102,6 +1105,7 @@ unsafe fn pump_recv(ch: &PumpChannel) -> PumpMessage {
             0
         };
         return PumpMessage {
+            badge,
             mi,
             m0,
             m1,
@@ -1181,6 +1185,7 @@ unsafe fn pump_reply_recv4(
         0
     };
     PumpMessage {
+        badge,
         mi,
         m0,
         m1,
@@ -1361,6 +1366,7 @@ unsafe fn component_pump_loop(ch: &PumpChannel, first: PumpMessage) -> PumpLoopO
                 msg.m2,
                 msg.m3,
                 msg.m4,
+                msg.badge,
             );
             pump_reply_recv4_into!(ch, msg, 2, status as u32 as u64, handle, 0, 0);
             continue;
