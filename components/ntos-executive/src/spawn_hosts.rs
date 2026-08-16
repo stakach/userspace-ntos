@@ -1869,8 +1869,12 @@ unsafe fn pump_service_io_port_fault(
     let port_base = grant.base;
     let port_len = grant.len;
     let port_u64 = port as u64;
+    let width = u64::from(bits) / 8;
     let grant_end = port_base.checked_add(port_len)?;
-    if port_u64 < port_base || port_u64 >= grant_end {
+    let Some(access_end) = port_u64.checked_add(width) else {
+        return None;
+    };
+    if width == 0 || port_u64 < port_base || access_end > grant_end {
         if bits == 16 {
             let offset = if is_in {
                 crate::driver_launch::SH_RESOURCE_IO_PORT_IN16_DENIED
@@ -1960,7 +1964,19 @@ unsafe fn pump_service_io_port_fault(
             }
         }
     } else if is_in {
-        return None;
+        let (value, io) = crate::io_in32_r(port_cap, port);
+        if io != 0 {
+            crate::print_str(b"[pump] IOPortIn32 failed label=");
+            crate::print_u64(io);
+            crate::print_str(b" port=0x");
+            crate::print_hex(port as u32);
+            crate::print_str(b"\n");
+            return None;
+        }
+        regs[3] = (regs[3] & !0xFFFF_FFFFu64) | value as u64;
+        if crate::win32k_glue::tcb_write_regs20(ch.tcb, &regs, false) != 0 {
+            return None;
+        }
     } else {
         let value = regs[3] as u32;
         let io = crate::io_out32(port_cap, port, value);

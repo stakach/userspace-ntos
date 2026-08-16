@@ -23,10 +23,10 @@
 
 /// Capacity of the fixed name->VA binding array. Sized for the largest hosted
 /// driver class: the FSD/device host surface is now shared by real ReactOS
-/// support images such as ndis.sys and registers over 180 distinct NT/HAL
+/// support images such as ndis.sys and registers over 250 distinct NT/HAL
 /// trampolines + aliases. Keep headroom so adding exact imports fails in review
 /// before it fails at boot.
-pub const DRIVER_TRAMPOLINE_CAP: usize = 256;
+pub const DRIVER_TRAMPOLINE_CAP: usize = 384;
 
 /// A heap-free, registration-driven resolver for a hosted driver's `ntoskrnl.exe`
 /// imports. Driver-agnostic: the executive owns one per driver class (or shares

@@ -10505,11 +10505,166 @@ unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
     cap != 0 && range_within_grant(grant_start, grant_len, start, len)
 }
 
+unsafe fn hosted_mmio_va_range_granted(start: u64, len: u64) -> bool {
+    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
+    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+    grant_start != 0 && range_within_grant(grant_start, grant_len, start, len)
+}
+
 unsafe fn bump_shared_io_counter(offset: u64) -> u64 {
     let ptr = (FSD_SHARED_VADDR + offset) as *mut u64;
     let next = read_volatile(ptr).saturating_add(1);
     write_volatile(ptr, next);
     next
+}
+
+unsafe fn hosted_port_cap_for_component_io(port: u64, width: u64) -> Option<u64> {
+    if port > u16::MAX as u64 || width == 0 || !hosted_io_range_granted(port, width) {
+        return None;
+    }
+    let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64);
+    if cap == 0 { None } else { Some(cap) }
+}
+
+extern "win64" fn s_read_port_ushort(port: u64) -> u16 {
+    unsafe {
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            port,
+        );
+        let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                u64::MAX,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                0,
+            );
+            return 0;
+        };
+        let (value, status) = crate::io_in16_r(cap, port as u16);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            status,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            value as u64,
+        );
+        if status != 0 {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_FAILURES);
+            return 0;
+        }
+        value
+    }
+}
+
+extern "win64" fn s_write_port_ushort(port: u64, value: u16) {
+    unsafe {
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            port,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            value as u64,
+        );
+        let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                u64::MAX,
+            );
+            return;
+        };
+        let status = crate::io_out16(cap, port as u16, value);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            status,
+        );
+        if status != 0 {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_FAILURES);
+        }
+    }
+}
+
+extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
+    unsafe {
+        let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
+            return 0;
+        };
+        let (value, status) = crate::io_in32_r(cap, port as u16);
+        if status == 0 { value } else { 0 }
+    }
+}
+
+extern "win64" fn s_write_port_ulong(port: u64, value: u32) {
+    unsafe {
+        let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
+            return;
+        };
+        if crate::io_out32(cap, port as u16, value) == 0 {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT32_FAULTS);
+        }
+    }
+}
+
+extern "win64" fn s_read_register_uchar(register: u64) -> u8 {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 1) {
+            read_volatile(register as *const u8)
+        } else {
+            0
+        }
+    }
+}
+
+extern "win64" fn s_read_register_ushort(register: u64) -> u16 {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 2) {
+            read_volatile(register as *const u16)
+        } else {
+            0
+        }
+    }
+}
+
+extern "win64" fn s_read_register_ulong(register: u64) -> u32 {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 4) {
+            read_volatile(register as *const u32)
+        } else {
+            0
+        }
+    }
+}
+
+extern "win64" fn s_write_register_uchar(register: u64, value: u8) {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 1) {
+            write_volatile(register as *mut u8, value);
+        }
+    }
+}
+
+extern "win64" fn s_write_register_ushort(register: u64, value: u16) {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 2) {
+            write_volatile(register as *mut u16, value);
+        }
+    }
+}
+
+extern "win64" fn s_write_register_ulong(register: u64, value: u32) {
+    unsafe {
+        if hosted_mmio_va_range_granted(register, 4) {
+            write_volatile(register as *mut u32, value);
+        }
+    }
 }
 
 unsafe fn hosted_video_range_granted(range: VideoAccessRangeX64) -> bool {
@@ -11540,6 +11695,46 @@ fn register_fsd_trampolines() {
         s_mm_unmap_io_space as *const () as usize as u64,
     );
     reg.bind(
+        "READ_PORT_USHORT",
+        s_read_port_ushort as *const () as usize as u64,
+    );
+    reg.bind(
+        "WRITE_PORT_USHORT",
+        s_write_port_ushort as *const () as usize as u64,
+    );
+    reg.bind(
+        "READ_PORT_ULONG",
+        s_read_port_ulong as *const () as usize as u64,
+    );
+    reg.bind(
+        "WRITE_PORT_ULONG",
+        s_write_port_ulong as *const () as usize as u64,
+    );
+    reg.bind(
+        "READ_REGISTER_UCHAR",
+        s_read_register_uchar as *const () as usize as u64,
+    );
+    reg.bind(
+        "READ_REGISTER_USHORT",
+        s_read_register_ushort as *const () as usize as u64,
+    );
+    reg.bind(
+        "READ_REGISTER_ULONG",
+        s_read_register_ulong as *const () as usize as u64,
+    );
+    reg.bind(
+        "WRITE_REGISTER_UCHAR",
+        s_write_register_uchar as *const () as usize as u64,
+    );
+    reg.bind(
+        "WRITE_REGISTER_USHORT",
+        s_write_register_ushort as *const () as usize as u64,
+    );
+    reg.bind(
+        "WRITE_REGISTER_ULONG",
+        s_write_register_ulong as *const () as usize as u64,
+    );
+    reg.bind(
         "IoConnectInterrupt",
         s_io_connect_interrupt as *const () as usize as u64,
     );
@@ -12058,15 +12253,19 @@ fn lookup_videoprt_export(name: &str) -> Option<u64> {
         "VideoPortReadPortUshort" => {
             Some(s_video_port_read_port_ushort as *const () as usize as u64)
         }
+        "VideoPortReadPortUlong" => Some(s_read_port_ulong as *const () as usize as u64),
         "VideoPortWritePortUshort" => {
             Some(s_video_port_write_port_ushort as *const () as usize as u64)
         }
+        "VideoPortWritePortUlong" => Some(s_write_port_ulong as *const () as usize as u64),
         "VideoPortReadRegisterUshort" => {
             Some(s_video_port_read_register_ushort as *const () as usize as u64)
         }
+        "VideoPortReadRegisterUlong" => Some(s_read_register_ulong as *const () as usize as u64),
         "VideoPortWriteRegisterUshort" => {
             Some(s_video_port_write_register_ushort as *const () as usize as u64)
         }
+        "VideoPortWriteRegisterUlong" => Some(s_write_register_ulong as *const () as usize as u64),
         "VideoPortSetRegistryParameters" => {
             Some(s_video_port_set_registry_parameters as *const () as usize as u64)
         }

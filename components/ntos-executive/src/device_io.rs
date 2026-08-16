@@ -762,18 +762,24 @@ pub(crate) unsafe fn io_in16_r(ioport: u64, port: u16) -> (u16, u64) {
 }
 
 pub(crate) unsafe fn io_in32(ioport: u64, port: u16) -> u32 {
+    io_in32_r(ioport, port).0
+}
+
+/// `in eax, dx` via an I/O-port cap. Returns `(value, kernel invocation label)`.
+pub(crate) unsafe fn io_in32_r(ioport: u64, port: u16) -> (u32, u64) {
     let value: u64;
+    let reply: u64;
     core::arch::asm!(
         "syscall",
         in("rdx") SYS_CALL as u64,
         inout("rdi") ioport => _,
-        inout("rsi") ((LBL_IOPORT_IN32 << 12) | 1) => _,
+        inout("rsi") ((LBL_IOPORT_IN32 << 12) | 1) => reply,
         inout("r10") port as u64 => value, // mr0 in = port; reply mr0 = value
         lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    value as u32
+    (value as u32, reply >> 12)
 }
 
 /// Read a 32-bit PCI configuration register (mechanism #1: 0xCF8 address / 0xCFC data).

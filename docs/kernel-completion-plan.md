@@ -6622,3 +6622,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   x86_64-unknown-none`, and `git diff --check`. Review adjustment: the next B3 packet-data-plane
   target is no longer missing WDM SG callbacks; it is observing and plumbing real e1000 TX/RX
   completion over the generic PCI/IOMMU-backed grant.
+
+  B3 hosted 32-bit port/register I/O completion (2026-08-16): the hosted driver boundary now handles
+  32-bit I/O-port reads as a first-class mechanism instead of suspending the component on
+  `in dx,eax`. The seL4 I/O wrapper reports `(value, status)` for `in32`, the shared component pump
+  writes the returned value back into EAX and resumes the faulting driver frame, and all inline
+  16/32-bit port faults now verify that the whole access width fits inside the per-devnode I/O
+  grant. Hosted ntoskrnl import resolution also exposes real grant-validated
+  `READ_PORT_USHORT`, `WRITE_PORT_USHORT`, `READ_PORT_ULONG`, `WRITE_PORT_ULONG`, and
+  `READ/WRITE_REGISTER_{UCHAR,USHORT,ULONG}` helpers, with the 32-bit port/register subset exported
+  through the videoprt provider as well. The fixed hosted-driver export registry capacity was raised
+  from 256 to 384 entries so adding real NT import names remains a generic resolution path rather
+  than a loader special case. Validation: `cargo fmt --all`, `cargo test -p nt-compat-exports`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun the serialized boot proof
+  against the previous e1000 StartDevice stall; if the NIC now advances, continue with real TX/RX
+  descriptor completion and interrupt/DPC delivery over the existing PCI/IOMMU grants. If it still
+  stalls, capture the first exact miniport wait/poll site and implement the next missing generic NT
+  or bus primitive.
