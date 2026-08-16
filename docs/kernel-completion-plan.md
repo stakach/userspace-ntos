@@ -1187,10 +1187,14 @@ before unrelated executive traffic monopolises the receive loop.
   resolver now has the real NT/HAL data and routine exports needed to load the ReactOS
   `ndis.sys`/`tcpip.sys`/`afd.sys` images fail-closed. The generated SYSTEM hive also carries
   ReactOS-derived NDIS/TCPIP/AFD service records and the network load-order groups through the same
-  Config Manager ordering path used by real REGF hives. Remaining B3 work is broader non-display
-  driver coverage: real hosted kernel-thread runtime for `PsCreateSystemThread`, metadata-driven
-  TCPIP/AFD activation once hosted waits can block/resume, miniport packet data-plane behavior, and
-  multi-device scaling under the same dynamic devnode/resource path.
+  Config Manager ordering path used by real REGF hives. Hosted `KeWaitForSingleObject` and
+  `KeWaitForMultipleObjects` now distinguish true zero-timeout polls from blocking or infinite waits:
+  ready dispatcher objects still complete normally, unsatisfied polls return `STATUS_TIMEOUT`, and
+  unsatisfied blocking waits fail closed until a real hosted wait broker can park and resume worker
+  TCBs. Remaining B3 work is broader non-display driver coverage: real hosted kernel-thread runtime
+  for `PsCreateSystemThread`, metadata-driven TCPIP/AFD activation once hosted waits can
+  block/resume, miniport packet data-plane behavior, and multi-device scaling under the same dynamic
+  devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6301,3 +6305,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   wait support. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`.
+
+  B3 hosted blocking-wait honesty cleanup (2026-08-16): hosted driver `KeWaitForSingleObject` and
+  `KeWaitForMultipleObjects` no longer collapse every unsatisfied dispatcher wait into
+  `STATUS_TIMEOUT`. The shared kernel-exec wait classifier now preserves the NT timeout pointer
+  distinction (`NULL` infinite wait, zero poll, nonzero timed wait); hosted import trampolines return
+  timeout only for real polls, while blocking/infinite waits report `STATUS_NOT_IMPLEMENTED` until
+  the hosted system-thread wait broker exists. This keeps TCPIP/AFD activation fail-closed instead of
+  spinning lwIP mailbox and semaphore loops on fabricated timeouts. Validation: `cargo fmt --all`,
+  `cargo test -p nt-kernel-exec`, executive `cargo check` for `x86_64-unknown-none`, and
+  `git diff --check`.

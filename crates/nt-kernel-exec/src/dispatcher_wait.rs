@@ -17,6 +17,24 @@ pub enum DispatcherWaitResult {
     DuplicateObject,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatcherWaitTimeout {
+    /// `Timeout == NULL`: wait forever.
+    Infinite,
+    /// `Timeout->QuadPart == 0`: poll and return immediately if no object is signaled.
+    Poll,
+    /// Any non-zero relative or absolute timeout: a real timed wait.
+    Blocking,
+}
+
+pub fn classify_dispatcher_wait_timeout(timeout: Option<i64>) -> DispatcherWaitTimeout {
+    match timeout {
+        None => DispatcherWaitTimeout::Infinite,
+        Some(0) => DispatcherWaitTimeout::Poll,
+        Some(_) => DispatcherWaitTimeout::Blocking,
+    }
+}
+
 pub fn dispatcher_ready(
     events: &EventStore,
     semaphores: &SemaphoreStore,
@@ -97,6 +115,26 @@ mod tests {
 
     fn stores() -> (EventStore, SemaphoreStore, MutantStore) {
         (EventStore::new(), SemaphoreStore::new(), MutantStore::new())
+    }
+
+    #[test]
+    fn wait_timeout_pointer_shape_distinguishes_poll_from_blocking() {
+        assert_eq!(
+            classify_dispatcher_wait_timeout(None),
+            DispatcherWaitTimeout::Infinite
+        );
+        assert_eq!(
+            classify_dispatcher_wait_timeout(Some(0)),
+            DispatcherWaitTimeout::Poll
+        );
+        assert_eq!(
+            classify_dispatcher_wait_timeout(Some(-10_000)),
+            DispatcherWaitTimeout::Blocking
+        );
+        assert_eq!(
+            classify_dispatcher_wait_timeout(Some(10_000)),
+            DispatcherWaitTimeout::Blocking
+        );
     }
 
     #[test]

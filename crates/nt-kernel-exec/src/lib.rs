@@ -39,7 +39,8 @@ mod work_item;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dispatcher_wait::{
-    consume_dispatcher, dispatcher_ready, poll_dispatchers, DispatcherObject, DispatcherWaitResult,
+    classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready, poll_dispatchers,
+    DispatcherObject, DispatcherWaitResult, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};

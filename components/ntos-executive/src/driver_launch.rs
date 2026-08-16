@@ -42,8 +42,9 @@ use nt_io_manager::{
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_kernel_exec::{
-    init_ksemaphore, kevent, ksemaphore_read_state, ksemaphore_release, ksemaphore_try_wait,
-    rtl_bitmap, EventKind, SEMAPHORE_OBJECT,
+    classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
+    ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
+    SEMAPHORE_OBJECT,
 };
 use nt_mdl::MdlRegistry;
 use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
@@ -7462,15 +7463,28 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     false
 }
 
+unsafe fn hosted_unsatisfied_wait_status(timeout: u64) -> i32 {
+    let timeout_value = if timeout == 0 {
+        None
+    } else {
+        Some(read_unaligned(timeout as *const i64))
+    };
+    match classify_dispatcher_wait_timeout(timeout_value) {
+        DispatcherWaitTimeout::Poll => STATUS_TIMEOUT_I32,
+        DispatcherWaitTimeout::Infinite | DispatcherWaitTimeout::Blocking => STATUS_NOT_IMPLEMENTED,
+    }
+}
+
 /// `NTSTATUS KeWaitForSingleObject(...)` for hosted-driver local dispatcher objects. The current
-/// component transport cannot sleep inside an import trampoline, so unsatisfied waits report timeout
-/// instead of fabricating success.
+/// component transport cannot yet park and resume an arbitrary hosted driver TCB inside an import
+/// trampoline. Ready objects complete normally; unsatisfied zero-timeout polls report timeout, while
+/// blocking waits fail closed until the hosted system-thread wait broker is wired.
 extern "win64" fn s_ke_wait_for_single_object(
     object: u64,
     _wait_reason: u32,
     _wait_mode: u32,
     _alertable: u8,
-    _timeout: u64,
+    timeout: u64,
 ) -> i32 {
     unsafe {
         match hosted_dispatcher_ready(object) {
@@ -7478,7 +7492,7 @@ extern "win64" fn s_ke_wait_for_single_object(
                 hosted_dispatcher_consume(object);
                 STATUS_SUCCESS
             }
-            Ok(false) => STATUS_TIMEOUT_I32,
+            Ok(false) => hosted_unsatisfied_wait_status(timeout),
             Err(status) => status,
         }
     }
@@ -7492,7 +7506,7 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     _wait_reason: u32,
     _wait_mode: u32,
     _alertable: u8,
-    _timeout: u64,
+    timeout: u64,
     _wait_block_array: u64,
 ) -> i32 {
     if count == 0 || count > 64 || object_array == 0 {
@@ -7513,7 +7527,7 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
                 }
                 Ok(false) => {
                     if wait_all {
-                        return STATUS_TIMEOUT_I32;
+                        return hosted_unsatisfied_wait_status(timeout);
                     }
                 }
                 Err(status) => return status,
@@ -7533,7 +7547,7 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
             hosted_dispatcher_consume(object);
             index as i32
         } else {
-            STATUS_TIMEOUT_I32
+            hosted_unsatisfied_wait_status(timeout)
         }
     }
 }
