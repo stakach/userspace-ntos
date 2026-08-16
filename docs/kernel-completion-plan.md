@@ -38,6 +38,19 @@ live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that st
 is using a stale binary or stale branch state. The callback/transport gates now assert live
 invariants from the real workload.
 
+Latest accepted desktop proof (2026-08-16):
+`.tmp/run-desktop-boot-proof-alias.log` reaches the harness sentinel with `296/296`
+executive-to-isolated-service checks passing after the boot-framebuffer display route was removed and
+the old fixed boot proof scratch aliases were replaced. The hosted Bochs/videoprt route remains the
+only display route: it publishes `\\Device\\Video0` through the hosted I/O Manager path, mode
+enumeration returns `bytes=320`, `VideoPortMapMemory` maps `phys=0x80000000 len=3145728` to
+`WIN32K_FB_VA`, and `PDEVOBJ_lChangeDisplaySettings status=0`. The storage proof now maps checked
+dynamic aliases before copying the real disk hive page, validates source/copy/faulted qwords against
+the `UNTHIVE1` image magic, and passes `exec_disk_section_demand_paged`. The same run reaches real
+`WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM classes, api0 callbacks, GDI user
+batch flushes, and `exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports
+`786432/786432` non-background pixels with at least 32 distinct non-background colors.
+
 Latest accepted desktop proof (2026-08-15):
 `.tmp/run-desktop-user-alloc-private-vm-20260815.log` reaches the harness sentinel with `296/296`
 executive-to-isolated-service checks passing after the legacy non-SEC_IMAGE user-allocation window
@@ -3737,6 +3750,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `295/296` checks. The lone remaining failure in that run is the unrelated
   `exec_disk_section_demand_paged` gate. Review adjustment: remaining B3 display work is the
   automated shell-pixel gate and diagnostic reduction, not another boot-video fallback.
+
+- B3 boot-proof scratch alias cleanup (2026-08-16). The stale fixed boot scratch aliases used by
+  the file-section, disk-hive, and SMSS SEC_IMAGE proof paths have been replaced with a checked
+  boot-proof alias range. `map_boot_proof_alias` creates executive page-table coverage with
+  `ensure_executive_paging`, uses checked `alloc_frame_r`/`page_map_r` results, and skips occupied
+  aliases instead of silently writing through an already-mapped VA. The disk-hive demand-page gate
+  now validates the real source qword in the storage shared window, the copied file-frame qword, and
+  the demand-faulted user verdict against the `UNTHIVE1` hive image magic. Serialized desktop proof
+  `.tmp/run-desktop-boot-proof-alias.log` passes `exec_disk_section_demand_paged` and reaches the
+  harness sentinel with `296/296` checks, preserving the hosted Bochs/videoprt route and
+  `exec_explorer_shell_chrome_painted`. Review adjustment: the boot-framebuffer fallback and the
+  fixed proof-alias debt are closed for the current B3 display frontier; remaining work is reducing
+  proof-only diagnostics and continuing real NT subsystem coverage without adding fallback success
+  paths.
 
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The

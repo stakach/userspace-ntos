@@ -1190,6 +1190,7 @@ pub const SSN_NT_DEBUG_ACTIVE_PROCESS: u64 = 59;
 pub const SSN_NT_DEBUG_CONTINUE: u64 = 60;
 pub const SSN_NT_REMOVE_PROCESS_DEBUG: u64 = 199;
 pub const SSN_NT_WAIT_FOR_DEBUG_EVENT: u64 = 279;
+const NT_HIVE_IMAGE_MAGIC_LE: u64 = 0x3145_5649_4854_4E55; // "UNTHIVE1"
 /// NtAllocateLocallyUniqueId — line 16 of `sysfuncs.lst` (0-based index 15). msgina's `MyLogonUser`
 /// calls it (via `AllocateLocallyUniqueId`) to mint the interactive logon session's LUID.
 pub const SSN_NT_ALLOCATE_LOCALLY_UNIQUE_ID: u64 = 15;
@@ -1230,16 +1231,14 @@ pub const STORAGE_IMPORTS_IMAGE_OFFSET: u64 = 0x800;
 pub const STORAGE_HIVE_IMAGE_CAP: usize =
     (STORAGE_SHARED_FRAMES as usize * 0x1000) - STORAGE_HIVE_IMAGE_OFFSET as usize;
 pub const STORAGE_SHARED_END: u64 = STORAGE_SHARED_VADDR + STORAGE_SHARED_FRAMES * 0x1000;
-pub const BOOT_FILE_SECTION_SCRATCH_VA: u64 = 0x0000_0100_1045_0000;
-pub const BOOT_SEC_IMAGE_SCRATCH_VA: u64 = 0x0000_0100_1045_1000;
-pub const BOOT_HIVE_SECTION_SCRATCH_VA: u64 = 0x0000_0100_1045_2000;
-pub const BOOT_SMSS_FILL_SCRATCH_VA: u64 = 0x0000_0100_1045_3000;
+pub const BOOT_PROOF_ALIAS_BASE: u64 = 0x0000_0100_1340_0000;
+pub const BOOT_PROOF_ALIAS_END: u64 = BOOT_PROOF_ALIAS_BASE + 0x20_0000;
+pub const BOOT_SEC_IMAGE_SCRATCH_BASE: u64 = BOOT_PROOF_ALIAS_BASE;
 const _: () = assert!(STORAGE_SHARED_VADDR >= WORK_CLUSTER_BASE);
 const _: () = assert!(STORAGE_SHARED_END <= WORK_CLUSTER_BASE + 0x20_0000);
-const _: () = assert!(STORAGE_SHARED_END <= BOOT_FILE_SECTION_SCRATCH_VA);
-const _: () = assert!(BOOT_SEC_IMAGE_SCRATCH_VA >= BOOT_FILE_SECTION_SCRATCH_VA + 0x1000);
-const _: () = assert!(BOOT_HIVE_SECTION_SCRATCH_VA >= BOOT_SEC_IMAGE_SCRATCH_VA + 0x1000);
-const _: () = assert!(BOOT_SMSS_FILL_SCRATCH_VA >= BOOT_HIVE_SECTION_SCRATCH_VA + 0x1000);
+const _: () = assert!(BOOT_PROOF_ALIAS_BASE >= WINLOGON_CSR_FILL_SCRATCH + 0x20_0000);
+const _: () = assert!(BOOT_PROOF_ALIAS_END <= SVC_LISTENER_STACK_MIRROR_VA);
+static NEXT_BOOT_PROOF_ALIAS: AtomicU64 = AtomicU64::new(BOOT_PROOF_ALIAS_END - 0x1000);
 /// A multi-frame file buffer shared between the executive and the storage host: the host reads
 /// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
@@ -11923,6 +11922,8 @@ static mut EXEC_PAGING_SEEN_N: usize = 0;
 const EXEC_PAGING_SEEN_PDPT: u64 = 1u64 << 60;
 const EXEC_PAGING_SEEN_PD: u64 = 2u64 << 60;
 const EXEC_PAGING_SEEN_PT: u64 = 3u64 << 60;
+const SEL4_RANGE_ERROR: u64 = 4;
+const SEL4_FAILED_LOOKUP: u64 = 6;
 const SEL4_DELETE_FIRST: u64 = 8;
 
 unsafe fn exec_paging_seen(key: u64) -> bool {
@@ -12019,6 +12020,26 @@ pub(crate) unsafe fn ensure_executive_paging(page: u64) -> bool {
             page,
             b"pt",
         )
+}
+
+unsafe fn map_boot_proof_alias(frame: u64) -> (u64, u64) {
+    for _ in 0..512 {
+        let alias = NEXT_BOOT_PROOF_ALIAS.fetch_sub(0x1000, Ordering::Relaxed);
+        if !(BOOT_PROOF_ALIAS_BASE..BOOT_PROOF_ALIAS_END).contains(&alias) {
+            return (0, SEL4_RANGE_ERROR);
+        }
+        if !ensure_executive_paging(alias) {
+            return (0, SEL4_FAILED_LOOKUP);
+        }
+        let map = page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+        if map == 0 {
+            return (alias, 0);
+        }
+        if map != SEL4_DELETE_FIRST {
+            return (0, map);
+        }
+    }
+    (0, SEL4_DELETE_FIRST)
 }
 
 /// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
@@ -22647,17 +22668,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // A "file" frame backing a demand-paged section: fill it (via an executive scratch mapping)
     // with a recognizable payload. (Sourcing this frame from a real disk file via the P2
     // storage host is the next composition — the demand-paging mechanism is identical.)
-    let ff = alloc_frame();
-    let _ = page_map(
-        ff,
-        BOOT_FILE_SECTION_SCRATCH_VA,
-        RW_NX,
-        CAP_INIT_THREAD_VSPACE,
-    );
-    core::ptr::write_volatile(
-        BOOT_FILE_SECTION_SCRATCH_VA as *mut u64,
-        0xDEAD_FACE_CAFE_F00D,
-    );
+    let (ff, ff_retype) = alloc_frame_r();
+    let (ff_alias, ff_map) = if ff_retype == 0 {
+        map_boot_proof_alias(ff)
+    } else {
+        (0, ff_retype)
+    };
+    if ff_map == 0 {
+        core::ptr::write_volatile(ff_alias as *mut u64, 0xDEAD_FACE_CAFE_F00D);
+    } else {
+        print_str(b"[ntos-exec] boot file-section alias map failed error=");
+        print_u64(ff_map);
+        print_str(b"\n");
+    }
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
     let (serviced, verdict) =
         service_user_syscalls(user_fault_ep, &mut *c, &mut *cm, user_pml4, ff);
@@ -22974,16 +22997,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             .expect("SMSS runtime layout must register before SEC_IMAGE demo spawn");
         let spawn =
             spawn_hosted_sec_image_for_image(smss_image, &pe, si_fault_c, None, false, 0, 0, 0);
-        let (v, f, _, _, _, _) = service_sec_image(
-            si_fault,
-            spawn.pml4,
-            spawn.main_tcb,
-            &pe,
-            BOOT_SEC_IMAGE_SCRATCH_VA,
-            None,
-        );
-        si_verdict = v;
-        si_faults = f;
+        if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
+            let (v, f, _, _, _, _) = service_sec_image(
+                si_fault,
+                spawn.pml4,
+                spawn.main_tcb,
+                &pe,
+                BOOT_SEC_IMAGE_SCRATCH_BASE,
+                None,
+            );
+            si_verdict = v;
+            si_faults = f;
+        } else {
+            print_str(b"[ntos-exec] SEC_IMAGE scratch paging unavailable\n");
+        }
     }
     print_str(b"[ntos-exec] SEC_IMAGE: PE ran demand-paged, read .rdata magic=0x");
     print_hex((si_verdict >> 32) as u32);
@@ -24061,30 +24088,50 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // Copy the disk hive (shared run page 1) into a dedicated file frame. The hive is
         // only `hive_len` bytes — don't read off the end of the shared hive window. ldff is
         // retype-zeroed, so the rest stays 0.
-        let ldff = alloc_frame();
-        let _ = page_map(
-            ldff,
-            BOOT_HIVE_SECTION_SCRATCH_VA,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
+        let (ldff, ld_frame_error) = alloc_frame_r();
+        let (ld_alias, ld_map) = if ld_frame_error == 0 {
+            map_boot_proof_alias(ldff)
+        } else {
+            (0, ld_frame_error)
+        };
+        let source_magic = core::ptr::read_volatile(
+            (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET) as *const u64,
         );
-        let n = (hive_len as u64).min(0x1000);
-        for i in 0..n {
-            let b = core::ptr::read_volatile(
-                (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET + i) as *const u8,
-            );
-            core::ptr::write_volatile((BOOT_HIVE_SECTION_SCRATCH_VA + i) as *mut u8, b);
+        let mut copied_magic = 0u64;
+        let mut ld_magic = 0u64;
+        let mut ld_faults = 0u64;
+        if ld_map == 0 {
+            let n = (hive_len as u64).min(0x1000);
+            for i in 0..n {
+                let b = core::ptr::read_volatile(
+                    (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET + i) as *const u8,
+                );
+                core::ptr::write_volatile((ld_alias + i) as *mut u8, b);
+            }
+            copied_magic = core::ptr::read_volatile(ld_alias as *const u64);
+            let ld_fault = make_object(OBJ_ENDPOINT);
+            let ld_fault_c = copy_cap(ld_fault);
+            let ld_sysarg = alloc_frame();
+            let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
+            let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
+            let (_srv, verdict) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
+            ld_magic = verdict;
+            ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         }
-        let ld_fault = make_object(OBJ_ENDPOINT);
-        let ld_fault_c = copy_cap(ld_fault);
-        let ld_sysarg = alloc_frame();
-        let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
-        let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
-        let (_srv, ld_magic) = service_user_syscalls(ld_fault, &mut *c, &mut *cm, ld_pml4, ldff);
-        let ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
         print_str(b"[ntos-exec] loader demand-paged the disk hive: magic=0x");
         print_hex((ld_magic >> 32) as u32);
         print_hex(ld_magic as u32);
+        print_str(b" source=0x");
+        print_hex((source_magic >> 32) as u32);
+        print_hex(source_magic as u32);
+        print_str(b" copy=0x");
+        print_hex((copied_magic >> 32) as u32);
+        print_hex(copied_magic as u32);
+        print_str(b" alias=0x");
+        print_hex((ld_alias >> 32) as u32);
+        print_hex(ld_alias as u32);
+        print_str(b" map=");
+        print_u64(ld_map);
         print_str(b" (UNTHIVE1) faults=");
         print_u64(ld_faults);
         print_str(b"\n");
@@ -24092,7 +24139,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // the real on-disk SYSTEM.DAT.
         check(
             b"exec_disk_section_demand_paged",
-            ld_magic == 0x3145_5649_4854_4E55 && ld_faults >= 1,
+            ld_frame_error == 0
+                && ld_map == 0
+                && ld_alias != 0
+                && source_magic == NT_HIVE_IMAGE_MAGIC_LE
+                && copied_magic == source_magic
+                && ld_magic == source_magic
+                && ld_faults >= 1,
             &mut passed,
         );
     }
@@ -26315,19 +26368,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
                 // translation and compare to the file's .text raw bytes. Match => our loader
                 // maps a real 6-section x64 binary correctly.
-                let scratch = BOOT_SMSS_FILL_SCRATCH_VA;
-                let _ = page_map(alloc_frame(), scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                let _ = fill_image_page(&pe, 0x1000, scratch);
+                let (scratch_frame, scratch_frame_error) = alloc_frame_r();
+                let (scratch, scratch_map) = if scratch_frame_error == 0 {
+                    map_boot_proof_alias(scratch_frame)
+                } else {
+                    (0, scratch_frame_error)
+                };
                 let mut fill_ok = false;
-                if let Some(t) = pe.sections().iter().find(|s| s.virtual_address == 0x1000) {
-                    let raw = t.pointer_to_raw_data as u64;
-                    fill_ok = true;
-                    for j in 0..64u64 {
-                        let a = core::ptr::read_volatile((scratch + j) as *const u8);
-                        let b = core::ptr::read_volatile((FILEBUF_VADDR + raw + j) as *const u8);
-                        if a != b {
-                            fill_ok = false;
-                            break;
+                if scratch_map == 0 {
+                    let _ = fill_image_page(&pe, 0x1000, scratch);
+                } else {
+                    print_str(b"[ntos-exec] smss fill scratch alias map failed error=");
+                    print_u64(scratch_map);
+                    print_str(b"\n");
+                }
+                if scratch_map == 0 {
+                    if let Some(t) = pe.sections().iter().find(|s| s.virtual_address == 0x1000) {
+                        let raw = t.pointer_to_raw_data as u64;
+                        fill_ok = true;
+                        for j in 0..64u64 {
+                            let a = core::ptr::read_volatile((scratch + j) as *const u8);
+                            let b =
+                                core::ptr::read_volatile((FILEBUF_VADDR + raw + j) as *const u8);
+                            if a != b {
+                                fill_ok = false;
+                                break;
+                            }
                         }
                     }
                 }
