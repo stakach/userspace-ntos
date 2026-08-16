@@ -31,6 +31,8 @@ pub const VIDEO_HW_INITIALIZATION_DATA_NT4_X64_SIZE: usize = 64;
 pub const VIDEO_HW_INITIALIZATION_DATA_W2K_X64_SIZE: usize = 140;
 pub const VIDEO_HW_INITIALIZATION_DATA_X64_SIZE: usize = 144;
 pub const VIDEO_ACCESS_RANGE_X64_SIZE: usize = 16;
+pub const VIDEO_PORT_CONFIG_INFO_NT4_X64_SIZE: usize = 74;
+pub const VIDEO_PORT_CONFIG_INFO_X64_SIZE: usize = 128;
 pub const VIDEO_REQUEST_PACKET_X64_SIZE: usize = 48;
 pub const VIDEO_STATUS_BLOCK_X64_SIZE: usize = 16;
 
@@ -165,6 +167,11 @@ pub enum VideoAccessRangeError {
     BufferTooSmall { needed: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoPortConfigInfoError {
+    BufferTooSmall { needed: usize },
+}
+
 /// x64 `VIDEO_ACCESS_RANGE` used by `VideoPortGetAccessRanges` and
 /// `VideoPortVerifyAccessRanges`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +229,119 @@ impl VideoAccessRangeX64 {
         output[14] = self.range_shareable as u8;
         output[15] = self.range_passive;
         Ok(VIDEO_ACCESS_RANGE_X64_SIZE)
+    }
+}
+
+/// x64 `VIDEO_PORT_CONFIG_INFO` passed by videoprt to a miniport `HwFindAdapter`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoPortConfigInfoX64 {
+    pub length: u32,
+    pub system_io_bus_number: u32,
+    pub adapter_interface_type: u32,
+    pub bus_interrupt_level: u32,
+    pub bus_interrupt_vector: u32,
+    pub interrupt_mode: u32,
+    pub num_emulator_access_entries: u32,
+    pub emulator_access_entries: u64,
+    pub emulator_access_entries_context: u64,
+    pub vdm_physical_video_memory_address: u64,
+    pub vdm_physical_video_memory_length: u32,
+    pub hardware_state_size: u32,
+    pub dma_channel: u32,
+    pub dma_port: u32,
+    pub dma_shareable: bool,
+    pub interrupt_shareable: bool,
+    pub master: bool,
+    pub dma_width: u32,
+    pub dma_speed: u32,
+    pub map_buffers: bool,
+    pub need_physical_addresses: bool,
+    pub demand_mode: bool,
+    pub maximum_transfer_length: u32,
+    pub number_of_physical_breaks: u32,
+    pub scatter_gather: bool,
+    pub maximum_scatter_gather_chunk_size: u32,
+    pub video_port_get_proc_address: u64,
+    pub driver_registry_path: u64,
+    pub system_memory_size: u64,
+}
+
+impl VideoPortConfigInfoX64 {
+    pub fn new_pnp(
+        system_io_bus_number: u32,
+        adapter_interface_type: u32,
+        bus_interrupt_level: u32,
+        bus_interrupt_vector: u32,
+        interrupt_mode: u32,
+        driver_registry_path: u64,
+        system_memory_size: u64,
+    ) -> Self {
+        Self {
+            length: VIDEO_PORT_CONFIG_INFO_X64_SIZE as u32,
+            system_io_bus_number,
+            adapter_interface_type,
+            bus_interrupt_level,
+            bus_interrupt_vector,
+            interrupt_mode,
+            num_emulator_access_entries: 0,
+            emulator_access_entries: 0,
+            emulator_access_entries_context: 0,
+            vdm_physical_video_memory_address: 0,
+            vdm_physical_video_memory_length: 0,
+            hardware_state_size: 0,
+            dma_channel: 0,
+            dma_port: 0,
+            dma_shareable: false,
+            interrupt_shareable: false,
+            master: false,
+            dma_width: 0,
+            dma_speed: 0,
+            map_buffers: false,
+            need_physical_addresses: false,
+            demand_mode: false,
+            maximum_transfer_length: 0,
+            number_of_physical_breaks: 0,
+            scatter_gather: false,
+            maximum_scatter_gather_chunk_size: 0,
+            video_port_get_proc_address: 0,
+            driver_registry_path,
+            system_memory_size,
+        }
+    }
+
+    pub fn write(&self, output: &mut [u8]) -> Result<usize, VideoPortConfigInfoError> {
+        require_video_port_config_info_output(output, VIDEO_PORT_CONFIG_INFO_X64_SIZE)?;
+        output[..VIDEO_PORT_CONFIG_INFO_X64_SIZE].fill(0);
+        write_u32(output, 0, self.length);
+        write_u32(output, 4, self.system_io_bus_number);
+        write_u32(output, 8, self.adapter_interface_type);
+        write_u32(output, 12, self.bus_interrupt_level);
+        write_u32(output, 16, self.bus_interrupt_vector);
+        write_u32(output, 20, self.interrupt_mode);
+        write_u32(output, 24, self.num_emulator_access_entries);
+        write_u64(output, 32, self.emulator_access_entries);
+        write_u64(output, 40, self.emulator_access_entries_context);
+        write_u64(output, 48, self.vdm_physical_video_memory_address);
+        write_u32(output, 56, self.vdm_physical_video_memory_length);
+        write_u32(output, 60, self.hardware_state_size);
+        write_u32(output, 64, self.dma_channel);
+        write_u32(output, 68, self.dma_port);
+        output[72] = self.dma_shareable as u8;
+        output[73] = self.interrupt_shareable as u8;
+        output[74] = self.master as u8;
+        write_u32(output, 76, self.dma_width);
+        write_u32(output, 80, self.dma_speed);
+        output[84] = self.map_buffers as u8;
+        output[85] = self.need_physical_addresses as u8;
+        output[86] = self.demand_mode as u8;
+        write_u32(output, 88, self.maximum_transfer_length);
+        write_u32(output, 92, self.number_of_physical_breaks);
+        output[96] = self.scatter_gather as u8;
+        write_u32(output, 100, self.maximum_scatter_gather_chunk_size);
+        write_u64(output, 104, self.video_port_get_proc_address);
+        write_u64(output, 112, self.driver_registry_path);
+        write_u64(output, 120, self.system_memory_size);
+        Ok(VIDEO_PORT_CONFIG_INFO_X64_SIZE)
     }
 }
 
@@ -807,6 +927,17 @@ fn require_video_access_range_input(
     }
 }
 
+fn require_video_port_config_info_output(
+    output: &[u8],
+    needed: usize,
+) -> Result<(), VideoPortConfigInfoError> {
+    if output.len() < needed {
+        Err(VideoPortConfigInfoError::BufferTooSmall { needed })
+    } else {
+        Ok(())
+    }
+}
+
 fn millimeters_at_default_dpi(pixels: u32) -> u32 {
     ((pixels as u64 * 254 + (DEFAULT_DPI as u64 * 5)) / (DEFAULT_DPI as u64 * 10)) as u32
 }
@@ -1195,6 +1326,90 @@ mod tests {
             VideoAccessRangeX64::parse(&raw),
             Err(VideoAccessRangeError::BufferTooSmall {
                 needed: VIDEO_ACCESS_RANGE_X64_SIZE
+            })
+        );
+    }
+
+    #[test]
+    fn video_port_config_info_uses_x64_layout() {
+        let mut config = VideoPortConfigInfoX64::new_pnp(
+            2,
+            5,
+            0x20,
+            0x21,
+            1,
+            0x1000_0000_0000_3000,
+            256 * 1024 * 1024,
+        );
+        config.num_emulator_access_entries = 3;
+        config.emulator_access_entries = 0x1000_0000_0000_4000;
+        config.emulator_access_entries_context = 0x1000_0000_0000_5000;
+        config.vdm_physical_video_memory_address = 0xA0000;
+        config.vdm_physical_video_memory_length = 0x20000;
+        config.hardware_state_size = 0x80;
+        config.dma_channel = 4;
+        config.dma_port = 5;
+        config.dma_shareable = true;
+        config.interrupt_shareable = true;
+        config.master = true;
+        config.dma_width = 2;
+        config.dma_speed = 3;
+        config.map_buffers = true;
+        config.need_physical_addresses = true;
+        config.demand_mode = true;
+        config.maximum_transfer_length = 0x10000;
+        config.number_of_physical_breaks = 16;
+        config.scatter_gather = true;
+        config.maximum_scatter_gather_chunk_size = 0x2000;
+        config.video_port_get_proc_address = 0x1000_0000_0000_6000;
+
+        let mut raw = [0xCCu8; VIDEO_PORT_CONFIG_INFO_X64_SIZE];
+        assert_eq!(
+            config.write(&mut raw).unwrap(),
+            VIDEO_PORT_CONFIG_INFO_X64_SIZE
+        );
+        assert_eq!(u32_at(&raw, 0), VIDEO_PORT_CONFIG_INFO_X64_SIZE as u32);
+        assert_eq!(u32_at(&raw, 4), 2);
+        assert_eq!(u32_at(&raw, 8), 5);
+        assert_eq!(u32_at(&raw, 12), 0x20);
+        assert_eq!(u32_at(&raw, 16), 0x21);
+        assert_eq!(u32_at(&raw, 20), 1);
+        assert_eq!(u32_at(&raw, 24), 3);
+        assert_eq!(&raw[28..32], &[0, 0, 0, 0]);
+        assert_eq!(u64_at(&raw, 32), 0x1000_0000_0000_4000);
+        assert_eq!(u64_at(&raw, 40), 0x1000_0000_0000_5000);
+        assert_eq!(u64_at(&raw, 48), 0xA0000);
+        assert_eq!(u32_at(&raw, 56), 0x20000);
+        assert_eq!(u32_at(&raw, 60), 0x80);
+        assert_eq!(u32_at(&raw, 64), 4);
+        assert_eq!(u32_at(&raw, 68), 5);
+        assert_eq!(raw[72], 1);
+        assert_eq!(raw[73], 1);
+        assert_eq!(raw[VIDEO_PORT_CONFIG_INFO_NT4_X64_SIZE], 1);
+        assert_eq!(raw[75], 0);
+        assert_eq!(u32_at(&raw, 76), 2);
+        assert_eq!(u32_at(&raw, 80), 3);
+        assert_eq!(raw[84], 1);
+        assert_eq!(raw[85], 1);
+        assert_eq!(raw[86], 1);
+        assert_eq!(raw[87], 0);
+        assert_eq!(u32_at(&raw, 88), 0x10000);
+        assert_eq!(u32_at(&raw, 92), 16);
+        assert_eq!(raw[96], 1);
+        assert_eq!(&raw[97..100], &[0, 0, 0]);
+        assert_eq!(u32_at(&raw, 100), 0x2000);
+        assert_eq!(u64_at(&raw, 104), 0x1000_0000_0000_6000);
+        assert_eq!(u64_at(&raw, 112), 0x1000_0000_0000_3000);
+        assert_eq!(u64_at(&raw, 120), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn video_port_config_info_rejects_small_buffers() {
+        let mut raw = [0u8; VIDEO_PORT_CONFIG_INFO_X64_SIZE - 1];
+        assert_eq!(
+            VideoPortConfigInfoX64::new_pnp(0, 5, 0, 0, 0, 0, 0).write(&mut raw),
+            Err(VideoPortConfigInfoError::BufferTooSmall {
+                needed: VIDEO_PORT_CONFIG_INFO_X64_SIZE
             })
         );
     }

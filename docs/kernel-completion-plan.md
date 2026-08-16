@@ -3593,6 +3593,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `HwStartIO` for typed `VIDEO_REQUEST_PACKET`s), after which the temporary boot-framebuffer adapter
   can be retired behind the same `VideoPort` boundary.
 
+- B3 videoprt `HwFindAdapter` slice (2026-08-16). `nt-video-miniport` now owns a host-tested x64
+  `VIDEO_PORT_CONFIG_INFO` writer with the NT4 compatibility offset pinned, and hosted videoprt
+  initialization publishes the captured miniport callback table into the component shared frame.
+  `IRP_MN_START_DEVICE` for a videoprt-initialized hosted driver now follows the NT port-driver
+  shape: the root-bus PDO start is forwarded first, a real miniport device extension is allocated,
+  a PnP `VIDEO_PORT_CONFIG_INFO` is staged, and the captured `HwFindAdapter` is invoked through the
+  hosted component pump. The returned VP_STATUS is translated into an NTSTATUS at the executive
+  boundary, while unsupported/absent callback state fails explicitly instead of falling back to a
+  generic WDM `MajorFunction` path. Validation: `cargo fmt --all`,
+  `cargo test -p nt-video-miniport -- --nocapture`, and `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: the next
+  B3 display slice should drive the captured `HwInitialize` on first open or device start, then
+  translate `IOCTL_VIDEO_*` requests into typed `VIDEO_REQUEST_PACKET`s for `HwStartIO` so the
+  existing boot-framebuffer bridge can shrink to a compatibility adapter behind the same boundary.
+
 - A4/B3 service window-station binding cleanup (2026-08-15). The win32k service-token
   authentication-id to window-station-handle cache no longer has an eight-record inline cap. The
   records now live in component-visible win32k pool storage, grow on demand, and keep the same
