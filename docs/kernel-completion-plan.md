@@ -6731,3 +6731,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Review adjustment: rerun the serialized B3 desktop/headless proof next and inspect whether TCPIP
   now reaches adapter registration and produces SG map-transfer descriptors; any remaining failure
   should be fixed as a generic NDIS/IO/DMA primitive, not by adding per-image registry fallbacks.
+
+  B3 live Config Manager hive seeding (2026-08-16): the isolated CM service is now populated from
+  the same imported SYSTEM hive snapshot that builds the boot/system/PnP driver launch plans before
+  any hosted driver is launched. The seed path uses the ordinary CM client ABI (`create_key` plus
+  typed raw-value `set_value`) and reclaims its temporary decode/snapshot heap state after the live
+  service has accepted the keys, so hosted `ZwOpenKey`, `ZwEnumerateKey`, `ZwQueryValueKey`, and
+  `RtlQueryRegistryValues` all observe the same authority as the planner instead of an empty
+  executive-local registry view. A new `exec_cm_live_hive_seeded` proof gate records nonzero
+  key/value import and fails on any seed error. Validation: `cargo fmt --all`,
+  `cargo test -p nt-hive-core reactos_network -- --nocapture`, `cargo test -p nt-hive-core`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized headless boot
+  `.tmp/run-headless-b3-live-cm-bindings.log`, which reports `[cm-seed] ... keys=45 values=86
+  failures=0`, passes `exec_cm_live_hive_seeded`, and still reaches
+  `exec_explorer_shell_chrome_painted`. Review adjustment: live CM population is no longer the B3
+  blocker; remaining faults belong in generic CM/NDIS/IO/DMA mechanisms.
+
+  B3 dynamic NIC registry binding materialization (2026-08-16): the Config Manager setup seed now
+  derives installed network binding state from CM's own PnP driver bindings instead of relying on
+  generated-hive-only E1000 records. For every network-class devnode it materializes the adapter
+  class `NetCfgInstanceId`, `DriverDesc`, `ComponentId`, `Linkage\Export`, `Linkage\RootDevice`,
+  and `Linkage\UpperBind`, appends the adapter to TCPIP `Linkage` `Bind`/`Export`/`Route`
+  `REG_MULTI_SZ` values, creates DHCP/default-address per-interface parameters, and publishes the
+  `Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}\...\Connection` records expected by
+  user-mode network services. Existing installed values remain authoritative; sparse hives only get
+  the missing setup-owned records. A host test covers two NIC devnodes under the same service, and
+  the executive `network-setup` log now reports separate TCPIP linkage/interface and adapter-class
+  counters. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core reactos_network
+  -- --nocapture`, `cargo test -p nt-hive-core`, executive
+  `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized headless boot
+  `.tmp/run-headless-b3-live-cm-bindings.log`. The proof confirms the dynamically materialized
+  bindings are present in the live CM seed count and that the real desktop/explorer paint path is
+  still intact. Review adjustment: `e1000.sys` still fails real `AddDevice` with
+  `STATUS_UNSUCCESSFUL`, leaving `exec_generic_hw_registry_selected`,
+  `exec_generic_pci_add_device_reached`, `exec_generic_pci_io_port_out32`, and
+  `exec_generic_hw_dma_packet_descriptors` red. The next B3 slice should inspect the generic
+  hosted registry and `IoGetDeviceProperty`/`RtlQueryRegistryValues` path that feeds ReactOS NDIS
+  adapter-class `Linkage\Export`; do not restore per-image or synthetic registry answers.

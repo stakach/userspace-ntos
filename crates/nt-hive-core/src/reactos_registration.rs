@@ -10,7 +10,10 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{canon_path, MutableHiveSet, RegistryOverlay, RegistryValueType};
-use nt_config_manager::{SERVICE_BOOT_START, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START};
+use nt_config_manager::{
+    CONTROL_CLASS_PATH, SERVICES_PATH, SERVICE_BOOT_START, SERVICE_KERNEL_DRIVER,
+    SERVICE_SYSTEM_START,
+};
 
 pub const REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU: u64 = 1 << 0;
 pub const REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE: u64 = 1 << 1;
@@ -57,6 +60,10 @@ pub struct ReactOsNetworkSetupSeedStats {
     pub ndis_service_values: u32,
     pub tcpip_service_values: u32,
     pub tcpip_parameter_values: u32,
+    pub tcpip_linkage_values: u32,
+    pub tcpip_interface_values: u32,
+    pub network_adapter_class_values: u32,
+    pub network_connection_values: u32,
     pub afd_service_values: u32,
 }
 
@@ -65,9 +72,20 @@ impl ReactOsNetworkSetupSeedStats {
         self.ndis_service_values
             + self.tcpip_service_values
             + self.tcpip_parameter_values
+            + self.tcpip_linkage_values
+            + self.tcpip_interface_values
+            + self.network_adapter_class_values
+            + self.network_connection_values
             + self.afd_service_values
     }
 }
+
+const NET_CLASS_GUID: &str = "{4D36E972-E325-11CE-BFC1-08002BE10318}";
+const TCPIP_LINKAGE_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Linkage";
+const TCPIP_INTERFACES_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+const CONTROL_NETWORK_NET_CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}";
 
 /// ReactOS `boot/bootdata/hivesys.inf` print setup registrations.
 ///
@@ -795,6 +813,421 @@ pub fn seed_reactos_network_setup_into_target<T: ReactOsSetupSeedTarget>(
     stats
 }
 
+#[derive(Clone, Debug)]
+struct ReactOsNetworkAdapterBinding {
+    instance_id: String,
+    class_key_path: String,
+    linkage_key_path: String,
+    interface_name: String,
+    device_name: String,
+    tcpip_export_name: String,
+    driver_desc: String,
+    component_id: String,
+}
+
+fn driver_key_is_net_class(driver_key: &str) -> bool {
+    let guid = driver_key.split('\\').next().unwrap_or(driver_key);
+    guid.eq_ignore_ascii_case(NET_CLASS_GUID)
+}
+
+fn service_is_net_class(service: &nt_config_manager::ServiceMetadata) -> bool {
+    service
+        .class_guid
+        .as_deref()
+        .is_some_and(|guid| guid.eq_ignore_ascii_case(NET_CLASS_GUID))
+}
+
+fn devnode_is_network_adapter(
+    service: &nt_config_manager::ServiceMetadata,
+    devnode: &nt_config_manager::DevnodeRecord,
+) -> bool {
+    service_is_net_class(service)
+        || devnode
+            .driver_key
+            .as_deref()
+            .is_some_and(driver_key_is_net_class)
+}
+
+fn registry_component_token(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        String::from("NET")
+    } else {
+        out
+    }
+}
+
+fn driver_key_leaf(driver_key: &str) -> &str {
+    driver_key.rsplit('\\').next().unwrap_or(driver_key)
+}
+
+fn instance_component_id(instance_id: &str) -> String {
+    instance_id
+        .rsplit_once('\\')
+        .map(|(component, _)| component)
+        .unwrap_or(instance_id)
+        .into()
+}
+
+fn strip_device_prefix(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(r"\Device\")
+        .or_else(|| value.strip_prefix(r"\device\"))
+}
+
+fn existing_string_value(
+    cm: &nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+) -> Option<String> {
+    let key = cm.registry().open_key(path)?;
+    cm.registry().query_string(key, name)
+}
+
+fn network_interface_name_for_binding(
+    cm: &nt_config_manager::ConfigManager,
+    service: &nt_config_manager::ServiceMetadata,
+    class_key_path: &str,
+    linkage_key_path: &str,
+    driver_key: &str,
+) -> String {
+    if let Some(value) = existing_string_value(cm, class_key_path, "NetCfgInstanceId") {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    if let Some(value) = existing_string_value(cm, linkage_key_path, "RootDevice") {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    if let Some(value) = existing_string_value(cm, linkage_key_path, "Export") {
+        if let Some(suffix) = strip_device_prefix(&value) {
+            if !suffix.is_empty() {
+                return suffix.into();
+            }
+        }
+    }
+
+    format!(
+        "{}_{}",
+        registry_component_token(&service.name),
+        registry_component_token(driver_key_leaf(driver_key))
+    )
+}
+
+fn network_driver_desc_for_binding(
+    cm: &nt_config_manager::ConfigManager,
+    service: &nt_config_manager::ServiceMetadata,
+    class_key_path: &str,
+) -> String {
+    existing_string_value(cm, class_key_path, "DriverDesc")
+        .or_else(|| service.display_name.clone())
+        .unwrap_or_else(|| service.name.clone())
+}
+
+fn collect_reactos_network_adapter_bindings(
+    cm: &nt_config_manager::ConfigManager,
+) -> Vec<ReactOsNetworkAdapterBinding> {
+    let mut out = Vec::new();
+    for binding in cm
+        .boot_system_pnp_driver_bindings()
+        .into_iter()
+        .chain(cm.demand_start_pnp_driver_bindings())
+    {
+        for devnode in binding.devnodes {
+            if !devnode_is_network_adapter(&binding.service, &devnode) {
+                continue;
+            }
+            let Some(driver_key) = devnode.driver_key.as_deref() else {
+                continue;
+            };
+            let class_key_path = join_key_path(CONTROL_CLASS_PATH, driver_key);
+            let linkage_key_path = join_key_path(&class_key_path, "Linkage");
+            let interface_name = network_interface_name_for_binding(
+                cm,
+                &binding.service,
+                &class_key_path,
+                &linkage_key_path,
+                driver_key,
+            );
+            if interface_name.is_empty()
+                || out.iter().any(|existing: &ReactOsNetworkAdapterBinding| {
+                    existing
+                        .interface_name
+                        .eq_ignore_ascii_case(&interface_name)
+                })
+            {
+                continue;
+            }
+            let device_name = format!(r"\Device\{}", interface_name);
+            let tcpip_export_name = format!(r"\Device\Tcpip_{}", interface_name);
+            let driver_desc =
+                network_driver_desc_for_binding(cm, &binding.service, &class_key_path);
+            out.push(ReactOsNetworkAdapterBinding {
+                instance_id: devnode.instance_id.clone(),
+                class_key_path,
+                linkage_key_path,
+                interface_name,
+                device_name,
+                tcpip_export_name,
+                driver_desc,
+                component_id: instance_component_id(&devnode.instance_id),
+            });
+        }
+    }
+    out
+}
+
+fn set_cm_value_if_missing(
+    cm: &mut nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+    value_type: RegistryValueType,
+    data: Vec<u8>,
+) -> bool {
+    let key = cm.registry_mut().create_key(path);
+    if cm.registry().query_value(key, name).is_some() {
+        return false;
+    }
+    cm.registry_mut().set_value(key, name, value_type, data)
+}
+
+fn set_cm_sz_if_missing(
+    cm: &mut nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+    value: &str,
+) -> bool {
+    set_cm_value_if_missing(cm, path, name, RegistryValueType::Sz, utf16le_sz(value))
+}
+
+fn set_cm_dword_if_missing(
+    cm: &mut nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+    value: u32,
+) -> bool {
+    set_cm_value_if_missing(
+        cm,
+        path,
+        name,
+        RegistryValueType::Dword,
+        value.to_le_bytes().to_vec(),
+    )
+}
+
+fn set_cm_multi_sz_if_missing(
+    cm: &mut nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+    values: &[&str],
+) -> bool {
+    set_cm_value_if_missing(
+        cm,
+        path,
+        name,
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(values),
+    )
+}
+
+fn append_cm_multi_sz_values(
+    cm: &mut nt_config_manager::ConfigManager,
+    path: &str,
+    name: &str,
+    values: &[String],
+) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    let key = cm.registry_mut().create_key(path);
+    let existing_value = cm.registry().query_value(key, name);
+    if existing_value.is_some()
+        && existing_value
+            .and_then(|value| value.as_multi_string())
+            .is_none()
+    {
+        return false;
+    }
+    let mut merged = cm
+        .registry()
+        .query_multi_string(key, name)
+        .unwrap_or_default();
+    let mut changed = existing_value.is_none();
+    for value in values {
+        if !merged
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(value))
+        {
+            merged.push(value.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    let refs: Vec<&str> = merged.iter().map(|value| value.as_str()).collect();
+    cm.registry_mut().set_value(
+        key,
+        name,
+        RegistryValueType::MultiSz,
+        nt_config_manager::encode_multi_sz(&refs),
+    )
+}
+
+fn network_connection_name(index: usize) -> String {
+    if index == 0 {
+        String::from("Local Area Connection")
+    } else {
+        format!("Local Area Connection {}", index + 1)
+    }
+}
+
+fn adapter_protocol_tcpip_parameters_path(interface_name: &str) -> String {
+    join_key_path(
+        &join_key_path(&join_key_path(SERVICES_PATH, interface_name), "Parameters"),
+        "Tcpip",
+    )
+}
+
+fn seed_reactos_network_bindings_in_config_manager(
+    cm: &mut nt_config_manager::ConfigManager,
+    stats: &mut ReactOsNetworkSetupSeedStats,
+) {
+    let adapters = collect_reactos_network_adapter_bindings(cm);
+    if adapters.is_empty() {
+        return;
+    }
+
+    let device_names: Vec<String> = adapters
+        .iter()
+        .map(|adapter| adapter.device_name.clone())
+        .collect();
+    let tcpip_export_names: Vec<String> = adapters
+        .iter()
+        .map(|adapter| adapter.tcpip_export_name.clone())
+        .collect();
+    let route_names: Vec<String> = adapters
+        .iter()
+        .map(|adapter| adapter.interface_name.clone())
+        .collect();
+
+    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Bind", &device_names) {
+        stats.tcpip_linkage_values += 1;
+    }
+    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Export", &tcpip_export_names) {
+        stats.tcpip_linkage_values += 1;
+    }
+    if append_cm_multi_sz_values(cm, TCPIP_LINKAGE_PATH, "Route", &route_names) {
+        stats.tcpip_linkage_values += 1;
+    }
+
+    if set_cm_sz_if_missing(cm, CONTROL_NETWORK_NET_CLASS_PATH, "", "Network Adapters") {
+        stats.network_connection_values += 1;
+    }
+    if set_cm_sz_if_missing(cm, CONTROL_NETWORK_NET_CLASS_PATH, "Class", "Net") {
+        stats.network_connection_values += 1;
+    }
+
+    for (index, adapter) in adapters.iter().enumerate() {
+        cm.registry_mut().create_key(&adapter.class_key_path);
+        if set_cm_sz_if_missing(
+            cm,
+            &adapter.class_key_path,
+            "NetCfgInstanceId",
+            &adapter.interface_name,
+        ) {
+            stats.network_adapter_class_values += 1;
+        }
+        if set_cm_sz_if_missing(
+            cm,
+            &adapter.class_key_path,
+            "DriverDesc",
+            &adapter.driver_desc,
+        ) {
+            stats.network_adapter_class_values += 1;
+        }
+        if set_cm_sz_if_missing(
+            cm,
+            &adapter.class_key_path,
+            "ComponentId",
+            &adapter.component_id,
+        ) {
+            stats.network_adapter_class_values += 1;
+        }
+        if set_cm_sz_if_missing(
+            cm,
+            &adapter.linkage_key_path,
+            "Export",
+            &adapter.device_name,
+        ) {
+            stats.network_adapter_class_values += 1;
+        }
+        if set_cm_sz_if_missing(
+            cm,
+            &adapter.linkage_key_path,
+            "RootDevice",
+            &adapter.interface_name,
+        ) {
+            stats.network_adapter_class_values += 1;
+        }
+        if set_cm_sz_if_missing(cm, &adapter.linkage_key_path, "UpperBind", "Tcpip") {
+            stats.network_adapter_class_values += 1;
+        }
+
+        let interface_path = join_key_path(TCPIP_INTERFACES_PATH, &adapter.interface_name);
+        if set_cm_multi_sz_if_missing(cm, &interface_path, "DefaultGateway", &["0.0.0.0"]) {
+            stats.tcpip_interface_values += 1;
+        }
+        if set_cm_multi_sz_if_missing(cm, &interface_path, "IPAddress", &["0.0.0.0"]) {
+            stats.tcpip_interface_values += 1;
+        }
+        if set_cm_multi_sz_if_missing(cm, &interface_path, "SubnetMask", &["0.0.0.0"]) {
+            stats.tcpip_interface_values += 1;
+        }
+        if set_cm_dword_if_missing(cm, &interface_path, "EnableDHCP", 1) {
+            stats.tcpip_interface_values += 1;
+        }
+        if set_cm_dword_if_missing(cm, &interface_path, "InterfaceMetric", 0) {
+            stats.tcpip_interface_values += 1;
+        }
+
+        cm.registry_mut()
+            .create_key(&adapter_protocol_tcpip_parameters_path(
+                &adapter.interface_name,
+            ));
+
+        let connection_path = join_key_path(
+            &join_key_path(CONTROL_NETWORK_NET_CLASS_PATH, &adapter.interface_name),
+            "Connection",
+        );
+        if set_cm_sz_if_missing(
+            cm,
+            &connection_path,
+            "Name",
+            &network_connection_name(index),
+        ) {
+            stats.network_connection_values += 1;
+        }
+        if set_cm_sz_if_missing(cm, &connection_path, "PnpInstanceID", &adapter.instance_id) {
+            stats.network_connection_values += 1;
+        }
+        if set_cm_dword_if_missing(cm, &connection_path, "ShowIcon", 1) {
+            stats.network_connection_values += 1;
+        }
+    }
+}
+
 pub fn seed_reactos_print_setup_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
 ) -> ReactOsPrintSetupSeedStats {
@@ -961,7 +1394,10 @@ pub fn seed_reactos_network_setup_in_mutable_hives(
 pub fn seed_reactos_network_setup_in_config_manager(
     cm: &mut nt_config_manager::ConfigManager,
 ) -> ReactOsNetworkSetupSeedStats {
-    seed_reactos_network_setup_into_target(&mut ConfigManagerSetupSeedTarget { cm })
+    let mut stats =
+        seed_reactos_network_setup_into_target(&mut ConfigManagerSetupSeedTarget { cm });
+    seed_reactos_network_bindings_in_config_manager(cm, &mut stats);
+    stats
 }
 
 /// Seed ReactOS print setup keys from `boot/bootdata/hivesys.inf` into the mounted SYSTEM hive.
@@ -1277,6 +1713,10 @@ mod tests {
                 ndis_service_values: 5,
                 tcpip_service_values: 5,
                 tcpip_parameter_values: 8,
+                tcpip_linkage_values: 0,
+                tcpip_interface_values: 0,
+                network_adapter_class_values: 0,
+                network_connection_values: 0,
                 afd_service_values: 5,
             }
         );
@@ -1373,6 +1813,10 @@ mod tests {
                 ndis_service_values: 5,
                 tcpip_service_values: 5,
                 tcpip_parameter_values: 8,
+                tcpip_linkage_values: 0,
+                tcpip_interface_values: 0,
+                network_adapter_class_values: 0,
+                network_connection_values: 0,
                 afd_service_values: 5,
             }
         );
@@ -1409,6 +1853,146 @@ mod tests {
                 alloc::string::String::from("afd")
             ]
         );
+        let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
+    }
+
+    #[test]
+    fn seeds_reactos_network_bindings_for_multiple_config_manager_nics() {
+        let mut cm = nt_config_manager::ConfigManager::new();
+        cm.register_typed_service(
+            "E1000",
+            r"system32\drivers\e1000.sys",
+            nt_config_manager::SERVICE_KERNEL_DRIVER,
+            Some("Net"),
+            Some(NET_CLASS_GUID),
+            nt_config_manager::SERVICE_SYSTEM_START,
+            1,
+        );
+
+        for (slot, instance) in [
+            ("0000", r"PCI\VEN_8086&DEV_100E\3&11583659&0&18"),
+            ("0001", r"PCI\VEN_8086&DEV_100E\3&11583659&0&19"),
+        ] {
+            let key = cm.registry_mut().create_key(&format!(
+                r"\Registry\Machine\System\CurrentControlSet\Enum\{}",
+                instance
+            ));
+            cm.registry_mut().set_string(key, "Service", "E1000");
+            cm.registry_mut()
+                .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
+            cm.registry_mut()
+                .set_string(key, "Driver", &format!(r"{}\{}", NET_CLASS_GUID, slot));
+            cm.registry_mut().set_value(
+                key,
+                "HardwareID",
+                RegistryValueType::MultiSz,
+                nt_config_manager::encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E"]),
+            );
+            cm.registry_mut().set_value(
+                key,
+                "CompatibleIDs",
+                RegistryValueType::MultiSz,
+                nt_config_manager::encode_multi_sz(&[r"PCI\CC_020000", r"PCI\CC_0200"]),
+            );
+        }
+        assert_eq!(cm.index_registry_devnodes(), 2);
+
+        let stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(
+            stats,
+            ReactOsNetworkSetupSeedStats {
+                ndis_service_values: 5,
+                tcpip_service_values: 5,
+                tcpip_parameter_values: 8,
+                tcpip_linkage_values: 3,
+                tcpip_interface_values: 10,
+                network_adapter_class_values: 12,
+                network_connection_values: 8,
+                afd_service_values: 5,
+            }
+        );
+        assert_eq!(stats.total_values(), 56);
+
+        let tcpip_linkage = cm
+            .registry()
+            .open_key(TCPIP_LINKAGE_PATH)
+            .expect("Tcpip Linkage");
+        assert_eq!(
+            cm.registry().query_multi_string(tcpip_linkage, "Bind"),
+            Some(alloc::vec![
+                alloc::string::String::from(r"\Device\E1000_0000"),
+                alloc::string::String::from(r"\Device\E1000_0001")
+            ])
+        );
+        assert_eq!(
+            cm.registry().query_multi_string(tcpip_linkage, "Export"),
+            Some(alloc::vec![
+                alloc::string::String::from(r"\Device\Tcpip_E1000_0000"),
+                alloc::string::String::from(r"\Device\Tcpip_E1000_0001")
+            ])
+        );
+        assert_eq!(
+            cm.registry().query_multi_string(tcpip_linkage, "Route"),
+            Some(alloc::vec![
+                alloc::string::String::from("E1000_0000"),
+                alloc::string::String::from("E1000_0001")
+            ])
+        );
+
+        for slot in ["0000", "0001"] {
+            let interface = format!("E1000_{}", slot);
+            let expected_export = format!(r"\Device\{}", interface);
+            let linkage_path = format!(
+                r"\Registry\Machine\System\CurrentControlSet\Control\Class\{}\{}\Linkage",
+                NET_CLASS_GUID, slot
+            );
+            let linkage = cm
+                .registry()
+                .open_key(&linkage_path)
+                .expect("adapter linkage");
+            assert_eq!(
+                cm.registry().query_string(linkage, "Export").as_deref(),
+                Some(expected_export.as_str())
+            );
+            assert_eq!(
+                cm.registry().query_string(linkage, "RootDevice").as_deref(),
+                Some(interface.as_str())
+            );
+            assert_eq!(
+                cm.registry().query_string(linkage, "UpperBind").as_deref(),
+                Some("Tcpip")
+            );
+
+            let interface_key = cm
+                .registry()
+                .open_key(&join_key_path(TCPIP_INTERFACES_PATH, &interface))
+                .expect("TCPIP interface");
+            assert_eq!(
+                cm.registry().query_multi_string(interface_key, "IPAddress"),
+                Some(alloc::vec![alloc::string::String::from("0.0.0.0")])
+            );
+            assert_eq!(
+                cm.registry().query_dword(interface_key, "EnableDHCP"),
+                Some(1)
+            );
+            assert_eq!(
+                cm.registry().query_dword(interface_key, "InterfaceMetric"),
+                Some(0)
+            );
+        }
+
+        let connection = cm
+            .registry()
+            .open_key(
+                r"\Registry\Machine\System\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}\E1000_0001\Connection",
+            )
+            .expect("second connection");
+        assert_eq!(
+            cm.registry().query_string(connection, "Name").as_deref(),
+            Some("Local Area Connection 2")
+        );
+
         let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
         assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
     }

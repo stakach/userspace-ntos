@@ -2986,6 +2986,14 @@ impl ExecNtHandler {
         print_u64(stats.tcpip_service_values as u64);
         print_str(b" tcpip-params=");
         print_u64(stats.tcpip_parameter_values as u64);
+        print_str(b" tcpip-linkage=");
+        print_u64(stats.tcpip_linkage_values as u64);
+        print_str(b" tcpip-ifaces=");
+        print_u64(stats.tcpip_interface_values as u64);
+        print_str(b" net-adapter-class=");
+        print_u64(stats.network_adapter_class_values as u64);
+        print_str(b" net-connections=");
+        print_u64(stats.network_connection_values as u64);
         print_str(b" afd=");
         print_u64(stats.afd_service_values as u64);
         print_str(b"\n");

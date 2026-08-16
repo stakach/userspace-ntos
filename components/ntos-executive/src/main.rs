@@ -17090,6 +17090,56 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     Some(cm)
 }
 
+#[derive(Default)]
+struct LiveConfigManagerSeedReport {
+    keys: u64,
+    values: u64,
+    failures: u64,
+    unavailable: bool,
+}
+
+fn seed_live_config_manager_from_config_hive() -> LiveConfigManagerSeedReport {
+    let heap_mark = allocator::mark();
+    let mut report = LiveConfigManagerSeedReport::default();
+    {
+        if let Some(cm_snapshot) = config_hive_config_manager() {
+            let snapshot = cm_snapshot.registry().snapshot_keys();
+            unsafe {
+                if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
+                    for (path, _volatile, values) in snapshot {
+                        if client.create_key(&path).is_err() {
+                            report.failures += 1;
+                            continue;
+                        }
+                        report.keys += 1;
+                        for value in values {
+                            if client
+                                .set_value(
+                                    &path,
+                                    &value.name,
+                                    value.value_type as u32,
+                                    value.data.as_slice(),
+                                )
+                                .is_ok()
+                            {
+                                report.values += 1;
+                            } else {
+                                report.failures += 1;
+                            }
+                        }
+                    }
+                } else {
+                    report.unavailable = true;
+                }
+            }
+        } else {
+            report.unavailable = true;
+        }
+    }
+    unsafe { allocator::reset_to(heap_mark) };
+    report
+}
+
 fn config_hive_boot_system_driver_launch_spec() -> Option<ConfigHiveDriverLaunchSpec> {
     let cm = config_hive_config_manager()?;
     let service = cm
@@ -24254,6 +24304,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
         }
     }
+
+    let live_cm_seed = seed_live_config_manager_from_config_hive();
+    print_str(b"[cm-seed] live Config Manager from SYSTEM hive keys=");
+    print_u64(live_cm_seed.keys);
+    print_str(b" values=");
+    print_u64(live_cm_seed.values);
+    print_str(b" failures=");
+    print_u64(live_cm_seed.failures);
+    print_str(b" unavailable=");
+    print_u64(live_cm_seed.unavailable as u64);
+    print_str(b"\n");
+    check(
+        b"exec_cm_live_hive_seeded",
+        !live_cm_seed.unavailable
+            && live_cm_seed.keys != 0
+            && live_cm_seed.values != 0
+            && live_cm_seed.failures == 0,
+        &mut passed,
+    );
 
     // --- P3: source a demand-paged section from a REAL disk file. The storage host read
     // SYSTEM.DAT (the hive) off the FAT32 disk into the shared frame; copy it into a file
