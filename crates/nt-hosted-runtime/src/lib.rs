@@ -9,6 +9,7 @@
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 33;
+pub const HOSTED_PROVIDER_CALLBACK_THUNK_LEN: usize = 23;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 64;
 pub const HOSTED_PROVIDER_EXPORT_ARG_CAP: usize = 12;
 pub const NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP: usize = 25;
@@ -199,6 +200,14 @@ pub struct HostedProviderImportThunkPlan {
     pub export_call_gate: u64,
     pub provider_domain_cookie: u64,
     pub provider_export_rva: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderCallbackThunkPlan {
+    pub thunk_va: u64,
+    pub thunk_offset: u64,
+    pub callback_gate: u64,
+    pub callback_cookie: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -598,6 +607,51 @@ pub fn encode_hosted_provider_import_thunk(
     out[2..10].copy_from_slice(&thunk.provider_export_rva.to_le_bytes());
     out[12..20].copy_from_slice(&thunk.provider_domain_cookie.to_le_bytes());
     out[22..30].copy_from_slice(&thunk.export_call_gate.to_le_bytes());
+    Ok(())
+}
+
+pub fn plan_hosted_provider_callback_thunk(
+    thunk_table_va: u64,
+    thunk_table_len: u64,
+    thunk_index: u64,
+    callback_gate: u64,
+    callback_cookie: u64,
+) -> Result<HostedProviderCallbackThunkPlan, HostedProviderImportThunkError> {
+    let Some(thunk_offset) = thunk_index.checked_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN) else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    let Some(thunk_end) = thunk_offset.checked_add(HOSTED_PROVIDER_CALLBACK_THUNK_LEN as u64)
+    else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    if thunk_end > thunk_table_len {
+        return Err(HostedProviderImportThunkError::ThunkOutsideTable);
+    }
+    let Some(thunk_va) = thunk_table_va.checked_add(thunk_offset) else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    Ok(HostedProviderCallbackThunkPlan {
+        thunk_va,
+        thunk_offset,
+        callback_gate,
+        callback_cookie,
+    })
+}
+
+pub fn encode_hosted_provider_callback_thunk(
+    thunk: HostedProviderCallbackThunkPlan,
+    out: &mut [u8],
+) -> Result<(), HostedProviderImportThunkError> {
+    if out.len() < HOSTED_PROVIDER_CALLBACK_THUNK_LEN {
+        return Err(HostedProviderImportThunkError::OutputTooSmall);
+    }
+    out[..HOSTED_PROVIDER_CALLBACK_THUNK_LEN].copy_from_slice(&[
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64
+        0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, // mov r11, imm64
+        0x41, 0xff, 0xe3, // jmp r11
+    ]);
+    out[2..10].copy_from_slice(&thunk.callback_cookie.to_le_bytes());
+    out[12..20].copy_from_slice(&thunk.callback_gate.to_le_bytes());
     Ok(())
 }
 
@@ -1291,6 +1345,61 @@ mod tests {
         let mut too_small = [0u8; HOSTED_PROVIDER_IMPORT_THUNK_LEN - 1];
         assert_eq!(
             encode_hosted_provider_import_thunk(thunk, &mut too_small),
+            Err(HostedProviderImportThunkError::OutputTooSmall)
+        );
+    }
+
+    #[test]
+    fn provider_callback_thunk_planner_assigns_fixed_slots() {
+        assert_eq!(
+            plan_hosted_provider_callback_thunk(
+                0x7100_0000,
+                0x100,
+                2,
+                0x1111_2222_3333_4444,
+                0xfeed_cafe_dead_beef,
+            ),
+            Ok(HostedProviderCallbackThunkPlan {
+                thunk_va: 0x7100_0080,
+                thunk_offset: 0x80,
+                callback_gate: 0x1111_2222_3333_4444,
+                callback_cookie: 0xfeed_cafe_dead_beef,
+            })
+        );
+        assert_eq!(
+            plan_hosted_provider_callback_thunk(0x7100_0000, 0x40, 1, 0x1, 0x2),
+            Err(HostedProviderImportThunkError::ThunkOutsideTable)
+        );
+        assert_eq!(
+            plan_hosted_provider_callback_thunk(u64::MAX, 0x100, 1, 0x1, 0x2),
+            Err(HostedProviderImportThunkError::Overflow)
+        );
+    }
+
+    #[test]
+    fn provider_callback_thunk_encoder_preserves_callback_arguments() {
+        let thunk = HostedProviderCallbackThunkPlan {
+            thunk_va: 0x7100_0040,
+            thunk_offset: 0x40,
+            callback_gate: 0x1111_2222_3333_4444,
+            callback_cookie: 0x0102_0304_0506_0708,
+        };
+        let mut out = [0xcc; HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize];
+        encode_hosted_provider_callback_thunk(thunk, &mut out).unwrap();
+        assert_eq!(
+            &out[..HOSTED_PROVIDER_CALLBACK_THUNK_LEN],
+            &[
+                0x48, 0xb8, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x49, 0xbb, 0x44, 0x44,
+                0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0x41, 0xff, 0xe3,
+            ]
+        );
+        assert!(out[HOSTED_PROVIDER_CALLBACK_THUNK_LEN..]
+            .iter()
+            .all(|byte| *byte == 0xcc));
+
+        let mut too_small = [0u8; HOSTED_PROVIDER_CALLBACK_THUNK_LEN - 1];
+        assert_eq!(
+            encode_hosted_provider_callback_thunk(thunk, &mut too_small),
             Err(HostedProviderImportThunkError::OutputTooSmall)
         );
     }

@@ -7176,3 +7176,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the NDIS miniport characteristics layout slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 provider reverse-callback thunk primitive (2026-08-17, in progress): `nt-hosted-runtime` now
+  owns the executable thunk shape needed for provider-to-dependent callbacks. The thunk preserves the
+  provider's Win64 callback arguments, loads a compact callback cookie, and jumps to a common
+  provider callback gate; slot planning reuses the existing 64-byte hosted thunk table stride and is
+  covered by host tests for byte encoding, fixed-slot assignment, and overflow/table exhaustion. This
+  is only the executable primitive: the executive still needs to reserve/publish a thunk arena for
+  provider components that receive copied callback tables, allocate callback cookies, and service the
+  reverse call in the dependent miniport component.
+  Review adjustment: continue by generalizing the hosted thunk table allocation so provider
+  singletons such as `ndis.sys` can host reverse callback thunks even when they do not import another
+  callable provider.
+
+  Validation for the provider reverse-callback thunk primitive: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, and `git diff --check`.
