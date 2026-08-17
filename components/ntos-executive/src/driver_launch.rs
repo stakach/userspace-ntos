@@ -11675,6 +11675,7 @@ struct HostedProviderSingleton {
     pool_base: u64,
     pool_frames: u64,
     export_call_gate: u64,
+    provider_domain_cookie: u64,
 }
 
 impl HostedProviderSingleton {
@@ -11690,6 +11691,7 @@ impl HostedProviderSingleton {
             pool_base: 0,
             pool_frames: 0,
             export_call_gate: 0,
+            provider_domain_cookie: 0,
         }
     }
 }
@@ -11977,6 +11979,7 @@ unsafe fn register_hosted_provider_singleton(
         pool_base,
         pool_frames,
         export_call_gate: 0,
+        provider_domain_cookie: 0,
     };
     HOSTED_PROVIDER_SINGLETON_COUNT.store((count + 1) as u64, Ordering::Relaxed);
     print_str(b"[driver-launch] provider singleton published ");
@@ -12115,6 +12118,9 @@ fn print_hosted_provider_domain_error(error: HostedProviderDomainError) {
         }
         HostedProviderDomainError::ImageExceedsFrames => print_str(b"image-exceeds-frames"),
         HostedProviderDomainError::EmptyPoolFrames => print_str(b"empty-pool-frames"),
+        HostedProviderDomainError::EmptyProviderDomainCookie => {
+            print_str(b"empty-provider-domain-cookie")
+        }
     }
 }
 
@@ -12150,6 +12156,7 @@ fn hosted_provider_domain_descriptor(
         pool_base: singleton.pool_base,
         pool_frames: singleton.pool_frames,
         export_call_gate: singleton.export_call_gate,
+        provider_domain_cookie: singleton.provider_domain_cookie,
     }
 }
 

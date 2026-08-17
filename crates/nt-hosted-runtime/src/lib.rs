@@ -8,8 +8,8 @@
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
-pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 23;
-pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 32;
+pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 33;
+pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
@@ -127,6 +127,7 @@ pub struct HostedProviderDomainDescriptor {
     pub pool_base: u64,
     pub pool_frames: u64,
     pub export_call_gate: u64,
+    pub provider_domain_cookie: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +138,7 @@ pub struct HostedProviderDomainBinding {
     pub pool_base: u64,
     pub pool_frames: u64,
     pub export_call_gate: u64,
+    pub provider_domain_cookie: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,11 +156,13 @@ pub enum HostedProviderDomainError {
     ImageFrameCapacityOverflow,
     ImageExceedsFrames,
     EmptyPoolFrames,
+    EmptyProviderDomainCookie,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedProviderExportCallPlan {
     pub export_call_gate: u64,
+    pub provider_domain_cookie: u64,
     pub provider_export_rva: u64,
     pub provider_export_offset: u64,
 }
@@ -186,6 +190,7 @@ pub struct HostedProviderImportThunkPlan {
     pub thunk_va: u64,
     pub thunk_offset: u64,
     pub export_call_gate: u64,
+    pub provider_domain_cookie: u64,
     pub provider_export_rva: u64,
 }
 
@@ -230,6 +235,9 @@ pub fn classify_hosted_provider_domain(
     if descriptor.export_call_gate == 0 {
         return Ok(HostedProviderDomainStatus::MetadataOnly);
     }
+    if descriptor.provider_domain_cookie == 0 {
+        return Err(HostedProviderDomainError::EmptyProviderDomainCookie);
+    }
     Ok(HostedProviderDomainStatus::Callable(
         HostedProviderDomainBinding {
             image_offset: descriptor.image_offset,
@@ -238,6 +246,7 @@ pub fn classify_hosted_provider_domain(
             pool_base: descriptor.pool_base,
             pool_frames: descriptor.pool_frames,
             export_call_gate: descriptor.export_call_gate,
+            provider_domain_cookie: descriptor.provider_domain_cookie,
         },
     ))
 }
@@ -254,6 +263,7 @@ pub fn plan_hosted_provider_export_call(
     };
     Ok(HostedProviderExportCallPlan {
         export_call_gate: binding.export_call_gate,
+        provider_domain_cookie: binding.provider_domain_cookie,
         provider_export_rva,
         provider_export_offset,
     })
@@ -300,6 +310,7 @@ pub fn plan_hosted_provider_import_thunk(
         thunk_va,
         thunk_offset,
         export_call_gate: export_plan.export_call_gate,
+        provider_domain_cookie: export_plan.provider_domain_cookie,
         provider_export_rva: export_plan.provider_export_rva,
     })
 }
@@ -313,11 +324,13 @@ pub fn encode_hosted_provider_import_thunk(
     }
     out[..HOSTED_PROVIDER_IMPORT_THUNK_LEN].copy_from_slice(&[
         0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64
+        0x49, 0xba, 0, 0, 0, 0, 0, 0, 0, 0, // mov r10, imm64
         0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, // mov r11, imm64
         0x41, 0xff, 0xe3, // jmp r11
     ]);
     out[2..10].copy_from_slice(&thunk.provider_export_rva.to_le_bytes());
-    out[12..20].copy_from_slice(&thunk.export_call_gate.to_le_bytes());
+    out[12..20].copy_from_slice(&thunk.provider_domain_cookie.to_le_bytes());
+    out[22..30].copy_from_slice(&thunk.export_call_gate.to_le_bytes());
     Ok(())
 }
 
@@ -631,6 +644,7 @@ mod tests {
             pool_base: 0x8800_0000,
             pool_frames: 4,
             export_call_gate: 0,
+            provider_domain_cookie: 0,
         };
         assert_eq!(
             classify_hosted_provider_domain(Some(metadata_only)),
@@ -639,6 +653,7 @@ mod tests {
 
         let callable = HostedProviderDomainDescriptor {
             export_call_gate: 0xfeed,
+            provider_domain_cookie: 0x55aa,
             ..metadata_only
         };
         assert_eq!(
@@ -651,6 +666,7 @@ mod tests {
                     pool_base: callable.pool_base,
                     pool_frames: callable.pool_frames,
                     export_call_gate: callable.export_call_gate,
+                    provider_domain_cookie: callable.provider_domain_cookie,
                 }
             ))
         );
@@ -665,6 +681,7 @@ mod tests {
             pool_base: 0x8800_0000,
             pool_frames: 1,
             export_call_gate: 0,
+            provider_domain_cookie: 0,
         };
         assert_eq!(
             classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
@@ -694,6 +711,13 @@ mod tests {
             })),
             Err(HostedProviderDomainError::EmptyPoolFrames)
         );
+        assert_eq!(
+            classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
+                export_call_gate: 0xbeef,
+                ..valid
+            })),
+            Err(HostedProviderDomainError::EmptyProviderDomainCookie)
+        );
     }
 
     #[test]
@@ -705,11 +729,13 @@ mod tests {
             pool_base: 0x8800_0000,
             pool_frames: 8,
             export_call_gate: 0xbeef,
+            provider_domain_cookie: 0xfeed_cafe,
         };
         assert_eq!(
             plan_hosted_provider_export_call(binding, 0x1234),
             Ok(HostedProviderExportCallPlan {
                 export_call_gate: 0xbeef,
+                provider_domain_cookie: 0xfeed_cafe,
                 provider_export_rva: 0x1234,
                 provider_export_offset: 0x41_234,
             })
@@ -736,6 +762,7 @@ mod tests {
                     pool_base: 0x9000_0000,
                     pool_frames: 8,
                     export_call_gate: 0,
+                    provider_domain_cookie: 0,
                 }),
                 0x1234,
             ),
@@ -754,12 +781,14 @@ mod tests {
                     pool_base: 0x9000_0000,
                     pool_frames: 8,
                     export_call_gate: 0xcafe,
+                    provider_domain_cookie: 0xabcd,
                 }),
                 0x2345,
             ),
             Ok(HostedProviderImportBinding::ProviderDomainCall(
                 HostedProviderExportCallPlan {
                     export_call_gate: 0xcafe,
+                    provider_domain_cookie: 0xabcd,
                     provider_export_rva: 0x2345,
                     provider_export_offset: 0x62_345,
                 }
@@ -778,6 +807,7 @@ mod tests {
                     pool_base: 0x9000_0000,
                     pool_frames: 8,
                     export_call_gate: 0xcafe,
+                    provider_domain_cookie: 0xabcd,
                 }),
                 0x1234,
             ),
@@ -795,6 +825,7 @@ mod tests {
                     pool_base: 0x9000_0000,
                     pool_frames: 8,
                     export_call_gate: 0xcafe,
+                    provider_domain_cookie: 0xabcd,
                 }),
                 0x20_000,
             ),
@@ -808,15 +839,17 @@ mod tests {
     fn provider_import_thunk_planner_assigns_fixed_slots() {
         let export_plan = HostedProviderExportCallPlan {
             export_call_gate: 0x1111_2222_3333_4444,
+            provider_domain_cookie: 0xaaaa_bbbb_cccc_dddd,
             provider_export_rva: 0x4567,
             provider_export_offset: 0x84_567,
         };
         assert_eq!(
             plan_hosted_provider_import_thunk(0x7000_0000, 0x100, 3, export_plan),
             Ok(HostedProviderImportThunkPlan {
-                thunk_va: 0x7000_0060,
-                thunk_offset: 0x60,
+                thunk_va: 0x7000_00c0,
+                thunk_offset: 0xc0,
                 export_call_gate: export_plan.export_call_gate,
+                provider_domain_cookie: export_plan.provider_domain_cookie,
                 provider_export_rva: export_plan.provider_export_rva,
             })
         );
@@ -826,6 +859,7 @@ mod tests {
     fn provider_import_thunk_planner_rejects_table_overflow() {
         let export_plan = HostedProviderExportCallPlan {
             export_call_gate: 0x1111_2222_3333_4444,
+            provider_domain_cookie: 0xaaaa_bbbb_cccc_dddd,
             provider_export_rva: 0x4567,
             provider_export_offset: 0x84_567,
         };
@@ -846,9 +880,10 @@ mod tests {
     #[test]
     fn provider_import_thunk_encoder_preserves_win64_arguments_for_gate() {
         let thunk = HostedProviderImportThunkPlan {
-            thunk_va: 0x7000_0020,
-            thunk_offset: 0x20,
+            thunk_va: 0x7000_0040,
+            thunk_offset: 0x40,
             export_call_gate: 0x1111_2222_3333_4444,
+            provider_domain_cookie: 0x0102_0304_0506_0708,
             provider_export_rva: 0x5566_7788_99aa_bbcc,
         };
         let mut out = [0xcc; HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize];
@@ -856,8 +891,9 @@ mod tests {
         assert_eq!(
             &out[..HOSTED_PROVIDER_IMPORT_THUNK_LEN],
             &[
-                0x48, 0xb8, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x49, 0xbb, 0x44, 0x44,
-                0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0x41, 0xff, 0xe3,
+                0x48, 0xb8, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x49, 0xba, 0x08, 0x07,
+                0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x49, 0xbb, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22,
+                0x11, 0x11, 0x41, 0xff, 0xe3,
             ]
         );
         assert!(out[HOSTED_PROVIDER_IMPORT_THUNK_LEN..]

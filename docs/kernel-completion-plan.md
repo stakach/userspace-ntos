@@ -7007,16 +7007,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
   B3 provider-domain thunk layout slice (2026-08-17, in progress): `nt-hosted-runtime` now models
   the per-import x64 thunk shape needed by the real provider-domain gate. Each thunk has a fixed
-  32-byte slot and emits `mov rax, provider_export_rva; mov r11, export_call_gate; jmp r11`, leaving
-  the original win64 argument registers and stack tail untouched for the gate entry. The planner
-  checks table bounds and arithmetic overflow before producing a thunk VA, and host tests pin both
-  the slot arithmetic and exact machine-code bytes. Review adjustment: the kernel-side work can now
-  allocate an RX thunk table for dependents and patch callable-provider IAT slots to per-export
-  thunks, with the remaining hard part being the gate handler that parks the dependent call and runs
-  the provider export inside the provider component's runtime context.
+  64-byte slot and emits `mov rax, provider_export_rva; mov r10, provider_domain_cookie; mov r11,
+  export_call_gate; jmp r11`, leaving the original win64 argument registers and stack tail untouched
+  for the gate entry. Callable provider domains now require a nonzero provider-domain cookie, so a
+  common executive gate can route by explicit provider identity instead of relying on singleton
+  inference. The planner checks table bounds and arithmetic overflow before producing a thunk VA, and
+  host tests pin both the slot arithmetic and exact machine-code bytes. Review adjustment: the
+  kernel-side work can now allocate an RX thunk table for dependents and patch callable-provider IAT
+  slots to per-export thunks, with the remaining hard part being the gate handler that parks the
+  dependent call and runs the provider export inside the provider component's runtime context.
 
-  Validation for the thunk-layout slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`, and
-  `git diff --check`.
+  Validation for the thunk-layout slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`.
 
   B3 provider import resolver-shape slice (2026-08-17, in progress): the executive PE loader no
   longer treats import resolution as a raw `u64` function-pointer lookup internally. `load_pe_into`
