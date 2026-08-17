@@ -7419,12 +7419,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   are projected between the dependent device binding and the provider component around each routed
   IRP. This deliberately fails closed if NDIS does not publish a real route; no private NDIS image
   fallback or synthetic AddDevice path was added.
-  Review adjustment: boot-test this route against `./run.sh --desktop`. The expected next proof is
-  that the earlier `generic hardware AddDevice failed status=0xc0000010` moves forward to a real
-  NDIS `NdisIAddDevice`/StartDevice path. If it fails, inspect the provider route logs and the first
-  real NDIS PnP/miniport callback that fails, keeping the provider-domain boundary dynamic and
-  multi-device-capable.
+  The first serialized desktop proof of this route moved past the old missing-AddDevice failure:
+  `e1000.sys` published a provider miniport route, generic PnP reached real NDIS AddDevice and
+  StartDevice dispatch, and the rest of the boot continued to Winlogon/Userinit/Explorer without
+  resource exhaustion. The graphics run was stopped manually after Explorer, Rundll32, and Kbswitch
+  reached stable native/win32k traffic. B3 is still not complete: the provider-owned E1000
+  StartDevice dispatch returns `STATUS_UNSUCCESSFUL` before DMA packet/common-buffer descriptors
+  are observed. The next serialized headless proof, `.tmp/run-headless-b3-provider-route-current-20260817.log`,
+  showed route publication and real NDIS AddDevice/StartDevice, then a dependent `e1000.sys`
+  callback fault in miniport initialization. No `[wdm-forward]` record appeared before the fault,
+  so the failure is no longer treated as a lower-PDO forwarding problem. The next slice fixes the
+  provider export ABI instead: `nt-hosted-runtime` now records whether a provider export returns an
+  NTSTATUS or is a true `VOID` routine. The executive uses that policy when materializing fixed
+  output copyouts, so void NDIS exports such as `NdisMAllocateSharedMemory` no longer have their
+  successful output pointers zeroed just because the ignored RAX value is nonzero. The same slice
+  keeps a bounded, policy-driven resource-list trace for `CallerInOutResourceList` exports so the
+  two-call `NdisMQueryAdapterResources` sequence can be verified without E1000-specific code.
+  Review adjustment: rerun `./run.sh --desktop` with the void-result fix and resource-list trace.
+  B3 closes only when real E1000 StartDevice reaches DMA common-buffer descriptor allocation and
+  desktop boot continues without provider-domain route or marshal failures.
 
   Validation for the provider-owned NDIS miniport dispatch route slice so far: `cargo fmt --all`,
-  `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
-  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+  `cargo test -p nt-hosted-runtime`, `./components/ntos-executive/build.sh`, and `git diff --check`.

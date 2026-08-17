@@ -285,10 +285,17 @@ pub enum HostedProviderExportSideEffect {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderExportResultSemantics {
+    NtStatus,
+    Void,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedProviderExportMarshalPolicy {
     pub argument_count: u8,
     pub stack_qwords: u8,
     pub side_effect: HostedProviderExportSideEffect,
+    pub result_semantics: HostedProviderExportResultSemantics,
     pub args: [HostedProviderArgumentMarshal; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 }
 
@@ -370,12 +377,38 @@ fn ascii_eq_ignore_case(a: &str, b: &str) -> bool {
 fn export_policy(
     args: &[HostedProviderArgumentMarshal],
 ) -> Option<HostedProviderExportMarshalPolicy> {
-    export_policy_with_side_effect(args, HostedProviderExportSideEffect::None)
+    export_policy_with_effect_and_result(
+        args,
+        HostedProviderExportSideEffect::None,
+        HostedProviderExportResultSemantics::NtStatus,
+    )
+}
+
+fn void_export_policy(
+    args: &[HostedProviderArgumentMarshal],
+) -> Option<HostedProviderExportMarshalPolicy> {
+    export_policy_with_effect_and_result(
+        args,
+        HostedProviderExportSideEffect::None,
+        HostedProviderExportResultSemantics::Void,
+    )
 }
 
 fn export_policy_with_side_effect(
     args: &[HostedProviderArgumentMarshal],
     side_effect: HostedProviderExportSideEffect,
+) -> Option<HostedProviderExportMarshalPolicy> {
+    export_policy_with_effect_and_result(
+        args,
+        side_effect,
+        HostedProviderExportResultSemantics::NtStatus,
+    )
+}
+
+fn export_policy_with_effect_and_result(
+    args: &[HostedProviderArgumentMarshal],
+    side_effect: HostedProviderExportSideEffect,
+    result_semantics: HostedProviderExportResultSemantics,
 ) -> Option<HostedProviderExportMarshalPolicy> {
     if args.len() > HOSTED_PROVIDER_EXPORT_ARG_CAP {
         return None;
@@ -390,6 +423,7 @@ fn export_policy_with_side_effect(
         argument_count: args.len() as u8,
         stack_qwords: args.len().saturating_sub(4) as u8,
         side_effect,
+        result_semantics,
         args: all,
     })
 }
@@ -422,7 +456,7 @@ pub fn hosted_provider_export_marshal_policy(
             export_policy(&[CallerOutPointerFromLength { length_arg: 1 }, Scalar, Scalar])
         }
         "NdisMInitializeScatterGatherDma" => export_policy(&[ProviderHandle, Scalar, Scalar]),
-        "NdisInitializeWrapper" => export_policy_with_side_effect(
+        "NdisInitializeWrapper" => export_policy_with_effect_and_result(
             &[
                 CallerOutHandle,
                 CallerInDriverObject,
@@ -430,6 +464,7 @@ pub fn hosted_provider_export_marshal_policy(
                 Scalar,
             ],
             HostedProviderExportSideEffect::NdisInitializeWrapper,
+            HostedProviderExportResultSemantics::Void,
         ),
         "NdisMRegisterMiniport" => export_policy_with_side_effect(
             &[
@@ -440,9 +475,9 @@ pub fn hosted_provider_export_marshal_policy(
             HostedProviderExportSideEffect::NdisMiniportRegistration,
         ),
         "NdisMSetAttributesEx" => {
-            export_policy(&[ProviderHandle, CallerContext, Scalar, Scalar, Scalar])
+            void_export_policy(&[ProviderHandle, CallerContext, Scalar, Scalar, Scalar])
         }
-        "NdisMQueryAdapterResources" => export_policy(&[
+        "NdisMQueryAdapterResources" => void_export_policy(&[
             CallerOutStatus,
             ProviderHandle,
             CallerInOutResourceList {
@@ -450,7 +485,7 @@ pub fn hosted_provider_export_marshal_policy(
             },
             CallerInOutU32,
         ]),
-        "NdisTerminateWrapper" => export_policy(&[ProviderHandle, Scalar]),
+        "NdisTerminateWrapper" => void_export_policy(&[ProviderHandle, Scalar]),
         "NdisReadPciSlotInformation" => export_policy(&[
             ProviderHandle,
             Scalar,
@@ -458,7 +493,7 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutBuffer { length_arg: 4 },
             Scalar,
         ]),
-        "NdisMFreeSharedMemory" => export_policy(&[
+        "NdisMFreeSharedMemory" => void_export_policy(&[
             ProviderHandle,
             Scalar,
             Scalar,
@@ -468,7 +503,7 @@ pub fn hosted_provider_export_marshal_policy(
             },
             Scalar,
         ]),
-        "NdisMDeregisterInterrupt" => export_policy(&[CallerInOutMiniportInterrupt]),
+        "NdisMDeregisterInterrupt" => void_export_policy(&[CallerInOutMiniportInterrupt]),
         "NdisMRegisterInterrupt" => export_policy(&[
             CallerInOutMiniportInterrupt,
             ProviderHandle,
@@ -478,7 +513,9 @@ pub fn hosted_provider_export_marshal_policy(
             Scalar,
             Scalar,
         ]),
-        "NdisMDeregisterIoPortRange" => export_policy(&[ProviderHandle, Scalar, Scalar, Scalar]),
+        "NdisMDeregisterIoPortRange" => {
+            void_export_policy(&[ProviderHandle, Scalar, Scalar, Scalar])
+        }
         "NdisMMapIoSpace" => export_policy(&[
             CallerOutMmioMapping {
                 physical_address_arg: 2,
@@ -497,8 +534,8 @@ pub fn hosted_provider_export_marshal_policy(
             Scalar,
             Scalar,
         ]),
-        "NdisMUnmapIoSpace" => export_policy(&[ProviderHandle, Scalar, Scalar]),
-        "NdisMAllocateSharedMemory" => export_policy(&[
+        "NdisMUnmapIoSpace" => void_export_policy(&[ProviderHandle, Scalar, Scalar]),
+        "NdisMAllocateSharedMemory" => void_export_policy(&[
             ProviderHandle,
             Scalar,
             Scalar,
@@ -507,9 +544,9 @@ pub fn hosted_provider_export_marshal_policy(
         ]),
         "NDIS_BUFFER_TO_SPAN_PAGES" => export_policy(&[CallerInNdisBuffer]),
         "NdisFreeMemory" => {
-            export_policy(&[CallerInOwnedAllocation { length_arg: 1 }, Scalar, Scalar])
+            void_export_policy(&[CallerInOwnedAllocation { length_arg: 1 }, Scalar, Scalar])
         }
-        "NdisTransferData" => export_policy(&[
+        "NdisTransferData" => void_export_policy(&[
             CallerOutStatus,
             ProviderHandle,
             Scalar,
@@ -518,10 +555,10 @@ pub fn hosted_provider_export_marshal_policy(
             CallerInOutPacket,
             CallerOutU32,
         ]),
-        "NdisSend" => export_policy(&[CallerOutStatus, ProviderHandle, CallerInPacket]),
-        "NdisRequest" => export_policy(&[CallerOutStatus, ProviderHandle, CallerInOutRequest]),
-        "NdisDeregisterProtocol" => export_policy(&[CallerOutStatus, ProviderHandle]),
-        "NdisOpenAdapter" => export_policy(&[
+        "NdisSend" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInPacket]),
+        "NdisRequest" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInOutRequest]),
+        "NdisDeregisterProtocol" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
+        "NdisOpenAdapter" => void_export_policy(&[
             CallerOutStatus,
             CallerOutStatus,
             CallerOutHandle,
@@ -534,36 +571,38 @@ pub fn hosted_provider_export_marshal_policy(
             Scalar,
             CallerInAnsiString,
         ]),
-        "NdisCloseAdapter" => export_policy(&[CallerOutStatus, ProviderHandle]),
-        "NdisRegisterProtocol" => export_policy(&[
+        "NdisCloseAdapter" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
+        "NdisRegisterProtocol" => void_export_policy(&[
             CallerOutStatus,
             CallerOutHandle,
             CallerInProtocolCharacteristics { length_arg: 3 },
             Scalar,
         ]),
-        "NdisFreePacket" => export_policy(&[CallerInOutPacket]),
-        "NdisAllocatePacket" => export_policy(&[CallerOutStatus, CallerOutPointer, ProviderHandle]),
-        "NdisGetFirstBufferFromPacket" => export_policy(&[
+        "NdisFreePacket" => void_export_policy(&[CallerInOutPacket]),
+        "NdisAllocatePacket" => {
+            void_export_policy(&[CallerOutStatus, CallerOutPointer, ProviderHandle])
+        }
+        "NdisGetFirstBufferFromPacket" => void_export_policy(&[
             CallerInPacket,
             CallerOutPointer,
             CallerOutPointer,
             CallerOutU32,
             CallerOutU32,
         ]),
-        "NdisAllocateBufferPool" => export_policy(&[CallerOutStatus, CallerOutHandle, Scalar]),
-        "NdisFreeBufferPool" => export_policy(&[ProviderHandle]),
+        "NdisAllocateBufferPool" => void_export_policy(&[CallerOutStatus, CallerOutHandle, Scalar]),
+        "NdisFreeBufferPool" => void_export_policy(&[ProviderHandle]),
         "NdisAllocatePacketPoolEx" => {
-            export_policy(&[CallerOutStatus, CallerOutHandle, Scalar, Scalar, Scalar])
+            void_export_policy(&[CallerOutStatus, CallerOutHandle, Scalar, Scalar, Scalar])
         }
-        "NdisFreePacketPool" => export_policy(&[ProviderHandle]),
-        "NdisAllocateBuffer" => export_policy(&[
+        "NdisFreePacketPool" => void_export_policy(&[ProviderHandle]),
+        "NdisAllocateBuffer" => void_export_policy(&[
             CallerOutStatus,
             CallerOutPointer,
             ProviderHandle,
             CallerInBuffer { length_arg: 4 },
             Scalar,
         ]),
-        "NdisReturnPackets" => export_policy(&[CallerInPointerArray { count_arg: 1 }, Scalar]),
+        "NdisReturnPackets" => void_export_policy(&[CallerInPointerArray { count_arg: 1 }, Scalar]),
         _ => None,
     }
 }
@@ -1181,6 +1220,10 @@ mod tests {
             policy.args[3],
             HostedProviderArgumentMarshal::CallerInOutU32
         );
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
     }
 
     #[test]
@@ -1213,6 +1256,10 @@ mod tests {
             hosted_provider_export_marshal_policy("ndis.sys", "NdisMAllocateSharedMemory").unwrap();
         assert_eq!(alloc.argument_count, 5);
         assert_eq!(
+            alloc.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+        assert_eq!(
             alloc.args[3],
             HostedProviderArgumentMarshal::CallerOutDmaCommonBuffer { length_arg: 1 }
         );
@@ -1225,12 +1272,54 @@ mod tests {
             hosted_provider_export_marshal_policy("ndis.sys", "NdisMFreeSharedMemory").unwrap();
         assert_eq!(free.argument_count, 5);
         assert_eq!(
+            free.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+        assert_eq!(
             free.args[3],
             HostedProviderArgumentMarshal::CallerInDmaCommonBuffer {
                 length_arg: 1,
                 physical_address_arg: 4,
             }
         );
+    }
+
+    #[test]
+    fn ndis_void_exports_do_not_treat_rax_as_status() {
+        for export in [
+            "NdisInitializeWrapper",
+            "NdisMSetAttributesEx",
+            "NdisMAllocateSharedMemory",
+            "NdisMFreeSharedMemory",
+            "NdisMDeregisterInterrupt",
+            "NdisMDeregisterIoPortRange",
+            "NdisMUnmapIoSpace",
+            "NdisTerminateWrapper",
+            "NdisFreeMemory",
+            "NdisTransferData",
+            "NdisSend",
+            "NdisRequest",
+            "NdisDeregisterProtocol",
+            "NdisOpenAdapter",
+            "NdisCloseAdapter",
+            "NdisRegisterProtocol",
+            "NdisFreePacket",
+            "NdisAllocatePacket",
+            "NdisGetFirstBufferFromPacket",
+            "NdisAllocateBufferPool",
+            "NdisFreeBufferPool",
+            "NdisAllocatePacketPoolEx",
+            "NdisFreePacketPool",
+            "NdisAllocateBuffer",
+            "NdisReturnPackets",
+        ] {
+            let policy = hosted_provider_export_marshal_policy("ndis.sys", export)
+                .unwrap_or_else(|| panic!("missing policy for {}", export));
+            assert_eq!(
+                policy.result_semantics,
+                HostedProviderExportResultSemantics::Void
+            );
+        }
     }
 
     #[test]

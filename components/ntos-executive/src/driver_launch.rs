@@ -40,8 +40,9 @@ use nt_hosted_runtime::{
     HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
     HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
     HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
-    HostedProviderExportSideEffect, HostedProviderImportBinding, HostedProviderImportBindingError,
-    HostedProviderImportThunkError, HostedProviderImportThunkPlan,
+    HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
+    HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
+    HostedProviderImportThunkPlan,
     NdisMiniportCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
     HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
@@ -636,6 +637,11 @@ static mut POOL_CALLS: u64 = 0;
 static mut POOL_LONG_WALKS: u32 = 0;
 static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 static FSD_CANCEL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WDM_FORWARD_CALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const WDM_FORWARD_TRACE_CAP: u64 = 64;
+static PROVIDER_RESOURCE_LIST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const PROVIDER_RESOURCE_LIST_TRACE_CAP: u64 = 16;
 
 #[inline]
 fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
@@ -5957,6 +5963,7 @@ const WDM_X64_IO_STACK_CONTROL_OFFSET: u64 = 0x03;
 const WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET: u64 = 0x28;
 const WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET: u64 = 0x38;
 const WDM_X64_IO_STACK_CONTEXT_OFFSET: u64 = 0x40;
+const WDM_X64_IO_STACK_COPY_TO_NEXT_BYTES: u64 = WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET;
 const WDM_X64_SL_INVOKE_ON_SUCCESS: u8 = 0x40;
 const WDM_X64_SL_INVOKE_ON_ERROR: u8 = 0x80;
 
@@ -5994,11 +6001,12 @@ extern "win64" fn s_io_copy_current_irp_stack_location_to_next(irp: u64) {
             return;
         }
         let mut off = 0u64;
-        while off < WDM_X64_IO_STACK_LOCATION_SIZE as u64 {
+        while off < WDM_X64_IO_STACK_COPY_TO_NEXT_BYTES {
             let byte = read_unaligned((current + off) as *const u8);
             write_unaligned((next + off) as *mut u8, byte);
             off += 1;
         }
+        write_unaligned((next + WDM_X64_IO_STACK_CONTROL_OFFSET) as *mut u8, 0);
     }
 }
 
@@ -6379,6 +6387,8 @@ extern "win64" fn s_io_csq_remove_next_irp(csq: u64, peek_context: u64) -> u64 {
 extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
     unsafe {
         let mut next = 0;
+        let mut previous_location = 0u8;
+        let mut current_location_after_forward = 0u8;
         let mut forwarded_minor = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
         if irp != 0 {
             let current_location =
@@ -6386,9 +6396,11 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             if current_location == 0 {
                 return 0xC000_0010u32 as i32; // STATUS_INVALID_DEVICE_REQUEST
             }
+            previous_location = current_location;
+            current_location_after_forward = current_location - 1;
             write_unaligned(
                 (irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
-                current_location - 1,
+                current_location_after_forward,
             );
             next = irp_next_stack_location(irp);
             if next != 0 {
@@ -6417,6 +6429,16 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             (FSD_SHARED_VADDR + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
             status,
         );
+        trace_wdm_forward_call(
+            device,
+            expected_pdo,
+            irp,
+            previous_location,
+            current_location_after_forward,
+            next,
+            forwarded_minor,
+            status,
+        );
         if irp != 0 {
             write_unaligned(
                 (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
@@ -6428,6 +6450,62 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
         status
     }
+}
+
+unsafe fn trace_wdm_forward_call(
+    device: u64,
+    expected_pdo: u64,
+    irp: u64,
+    previous_location: u8,
+    current_location: u8,
+    stack: u64,
+    minor: u64,
+    status: i32,
+) {
+    if expected_pdo == 0 {
+        return;
+    }
+    if WDM_FORWARD_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= WDM_FORWARD_TRACE_CAP {
+        return;
+    }
+    let completion = if stack == 0 {
+        0
+    } else {
+        read_unaligned((stack + WDM_X64_IO_STACK_COMPLETION_ROUTINE_OFFSET) as *const u64)
+    };
+    let context = if stack == 0 {
+        0
+    } else {
+        read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64)
+    };
+    let control = if stack == 0 {
+        0
+    } else {
+        read_unaligned((stack + WDM_X64_IO_STACK_CONTROL_OFFSET) as *const u8)
+    };
+    print_str(b"[wdm-forward] dev=");
+    print_hex64(device);
+    print_str(b" expected=");
+    print_hex64(expected_pdo);
+    print_str(b" irp=");
+    print_hex64(irp);
+    print_str(b" loc=");
+    print_u64(previous_location as u64);
+    print_str(b"->");
+    print_u64(current_location as u64);
+    print_str(b" stack=");
+    print_hex64(stack);
+    print_str(b" minor=");
+    print_u64(minor);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" completion=");
+    print_hex64(completion);
+    print_str(b" control=0x");
+    print_hex(control as u32);
+    print_str(b" context=");
+    print_hex64(context);
+    print_str(b"\n");
 }
 
 unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
@@ -6442,7 +6520,11 @@ unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
     } else {
         (control & WDM_X64_SL_INVOKE_ON_ERROR) != 0
     };
+    let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
     if !invoke {
+        trace_wdm_forward_completion(
+            irp, stack, status, completion, control, false, 0, 0, context,
+        );
         return;
     }
 
@@ -6461,10 +6543,55 @@ unsafe fn complete_forwarded_stack_location(irp: u64, stack: u64, status: i32) {
     } else {
         0
     };
-    let context = read_unaligned((stack + WDM_X64_IO_STACK_CONTEXT_OFFSET) as *const u64);
+    trace_wdm_forward_completion(
+        irp,
+        stack,
+        status,
+        completion,
+        control,
+        true,
+        next_stack,
+        device_object,
+        context,
+    );
     let routine: extern "win64" fn(u64, u64, u64) -> i32 =
         core::mem::transmute(completion as *const ());
     let _ = routine(device_object, irp, context);
+}
+
+unsafe fn trace_wdm_forward_completion(
+    irp: u64,
+    stack: u64,
+    status: i32,
+    completion: u64,
+    control: u8,
+    invoke: bool,
+    next_stack: u64,
+    device_object: u64,
+    context: u64,
+) {
+    if WDM_FORWARD_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= WDM_FORWARD_TRACE_CAP {
+        return;
+    }
+    print_str(b"[wdm-forward-complete] irp=");
+    print_hex64(irp);
+    print_str(b" stack=");
+    print_hex64(stack);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" completion=");
+    print_hex64(completion);
+    print_str(b" control=0x");
+    print_hex(control as u32);
+    print_str(b" invoke=");
+    print_u64(if invoke { 1 } else { 0 });
+    print_str(b" next=");
+    print_hex64(next_stack);
+    print_str(b" devobj=");
+    print_hex64(device_object);
+    print_str(b" context=");
+    print_hex64(context);
+    print_str(b"\n");
 }
 
 /// `NTSTATUS PoCallDriver(PDEVICE_OBJECT, PIRP)`.
@@ -12144,6 +12271,7 @@ static HOSTED_PROVIDER_SINGLETON_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_RECORD_CAP: usize = 256;
 static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
     HOSTED_PROVIDER_CALLBACK_RECORD_CAP] =
@@ -12151,6 +12279,9 @@ static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
 static HOSTED_PROVIDER_CALLBACK_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_TRACE_CAP: u64 = 96;
 const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
     HOSTED_PROVIDER_POINTER_ALLOCATION_CAP] =
@@ -12555,6 +12686,118 @@ fn hosted_provider_export_failure(status: i32) -> u64 {
 
 fn hosted_provider_callback_failure(status: i32) -> u64 {
     status as u32 as u64
+}
+
+fn print_ndis_miniport_callback_name(offset: u64) {
+    match offset {
+        NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64 => print_str(b"CheckForHang"),
+        NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64 => print_str(b"DisableInterrupt"),
+        NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64 => print_str(b"EnableInterrupt"),
+        NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64 => print_str(b"Halt"),
+        NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => print_str(b"HandleInterrupt"),
+        NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => print_str(b"Initialize"),
+        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => print_str(b"ISR"),
+        NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => print_str(b"QueryInformation"),
+        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => print_str(b"Reconfigure"),
+        NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => print_str(b"Reset"),
+        NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64 => print_str(b"Send"),
+        NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => print_str(b"SetInformation"),
+        NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => print_str(b"TransferData"),
+        _ => print_str(b"unknown"),
+    }
+}
+
+unsafe fn trace_hosted_provider_export(
+    phase: &[u8],
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    provider_domain_cookie: u64,
+    provider_export_rva: u64,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    result: u64,
+) {
+    if HOSTED_PROVIDER_EXPORT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_PROVIDER_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[provider-export] ");
+    print_str(phase);
+    print_str(b" provider=");
+    print_str(provider.as_bytes());
+    print_str(b" cookie=");
+    print_u64(provider_domain_cookie);
+    print_str(b" rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" args=");
+    print_hex64(args[0]);
+    print_str(b",");
+    print_hex64(args[1]);
+    print_str(b",");
+    print_hex64(args[2]);
+    print_str(b",");
+    print_hex64(args[3]);
+    print_str(b" stack=");
+    print_hex64(args[4]);
+    print_str(b",");
+    print_hex64(args[5]);
+    if phase == b"done" {
+        print_str(b" result=0x");
+        print_hex((result >> 32) as u32);
+        print_hex(result as u32);
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_callback(
+    phase: &[u8],
+    record: HostedProviderCallbackRecord,
+    args: [u64; 4],
+    stack_args: &[u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    result: Result<u64, i32>,
+) {
+    if HOSTED_PROVIDER_CALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_PROVIDER_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[provider-callback] ");
+    print_str(phase);
+    print_str(b" provider-inst=");
+    print_u64(record.provider_instance as u64);
+    print_str(b" dependent-inst=");
+    print_u64(record.dependent_instance as u64);
+    print_str(b" off=0x");
+    print_hex(record.callback_offset as u32);
+    print_str(b" ");
+    print_ndis_miniport_callback_name(record.callback_offset);
+    print_str(b" target=");
+    print_hex64(record.target);
+    print_str(b" args=");
+    print_hex64(args[0]);
+    print_str(b",");
+    print_hex64(args[1]);
+    print_str(b",");
+    print_hex64(args[2]);
+    print_str(b",");
+    print_hex64(args[3]);
+    print_str(b" stack=");
+    print_hex64(stack_args[0]);
+    print_str(b",");
+    print_hex64(stack_args[1]);
+    if phase == b"done" {
+        match result {
+            Ok(value) => {
+                print_str(b" result=0x");
+                print_hex((value >> 32) as u32);
+                print_hex(value as u32);
+            }
+            Err(status) => {
+                print_str(b" status=0x");
+                print_hex(status as u32);
+            }
+        }
+    }
+    print_str(b"\n");
 }
 
 unsafe fn hosted_provider_callback_record_available() -> u64 {
@@ -13905,8 +14148,13 @@ unsafe fn prepare_provider_export_marshal(
     Ok(state)
 }
 
-unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result: u64) {
-    let success = result == STATUS_SUCCESS as u64;
+unsafe fn complete_provider_export_marshal(
+    policy: HostedProviderExportMarshalPolicy,
+    state: &ProviderMarshalState,
+    result: u64,
+) {
+    let success = policy.result_semantics == HostedProviderExportResultSemantics::Void
+        || result == STATUS_SUCCESS as u64;
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
@@ -14177,6 +14425,155 @@ unsafe fn complete_provider_dma_state(
     }
 }
 
+fn provider_policy_resource_list_args(
+    policy: HostedProviderExportMarshalPolicy,
+) -> Option<(usize, usize)> {
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        if let HostedProviderArgumentMarshal::CallerInOutResourceList { length_pointer_arg } =
+            policy.args[index]
+        {
+            return Some((index, length_pointer_arg as usize));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn provider_policy_status_arg(policy: HostedProviderExportMarshalPolicy) -> Option<usize> {
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        if policy.args[index] == HostedProviderArgumentMarshal::CallerOutStatus {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn read_provider_arg_u32(
+    instance_index: usize,
+    inst: DriverInstance,
+    component_va: u64,
+) -> Option<u32> {
+    component_to_exec_va_for_instance(instance_index, inst, component_va, 4)
+        .map(|exec_va| read_unaligned(exec_va as *const u32))
+}
+
+unsafe fn read_provider_resource_descriptor_type(
+    instance_index: usize,
+    inst: DriverInstance,
+    list_component_va: u64,
+    descriptor_index: u32,
+) -> Option<u8> {
+    let offset = 8u64.checked_add((descriptor_index as u64).checked_mul(20)?)?;
+    component_to_exec_va_for_instance(instance_index, inst, list_component_va + offset, 1)
+        .map(|exec_va| read_unaligned(exec_va as *const u8))
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn trace_provider_resource_list_export(
+    policy: HostedProviderExportMarshalPolicy,
+    provider_export_rva: u64,
+    provider_index: usize,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    original_args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshalled_args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    result: u64,
+) {
+    let Some((list_index, length_index)) = provider_policy_resource_list_args(policy) else {
+        return;
+    };
+    if length_index >= policy.argument_count as usize || list_index >= policy.argument_count as usize
+    {
+        return;
+    }
+    let trace = PROVIDER_RESOURCE_LIST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= PROVIDER_RESOURCE_LIST_TRACE_CAP {
+        return;
+    }
+
+    let status_index = provider_policy_status_arg(policy);
+    let dependent_status = status_index
+        .and_then(|index| read_provider_arg_u32(dependent_index, dependent_inst, original_args[index]))
+        .unwrap_or(u32::MAX);
+    let provider_status = status_index
+        .and_then(|index| read_provider_arg_u32(provider_index, provider_inst, marshalled_args[index]))
+        .unwrap_or(u32::MAX);
+    let dependent_len = read_provider_arg_u32(
+        dependent_index,
+        dependent_inst,
+        original_args[length_index],
+    )
+    .unwrap_or(u32::MAX);
+    let provider_len = read_provider_arg_u32(provider_index, provider_inst, marshalled_args[length_index])
+        .unwrap_or(u32::MAX);
+    let list_component_va = original_args[list_index];
+    let (version, revision, count) = if list_component_va == 0 {
+        (0xffffu16, 0xffffu16, u32::MAX)
+    } else if let Some(list_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, list_component_va, 8)
+    {
+        (
+            read_unaligned(list_exec as *const u16),
+            read_unaligned((list_exec + 2) as *const u16),
+            read_unaligned((list_exec + 4) as *const u32),
+        )
+    } else {
+        (0xffffu16, 0xffffu16, u32::MAX)
+    };
+    let desc0 = if count > 0 && count != u32::MAX {
+        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 0)
+            .unwrap_or(0xff)
+    } else {
+        0xff
+    };
+    let desc1 = if count > 1 && count != u32::MAX {
+        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 1)
+            .unwrap_or(0xff)
+    } else {
+        0xff
+    };
+    let desc2 = if count > 2 && count != u32::MAX {
+        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 2)
+            .unwrap_or(0xff)
+    } else {
+        0xff
+    };
+
+    print_str(b"[driver-import] provider resource-list export rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" result=0x");
+    print_hex((result >> 32) as u32);
+    print_hex(result as u32);
+    print_str(b" status dep/prov=0x");
+    print_hex(dependent_status);
+    print_str(b"/0x");
+    print_hex(provider_status);
+    print_str(b" len dep/prov=");
+    print_u64(dependent_len as u64);
+    print_str(b"/");
+    print_u64(provider_len as u64);
+    print_str(b" list=0x");
+    print_hex((list_component_va >> 32) as u32);
+    print_hex(list_component_va as u32);
+    print_str(b" v/r/count=");
+    print_u64(version as u64);
+    print_str(b"/");
+    print_u64(revision as u64);
+    print_str(b"/");
+    print_u64(count as u64);
+    print_str(b" types=");
+    print_u64(desc0 as u64);
+    print_str(b",");
+    print_u64(desc1 as u64);
+    print_str(b",");
+    print_u64(desc2 as u64);
+    print_str(b"\n");
+}
+
 pub(crate) unsafe fn service_hosted_provider_export(
     dependent_channel: &crate::spawn_hosts::PumpChannel,
     provider_export_rva: u64,
@@ -14251,6 +14648,15 @@ pub(crate) unsafe fn service_hosted_provider_export(
         );
         stack_index += 1;
     }
+    let original_args = args;
+    trace_hosted_provider_export(
+        b"enter",
+        &singleton.provider,
+        provider_domain_cookie,
+        provider_export_rva,
+        &args,
+        0,
+    );
     let dependent_binding = if dependent_inst.device_id == 0 {
         None
     } else {
@@ -14363,7 +14769,18 @@ pub(crate) unsafe fn service_hosted_provider_export(
         dependent_channel.shared_va,
         provider_shared,
     );
-    complete_provider_export_marshal(&marshal_state, result);
+    complete_provider_export_marshal(policy, &marshal_state, result);
+    trace_provider_resource_list_export(
+        policy,
+        provider_export_rva,
+        singleton.instance,
+        provider_inst,
+        dependent_index,
+        dependent_inst,
+        &original_args,
+        &args,
+        result,
+    );
     complete_provider_resource_mapping(
         &marshal_state,
         dependent_channel.shared_va,
@@ -14371,6 +14788,14 @@ pub(crate) unsafe fn service_hosted_provider_export(
         result,
     );
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    trace_hosted_provider_export(
+        b"done",
+        &singleton.provider,
+        provider_domain_cookie,
+        provider_export_rva,
+        &args,
+        result,
+    );
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
         print_u64(provider_domain_cookie);
@@ -14753,6 +15178,8 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
+    let callback_args = [arg0, arg1, arg2, arg3];
+    trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
     let result = match record.callback_offset {
         NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
@@ -14839,6 +15266,8 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Err(STATUS_NOT_SUPPORTED),
         _ => Err(STATUS_NOT_SUPPORTED),
     };
+    HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
     match result {
         Ok(value) => value,
         Err(status) => hosted_provider_callback_failure(status),
@@ -16571,7 +17000,19 @@ pub(crate) unsafe fn call_on4(
     let m2: u64;
     let m3: u64;
     core::arch::asm!(
+        // The syscall path may park/resume through nested hosted-driver callbacks. Keep the Rust
+        // call ABI explicit: these registers are not part of the component-service reply tuple.
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
         "syscall",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
         in("rdx") crate::SYS_CALL as u64,
         inout("rdi") crate::CT_FAULT => _,
         inout("rsi") msginfo => reply_info,
@@ -16580,7 +17021,6 @@ pub(crate) unsafe fn call_on4(
         inout("r9") arg2 => m2,
         inout("r15") arg3 => m3,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
     );
     (reply_info >> 12, m0, m1, m2, m3)
 }
