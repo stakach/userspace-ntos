@@ -2315,6 +2315,63 @@ fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
     Some(FSD_POOL_VADDR + off)
 }
 
+unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<u64> {
+    if inst.exec_pool_va == 0 || size == 0 {
+        return None;
+    }
+    let pool_bytes = FSD_POOL_FRAMES.checked_mul(0x1000)?;
+    let exec_pool_end = inst.exec_pool_va.checked_add(pool_bytes)?;
+    let component_pool_end = component_pool_end();
+    let head_slot_exec = inst.exec_pool_va.checked_add(8)?;
+    let mut prev_next_slot_exec = head_slot_exec;
+    let mut cur = read_volatile(head_slot_exec as *const u64);
+    let mut steps = 0u64;
+    while cur != 0 {
+        if steps >= POOL_FREE_LIST_MAX {
+            FSD_POOL_LIST_CYCLES.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        steps += 1;
+        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur >= component_pool_end {
+            break;
+        }
+        let Some(cur_exec) = inst.exec_pool_va.checked_add(cur - FSD_POOL_VADDR) else {
+            break;
+        };
+        if cur_exec < inst.exec_pool_va + 16 || cur_exec >= exec_pool_end {
+            break;
+        }
+        let cap = read_volatile((cur_exec - 16) as *const u64);
+        let next = read_volatile((cur_exec - 8) as *const u64);
+        if cap >= size {
+            write_volatile(prev_next_slot_exec as *mut u64, next);
+            return Some(cur);
+        }
+        prev_next_slot_exec = cur_exec - 8;
+        cur = next;
+    }
+
+    let ctr_exec = inst.exec_pool_va;
+    let mut off = read_volatile(ctr_exec as *const u64);
+    if off < POOL_DATA_OFF {
+        off = POOL_DATA_OFF;
+    }
+    let hdr = FSD_POOL_VADDR.checked_add(off)?.checked_add(15)? & !15;
+    let block = hdr.checked_add(16)?;
+    let end = block.checked_add(size)?;
+    if end > component_pool_end {
+        return None;
+    }
+    let block_exec = inst.exec_pool_va.checked_add(block - FSD_POOL_VADDR)?;
+    if block_exec < inst.exec_pool_va + 16 || block_exec >= exec_pool_end {
+        return None;
+    }
+    write_volatile(ctr_exec as *mut u64, end - FSD_POOL_VADDR);
+    write_volatile((block_exec - 16) as *mut u64, size);
+    write_volatile((block_exec - 8) as *mut u64, 0);
+    Some(block)
+}
+
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
     let sh = inst.exec_shared_va;
     let irp_c = read_volatile((sh + SH_ACTIVE_IRP) as *const u64);
@@ -11833,6 +11890,9 @@ struct ProviderMarshalCopyout {
     dependent_exec_va: u64,
     provider_exec_va: u64,
     bytes: u64,
+    fixed_success_value: u64,
+    fixed_failure_value: u64,
+    fixed_bytes: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -11850,6 +11910,9 @@ impl ProviderMarshalState {
                 dependent_exec_va: 0,
                 provider_exec_va: 0,
                 bytes: 0,
+                fixed_success_value: 0,
+                fixed_failure_value: 0,
+                fixed_bytes: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             copyout_count: 0,
         }
@@ -12418,6 +12481,18 @@ fn provider_marshal_add_copyout(
     provider_exec_va: u64,
     bytes: u64,
 ) -> Option<()> {
+    provider_marshal_add_copyout_with_fixed(state, dependent_exec_va, provider_exec_va, bytes, 0, 0, 0)
+}
+
+fn provider_marshal_add_copyout_with_fixed(
+    state: &mut ProviderMarshalState,
+    dependent_exec_va: u64,
+    provider_exec_va: u64,
+    bytes: u64,
+    fixed_success_value: u64,
+    fixed_failure_value: u64,
+    fixed_bytes: u8,
+) -> Option<()> {
     if state.copyout_count >= state.copyouts.len() {
         return None;
     }
@@ -12425,6 +12500,9 @@ fn provider_marshal_add_copyout(
         dependent_exec_va,
         provider_exec_va,
         bytes,
+        fixed_success_value,
+        fixed_failure_value,
+        fixed_bytes,
     };
     state.copyout_count += 1;
     Some(())
@@ -12450,6 +12528,43 @@ unsafe fn provider_marshal_output_cell(
     };
     provider_marshal_add_copyout(state, dependent_exec_va, provider_exec_va, bytes)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_output_pointer_from_length(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    length: u64,
+) -> Result<u64, i32> {
+    if length == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(allocated_component_va) = hosted_instance_pool_alloc(dependent_inst, length) else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 8)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    provider_marshal_add_copyout_with_fixed(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        8,
+        allocated_component_va,
+        0,
+        8,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     Ok(provider_component_va)
 }
 
@@ -12650,6 +12765,20 @@ unsafe fn prepare_provider_export_marshal(
                     args[length_index],
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_output_pointer_from_length(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
             _ => return Err(STATUS_NOT_SUPPORTED),
         };
         index += 1;
@@ -12657,10 +12786,22 @@ unsafe fn prepare_provider_export_marshal(
     Ok(state)
 }
 
-unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState) {
+unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result: u64) {
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
+        if copyout.fixed_bytes != 0 {
+            let value = if result == STATUS_SUCCESS as u64 {
+                copyout.fixed_success_value
+            } else {
+                copyout.fixed_failure_value
+            };
+            match copyout.fixed_bytes {
+                4 => write_unaligned(copyout.provider_exec_va as *mut u32, value as u32),
+                8 => write_unaligned(copyout.provider_exec_va as *mut u64, value),
+                _ => {}
+            }
+        }
         copy_bytes(copyout.dependent_exec_va, copyout.provider_exec_va, copyout.bytes);
         index += 1;
     }
@@ -12817,8 +12958,8 @@ pub(crate) unsafe fn service_hosted_provider_export(
         register_instance_ready(singleton.instance, false);
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
-    complete_provider_export_marshal(&marshal_state);
     let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
+    complete_provider_export_marshal(&marshal_state, result);
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");

@@ -7265,3 +7265,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the `MiniportInitialize` provider-callback dispatch slice: `cargo fmt --all`,
   `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 `NdisAllocateMemoryWithTag` caller-pointer slice (2026-08-17, in progress): provider export
+  policy now distinguishes output pointers whose storage size is supplied by another argument.
+  `NdisAllocateMemoryWithTag` is modelled as `CallerOutPointerFromLength { length_arg: 1 }` rather
+  than an untyped raw pointer copyout, and the executive marshaller allocates durable memory from the
+  dependent miniport component's hosted pool for that caller-visible result. Provider scratch still
+  receives a normal `PVOID *` while the real provider export runs, but marshal completion now reads
+  the provider result first and conditionally overwrites the scratch output cell before copying it
+  back: success publishes the dependent-pool VA, failure publishes NULL. This prevents provider-local
+  pool addresses from leaking into the miniport VSpace and lets the e1000 adapter-context allocation
+  become a real dereferenceable object in the dependent component.
+  Review adjustment: continue the pointer-returning NDIS work by adding allocation ownership records
+  plus `NdisFreeMemory` handling, then implement the next `MiniportInitialize` export contracts:
+  `NdisReadPciSlotInformation` caller output buffers and `NdisMQueryAdapterResources`
+  status/resource-list/length marshalling. The remaining MMIO/I/O-port/shared-memory APIs should get
+  separate typed policies because they are resource mappings, not generic pool allocations.
+
+  Validation for the `NdisAllocateMemoryWithTag` caller-pointer slice: `cargo fmt --all`, `cargo
+  test -p nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

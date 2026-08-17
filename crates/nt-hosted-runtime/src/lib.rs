@@ -238,6 +238,7 @@ pub enum HostedProviderArgumentMarshal {
     CallerOutStatus,
     CallerOutHandle,
     CallerOutPointer,
+    CallerOutPointerFromLength { length_arg: u8 },
     CallerOutU32,
     CallerInOutU32,
     CallerOutPhysicalAddress,
@@ -355,7 +356,9 @@ pub fn hosted_provider_export_marshal_policy(
     }
 
     match export_name {
-        "NdisAllocateMemoryWithTag" => export_policy(&[CallerOutPointer, Scalar, Scalar]),
+        "NdisAllocateMemoryWithTag" => {
+            export_policy(&[CallerOutPointerFromLength { length_arg: 1 }, Scalar, Scalar])
+        }
         "NdisMInitializeScatterGatherDma" => export_policy(&[ProviderHandle, Scalar, Scalar]),
         "NdisInitializeWrapper" => export_policy(&[
             CallerOutHandle,
@@ -1013,6 +1016,19 @@ mod tests {
         );
         assert!(hosted_provider_export_marshal_policy("ndis.sys", "NdisMissing").is_none());
         assert!(hosted_provider_export_marshal_policy("tcpip.sys", "NdisOpenAdapter").is_none());
+    }
+
+    #[test]
+    fn ndis_allocate_memory_policy_returns_caller_owned_pointer_from_length() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisAllocateMemoryWithTag").unwrap();
+        assert_eq!(policy.argument_count, 3);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg: 1 }
+        );
+        assert_eq!(policy.args[1], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
     }
 
     #[test]
