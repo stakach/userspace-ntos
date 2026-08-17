@@ -64,14 +64,27 @@ static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
-// Mapping caps retained for per-client win32k shared views are not addressed by
-// userspace again; they only need a durable owner so the seL4 mapping remains
-// live. The extern-rootserver root CSpace is an XL CNode, while kernel-side
-// radix-12 CNode backing is intentionally small; keep these high-volume USER/GDI
-// caps in root slots instead of consuming scarce kernel CNode pages.
+// Per-client win32k shared views carry thousands of mapped frame/page-table caps. Keep the root
+// CSpace to process-global names and move these high-volume mapping caps into per-pi child-CNode
+// segments until final process teardown.
+const WIN32K_CLIENT_CAP_BANK_RADIX: u32 = 12;
+const WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS: u64 = 1u64 << WIN32K_CLIENT_CAP_BANK_RADIX;
+const WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI: usize = 3;
+const WIN32K_CLIENT_CAP_BANK_SLOTS: u64 =
+    WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI as u64;
+const WIN32K_CLIENT_CAP_BANK_GUARD_BADGE: u64 = 64 - WIN32K_CLIENT_CAP_BANK_RADIX as u64;
+static WIN32K_CLIENT_CAP_BANK_RAW: [AtomicU64; MAX_PI * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI];
+static WIN32K_CLIENT_CAP_BANK_CNODE: [AtomicU64; MAX_PI * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI];
+static WIN32K_CLIENT_CAP_BANK_NEXT: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
 static WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] =
     [const { AtomicU64::new(0) }; MAX_PI];
 static WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_CAP_BANK_RELEASES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
@@ -3244,14 +3257,15 @@ unsafe fn map_static_win32k_arena_into_client(
 
     const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER;
     for p in 0..(frames + 511) / 512 {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            client_base + p * 0x20_0000,
+        if !win32k_client_cap_bank_map_page_table(
             pml4,
-        );
+            pi,
+            client_base + p * 0x20_0000,
+            label,
+            p,
+        ) {
+            return false;
+        }
     }
     for i in 0..frames {
         let (cp, copy_error) = copy_cap_r(frame_base + i);
@@ -3303,31 +3317,280 @@ unsafe fn map_static_win32k_arena_into_client(
     true
 }
 
+unsafe fn win32k_client_cap_bank_map_page_table(
+    pml4: u64,
+    pi: usize,
+    vaddr: u64,
+    label: &[u8],
+    index: u64,
+) -> bool {
+    let Some(pt) = try_alloc_slot() else {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[win32k-svc] failed to allocate ");
+        print_str(label);
+        print_str(b" page table for pi=");
+        print_u64(pi as u64);
+        print_str(b" index=0x");
+        print_hex(index as u32);
+        print_str(b" error=4\n");
+        return false;
+    };
+    let retype_error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    if retype_error != 0 {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[win32k-svc] failed to retype ");
+        print_str(label);
+        print_str(b" page table for pi=");
+        print_u64(pi as u64);
+        print_str(b" index=0x");
+        print_hex(index as u32);
+        print_str(b" error=");
+        print_u64(retype_error);
+        print_str(b"\n");
+        recycle_deleted_root_slot(pt);
+        return false;
+    }
+    let map_error = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, pml4);
+    if map_error == SEL4_DELETE_FIRST {
+        let _ = cnode_delete_recycle_r(pt);
+        return true;
+    }
+    if map_error != 0 {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[win32k-svc] failed to map ");
+        print_str(label);
+        print_str(b" page table into pi=");
+        print_u64(pi as u64);
+        print_str(b" va=0x");
+        print_hex((vaddr >> 32) as u32);
+        print_hex(vaddr as u32);
+        print_str(b" error=");
+        print_u64(map_error);
+        print_str(b"\n");
+        let _ = cnode_delete_recycle_r(pt);
+        return false;
+    }
+    if !win32k_client_cap_bank_store(pi, pt) {
+        print_str(b"[win32k-svc] failed to retain ");
+        print_str(label);
+        print_str(b" page-table cap for pi=");
+        print_u64(pi as u64);
+        print_str(b" index=0x");
+        print_hex(index as u32);
+        print_str(b"\n");
+        let _ = cnode_delete_recycle_r(pt);
+        return false;
+    }
+    true
+}
+
+const fn win32k_client_cap_bank_segment_index(pi: usize, segment: usize) -> usize {
+    pi * WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI + segment
+}
+
+unsafe fn win32k_client_cap_bank_ensure(pi: usize, segment: usize) -> Option<u64> {
+    if pi >= MAX_PI || segment >= WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let bank_index = win32k_client_cap_bank_segment_index(pi, segment);
+    let existing = WIN32K_CLIENT_CAP_BANK_CNODE[bank_index].load(Ordering::Relaxed);
+    if existing != 0 {
+        return Some(existing);
+    }
+    let Some(raw) = try_alloc_slot() else {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    if untyped_retype_r(
+        CAP_INIT_UNTYPED,
+        OBJ_CNODE,
+        WIN32K_CLIENT_CAP_BANK_RADIX,
+        1,
+        raw,
+    ) != 0
+    {
+        recycle_deleted_root_slot(raw);
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(cnode) = try_alloc_slot() else {
+        let _ = cnode_delete_recycle_r(raw);
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let mint = cnode_mint_r(
+        CAP_INIT_THREAD_CNODE,
+        cnode,
+        raw,
+        WIN32K_CLIENT_CAP_BANK_GUARD_BADGE,
+    );
+    if mint != 0 {
+        recycle_deleted_root_slot(cnode);
+        let _ = cnode_delete_recycle_r(raw);
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    WIN32K_CLIENT_CAP_BANK_RAW[bank_index].store(raw, Ordering::Relaxed);
+    WIN32K_CLIENT_CAP_BANK_CNODE[bank_index].store(cnode, Ordering::Relaxed);
+    Some(cnode)
+}
+
 unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
     if pi >= MAX_PI || root_cap == 0 {
         WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    let slot = WIN32K_CLIENT_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
+    if slot >= WIN32K_CLIENT_CAP_BANK_SLOTS {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let segment = (slot / WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS) as usize;
+    let segment_slot = slot % WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS;
+    let Some(cnode) = win32k_client_cap_bank_ensure(pi, segment) else {
+        return false;
+    };
+    let label = cnode_move_root_to_cnode_r(cnode, segment_slot, root_cap);
+    if label != 0 {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    recycle_deleted_root_slot(root_cap);
+    WIN32K_CLIENT_CAP_BANK_NEXT[pi].store(slot + 1, Ordering::Relaxed);
+    WIN32K_CLIENT_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
     WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].fetch_add(1, Ordering::Relaxed);
-    WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    note_high_water(&WIN32K_CLIENT_CAP_BANK_LIVE_HW, live);
     true
 }
 
 pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
     let mut processes = 0u64;
+    let mut banks = 0u64;
+    let mut next = 0u64;
     for pi in 0..MAX_PI {
         if WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed) != 0 {
             processes += 1;
         }
+        for segment in 0..WIN32K_CLIENT_CAP_BANK_SEGMENTS_PER_PI {
+            let bank_index = win32k_client_cap_bank_segment_index(pi, segment);
+            if WIN32K_CLIENT_CAP_BANK_CNODE[bank_index].load(Ordering::Relaxed) != 0 {
+                banks += 1;
+            }
+        }
+        next += WIN32K_CLIENT_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
     }
     let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed);
     (
         live,
-        live,
+        next,
         processes,
-        0,
+        banks,
         WIN32K_CLIENT_CAP_BANK_FAILS.load(Ordering::Relaxed),
     )
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Win32kClientCapBankReclaimStats {
+    pub caps: u64,
+    pub failures: u64,
+}
+
+pub(crate) unsafe fn release_win32k_client_cap_bank(
+    pi: usize,
+) -> Win32kClientCapBankReclaimStats {
+    if pi >= MAX_PI {
+        return Win32kClientCapBankReclaimStats::default();
+    }
+    if pi < 64 {
+        let bit = !(1u64 << pi);
+        WIN32K_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
+        WIN32K_POOL_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
+        GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
+        GDI_USERVM_MAPPED.fetch_and(bit, Ordering::Relaxed);
+    }
+
+    let next = WIN32K_CLIENT_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
+    let live = WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed);
+    if next == 0 {
+        if live != 0 {
+            WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+            WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].store(0, Ordering::Relaxed);
+            WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_sub(live, Ordering::Relaxed);
+        }
+        return Win32kClientCapBankReclaimStats::default();
+    }
+
+    let mut released = 0u64;
+    let mut failures = 0u64;
+    for slot in 0..next {
+        let segment = (slot / WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS) as usize;
+        let segment_slot = slot % WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS;
+        let bank_index = win32k_client_cap_bank_segment_index(pi, segment);
+        let cnode = WIN32K_CLIENT_CAP_BANK_CNODE[bank_index].load(Ordering::Relaxed);
+        if cnode == 0 {
+            failures = failures.saturating_add(1);
+            if failures <= 4 {
+                print_str(b"[w32-bank-release] missing segment pi=");
+                print_u64(pi as u64);
+                print_str(b" segment=");
+                print_u64(segment as u64);
+                print_str(b" slot=0x");
+                print_hex(segment_slot as u32);
+                print_str(b"\n");
+            }
+            continue;
+        }
+        let label = cnode_delete_in_cnode_r(cnode, segment_slot);
+        if label == 0 {
+            released = released.saturating_add(1);
+        } else {
+            failures = failures.saturating_add(1);
+            if failures <= 4 {
+                print_str(b"[w32-bank-release] failed pi=");
+                print_u64(pi as u64);
+                print_str(b" segment=");
+                print_u64(segment as u64);
+                print_str(b" slot=0x");
+                print_hex(segment_slot as u32);
+                print_str(b" label=");
+                print_u64(label);
+                print_str(b"\n");
+            }
+        }
+    }
+
+    let accounted = released.min(live);
+    if accounted != 0 {
+        WIN32K_CLIENT_CAP_BANK_RELEASES.fetch_add(accounted, Ordering::Relaxed);
+        WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_sub(accounted, Ordering::Relaxed);
+    }
+    if failures == 0 {
+        WIN32K_CLIENT_CAP_BANK_NEXT[pi].store(0, Ordering::Relaxed);
+        WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].store(0, Ordering::Relaxed);
+    } else {
+        WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi]
+            .store(live.saturating_sub(accounted), Ordering::Relaxed);
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(failures, Ordering::Relaxed);
+    }
+    if released != 0 || failures != 0 {
+        print_str(b"[w32-bank-release] pi=");
+        print_u64(pi as u64);
+        print_str(b" caps=");
+        print_u64(released);
+        print_str(b" failures=");
+        print_u64(failures);
+        print_str(b" next=");
+        print_u64(next);
+        print_str(b" total-released=");
+        print_u64(WIN32K_CLIENT_CAP_BANK_RELEASES.load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+    Win32kClientCapBankReclaimStats {
+        caps: released,
+        failures,
+    }
 }
 
 /// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi,
@@ -3436,16 +3699,17 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usiz
     }
     const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER; // read-only, non-executable
                                                // The 1 GiB PD covering 0x8000_0000..0xC000_0000 already exists in the client; the table window is
-                                               // fresh, so allocate + map one PT per 2 MiB sub-range up front (page_map is fire-and-forget).
+                                               // fresh, so allocate + map one PT per 2 MiB sub-range up front.
     for p in 0..(frames + 511) / 512 {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            win32k_subsystem::GDI_SHARED_TABLE_VA + p * 0x20_0000,
+        if !win32k_client_cap_bank_map_page_table(
             pml4,
-        );
+            pi,
+            win32k_subsystem::GDI_SHARED_TABLE_VA + p * 0x20_0000,
+            b"live GDI handle table",
+            p,
+        ) {
+            return 0;
+        }
     }
     for i in 0..frames {
         let (cp, copy_error) = copy_cap_r(heap_frames + source_offset + i);
@@ -3511,23 +3775,55 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
         return true;
     }
     for page_table in 0..(win32k_subsystem::WIN32K_USERVM_FRAMES + 511) / 512 {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            win32k_subsystem::WIN32K_USERVM_VADDR + page_table * 0x20_0000,
+        if !win32k_client_cap_bank_map_page_table(
             pml4,
-        );
+            pi,
+            win32k_subsystem::WIN32K_USERVM_VADDR + page_table * 0x20_0000,
+            b"live GDI user attributes",
+            page_table,
+        ) {
+            return false;
+        }
     }
     for frame in 0..win32k_subsystem::WIN32K_USERVM_FRAMES {
-        let cp = copy_cap(base + frame);
-        let _ = page_map(
+        let (cp, copy_error) = copy_cap_r(base + frame);
+        if copy_error != 0 {
+            print_str(b"[win32k-svc] failed to copy live GDI user attributes frame for pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(frame as u32);
+            print_str(b" error=");
+            print_u64(copy_error);
+            print_str(b"\n");
+            return false;
+        }
+        let map_error = page_map_r(
             cp,
             win32k_subsystem::WIN32K_USERVM_VADDR + frame * 0x1000,
             RW_NX,
             pml4,
         );
+        if map_error != 0 {
+            print_str(b"[win32k-svc] failed to map live GDI user attributes into pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(frame as u32);
+            print_str(b" error=");
+            print_u64(map_error);
+            print_str(b"\n");
+            let _ = cnode_delete_recycle_r(cp);
+            return false;
+        }
+        if !win32k_client_cap_bank_store(pi, cp) {
+            print_str(b"[win32k-svc] failed to retain live GDI user attributes mapping cap for pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(frame as u32);
+            print_str(b"\n");
+            let _ = page_unmap_r(cp);
+            let _ = cnode_delete_recycle_r(cp);
+            return false;
+        }
     }
     GDI_USERVM_MAPPED.fetch_or(bit, Ordering::Relaxed);
     print_str(b"[win32k-svc] RW-mapped live GDI user attributes into pi 0x");

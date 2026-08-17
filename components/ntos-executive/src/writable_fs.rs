@@ -339,6 +339,7 @@ pub(crate) static WRITABLE_FS_SNAPSHOT_COMMITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_COMMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WRITABLE_FS_SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WRITABLE_FS_SNAPSHOT_WRITE_SECTORS: AtomicU64 = AtomicU64::new(0);
 
 /// Statistics — every one of these is a REAL operation that went through the `Zw*` surface.
 pub(crate) static OVERLAY_CREATES: AtomicU64 = AtomicU64::new(0);
@@ -497,6 +498,16 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
         let absolute = self.absolute_lba(lba)?;
         let tfd = unsafe { crate::fs_loader::fat_write_sector(&self.fat, absolute, data) };
         if tfd & 0x89 == 0 {
+            let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 2048 == 0 {
+                print_str(b"[writable-fs-snapshot] write-sector #");
+                print_u64(n.saturating_add(1));
+                print_str(b" rel-lba=");
+                print_u64(lba);
+                print_str(b" abs-lba=");
+                print_u64(absolute as u64);
+                print_str(b"\n");
+            }
             Ok(())
         } else {
             Err(nt_fs::SnapshotBlockStoreError::Io)
@@ -606,6 +617,13 @@ unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
         return Err(0xC000_0001);
     };
     let store = nt_fs::SnapshotBlockStore::new(0, dev.sectors as u64);
+    print_str(b"[writable-fs-snapshot] dirty commit begin nodes=");
+    print_u64(fs.node_count() as u64);
+    print_str(b" reserve-sectors=");
+    print_u64(dev.sectors as u64);
+    print_str(b" written-sectors=");
+    print_u64(WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.load(Ordering::Relaxed));
+    print_str(b"\n");
     match fs.commit_volume_snapshot(&store, &mut dev) {
         Ok((generation, bytes)) => Ok((generation, bytes)),
         Err(err) => {

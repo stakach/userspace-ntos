@@ -7547,27 +7547,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     any hosted private stack. Validation: `cargo test -p nt-address-space guard`, `cargo test -p
     nt-address-space`, `./components/ntos-executive/build.sh`, and serialized desktop proof
     `.tmp/run-desktop-guard-page-20260817-full.log`.
-  - `[~]` Current frontier: the guard-page proof reaches authenticated logon, real profile copy,
-    `NtLoadKey`, `WlxActivateUserShell`, and a genuine `CreateProcessAsUserW(userinit.exe)`.
-    `userinit.exe` is parked during `NtUserProcessConnect` after `[retype: cnode pool exhausted]`;
-    the same gate shows root CSpace slots and untyped memory still available, so the active wall is
-    the seL4 model's kernel-side CNode backing for real CapTable objects. A direct
-    extern-rootserver `MAX_CNODES=64` experiment is rejected: it made `sys/core` too large and
-    `./run.sh --desktop` failed immediately with `BOOTBOOT-PANIC: Kernel is too big (EFI Load
-    Error)`. The corrected path keeps extern-rootserver `MAX_CNODES=23` and moves the high-volume
-    retained win32k USER/GDI shared-view mapping caps back into the XL root CSpace after successful
-    mapping, preserving scarce kernel CNode backing for image map-cap banks and other real child
-    CapTables. Review adjustment: rebuild rust-micro/executive serially, rerun `./run.sh
-    --desktop`, and require no BOOTBOOT failure, no `[retype: cnode pool exhausted]`,
-    `w32-bank-fails=0`, `image-bank-fails=0`, `exec_userinit_gdi_shared_table_mapped`,
-    `exec_explorer_process_spawned`, and `exec_explorer_shell_chrome_painted` to prove the
-    CNode-capacity fix rather than adding any shell launch fallback.
-  - `[x]` Follow-up capacity recovery result: the serialized desktop retry
-    `.tmp/run-desktop-win32k-root-retain-20260817-full.log` clears the BOOTBOOT-size failure and the
-    kernel CNode backing wall without increasing extern-rootserver `MAX_CNODES`. The run reaches
-    LSASS SRM bring-up with `w32-bank-fails=0`, `image-bank-fails=0`, no
-    `[retype: cnode pool exhausted]`, and root CSpace headroom still available. The root-retained
-    win32k USER/GDI shared-view cap model is therefore the accepted capacity direction.
+  - `[x]` Superseded capacity diagnosis: the guard-page proof reached authenticated logon, real
+    profile copy, `NtLoadKey`, `WlxActivateUserShell`, and a genuine
+    `CreateProcessAsUserW(userinit.exe)`, then parked during `NtUserProcessConnect` after
+    `[retype: cnode pool exhausted]`. A direct extern-rootserver `MAX_CNODES=64` experiment remains
+    rejected because it made `sys/core` too large and `./run.sh --desktop` failed immediately with
+    `BOOTBOOT-PANIC: Kernel is too big (EFI Load Error)`.
+  - `[x]` Follow-up capacity recovery result: the first root-retained retry
+    `.tmp/run-desktop-win32k-root-retain-20260817-full.log` cleared the BOOTBOOT-size failure and
+    the kernel CNode backing wall without increasing extern-rootserver `MAX_CNODES`, but it was not
+    the final shape. The accepted direction is now a segmented per-process win32k client cap bank:
+    USER heap, win32k pool, GDI shared handle table, GDI user-attribute frame, and required page-table
+    mapping caps are moved out of the root CSpace into lazily allocated radix-12 child-CNode
+    segments and released during final process VM teardown. A failed single radix-13 CNode attempt
+    proved the child-CNode backing is 4096 slots per CNode (`offset 4096 >= storage 4096`), so the
+    final bank uses multiple radix-12 segments per process. The serialized retry
+    `.tmp/run-desktop-w32-cap-bank-segmented-20260817-full.log` reaches CSRSS, winlogon,
+    services.exe, LSASS win32k connects, natural desktop-background paint, and LSASS SRM bring-up
+    with `w32-bank=22076/22076/4/8`, `w32-bank-fails=0`, `image-bank-fails=0`, no
+    `[retype: cnode pool exhausted]`, and root CSpace headroom (`slot-free=67149`).
   - `[x]` Follow-up LSASS readiness result: the serialized desktop traces
     `.tmp/run-desktop-lsass-csr-tail-20260817-full.log` and
     `.tmp/run-desktop-delay-rearm-20260817-full.log` move past the old CSR/thread frontier. LSASS
@@ -7633,7 +7631,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `cr2=0x3` stub-ret fault follows. The same run continues into real post-LSA winlogon work,
     including repeated USER/GDI paint/cursor calls, `msgina`, `shsvcs`, and `uxtheme` demand loads,
     and 611 user-callback push/unwind pairs with no callback sequence leak.
-  - `[~]` Current frontier after the TCB-restage repair: the desktop run advances far past the old
+  - `[x]` Follow-up frontier after the TCB-restage repair: the desktop run advanced far past the old
     `SetWindowStationUser` corruption, but the interrupted quiesce gate does not yet reach the final
     sentinel or explorer launch. Census at quiesce has no resource wall (`ut-fails=0`,
     `image-bank-fails=0`, `w32-bank-fails=0`, `shared-full=0`), winlogon at 1148 syscalls, LSASS at
@@ -7643,3 +7641,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     make the quiesce gate finish reliably after hive checkpointing, then continue the real winlogon
     GINA/logon path until `WlxActivateUserShell`, profile hive load, genuine userinit launch, and
     explorer chrome pixels reappear.
+  - `[~]` Current frontier after segmented win32k client cap banking: the desktop run is no longer
+    stopped by BOOTBOOT size, root CSpace pressure, kernel CNode backing, or the raw user32 syscall
+    context bug. The latest serialized trace reaches genuine background pixels, services.exe,
+    LSASS, `\SeLsaCommandPort` creation, `\SeRmCommandPort` acceptance/completion, and the reverse
+    kernel SRM connection. The LSASS `LsapRmServerThread` then accepts/completes the reverse
+    connection and parks on `NtReplyWaitReceivePort` for the accepted command port, which matches
+    ReactOS' idle SRM server loop. The active blocker is the LSASS main/runtime path after that
+    point: it remains the last running top-level owner and does not reach the normal
+    `LsarStartRpcServer`/`RpcServerListen`/`lsa_rpc_server_active` readiness path in this proof.
+    Continue by identifying the exact late LSASS loader/syscall/RPC gap from the real main-thread
+    execution state; do not synthesize the readiness event and do not launch userinit/explorer by
+    hand.

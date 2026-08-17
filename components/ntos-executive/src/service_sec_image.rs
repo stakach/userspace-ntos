@@ -8694,6 +8694,10 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(vm_reclaim.registered_frames);
                         print_str(b" shared-maps=");
                         print_u64(vm_reclaim.shared_image_maps);
+                        print_str(b" w32-caps=");
+                        print_u64(vm_reclaim.win32k_client_caps);
+                        print_str(b"/");
+                        print_u64(vm_reclaim.win32k_client_cap_failures);
                         print_str(b" dll-cache-evict=");
                         print_u64(vm_reclaim.dll_cache_evictions);
                         print_str(b" dll-views=");

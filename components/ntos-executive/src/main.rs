@@ -14687,13 +14687,18 @@ struct ProcessVmReclaimStats {
     generic_writeback_failures: u64,
     dll_views: u64,
     shared_image_maps: u64,
+    win32k_client_caps: u64,
+    win32k_client_cap_failures: u64,
     dll_cache_evictions: u64,
     registered_frames: u64,
     private_pts: u64,
     private_pt_failures: u64,
 }
 
-unsafe fn reclaim_final_process_vm(process_index: u8, handler: &mut ExecNtHandler) -> ProcessVmReclaimStats {
+unsafe fn reclaim_final_process_vm(
+    process_index: u8,
+    handler: &mut ExecNtHandler,
+) -> ProcessVmReclaimStats {
     let pi = process_index as usize;
     if pi >= MAX_PI {
         return ProcessVmReclaimStats::default();
@@ -14748,6 +14753,9 @@ unsafe fn reclaim_final_process_vm(process_index: u8, handler: &mut ExecNtHandle
     }
 
     stats.shared_image_maps = shared_image_mapping_unmap_process(pi as u64);
+    let win32k_reclaim = win32k_glue::release_win32k_client_cap_bank(pi);
+    stats.win32k_client_caps = win32k_reclaim.caps;
+    stats.win32k_client_cap_failures = win32k_reclaim.failures;
     stats.dll_cache_evictions = dll_cache_evict_unreferenced_all();
     stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
     process_committed_mapping_reset(pi);
