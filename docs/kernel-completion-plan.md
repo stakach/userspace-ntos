@@ -7191,3 +7191,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
   Validation for the provider reverse-callback thunk primitive: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, and `git diff --check`.
+
+  B3 hosted executable thunk arena cleanup (2026-08-17, in progress): the executive image planner no
+  longer treats the hosted thunk page as provider-import-only state. The old provider thunk table
+  fields and writer have been renamed to a generic executable thunk arena/writer, and the planner now
+  allocates the executable page either when a dependent binds callable provider imports or when the
+  primary image is itself a hosted `.sys` provider singleton that may receive copied callback tables.
+  This gives provider components such as `ndis.sys` a real executable slot arena for reverse
+  miniport/protocol callback thunks without mapping dependent image frames into the provider VSpace or
+  placing executable code in provider data scratch.
+  Review adjustment: next B3 work should allocate callback-cookie records from this arena while
+  marshalling `NDIS_MINIPORT_CHARACTERISTICS`, rewrite nonzero callback entries to generated reverse
+  thunks, and add the provider-callback service label/gate that dispatches the original callback in
+  the dependent component.
+
+  Validation for the hosted executable thunk arena cleanup: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.

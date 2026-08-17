@@ -11626,9 +11626,8 @@ const HOSTED_DEP_PATH_MAX: usize = 96;
 const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = b"reactos\\system32\\drivers\\";
 const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
-const HOSTED_PROVIDER_IMPORT_THUNK_FRAMES: u64 = 1;
-const HOSTED_PROVIDER_IMPORT_THUNK_TABLE_LEN: u64 =
-    HOSTED_PROVIDER_IMPORT_THUNK_FRAMES * 0x1000;
+const HOSTED_EXECUTABLE_THUNK_FRAMES: u64 = 1;
+const HOSTED_EXECUTABLE_THUNK_TABLE_LEN: u64 = HOSTED_EXECUTABLE_THUNK_FRAMES * 0x1000;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -11672,14 +11671,14 @@ trait DriverImportResolver {
     fn resolve_import(&mut self, request: DriverImportRequest<'_>) -> Option<DriverImportResolution>;
 }
 
-struct HostedProviderImportThunkWriter {
+struct HostedExecutableThunkWriter {
     exec_va: u64,
     run_va: u64,
     len: u64,
     next: u64,
 }
 
-impl HostedProviderImportThunkWriter {
+impl HostedExecutableThunkWriter {
     fn new(exec_va: u64, run_va: u64, len: u64) -> Self {
         Self {
             exec_va,
@@ -11689,7 +11688,7 @@ impl HostedProviderImportThunkWriter {
         }
     }
 
-    unsafe fn emit(
+    unsafe fn emit_provider_import(
         &mut self,
         plan: HostedProviderExportCallPlan,
     ) -> Result<HostedProviderImportThunkPlan, HostedProviderImportThunkError> {
@@ -11814,8 +11813,8 @@ struct PlannedHostedImages {
     dependencies: Vec<PlannedDependencyImage>,
     primary_offset: u64,
     private_dependency_offset: u64,
-    provider_thunk_offset: u64,
-    provider_thunk_frames: u64,
+    executable_thunk_offset: u64,
+    executable_thunk_frames: u64,
     total_frames: u64,
 }
 
@@ -13784,7 +13783,7 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
 }
 
 struct HostedProviderImportResolver<'a> {
-    thunks: Option<&'a mut HostedProviderImportThunkWriter>,
+    thunks: Option<&'a mut HostedExecutableThunkWriter>,
 }
 
 impl DriverImportResolver for HostedProviderImportResolver<'_> {
@@ -13799,7 +13798,7 @@ impl DriverImportResolver for HostedProviderImportResolver<'_> {
                         log_provider_domain_export_thunk_missing(request.dll, request.name, plan);
                         return None;
                     };
-                    match writer.emit(plan) {
+                    match writer.emit_provider_import(plan) {
                         Ok(thunk) => return Some(DriverImportResolution::ProviderThunk(thunk)),
                         Err(error) => {
                             print_str(b"[driver-import] provider-domain thunk refused ");
@@ -15495,6 +15494,7 @@ unsafe fn plan_hosted_images(
     fs: &Fat32,
     primary_src_va: u64,
     primary_src_size: u32,
+    primary_is_provider: bool,
 ) -> Option<PlannedHostedImages> {
     clear_hosted_dependency_images();
 
@@ -15554,24 +15554,24 @@ unsafe fn plan_hosted_images(
         return None;
     }
 
-    let provider_thunk_frames = if provider_domains.is_empty() {
-        0
+    let executable_thunk_frames = if primary_is_provider || !provider_domains.is_empty() {
+        HOSTED_EXECUTABLE_THUNK_FRAMES
     } else {
-        HOSTED_PROVIDER_IMPORT_THUNK_FRAMES
+        0
     };
-    let provider_thunk_offset = if provider_thunk_frames == 0 {
+    let executable_thunk_offset = if executable_thunk_frames == 0 {
         0
     } else {
         align_up_4k(layout.total_image_len)?
     };
-    let total_frames = if provider_thunk_frames == 0 {
+    let total_frames = if executable_thunk_frames == 0 {
         layout.total_frames
     } else {
-        let required = provider_thunk_offset
-            .checked_add(provider_thunk_frames.checked_mul(0x1000)?)?
+        let required = executable_thunk_offset
+            .checked_add(executable_thunk_frames.checked_mul(0x1000)?)?
             / 0x1000;
         if required > FSD_IMAGE_MAX_FRAMES {
-            print_str(b"[driver-launch] provider thunk table exceeds image capacity\n");
+            print_str(b"[driver-launch] hosted executable thunk table exceeds image capacity\n");
             return None;
         }
         layout.total_frames.max(required)
@@ -15581,8 +15581,8 @@ unsafe fn plan_hosted_images(
         dependencies,
         primary_offset: layout.primary_offset,
         private_dependency_offset: layout.private_dependency_offset,
-        provider_thunk_offset,
-        provider_thunk_frames,
+        executable_thunk_offset,
+        executable_thunk_frames,
         total_frames,
     })
 }
@@ -16101,7 +16101,7 @@ unsafe fn load_hosted_dependency_images(
     shared_va: u64,
     img_frames: u64,
     rights: &mut [u64],
-    mut provider_thunks: Option<&mut HostedProviderImportThunkWriter>,
+    mut executable_thunks: Option<&mut HostedExecutableThunkWriter>,
 ) -> Option<LoadedSupportImages> {
     clear_support_image_records(shared_va);
 
@@ -16149,7 +16149,7 @@ unsafe fn load_hosted_dependency_images(
         let dep_exec_va = code_va + dep_offset;
         let dep_run_va = run_va + dep_offset;
         let mut resolver = HostedProviderImportResolver {
-            thunks: provider_thunks.as_deref_mut(),
+            thunks: executable_thunks.as_deref_mut(),
         };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
@@ -16260,7 +16260,8 @@ unsafe fn load_driver_reserved(
     print_u64(instance as u64);
     print_str(b"\n");
 
-    let planned_images = plan_hosted_images(fs, src_va, src_size)?;
+    let primary_is_provider = hosted_provider_leaf_from_path(path).is_some();
+    let planned_images = plan_hosted_images(fs, src_va, src_size, primary_is_provider)?;
 
     // The image RUNS at the fixed component VA (FSD_CODE_VA) in its own VSpace; the executive loads
     // its bytes at the per-instance window (win.code_va) so two instances don't collide executive-side.
@@ -16306,30 +16307,30 @@ unsafe fn load_driver_reserved(
         map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
         i += 1;
     }
-    if planned_images.provider_thunk_frames != 0 {
-        if planned_images.provider_thunk_offset & 0xfff != 0
-            || planned_images.provider_thunk_frames != HOSTED_PROVIDER_IMPORT_THUNK_FRAMES
+    if planned_images.executable_thunk_frames != 0 {
+        if planned_images.executable_thunk_offset & 0xfff != 0
+            || planned_images.executable_thunk_frames != HOSTED_EXECUTABLE_THUNK_FRAMES
         {
-            print_str(b"[driver-launch] provider thunk table layout invalid\n");
+            print_str(b"[driver-launch] hosted executable thunk table layout invalid\n");
             return None;
         }
-        let thunk_frame = planned_images.provider_thunk_offset / 0x1000;
+        let thunk_frame = planned_images.executable_thunk_offset / 0x1000;
         if thunk_frame
-            .checked_add(planned_images.provider_thunk_frames)
+            .checked_add(planned_images.executable_thunk_frames)
             .filter(|end| *end <= img_frames)
             .is_none()
         {
-            print_str(b"[driver-launch] provider thunk table outside image window\n");
+            print_str(b"[driver-launch] hosted executable thunk table outside image window\n");
             return None;
         }
         let mut frame = 0u64;
-        while frame < planned_images.provider_thunk_frames {
+        while frame < planned_images.executable_thunk_frames {
             rights_vec[(thunk_frame + frame) as usize] = 2;
             frame += 1;
         }
         zero(
-            code_va + planned_images.provider_thunk_offset,
-            planned_images.provider_thunk_frames * 0x1000,
+            code_va + planned_images.executable_thunk_offset,
+            planned_images.executable_thunk_frames * 0x1000,
         );
     }
     let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
@@ -16377,13 +16378,13 @@ unsafe fn load_driver_reserved(
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
-    let mut provider_thunk_writer = if planned_images.provider_thunk_frames == 0 {
+    let mut executable_thunk_writer = if planned_images.executable_thunk_frames == 0 {
         None
     } else {
-        Some(HostedProviderImportThunkWriter::new(
-            code_va + planned_images.provider_thunk_offset,
-            run_va + planned_images.provider_thunk_offset,
-            HOSTED_PROVIDER_IMPORT_THUNK_TABLE_LEN,
+        Some(HostedExecutableThunkWriter::new(
+            code_va + planned_images.executable_thunk_offset,
+            run_va + planned_images.executable_thunk_offset,
+            HOSTED_EXECUTABLE_THUNK_TABLE_LEN,
         ))
     };
     let support_images = load_hosted_dependency_images(
@@ -16394,7 +16395,7 @@ unsafe fn load_driver_reserved(
         win.shared_va,
         img_frames,
         rights,
-        provider_thunk_writer.as_mut(),
+        executable_thunk_writer.as_mut(),
     )?;
     if planned_images.primary_offset & 0xfff != 0 {
         return None;
@@ -16411,7 +16412,7 @@ unsafe fn load_driver_reserved(
     let primary_frames = img_frames - primary_frame_offset;
     let primary_rights = &mut rights[primary_frame_offset as usize..];
     let mut resolver = HostedProviderImportResolver {
-        thunks: provider_thunk_writer.as_mut(),
+        thunks: executable_thunk_writer.as_mut(),
     };
     let (entry_rva, image_len) = load_pe_into(
         src_va,
