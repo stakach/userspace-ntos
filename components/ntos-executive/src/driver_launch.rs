@@ -33,14 +33,15 @@ use nt_dma_manager::{
 };
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_import_thunk,
-    hosted_provider_export_marshal_policy, plan_hosted_driver_image,
+    hosted_provider_export_marshal_policy, ndis_miniport_characteristics_layout,
+    plan_hosted_driver_image,
     plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
     HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderDomainDescriptor,
     HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderExportCallPlan,
     HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
     HostedProviderImportBindingError, HostedProviderImportThunkError,
-    HostedProviderImportThunkPlan, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
+    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -12369,6 +12370,62 @@ unsafe fn provider_marshal_unicode_string(
     Ok(provider_desc_va)
 }
 
+unsafe fn provider_marshal_miniport_characteristics(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    supplied_len: u64,
+) -> Result<u64, i32> {
+    let Some(header_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let major = read_unaligned(header_exec as *const u8);
+    let minor = read_unaligned((header_exec + 1) as *const u8);
+    let layout = match ndis_miniport_characteristics_layout(major, minor, supplied_len) {
+        Ok(layout) => layout,
+        Err(NdisMiniportCharacteristicsLayoutError::BadVersion) => {
+            return Err(STATUS_INVALID_PARAMETER)
+        }
+        Err(NdisMiniportCharacteristicsLayoutError::BufferTooSmall) => {
+            return Err(STATUS_INVALID_PARAMETER)
+        }
+    };
+    if layout.required_len > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        layout.required_len,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+
+    let mut callback_index = 0usize;
+    while callback_index < layout.callback_count as usize {
+        let Some(offset) = layout.callback_offset(callback_index) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if read_unaligned((dependent_exec_va + offset) as *const u64) != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        callback_index += 1;
+    }
+
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, layout.required_len)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    copy_bytes(provider_exec_va, dependent_exec_va, layout.required_len);
+    Ok(provider_component_va)
+}
+
 unsafe fn prepare_provider_export_marshal(
     policy: HostedProviderExportMarshalPolicy,
     dependent_index: usize,
@@ -12422,6 +12479,20 @@ unsafe fn prepare_provider_export_marshal(
                 provider_shared,
                 arg,
             )?,
+            HostedProviderArgumentMarshal::CallerInMiniportCharacteristics { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_miniport_characteristics(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
             _ => return Err(STATUS_NOT_SUPPORTED),
         };
         index += 1;

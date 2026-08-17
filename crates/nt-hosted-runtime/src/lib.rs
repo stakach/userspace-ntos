@@ -11,6 +11,13 @@ pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 33;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 64;
 pub const HOSTED_PROVIDER_EXPORT_ARG_CAP: usize = 12;
+pub const NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP: usize = 25;
+pub const NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_BASE_X64: u64 = 0x08;
+pub const NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_STRIDE_X64: u64 = 0x08;
+pub const NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x70;
+pub const NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x88;
+pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
+pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
@@ -232,6 +239,65 @@ pub struct HostedProviderExportMarshalPolicy {
     pub argument_count: u8,
     pub stack_qwords: u8,
     pub args: [HostedProviderArgumentMarshal; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdisMiniportCharacteristicsLayout {
+    pub required_len: u64,
+    pub callback_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NdisMiniportCharacteristicsLayoutError {
+    BadVersion,
+    BufferTooSmall,
+}
+
+impl NdisMiniportCharacteristicsLayout {
+    pub const fn callback_offset(self, index: usize) -> Option<u64> {
+        if index >= self.callback_count as usize {
+            return None;
+        }
+        let Some(offset) =
+            (index as u64).checked_mul(NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_STRIDE_X64)
+        else {
+            return None;
+        };
+        NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_BASE_X64.checked_add(offset)
+    }
+}
+
+pub fn ndis_miniport_characteristics_layout(
+    major: u8,
+    minor: u8,
+    supplied_len: u64,
+) -> Result<NdisMiniportCharacteristicsLayout, NdisMiniportCharacteristicsLayoutError> {
+    let layout = match major {
+        0x03 => NdisMiniportCharacteristicsLayout {
+            required_len: NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64,
+            callback_count: 13,
+        },
+        0x04 => NdisMiniportCharacteristicsLayout {
+            required_len: NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64,
+            callback_count: 16,
+        },
+        0x05 => match minor {
+            0x00 => NdisMiniportCharacteristicsLayout {
+                required_len: NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64,
+                callback_count: 22,
+            },
+            0x01 => NdisMiniportCharacteristicsLayout {
+                required_len: NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64,
+                callback_count: 25,
+            },
+            _ => return Err(NdisMiniportCharacteristicsLayoutError::BadVersion),
+        },
+        _ => return Err(NdisMiniportCharacteristicsLayoutError::BadVersion),
+    };
+    if supplied_len < layout.required_len {
+        return Err(NdisMiniportCharacteristicsLayoutError::BufferTooSmall);
+    }
+    Ok(layout)
 }
 
 fn ascii_eq_ignore_case(a: &str, b: &str) -> bool {
@@ -893,6 +959,63 @@ mod tests {
         );
         assert!(hosted_provider_export_marshal_policy("ndis.sys", "NdisMissing").is_none());
         assert!(hosted_provider_export_marshal_policy("tcpip.sys", "NdisOpenAdapter").is_none());
+    }
+
+    #[test]
+    fn ndis_miniport_characteristics_layout_follows_nt5_versions() {
+        assert_eq!(
+            ndis_miniport_characteristics_layout(3, 0, NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64),
+            Ok(NdisMiniportCharacteristicsLayout {
+                required_len: NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64,
+                callback_count: 13,
+            })
+        );
+        assert_eq!(
+            ndis_miniport_characteristics_layout(4, 0, NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64),
+            Ok(NdisMiniportCharacteristicsLayout {
+                required_len: NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64,
+                callback_count: 16,
+            })
+        );
+        assert_eq!(
+            ndis_miniport_characteristics_layout(5, 0, NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64)
+                .unwrap()
+                .callback_count,
+            22
+        );
+        assert_eq!(
+            ndis_miniport_characteristics_layout(5, 1, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64)
+                .unwrap()
+                .callback_count,
+            NDIS_MINIPORT_CHARACTERISTICS_CALLBACK_CAP as u8
+        );
+    }
+
+    #[test]
+    fn ndis_miniport_characteristics_callback_offsets_are_pointer_slots() {
+        let layout =
+            ndis_miniport_characteristics_layout(5, 1, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64)
+                .unwrap();
+        assert_eq!(layout.callback_offset(0), Some(0x08));
+        assert_eq!(layout.callback_offset(15), Some(0x80));
+        assert_eq!(layout.callback_offset(24), Some(0xc8));
+        assert_eq!(layout.callback_offset(25), None);
+    }
+
+    #[test]
+    fn ndis_miniport_characteristics_layout_rejects_bad_headers() {
+        assert_eq!(
+            ndis_miniport_characteristics_layout(5, 1, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64 - 1),
+            Err(NdisMiniportCharacteristicsLayoutError::BufferTooSmall)
+        );
+        assert_eq!(
+            ndis_miniport_characteristics_layout(5, 2, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64),
+            Err(NdisMiniportCharacteristicsLayoutError::BadVersion)
+        );
+        assert_eq!(
+            ndis_miniport_characteristics_layout(6, 0, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64),
+            Err(NdisMiniportCharacteristicsLayoutError::BadVersion)
+        );
     }
 
     #[test]

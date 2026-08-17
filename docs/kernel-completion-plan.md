@@ -7156,3 +7156,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the provider export marshal-executor foundation: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 NDIS miniport characteristics layout slice (2026-08-17, in progress): `nt-hosted-runtime`
+  now owns the NT5 x64 `NDIS_MINIPORT_CHARACTERISTICS` layout contract used by
+  `NdisMRegisterMiniport`, including the version-derived minimum copy sizes for NDIS 3.0/4.0/5.0/5.1
+  and the exact callback pointer slots that need provider-visible reverse thunks. The executive
+  marshaller now uses that checked contract for `CallerInMiniportCharacteristics`: it validates the
+  dependent's version header and supplied length, translates the dependent buffer through the normal
+  component-address lanes, copies the provider-visible structure into bounded provider scratch, and
+  rejects nonzero callback pointers with `STATUS_NOT_SUPPORTED` until the reverse-thunk gate exists.
+  This keeps `NdisInitializeWrapper`/`NdisMSetAttributesEx` on the real marshal path while preventing
+  `NdisMRegisterMiniport` from silently copying dependent code pointers into the NDIS provider
+  VSpace.
+  Review adjustment: the next B3 slice should allocate/provider-map reverse callback thunks for the
+  nonzero miniport entries, record the dependent instance and original function target per thunk, and
+  add the provider-to-dependent callback service that executes those callbacks in the owning
+  miniport component.
+
+  Validation for the NDIS miniport characteristics layout slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.
