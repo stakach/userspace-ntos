@@ -60,7 +60,7 @@ are closed. The remaining B3 packet frontier is real NDIS receive indication aft
 bind/packet-filter setup, TX traffic from the real scatter/gather send route, and repeated-device
 scaling under the same dynamic devnode/resource path. The next loader cleanup is the provider
 identity boundary: ReactOS `ndis.sys` owns global protocol/miniport lists, so TCPIP and E1000 must
-call a shared provider image instead of each loading a private dependency copy.
+call a shared provider runtime domain instead of each loading a private dependency copy.
 
 Current shared-provider prep (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
@@ -83,6 +83,23 @@ from this path. The serialized desktop retest
 passing, Explorer shell chrome painted, generic e1000 descriptor-completion evidence preserved, and
 provider-sharing evidence reporting `private-deps-with-primary=2`, `duplicate-private-deps=2`, and
 `overflow=0`.
+
+Current shared-provider runtime-domain implementation (2026-08-17, in progress): image-only sharing
+was rejected as an unsafe halfway point. ReactOS provider globals can hold pool pointers, and every
+hosted component maps `FSD_POOL_VADDR` in its own VSpace; sharing only `ndis.sys` image/data while
+keeping separate pools would make those global pointers resolve to different physical pool frames in
+TCPIP and E1000. A follow-up direct image+pool sharing experiment also proved insufficient: E1000's
+`START_DEVICE` jumped into an unmapped shared-provider address after NDIS was executed from the
+dependent component's VSpace, because the provider's executable state, DATA/SHARED pages, and
+callback/call context are not represented by image and pool frames alone. The executive now treats
+published provider singletons as reset-safe metadata only unless the provider record exposes a real
+export-call gate. Without that gate, dependents continue to load and initialize honest private
+support images; the kernel does not claim singleton-provider semantics it cannot yet enforce. The
+next B3 mechanism is a provider-domain export transport that enters the provider-owned runtime
+context and marshals NT kernel pointers/IRPs without substituting raw image frames into dependents.
+The serialized desktop proof `.tmp/run-desktop-20260817-104324.log` restores the full
+`298/298` desktop path with `shared-maps=0`, E1000 `START_DEVICE` success, and Explorer shell chrome
+painted.
 
 Latest accepted B3 packet proof (2026-08-17):
 `.tmp/run-desktop-shared-image-stable-chunks-20260817-092332.log` reaches the harness sentinel with
@@ -6926,6 +6943,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `dma_dev_cause/fail=144/0`, and reports provider evidence
   `primary=10 private-deps=2 private-deps-with-primary=2 duplicate-private-deps=2 overflow=0`.
   Review adjustment: the next B3 slice should register successful primary provider images as
-  singleton provider mappings, place dependents after the provider prefix, skip rerunning provider
-  `DriverEntry`, and then re-test NDIS protocol bind/packet-filter evidence before expanding RX/TX
-  packet proofs.
+  singleton provider runtime domains, place dependents after the provider prefix, skip rerunning
+  provider `DriverEntry`, share the provider-domain pool, and then re-test NDIS protocol
+  bind/packet-filter evidence before expanding RX/TX packet proofs.
+
+  B3 shared-provider runtime domain (2026-08-17, in progress): successful root provider primary
+  loads whose image is relocated at a stable component offset and has no private dependency copies
+  can now publish reset-safe singleton metadata: provider leaf, image offset/length/frame caps, W^X
+  rights, and pool frame range. A serialized desktop attempt with direct image+pool substitution was
+  rejected because it broke the real E1000 `START_DEVICE` path: NDIS provider code ran in the
+  dependent component's VSpace and jumped into an unmapped provider-derived address. That result
+  proves the real NT provider boundary requires a callable provider runtime domain, not frame
+  aliasing. The loader now gates substitution on a nonzero provider export-call gate; current
+  singleton records have no gate, so dependents keep real private support images rather than taking a
+  fake success path. Validation after the gate: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive cargo check, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-20260817-104324.log`. The proof reports provider metadata with `singletons=8`,
+  `shared-maps=0`, and `shared-pools=0`; private NDIS support images are still loaded for TCPIP and
+  E1000, E1000 `START_DEVICE` succeeds with the generic DMA/interrupt evidence intact, and Explorer
+  reaches full shell chrome pixels with `298/298` checks passing.

@@ -31,6 +31,7 @@ use nt_compat_exports::DriverExportRegistry;
 use nt_dma_manager::{
     DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
+use nt_hosted_runtime::{plan_provider_prefixed_image, HostedProviderImagePlanError};
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
@@ -11583,6 +11584,33 @@ impl HostedProviderSummary {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HostedProviderSingleton {
+    present: bool,
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    image_offset: u64,
+    image_len: u32,
+    image_frames: u64,
+    pool_base: u64,
+    pool_frames: u64,
+    export_call_gate: u64,
+}
+
+impl HostedProviderSingleton {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider: HostedAscii::empty(),
+            image_offset: 0,
+            image_len: 0,
+            image_frames: 0,
+            pool_base: 0,
+            pool_frames: 0,
+            export_call_gate: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostedProviderSharingEvidence {
     pub primary_services: u64,
@@ -11594,6 +11622,11 @@ pub(crate) struct HostedProviderSharingEvidence {
     pub duplicate_private_dependencies: u64,
     pub unique_primary_provider_matches: u64,
     pub overflowed_load_records: u64,
+    pub singleton_providers: u64,
+    pub shared_provider_mappings: u64,
+    pub shared_provider_pool_mappings: u64,
+    pub singleton_overflows: u64,
+    pub singleton_conflicts: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -11609,10 +11642,25 @@ struct PlannedDependencyImage {
     src_size: u32,
 }
 
+#[derive(Clone, Copy)]
+struct PlannedSharedProviderImage {
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    singleton_index: usize,
+    image_offset: u64,
+    prefix_offset: u64,
+    image_len: u32,
+    image_frames: u64,
+    pool_base: u64,
+    pool_frames: u64,
+}
+
 struct PlannedHostedImages {
+    shared_providers: Vec<PlannedSharedProviderImage>,
     dependencies: Vec<PlannedDependencyImage>,
-    primary_image_len: u64,
-    total_image_len: u64,
+    provider_prefix_len: u64,
+    primary_offset: u64,
+    private_dependency_offset: u64,
+    total_frames: u64,
 }
 
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
@@ -11621,6 +11669,21 @@ static mut HOSTED_PROVIDER_SUMMARIES: [HostedProviderSummary; HOSTED_PROVIDER_SU
     [HostedProviderSummary::empty(); HOSTED_PROVIDER_SUMMARY_CAP];
 static HOSTED_PROVIDER_SUMMARY_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_LOAD_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_SINGLETON_CAP: usize = 16;
+const HOSTED_PROVIDER_SINGLETON_FRAME_CAP: usize = FSD_IMAGE_MAX_FRAMES as usize;
+static mut HOSTED_PROVIDER_SINGLETONS: [HostedProviderSingleton; HOSTED_PROVIDER_SINGLETON_CAP] =
+    [HostedProviderSingleton::empty(); HOSTED_PROVIDER_SINGLETON_CAP];
+static mut HOSTED_PROVIDER_SINGLETON_FRAMES: [[u64; HOSTED_PROVIDER_SINGLETON_FRAME_CAP];
+    HOSTED_PROVIDER_SINGLETON_CAP] =
+    [[0; HOSTED_PROVIDER_SINGLETON_FRAME_CAP]; HOSTED_PROVIDER_SINGLETON_CAP];
+static mut HOSTED_PROVIDER_SINGLETON_RIGHTS: [[u64; HOSTED_PROVIDER_SINGLETON_FRAME_CAP];
+    HOSTED_PROVIDER_SINGLETON_CAP] =
+    [[0; HOSTED_PROVIDER_SINGLETON_FRAME_CAP]; HOSTED_PROVIDER_SINGLETON_CAP];
+static HOSTED_PROVIDER_SINGLETON_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_SHARED_MAPPINGS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_SHARED_POOL_MAPPINGS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_SINGLETON_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_SINGLETON_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -11716,55 +11779,181 @@ unsafe fn record_hosted_provider_load(
     }
 }
 
+unsafe fn hosted_provider_singleton_at(index: usize) -> HostedProviderSingleton {
+    let singletons =
+        core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETONS) as *const HostedProviderSingleton;
+    *singletons.add(index)
+}
+
+unsafe fn find_hosted_provider_singleton(
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+) -> Option<(usize, HostedProviderSingleton)> {
+    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let singleton = hosted_provider_singleton_at(index);
+        if singleton.present && hosted_ascii_eq_ignore_case(&singleton.provider, provider) {
+            return Some((index, singleton));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn hosted_provider_singleton_frame(index: usize, frame_index: usize) -> u64 {
+    let frames = core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETON_FRAMES) as *const u64;
+    *frames.add(index * HOSTED_PROVIDER_SINGLETON_FRAME_CAP + frame_index)
+}
+
+unsafe fn hosted_provider_singleton_right(index: usize, frame_index: usize) -> u64 {
+    let rights = core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETON_RIGHTS) as *const u64;
+    *rights.add(index * HOSTED_PROVIDER_SINGLETON_FRAME_CAP + frame_index)
+}
+
+unsafe fn set_hosted_provider_singleton_frame(index: usize, frame_index: usize, frame: u64) {
+    let frames = core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETON_FRAMES) as *mut u64;
+    *frames.add(index * HOSTED_PROVIDER_SINGLETON_FRAME_CAP + frame_index) = frame;
+}
+
+unsafe fn set_hosted_provider_singleton_right(index: usize, frame_index: usize, right: u64) {
+    let rights = core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETON_RIGHTS) as *mut u64;
+    *rights.add(index * HOSTED_PROVIDER_SINGLETON_FRAME_CAP + frame_index) = right;
+}
+
+unsafe fn register_hosted_provider_singleton(
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    image_offset: u64,
+    image_len: u32,
+    image_frames: u64,
+    image_frame_caps: &[u64],
+    rights: &[u64],
+    pool_base: u64,
+    pool_frames: u64,
+) -> bool {
+    if image_offset & 0xfff != 0
+        || image_frames == 0
+        || image_frames as usize > HOSTED_PROVIDER_SINGLETON_FRAME_CAP
+        || image_frames as usize > image_frame_caps.len()
+        || image_frames as usize > rights.len()
+    {
+        HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[driver-launch] provider singleton image capacity refused ");
+        print_str(provider.as_bytes());
+        print_str(b" frames=");
+        print_u64(image_frames);
+        print_str(b"\n");
+        return false;
+    }
+
+    if let Some((_index, existing)) = find_hosted_provider_singleton(&provider) {
+        if existing.image_offset == image_offset
+            && existing.image_len == image_len
+            && existing.image_frames == image_frames
+            && existing.pool_base == pool_base
+            && existing.pool_frames == pool_frames
+        {
+            return true;
+        }
+        HOSTED_PROVIDER_SINGLETON_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[driver-launch] provider singleton conflict ");
+        print_str(provider.as_bytes());
+        print_str(b"\n");
+        return false;
+    }
+
+    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
+    if count >= HOSTED_PROVIDER_SINGLETON_CAP {
+        HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[driver-launch] provider singleton table exhausted before ");
+        print_str(provider.as_bytes());
+        print_str(b"\n");
+        return false;
+    }
+
+    let mut frame_index = 0usize;
+    while frame_index < image_frames as usize {
+        set_hosted_provider_singleton_frame(count, frame_index, image_frame_caps[frame_index]);
+        set_hosted_provider_singleton_right(count, frame_index, rights[frame_index]);
+        frame_index += 1;
+    }
+    let singletons =
+        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
+    *singletons.add(count) = HostedProviderSingleton {
+        present: true,
+        provider,
+        image_offset,
+        image_len,
+        image_frames,
+        pool_base,
+        pool_frames,
+        export_call_gate: 0,
+    };
+    HOSTED_PROVIDER_SINGLETON_COUNT.store((count + 1) as u64, Ordering::Relaxed);
+    print_str(b"[driver-launch] provider singleton published ");
+    print_str(provider.as_bytes());
+    print_str(b" frames=");
+    print_u64(image_frames);
+    print_str(b" pool-frames=");
+    print_u64(pool_frames);
+    print_str(b"\n");
+    true
+}
+
 pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidence {
     let count = HOSTED_PROVIDER_SUMMARY_COUNT.load(Ordering::Relaxed) as usize;
-    if count == 0 {
-        return HostedProviderSharingEvidence::default();
-    }
-    let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
-    let summaries = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(HOSTED_PROVIDER_SUMMARIES) as *const HostedProviderSummary,
-            bounded_count,
-        )
-    };
     let mut evidence = HostedProviderSharingEvidence::default();
-    for summary in summaries {
-        evidence.primary_services = evidence
-            .primary_services
-            .saturating_add(summary.primary_count);
-        evidence.primary_service_image_bytes = evidence
-            .primary_service_image_bytes
-            .saturating_add(summary.primary_image_bytes);
-        evidence.private_dependencies = evidence
-            .private_dependencies
-            .saturating_add(summary.private_count);
-        evidence.private_dependency_image_bytes = evidence
-            .private_dependency_image_bytes
-            .saturating_add(summary.private_image_bytes);
-        if summary.primary_count != 0 && summary.private_count != 0 {
-            evidence.private_dependencies_with_primary_provider = evidence
-                .private_dependencies_with_primary_provider
+    if count != 0 {
+        let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
+        let summaries = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(HOSTED_PROVIDER_SUMMARIES) as *const HostedProviderSummary,
+                bounded_count,
+            )
+        };
+        for summary in summaries {
+            evidence.primary_services = evidence
+                .primary_services
+                .saturating_add(summary.primary_count);
+            evidence.primary_service_image_bytes = evidence
+                .primary_service_image_bytes
+                .saturating_add(summary.primary_image_bytes);
+            evidence.private_dependencies = evidence
+                .private_dependencies
                 .saturating_add(summary.private_count);
-            evidence.unique_primary_provider_matches = evidence
-                .unique_primary_provider_matches
-                .saturating_add(1);
-            if summary.first_private_instance != 0
-                && (evidence.first_private_dependency_with_primary_instance == 0
-                    || summary.first_private_instance
-                        < evidence.first_private_dependency_with_primary_instance)
-            {
-                evidence.first_private_dependency_with_primary_instance =
-                    summary.first_private_instance;
+            evidence.private_dependency_image_bytes = evidence
+                .private_dependency_image_bytes
+                .saturating_add(summary.private_image_bytes);
+            if summary.primary_count != 0 && summary.private_count != 0 {
+                evidence.private_dependencies_with_primary_provider = evidence
+                    .private_dependencies_with_primary_provider
+                    .saturating_add(summary.private_count);
+                evidence.unique_primary_provider_matches = evidence
+                    .unique_primary_provider_matches
+                    .saturating_add(1);
+                if summary.first_private_instance != 0
+                    && (evidence.first_private_dependency_with_primary_instance == 0
+                        || summary.first_private_instance
+                            < evidence.first_private_dependency_with_primary_instance)
+                {
+                    evidence.first_private_dependency_with_primary_instance =
+                        summary.first_private_instance;
+                }
             }
-        }
-        if summary.private_count > 1 {
-            evidence.duplicate_private_dependencies = evidence
-                .duplicate_private_dependencies
-                .saturating_add(summary.private_count);
+            if summary.private_count > 1 {
+                evidence.duplicate_private_dependencies = evidence
+                    .duplicate_private_dependencies
+                    .saturating_add(summary.private_count);
+            }
         }
     }
     evidence.overflowed_load_records = HOSTED_PROVIDER_LOAD_OVERFLOWS.load(Ordering::Relaxed);
+    evidence.singleton_providers = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed);
+    evidence.shared_provider_mappings = HOSTED_PROVIDER_SHARED_MAPPINGS.load(Ordering::Relaxed);
+    evidence.shared_provider_pool_mappings =
+        HOSTED_PROVIDER_SHARED_POOL_MAPPINGS.load(Ordering::Relaxed);
+    evidence.singleton_overflows = HOSTED_PROVIDER_SINGLETON_OVERFLOWS.load(Ordering::Relaxed);
+    evidence.singleton_conflicts = HOSTED_PROVIDER_SINGLETON_CONFLICTS.load(Ordering::Relaxed);
     evidence
 }
 
@@ -11810,6 +11999,14 @@ fn dependency_plan_contains(
         .any(|planned| hosted_ascii_eq_ignore_case(&planned.provider, provider))
 }
 
+fn shared_provider_plan_contains(
+    plan: &[PlannedSharedProviderImage],
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+) -> bool {
+    plan.iter()
+        .any(|planned| hosted_ascii_eq_ignore_case(&planned.provider, provider))
+}
+
 fn dependency_name_list_contains(
     names: &[HostedAscii<HOSTED_DEP_PROVIDER_MAX>],
     provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
@@ -11817,6 +12014,42 @@ fn dependency_name_list_contains(
     names
         .iter()
         .any(|existing| hosted_ascii_eq_ignore_case(existing, provider))
+}
+
+unsafe fn add_shared_provider_if_registered(
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    shared_providers: &mut Vec<PlannedSharedProviderImage>,
+) -> Option<bool> {
+    if shared_provider_plan_contains(shared_providers, &provider) {
+        return Some(true);
+    }
+    let Some((singleton_index, singleton)) = find_hosted_provider_singleton(&provider) else {
+        return Some(false);
+    };
+    if singleton.export_call_gate == 0 {
+        return Some(false);
+    }
+    if singleton.image_frames == 0
+        || singleton.image_frames as usize > HOSTED_PROVIDER_SINGLETON_FRAME_CAP
+    {
+        print_str(b"[driver-launch] registered provider image frame count invalid ");
+        print_str(provider.as_bytes());
+        print_str(b"\n");
+        return None;
+    }
+    shared_providers.try_reserve_exact(1).ok()?;
+    shared_providers.push(PlannedSharedProviderImage {
+        provider,
+        singleton_index,
+        image_offset: singleton.image_offset,
+        prefix_offset: 0,
+        image_len: singleton.image_len,
+        image_frames: singleton.image_frames,
+        pool_base: singleton.pool_base,
+        pool_frames: singleton.pool_frames,
+    });
+    HOSTED_PROVIDER_SHARED_MAPPINGS.fetch_add(1, Ordering::Relaxed);
+    Some(true)
 }
 
 fn hosted_dependency_provider_matches(dep: LoadedDependencyImage, provider: &str) -> bool {
@@ -14226,9 +14459,15 @@ unsafe fn collect_hosted_dependency_closure(
     fs: &Fat32,
     provider_name: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     visiting: &mut Vec<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>,
+    shared_providers: &mut Vec<PlannedSharedProviderImage>,
     plan: &mut Vec<PlannedDependencyImage>,
 ) -> Option<()> {
-    if dependency_plan_contains(plan, &provider_name) {
+    if dependency_plan_contains(plan, &provider_name)
+        || shared_provider_plan_contains(shared_providers, &provider_name)
+    {
+        return Some(());
+    }
+    if add_shared_provider_if_registered(provider_name, shared_providers)? {
         return Some(());
     }
     if dependency_name_list_contains(visiting, &provider_name) {
@@ -14273,7 +14512,15 @@ unsafe fn collect_hosted_dependency_closure(
     }
     let mut idx = 0usize;
     while idx < nested.len() {
-        if collect_hosted_dependency_closure(fs, nested[idx], visiting, plan).is_none() {
+        if collect_hosted_dependency_closure(
+            fs,
+            nested[idx],
+            visiting,
+            shared_providers,
+            plan,
+        )
+        .is_none()
+        {
             let _ = visiting.pop();
             return None;
         }
@@ -14348,6 +14595,7 @@ unsafe fn plan_hosted_images(
 
     let mut providers = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
     raw_pe_collect_hosted_dependencies(primary_src_va, primary_src_size, &mut providers)?;
+    let mut shared_providers = Vec::<PlannedSharedProviderImage>::new();
     let mut dependencies = Vec::<PlannedDependencyImage>::new();
     let mut visiting = Vec::<HostedAscii<HOSTED_DEP_PROVIDER_MAX>>::new();
     let mut provider_idx = 0usize;
@@ -14356,25 +14604,91 @@ unsafe fn plan_hosted_images(
             fs,
             providers[provider_idx],
             &mut visiting,
+            &mut shared_providers,
             &mut dependencies,
         )?;
         provider_idx += 1;
     }
 
     let primary_image_len = raw_pe_size_of_image(primary_src_va, primary_src_size)? as u64;
-    let mut total_image_len = align_up_4k(primary_image_len)?;
+    let mut shared_lens = Vec::<u64>::new();
+    shared_lens
+        .try_reserve_exact(shared_providers.len())
+        .ok()?;
+    let mut idx = 0usize;
+    while idx < shared_providers.len() {
+        shared_lens.push(shared_providers[idx].image_len as u64);
+        idx += 1;
+    }
+    let mut private_lens = Vec::<u64>::new();
+    private_lens.try_reserve_exact(dependencies.len()).ok()?;
+    idx = 0;
+    while idx < dependencies.len() {
+        private_lens.push(raw_pe_size_of_image(
+            dependencies[idx].src_va,
+            dependencies[idx].src_size,
+        )? as u64);
+        idx += 1;
+    }
+    let layout = match plan_provider_prefixed_image(
+        &shared_lens,
+        primary_image_len,
+        &private_lens,
+        FSD_IMAGE_FRAMES,
+        FSD_IMAGE_MAX_FRAMES,
+    ) {
+        Ok(layout) => layout,
+        Err(HostedProviderImagePlanError::Overflow) => {
+            print_str(b"[driver-launch] hosted provider image layout overflow\n");
+            return None;
+        }
+        Err(HostedProviderImagePlanError::ExceedsFrameCapacity) => {
+            print_str(b"[driver-launch] hosted provider image layout exceeds frame capacity\n");
+            return None;
+        }
+    };
+
+    let mut provider_offset = 0u64;
+    idx = 0;
+    while idx < shared_providers.len() {
+        if shared_providers[idx].image_offset != provider_offset {
+            print_str(b"[driver-launch] provider singleton offset mismatch ");
+            print_str(shared_providers[idx].provider.as_bytes());
+            print_str(b" loaded=0x");
+            print_hex(shared_providers[idx].image_offset as u32);
+            print_str(b" planned=0x");
+            print_hex(provider_offset as u32);
+            print_str(b"\n");
+            return None;
+        }
+        shared_providers[idx].prefix_offset = provider_offset;
+        provider_offset = align_up_4k(provider_offset.checked_add(
+            shared_providers[idx].image_len as u64,
+        )?)?;
+        idx += 1;
+    }
+    if provider_offset != layout.provider_prefix_len {
+        return None;
+    }
+
+    let mut expected_private_offset = layout.private_dependency_offset;
     let mut idx = 0usize;
     while idx < dependencies.len() {
-        let dep_image_len =
-            raw_pe_size_of_image(dependencies[idx].src_va, dependencies[idx].src_size)? as u64;
-        total_image_len = total_image_len.checked_add(align_up_4k(dep_image_len)?)?;
+        expected_private_offset =
+            expected_private_offset.checked_add(align_up_4k(private_lens[idx])?)?;
         idx += 1;
+    }
+    if expected_private_offset != layout.total_image_len {
+        return None;
     }
 
     Some(PlannedHostedImages {
+        shared_providers,
         dependencies,
-        primary_image_len,
-        total_image_len,
+        provider_prefix_len: layout.provider_prefix_len,
+        primary_offset: layout.primary_offset,
+        private_dependency_offset: layout.private_dependency_offset,
+        total_frames: layout.total_frames,
     })
 }
 
@@ -14744,6 +15058,28 @@ static mut DRIVER_EXEC_PD_WINDOWS: Option<Vec<u64>> = None;
 const EXEC_PD_SPAN: u64 = 0x4000_0000; // 1 GiB
 const SEL4_DELETE_FIRST: u64 = 8;
 
+unsafe fn register_planned_shared_provider_images(
+    plan: &PlannedHostedImages,
+    code_va: u64,
+    run_va: u64,
+) -> Option<()> {
+    let mut idx = 0usize;
+    while idx < plan.shared_providers.len() {
+        let shared = plan.shared_providers[idx];
+        if shared.prefix_offset != shared.image_offset {
+            return None;
+        }
+        register_loaded_dependency_image(
+            shared.provider.as_str(),
+            code_va.checked_add(shared.prefix_offset)?,
+            run_va.checked_add(shared.prefix_offset)?,
+            shared.image_len,
+        )?;
+        idx += 1;
+    }
+    Some(())
+}
+
 unsafe fn load_hosted_dependency_images(
     plan: &PlannedHostedImages,
     instance: usize,
@@ -14761,7 +15097,7 @@ unsafe fn load_hosted_dependency_images(
             first_entry_rva: 0,
         });
     }
-    let mut dep_offset = align_up_4k(plan.primary_image_len)?;
+    let mut dep_offset = plan.private_dependency_offset;
     let mut support_images = LoadedSupportImages {
         count: 0,
         first_entry_rva: 0,
@@ -14913,8 +15249,7 @@ unsafe fn load_driver_reserved(
     // its bytes at the per-instance window (win.code_va) so two instances don't collide executive-side.
     let code_va = win.code_va;
     let run_va = FSD_CODE_VA;
-    let required_frames = frames_for_image_len(planned_images.total_image_len)?;
-    let img_frames = required_frames.max(FSD_IMAGE_FRAMES);
+    let img_frames = planned_images.total_frames;
     let image_capacity = hosted_image_frame_capacity(win);
     if img_frames > image_capacity {
         print_str(b"[driver-launch] image window exhausted required=");
@@ -14939,18 +15274,85 @@ unsafe fn load_driver_reserved(
     image_frame_caps_vec
         .try_reserve_exact(img_frames as usize)
         .ok()?;
-    for i in 0..img_frames {
-        let frame = alloc_frame();
-        image_frame_caps_vec.push(frame);
-        let cap = copy_cap(frame);
+    let mut rights_vec = Vec::new();
+    rights_vec.try_reserve_exact(img_frames as usize).ok()?;
+    for _ in 0..img_frames {
+        image_frame_caps_vec.push(0);
+        rights_vec.push(RW_NX);
+    }
+    let mut shared_idx = 0usize;
+    while shared_idx < planned_images.shared_providers.len() {
+        let shared = planned_images.shared_providers[shared_idx];
+        if shared.prefix_offset & 0xfff != 0
+            || shared.prefix_offset != shared.image_offset
+            || shared.image_frames == 0
+        {
+            print_str(b"[driver-launch] shared provider offset invalid ");
+            print_str(shared.provider.as_bytes());
+            print_str(b"\n");
+            return None;
+        }
+        let dst_frame = (shared.prefix_offset / 0x1000) as usize;
+        if dst_frame
+            .checked_add(shared.image_frames as usize)
+            .filter(|end| *end <= img_frames as usize)
+            .is_none()
+        {
+            print_str(b"[driver-launch] shared provider frame range exhausted ");
+            print_str(shared.provider.as_bytes());
+            print_str(b"\n");
+            return None;
+        }
+        let mut frame_idx = 0usize;
+        while frame_idx < shared.image_frames as usize {
+            let target = dst_frame + frame_idx;
+            if image_frame_caps_vec[target] != 0 {
+                print_str(b"[driver-launch] shared provider frame overlap ");
+                print_str(shared.provider.as_bytes());
+                print_str(b"\n");
+                return None;
+            }
+            image_frame_caps_vec[target] =
+                hosted_provider_singleton_frame(shared.singleton_index, frame_idx);
+            rights_vec[target] = hosted_provider_singleton_right(shared.singleton_index, frame_idx);
+            frame_idx += 1;
+        }
+        shared_idx += 1;
+    }
+    let mut i = 0u64;
+    while i < img_frames {
+        if image_frame_caps_vec[i as usize] == 0 {
+            image_frame_caps_vec[i as usize] = alloc_frame();
+        }
+        let cap = copy_cap(image_frame_caps_vec[i as usize]);
         map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
+        i += 1;
     }
     let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
-    // POOL frames (host-only; allocate the caps, mapped by spawn_component).
-    let pool_base = alloc_frame();
-    for _ in 1..FSD_POOL_FRAMES {
-        let _ = alloc_frame();
-    }
+    let rights = Box::leak(rights_vec.into_boxed_slice());
+    // POOL frames. Provider dependents share the provider-domain pool; standalone drivers allocate
+    // a fresh pool arena.
+    let pool_base = if let Some(first) = planned_images.shared_providers.first().copied() {
+        let mut idx = 0usize;
+        while idx < planned_images.shared_providers.len() {
+            let shared = planned_images.shared_providers[idx];
+            if shared.pool_base != first.pool_base || shared.pool_frames != FSD_POOL_FRAMES {
+                print_str(b"[driver-launch] shared provider pool-domain mismatch ");
+                print_str(shared.provider.as_bytes());
+                print_str(b"\n");
+                return None;
+            }
+            idx += 1;
+        }
+        HOSTED_PROVIDER_SHARED_POOL_MAPPINGS.fetch_add(1, Ordering::Relaxed);
+        first.pool_base
+    } else {
+        let pool_base = alloc_frame();
+        for _ in 1..FSD_POOL_FRAMES {
+            let _ = alloc_frame();
+        }
+        pool_base
+    };
     let ppt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
     map_instance_exec_pt(instance, ppt, win.pool_va)?;
@@ -14990,12 +15392,7 @@ unsafe fn load_driver_reserved(
 
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
-    let mut rights_vec = Vec::new();
-    rights_vec.try_reserve_exact(img_frames as usize).ok()?;
-    for _ in 0..img_frames {
-        rights_vec.push(RW_NX);
-    }
-    let rights = Box::leak(rights_vec.into_boxed_slice());
+    register_planned_shared_provider_images(&planned_images, code_va, run_va)?;
     let support_images = load_hosted_dependency_images(
         &planned_images,
         instance,
@@ -15005,13 +15402,40 @@ unsafe fn load_driver_reserved(
         img_frames,
         rights,
     )?;
-    let (entry_rva, image_len) =
-        load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
-    let _ = register_system_module(path, code_va, image_len);
+    if planned_images.primary_offset & 0xfff != 0 {
+        return None;
+    }
+    let primary_frame_offset = planned_images.primary_offset / 0x1000;
+    if primary_frame_offset >= img_frames {
+        print_str(b"[driver-launch] primary image window exhausted offset=0x");
+        print_hex(planned_images.primary_offset as u32);
+        print_str(b"\n");
+        return None;
+    }
+    let primary_exec_va = code_va + planned_images.primary_offset;
+    let primary_run_va = run_va + planned_images.primary_offset;
+    let primary_frames = img_frames - primary_frame_offset;
+    let primary_rights = &mut rights[primary_frame_offset as usize..];
+    let (entry_rva, image_len) = load_pe_into(
+        src_va,
+        primary_exec_va,
+        primary_run_va,
+        primary_frames,
+        primary_rights,
+        fsd_export_addr,
+    )?;
+    let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
+    if planned_images.primary_offset != 0 {
+        print_str(b" image-offset=0x");
+        print_hex(planned_images.primary_offset as u32);
+    }
     print_str(b"\n");
-    write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
+    let primary_entry_rva = planned_images
+        .primary_offset
+        .checked_add(entry_rva as u64)?;
+    write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, primary_entry_rva);
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
     write_volatile(
@@ -15183,6 +15607,25 @@ unsafe fn load_driver_reserved(
             instance,
             image_len,
         );
+        if planned_images.provider_prefix_len == 0
+            && planned_images.primary_offset == 0
+            && planned_images.dependencies.is_empty()
+        {
+            let singleton_image_frames = frames_for_image_len(image_len as u64)?;
+            if !register_hosted_provider_singleton(
+                provider,
+                planned_images.primary_offset,
+                image_len,
+                singleton_image_frames,
+                image_frame_caps,
+                &rights[..img_frames as usize],
+                pool_base,
+                FSD_POOL_FRAMES,
+            ) {
+                clear_driver_object_extensions_for_driver_object(drvobj);
+                return None;
+            }
+        }
     }
 
     let driver_id = register_io_driver(driver_object_path, instance)?;
