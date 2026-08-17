@@ -1436,15 +1436,13 @@ unsafe fn read_cstr(base: u64, rva: u32, buf: &mut [u8]) -> usize {
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_MAP_VIEW_OF_SECTION: u32 = 113;
 
-/// The largest dependency graph we resolve in one process. ★ winlogon's runtime graph is LARGE — it
-/// LoadLibrary's the crypto/UI stack (comdlg32, shell32, comctl32, wintrust, crypt32, dbghelp, …) so
-/// **55+ distinct DLLs** load in one process. The table MUST hold every loaded module: it is the
-/// dedup key (`find` → skip re-map) AND the DFS `run_process_attach` module set. At cap 32 the table
-/// OVERFLOWED — `insert` silently dropped the 33rd+ module, so `find` later returned 0 for it → the
-/// executive RE-MAPPED that DLL fresh over its VA (a new SEC_IMAGE view with a RAW, unsnapped IAT),
-/// and its `DllMain` then `jmp`ed through an unsnapped import thunk to a bare RVA (comdlg32's
-/// `GetSystemTimeAsFileTime` = 0x3ad64). Sized well above the observed 55 for headroom (csrss's tiny
-/// graph is unaffected; the cost is a larger static table + a deeper DFS `visited`/`entry_vas`).
+/// The largest dependency graph we resolve in one process. Winlogon's runtime graph can become large
+/// after real `LoadLibrary` calls pull in the crypto/UI stack (comdlg32, shell32, comctl32, wintrust,
+/// crypt32, dbghelp, ...), so the table must hold every actually loaded module. It is the de-dup key
+/// (`find` -> skip re-map) and the DFS `run_process_attach` module set. At cap 32 the table
+/// overflowed: `insert` silently dropped the 33rd+ module, so `find` later returned 0 for it and the
+/// executive re-mapped that DLL fresh over its VA with a raw, unsnapped IAT. Sized well above the
+/// observed runtime graph for headroom.
 #[cfg(target_arch = "x86_64")]
 const MODULE_TABLE_CAP: usize = 256;
 /// Bound recursive import/attach walks without rejecting the dependency depth in the staged
@@ -1468,7 +1466,8 @@ struct LoadedMod {
     /// Process-attach lifecycle persisted across static initialization and runtime LdrLoadDll calls.
     attached: bool,
     attaching: bool,
-    /// The mapped image's ordinary and delay import tables have been snapped at least once.
+    /// The mapped image's ordinary import table has been snapped at least once. Delay imports stay
+    /// lazy and are loaded through the normal runtime `LoadLibrary`/`LdrLoadDll` path when called.
     imports_ready: bool,
     /// A snap transaction currently owns this mapping; dependency back-edges may resolve it but
     /// no TLS callback or DllMain may run until the transaction commits.
@@ -3068,81 +3067,6 @@ unsafe fn snap_module(
         if out.status != 0 {
             return;
         }
-        // BATCH 14 — also EAGERLY bind DELAY imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13). A VC++
-        // delay-load leaves the delay-IAT pointing at `__delayLoadHelper2`, which at first call does
-        // `LoadLibrary(szDll)` in real kernel32; in our environment that path fails BEFORE reaching our
-        // ntdll `LdrLoadDll`, so the helper raises `0xC06D007E` (ERROR_MOD_NOT_FOUND). Pre-binding the
-        // delay IAT here (map the DLL + snap the delay INT→IAT like a normal import) means the helper is
-        // never invoked — the delay-imported functions are already resolved. This is the root fix for
-        // winlogon parking at `RtlRaiseException` on kernel32_vista's delay-load of ntdll_vista.dll.
-        // `ImgDelayDescr` (x64, grAttrs&1 => RVA-based): grAttrs@0x00, rvaDLLName@0x04, rvaHmod@0x08,
-        // rvaIAT@0x0C, rvaINT@0x10, rvaBoundIAT@0x14, rvaUnloadIAT@0x18, dwTimeStamp@0x1C (32 bytes).
-        let (ddir_rva, _dsz) = data_directory(image_base, 13);
-        if ddir_rva != 0 {
-            let mut ddesc = image_base + ddir_rva as u64;
-            loop {
-                let name_rva = rd32(ddesc, 4); // rvaDLLName
-                let iat_rva = rd32(ddesc, 12); // rvaIAT
-                let int_rva = rd32(ddesc, 16); // rvaINT
-                if name_rva == 0 && iat_rva == 0 {
-                    break; // terminator
-                }
-                if int_rva != 0 && iat_rva != 0 {
-                    let mut base = [0u8; 32];
-                    let bn = import_desc_basename(image_base, name_rva, &mut base);
-                    let dep_name = &base[..bn];
-                    let mut dep_base = (&*table).find(dep_name);
-                    let mut edge = DependencySnap {
-                        base: dep_base,
-                        increment_existing_reference: dep_base != 0,
-                    };
-                    if dep_base == 0 {
-                        edge =
-                            load_and_snap_dependency(dep_name, ntdll_base, table, out, depth + 1);
-                        dep_base = edge.base;
-                        if out.status != 0 {
-                            core::ptr::write_unaligned(
-                                (image_base + iat_rva as u64) as *mut u64,
-                                nt_ntdll::loader::resolve::BAD_IAT_VALUE,
-                            );
-                            out.missing += 1;
-                            return;
-                        }
-                    }
-                    if dep_base != 0 {
-                        // Snap the delay INT (int_rva) → the delay IAT (iat_rva), exactly like a normal
-                        // import descriptor. The delay-load helper is now bypassed for this DLL.
-                        snap_descriptor_against(
-                            image_base,
-                            int_rva,
-                            iat_rva,
-                            dep_base,
-                            table,
-                            out,
-                        );
-                        if out.status != 0 {
-                            return;
-                        }
-                        if !import_edges
-                            .as_mut()
-                            .record(dep_base, edge.increment_existing_reference)
-                        {
-                            out.status = STATUS_NO_MEMORY as u32;
-                            return;
-                        }
-                    } else {
-                        core::ptr::write_unaligned(
-                            (image_base + iat_rva as u64) as *mut u64,
-                            nt_ntdll::loader::resolve::BAD_IAT_VALUE,
-                        );
-                        out.missing += 1;
-                        out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
-                        return;
-                    }
-                }
-                ddesc += 32; // sizeof(ImgDelayDescr)
-            }
-        }
         if out.status == 0 {
             let reference_status = publish_import_reference_edges(import_edges.as_ref());
             if reference_status != 0 {
@@ -4209,38 +4133,6 @@ unsafe fn collect_reference_releases(
             }
         }
     }
-    let (delay_rva, _) = unsafe { data_directory(base, 13) };
-    if delay_rva != 0 {
-        let mut descriptor = base + delay_rva as u64;
-        let mut descriptor_count = 0usize;
-        loop {
-            let name_rva = unsafe { rd32(descriptor, 4) };
-            let iat_rva = unsafe { rd32(descriptor, 12) };
-            let int_rva = unsafe { rd32(descriptor, 16) };
-            if name_rva == 0 && iat_rva == 0 {
-                break;
-            }
-            if int_rva != 0 && iat_rva != 0 {
-                let mut name = [0u8; 32];
-                let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-                let dependency = unsafe { (&*table).find(&name[..length]) };
-                if dependency >= 0x1_0000
-                    && !dependencies[..dependency_count].contains(&dependency)
-                {
-                    if dependency_count == MODULE_TABLE_CAP {
-                        return 0xC000_0017;
-                    }
-                    dependencies[dependency_count] = dependency;
-                    dependency_count += 1;
-                }
-            }
-            descriptor += 32;
-            descriptor_count += 1;
-            if descriptor_count >= MODULE_TABLE_CAP {
-                return 0xC000_007B;
-            }
-        }
-    }
     let mut index = 0usize;
     while index < dependency_count {
         let dependency = dependencies[index];
@@ -4298,37 +4190,6 @@ unsafe fn collect_reference_modules_dfs(
             descriptor_count += 1;
             if descriptor_count >= MODULE_TABLE_CAP {
                 return 0xC000_007B; // STATUS_INVALID_IMAGE_FORMAT
-            }
-        }
-    }
-    let (delay_rva, _) = unsafe { data_directory(base, 13) };
-    if delay_rva != 0 {
-        let mut descriptor = base + delay_rva as u64;
-        let mut descriptor_count = 0usize;
-        loop {
-            let name_rva = unsafe { rd32(descriptor, 4) };
-            let iat_rva = unsafe { rd32(descriptor, 12) };
-            let int_rva = unsafe { rd32(descriptor, 16) };
-            if name_rva == 0 && iat_rva == 0 {
-                break;
-            }
-            if int_rva != 0 && iat_rva != 0 {
-                let mut name = [0u8; 32];
-                let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
-                let dependency = unsafe { (&*table).find(&name[..length]) };
-                if dependency >= 0x1_0000 {
-                    let status = unsafe {
-                        collect_reference_modules_dfs(table, dependency, visited, visited_count)
-                    };
-                    if status != 0 {
-                        return status;
-                    }
-                }
-            }
-            descriptor += 32;
-            descriptor_count += 1;
-            if descriptor_count >= MODULE_TABLE_CAP {
-                return 0xC000_007B;
             }
         }
     }

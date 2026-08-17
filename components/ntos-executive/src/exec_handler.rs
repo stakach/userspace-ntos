@@ -7706,6 +7706,13 @@ impl ExecNtHandler {
             .map(|runtime| runtime.role)
     }
 
+    pub(crate) fn hosted_thread_teb_for_badge(&self, badge: u64) -> Option<u64> {
+        let runtime = self.thread_runtime.get_by_badge(badge)?;
+        self.pm
+            .thread_teb(runtime.tid as nt_process::ThreadId)
+            .filter(|teb| *teb != 0)
+    }
+
     fn current_hosted_thread_user_stack_range(&self) -> Option<(u64, u64)> {
         let runtime = self
             .thread_runtime
@@ -10308,12 +10315,16 @@ impl ExecNtHandler {
         file_id: u64,
         release: nt_io_completion::FileReferenceRelease,
     ) {
+        let server_file_id =
+            nt_io_manager::pipe_server_file_id_for_endpoint(file_id).unwrap_or(file_id);
         if release.cleanup_required {
+            crate::pipe_server_preconnected_forget(server_file_id);
             crate::pipe_server_available_forget(file_id);
             self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLEANUP);
         }
         if release.close_required {
             self.dispatch_file_lifecycle_irp(file_id, release.device_id, major::IRP_MJ_CLOSE);
+            crate::pipe_server_preconnected_forget(server_file_id);
             crate::pipe_server_available_forget(file_id);
             crate::pipe_fid_name_forget(file_id);
         }
@@ -11296,30 +11307,48 @@ impl ExecNtHandler {
         handle: u64,
         tid: u64,
     ) {
-        if spec.trace != RoleOwnedLocalThreadTrace::LsassThird {
+        if spec.owner_role != nt_exe_image::HostedProcessRole::LocalSecurityAuthority
+            && spec.trace != RoleOwnedLocalThreadTrace::LsassThird
+        {
             return;
         }
         let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
+        let create_suspended =
+            nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
+        let slot = match spec.request {
+            HostedThreadSpawnRequest::LsassListener { slot } => slot,
+            _ => usize::MAX,
+        };
         print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
-        print_hex(args[3] as u32);
-        print_str(b" slot=2 start=0x");
-        print_hex((start.rip >> 32) as u32);
-        print_hex(start.rip as u32);
+        print_hex_u64(args[3]);
+        print_str(b" slot=");
+        print_u64(slot as u64);
+        print_str(b" start=0x");
+        print_hex_u64(start.rip);
+        print_str(b" arg0=0x");
+        print_hex_u64(start.rcx);
+        print_str(b" arg1=0x");
+        print_hex_u64(start.rdx);
+        print_str(b" rsp=0x");
+        print_hex_u64(start.rsp);
         print_str(b" teb=0x");
-        print_hex((spec.teb >> 32) as u32);
-        print_hex(spec.teb as u32);
+        print_hex_u64(spec.teb);
         print_str(b" initial_teb=0x");
-        print_hex(initial_teb as u32);
-        print_str(b" stack_base=0x");
-        print_hex(smss_stack_read(initial_teb + 0x10) as u32);
-        print_str(b" stack_limit=0x");
-        print_hex(smss_stack_read(initial_teb + 0x18) as u32);
-        print_str(b" alloc_base=0x");
-        print_hex(smss_stack_read(initial_teb + 0x20) as u32);
+        print_hex_u64(initial_teb);
+        if initial_teb != 0 {
+            print_str(b" stack_base=0x");
+            print_hex_u64(smss_stack_read(initial_teb + 0x10));
+            print_str(b" stack_limit=0x");
+            print_hex_u64(smss_stack_read(initial_teb + 0x18));
+            print_str(b" alloc_base=0x");
+            print_hex_u64(smss_stack_read(initial_teb + 0x20));
+        }
         print_str(b" handle=0x");
         print_hex(handle as u32);
         print_str(b" tid=");
         print_u64(tid);
+        print_str(b" suspended=");
+        print_u64(create_suspended as u64);
         print_str(b" status=0\n");
     }
 
@@ -19539,11 +19568,34 @@ impl ExecNtHandler {
                                 nt_io_manager::pipe_server_file_id_for_endpoint(fid)
                             {
                                 redrive_server_fid = server_fid;
+                                let listen_already_armed =
+                                    (&*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS))
+                                        .armed(server_fid);
                                 if let Err(name_status) =
                                     crate::pipe_fid_name_remember(fid, pipe_hash)
                                 {
                                     status = name_status;
                                     None
+                                } else if !listen_already_armed {
+                                    match crate::pipe_server_preconnected_remember(server_fid) {
+                                        Ok(recorded) => {
+                                            let handle =
+                                                self.mint_file_handle(fid, desired_access, synchronous);
+                                            if handle.is_none() {
+                                                crate::pipe_fid_name_forget(fid);
+                                                if recorded {
+                                                    crate::pipe_server_preconnected_forget(server_fid);
+                                                }
+                                                status = 0xC000_009A;
+                                            }
+                                            handle
+                                        }
+                                        Err(preconnect_status) => {
+                                            crate::pipe_fid_name_forget(fid);
+                                            status = preconnect_status;
+                                            None
+                                        }
+                                    }
                                 } else {
                                     let handle =
                                         self.mint_file_handle(fid, desired_access, synchronous);
@@ -22270,12 +22322,19 @@ impl ExecNtHandler {
                             .is_some()
                     {
                         crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if crate::pipe_server_available_remember(fid, listen_name_hash).is_err() {
-                            print_str(b"[pipe-listen] availability record failed server fid=0x");
-                            print_hex(fid as u32);
-                            print_str(b" pi=");
-                            print_u64(self.pi as u64);
-                            print_str(b"\n");
+                        let connected_before_listen = crate::pipe_server_preconnected_take(fid);
+                        if connected_before_listen {
+                            self.pipe_connect_redrive_server_fid = fid;
+                        } else {
+                            if crate::pipe_server_available_remember(fid, listen_name_hash).is_err()
+                            {
+                                print_str(b"[pipe-listen] availability record failed server fid=0x");
+                                print_hex(fid as u32);
+                                print_str(b" pi=");
+                                print_u64(self.pi as u64);
+                                print_str(b"\n");
+                            }
+                            self.pipe_name_wait_redrive = listen_name_hash;
                         }
                         print_str(b"[pipe-listen] ARMED server fid=0x");
                         print_hex(fid as u32);
@@ -22283,10 +22342,12 @@ impl ExecNtHandler {
                         print_hex(event_obj_idx as u32);
                         print_str(b" pi=");
                         print_u64(self.pi as u64);
+                        if connected_before_listen {
+                            print_str(b" preconnected=1");
+                        }
                         print_str(b"\n");
                         // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
                         self.pipe_listen_fid = fid;
-                        self.pipe_name_wait_redrive = listen_name_hash;
                     } else {
                         if !already_armed && retain_status.is_ok() {
                             self.release_file_reference(fid);
@@ -27323,10 +27384,44 @@ impl ExecNtHandler {
                                     if let Some(server_fid) =
                                         nt_io_manager::pipe_server_file_id_for_endpoint(file_id)
                                     {
+                                        let listen_already_armed =
+                                            (&*core::ptr::addr_of!(crate::PIPE_ASYNC_LISTENS))
+                                                .armed(server_fid);
                                         if let Err(name_status) =
                                             crate::pipe_fid_name_remember(file_id, pipe_hash)
                                         {
                                             status = name_status;
+                                        } else if !listen_already_armed {
+                                            match crate::pipe_server_preconnected_remember(server_fid)
+                                            {
+                                                Ok(recorded) => {
+                                                    if let Some(handle) = self.mint_file_handle(
+                                                        file_id,
+                                                        desired_access,
+                                                        synchronous,
+                                                    ) {
+                                                        self.queue_write(file_handle_out, handle);
+                                                        info = nt_fs::FILE_OPENED as u64;
+                                                        crate::pipe_server_available_consume(
+                                                            server_fid,
+                                                        );
+                                                        self.pipe_connect_redrive_server_fid =
+                                                            server_fid;
+                                                    } else {
+                                                        crate::pipe_fid_name_forget(file_id);
+                                                        if recorded {
+                                                            crate::pipe_server_preconnected_forget(
+                                                                server_fid,
+                                                            );
+                                                        }
+                                                        status = 0xC000_009A;
+                                                    }
+                                                }
+                                                Err(preconnect_status) => {
+                                                    crate::pipe_fid_name_forget(file_id);
+                                                    status = preconnect_status;
+                                                }
+                                            }
                                         } else if let Some(handle) =
                                             self.mint_file_handle(file_id, desired_access, synchronous)
                                         {

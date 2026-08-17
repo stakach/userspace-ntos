@@ -62,8 +62,9 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// sibling of `reactos/`**, and every extraction in `fetch_reactos.sh` was scoped to `reactos`, so
 /// it never reached the disk image. `fetch_reactos.sh` now extracts it and `make_image.sh` lays it
 /// down at `::Profiles` — exactly where `%SystemDrive%\Profiles` (the real SOFTWARE hive's
-/// `ProfileList\ProfilesDirectory`) resolves. Nothing is synthesised: these are the ISO's own
-/// directories and files, byte for byte.
+/// `ProfileList\ProfilesDirectory`) resolves. The image builder also applies the tiny ReactOS setup
+/// physical-directory delta that the LiveCD cache lacks (`Default User\Local Settings\Temp`), so
+/// winlogon's real profile copy sees installed-volume content rather than a query/create fallback.
 ///
 /// **Composition with the writable volume.** `C:\Profiles` is a writable-volume prefix
 /// ([`WRITABLE_PREFIXES`]) while the staged tree is on the READ-ONLY FAT volume, so the two must
@@ -74,7 +75,8 @@ pub(crate) const WRITABLE_OVERLAY_MOUNTED: bool = true;
 /// syscall sees a single, coherent, writable `C:\Profiles`, so `CopyDirectory` can enumerate and
 /// read the source and write the destination with no per-operation layer arbitration, and a later
 /// FAT32 write-through milestone replaces the backing without touching any of it. The cost is the
-/// tree's bytes in RAM, which for this tree is ~76 nodes and ~360 bytes of file content.
+/// tree's bytes in RAM, which for this tree is ~76 nodes plus setup-created empty directories and
+/// ~360 bytes of file content.
 ///
 /// ★ **ON since batch 58.** It shipped `false` for one batch on the belief that the profile flow
 /// blew the TCG time budget ("post-logon UI work grows ~2.5x"). That was WRONG: host-side

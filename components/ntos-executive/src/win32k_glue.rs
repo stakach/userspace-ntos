@@ -31,6 +31,7 @@ static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RESUME_IP_REPAIRS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RESUME_IP_REJECTS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +64,15 @@ static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
+// Mapping caps retained for per-client win32k shared views are not addressed by
+// userspace again; they only need a durable owner so the seL4 mapping remains
+// live. The extern-rootserver root CSpace is an XL CNode, while kernel-side
+// radix-12 CNode backing is intentionally small; keep these high-volume USER/GDI
+// caps in root slots instead of consuming scarce kernel CNode pages.
+static WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
+static WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -1142,6 +1152,138 @@ fn callback_client_is_explorer(client: crate::spawn_hosts::UserCallbackClient) -
     callback_client_has_process_role(client, nt_exe_image::HostedProcessRole::InteractiveShell)
 }
 
+fn callback_context_trace_enabled(client: Win32kClientContext) -> bool {
+    matches!(
+        client.process_role,
+        Some(
+            nt_exe_image::HostedProcessRole::InteractiveLogon
+                | nt_exe_image::HostedProcessRole::InteractiveShell
+        )
+    )
+}
+
+unsafe fn trace_user_callback_context(
+    phase: &[u8],
+    client: Win32kClientContext,
+    api_index: u32,
+    redirect_context: &[u64; 20],
+    completion_context: &[u64; 20],
+    output_context: &[u64; 20],
+    resume_ip: u64,
+    callout_rsp: u64,
+) {
+    if !callback_context_trace_enabled(client) {
+        return;
+    }
+    let n = USER_CALLBACK_CONTEXT_TRACES.fetch_add(1, Ordering::Relaxed);
+    if n >= 96 {
+        return;
+    }
+    print_str(b"[user-callback-ctx] #");
+    print_u64(n);
+    print_str(b" phase=");
+    print_str(phase);
+    print_str(b" api=");
+    print_u64(api_index as u64);
+    print_str(b" pi=");
+    print_u64(client.pi as u64);
+    print_str(b" tid=");
+    print_u64(client.tid);
+    print_str(b" from-rip=0x");
+    print_crash_hex64(redirect_context[nt_user_callback::USER_CONTEXT_RIP]);
+    print_str(b" from-rsp=0x");
+    print_crash_hex64(redirect_context[nt_user_callback::USER_CONTEXT_RSP]);
+    print_str(b" saved-rip=0x");
+    print_crash_hex64(completion_context[nt_user_callback::USER_CONTEXT_RIP]);
+    print_str(b" saved-rsp=0x");
+    print_crash_hex64(completion_context[nt_user_callback::USER_CONTEXT_RSP]);
+    print_str(b" out-rip=0x");
+    print_crash_hex64(output_context[nt_user_callback::USER_CONTEXT_RIP]);
+    print_str(b" out-rsp=0x");
+    print_crash_hex64(output_context[nt_user_callback::USER_CONTEXT_RSP]);
+    print_str(b" resume-ip=0x");
+    print_crash_hex64(resume_ip);
+    print_str(b" callout-rsp=0x");
+    print_crash_hex64(callout_rsp);
+    print_str(b"\n");
+    if n < 32 && client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveLogon) {
+        trace_user_callback_stack_words(
+            n,
+            phase,
+            client,
+            api_index,
+            b"out",
+            output_context[nt_user_callback::USER_CONTEXT_RSP],
+        );
+        let saved_rsp = completion_context[nt_user_callback::USER_CONTEXT_RSP];
+        if saved_rsp != output_context[nt_user_callback::USER_CONTEXT_RSP] {
+            trace_user_callback_stack_words(n, phase, client, api_index, b"saved", saved_rsp);
+        }
+        if callout_rsp != 0
+            && callout_rsp != output_context[nt_user_callback::USER_CONTEXT_RSP]
+            && callout_rsp != saved_rsp
+        {
+            trace_user_callback_stack_words(n, phase, client, api_index, b"callout", callout_rsp);
+        }
+    }
+}
+
+unsafe fn trace_user_callback_stack_words(
+    trace_id: u64,
+    phase: &[u8],
+    client: Win32kClientContext,
+    api_index: u32,
+    label: &[u8],
+    base: u64,
+) {
+    if base < 0x10000 {
+        print_str(b"[user-callback-stack] #");
+        print_u64(trace_id);
+        print_str(b" phase=");
+        print_str(phase);
+        print_str(b" api=");
+        print_u64(api_index as u64);
+        print_str(b" ");
+        print_str(label);
+        print_str(b" base=0x");
+        print_crash_hex64(base);
+        print_str(b" skipped-low\n");
+        return;
+    }
+    print_str(b"[user-callback-stack] #");
+    print_u64(trace_id);
+    print_str(b" phase=");
+    print_str(phase);
+    print_str(b" api=");
+    print_u64(api_index as u64);
+    print_str(b" ");
+    print_str(label);
+    print_str(b" base=0x");
+    print_crash_hex64(base);
+    for i in 0..8u64 {
+        let Some(va) = base.checked_add(i * 8) else {
+            break;
+        };
+        print_str(b" +");
+        print_u64(i * 8);
+        print_str(b"=");
+        match crate::img_spawn::client_read_u64_mapped(
+            client.pi as u64,
+            va,
+            &[],
+            0,
+            client.scratch_base,
+        ) {
+            Some(value) => {
+                print_str(b"0x");
+                print_crash_hex64(value);
+            }
+            None => print_str(b"miss"),
+        }
+    }
+    print_str(b"\n");
+}
+
 fn client_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -> Option<u64> {
     if callback_client_is_winlogon(client) {
         winlogon_callback_teb_alias(client)
@@ -2082,6 +2224,7 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
         outer_resume_ip,
         outer_rsp,
         outer_flags,
+        b"root-redirect",
     )
 }
 
@@ -2093,6 +2236,7 @@ unsafe fn redirect_pending_user_callback(
     callout_resume_ip: u64,
     callout_rsp: u64,
     callout_flags: u64,
+    phase: &[u8],
 ) -> bool {
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
@@ -2184,6 +2328,16 @@ unsafe fn redirect_pending_user_callback(
         redirect_context,
         dispatcher,
         layout.frame_pointer,
+    );
+    trace_user_callback_context(
+        phase,
+        client,
+        request.api_index,
+        redirect_context,
+        completion_context,
+        &redirected,
+        completion_resume_ip,
+        callout_rsp,
     );
     let error = tcb_write_regs20(tcb, &redirected, false);
     if error != 0 {
@@ -2715,9 +2869,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     result_pointer: u64,
     result_length: u64,
     callback_status: u64,
-    return_resume_ip: u64,
+    _return_resume_ip: u64,
     return_rsp: u64,
-    return_flags: u64,
+    _return_flags: u64,
 ) -> Option<CompletedUserCallback> {
     // `NtCallbackReturn` returns the callback that is innermost ON THE CALLING THREAD — the caller's
     // own identity selects the frame, never the interleaved stack's global top.
@@ -2951,23 +3105,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     );
     if component.callback_suspended {
         let chained_client = completed_context;
-        let Some(chained_tcb) = callback_context_tcb(chained_client) else {
+        if callback_context_tcb(chained_client).is_none() {
             abort_controlled_user_callbacks();
             print_str(b"[user-callback] chained callback missing client TCB\n");
             return None;
-        };
-        let mut chained_context = [0u64; 20];
-        tcb_read_regs20(chained_tcb, &mut chained_context);
-        let Some(chained_callout_resume_ip) = resolve_callback_resume_ip(
-            chained_client,
-            return_resume_ip,
-            &chained_context,
-            b"chained-callout",
-        ) else {
-            abort_controlled_user_callbacks();
-            print_str(b"[user-callback] chained callback missing executable callout resume\n");
-            return None;
-        };
+        }
         let Some(chained_outer_resume_ip) = resolve_callback_resume_ip(
             chained_client,
             completed_frame.outer_resume_ip(),
@@ -2980,21 +3122,23 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_str(b"\n");
             return None;
         };
+        let saved_outer = completed_frame.saved_user_context();
         if !redirect_pending_user_callback(
             chained_client,
-            &chained_context,
-            completed_frame.saved_user_context(),
+            saved_outer,
+            saved_outer,
             chained_outer_resume_ip,
-            chained_callout_resume_ip,
-            return_rsp,
-            return_flags,
+            chained_outer_resume_ip,
+            saved_outer[nt_user_callback::USER_CONTEXT_RSP],
+            saved_outer[nt_user_callback::USER_CONTEXT_RFLAGS],
+            b"chained-redirect",
         ) {
             abort_controlled_user_callbacks();
             print_str(b"[user-callback] chained callback redirect failed\n");
             return None;
         }
         USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[user-callback] B yielded another callback; transferred saved A context\n");
+        print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
         return Some(CompletedUserCallback {
             outer_dispatch: None,
         });
@@ -3040,6 +3184,18 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         completed_frame.saved_user_context(),
         component.result,
         completed_outer_resume_ip,
+    );
+    let mut return_context = [0u64; 20];
+    tcb_read_regs20(tcb, &mut return_context);
+    trace_user_callback_context(
+        b"complete",
+        completed_context,
+        request.api_index,
+        &return_context,
+        completed_frame.saved_user_context(),
+        &completed,
+        completed_outer_resume_ip,
+        return_rsp,
     );
     if tcb_write_regs20(tcb, &completed, false) != 0 {
         return None;
@@ -3129,10 +3285,49 @@ unsafe fn map_static_win32k_arena_into_client(
             let _ = cnode_delete_recycle_r(cp);
             return false;
         }
+        if !win32k_client_cap_bank_store(pi, cp) {
+            print_str(b"[win32k-svc] failed to retain ");
+            print_str(label);
+            print_str(b" mapping cap for pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(i as u32);
+            print_str(b"\n");
+            let _ = page_unmap_r(cp);
+            let _ = cnode_delete_recycle_r(cp);
+            return false;
+        }
     }
 
     mapped_guard.fetch_or(bit, Ordering::Relaxed);
     true
+}
+
+unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
+    if pi >= MAX_PI || root_cap == 0 {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].fetch_add(1, Ordering::Relaxed);
+    WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
+    let mut processes = 0u64;
+    for pi in 0..MAX_PI {
+        if WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed) != 0 {
+            processes += 1;
+        }
+    }
+    let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed);
+    (
+        live,
+        live,
+        processes,
+        0,
+        WIN32K_CLIENT_CAP_BANK_FAILS.load(Ordering::Relaxed),
+    )
 }
 
 /// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi,
@@ -3253,13 +3448,44 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usiz
         );
     }
     for i in 0..frames {
-        let cp = copy_cap(heap_frames + source_offset + i);
-        let _ = page_map(
+        let (cp, copy_error) = copy_cap_r(heap_frames + source_offset + i);
+        if copy_error != 0 {
+            print_str(b"[win32k-svc] failed to copy live GDI handle table frame for pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(i as u32);
+            print_str(b" error=");
+            print_u64(copy_error);
+            print_str(b"\n");
+            return 0;
+        }
+        let map_error = page_map_r(
             cp,
             win32k_subsystem::GDI_SHARED_TABLE_VA + i * 0x1000,
             RO_NX,
             pml4,
         );
+        if map_error != 0 {
+            print_str(b"[win32k-svc] failed to map live GDI handle table into pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(i as u32);
+            print_str(b" error=");
+            print_u64(map_error);
+            print_str(b"\n");
+            let _ = cnode_delete_recycle_r(cp);
+            return 0;
+        }
+        if !win32k_client_cap_bank_store(pi, cp) {
+            print_str(b"[win32k-svc] failed to retain live GDI handle table mapping cap for pi=");
+            print_u64(pi as u64);
+            print_str(b" index=0x");
+            print_hex(i as u32);
+            print_str(b"\n");
+            let _ = page_unmap_r(cp);
+            let _ = cnode_delete_recycle_r(cp);
+            return 0;
+        }
     }
     GDI_SHARED_TABLE_FRAME_BASE.store(heap_frames + source_offset, Ordering::Relaxed);
     GDI_SHARED_TABLE_MAPPED.fetch_or(bit, Ordering::Relaxed);

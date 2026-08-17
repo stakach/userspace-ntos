@@ -1728,6 +1728,17 @@ mod tests {
     }
 
     #[test]
+    fn user_profile_setup_table_includes_physical_temp_directory() {
+        let temp = REACTOS_USER_PROFILE_SHELL_FOLDERS
+            .iter()
+            .find(|folder| folder.value_name == "Temp")
+            .expect("Temp setup folder");
+        assert_eq!(temp.path, r"Local Settings\Temp");
+        assert!(!temp.shell_folder);
+        assert!(!temp.user_shell_folder);
+    }
+
+    #[test]
     fn seeds_reactos_print_setup_into_mutable_system_hive() {
         let mut hives = MutableHiveSet::new();
         hives.mount(r"\Registry\Machine\System", 1, Hive::new(HiveKind::System));

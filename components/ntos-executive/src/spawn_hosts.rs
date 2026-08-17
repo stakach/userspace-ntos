@@ -715,6 +715,85 @@ unsafe fn win32k_wall_diag(ch: &PumpChannel, label: u64, m0: u64, m1: u64, m2: u
     crate::print_str(b"\n");
 }
 
+#[inline(always)]
+fn pump_print_hex64(value: u64) {
+    crate::print_hex((value >> 32) as u32);
+    crate::print_hex(value as u32);
+}
+
+#[inline(never)]
+unsafe fn pump_wall_state_diag(ch: &PumpChannel, outcome: PumpLoopOutcome) {
+    if ch.tcb == 0
+        || PUMP_WALL_STATE_TRACES.fetch_add(1, Ordering::Relaxed) >= PUMP_WALL_STATE_TRACE_CAP
+    {
+        return;
+    }
+
+    let mut regs = [0u64; 20];
+    crate::win32k_glue::tcb_read_regs20(ch.tcb, &mut regs);
+    crate::print_str(b"[pump-wall-regs] label=");
+    crate::print_u64(outcome.wall_label);
+    crate::print_str(b" rip=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RIP]);
+    crate::print_str(b" rsp=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RSP]);
+    crate::print_str(b" rflags=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RFLAGS]);
+    crate::print_str(b" rax=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RAX]);
+    crate::print_str(b" rbx=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RBX]);
+    crate::print_str(b" rcx=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RCX]);
+    crate::print_str(b" rdx=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+    crate::print_str(b" rsi=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RSI]);
+    crate::print_str(b" rdi=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RDI]);
+    crate::print_str(b" rbp=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_RBP]);
+    crate::print_str(b" r8=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R8]);
+    crate::print_str(b" r9=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R9]);
+    crate::print_str(b" r10=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R10]);
+    crate::print_str(b" r11=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R11]);
+    crate::print_str(b" r12=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R12]);
+    crate::print_str(b" r13=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R13]);
+    crate::print_str(b" r14=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R14]);
+    crate::print_str(b" r15=0x");
+    pump_print_hex64(regs[nt_user_callback::USER_CONTEXT_R15]);
+    crate::print_str(b"\n");
+
+    let rsp = regs[nt_user_callback::USER_CONTEXT_RSP];
+    crate::print_str(b"[pump-wall-stack] shared=0x");
+    pump_print_hex64(ch.shared_va);
+    crate::print_str(b" rsp=0x");
+    pump_print_hex64(rsp);
+    crate::print_str(b" top:");
+    let mut i = 0u64;
+    while i < 8 {
+        crate::print_str(b" +");
+        crate::print_u64(i * 8);
+        crate::print_str(b"=0x");
+        if let Some(value) =
+            crate::driver_launch::hosted_component_stack_qword(ch.shared_va, rsp, i)
+        {
+            pump_print_hex64(value);
+        } else {
+            crate::print_str(b"?");
+        }
+        i += 1;
+    }
+    crate::print_str(b"\n");
+}
+
 /// PROOF-OF-WIRING counters: `component_pump` increments these per SERVICED dispatch, tagged by
 /// `ReqKind`. They are the durable evidence that a component's live traffic actually flows through
 /// the SHARED harness pump (not the retired bespoke inline loop). The `exec_fsd_on_shared_harness`
@@ -780,6 +859,8 @@ pub(crate) fn pump_call_dispatches(kind: ReqKind) -> u64 {
 pub(crate) static PUMP_REPLY_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Components suspended (`TCB_Suspend`) because their pump WALLED — see risk R2 at the wall tail.
 pub(crate) static PUMP_WALL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
+static PUMP_WALL_STATE_TRACES: AtomicU64 = AtomicU64::new(0);
+const PUMP_WALL_STATE_TRACE_CAP: u64 = 16;
 /// Hosted hardware-driver inline `out dx,eax` faults serviced through a PnP-granted IOPort cap.
 pub(crate) static HOSTED_IO_PORT_OUT32_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IO_PORT_UNHANDLED_GPS: AtomicU64 = AtomicU64::new(0);
@@ -2104,6 +2185,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
     if !outcome.completed && !outcome.callback_suspended {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
+        pump_wall_state_diag(ch, outcome);
         let e = if ch.tcb != 0 {
             crate::tcb_suspend_r(ch.tcb)
         } else {

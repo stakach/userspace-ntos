@@ -1817,10 +1817,10 @@ pub const X64_SYSCALL_INSTRUCTION_LEN: u64 = 2;
 pub const DISPATCH_ARG_SNAPSHOT_BYTES: usize = 0x400;
 
 /// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
-/// path. The dispatcher takes its arguments from the `UCALLOUT_FRAME` on RSP, so the kernel-facing
-/// entry registers are scrubbed like ReactOS `KiUserCallbackExit`: stale interrupted syscall
-/// registers must not leak into user32 or a client WndProc while the original outer syscall context
-/// remains untouched in the caller's saved copy.
+/// path. The dispatcher takes its arguments from the `UCALLOUT_FRAME` on RSP, so entry registers are
+/// scrubbed like ReactOS `KiUserCallbackExit`: stale interrupted syscall/caller state must not leak
+/// into user32 or a client WndProc. The original interrupted context is still saved separately and
+/// restored by [`completed_outer_context`] after `NtCallbackReturn`.
 pub const fn callback_redirect_context(
     saved: &[u64; 20],
     dispatcher: u64,
@@ -1972,31 +1972,31 @@ pub struct UserCallbackStackLayout {
 }
 
 impl UserCallbackStackLayout {
-    /// Place the fixed callout frame and bounded input copy below the client's saved RSP.
+    /// Place the fixed callout frame and bounded input copy below the client's saved RSP using the
+    /// ReactOS AMD64 callout formula:
+    ///
+    /// `UserArguments = ALIGN_DOWN(OldStack - ArgumentLength, 16) - 8`
+    ///
+    /// `UCALLOUT_FRAME` sits immediately below `UserArguments`. That leaves the dispatcher entry
+    /// stack 16-byte aligned while the callback buffer pointer itself is 8-byte unaligned, matching
+    /// `ntoskrnl/ke/amd64/usercall.c`.
     pub fn below(prior_rsp: u64, input_length: usize) -> Result<Self, ValidationError> {
         checked_payload_length(input_length)?;
         let frame_size = core::mem::size_of::<UserCalloutFrame>() as u64;
-        let total_size = frame_size
-            .checked_add(input_length as u64)
-            .and_then(|size| size.checked_add(15))
+        let input_pointer = prior_rsp
+            .checked_sub(input_length as u64)
             .ok_or(ValidationError::Length)?
             & !15;
-        let frame_pointer = prior_rsp
-            .checked_sub(total_size)
-            .ok_or(ValidationError::Length)?
-            & !15;
-        let input_pointer = if input_length == 0 {
-            0
-        } else {
-            frame_pointer
-                .checked_add(frame_size)
-                .ok_or(ValidationError::Length)?
-        };
-        let end = frame_pointer
-            .checked_add(frame_size)
-            .and_then(|address| address.checked_add(input_length as u64))
+        let input_pointer = input_pointer
+            .checked_sub(8)
             .ok_or(ValidationError::Length)?;
-        if end > prior_rsp {
+        let frame_pointer = input_pointer
+            .checked_sub(frame_size)
+            .ok_or(ValidationError::Length)?;
+        let input_end = input_pointer
+            .checked_add(input_length as u64)
+            .ok_or(ValidationError::Length)?;
+        if input_end > prior_rsp {
             return Err(ValidationError::Length);
         }
         Ok(Self {
@@ -2691,9 +2691,15 @@ mod tests {
     #[test]
     fn callback_stack_layout_is_aligned_bounded_and_nonoverlapping() {
         let layout = UserCallbackStackLayout::below(0x8000, 0x90).unwrap();
+        assert_eq!(layout.frame_pointer, 0x7f10);
+        assert_eq!(layout.input_pointer, 0x7f68);
         assert_eq!(layout.frame_pointer & 0xf, 0);
+        assert_eq!(layout.input_pointer & 0xf, 8);
         assert_eq!(layout.input_pointer, layout.frame_pointer + 0x58);
         assert!(layout.input_pointer + 0x90 <= 0x8000);
+        let empty = UserCallbackStackLayout::below(0x8000, 0).unwrap();
+        assert_eq!(empty.frame_pointer, 0x7fa0);
+        assert_eq!(empty.input_pointer, 0x7ff8);
         assert_eq!(
             UserCallbackStackLayout::below(0x40, 0x90),
             Err(ValidationError::Length)
@@ -2705,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn chained_callback_uses_current_stack_but_inherited_completion_context() {
+    fn chained_callback_reuses_inherited_trap_stack_and_completion_context() {
         let mut inherited = [0u64; 20];
         inherited[USER_CONTEXT_RIP] = 0x1000_8010;
         inherited[USER_CONTEXT_RSP] = 0x1001_05c3_000;
@@ -2714,14 +2720,14 @@ mod tests {
         let mut current = inherited;
         current[USER_CONTEXT_RIP] = 0x801e_f0c1;
         current[USER_CONTEXT_RCX] = 0x801e_f0f8;
-        current[USER_CONTEXT_RSP] = 0x1001_3f4f_e58;
+        current[USER_CONTEXT_RSP] = inherited[USER_CONTEXT_RSP] - 0x900;
 
-        let layout = UserCallbackStackLayout::below(current[USER_CONTEXT_RSP], 0x40).unwrap();
-        let redirected = callback_redirect_context(&current, 0x1000_9000, layout.frame_pointer);
+        let layout = UserCallbackStackLayout::below(inherited[USER_CONTEXT_RSP], 0x40).unwrap();
+        let redirected = callback_redirect_context(&inherited, 0x1000_9000, layout.frame_pointer);
         assert_eq!(redirected[USER_CONTEXT_RIP], 0x1000_9000);
         assert_eq!(redirected[USER_CONTEXT_RSP], layout.frame_pointer);
-        assert!(layout.frame_pointer < current[USER_CONTEXT_RSP]);
-        assert!(layout.frame_pointer > inherited[USER_CONTEXT_RSP]);
+        assert!(layout.frame_pointer < inherited[USER_CONTEXT_RSP]);
+        assert!(layout.frame_pointer > current[USER_CONTEXT_RSP]);
 
         let completed = completed_outer_context(&inherited, 0x1234, inherited[USER_CONTEXT_RIP]);
         assert_eq!(completed[USER_CONTEXT_RIP], inherited[USER_CONTEXT_RIP]);

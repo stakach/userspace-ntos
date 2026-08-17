@@ -35,8 +35,10 @@ seL4 syscall numbers. Out-params ride on the existing client stack/heap/image mi
 **The loader** is ours end to end: `crates/nt-ntdll/src/loader/` (module graph, import resolution
 incl. forwarders, dependency-ordered `DLL_PROCESS_ATTACH`, `PEB->Ldr` construction and the three
 circular lists, TLS, loader lock, DLL notifications, IFEO) driven on target by
-`nt-ntdll-dll/src/on_target.rs`'s recursive loader from `LdrpInitialize`. Delay imports are bound
-eagerly. `Peb->ProcessHeap` is published by the loader (msvcrt's CRT init depends on it).
+`nt-ntdll-dll/src/on_target.rs`'s recursive loader from `LdrpInitialize`. Ordinary imports are
+snapped during initialization; delay imports stay lazy and load through the runtime
+`LoadLibrary`/`LdrLoadDll` path when called. `Peb->ProcessHeap` is published by the loader (msvcrt's
+CRT init depends on it).
 
 **SEH** is real x64 table-based dispatch: `.pdata`/`.xdata` unwind-code interpreter + live
 module-scan `RtlLookupFunctionEntry`, `RtlVirtualUnwind`, `RtlDispatchException`, `RtlUnwindEx`,

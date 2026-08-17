@@ -39,10 +39,16 @@ static SHELL_CHROME_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_CALLBACK_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static INTERACTIVE_SYSCALL_CONTEXT_TRACE: AtomicU64 = AtomicU64::new(0);
+static UNKNOWN_SYSCALL_TCB_RESTAGE_TRACE: AtomicU64 = AtomicU64::new(0);
 static SERVICES_NQIP_TRACE: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER2_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER3_NATIVE_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_TP_WORKER_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_TP_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_GUARD_PAGE_TRACE: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_DIRTY_MARKS: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_WRITEBACKS: AtomicU64 = AtomicU64::new(0);
 static GENERIC_SECTION_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +192,7 @@ const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
 const GUI_MESSAGE_WAITER_N: usize = 16;
 static CSR_API_TAIL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CSR_API_TAIL_REPLY_TRACE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct GuiMessageWaiter {
@@ -226,6 +233,199 @@ impl GuiMessageWaiter {
 
 static mut GUI_MESSAGE_WAITERS: [GuiMessageWaiter; GUI_MESSAGE_WAITER_N] =
     [GuiMessageWaiter::EMPTY; GUI_MESSAGE_WAITER_N];
+
+#[derive(Clone, Copy)]
+struct SyscallReplyContext {
+    regs: [u64; 18],
+}
+
+#[derive(Clone, Copy)]
+struct AuthoritativeUnknownSyscallContext {
+    tcb: u64,
+    user: [u64; 20],
+    msg_r8: u64,
+    msg_r9: u64,
+    msg_r10: u64,
+    msg_sp: u64,
+    msg_flags: u64,
+}
+
+impl SyscallReplyContext {
+    unsafe fn capture(m0: u64, m1: u64, m2: u64, m3: u64) -> Self {
+        let mut regs = [0u64; 18];
+        regs[0] = m0;
+        regs[1] = m1;
+        regs[2] = m2;
+        regs[3] = m3;
+        let mut i = 4;
+        while i < regs.len() {
+            regs[i] = get_recv_mr(i);
+            i += 1;
+        }
+        Self { regs }
+    }
+
+    fn from_unknown_syscall_user_context(user: &[u64; 20], next_ip: u64) -> Self {
+        let mut regs = [0u64; 18];
+        regs[0] = user[nt_user_callback::USER_CONTEXT_RAX];
+        regs[1] = user[nt_user_callback::USER_CONTEXT_RBX];
+        // seL4 reports UnknownSyscall slot 2 as the syscall return address
+        // saved by SYSCALL. `TCBReadRegisters` reports the fault IP instead.
+        // The reply path skips RCX, but preserving the wire shape keeps the
+        // executive's register view coherent while the syscall is serviced.
+        regs[2] = next_ip;
+        regs[3] = user[nt_user_callback::USER_CONTEXT_RDX];
+        regs[4] = user[nt_user_callback::USER_CONTEXT_RSI];
+        regs[5] = user[nt_user_callback::USER_CONTEXT_RDI];
+        regs[6] = user[nt_user_callback::USER_CONTEXT_RBP];
+        regs[7] = user[nt_user_callback::USER_CONTEXT_R8];
+        regs[8] = user[nt_user_callback::USER_CONTEXT_R9];
+        regs[9] = user[nt_user_callback::USER_CONTEXT_R10];
+        regs[10] = user[nt_user_callback::USER_CONTEXT_R11];
+        regs[11] = user[nt_user_callback::USER_CONTEXT_R12];
+        regs[12] = user[nt_user_callback::USER_CONTEXT_R13];
+        regs[13] = user[nt_user_callback::USER_CONTEXT_R14];
+        regs[14] = user[nt_user_callback::USER_CONTEXT_R15];
+        regs[15] = user[nt_user_callback::USER_CONTEXT_RIP];
+        regs[16] = user[nt_user_callback::USER_CONTEXT_RSP];
+        regs[17] = user[nt_user_callback::USER_CONTEXT_RFLAGS];
+        Self { regs }
+    }
+
+    unsafe fn restage_unknown_syscall_recv_from_user_context(
+        user: &[u64; 20],
+        next_ip: u64,
+    ) -> Self {
+        let context = Self::from_unknown_syscall_user_context(user, next_ip);
+        let mut i = 4;
+        while i < context.regs.len() {
+            set_recv_mr(i, context.regs[i]);
+            i += 1;
+        }
+        context
+    }
+
+    unsafe fn stage_fault_reply(
+        self,
+        status: u64,
+        resume_ip: u64,
+        sp: u64,
+        flags: u64,
+    ) -> (u64, u64, u64, u64) {
+        let mut regs = self.regs;
+        regs[0] = status;
+        regs[15] = resume_ip;
+        regs[16] = sp;
+        regs[17] = flags;
+        let mut i = 4;
+        while i < regs.len() {
+            set_reply_mr(i, regs[i]);
+            i += 1;
+        }
+        (regs[0], regs[1], regs[2], regs[3])
+    }
+}
+
+unsafe fn capture_authoritative_unknown_syscall_context(
+    nt_handler: &ExecNtHandler,
+    badge: u64,
+    next_ip: u64,
+) -> Option<(AuthoritativeUnknownSyscallContext, SyscallReplyContext)> {
+    let tcb = nt_handler.hosted_thread_tcb_for_badge(badge)?;
+    let msg_r8 = get_recv_mr(7);
+    let msg_r9 = get_recv_mr(8);
+    let msg_r10 = get_recv_mr(9);
+    let msg_sp = get_recv_mr(16);
+    let msg_flags = get_recv_mr(17);
+    let mut user = [0u64; 20];
+    crate::win32k_glue::tcb_read_regs20(tcb, &mut user);
+    let context = SyscallReplyContext::restage_unknown_syscall_recv_from_user_context(&user, next_ip);
+    Some((
+        AuthoritativeUnknownSyscallContext {
+            tcb,
+            user,
+            msg_r8,
+            msg_r9,
+            msg_r10,
+            msg_sp,
+            msg_flags,
+        },
+        context,
+    ))
+}
+
+fn trace_unknown_syscall_tcb_restage(
+    ssn: u64,
+    badge: u64,
+    pi: usize,
+    ctx: &AuthoritativeUnknownSyscallContext,
+) {
+    let user_r8 = ctx.user[nt_user_callback::USER_CONTEXT_R8];
+    let user_r9 = ctx.user[nt_user_callback::USER_CONTEXT_R9];
+    let user_r10 = ctx.user[nt_user_callback::USER_CONTEXT_R10];
+    let user_sp = ctx.user[nt_user_callback::USER_CONTEXT_RSP];
+    let user_flags = ctx.user[nt_user_callback::USER_CONTEXT_RFLAGS];
+    let changed = ctx.msg_r8 != user_r8
+        || ctx.msg_r9 != user_r9
+        || ctx.msg_r10 != user_r10
+        || ctx.msg_sp != user_sp
+        || ctx.msg_flags != user_flags;
+    let n = UNKNOWN_SYSCALL_TCB_RESTAGE_TRACE.fetch_add(1, Ordering::Relaxed);
+    if !(n < 24 || ssn == 0x1286 || (changed && n < 128)) {
+        return;
+    }
+    print_str(b"[unknown-syscall-tcb] #");
+    print_u64(n);
+    print_str(b" ssn=0x");
+    print_hex_u64(ssn);
+    print_str(b" badge=");
+    print_u64(badge);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" tcb=0x");
+    print_hex_u64(ctx.tcb);
+    print_str(b" msg-sp=0x");
+    print_hex_u64(ctx.msg_sp);
+    print_str(b" tcb-sp=0x");
+    print_hex_u64(user_sp);
+    print_str(b" msg-r8=0x");
+    print_hex_u64(ctx.msg_r8);
+    print_str(b" tcb-r8=0x");
+    print_hex_u64(user_r8);
+    print_str(b" msg-r9=0x");
+    print_hex_u64(ctx.msg_r9);
+    print_str(b" tcb-r9=0x");
+    print_hex_u64(user_r9);
+    print_str(b" msg-r10=0x");
+    print_hex_u64(ctx.msg_r10);
+    print_str(b" tcb-r10=0x");
+    print_hex_u64(user_r10);
+    print_str(b" msg-flags=0x");
+    print_hex_u64(ctx.msg_flags);
+    print_str(b" tcb-flags=0x");
+    print_hex_u64(user_flags);
+    print_str(b"\n");
+}
+
+unsafe fn stage_serviced_syscall_reply(
+    native_call_transport: bool,
+    context: SyscallReplyContext,
+    result: u64,
+    m1: u64,
+    m3: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> (u64, u64, u64, u64) {
+    if native_call_transport {
+        set_reply_mr(15, resume_ip);
+        set_reply_mr(16, sp);
+        set_reply_mr(17, flags);
+        (result, m1, 0, m3)
+    } else {
+        context.stage_fault_reply(result, resume_ip, sp, flags)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct DeferredCallbackReturn {
@@ -1283,6 +1483,86 @@ fn vm_fault_access_from_x86_error(error_code: u64) -> nt_address_space::FaultAcc
     } else {
         nt_address_space::FaultAccess::Read
     }
+}
+
+unsafe fn service_private_guard_page_fault(
+    nt_handler: &ExecNtHandler,
+    pi: usize,
+    badge: u64,
+    page: u64,
+    pml4: u64,
+    scratch_base: u64,
+    fault_access: nt_address_space::FaultAccess,
+    filled_pages: &[u64; 512],
+    faults: usize,
+) -> Result<bool, u32> {
+    let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
+        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
+        .add(pi);
+    let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
+    let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+    *before = core::ptr::read(vm_map);
+    let Some(extent) = before.extent_at(page) else {
+        return Ok(false);
+    };
+    if extent.state != nt_address_space::VmExtentState::Committed {
+        return Ok(false);
+    }
+    let Some(old_protection) = before.protection_at(page) else {
+        return Ok(false);
+    };
+    let Some(new_protection) =
+        nt_address_space::private_guard_page_fault_plan(old_protection, fault_access)
+    else {
+        return Ok(false);
+    };
+    *after = *before;
+    let plan = after.protect(page, nt_address_space::PAGE_SIZE, new_protection)?;
+    let map_result = if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+        vm_reprotect_private_page(pi, page, old_protection, plan.new_protection, pml4)
+    } else {
+        vm_map_private_page(pi, page, plan.new_protection, pml4, scratch_base)
+    };
+    map_result?;
+    core::ptr::write(vm_map, *after);
+
+    let mut teb_write_ok = false;
+    if nt_handler
+        .hosted_thread_user_stack_for_badge(badge, pi)
+        .is_some_and(|(allocation_base, stack_base, _)| {
+            page >= allocation_base && page < stack_base
+        })
+    {
+        if let Some(teb) = nt_handler.hosted_thread_teb_for_badge(badge) {
+            teb_write_ok = img_spawn::client_copyout_mapped(
+                pi as u64,
+                teb + 0x10,
+                &page.to_le_bytes(),
+                filled_pages,
+                faults,
+                scratch_base,
+            );
+        }
+    }
+
+    let trace = PRIVATE_GUARD_PAGE_TRACE.fetch_add(1, Ordering::Relaxed);
+    if trace < 32 {
+        print_str(b"[guard-page] pi=");
+        print_u64(pi as u64);
+        print_str(b" badge=");
+        print_u64(badge);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" old=0x");
+        print_hex(old_protection);
+        print_str(b" new=0x");
+        print_hex(plan.new_protection);
+        print_str(b" teb=");
+        print_u64(teb_write_ok as u64);
+        print_str(b"\n");
+    }
+    Ok(true)
 }
 
 #[inline(never)]
@@ -6273,6 +6553,49 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             }
+            match service_private_guard_page_fault(
+                &nt_handler,
+                pi,
+                badge,
+                page,
+                pml4,
+                scratch_base,
+                vm_fault_access_from_x86_error(m3),
+                filled_pages,
+                faults as usize,
+            ) {
+                Ok(true) => {
+                    bump_progress();
+                    faults += 1;
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                        reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(status) => {
+                    print_str(b"[guard-page] failed pi=");
+                    print_u64(pi as u64);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" page=0x");
+                    print_hex((page >> 32) as u32);
+                    print_hex(page as u32);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"guard-page", m0, addr);
+                }
+            }
             // csrss's anonymous section (CSR shared memory): commit a ZERO frame on touch.
             if pi == 1
                 && csrss_anon_base != 0
@@ -7055,7 +7378,8 @@ pub(crate) unsafe fn service_sec_image(
         // unchanged (dispatch + out-writes + spawn/park/delay post-actions). The reply is a NORMAL IPC
         // reply (the native caller has NO pending fault): `reply_recv_badge(..,result,..)` fans
         // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
-        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+        let native_call_transport = (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
+        if native_call_transport {
             let ssn = m0; // MR0
             let rsp = m1; // MR1 = caller rsp (for stack args + stack out-param mirror writes)
             let arg1 = m2; // MR2
@@ -7260,11 +7584,20 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
-            if is_lsass_listener3 {
-                let dn = LSA_LISTENER3_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
-                if dn < 40 {
-                    print_str(b"[lsa-srv-ssn] #");
+            if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 {
+                let (counter, tag) = if is_lsass_listener3 {
+                    (&LSASS_LISTENER3_NATIVE_SSN_TRACE, b"[lsass-listener3-ssn] #" as &[u8])
+                } else if is_lsass_listener2 {
+                    (&LSASS_LISTENER2_SSN_TRACE, b"[lsass-listener2-ssn] #" as &[u8])
+                } else {
+                    (&LSASS_LISTENER_SSN_TRACE, b"[lsass-listener-ssn] #" as &[u8])
+                };
+                let dn = counter.fetch_add(1, Ordering::Relaxed);
+                if dn < 48 {
+                    print_str(tag);
                     print_u64(dn);
+                    print_str(b" badge=");
+                    print_u64(badge);
                     print_str(b" ssn=");
                     print_u64(ssn);
                     print_str(b" arg1=0x");
@@ -7273,11 +7606,33 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(arg2 as u32);
                     print_str(b"\n");
                 }
+                if is_lsass_listener3 {
+                    let dn = LSA_LISTENER3_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if dn < 40 {
+                        print_str(b"[lsa-srv-ssn] #");
+                        print_u64(dn);
+                        print_str(b" ssn=");
+                        print_u64(ssn);
+                        print_str(b" arg1=0x");
+                        print_hex(arg1 as u32);
+                        print_str(b" arg2=0x");
+                        print_hex(arg2 as u32);
+                        print_str(b"\n");
+                    }
+                }
             }
         }
         if (mi >> 12) == 2 {
             // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
             // sentinel; otherwise it's a REAL Nt* system call to service.
+            let authoritative_syscall_context = if native_call_transport {
+                None
+            } else {
+                capture_authoritative_unknown_syscall_context(&nt_handler, badge, m2)
+            };
+            if let Some((ctx, _)) = authoritative_syscall_context.as_ref() {
+                trace_unknown_syscall_tcb_restage(m0, badge, pi, ctx);
+            }
             if m0 == SSN_DONE {
                 verdict = get_recv_mr(9); // R10 = arg1
                 break;
@@ -7296,6 +7651,9 @@ pub(crate) unsafe fn service_sec_image(
             let mut resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
+            let syscall_reply_context = authoritative_syscall_context
+                .map(|(_, context)| context)
+                .unwrap_or_else(|| SyscallReplyContext::capture(m0, m1, m2, m3));
             let current_tid = nt_handler
                 .hosted_thread_tid_for_badge(badge)
                 .unwrap_or_else(|| {
@@ -7307,6 +7665,46 @@ pub(crate) unsafe fn service_sec_image(
                     0
                 });
             let syscall_process_role = nt_handler.hosted_process_role(pi);
+            if matches!(
+                syscall_process_role,
+                Some(
+                    nt_exe_image::HostedProcessRole::InteractiveLogon
+                        | nt_exe_image::HostedProcessRole::InteractiveShell
+                        | nt_exe_image::HostedProcessRole::Win32Subsystem
+                )
+            ) {
+                let n = INTERACTIVE_SYSCALL_CONTEXT_TRACE.fetch_add(1, Ordering::Relaxed);
+                if n < 96 || m0 == 0x1286 {
+                    print_str(b"[interactive-ssn-ctx] #");
+                    print_u64(n);
+                    print_str(b" role=");
+                    print_str(match syscall_process_role {
+                        Some(nt_exe_image::HostedProcessRole::InteractiveLogon) => b"winlogon",
+                        Some(nt_exe_image::HostedProcessRole::InteractiveShell) => b"explorer",
+                        Some(nt_exe_image::HostedProcessRole::Win32Subsystem) => b"csrss",
+                        _ => b"other",
+                    });
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" pi=");
+                    print_u64(pi as u64);
+                    print_str(b" tid=");
+                    print_u64(current_tid);
+                    print_str(b" ssn=0x");
+                    print_hex(m0 as u32);
+                    print_str(b" rip=0x");
+                    print_hex_u64(resume_ip);
+                    print_str(b" sp=0x");
+                    print_hex_u64(sp);
+                    print_str(b" flags=0x");
+                    print_hex_u64(flags);
+                    print_str(b" r10=0x");
+                    print_hex_u64(get_recv_mr(9));
+                    print_str(b" rdx=0x");
+                    print_hex_u64(m3);
+                    print_str(b"\n");
+                }
+            }
             let syscall_is_explorer =
                 syscall_process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell);
             if syscall_is_explorer {
@@ -14928,14 +15326,19 @@ pub(crate) unsafe fn service_sec_image(
             crate::teb_tail_watch(pi, 3, m0, badge);
             let redirected_user_control =
                 redirected_user_callback || redirected_user_apc || redirected_context_continue;
-            if !park_caller && !redirected_user_control {
-                set_reply_mr(15, resume_ip);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-            }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
-                reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
+                let (r0, r1, r2, r3) = stage_serviced_syscall_reply(
+                    native_call_transport,
+                    syscall_reply_context,
+                    result,
+                    m1,
+                    m3,
+                    resume_ip,
+                    sp,
+                    flags,
+                );
+                reply_recv_badge(fault_ep, 18, r0, r1, r2, r3)
             } else if park_caller {
                 // The caller's binding was STOLEN into a park slot — do not reply, just recv.
                 recv_full_r12(fault_ep, reply_main)
@@ -14945,12 +15348,39 @@ pub(crate) unsafe fn service_sec_image(
                 // the same shape because the APC dispatcher frame already carries the eventual
                 // STATUS_USER_APC return in the restored context.
                 let len = if redirected_user_control { 0 } else { 18 };
-                let (r0, r1, r3) = if redirected_user_control {
-                    (0, 0, 0)
+                let (r0, r1, r2, r3) = if redirected_user_control {
+                    (0, 0, 0, 0)
                 } else {
-                    (result, m1, m3)
+                    stage_serviced_syscall_reply(
+                        native_call_transport,
+                        syscall_reply_context,
+                        result,
+                        m1,
+                        m3,
+                        resume_ip,
+                        sp,
+                        flags,
+                    )
                 };
-                client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, 0, r3)
+                if nt_handler.csr_request_port != 0 {
+                    let n = CSR_API_TAIL_REPLY_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if n < 64 {
+                        print_str(b"[csr-api] tail reply pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" tid=");
+                        print_u64(current_tid);
+                        print_str(b" len=");
+                        print_u64(len as u64);
+                        print_str(b" status=0x");
+                        print_hex(r0 as u32);
+                        print_str(b" resume-ip=0x");
+                        print_hex_u64(resume_ip);
+                        print_str(b"\n");
+                    }
+                }
+                client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, r2, r3)
             };
             badge = nb;
             mi = nmi;
@@ -18928,10 +19358,27 @@ unsafe fn spawn_requested_multiplexed_thread(
     };
 
     print_str(spec.spawn_prefix);
-    print_hex((start.rip >> 32) as u32);
-    print_hex(start.rip as u32);
+    print_hex_u64(start.rip);
+    print_str(b" rcx=0x");
+    print_hex_u64(start.rcx);
+    print_str(b" rdx=0x");
+    print_hex_u64(start.rdx);
+    print_str(b" rsp=0x");
+    print_hex_u64(start.rsp);
     print_str(b" tid=");
     print_u64(tid);
+    print_str(b" initial_teb=0x");
+    print_hex_u64(initial_teb_va);
+    print_str(b" stack=(");
+    print_hex_u64(initial_teb.stack_base);
+    print_str(b",");
+    print_hex_u64(initial_teb.stack_limit);
+    print_str(b",");
+    print_hex_u64(initial_teb.allocated_stack_base);
+    print_str(b") suspended=");
+    print_u64(suspended as u64);
+    print_str(b" resume=");
+    print_u64(resume as u64);
     print_str(b"\n");
 
     let spawned = match spec.spawner {
@@ -18949,15 +19396,25 @@ unsafe fn spawn_requested_multiplexed_thread(
         }
     };
 
-    if nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role) {
-        let _ = nt_handler.remember_hosted_thread_user_stack(tid, initial_teb);
-    }
+    let registered =
+        nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role);
+    let remembered = if registered {
+        nt_handler.remember_hosted_thread_user_stack(tid, initial_teb)
+    } else {
+        false
+    };
     nt_handler
         .pm
         .set_thread_teb(tid as nt_process::ThreadId, spec.teb);
 
     print_str(spec.spawned_prefix);
     print_hex(spawned.tcb() as u32);
+    print_str(b" registered=");
+    print_u64(registered as u64);
+    print_str(b" stack-record=");
+    print_u64(remembered as u64);
+    print_str(b" resume=");
+    print_u64(resume as u64);
     print_str(spec.spawned_suffix);
 }
 
@@ -19166,10 +19623,21 @@ unsafe fn dump_hosted_main_thread_quiesce(
     print_str(b"\n");
 
     let (stack_base, stack_size, stack_mirror, _, _, _) = mirror_ctx_for(badge, pi);
+    let mirror_stack_end = stack_base.checked_add(stack_size);
+    let hosted_stack_range = nt_handler.hosted_thread_user_stack_for_badge(badge, pi);
+    let rsp_has_qword = rsp
+        .checked_add(8)
+        .is_some_and(|end| match (mirror_stack_end, hosted_stack_range) {
+            (Some(mirror_end), _) if rsp >= stack_base && end <= mirror_end => true,
+            (_, Some((allocation_base, stack_base, _))) => {
+                rsp >= allocation_base && end <= stack_base
+            }
+            _ => false,
+        });
     let read_wl = |va: u64| -> Option<u64> {
         unsafe {
             let end = va.checked_add(8)?;
-            if va >= stack_base && end <= stack_base + stack_size {
+            if mirror_stack_end.is_some_and(|mirror_end| va >= stack_base && end <= mirror_end) {
                 return Some(core::ptr::read_volatile(
                     (stack_mirror + (va - stack_base)) as *const u64,
                 ));
@@ -19183,12 +19651,39 @@ unsafe fn dump_hosted_main_thread_quiesce(
     print_quiesce_tag(label, b"-stack");
     print_str(b" rsp=0x");
     print_hex_u64(rsp);
+    print_str(b" mirror=[0x");
+    print_hex_u64(stack_base);
+    print_str(b"..0x");
+    if let Some(mirror_end) = mirror_stack_end {
+        print_hex_u64(mirror_end);
+    } else {
+        print_str(b"overflow");
+    }
+    print_str(b") runtime=");
+    if let Some((allocation_base, stack_base, _)) = hosted_stack_range {
+        print_str(b"[0x");
+        print_hex_u64(allocation_base);
+        print_str(b"..0x");
+        print_hex_u64(stack_base);
+        print_str(b")");
+    } else {
+        print_str(b"none");
+    }
+    if !rsp_has_qword {
+        print_str(b" invalid-stack-pointer -> stack walk skipped\n");
+        print_quiesce_tag(label, b"-callers");
+        print_str(b" skipped-invalid-rsp\n");
+        return;
+    }
     print_str(b" top:");
     for slot in 0..8u64 {
         print_str(b" +");
         print_u64(slot * 8);
         print_str(b"=");
-        match read_wl(rsp + slot * 8) {
+        match rsp
+            .checked_add(slot.saturating_mul(8))
+            .and_then(&read_wl)
+        {
             Some(value) => print_hex_u64(value),
             None => print_str(b"?"),
         }
@@ -19198,7 +19693,10 @@ unsafe fn dump_hosted_main_thread_quiesce(
     let mut shown = 0usize;
     let mut iat_shown = 0usize;
     for slot in 0..160u64 {
-        let Some(value) = read_wl(rsp + slot * 8) else {
+        let Some(value) = rsp
+            .checked_add(slot.saturating_mul(8))
+            .and_then(&read_wl)
+        else {
             continue;
         };
         if !quiesce_addr_is_known(value, pi, loaded_images, reg, ntdll) {

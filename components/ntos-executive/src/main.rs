@@ -2263,8 +2263,8 @@ static ROOT_CSPACE_END: AtomicU64 = AtomicU64::new(0);
 /// root-CSpace occupancy as used/capacity rather than an opaque absolute CPtr.
 static ROOT_CSPACE_START: AtomicU64 = AtomicU64::new(0);
 const ROOT_SLOT_RECYCLE_CAP: usize = 32768;
-const ROOT_SLOT_LIVE_WORDS: usize = 4096;
-const ROOT_SLOT_TRACK_CAP: usize = ROOT_SLOT_LIVE_WORDS * 64;
+const ROOT_SLOT_TRACK_CAP: usize = 1 << 19;
+const ROOT_SLOT_LIVE_WORDS: usize = ROOT_SLOT_TRACK_CAP / 64;
 static mut ROOT_SLOT_RECYCLE: [u64; ROOT_SLOT_RECYCLE_CAP] = [0; ROOT_SLOT_RECYCLE_CAP];
 static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
@@ -2643,6 +2643,11 @@ static mut PIPE_FID_NAMES: nt_io_manager::PipeFidNameTable = nt_io_manager::Pipe
 /// instances are already connected; readiness must therefore be tracked separately from fid metadata.
 static mut PIPE_SERVER_AVAILABILITY: nt_io_manager::PipeServerAvailabilityTable =
     nt_io_manager::PipeServerAvailabilityTable::new();
+/// Exact server endpoints that accepted a client before the server posted its async listen IRP.
+/// This models the documented `CreateFile` before `ConnectNamedPipe` race generically: the later
+/// `FSCTL_PIPE_LISTEN` completes the already-connected server fid once, without matching by name.
+static mut PIPE_PRECONNECTED_SERVERS: nt_io_manager::PipePreconnectedServerTable =
+    nt_io_manager::PipePreconnectedServerTable::new();
 
 /// Record (or update) `fid -> name_hash`. Replaces an existing entry for `fid`.
 pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) -> Result<(), u32> {
@@ -2671,6 +2676,22 @@ pub(crate) fn pipe_server_available_consume(server_fid: u64) -> bool {
 
 pub(crate) fn pipe_server_available_forget(server_fid: u64) -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_SERVER_AVAILABILITY)).remove(server_fid) }
+}
+
+pub(crate) fn pipe_server_preconnected_remember(server_fid: u64) -> Result<bool, u32> {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS))
+            .remember(server_fid)
+            .map_err(|_| nt_io_completion::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
+pub(crate) fn pipe_server_preconnected_take(server_fid: u64) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS)).take(server_fid) }
+}
+
+pub(crate) fn pipe_server_preconnected_forget(server_fid: u64) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(PIPE_PRECONNECTED_SERVERS)).remove(server_fid) }
 }
 
 pub(crate) fn pipe_name_hash_known(name_hash: u64) -> bool {
@@ -2976,6 +2997,8 @@ static DELAY_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_OTHER_BADGE_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_REBIND_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_REARM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass signals LSA_RPC_SERVER_ACTIVE (its essential init is complete: the LSA RPC server is
 /// up). After this, an unrecoverable fault on lsass' MAIN thread (e.g. rpcrt4 NdrSimpleTypeUnmarshall
 /// dereferencing a bogus request buffer while servicing a self-directed RPC) is CONTAINED (the loop
@@ -8773,6 +8796,18 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(IMAGE_MAP_CAP_BANK_TO_ROOT.load(Ordering::Relaxed));
     print_str(b" image-bank-fails=");
     print_u64(IMAGE_MAP_CAP_BANK_FAILS.load(Ordering::Relaxed));
+    let (w32_bank_live, w32_bank_next, w32_bank_pis, w32_bank_segments, w32_bank_fails) =
+        win32k_glue::win32k_client_cap_bank_stats();
+    print_str(b" w32-bank=");
+    print_u64(w32_bank_live);
+    print_str(b"/");
+    print_u64(w32_bank_next);
+    print_str(b"/");
+    print_u64(w32_bank_pis);
+    print_str(b"/");
+    print_u64(w32_bank_segments);
+    print_str(b" w32-bank-fails=");
+    print_u64(w32_bank_fails);
     print_str(b" shared-frames=");
     print_u64(unsafe { core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64 });
     print_str(b"/");
@@ -13400,6 +13435,14 @@ unsafe fn delay_timer_init() -> bool {
                 0,
                 0,
             );
+            let n = DELAY_TIMER_REBIND_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 12 {
+                print_str(b"[delay-bind] rebind existing notification=0x");
+                print_hex_u64(notification);
+                print_str(b" root-bound=");
+                print_delay_root_bound_notification();
+                print_str(b"\n");
+            }
         }
         return true;
     }
@@ -13472,8 +13515,28 @@ unsafe fn delay_timer_init() -> bool {
     print_u64(period);
     print_str(b" bound_badge=0x");
     print_hex_u64(DELAY_TIMER_BADGE);
+    print_str(b" root-bound=");
+    print_delay_root_bound_notification();
     print_str(b"\n");
     true
+}
+
+unsafe fn print_delay_root_bound_notification() {
+    let mut state = [0u64; win32k_glue::TCB_DEBUG_STATE_WORDS];
+    win32k_glue::tcb_read_debug_state(1, REPLY_MAIN_SLOT.load(Ordering::Relaxed), &mut state);
+    let bound = state[win32k_glue::TCB_DBG_BOUND_NOTIFICATION];
+    if bound == win32k_glue::TCB_DEBUG_NONE {
+        print_str(b"none");
+    } else {
+        print_u64(bound);
+    }
+    print_str(b" reply-bound=");
+    let reply_bound = state[win32k_glue::TCB_DBG_REPLY_BOUND_TCB];
+    if reply_bound == win32k_glue::TCB_DEBUG_NONE {
+        print_str(b"none");
+    } else {
+        print_u64(reply_bound);
+    }
 }
 
 unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
@@ -13566,6 +13629,28 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         // ARM. The comparator is written before the enable edge, with stale level status cleared on
         // both sides of the comparator write so an old assertion cannot storm as soon as we unmask.
         config |= HPET_TN_INT_ENB;
+        let trace = DELAY_TIMER_REARM_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < 24 {
+            print_str(b"[delay-rearm] #");
+            print_u64(trace + 1);
+            print_str(b" src=");
+            print_u64(source);
+            print_str(b" deadline=");
+            print_u64(deadline);
+            print_str(b" now100=");
+            print_u64(monotonic_time_100ns());
+            print_str(b" hpet-now=0x");
+            print_hex_u64(now);
+            print_str(b" target=0x");
+            print_hex_u64(target.max(now.saturating_add(1)));
+            print_str(b" cfg=0x");
+            print_hex_u64(config);
+            print_str(b" delayq=");
+            print_u64(queue.len() as u64);
+            print_str(b" root-bound=");
+            print_delay_root_bound_notification();
+            print_str(b"\n");
+        }
     } else {
         // DISARM — nothing is waiting on time, so the timer must stop delivering entirely.
         // This used to clear `Tn_INT_TYPE_CNF` (bit 1) instead, leaving `Tn_INT_ENB` set with a
@@ -22617,6 +22702,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         park();
     }
     IMAGE_FRAMES_COUNT.store(image_frame_count, Ordering::Relaxed);
+    print_str(b"[boot] root cspace size-bits=");
+    print_u64(bi.init_thread_cnode_size_bits);
+    print_str(b" empty=");
+    print_u64(bi.empty.start);
+    print_str(b"..");
+    print_u64(bi.empty.end);
+    print_str(b" user-image=");
+    print_u64(img.start);
+    print_str(b"..");
+    print_u64(img.end);
+    print_str(b" elf-frames=");
+    print_u64(image_frame_count);
+    print_str(b"\n");
 
     let mut physical_pages = 0u64;
     let mut lowest_page = u64::MAX;
@@ -26427,14 +26525,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_root_attempted = 0u64;
     let mut generic_root_started = 0u64;
     let mut generic_pci_registry_selected = false;
-    let mut generic_pci_support_driver_entry = false;
+    let mut generic_pci_provider_domain_bound = false;
     let mut generic_pci_add_device = false;
     let mut generic_pci_selected = 0u64;
     let mut generic_pci_attempted = 0u64;
-    let mut generic_pci_support_ready = 0u64;
+    let mut generic_pci_provider_export_requests = 0u64;
+    let mut generic_pci_provider_export_completions = 0u64;
+    let mut generic_pci_provider_export_rejections = 0u64;
     let mut generic_pci_add_device_count = 0u64;
     let mut generic_pci_started = 0u64;
-    let mut generic_pci_io_out32 = false;
+    let mut generic_pci_resource_accessed = false;
     let mut generic_pci_first_error = 0u32;
     let config_pnp_launch_plans = [config_pnp_plan, config_demand_pnp_plan];
     if config_pnp_launch_plans
@@ -26470,18 +26570,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         proof_pnp_spec.class,
                         proof_pnp_spec.driver_object_path.as_str(),
                     ) {
-                        let pci_support_ready = spec_has_pci_devnode
-                            && ((dc.support_status == 0 && (dc.support_verdict & V_SUCCESS) != 0)
-                                || driver_launch::hosted_driver_video_port_initialized(
-                                    dc.driver_id,
-                                ));
-                        generic_pci_support_driver_entry |= pci_support_ready;
+                        let provider_before = driver_launch::hosted_provider_sharing_evidence();
                         let start_report = start_inline_driver_service_devnodes(
                             &dc,
                             proof_pnp_spec,
                             proof_pnp_plan,
                             HostedPnpStartOptions::hardware_proof(),
                         );
+                        let provider_after = driver_launch::hosted_provider_sharing_evidence();
                         generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
                         generic_hw_add_device |= start_report.add_device;
                         generic_hw_attempted += start_report.attempted;
@@ -26495,10 +26591,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_pci_attempted += start_report.attempted;
                             generic_pci_add_device_count += start_report.add_device_count;
                             generic_pci_started += start_report.started;
-                            if pci_support_ready {
-                                generic_pci_support_ready += start_report.attempted;
-                            }
-                            generic_pci_io_out32 |= start_report.io_port_out32;
+                            generic_pci_provider_domain_bound |=
+                                provider_after.provider_domain_bindings != 0;
+                            generic_pci_provider_export_requests =
+                                generic_pci_provider_export_requests.saturating_add(
+                                    provider_after
+                                        .provider_export_requests
+                                        .saturating_sub(provider_before.provider_export_requests),
+                                );
+                            generic_pci_provider_export_completions =
+                                generic_pci_provider_export_completions.saturating_add(
+                                    provider_after
+                                        .provider_export_completions
+                                        .saturating_sub(provider_before.provider_export_completions),
+                                );
+                            generic_pci_provider_export_rejections =
+                                generic_pci_provider_export_rejections.saturating_add(
+                                    provider_after
+                                        .provider_export_rejections
+                                        .saturating_sub(provider_before.provider_export_rejections),
+                                );
+                            generic_pci_resource_accessed |= start_report.mmio_mapped
+                                || start_report.io_port_out32
+                                || start_report.interrupt_delivered
+                                || start_report.dma_common
+                                || start_report.dma_packet_descriptors
+                                || start_report.dma_device_tx_completion_count != 0
+                                || start_report.dma_device_rx_completion_count != 0
+                                || start_report.dma_device_interrupt_cause_count != 0;
                             if generic_pci_first_error == 0 && start_report.first_error != 0 {
                                 generic_pci_first_error = start_report.first_error;
                             }
@@ -26573,14 +26693,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_pci_selected);
         print_str(b" pci_attempted=");
         print_u64(generic_pci_attempted);
-        print_str(b" pci_support=");
-        print_u64(generic_pci_support_ready);
+        print_str(b" pci_provider_domain=");
+        print_u64(generic_pci_provider_domain_bound as u64);
+        print_str(b" pci_provider_exports=");
+        print_u64(generic_pci_provider_export_completions);
+        print_str(b"/");
+        print_u64(generic_pci_provider_export_requests);
+        print_str(b" pci_provider_rejections=");
+        print_u64(generic_pci_provider_export_rejections);
         print_str(b" pci_add=");
         print_u64(generic_pci_add_device_count);
         print_str(b" pci_started=");
         print_u64(generic_pci_started);
-        print_str(b" pci_io_out32=");
-        print_u64(generic_pci_io_out32 as u64);
+        print_str(b" pci_resource_accessed=");
+        print_u64(generic_pci_resource_accessed as u64);
         print_str(b" pci_first_error=0x");
         print_hex(generic_pci_first_error);
         print_str(b" root_attempted=");
@@ -26641,6 +26767,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.singleton_providers);
         print_str(b" provider-domains=");
         print_u64(provider_sharing.provider_domain_bindings);
+        print_str(b" exports=");
+        print_u64(provider_sharing.provider_export_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_export_requests);
+        print_str(b" export-rejections=");
+        print_u64(provider_sharing.provider_export_rejections);
+        print_str(b" callbacks=");
+        print_u64(provider_sharing.provider_callback_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_callback_requests);
         print_str(b" singleton-overflows=");
         print_u64(provider_sharing.singleton_overflows);
         print_str(b" singleton-conflicts=");
@@ -26679,10 +26815,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     check(
-        b"exec_generic_pci_support_driver_entry",
-        generic_pci_support_driver_entry
-            && generic_pci_attempted == generic_pci_selected
-            && generic_pci_support_ready == generic_pci_selected,
+        b"exec_generic_pci_provider_domain_serviced",
+        generic_pci_provider_domain_bound
+            && generic_pci_provider_export_requests != 0
+            && generic_pci_provider_export_completions != 0
+            && generic_pci_provider_export_rejections == 0,
         &mut passed,
     );
     check(
@@ -26693,8 +26830,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     check(
-        b"exec_generic_pci_io_port_out32",
-        generic_pci_registry_selected && generic_pci_io_out32,
+        b"exec_generic_pci_resource_accessed",
+        generic_pci_registry_selected && generic_pci_resource_accessed,
         &mut passed,
     );
     check(

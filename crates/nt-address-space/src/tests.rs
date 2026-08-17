@@ -1039,6 +1039,38 @@ fn fixed_vm_map_reports_committed_access_permissions() {
 }
 
 #[test]
+fn private_guard_fault_plan_clears_guard_for_permitted_access() {
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_READWRITE | PAGE_GUARD, FaultAccess::Write),
+        Some(PAGE_READWRITE)
+    );
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_READONLY | PAGE_GUARD, FaultAccess::Read),
+        Some(PAGE_READONLY)
+    );
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_EXECUTE | PAGE_GUARD, FaultAccess::Execute),
+        Some(PAGE_EXECUTE)
+    );
+}
+
+#[test]
+fn private_guard_fault_plan_rejects_non_guard_or_underlying_violation() {
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_READWRITE, FaultAccess::Write),
+        None
+    );
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_READONLY | PAGE_GUARD, FaultAccess::Write),
+        None
+    );
+    assert_eq!(
+        private_guard_page_fault_plan(PAGE_READWRITE | PAGE_GUARD, FaultAccess::Execute),
+        None
+    );
+}
+
+#[test]
 fn fixed_vm_map_protect_rounds_range_and_returns_old_protection() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map

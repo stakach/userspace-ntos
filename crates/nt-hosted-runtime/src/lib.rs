@@ -19,6 +19,7 @@ pub const NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x70;
 pub const NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x88;
 pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
 pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
+pub const NDIS_MINIPORT_INTERRUPT_LEN_X64: u64 = 0x98;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
@@ -282,6 +283,7 @@ pub enum HostedProviderExportSideEffect {
     None,
     NdisInitializeWrapper,
     NdisMiniportRegistration,
+    NdisMiniportInterruptDeregistration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,7 +505,11 @@ pub fn hosted_provider_export_marshal_policy(
             },
             Scalar,
         ]),
-        "NdisMDeregisterInterrupt" => void_export_policy(&[CallerInOutMiniportInterrupt]),
+        "NdisMDeregisterInterrupt" => export_policy_with_effect_and_result(
+            &[CallerInOutMiniportInterrupt],
+            HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisMRegisterInterrupt" => export_policy(&[
             CallerInOutMiniportInterrupt,
             ProviderHandle,
@@ -1281,6 +1287,40 @@ mod tests {
                 length_arg: 1,
                 physical_address_arg: 4,
             }
+        );
+    }
+
+    #[test]
+    fn ndis_interrupt_policies_use_typed_miniport_interrupt_storage() {
+        assert_eq!(NDIS_MINIPORT_INTERRUPT_LEN_X64, 0x98);
+
+        let register =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMRegisterInterrupt").unwrap();
+        assert_eq!(register.argument_count, 7);
+        assert_eq!(
+            register.args[0],
+            HostedProviderArgumentMarshal::CallerInOutMiniportInterrupt
+        );
+        assert_eq!(register.stack_qwords, 3);
+        assert_eq!(
+            register.result_semantics,
+            HostedProviderExportResultSemantics::NtStatus
+        );
+
+        let deregister =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMDeregisterInterrupt").unwrap();
+        assert_eq!(deregister.argument_count, 1);
+        assert_eq!(
+            deregister.args[0],
+            HostedProviderArgumentMarshal::CallerInOutMiniportInterrupt
+        );
+        assert_eq!(
+            deregister.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+        assert_eq!(
+            deregister.side_effect,
+            HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration
         );
     }
 

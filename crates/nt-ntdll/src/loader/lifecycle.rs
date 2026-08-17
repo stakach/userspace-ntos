@@ -114,7 +114,9 @@ pub struct ImportReferenceEdge {
 ///
 /// A dependency first mapped for the importing module consumes the new module's initial load count.
 /// A dependency that was already present needs one additional count. Duplicate descriptors or
-/// delay descriptors inside the same importing module still publish only one edge.
+/// repeated references inside the same importing module still publish only one edge. Delay-load
+/// descriptors are intentionally excluded; the runtime `LoadLibrary`/`LdrLoadDll` path owns their
+/// references when the delayed function is actually called.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportReferenceLedger<const N: usize> {
     entries: [ImportReferenceEdge; N],

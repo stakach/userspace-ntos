@@ -1237,14 +1237,15 @@ read bytes too. The active failure remains a real rpcrt4 context mismatch, now f
 `{e44be6c8-a98d-40e7-8db7-220913505ca7}`; do not add UUID or service fallback handling.
 
 Current chained-callback context slice: `.tmp/boot-chained-callback-context-20260811-044456.log`
-removes the early winlogon api0 callback crash by separating the chained callback's physical
-callout context from the inherited outer completion context. When win32k immediately yielded a
-second callback while an outer callback was parked, the executive had been placing the next
-`UCALLOUT_FRAME` under the stale outer saved stack. Chained redirects now read the live client TCB,
-use that current stack and syscall-return IP for the dispatcher callout frame, and keep the inherited
-outer saved context only for final `NtCallbackReturn` completion. Local validation is green
+removed the early winlogon api0 callback crash, but the later 2026-08-17 desktop retry proved its
+current-stack half was only an intermediate workaround. ReactOS restores the user-mode stack pointer
+held in the outer trap frame before the next `KeUserModeCallback`; it does not lay the next
+`UCALLOUT_FRAME` under the transient `ZwCallbackReturn` user32 frame. Chained redirects now reuse the
+saved outer trap context for both the dispatcher callout frame and final `NtCallbackReturn`
+completion, while the live callback-return context remains relevant only for servicing nested
+syscalls made by the callback itself. Local validation for the original slice was green
 (`cargo fmt --all`, `cargo test -p nt-user-callback -- --nocapture`, executive `cargo check`, and
-`git diff --check`). Boot validation confirms no `cb-crash`, no `dead client pi=2`, and real
+`git diff --check`). Boot validation confirmed no `cb-crash`, no `dead client pi=2`, and real
 winlogon base desktop paint (`desktop-bg 768/768`). This is still not a shell proof:
 `explorer total=0` throughout the census, and the quiet-period red edge has moved to generic native
 syscall/RPC service behavior (`SSN=100`, `SSN=56`, LSA `SSN=203`, and RPCRT4 context faults). The
@@ -1286,6 +1287,20 @@ services/LSASS IO-completion and registry traffic continue. Review adjustment: t
 now the real Reply-cap/MCS scheduling-context handoff in the microkernel composite reply+receive
 path, so lower-priority hosted clients that just regained their donated context actually resume
 before unrelated executive traffic monopolises the receive loop.
+
+Serialized retry `.tmp/run-desktop-b3-lazy-delay-20260817-full.log` proves that the native
+delay-load cleanup moved the same frontier past the previous LSA readiness wall without
+reintroducing service, image, userinit, explorer, or paint shortcuts. Winlogon creates and waits on
+`\BaseNamedObjects\lsa_rpc_server_active`; LSASS later opens the same dispatcher object and signals
+it, waking the winlogon waiter. The route is not resource-limited: the proof keeps the root CSpace
+healthy, shows the dynamic win32k cap bank at `w32-bank=17936/17936/4/8` with `w32-bank-fails=0`,
+and keeps the B3 provider/driver gates green. The new red edge is later: winlogon completes the
+`Winlogon\Notify` `ScCertProp`/`Schedule` `DllName=wlnotify.dll` registry reads, while LSASS serves
+a real `\lsarpc` bind and its per-connection worker parks for the next server-side read after
+writing a `bind_ack`. No userinit or explorer process is spawned yet. Review adjustment: continue
+with scheduler/reply handoff and ordinary pipe/RPC completion semantics so the already-runnable
+post-LSA clients resume naturally; do not add executable-order, profile, userinit, explorer, or
+notification-package fallbacks.
 
 ### A. SCM-Controlled Service Startup
 
@@ -7438,6 +7453,193 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Review adjustment: rerun `./run.sh --desktop` with the void-result fix and resource-list trace.
   B3 closes only when real E1000 StartDevice reaches DMA common-buffer descriptor allocation and
   desktop boot continues without provider-domain route or marshal failures.
+  The serialized desktop attempt `.tmp/run-desktop-20260817-194319.log` moved that frontier forward:
+  the provider-domain `NdisMRegisterInterrupt` call now completes with `STATUS_SUCCESS`, backed by a
+  typed `NDIS_MINIPORT_INTERRUPT` marshal/copyback contract and generic HAL/IoConnectInterrupt
+  traces. The remaining wall in that run is immediately after the successful interrupt registration:
+  the dependent e1000 callback thread faults with `RIP=0`, before the post-register
+  `NICApplyInterruptMask`/`NICEnableTxRx` path can finish. Review adjustment: validate the provider
+  component-service syscall ABI fix that preserves nonvolatile `r15` across nested export/callback
+  gates; if that still walls, inspect the post-register e1000 MMIO register writes and callback
+  return frame with bounded generic traces rather than adding image-specific fallbacks.
+  Follow-up durable interrupt-state slice: `CallerInOutMiniportInterrupt` no longer uses transient
+  provider-export scratch storage. The executive now keeps a provider-pool
+  `NDIS_MINIPORT_INTERRUPT` shadow keyed by provider instance, dependent instance, and the
+  dependent component pointer, passes that stable provider-domain pointer to NDIS, copies the
+  provider-populated object back to the dependent miniport storage, and frees the shadow only through
+  the typed `NdisMDeregisterInterrupt` export side effect. Pump-wall diagnostics now print the
+  walled component register frame and top stack qwords through the generic hosted-component stack
+  translator. Review adjustment: rerun serialized `./run.sh --desktop`; if the dependent callback
+  still faults with `RIP=0`, use the new pump wall/provider-callback traces to decide whether the
+  next fix is the provider-callback return frame or provider-owned interrupt dispatch routing.
+  Follow-up provider-call ABI slice: the component-service provider export syscall path now passes
+  the Win64 fourth argument through the actual syscall MR3 carrier and copies the returned MR3 back
+  from `r15` before restoring nonvolatile registers. The previous frame trace showed stale `r15`
+  data being interpreted as a provider-export argument; after the fix, the serialized desktop run
+  `.tmp/run-desktop-b3-call-on4-mr3-20260817.log` shows sane NDIS export arguments,
+  `NdisMRegisterInterrupt` completing through the provider domain, and E1000 reaching real
+  AddDevice/StartDevice with generic interrupt and DMA-descriptor evidence. The old private
+  support-driver and port-only PCI gates are being retired in favor of provider-domain export
+  service evidence plus generic PCI resource access: a registry-selected PCI miniport may use MMIO
+  rather than `out32`, and callable NDIS must be proven by dynamic provider-domain export
+  requests/completions instead of private `ndis.sys` dependency `DriverEntry` state. Review
+  adjustment: the follow-up desktop proof
+  `.tmp/run-desktop-b3-pool-8m-20260817-full.log` moved past the old low-address fault, reached
+  Explorer shell paint traffic, started `kbswitch.exe`, then stopped at a real resource ceiling:
+  win32k USER-heap mapping for `pi=13` failed at frame `0x25e` with `root CSpace exhausted`. The
+  current cleanup moves win32k shared-area mapping caps into a lazily allocated per-client CNode
+  after each successful map, so root CSpace usage stays proportional to active kernel objects rather
+  than every shared page alias. Rerun the desktop gate after this cap-bank slice and keep the stale
+  private support-driver/port-only PCI checks retired in favor of provider-domain and resource
+  evidence.
 
   Validation for the provider-owned NDIS miniport dispatch route slice so far: `cargo fmt --all`,
   `cargo test -p nt-hosted-runtime`, `./components/ntos-executive/build.sh`, and `git diff --check`.
+
+  B3 win32k cap-bank and native delay-load cleanup (2026-08-17, in progress): the serialized
+  desktop retry `.tmp/run-desktop-b3-win32k-bank-segments-r18-20260817-full.log` proves the
+  resource-ceiling cleanup is on the right boundary. The extern-rootserver XL CNode is back to
+  radix 18 so the boot ELF stays below BOOTBOOT limits, while win32k shared USER/GDI mappings move
+  their retained caps into lazily allocated per-client cap-bank CNodes. The run boots past BOOTBOOT,
+  publishes `w32-bank=8968/8968/2/4` with `w32-bank-fails=0`, leaves root CSpace headroom, and keeps
+  the generic B3 provider gates green: registry-selected hardware, PCI provider-domain service,
+  AddDevice/StartDevice, resource access, interrupt/DPC delivery, and DMA packet descriptor evidence.
+  The real profile/default-user/hive setup also reaches the Winlogon LSA readiness boundary.
+
+  The remaining blocker in that proof is no longer CSpace or provider-domain routing. Winlogon
+  correctly creates and waits on `\BaseNamedObjects\lsa_rpc_server_active`; services.exe and
+  lsass.exe continue real image loading, but no `NtOpenEvent`/`NtSetEvent` for
+  `LSA_RPC_SERVER_ACTIVE` appears before the run stalls, so `userinit.exe` and `explorer.exe` are not
+  spawned in that proof. ReactOS' native route is for LSASS to reach `LsarStartRpcServer`,
+  `RpcServerListen`, create/open the same named event, and signal it. The kernel must therefore
+  repair the LSASS/runtime service gap that prevents that path, not synthesize the event or launch
+  the shell by hand.
+
+  Cleanup adjustment: our ntdll target loader no longer eagerly binds delay-import descriptors while
+  snapping ordinary imports. Delay imports now remain lazy and resolve through the real runtime
+  `LoadLibrary`/`LdrLoadDll` path when the delayed function is called; unload/reference DFS excludes
+  delay descriptors until that runtime load has actually happened. This removes the old eager
+  loader shortcut that could drag broad shell/COM/image-codec DLL graphs into services/LSASS before
+  LSASS readiness. Validation for this cleanup: `./scripts/build_ntdll_dll.sh`,
+  `cargo test -p nt-ntdll`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`. The
+  direct host `cargo test --manifest-path crates/nt-ntdll-dll/Cargo.toml` path remains invalid on
+  this aarch64 host because the DLL crate is x86_64/no-std target-only; the target DLL build is the
+  accepted gate. Review adjustment: rerun serialized `./run.sh --desktop` after the lazy delay-load
+  cleanup. If LSASS still does not signal `LSA_RPC_SERVER_ACTIVE`, inspect the first real lazy
+  delay-load or ntdll/kernel service failure that prevents LSASS from entering `LsarStartRpcServer`.
+
+  Follow-up desktop recovery status (2026-08-17):
+
+  - `[x]` NPFS client-before-listen handling is now exact CCB state, not a service-specific wakeup.
+    `nt-io-manager` owns a host-tested `PipePreconnectedServerTable`; client opens that complete
+    before a server arms `FSCTL_PIPE_LISTEN` remember the exact server file id, and the later listen
+    consumes that one record through the normal redrive path. This removed the security-service pipe
+    timeout without advertising unrelated server availability. Validation: `cargo test -p
+    nt-io-manager preconnected`, `cargo test -p nt-io-manager before_listen`, and serialized desktop
+    proof `.tmp/run-desktop-preconnected-pipe-20260817-full.log`, which moved the old pipe wall to an
+    LSASS stack-guard fault.
+  - `[x]` Private `PAGE_GUARD` faults are now handled generically by the VM layer and executive
+    fault path. `nt-address-space` exposes `private_guard_page_fault_plan`, and the executive clears
+    the guard bit on committed private pages when the underlying protection permits the faulting
+    access. For hosted thread stacks it also advances the faulting thread's `TEB.StackLimit` by
+    badge-derived TEB lookup. This is not an LSASS special case; it is NT stack-guard semantics for
+    any hosted private stack. Validation: `cargo test -p nt-address-space guard`, `cargo test -p
+    nt-address-space`, `./components/ntos-executive/build.sh`, and serialized desktop proof
+    `.tmp/run-desktop-guard-page-20260817-full.log`.
+  - `[~]` Current frontier: the guard-page proof reaches authenticated logon, real profile copy,
+    `NtLoadKey`, `WlxActivateUserShell`, and a genuine `CreateProcessAsUserW(userinit.exe)`.
+    `userinit.exe` is parked during `NtUserProcessConnect` after `[retype: cnode pool exhausted]`;
+    the same gate shows root CSpace slots and untyped memory still available, so the active wall is
+    the seL4 model's kernel-side CNode backing for real CapTable objects. A direct
+    extern-rootserver `MAX_CNODES=64` experiment is rejected: it made `sys/core` too large and
+    `./run.sh --desktop` failed immediately with `BOOTBOOT-PANIC: Kernel is too big (EFI Load
+    Error)`. The corrected path keeps extern-rootserver `MAX_CNODES=23` and moves the high-volume
+    retained win32k USER/GDI shared-view mapping caps back into the XL root CSpace after successful
+    mapping, preserving scarce kernel CNode backing for image map-cap banks and other real child
+    CapTables. Review adjustment: rebuild rust-micro/executive serially, rerun `./run.sh
+    --desktop`, and require no BOOTBOOT failure, no `[retype: cnode pool exhausted]`,
+    `w32-bank-fails=0`, `image-bank-fails=0`, `exec_userinit_gdi_shared_table_mapped`,
+    `exec_explorer_process_spawned`, and `exec_explorer_shell_chrome_painted` to prove the
+    CNode-capacity fix rather than adding any shell launch fallback.
+  - `[x]` Follow-up capacity recovery result: the serialized desktop retry
+    `.tmp/run-desktop-win32k-root-retain-20260817-full.log` clears the BOOTBOOT-size failure and the
+    kernel CNode backing wall without increasing extern-rootserver `MAX_CNODES`. The run reaches
+    LSASS SRM bring-up with `w32-bank-fails=0`, `image-bank-fails=0`, no
+    `[retype: cnode pool exhausted]`, and root CSpace headroom still available. The root-retained
+    win32k USER/GDI shared-view cap model is therefore the accepted capacity direction.
+  - `[x]` Follow-up LSASS readiness result: the serialized desktop traces
+    `.tmp/run-desktop-lsass-csr-tail-20260817-full.log` and
+    `.tmp/run-desktop-delay-rearm-20260817-full.log` move past the old CSR/thread frontier. LSASS
+    returns from the real `\Windows\ApiPort` thread request, creates `\LsaAuthenticationPort`,
+    signals `lsa_rpc_server_active`, and starts real `\pipe\lsarpc` traffic. The delay path is also
+    cleared: bounded traces show the root-bound delay timer, delay rearm, and timer notification
+    deliveries working, so the current blocker is not LSASS readiness and not `NtDelayExecution`.
+  - `[x]` Historical frontier: after genuine `NtUserSwitchDesktop` background paint, winlogon calls
+    `NtUserSetWindowStationUser` (`SSN 0x1286`). ReactOS win32k returns `FALSE` for an invalid
+    window-station handle, which matches the trace argument evidence (`hWindowStation=0`), but the
+    raw user32 syscall stub then resumes with `rsp=0x3` and faults at the stub `ret`
+    (`user32+0xa0c4c`). This points at generic hosted syscall/user-context corruption around raw
+    user32 syscall return, potentially after win32k user callbacks, not shell-launch policy or a
+    winlogon-only fallback. The quiesce stack reporter now treats invalid hosted stack pointers as
+    evidence and skips stack probing instead of faulting the executive while reporting the corrupted
+    user context. Review adjustment: rerun the serialized desktop gate, use the invalid-stack and
+    syscall context evidence to find the first save/restore mismatch, and keep the boundary exact:
+    do not synthesize `SetWindowStationUser` success, do not manufacture shell launches, and do not
+    substitute a stack pointer without proving the correct kernel context transition.
+  - `[~]` Follow-up callback-context evidence: `.tmp/run-desktop-callback-rsp-20260817-full.log`
+    proves the chained win32k user-callback restore path writes a valid outer stack back to the
+    winlogon TCB (`saved-rsp/out-rsp=0x1000105c3cf8`) before `NtUserSwitchDesktop` returns. That
+    narrows the `rsp=0x3` failure to the next raw hosted syscall entry/reply boundary rather than
+    the callback frame transfer itself. Added a rust-micro regression,
+    `reply_cap_fault_reply_restores_unknown_syscall_context`, which drives the cap-based reply path
+    used by the executive and verifies an UnknownSyscall fault reply restores `RAX`, resume IP,
+    `RSP`, and flags from MR0/MR15/MR16/MR17. Added bounded `[interactive-ssn-ctx]` tracing at the
+    executive high-SSN service boundary so the next desktop run can prove whether `SSN 0x1286`
+    arrives with a valid MR16 stack and corrupts on reply, or arrives already poisoned.
+  - `[~]` Follow-up syscall-reply context fix: `.tmp/run-desktop-interactive-ctx-20260817-full.log`
+    proves `SSN 0x1286` arrives at the executive with `sp=0x3` after a valid callback restore, so
+    the corruption happened before the service body for `NtUserSetWindowStationUser`. The immediate
+    fix under validation makes the ordinary hosted UnknownSyscall reply path capture all 18 incoming
+    fault registers at service entry and restage that saved frame at reply time, changing only
+    `RAX`, resume IP, `RSP`, and flags. This removes the stale-IPC-buffer dependency that nested
+    win32k/LPC/component dispatches can clobber while a raw user32 syscall is parked in the
+    executive. Native seL4-call ntdll transport remains a normal IPC reply; this full-frame restage
+    is for real Windows syscall faults. Review adjustment: run the serialized desktop gate and
+    require the post-`NtUserSwitchDesktop` raw user32 path to enter the next syscall with a valid
+    stack. If later waits show the same shape, promote the compact parked-wait resume records
+    (`resume_ip/sp/flags/status`) to carry the full saved syscall reply context as the same generic
+    transport rule.
+  - `[x]` Follow-up callback ABI check: `.tmp/run-desktop-syscall-reply-context-20260817-full.log`
+    shows the full-frame synchronous reply fix is necessary cleanup but not sufficient for the
+    `rsp=0x3` frontier: `SSN 0x1286` still enters with `caller-sp=3`, while the last API15
+    completion trace has `out-rsp=0x1000105c3cf8`. The callback entry ABI is not the repair target:
+    ReactOS `KiCallUserMode`/`KiUserCallbackDispatcher` entry zeroes the nonvolatile GPRs for the
+    callback transfer, and `nt-user-callback` keeps that behavior in
+    `callback_redirect_context_uses_scrubbed_dispatcher_entry`. The bad `sp=3` evidence is instead a
+    stale high-IPC-slot problem at raw hosted UnknownSyscall entry.
+  - `[x]` Follow-up authoritative UnknownSyscall context repair: raw hosted Windows syscalls now read
+    the faulter's authoritative `seL4_TCB_ReadRegisters` frame at service entry, convert the
+    `seL4_UserContext` layout back to x86_64 `seL4_UnknownSyscall_Msg` layout, and restage the
+    executive receive slots before any handler reads `R8/R9/R10/SP/FLAGS`. Native ntdll seL4-call
+    transport remains on the existing normalized IPC path. Validation: `cargo fmt --all`, `cargo test
+    -p nt-user-callback`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+    `.tmp/run-desktop-tcb-restage-20260817-full.log`. The proof reaches the old wall and shows
+    `[unknown-syscall-tcb] #620` correcting stale message slots
+    (`msg-sp=0x3`, `msg-r8/r9=0x24/0xd`, `msg-flags=0x77`) to the TCB frame
+    (`tcb-sp=0x1000105c3ca8`, `tcb-r8/r9=0`, `tcb-flags=0x202`); the following
+    `[interactive-ssn-ctx]` for `SSN 0x1286` has a valid stack, win32k returns success, and no
+    `cr2=0x3` stub-ret fault follows. The same run continues into real post-LSA winlogon work,
+    including repeated USER/GDI paint/cursor calls, `msgina`, `shsvcs`, and `uxtheme` demand loads,
+    and 611 user-callback push/unwind pairs with no callback sequence leak.
+  - `[~]` Current frontier after the TCB-restage repair: the desktop run advances far past the old
+    `SetWindowStationUser` corruption, but the interrupted quiesce gate does not yet reach the final
+    sentinel or explorer launch. Census at quiesce has no resource wall (`ut-fails=0`,
+    `image-bank-fails=0`, `w32-bank-fails=0`, `shared-full=0`), winlogon at 1148 syscalls, LSASS at
+    427 syscalls, and explorer still at zero. The last useful forward progress is LSASS RPC/thread
+    pool work followed by a short `NtDelayExecution` park, then the gate enters boot-hive checkpoint
+    (`SOFTWARE`, `SECURITY`, `SAM`) and was manually interrupted before summary. Review adjustment:
+    make the quiesce gate finish reliably after hive checkpointing, then continue the real winlogon
+    GINA/logon path until `WlxActivateUserShell`, profile hive load, genuine userinit launch, and
+    explorer chrome pixels reappear.

@@ -44,7 +44,7 @@ use nt_hosted_runtime::{
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan,
     NdisMiniportCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_INTERRUPT_LEN_X64,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -114,11 +114,12 @@ pub const FSD_IMAGE_FRAMES: u64 = 64;
 /// The component ABI places the pool after the image lane; image mapping must not cross it.
 pub const FSD_IMAGE_MAX_FRAMES: u64 = (FSD_POOL_VADDR - FSD_CODE_VA) / 0x1000;
 
-/// The FSD pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter @+0, data @
-/// +0x1000). Hosted FSD/NDIS boot drivers currently fit comfortably inside one mapped 2 MiB window;
-/// keep the allocation honest so unused per-instance frames do not consume root untyped headroom.
+/// The hosted driver pool arena the `ExAllocatePool*` trampolines allocate from (counter @+0, free
+/// list @+8, data @+0x1000). Real NT boot drivers share the kernel's nonpaged-pool capacity; the
+/// hosted provider-domain model keeps per-component isolation, so each component needs enough pool
+/// headroom for real provider-owned allocations such as NDIS packet/buffer pools.
 pub const FSD_POOL_VADDR: u64 = 0x0000_0100_0E80_0000;
-pub const FSD_POOL_FRAMES: u64 = 512; // 2 MiB, pre-mapped
+pub const FSD_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
 
 /// The component's own stack (32 frames = 128 KiB, own PT). An FSD's dispatch call chains
 /// (NpFsdCreate → Np*) are moderately deep.
@@ -204,6 +205,7 @@ const _: () = assert!(FSD_SHARED_VADDR + FSD_SHARED_FRAMES * 0x1000 <= FSD_ARG_V
 pub const FSD_ARG_VADDR: u64 = 0x0000_0100_0F3A_0000;
 pub const FSD_ARG_FRAMES: u64 = 4;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
+const _: () = assert!(FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000 <= FSD_STACK_VADDR);
 
 // --- PER-INSTANCE executive-side load/comm VAs (multi-driver de-singleton) --------------------
 //
@@ -266,7 +268,7 @@ impl ExecVaWindow {
             Some(ExecVaWindow {
                 code_va: base,                 // 256 KiB image window (fits in the first 2 MiB PT)
                 stack_va: base + 0x0040_0000,  // main component stack (128 KiB, own PT)
-                pool_va: base + 0x0080_0000,   // POOL (2 MiB, own PT)
+                pool_va: base + 0x0080_0000,   // POOL (8 MiB max, own PTs)
                 data_va: base + 0x0030_0000,   // DATA (4 frames)
                 shared_va: base + 0x0038_0000, // SHARED (1 frame)
                 arg_va: base + 0x003A_0000,    // ARG (4 frames)
@@ -275,6 +277,8 @@ impl ExecVaWindow {
         }
     }
 }
+
+const _: () = assert!(0x0080_0000 + FSD_POOL_FRAMES * 0x1000 <= FSD_EXEC_STRIDE);
 
 // --- shared-page offsets ---------------------------------------------------------------------
 
@@ -642,6 +646,11 @@ static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const WDM_FORWARD_TRACE_CAP: u64 = 64;
 static PROVIDER_RESOURCE_LIST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_RESOURCE_LIST_TRACE_CAP: u64 = 16;
+static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
+static HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP: u64 = 16;
 
 #[inline]
 fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
@@ -2326,6 +2335,27 @@ fn component_to_exec_va_for_instance(
     })
 }
 
+pub(crate) unsafe fn hosted_component_stack_qword(
+    shared_va: u64,
+    component_rsp: u64,
+    qword_index: u64,
+) -> Option<u64> {
+    let byte_offset = qword_index.checked_mul(8)?;
+    let component_va = component_rsp.checked_add(byte_offset)?;
+    if component_va < FSD_STACK_VADDR || component_va.checked_add(8)? > FSD_STACK_VADDR + FSD_STACK_BYTES
+    {
+        return None;
+    }
+    let (_, inst) = instance_by_shared_va(shared_va)?;
+    if inst.exec_stack_va == 0 {
+        return None;
+    }
+    let exec_va = inst
+        .exec_stack_va
+        .checked_add(component_va - FSD_STACK_VADDR)?;
+    Some(core::ptr::read_volatile(exec_va as *const u64))
+}
+
 fn exec_pool_to_component_va(exec_pool_va: u64, exec_va: u64) -> Option<u64> {
     if exec_va < exec_pool_va {
         return None;
@@ -2651,6 +2681,77 @@ fn print_hex64(value: u64) {
             b'a' + (nib - 10)
         });
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_hosted_hal_interrupt_vector(
+    interface_type: u32,
+    bus_number: u32,
+    bus_interrupt_level: u32,
+    bus_interrupt_vector: u32,
+    granted_vector: u32,
+    irql: u8,
+    affinity: u64,
+    result: u32,
+) {
+    let trace = HOSTED_INTERRUPT_VECTOR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_INTERRUPT_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-interrupt] HalGetInterruptVector if/bus=");
+    print_u64(interface_type as u64);
+    print_str(b"/");
+    print_u64(bus_number as u64);
+    print_str(b" level/vector=");
+    print_u64(bus_interrupt_level as u64);
+    print_str(b"/");
+    print_u64(bus_interrupt_vector as u64);
+    print_str(b" grant=");
+    print_u64(granted_vector as u64);
+    print_str(b" out-irql=");
+    print_u64(irql as u64);
+    print_str(b" out-aff=");
+    print_hex64(affinity);
+    print_str(b" result=");
+    print_u64(result as u64);
+    print_str(b"\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_hosted_io_connect_interrupt(
+    interrupt_obj_out: u64,
+    service_routine: u64,
+    service_context: u64,
+    vector: u32,
+    granted_vector: u32,
+    affinity: u64,
+    granted_affinity: u64,
+    projection: u64,
+    status: i32,
+) {
+    let trace = HOSTED_INTERRUPT_CONNECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_INTERRUPT_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-interrupt] IoConnectInterrupt out=");
+    print_hex64(interrupt_obj_out);
+    print_str(b" routine/context=");
+    print_hex64(service_routine);
+    print_str(b"/");
+    print_hex64(service_context);
+    print_str(b" vector grant=");
+    print_u64(vector as u64);
+    print_str(b"/");
+    print_u64(granted_vector as u64);
+    print_str(b" affinity grant=");
+    print_hex64(affinity);
+    print_str(b"/");
+    print_hex64(granted_affinity);
+    print_str(b" projection=");
+    print_hex64(projection);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b"\n");
 }
 
 fn print_tcb_debug_opt(value: u64) {
@@ -2982,9 +3083,10 @@ static mut BUGCHECK_JB: [u64; 3] = [0; 3];
 // The setjmp/longjmp pair. Written in assembly on purpose: the escape abandons npfs' frames, so no
 // Rust value may be live across it. `fsd_guarded_call` saves every Win64 callee-saved GPR, records
 // (pop-base, resume-address) in the jump buffer, then calls `handler(devobj, irp)` with a forced
-// Win64 call frame (`rsp` 16-byte aligned before `call`, plus 32 bytes of shadow space). Both the
-// normal return and the longjmp land on the SAME epilogue, so the register file is restored either
-// way.
+// Win64 call frame (`rsp` 16-byte aligned before `call`, plus 32 bytes of shadow space). Normal
+// returns restore the saved pop-base from that owned call frame; the longjmp path restores it from
+// the explicit jump buffer. That keeps the epilogue independent of any hosted-driver preservation of
+// scratch state across nested executive/provider calls.
 core::arch::global_asm!(
     ".text",
     ".globl fsd_guarded_call",
@@ -2998,17 +3100,22 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "mov r15, r9",
-    "lea rax, [rip + 9f]",
-    "mov [r15], rsp",
+    "mov r11, rsp",
+    "lea rax, [rip + 11f]",
+    "mov [r15], r11",
     "mov [r15 + 8], rax",
     "mov r10, rcx",
     "mov rcx, rdx",
     "mov rdx, r8",
     "and rsp, -16",
-    "sub rsp, 0x20",
+    "sub rsp, 0x30",
+    "mov [rsp + 0x20], r11",
     "call r10",
-    "9:", // the longjmp lands here and uses the same pop-base restore as a normal return.
+    "mov rsp, [rsp + 0x20]",
+    "jmp 12f",
+    "11:",
     "mov rsp, [r15]",
+    "12:",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -3033,11 +3140,12 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    "mov r11, rsp",
     "mov r14, [rsp + 0x68]",
     "mov r13, [rsp + 0x70]",
     "mov r15, [rsp + 0x78]",
-    "lea rax, [rip + 29f]",
-    "mov [r15], rsp",
+    "lea rax, [rip + 21f]",
+    "mov [r15], r11",
     "mov [r15 + 8], rax",
     "mov r10, rcx",
     "mov rcx, rdx",
@@ -3045,7 +3153,7 @@ core::arch::global_asm!(
     "mov r8, r9",
     "mov r9, r14",
     "and rsp, -16",
-    "sub rsp, 0x60",
+    "sub rsp, 0x70",
     "mov rax, [r13]",
     "mov [rsp + 0x20], rax",
     "mov rax, [r13 + 0x08]",
@@ -3062,9 +3170,13 @@ core::arch::global_asm!(
     "mov [rsp + 0x50], rax",
     "mov rax, [r13 + 0x38]",
     "mov [rsp + 0x58], rax",
+    "mov [rsp + 0x60], r11",
     "call r10",
-    "29:",
+    "mov rsp, [rsp + 0x60]",
+    "jmp 22f",
+    "21:",
     "mov rsp, [r15]",
+    "22:",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -6914,11 +7026,35 @@ extern "win64" fn s_io_connect_interrupt(
             || vector != granted_vector
             || (affinity != 0 && granted_affinity != 0 && affinity != granted_affinity)
         {
-            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+            let status = 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+            trace_hosted_io_connect_interrupt(
+                interrupt_obj_out as u64,
+                service_routine,
+                service_context,
+                vector,
+                granted_vector,
+                affinity,
+                granted_affinity,
+                0,
+                status,
+            );
+            return status;
         }
         let projection = pool_alloc(0x20);
         if projection == 0 {
-            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+            let status = 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+            trace_hosted_io_connect_interrupt(
+                interrupt_obj_out as u64,
+                service_routine,
+                service_context,
+                vector,
+                granted_vector,
+                affinity,
+                granted_affinity,
+                0,
+                status,
+            );
+            return status;
         }
         write_unaligned(projection as *mut u32, vector);
         write_unaligned((projection + 8) as *mut u64, service_routine);
@@ -6937,6 +7073,17 @@ extern "win64" fn s_io_connect_interrupt(
         write_volatile(
             (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
             service_context,
+        );
+        trace_hosted_io_connect_interrupt(
+            interrupt_obj_out as u64,
+            service_routine,
+            service_context,
+            vector,
+            granted_vector,
+            affinity,
+            granted_affinity,
+            projection,
+            0,
         );
         0
     }
@@ -10835,7 +10982,7 @@ extern "win64" fn s_hal_translate_bus_address(
 extern "win64" fn s_hal_get_interrupt_vector(
     interface_type: u32,
     bus_number: u32,
-    _bus_interrupt_level: u32,
+    bus_interrupt_level: u32,
     bus_interrupt_vector: u32,
     irql_out: u64,
     affinity_out: u64,
@@ -10847,6 +10994,16 @@ extern "win64" fn s_hal_get_interrupt_vector(
             || bus_number
                 != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
         {
+            trace_hosted_hal_interrupt_vector(
+                interface_type,
+                bus_number,
+                bus_interrupt_level,
+                bus_interrupt_vector,
+                0,
+                0,
+                0,
+                0,
+            );
             return 0;
         }
         let granted_vector =
@@ -10854,19 +11011,39 @@ extern "win64" fn s_hal_get_interrupt_vector(
         if granted_vector == 0
             || (bus_interrupt_vector != 0 && bus_interrupt_vector != granted_vector)
         {
+            trace_hosted_hal_interrupt_vector(
+                interface_type,
+                bus_number,
+                bus_interrupt_level,
+                bus_interrupt_vector,
+                granted_vector,
+                0,
+                0,
+                0,
+            );
             return 0;
         }
+        let irql = granted_vector.min(0xF) as u8;
         if irql_out != 0 {
-            write_unaligned(irql_out as *mut u8, granted_vector.min(0xF) as u8);
+            write_unaligned(irql_out as *mut u8, irql);
         }
+        let mut effective_affinity = 0;
         if affinity_out != 0 {
             let affinity =
                 read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
-            write_unaligned(
-                affinity_out as *mut u64,
-                if affinity == 0 { 1 } else { affinity },
-            );
+            effective_affinity = if affinity == 0 { 1 } else { affinity };
+            write_unaligned(affinity_out as *mut u64, effective_affinity);
         }
+        trace_hosted_hal_interrupt_vector(
+            interface_type,
+            bus_number,
+            bus_interrupt_level,
+            bus_interrupt_vector,
+            granted_vector,
+            irql,
+            effective_affinity,
+            granted_vector,
+        );
         granted_vector
     }
 }
@@ -12085,6 +12262,11 @@ pub(crate) struct HostedProviderSharingEvidence {
     pub provider_domain_bindings: u64,
     pub singleton_overflows: u64,
     pub singleton_conflicts: u64,
+    pub provider_export_requests: u64,
+    pub provider_export_completions: u64,
+    pub provider_export_rejections: u64,
+    pub provider_callback_requests: u64,
+    pub provider_callback_completions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -12179,9 +12361,13 @@ struct ProviderMarshalState {
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
     resource_mapping_copyback: bool,
+    resource_state_copyback: bool,
     dma_state_copyback: bool,
     dma_free_logical: u64,
     dma_free_len: u64,
+    miniport_interrupt_provider_instance: usize,
+    miniport_interrupt_provider_component_va: u64,
+    miniport_interrupt_free_on_success: bool,
     ndis_route_index: usize,
     ndis_initialize_wrapper_handle_exec_va: u64,
 }
@@ -12206,11 +12392,38 @@ impl ProviderMarshalState {
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
             resource_mapping_copyback: false,
+            resource_state_copyback: false,
             dma_state_copyback: false,
             dma_free_logical: 0,
             dma_free_len: 0,
+            miniport_interrupt_provider_instance: usize::MAX,
+            miniport_interrupt_provider_component_va: 0,
+            miniport_interrupt_free_on_success: false,
             ndis_route_index: usize::MAX,
             ndis_initialize_wrapper_handle_exec_va: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderMiniportInterruptShadow {
+    present: bool,
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+    provider_component_va: u64,
+    bytes: u64,
+}
+
+impl HostedProviderMiniportInterruptShadow {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider_instance: 0,
+            dependent_instance: 0,
+            dependent_component_va: 0,
+            provider_component_va: 0,
+            bytes: 0,
         }
     }
 }
@@ -12272,6 +12485,8 @@ static HOSTED_PROVIDER_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 64;
 const HOSTED_PROVIDER_CALLBACK_RECORD_CAP: usize = 256;
 static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
     HOSTED_PROVIDER_CALLBACK_RECORD_CAP] =
@@ -12281,6 +12496,8 @@ static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 96;
 const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
@@ -12289,6 +12506,14 @@ static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation
 static HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP: usize = 128;
+static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: [HostedProviderMiniportInterruptShadow;
+    HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP] =
+    [HostedProviderMiniportInterruptShadow::empty();
+        HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP];
+static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_PROVIDER_DISPATCH_ROUTES: Option<Vec<HostedProviderDispatchRoute>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
@@ -12565,6 +12790,12 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
     evidence.provider_domain_bindings = HOSTED_PROVIDER_DOMAIN_BINDINGS.load(Ordering::Relaxed);
     evidence.singleton_overflows = HOSTED_PROVIDER_SINGLETON_OVERFLOWS.load(Ordering::Relaxed);
     evidence.singleton_conflicts = HOSTED_PROVIDER_SINGLETON_CONFLICTS.load(Ordering::Relaxed);
+    evidence.provider_export_requests = HOSTED_PROVIDER_EXPORT_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_export_completions = HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_export_rejections = HOSTED_PROVIDER_EXPORT_REJECTIONS.load(Ordering::Relaxed);
+    evidence.provider_callback_requests = HOSTED_PROVIDER_CALLBACK_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_callback_completions =
+        HOSTED_PROVIDER_CALLBACK_COMPLETIONS.load(Ordering::Relaxed);
     evidence
 }
 
@@ -12748,6 +12979,50 @@ unsafe fn trace_hosted_provider_export(
     print_str(b"\n");
 }
 
+unsafe fn trace_hosted_provider_export_frame(
+    phase: &[u8],
+    provider_export_rva: u64,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    caller_rsp: u64,
+) {
+    let trace = HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP {
+        return;
+    }
+    print_str(b"[provider-export-frame] ");
+    print_str(phase);
+    print_str(b" dependent-inst=");
+    print_u64(dependent_index as u64);
+    print_str(b" rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" caller-rsp=");
+    print_hex64(caller_rsp);
+    if let Some(stack_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, caller_rsp, 0x40)
+    {
+        print_str(b" ret=");
+        print_hex64(read_unaligned(stack_exec as *const u64));
+        print_str(b" home=");
+        print_hex64(read_unaligned((stack_exec + 0x08) as *const u64));
+        print_str(b",");
+        print_hex64(read_unaligned((stack_exec + 0x10) as *const u64));
+        print_str(b",");
+        print_hex64(read_unaligned((stack_exec + 0x18) as *const u64));
+        print_str(b",");
+        print_hex64(read_unaligned((stack_exec + 0x20) as *const u64));
+        print_str(b" tail=");
+        print_hex64(read_unaligned((stack_exec + 0x28) as *const u64));
+        print_str(b",");
+        print_hex64(read_unaligned((stack_exec + 0x30) as *const u64));
+        print_str(b",");
+        print_hex64(read_unaligned((stack_exec + 0x38) as *const u64));
+    } else {
+        print_str(b" stack=no-map");
+    }
+    print_str(b"\n");
+}
+
 unsafe fn trace_hosted_provider_callback(
     phase: &[u8],
     record: HostedProviderCallbackRecord,
@@ -12795,6 +13070,62 @@ unsafe fn trace_hosted_provider_callback(
                 print_str(b" status=0x");
                 print_hex(status as u32);
             }
+        }
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_callback_wall(
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    pr: crate::spawn_hosts::PumpResult,
+) {
+    let trace = HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP {
+        return;
+    }
+    let mut regs = [0u64; 20];
+    crate::win32k_glue::tcb_read_regs20(dependent_inst.tcb, &mut regs);
+    print_str(b"[provider-callback-wall] provider-inst=");
+    print_u64(record.provider_instance as u64);
+    print_str(b" dependent-inst=");
+    print_u64(record.dependent_instance as u64);
+    print_str(b" off=0x");
+    print_hex(record.callback_offset as u32);
+    print_str(b" target=");
+    print_hex64(record.target);
+    print_str(b" status=0x");
+    print_hex(pr.status as u32);
+    print_str(b" wall-ip=");
+    print_hex64(pr.wall_ip);
+    print_str(b" wall-addr=");
+    print_hex64(pr.wall_addr);
+    print_str(b" regs rip/rsp/rax/rcx/rdx/r8/r9=");
+    print_hex64(regs[0]);
+    print_str(b"/");
+    print_hex64(regs[1]);
+    print_str(b"/");
+    print_hex64(regs[3]);
+    print_str(b"/");
+    print_hex64(regs[5]);
+    print_str(b"/");
+    print_hex64(regs[6]);
+    print_str(b"/");
+    print_hex64(regs[10]);
+    print_str(b"/");
+    print_hex64(regs[11]);
+    let rsp = regs[1];
+    if let Some(stack_exec) =
+        component_to_exec_va_for_instance(record.dependent_instance, dependent_inst, rsp, 64)
+    {
+        print_str(b" stack=");
+        let mut index = 0u64;
+        while index < 8 {
+            if index != 0 {
+                print_str(b",");
+            }
+            print_hex64(read_unaligned((stack_exec + index * 8) as *const u64));
+            index += 1;
         }
     }
     print_str(b"\n");
@@ -13208,6 +13539,212 @@ unsafe fn take_hosted_provider_pointer_allocation(
     None
 }
 
+unsafe fn find_hosted_provider_miniport_interrupt_shadow(
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Option<(usize, HostedProviderMiniportInterruptShadow)> {
+    if dependent_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS)
+        as *const HostedProviderMiniportInterruptShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+        {
+            return Some((index, record));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Result<HostedProviderMiniportInterruptShadow, i32> {
+    let Some(provider_component_va) =
+        hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_INTERRUPT_LEN_X64)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_component_va,
+        NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    )
+    .is_none()
+    {
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS)
+        as *mut HostedProviderMiniportInterruptShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP);
+    let shadow = HostedProviderMiniportInterruptShadow {
+        present: true,
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+        provider_component_va,
+        bytes: NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    };
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if !record.present {
+            *record = shadow;
+            return Ok(shadow);
+        }
+        index += 1;
+    }
+    if bounded_count >= HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP {
+        HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    *records.add(bounded_count) = shadow;
+    HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT
+        .store((bounded_count + 1) as u64, Ordering::Relaxed);
+    Ok(shadow)
+}
+
+unsafe fn hosted_provider_miniport_interrupt_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    dependent_component_va: u64,
+    allow_create: bool,
+) -> Result<(u64, u64, u64), i32> {
+    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_component_va,
+        NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let shadow = match find_hosted_provider_miniport_interrupt_shadow(
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+    ) {
+        Some((_index, shadow)) => shadow,
+        None if allow_create => allocate_hosted_provider_miniport_interrupt_shadow(
+            provider_instance,
+            provider_inst,
+            dependent_instance,
+            dependent_component_va,
+        )?,
+        None => {
+            HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+    if shadow.bytes < NDIS_MINIPORT_INTERRUPT_LEN_X64 {
+        HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(provider_exec_va) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        shadow.provider_component_va,
+        NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    copy_bytes(
+        provider_exec_va,
+        dependent_exec_va,
+        NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    );
+    Ok((
+        shadow.provider_component_va,
+        dependent_exec_va,
+        provider_exec_va,
+    ))
+}
+
+unsafe fn take_hosted_provider_miniport_interrupt_shadow_by_provider(
+    provider_instance: usize,
+    provider_component_va: u64,
+) -> Option<HostedProviderMiniportInterruptShadow> {
+    if provider_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS)
+        as *mut HostedProviderMiniportInterruptShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.provider_component_va == provider_component_va
+        {
+            let taken = *record;
+            *record = HostedProviderMiniportInterruptShadow::empty();
+            return Some(taken);
+        }
+        index += 1;
+    }
+    HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+unsafe fn free_hosted_provider_miniport_interrupt_shadow(
+    provider_instance: usize,
+    provider_component_va: u64,
+) -> bool {
+    let Some(shadow) = take_hosted_provider_miniport_interrupt_shadow_by_provider(
+        provider_instance,
+        provider_component_va,
+    ) else {
+        return false;
+    };
+    let Some(provider_inst) = instance(shadow.provider_instance) else {
+        return false;
+    };
+    hosted_instance_pool_free(provider_inst, shadow.provider_component_va)
+}
+
+unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(instance_index: usize) {
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS)
+        as *mut HostedProviderMiniportInterruptShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && (record.provider_instance == instance_index
+                || record.dependent_instance == instance_index)
+        {
+            if let Some(provider_inst) = instance(record.provider_instance) {
+                hosted_instance_pool_free(provider_inst, record.provider_component_va);
+            }
+            *record = HostedProviderMiniportInterruptShadow::empty();
+        }
+        index += 1;
+    }
+}
+
 unsafe fn provider_marshal_emit_callback_thunk(
     provider_instance: usize,
     dependent_instance: usize,
@@ -13427,6 +13964,38 @@ unsafe fn provider_marshal_resource_list(
         arg_value,
         bytes,
     )
+}
+
+unsafe fn provider_marshal_miniport_interrupt(
+    state: &mut ProviderMarshalState,
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    arg_value: u64,
+    free_on_success: bool,
+) -> Result<u64, i32> {
+    let (provider_arg, dependent_exec_va, provider_exec_va) =
+        hosted_provider_miniport_interrupt_shadow(
+            provider_instance,
+            provider_inst,
+            dependent_index,
+            dependent_inst,
+            arg_value,
+            !free_on_success,
+        )?;
+    provider_marshal_add_copyout(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    state.resource_state_copyback = true;
+    state.miniport_interrupt_provider_instance = provider_instance;
+    state.miniport_interrupt_provider_component_va = provider_arg;
+    state.miniport_interrupt_free_on_success = free_on_success;
+    Ok(provider_arg)
 }
 
 unsafe fn provider_marshal_fixed_output_pointer(
@@ -14052,6 +14621,21 @@ unsafe fn prepare_provider_export_marshal(
                     args[length_index],
                 )?
             }
+            HostedProviderArgumentMarshal::CallerInOutMiniportInterrupt => {
+                let Some(provider_inst) = instance(provider_instance) else {
+                    return Err(STATUS_DEVICE_NOT_READY);
+                };
+                provider_marshal_miniport_interrupt(
+                    &mut state,
+                    provider_instance,
+                    provider_inst,
+                    dependent_index,
+                    dependent_inst,
+                    arg,
+                    policy.side_effect
+                        == HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration,
+                )?
+            }
             HostedProviderArgumentMarshal::CallerOutIoPortRange {
                 initial_port_arg,
                 length_arg,
@@ -14153,8 +14737,7 @@ unsafe fn complete_provider_export_marshal(
     state: &ProviderMarshalState,
     result: u64,
 ) {
-    let success = policy.result_semantics == HostedProviderExportResultSemantics::Void
-        || result == STATUS_SUCCESS as u64;
+    let success = provider_export_result_success(policy, result);
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
@@ -14195,6 +14778,16 @@ unsafe fn complete_provider_export_marshal(
         }
         free_index += 1;
     }
+    if success
+        && state.miniport_interrupt_free_on_success
+        && state.miniport_interrupt_provider_component_va != 0
+        && state.miniport_interrupt_provider_instance != usize::MAX
+    {
+        free_hosted_provider_miniport_interrupt_shadow(
+            state.miniport_interrupt_provider_instance,
+            state.miniport_interrupt_provider_component_va,
+        );
+    }
 }
 
 unsafe fn complete_provider_export_side_effects(
@@ -14226,6 +14819,7 @@ unsafe fn complete_provider_export_side_effects(
             }
             complete_hosted_provider_miniport_registration(provider_instance, args[0])
         }
+        HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration => Ok(()),
     }
 }
 
@@ -14258,6 +14852,28 @@ const PROVIDER_DMA_PROJECTION_OFFSETS: [u64; 11] = [
     SH_DMA_ALLOC_RECORD_COUNT,
     SH_DMA_ALLOC_RECORD_CAPACITY,
 ];
+
+const PROVIDER_INTERRUPT_STATE_OFFSETS: [u64; 7] = [
+    SH_RESOURCE_INTERRUPT_OBJECT,
+    SH_RESOURCE_INTERRUPT_ROUTINE,
+    SH_RESOURCE_INTERRUPT_CONTEXT,
+    SH_RESOURCE_INTERRUPT_ID,
+    SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR,
+    SH_RESOURCE_INTERRUPT_ISR_CLAIMED,
+    SH_RESOURCE_INTERRUPT_DELIVERIES,
+];
+
+unsafe fn copy_provider_interrupt_state(dst_shared: u64, src_shared: u64) {
+    let mut index = 0usize;
+    while index < PROVIDER_INTERRUPT_STATE_OFFSETS.len() {
+        let offset = PROVIDER_INTERRUPT_STATE_OFFSETS[index];
+        write_volatile(
+            (dst_shared + offset) as *mut u64,
+            read_volatile((src_shared + offset) as *const u64),
+        );
+        index += 1;
+    }
+}
 
 unsafe fn copy_provider_dma_projection_fields(dst_shared: u64, src_shared: u64) {
     let mut index = 0usize;
@@ -14358,27 +14974,42 @@ unsafe fn project_provider_resource_state(
     }
     write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    copy_provider_interrupt_state(provider_shared, dependent_shared);
     project_provider_dma_state(dependent_shared, provider_shared)?;
     Ok(())
 }
 
+fn provider_export_result_success(
+    policy: HostedProviderExportMarshalPolicy,
+    result: u64,
+) -> bool {
+    policy.result_semantics == HostedProviderExportResultSemantics::Void
+        || result == STATUS_SUCCESS as u64
+}
+
 unsafe fn complete_provider_resource_mapping(
+    policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
     dependent_shared: u64,
     provider_shared: u64,
     result: u64,
 ) {
-    if !state.resource_mapping_copyback || result != STATUS_SUCCESS as u64 {
+    if !provider_export_result_success(policy, result) {
         return;
     }
-    write_volatile(
-        (dependent_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
-        read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
-    );
-    write_volatile(
-        (dependent_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
-        read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
-    );
+    if state.resource_mapping_copyback {
+        write_volatile(
+            (dependent_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+            read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
+        );
+        write_volatile(
+            (dependent_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+            read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
+        );
+    }
+    if state.resource_state_copyback {
+        copy_provider_interrupt_state(dependent_shared, provider_shared);
+    }
 }
 
 unsafe fn complete_provider_dma_state(
@@ -14649,6 +15280,13 @@ pub(crate) unsafe fn service_hosted_provider_export(
         stack_index += 1;
     }
     let original_args = args;
+    trace_hosted_provider_export_frame(
+        b"enter",
+        provider_export_rva,
+        dependent_index,
+        dependent_inst,
+        caller_rsp,
+    );
     trace_hosted_provider_export(
         b"enter",
         &singleton.provider,
@@ -14741,6 +15379,30 @@ pub(crate) unsafe fn service_hosted_provider_export(
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
     if !pr.completed {
+        let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
+            print_str(b"[provider-export] incomplete provider=");
+            print_str(singleton.provider.as_bytes());
+            print_str(b" cookie=");
+            print_u64(provider_domain_cookie);
+            print_str(b" rva=0x");
+            print_hex(provider_export_rva as u32);
+            print_str(b" status=0x");
+            print_hex(pr.status as u32);
+            print_str(b" result=");
+            print_hex64(pr.result);
+            print_str(b" wall-ip=");
+            print_hex64(pr.wall_ip);
+            print_str(b" wall-addr=");
+            print_hex64(pr.wall_addr);
+            print_str(b" wall-label=");
+            print_hex64(pr.wall_label);
+            print_str(b" wall-flags=");
+            print_hex64(pr.wall_flags);
+            print_str(b" tcb=");
+            print_hex64(provider_inst.tcb);
+            print_str(b"\n");
+        }
         register_instance_ready(singleton.instance, false);
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
@@ -14782,6 +15444,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         result,
     );
     complete_provider_resource_mapping(
+        policy,
         &marshal_state,
         dependent_channel.shared_va,
         provider_shared,
@@ -14795,6 +15458,13 @@ pub(crate) unsafe fn service_hosted_provider_export(
         provider_export_rva,
         &args,
         result,
+    );
+    trace_hosted_provider_export_frame(
+        b"done",
+        provider_export_rva,
+        dependent_index,
+        dependent_inst,
+        caller_rsp,
     );
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
@@ -14883,6 +15553,7 @@ unsafe fn dispatch_dependent_provider_callback(
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
     if !pr.completed {
+        trace_hosted_provider_callback_wall(record, dependent_inst, pr);
         register_instance_ready(record.dependent_instance, false);
         return Err(STATUS_UNSUCCESSFUL);
     }
@@ -17007,7 +17678,11 @@ pub(crate) unsafe fn call_on4(
         "push r12",
         "push r13",
         "push r14",
+        "push r15",
+        "mov r15, rax",
         "syscall",
+        "mov rax, r15",
+        "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
@@ -17019,8 +17694,8 @@ pub(crate) unsafe fn call_on4(
         inout("r10") arg0 => m0,
         inout("r8") arg1 => m1,
         inout("r9") arg2 => m2,
-        inout("r15") arg3 => m3,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        inlateout("rax") arg3 => m3,
+        lateout("rcx") _, lateout("r11") _,
     );
     (reply_info >> 12, m0, m1, m2, m3)
 }
@@ -17825,10 +18500,6 @@ pub(crate) struct DriverComponent {
     pub symlink_target_utf16: [u8; SH_CAPTURED_PATH_BYTES],
     /// The DriverEntry verdict bitmask ([`V_ENTERED`] etc.).
     pub verdict: u32,
-    /// The support image's DriverEntry status when this driver depends on a hosted provider image.
-    pub support_status: i32,
-    /// The support image's DriverEntry verdict bitmask.
-    pub support_verdict: u32,
     /// Whether DriverEntry ran to its dispatch loop (parked) vs faulted mid-init.
     pub finished: bool,
     /// The EXECUTIVE-side SHARED-frame VA for THIS instance (where the executive marshals IRP
@@ -19023,8 +19694,8 @@ unsafe fn load_driver_reserved(
         return None;
     }
 
-    // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, POOL in its own
-    //    mirrored 2 MiB PT, and DATA + SHARED + ARG in an aux PT.
+    // 2. Executive-side frames: CODE (mapped RW to load into), POOL in its own PT span, and DATA +
+    //    SHARED + ARG in an aux PT.
     let code_pts = pts_for(img_frames);
     let mut cpt_i = 0;
     while cpt_i < code_pts {
@@ -19084,9 +19755,14 @@ unsafe fn load_driver_reserved(
     for _ in 1..FSD_POOL_FRAMES {
         let _ = alloc_frame();
     }
-    let ppt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
-    map_instance_exec_pt(instance, ppt, win.pool_va)?;
+    let pool_pts = pts_for(FSD_POOL_FRAMES);
+    let mut pool_pt_index = 0u64;
+    while pool_pt_index < pool_pts {
+        let ppt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
+        map_instance_exec_pt(instance, ppt, win.pool_va + pool_pt_index * 0x20_0000)?;
+        pool_pt_index += 1;
+    }
     for i in 0..FSD_POOL_FRAMES {
         let cap = copy_cap(pool_base + i);
         map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)?;
@@ -19402,8 +20078,6 @@ unsafe fn load_driver_reserved(
         symlink_target_len,
         symlink_target_utf16,
         verdict,
-        support_status,
-        support_verdict,
         finished,
         exec_shared_va: win.shared_va,
         exec_pool_va: win.pool_va,
@@ -19465,7 +20139,7 @@ unsafe fn spawn_fsd_component(
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
-        // The npfs PE image, W^X, its own 2 MiB PT.
+        // Hosted driver image, W^X, with enough PTs for the loaded image lane.
         Region {
             source: FrameSource::AliasList(image_frame_caps),
             base_va: FSD_CODE_VA,
@@ -22664,6 +23338,7 @@ fn clear_instance(i: usize) {
     clear_hosted_driver_threads_for_instance(i);
     clear_hosted_device_bindings_for_instance(i);
     unsafe {
+        clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
         clear_hosted_provider_dispatch_routes_for_instance(i);
     }
     if let Some(inst) = instance(i) {

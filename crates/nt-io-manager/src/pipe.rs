@@ -1171,6 +1171,82 @@ impl PipeServerAvailabilityTable {
     }
 }
 
+/// Exact server pipe endpoints that accepted a client before the server posted its async
+/// `FSCTL_PIPE_LISTEN` IRP.
+///
+/// Win32 explicitly allows the client `CreateFile("\\\\.\\pipe\\...")` to win the race against
+/// `ConnectNamedPipe`. The later server-side connect/listen then completes immediately for that
+/// same server endpoint. This table is only the cross-syscall edge; the pipe FSD still owns the
+/// actual connected CCB and byte queues.
+#[derive(Clone, Debug)]
+pub struct PipePreconnectedServerTable {
+    server_file_ids: Vec<u64>,
+}
+
+impl Default for PipePreconnectedServerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipePreconnectedServerTable {
+    pub const fn new() -> Self {
+        Self {
+            server_file_ids: Vec::new(),
+        }
+    }
+
+    /// Record a server endpoint whose client side already connected. Idempotent for the same fid.
+    pub fn remember(&mut self, server_file_id: u64) -> Result<bool, ()> {
+        if server_file_id == 0 {
+            return Err(());
+        }
+        if self.server_file_ids.contains(&server_file_id) {
+            return Ok(false);
+        }
+        if self.server_file_ids.len() == self.server_file_ids.capacity() {
+            let reserve = if self.server_file_ids.capacity() == 0 {
+                32
+            } else {
+                1
+            };
+            self.server_file_ids.try_reserve(reserve).map_err(|_| ())?;
+        }
+        self.server_file_ids.push(server_file_id);
+        Ok(true)
+    }
+
+    /// Consume the preconnected edge exactly once when the server posts `FSCTL_PIPE_LISTEN`.
+    pub fn take(&mut self, server_file_id: u64) -> bool {
+        if let Some(index) = self
+            .server_file_ids
+            .iter()
+            .position(|&entry| entry == server_file_id)
+        {
+            self.server_file_ids.swap_remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove(&mut self, server_file_id: u64) -> bool {
+        self.take(server_file_id)
+    }
+
+    pub fn contains(&self, server_file_id: u64) -> bool {
+        server_file_id != 0 && self.server_file_ids.contains(&server_file_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.server_file_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.server_file_ids.is_empty()
+    }
+}
+
 /// A pending async server-side `FSCTL_PIPE_LISTEN` awaiting a client connect. Keyed by the SERVER
 /// end's npfs `file_id`. On the peer connect/write the executive completes it: fills `iosb_va` with
 /// SUCCESS (in the server's VSpace) and signals `event_obj_idx` (waking the server's wait-array).
@@ -2734,6 +2810,51 @@ mod tests {
         assert!(table.consume(0x203));
         assert!(!table.available_name(ntsvcs_hash));
         assert_eq!(table.available_len(), 0);
+    }
+
+    #[test]
+    fn pipe_preconnected_server_table_consumes_exactly_once() {
+        let mut table = PipePreconnectedServerTable::new();
+
+        assert!(table.remember(0).is_err());
+        assert!(table.is_empty());
+
+        assert_eq!(table.remember(0x301), Ok(true));
+        assert_eq!(table.remember(0x301), Ok(false));
+        assert!(table.contains(0x301));
+        assert!(!table.contains(0x303));
+        assert_eq!(table.len(), 1);
+
+        assert!(table.take(0x301));
+        assert!(!table.take(0x301));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn client_connect_before_listen_completes_late_armed_exact_server() {
+        let control_pipe: std::vec::Vec<u16> = "\\net\\NtControlPipe0".encode_utf16().collect();
+        let mut preconnected = PipePreconnectedServerTable::new();
+        let mut listens = AsyncListenTable::<2>::new();
+
+        preconnected.remember(0x401).unwrap();
+        preconnected.remember(0x403).unwrap();
+        listens
+            .arm(al_named(0x401, 0x77, &control_pipe))
+            .expect("late listen arms");
+
+        assert!(preconnected.take(0x401));
+        let completed = listens
+            .complete(0x401)
+            .expect("accepted endpoint completes");
+        assert_eq!(completed.server_file_id, 0x401);
+        assert_eq!(completed.event_obj_idx, 0x77);
+
+        assert!(
+            preconnected.contains(0x403),
+            "other accepted endpoints remain distinct"
+        );
+        assert!(!preconnected.take(0x401), "the completion edge is one-shot");
+        assert!(listens.is_empty());
     }
 
     #[test]

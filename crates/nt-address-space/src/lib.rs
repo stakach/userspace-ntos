@@ -462,6 +462,14 @@ pub fn image_view_fault_access_status(protection: u32, access: FaultAccess) -> R
     Ok(())
 }
 
+pub fn private_guard_page_fault_plan(protection: u32, access: FaultAccess) -> Option<u32> {
+    if protection & PAGE_GUARD == 0 {
+        return None;
+    }
+    let unguarded = protection & !PAGE_GUARD;
+    protection_allows_fault_access(unguarded, access).then_some(unguarded)
+}
+
 pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewFaultPlan {
     let base = protection & 0xff;
     let modifiers = protection & !0xff;
