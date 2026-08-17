@@ -21,6 +21,12 @@ pub(crate) enum FrameSource {
     /// `copy_cap`-aliased frames starting at this cap slot — the SAME physical frames are
     /// (or stay) mapped in the executive too (device BARs, DMA, staging buffers, shared pages).
     Alias(u64),
+    /// `copy_cap`-aliased frames from an explicit cap list.
+    ///
+    /// Hosted driver images normally use a contiguous fresh cap range, but shared provider images
+    /// such as a future singleton `ndis.sys` need to mix provider-owned frames with dependent-owned
+    /// primary-driver frames in one component VA image window.
+    AliasList(&'static [u64]),
 }
 
 /// Per-frame rights for a region.
@@ -334,11 +340,23 @@ unsafe fn map_region(pml4: u64, r: &Region) {
                 f
             }
             FrameSource::Alias(base) => copy_cap(base + i),
+            FrameSource::AliasList(frames) => match frames.get(i as usize).copied() {
+                Some(frame) => copy_cap(frame),
+                None => {
+                    print_str(b"[component-spawn] image cap list too short have=");
+                    print_u64(frames.len() as u64);
+                    print_str(b" need=");
+                    print_u64(r.count);
+                    print_str(b"\n");
+                    park();
+                }
+            },
         };
         if i == 0 {
             first = match r.source {
                 FrameSource::FreshZeroed => cap,
                 FrameSource::Alias(base) => base,
+                FrameSource::AliasList(frames) => frames.first().copied().unwrap_or(0),
             };
         }
         let _ = page_map(cap, r.base_va + i * 0x1000, rights_at(r.rights, i), pml4);

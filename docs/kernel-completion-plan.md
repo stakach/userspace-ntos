@@ -58,7 +58,31 @@ components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git dif
 Review adjustment: the descriptor-completion/device-model foundation and serialized desktop proof
 are closed. The remaining B3 packet frontier is real NDIS receive indication after protocol
 bind/packet-filter setup, TX traffic from the real scatter/gather send route, and repeated-device
-scaling under the same dynamic devnode/resource path.
+scaling under the same dynamic devnode/resource path. The next loader cleanup is the provider
+identity boundary: ReactOS `ndis.sys` owns global protocol/miniport lists, so TCPIP and E1000 must
+call a shared provider image instead of each loading a private dependency copy.
+
+Current shared-provider prep (2026-08-17): hosted component spawning now accepts an explicit image
+frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
+driver image mapping through that list. This preserves current private image behavior while removing
+the contiguous-cap assumption needed before provider-owned frames can be mixed with dependent-owned
+primary-driver frames. `nt-hosted-runtime` has a host-tested provider-prefixed image-layout planner
+for the upcoming shared-provider shape: shared provider prefix, primary driver, then private
+dependencies with checked page alignment and frame-capacity failure. The executive also records
+generic provider-load evidence for loaded `.sys` primary services and private `.sys` dependencies,
+including private dependency loads whose provider leaf already exists as a primary service. This is
+not a success fallback or a TCPIP/E1000 special case; it is evidence for the NT module boundary that
+must be fixed next. Follow-up cleanup in the same slice made the provider-load evidence storage
+reset-safe: it now lives in a compact static per-provider summary table, with overflow counted in
+the evidence line, instead of a heap-backed `Vec` that could outlive a service-loop bump-heap reset.
+A failed desktop attempt before that cleanup reached
+`rundll32.exe` creation and then faulted the executive in `allocator::reset_to` while reading a
+corrupt free-list pointer; the static evidence store removes the new durable-after-reset allocation
+from this path. The serialized desktop retest
+`.tmp/run-desktop-provider-summary-20260817-100747.log` reaches the sentinel with `298/298` checks
+passing, Explorer shell chrome painted, generic e1000 descriptor-completion evidence preserved, and
+provider-sharing evidence reporting `private-deps-with-primary=2`, `duplicate-private-deps=2`, and
+`overflow=0`.
 
 Latest accepted B3 packet proof (2026-08-17):
 `.tmp/run-desktop-shared-image-stable-chunks-20260817-092332.log` reaches the harness sentinel with
@@ -1318,7 +1342,10 @@ before unrelated executive traffic monopolises the receive loop.
   grant. Generic descriptor completion and the first e1000 register-profile bus-master model are in
   place and proven through the full desktop shell path, so remaining B3 work is real NDIS receive
   indication after protocol bind/packet-filter setup, TX traffic from the real scatter/gather send
-  route, and repeated-device scaling under the same dynamic devnode/resource path.
+  route, and repeated-device scaling under the same dynamic devnode/resource path. The active loader
+  cleanup is replacing private dependency copies of stateful provider `.sys` images with shared
+  provider mappings; current code now has the generic cap-list image mapping and provider-load
+  evidence needed to wire `ndis.sys` as a real singleton provider next.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -6880,3 +6907,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `ut-fails=0`, `registry=0`, and `asid-fails=0`. Review adjustment: B3 now moves to the true
   NDIS data-plane frontier: prove protocol bind/OID packet-filter setup, surface receive indication
   from the completed RX descriptor, then drive TX traffic from the real scatter/gather send route.
+
+  B3 shared-provider prep (2026-08-17): the NDIS bind investigation found the next mechanism
+  boundary: TCPIP and E1000 currently load private `ndis.sys` dependency images even though NT has
+  one loaded NDIS module owning the protocol and miniport lists. The component spawner now supports
+  explicit image-frame cap lists, and hosted driver launch uses that list for all image windows while
+  preserving today's private-frame behavior. This removes the contiguous-cap assumption that blocked
+  future dependent images from mapping provider-owned frames in the same VA prefix. `nt-hosted-runtime`
+  now host-tests the provider-prefixed layout arithmetic that shared providers need, and the
+  executive prints generic provider-load evidence showing primary services, private dependencies,
+  duplicate private dependencies, and private dependency loads whose provider leaf already exists as
+  a primary service. The evidence table is now reset-safe static storage rather than heap-backed
+  state; overflow is reported explicitly. Validation: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+  `.tmp/run-desktop-provider-summary-20260817-100747.log`. The proof reaches `298/298`, keeps
+  Explorer shell chrome painted, preserves `dma_desc_addr/ok=128/128`, `dma_dev_tx/rx=0/1`, and
+  `dma_dev_cause/fail=144/0`, and reports provider evidence
+  `primary=10 private-deps=2 private-deps-with-primary=2 duplicate-private-deps=2 overflow=0`.
+  Review adjustment: the next B3 slice should register successful primary provider images as
+  singleton provider mappings, place dependents after the provider prefix, skip rerunning provider
+  `DriverEntry`, and then re-test NDIS protocol bind/packet-filter evidence before expanding RX/TX
+  packet proofs.

@@ -11550,6 +11550,52 @@ struct LoadedDependencyImage {
     image_len: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedProviderLoadRole {
+    PrimaryService,
+    PrivateDependency,
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderSummary {
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    primary_count: u64,
+    primary_image_bytes: u64,
+    private_count: u64,
+    private_image_bytes: u64,
+    first_private_instance: u64,
+}
+
+impl HostedProviderSummary {
+    const fn empty() -> Self {
+        Self {
+            provider: HostedAscii::empty(),
+            primary_count: 0,
+            primary_image_bytes: 0,
+            private_count: 0,
+            private_image_bytes: 0,
+            first_private_instance: 0,
+        }
+    }
+
+    fn present(&self) -> bool {
+        self.primary_count != 0 || self.private_count != 0
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostedProviderSharingEvidence {
+    pub primary_services: u64,
+    pub primary_service_image_bytes: u64,
+    pub private_dependencies: u64,
+    pub private_dependency_image_bytes: u64,
+    pub private_dependencies_with_primary_provider: u64,
+    pub first_private_dependency_with_primary_instance: u64,
+    pub duplicate_private_dependencies: u64,
+    pub unique_primary_provider_matches: u64,
+    pub overflowed_load_records: u64,
+}
+
 #[derive(Clone, Copy)]
 struct LoadedSupportImages {
     count: u32,
@@ -11570,6 +11616,11 @@ struct PlannedHostedImages {
 }
 
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
+const HOSTED_PROVIDER_SUMMARY_CAP: usize = 128;
+static mut HOSTED_PROVIDER_SUMMARIES: [HostedProviderSummary; HOSTED_PROVIDER_SUMMARY_CAP] =
+    [HostedProviderSummary::empty(); HOSTED_PROVIDER_SUMMARY_CAP];
+static HOSTED_PROVIDER_SUMMARY_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_LOAD_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -11583,6 +11634,138 @@ unsafe fn clear_hosted_dependency_images() {
     if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
         images.clear();
     }
+}
+
+fn hosted_provider_leaf_from_path(path: &[u8]) -> Option<HostedAscii<HOSTED_DEP_PROVIDER_MAX>> {
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < path.len() {
+        if path[i] == b'\\' || path[i] == b'/' {
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start >= path.len() {
+        return None;
+    }
+    let leaf = core::str::from_utf8(&path[start..]).ok()?;
+    if !hosted_dependency_provider_dll(leaf) {
+        return None;
+    }
+    let mut provider = HostedAscii::<HOSTED_DEP_PROVIDER_MAX>::empty();
+    provider.set_str(leaf).then_some(provider)
+}
+
+unsafe fn record_hosted_provider_load(
+    provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    role: HostedProviderLoadRole,
+    instance: usize,
+    image_len: u32,
+) {
+    let summaries =
+        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SUMMARIES) as *mut HostedProviderSummary;
+    let count = HOSTED_PROVIDER_SUMMARY_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let summary = &mut *summaries.add(index);
+        if summary.present() && hosted_ascii_eq_ignore_case(&summary.provider, &provider) {
+            match role {
+                HostedProviderLoadRole::PrimaryService => {
+                    summary.primary_count = summary.primary_count.saturating_add(1);
+                    summary.primary_image_bytes =
+                        summary.primary_image_bytes.saturating_add(image_len as u64);
+                }
+                HostedProviderLoadRole::PrivateDependency => {
+                    summary.private_count = summary.private_count.saturating_add(1);
+                    summary.private_image_bytes =
+                        summary.private_image_bytes.saturating_add(image_len as u64);
+                    if summary.first_private_instance == 0 {
+                        summary.first_private_instance = (instance as u64).saturating_add(1);
+                    }
+                }
+            }
+            return;
+        }
+        index += 1;
+    }
+    if count >= HOSTED_PROVIDER_SUMMARY_CAP {
+        HOSTED_PROVIDER_LOAD_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let summary = &mut *summaries.add(count);
+    *summary = HostedProviderSummary {
+        provider,
+        primary_count: 0,
+        primary_image_bytes: 0,
+        private_count: 0,
+        private_image_bytes: 0,
+        first_private_instance: 0,
+    };
+    HOSTED_PROVIDER_SUMMARY_COUNT.store((count + 1) as u64, Ordering::Relaxed);
+    match role {
+        HostedProviderLoadRole::PrimaryService => {
+            summary.primary_count = 1;
+            summary.primary_image_bytes = image_len as u64;
+        }
+        HostedProviderLoadRole::PrivateDependency => {
+            summary.private_count = 1;
+            summary.private_image_bytes = image_len as u64;
+            summary.first_private_instance = (instance as u64).saturating_add(1);
+        }
+    }
+}
+
+pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidence {
+    let count = HOSTED_PROVIDER_SUMMARY_COUNT.load(Ordering::Relaxed) as usize;
+    if count == 0 {
+        return HostedProviderSharingEvidence::default();
+    }
+    let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
+    let summaries = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(HOSTED_PROVIDER_SUMMARIES) as *const HostedProviderSummary,
+            bounded_count,
+        )
+    };
+    let mut evidence = HostedProviderSharingEvidence::default();
+    for summary in summaries {
+        evidence.primary_services = evidence
+            .primary_services
+            .saturating_add(summary.primary_count);
+        evidence.primary_service_image_bytes = evidence
+            .primary_service_image_bytes
+            .saturating_add(summary.primary_image_bytes);
+        evidence.private_dependencies = evidence
+            .private_dependencies
+            .saturating_add(summary.private_count);
+        evidence.private_dependency_image_bytes = evidence
+            .private_dependency_image_bytes
+            .saturating_add(summary.private_image_bytes);
+        if summary.primary_count != 0 && summary.private_count != 0 {
+            evidence.private_dependencies_with_primary_provider = evidence
+                .private_dependencies_with_primary_provider
+                .saturating_add(summary.private_count);
+            evidence.unique_primary_provider_matches = evidence
+                .unique_primary_provider_matches
+                .saturating_add(1);
+            if summary.first_private_instance != 0
+                && (evidence.first_private_dependency_with_primary_instance == 0
+                    || summary.first_private_instance
+                        < evidence.first_private_dependency_with_primary_instance)
+            {
+                evidence.first_private_dependency_with_primary_instance =
+                    summary.first_private_instance;
+            }
+        }
+        if summary.private_count > 1 {
+            evidence.duplicate_private_dependencies = evidence
+                .duplicate_private_dependencies
+                .saturating_add(summary.private_count);
+        }
+    }
+    evidence.overflowed_load_records = HOSTED_PROVIDER_LOAD_OVERFLOWS.load(Ordering::Relaxed);
+    evidence
 }
 
 unsafe fn clear_support_image_records(shared_va: u64) {
@@ -14563,6 +14746,7 @@ const SEL4_DELETE_FIRST: u64 = 8;
 
 unsafe fn load_hosted_dependency_images(
     plan: &PlannedHostedImages,
+    instance: usize,
     code_va: u64,
     run_va: u64,
     shared_va: u64,
@@ -14626,6 +14810,12 @@ unsafe fn load_hosted_dependency_images(
             return None;
         }
         register_loaded_dependency_image(provider, dep_exec_va, dep_run_va, dep_image_len)?;
+        record_hosted_provider_load(
+            provider_name,
+            HostedProviderLoadRole::PrivateDependency,
+            instance,
+            dep_image_len,
+        );
         let _ = register_system_module(&dep_path[..dep_path_len], dep_exec_va, dep_image_len);
         print_str(b"[driver-launch] dependency loaded ");
         print_str(provider.as_bytes());
@@ -14745,14 +14935,17 @@ unsafe fn load_driver_reserved(
         map_instance_exec_pt(instance, cpt, code_va + cpt_i * 0x20_0000)?;
         cpt_i += 1;
     }
-    let code_base = alloc_frame();
-    for _ in 1..img_frames {
-        let _ = alloc_frame();
-    }
+    let mut image_frame_caps_vec = Vec::new();
+    image_frame_caps_vec
+        .try_reserve_exact(img_frames as usize)
+        .ok()?;
     for i in 0..img_frames {
-        let cap = copy_cap(code_base + i);
+        let frame = alloc_frame();
+        image_frame_caps_vec.push(frame);
+        let cap = copy_cap(frame);
         map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
     }
+    let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
     // POOL frames (host-only; allocate the caps, mapped by spawn_component).
     let pool_base = alloc_frame();
     for _ in 1..FSD_POOL_FRAMES {
@@ -14805,6 +14998,7 @@ unsafe fn load_driver_reserved(
     let rights = Box::leak(rights_vec.into_boxed_slice());
     let support_images = load_hosted_dependency_images(
         &planned_images,
+        instance,
         code_va,
         run_va,
         win.shared_va,
@@ -14845,7 +15039,7 @@ unsafe fn load_driver_reserved(
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
     let (pml4, tcb, cnode, stack_frame_base) = spawn_fsd_component(
-        code_base,
+        image_frame_caps,
         pool_base,
         data_base,
         shared_base,
@@ -14982,6 +15176,14 @@ unsafe fn load_driver_reserved(
         clear_driver_object_extensions_for_driver_object(drvobj);
         return None;
     }
+    if let Some(provider) = hosted_provider_leaf_from_path(path) {
+        record_hosted_provider_load(
+            provider,
+            HostedProviderLoadRole::PrimaryService,
+            instance,
+            image_len,
+        );
+    }
 
     let driver_id = register_io_driver(driver_object_path, instance)?;
     let dc = DriverComponent {
@@ -15045,7 +15247,7 @@ unsafe fn load_driver_reserved(
 /// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED arena/ARG windows,
 /// fault EP — NO device caps. Delegates to the generic [`spawn_component`] engine.
 unsafe fn spawn_fsd_component(
-    code_base: u64,
+    image_frame_caps: &'static [u64],
     pool_base: u64,
     data_base: u64,
     shared: u64,
@@ -15059,7 +15261,7 @@ unsafe fn spawn_fsd_component(
     let regions = [
         // The npfs PE image, W^X, its own 2 MiB PT.
         Region {
-            source: FrameSource::Alias(code_base),
+            source: FrameSource::AliasList(image_frame_caps),
             base_va: FSD_CODE_VA,
             count: image_frames,
             rights: Rights::PerFrame(rights_static),

@@ -26613,6 +26613,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_hw_video_route_published_count);
         print_str(b"\n");
     }
+    let provider_sharing = driver_launch::hosted_provider_sharing_evidence();
+    if provider_sharing.primary_services != 0 || provider_sharing.private_dependencies != 0 {
+        print_str(b"[driver-launch] hosted provider sharing primary=");
+        print_u64(provider_sharing.primary_services);
+        print_str(b" primary-bytes=");
+        print_u64(provider_sharing.primary_service_image_bytes);
+        print_str(b" private-deps=");
+        print_u64(provider_sharing.private_dependencies);
+        print_str(b" private-bytes=");
+        print_u64(provider_sharing.private_dependency_image_bytes);
+        print_str(b" private-deps-with-primary=");
+        print_u64(provider_sharing.private_dependencies_with_primary_provider);
+        print_str(b" first-private-primary-inst=");
+        print_u64(provider_sharing.first_private_dependency_with_primary_instance);
+        print_str(b" duplicate-private-deps=");
+        print_u64(provider_sharing.duplicate_private_dependencies);
+        print_str(b" unique-primary-provider-matches=");
+        print_u64(provider_sharing.unique_primary_provider_matches);
+        print_str(b" overflow=");
+        print_u64(provider_sharing.overflowed_load_records);
+        print_str(b"\n");
+    }
     check(
         b"exec_generic_hw_registry_selected",
         generic_hw_registry_selected
