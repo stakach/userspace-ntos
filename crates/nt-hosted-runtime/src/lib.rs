@@ -264,6 +264,13 @@ pub enum HostedProviderArgumentMarshal {
         physical_address_arg: u8,
         length_arg: u8,
     },
+    CallerOutDmaCommonBuffer {
+        length_arg: u8,
+    },
+    CallerInDmaCommonBuffer {
+        length_arg: u8,
+        physical_address_arg: u8,
+    },
     CallerOutU32,
     CallerInOutU32,
     CallerOutPhysicalAddress,
@@ -419,7 +426,10 @@ pub fn hosted_provider_export_marshal_policy(
             ProviderHandle,
             Scalar,
             Scalar,
-            CallerInBuffer { length_arg: 1 },
+            CallerInDmaCommonBuffer {
+                length_arg: 1,
+                physical_address_arg: 4,
+            },
             Scalar,
         ]),
         "NdisMDeregisterInterrupt" => export_policy(&[CallerInOutMiniportInterrupt]),
@@ -456,7 +466,7 @@ pub fn hosted_provider_export_marshal_policy(
             ProviderHandle,
             Scalar,
             Scalar,
-            CallerOutPointer,
+            CallerOutDmaCommonBuffer { length_arg: 1 },
             CallerOutPhysicalAddress,
         ]),
         "NdisFreeMemory" => {
@@ -1139,6 +1149,32 @@ mod tests {
             HostedProviderArgumentMarshal::CallerOutMmioMapping {
                 physical_address_arg: 2,
                 length_arg: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn ndis_shared_memory_policies_are_typed_dma_common_buffers() {
+        let alloc =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMAllocateSharedMemory").unwrap();
+        assert_eq!(alloc.argument_count, 5);
+        assert_eq!(
+            alloc.args[3],
+            HostedProviderArgumentMarshal::CallerOutDmaCommonBuffer { length_arg: 1 }
+        );
+        assert_eq!(
+            alloc.args[4],
+            HostedProviderArgumentMarshal::CallerOutPhysicalAddress
+        );
+
+        let free =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMFreeSharedMemory").unwrap();
+        assert_eq!(free.argument_count, 5);
+        assert_eq!(
+            free.args[3],
+            HostedProviderArgumentMarshal::CallerInDmaCommonBuffer {
+                length_arg: 1,
+                physical_address_arg: 4,
             }
         );
     }

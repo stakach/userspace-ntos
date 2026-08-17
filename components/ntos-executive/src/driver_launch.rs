@@ -6850,7 +6850,7 @@ extern "win64" fn s_io_get_dma_adapter(
             return 0;
         }
         let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if active_adapter != 0 {
+        if dma_adapter_blob_matches(active_adapter, adapter_id) {
             if !number_of_map_registers.is_null() {
                 write_unaligned(number_of_map_registers, 64);
             }
@@ -6934,7 +6934,15 @@ extern "win64" fn s_io_get_dma_adapter(
         // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8.
         write_unaligned(adapter as *mut u16, 1);
         write_unaligned((adapter + 2) as *mut u16, 0x40);
-        write_unaligned((adapter + 8) as *mut u64, ops);
+        write_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *mut u64, ops);
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *mut u64,
+            HOSTED_DMA_ADAPTER_SIGNATURE,
+        );
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_ID_OFFSET) as *mut u64,
+            adapter_id,
+        );
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64,
             adapter,
@@ -6950,13 +6958,20 @@ extern "win64" fn s_io_get_dma_adapter(
 /// `PutDmaAdapter` — release the component-local adapter projection.
 extern "win64" fn s_dma_put_adapter(adapter: u64) {
     unsafe {
+        if dma_adapter_blob_id(adapter).is_none() {
+            return;
+        }
         let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
-        if adapter != 0 && adapter == active {
-            let ops = read_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *const u64);
-            pool_free(adapter);
-            if ops != 0 {
-                pool_free(ops);
-            }
+        let ops = read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64);
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *mut u64,
+            0,
+        );
+        pool_free(adapter);
+        if ops != 0 {
+            pool_free(ops);
+        }
+        if adapter == active {
             write_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
             write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, 0);
         }
@@ -6968,6 +6983,10 @@ const HOSTED_DMA_RECORD_KIND_COMMON: u64 = 1;
 const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
 const HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE: u64 = 1;
 const HOSTED_DMA_MAP_REGISTER_SIGNATURE: u64 = 0x4D41_5052_4547_3031; // "MAPREG01"
+const HOSTED_DMA_ADAPTER_SIGNATURE: u64 = 0x444D_4144_4150_3031; // "DMADAP01"
+const HOSTED_DMA_ADAPTER_OPS_OFFSET: u64 = 0x08;
+const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
+const HOSTED_DMA_ADAPTER_ID_OFFSET: u64 = 0x18;
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {
@@ -7075,6 +7094,28 @@ unsafe fn first_free_dma_allocation_record(sh: u64) -> Option<u64> {
     None
 }
 
+unsafe fn dma_adapter_blob_id(adapter: u64) -> Option<u64> {
+    if adapter == 0
+        || read_unaligned((adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *const u64)
+            != HOSTED_DMA_ADAPTER_SIGNATURE
+    {
+        return None;
+    }
+    Some(read_unaligned(
+        (adapter + HOSTED_DMA_ADAPTER_ID_OFFSET) as *const u64,
+    ))
+}
+
+unsafe fn dma_adapter_blob_matches(adapter: u64, adapter_id: u64) -> bool {
+    if adapter_id == 0 {
+        return false;
+    }
+    dma_adapter_blob_id(adapter)
+        .map(|id| id == adapter_id)
+        .unwrap_or(false)
+        && read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64) != 0
+}
+
 /// `AllocateCommonBuffer` — allocate a bounded slice from the PnP-granted DMA common-buffer window.
 extern "win64" fn s_dma_allocate_common_buffer(
     adapter: u64,
@@ -7083,13 +7124,13 @@ extern "win64" fn s_dma_allocate_common_buffer(
     _cache_enabled: u8,
 ) -> u64 {
     unsafe {
-        let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+        let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
         let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
         let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
         let requested = length as u64;
         if adapter == 0
-            || adapter != active
+            || !dma_adapter_blob_matches(adapter, adapter_id)
             || grant_va == 0
             || grant_len == 0
             || grant_logical == 0
@@ -7125,7 +7166,8 @@ extern "win64" fn s_dma_allocate_common_buffer(
 
         let va = grant_va + offset;
         let logical = grant_logical + offset;
-        core::ptr::write_bytes(va as *mut u8, 0, requested as usize);
+        // Common-buffer allocation does not promise zeroed memory, and provider-domain NDIS must
+        // not dereference a VA that belongs to the dependent miniport VSpace.
         write_volatile(
             (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
             logical,
@@ -7180,13 +7222,16 @@ extern "win64" fn s_dma_allocate_common_buffer(
 
 /// `FreeCommonBuffer` — release the matching common-buffer allocation record.
 extern "win64" fn s_dma_free_common_buffer(
-    _adapter: u64,
+    adapter: u64,
     length: u32,
     logical: i64,
     virtual_address: u64,
     _cache_enabled: u8,
 ) {
     unsafe {
+        if dma_active_adapter_and_grant(adapter).is_none() {
+            return;
+        }
         let logical = logical as u64;
         let mut i = 0u64;
         let capacity = dma_allocation_record_capacity(FSD_SHARED_VADDR);
@@ -7227,12 +7272,12 @@ extern "win64" fn s_dma_free_common_buffer(
 }
 
 unsafe fn dma_active_adapter_and_grant(adapter: u64) -> Option<(u64, u64, u64)> {
-    let active = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
+    let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
     let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
     let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
     let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
     if adapter == 0
-        || adapter != active
+        || !dma_adapter_blob_matches(adapter, adapter_id)
         || grant_va == 0
         || grant_len == 0
         || grant_logical == 0
@@ -11953,6 +11998,9 @@ struct ProviderMarshalState {
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
     resource_mapping_copyback: bool,
+    dma_state_copyback: bool,
+    dma_free_logical: u64,
+    dma_free_len: u64,
 }
 
 impl ProviderMarshalState {
@@ -11975,6 +12023,9 @@ impl ProviderMarshalState {
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
             resource_mapping_copyback: false,
+            dma_state_copyback: false,
+            dma_free_logical: 0,
+            dma_free_len: 0,
         }
     }
 }
@@ -12892,6 +12943,127 @@ unsafe fn provider_marshal_mmio_mapping(
     )
 }
 
+unsafe fn dma_common_pointer_in_grant(
+    sh: u64,
+    component_va: u64,
+    logical: u64,
+    length: u64,
+) -> bool {
+    let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
+    let grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    if grant_va == 0
+        || grant_len == 0
+        || grant_logical == 0
+        || component_va == 0
+        || logical == 0
+        || length == 0
+    {
+        return false;
+    }
+    let Some(va_offset) = component_va.checked_sub(grant_va) else {
+        return false;
+    };
+    let Some(logical_offset) = logical.checked_sub(grant_logical) else {
+        return false;
+    };
+    va_offset == logical_offset && va_offset <= grant_len && length <= grant_len - va_offset
+}
+
+unsafe fn dma_common_allocation_record_matches(
+    sh: u64,
+    component_va: u64,
+    logical: u64,
+    length: u64,
+) -> bool {
+    if !dma_common_pointer_in_grant(sh, component_va, logical, length) {
+        return false;
+    }
+    let capacity = dma_allocation_record_capacity(sh);
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if capacity == 0 || count > capacity {
+        return false;
+    }
+    let mut index = 0u64;
+    while index < count {
+        let Some(record) = dma_allocation_record(sh, index) else {
+            return false;
+        };
+        let record_logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let record_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let record_va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let record_kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if record_kind == HOSTED_DMA_RECORD_KIND_COMMON
+            && record_logical == logical
+            && record_len == length
+            && record_va == component_va
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+unsafe fn provider_marshal_output_dma_common_buffer(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    length: u64,
+) -> Result<u64, i32> {
+    let sh = dependent_inst.exec_shared_va;
+    let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
+    let grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    let adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
+    if grant_va == 0
+        || grant_len == 0
+        || grant_logical == 0
+        || adapter_id == 0
+        || length == 0
+        || length > u32::MAX as u64
+        || length > grant_len
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let cell = provider_marshal_output_cell(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        arg_value,
+        8,
+    )?;
+    state.dma_state_copyback = true;
+    Ok(cell)
+}
+
+unsafe fn provider_marshal_input_dma_common_buffer(
+    state: &mut ProviderMarshalState,
+    dependent_inst: DriverInstance,
+    arg_value: u64,
+    length: u64,
+    physical_address: u64,
+) -> Result<u64, i32> {
+    if length > u32::MAX as u64 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if !dma_common_allocation_record_matches(
+        dependent_inst.exec_shared_va,
+        arg_value,
+        physical_address,
+        length,
+    ) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    state.dma_state_copyback = true;
+    state.dma_free_logical = physical_address;
+    state.dma_free_len = length;
+    Ok(arg_value)
+}
+
 unsafe fn provider_marshal_output_pointer_from_length(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -13262,6 +13434,39 @@ unsafe fn prepare_provider_export_marshal(
                     args[length_index],
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutDmaCommonBuffer { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_output_dma_common_buffer(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInDmaCommonBuffer {
+                length_arg,
+                physical_address_arg,
+            } => {
+                let length_index = length_arg as usize;
+                let physical_address_index = physical_address_arg as usize;
+                if length_index >= policy.argument_count as usize
+                    || physical_address_index >= policy.argument_count as usize
+                {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_input_dma_common_buffer(
+                    &mut state,
+                    dependent_inst,
+                    arg,
+                    args[length_index],
+                    args[physical_address_index],
+                )?
+            }
             HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg } => {
                 let length_index = length_arg as usize;
                 if length_index >= policy.argument_count as usize {
@@ -13343,7 +13548,108 @@ const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 13] = [
     SH_RESOURCE_IO_PORT_LEN,
 ];
 
-unsafe fn project_provider_resource_state(dependent_shared: u64, provider_shared: u64) {
+const PROVIDER_DMA_PROJECTION_OFFSETS: [u64; 11] = [
+    SH_DMA_COMMON_VA,
+    SH_DMA_COMMON_LEN,
+    SH_DMA_COMMON_LOGICAL,
+    SH_DMA_ADAPTER_ID,
+    SH_DMA_REQUESTED_LEN,
+    SH_DMA_ALLOCATED_VA,
+    SH_DMA_ALLOCATED_LOGICAL,
+    SH_DMA_FREED_LOGICAL,
+    SH_DMA_ALLOC_CURSOR,
+    SH_DMA_ALLOC_RECORD_COUNT,
+    SH_DMA_ALLOC_RECORD_CAPACITY,
+];
+
+unsafe fn copy_provider_dma_projection_fields(dst_shared: u64, src_shared: u64) {
+    let mut index = 0usize;
+    while index < PROVIDER_DMA_PROJECTION_OFFSETS.len() {
+        let offset = PROVIDER_DMA_PROJECTION_OFFSETS[index];
+        write_volatile(
+            (dst_shared + offset) as *mut u64,
+            read_volatile((src_shared + offset) as *const u64),
+        );
+        index += 1;
+    }
+}
+
+unsafe fn copy_provider_dma_allocation_records(dst_shared: u64, src_shared: u64) {
+    copy_bytes(
+        dst_shared + SH_DMA_ALLOC_RECORDS,
+        src_shared + SH_DMA_ALLOC_RECORDS,
+        SH_DMA_ALLOC_RECORD_LIMIT - SH_DMA_ALLOC_RECORDS,
+    );
+}
+
+unsafe fn provider_dma_allocation_records_valid(sh: u64) -> bool {
+    let record_capacity = dma_allocation_record_capacity(sh);
+    let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if record_capacity != dma_allocation_record_arena_capacity() || record_count > record_capacity {
+        return false;
+    }
+    let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
+    let grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    let adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
+    let mut index = 0u64;
+    while index < record_count {
+        let Some(record) = dma_allocation_record(sh, index) else {
+            return false;
+        };
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if logical != 0 || len != 0 || va != 0 || kind != 0 {
+            if adapter_id == 0
+                || grant_va == 0
+                || grant_len == 0
+                || grant_logical == 0
+                || len == 0
+                || (kind != HOSTED_DMA_RECORD_KIND_COMMON
+                    && kind != HOSTED_DMA_RECORD_KIND_MAP_TRANSFER)
+            {
+                return false;
+            }
+            if !dma_common_pointer_in_grant(sh, va, logical, len) {
+                return false;
+            }
+            if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER {
+                let source_va =
+                    read_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *const u64);
+                let map_register =
+                    read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+                if source_va == 0 || map_register == 0 {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+unsafe fn project_provider_dma_state(
+    dependent_shared: u64,
+    provider_shared: u64,
+) -> Result<(), i32> {
+    if !provider_dma_allocation_records_valid(dependent_shared) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    copy_provider_dma_projection_fields(provider_shared, dependent_shared);
+    copy_provider_dma_allocation_records(provider_shared, dependent_shared);
+    write_volatile((provider_shared + SH_DMA_REQUESTED_LEN) as *mut u64, 0);
+    write_volatile((provider_shared + SH_DMA_ALLOCATED_VA) as *mut u64, 0);
+    write_volatile((provider_shared + SH_DMA_ALLOCATED_LOGICAL) as *mut u64, 0);
+    write_volatile((provider_shared + SH_DMA_FREED_LOGICAL) as *mut u64, 0);
+    Ok(())
+}
+
+unsafe fn project_provider_resource_state(
+    dependent_shared: u64,
+    provider_shared: u64,
+) -> Result<(), i32> {
     let mut index = 0usize;
     while index < PROVIDER_RESOURCE_PROJECTION_OFFSETS.len() {
         let offset = PROVIDER_RESOURCE_PROJECTION_OFFSETS[index];
@@ -13355,6 +13661,8 @@ unsafe fn project_provider_resource_state(dependent_shared: u64, provider_shared
     }
     write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    project_provider_dma_state(dependent_shared, provider_shared)?;
+    Ok(())
 }
 
 unsafe fn complete_provider_resource_mapping(
@@ -13374,6 +13682,50 @@ unsafe fn complete_provider_resource_mapping(
         (dependent_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
         read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
     );
+}
+
+unsafe fn complete_provider_dma_state(
+    state: &ProviderMarshalState,
+    binding: Option<HostedDeviceBinding>,
+    dependent_shared: u64,
+    provider_shared: u64,
+) {
+    if !state.dma_state_copyback {
+        return;
+    }
+    if !provider_dma_allocation_records_valid(provider_shared) {
+        print_str(b"[driver-import] provider DMA state rejected\n");
+        return;
+    }
+    copy_provider_dma_projection_fields(dependent_shared, provider_shared);
+    copy_provider_dma_allocation_records(dependent_shared, provider_shared);
+    let Some(binding) = binding else {
+        print_str(b"[driver-import] provider DMA state has no dependent binding\n");
+        return;
+    };
+    if state.dma_free_logical != 0 {
+        let freed = read_volatile((dependent_shared + SH_DMA_FREED_LOGICAL) as *const u64);
+        if freed == state.dma_free_logical {
+            match hosted_dma_manager_mut().free_common_buffer(
+                hosted_dma_owner(binding),
+                state.dma_free_logical,
+                state.dma_free_len,
+            ) {
+                Ok(()) | Err(DmaError::StaleId) => {}
+                Err(_) => {
+                    print_str(b"[driver-import] provider DMA free rejected by manager\n");
+                }
+            }
+        }
+    }
+    match replay_hosted_dma_allocation_records(binding, dependent_shared) {
+        Ok(()) => refresh_hosted_device_resource_state(binding, dependent_shared),
+        Err(status) => {
+            print_str(b"[driver-import] provider DMA replay rejected status=0x");
+            print_hex(status.0 as u32);
+            print_str(b"\n");
+        }
+    }
 }
 
 pub(crate) unsafe fn service_hosted_provider_export(
@@ -13450,6 +13802,11 @@ pub(crate) unsafe fn service_hosted_provider_export(
         );
         stack_index += 1;
     }
+    let dependent_binding = if dependent_inst.device_id == 0 {
+        None
+    } else {
+        hosted_device_binding_by_device_id(dependent_inst.device_id)
+    };
     let marshal_state = match prepare_provider_export_marshal(
         policy,
         singleton.instance,
@@ -13462,7 +13819,10 @@ pub(crate) unsafe fn service_hosted_provider_export(
         Err(status) => return hosted_provider_export_failure(status),
     };
 
-    project_provider_resource_state(dependent_channel.shared_va, provider_shared);
+    if let Err(status) = project_provider_resource_state(dependent_channel.shared_va, provider_shared)
+    {
+        return hosted_provider_export_failure(status);
+    }
     write_volatile(
         (provider_shared + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_PROVIDER_EXPORT,
@@ -13529,6 +13889,12 @@ pub(crate) unsafe fn service_hosted_provider_export(
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
     let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
+    complete_provider_dma_state(
+        &marshal_state,
+        dependent_binding,
+        dependent_channel.shared_va,
+        provider_shared,
+    );
     complete_provider_export_marshal(&marshal_state, result);
     complete_provider_resource_mapping(
         &marshal_state,
@@ -18854,7 +19220,7 @@ impl HostedHardwareEvidence {
     }
 
     pub(crate) fn dma_adapter_created(self) -> bool {
-        self.dma_adapter_id != 0 && self.dma_adapter_blob != 0
+        self.dma_adapter_id != 0 && (self.dma_adapter_blob != 0 || self.dma_common_allocated())
     }
 
     pub(crate) fn dma_common_allocated(self) -> bool {
@@ -22846,6 +23212,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     {
         state.mmio_broker_va = mmio_broker_va;
         state.dma_broker_va = dma_broker_va;
+        state.dma_frame_base = dma_frame_base;
+        state.dma_pages = dma_pages;
     }
     Ok(())
 }
@@ -22855,13 +23223,9 @@ unsafe fn replay_hosted_dma_allocation_records(
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
     let dma_adapter_id = read_volatile((sh + SH_DMA_ADAPTER_ID) as *const u64);
-    let dma_adapter_blob = read_volatile((sh + SH_DMA_ADAPTER_BLOB) as *const u64);
     let dma_grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
     let dma_grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
     let dma_grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
-    if dma_adapter_blob != 0 && dma_adapter_id == 0 {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
 
     let record_capacity = dma_allocation_record_capacity(sh);
     let record_count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
@@ -22879,7 +23243,6 @@ unsafe fn replay_hosted_dma_allocation_records(
         let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
         if logical != 0 || len != 0 || va != 0 {
             if dma_adapter_id == 0
-                || dma_adapter_blob == 0
                 || dma_grant_va == 0
                 || dma_grant_len == 0
                 || dma_grant_logical == 0

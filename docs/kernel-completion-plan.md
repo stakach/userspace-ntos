@@ -7352,3 +7352,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the typed I/O-port/MMIO provider mapping slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 NDIS shared-DMA provider slice (2026-08-17, in progress): `NdisMAllocateSharedMemory` and
+  `NdisMFreeSharedMemory` now use typed DMA common-buffer policies instead of generic caller-pointer
+  or input-buffer marshalling. The provider-export service projects the dependent miniport's DMA
+  grant and allocation-record arena into the provider shared frame while keeping provider-local
+  `DMA_ADAPTER` blobs tagged by adapter id. The provider-side common-buffer shim records the
+  caller-visible VA/logical pair without dereferencing the caller VA from the provider VSpace, then
+  marshal completion copies allocation/free records back to the dependent shared frame. Completion
+  also replays those records into the canonical hosted DMA manager and releases freed common buffers
+  by owner/logical/length, so the miniport-visible VA/logical-address pair remains tied to the
+  devnode's brokered DMA grant.
+  Review adjustment: continue B3 by boot-testing the real provider-domain e1000 initialization path.
+  If this still does not reach shell networking/desktop progress, inspect the next nested
+  `MiniportInitialize` provider export or callback shape rather than adding private NDIS image
+  fallbacks.
+
+  Validation for the NDIS shared-DMA provider slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
