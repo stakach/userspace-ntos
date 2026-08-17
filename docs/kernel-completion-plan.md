@@ -7662,14 +7662,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact running thread and call site instead of relying on a partial census.
   - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural
     smell, not a resource problem to solve by inflating the monolithic image. The preferred direction
-    is a small seL4/rootserver boot image loaded directly by BOOTBOOT, plus an initrd/folder manifest
-    that carries the NT personality set as separate artifacts: executive, isolated NT services, hosted
-    drivers, win32k assets, and our ntdll. The kernel should discover those artifacts through explicit
-    manifests and capability handoff instead of baking them into one large binary blob. Keep this as a
-    packaging/ownership cleanup item; it should not block the current desktop repair unless the
-    BOOTBOOT limit reappears. The 2026-08-17 desktop proof with the restored shell path still showed
-    `text @... 15855616 bytes`, so the boot image is below the hard limit but too close to keep
-    treating monolithic growth as acceptable.
+    is a small rust-micro seL4/rootserver boot image loaded directly by BOOTBOOT, plus an
+    initrd/folder manifest that carries the NT personality set as separate artifacts: executive,
+    isolated NT services, hosted drivers, win32k assets, and our ntdll. The kernel should discover
+    those artifacts through explicit manifests and capability handoff instead of baking them into one
+    large binary blob. Keep this as a packaging/ownership cleanup item; it should not block the
+    current desktop repair unless the BOOTBOOT limit reappears. The 2026-08-17 desktop proof with the
+    restored shell path still showed `text @... 15855616 bytes`, so the boot image is below the hard
+    limit but too close to keep treating monolithic growth as acceptable.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
@@ -7744,7 +7744,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     recursive_existing_import_references_balance_recursive_release`, `./scripts/build_ntdll_dll.sh`,
     `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
     x86_64-unknown-none`, and `git diff --check`.
-  - `[~]` Current frontier after restored Explorer shell chrome: serialized desktop proof
+  - `[x]` Current frontier after restored Explorer shell chrome: serialized desktop proof
     `.tmp/run-desktop-loader-recursive-ref-20260817.log` reaches the sentinel with `297/298`
     executive checks passing. The restored path is genuine: profile hive copy/load,
     `WlxActivateUserShell`, userinit launch, Explorer launch, `RegisterWindowMessage` capture,
@@ -7754,4 +7754,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `image-mapcap-fails=0`, `image-bank-fails=0`, `w32-bank-fails=0`, and frame-reg census top
     owners are `pi=6`, `pi=2`, `pi=3`, `pi=10`, `pi=7`, and `pi=4`. Continue with mechanism-level
     resource accounting/release and boot packaging separation; do not relax the gate and do not add
-    image-fault or Explorer-specific fallbacks.
+    image-fault or Explorer-specific fallbacks. Closed by the rootserver Untyped handoff sizing proof
+    below.
+  - `[x]` Rootserver Untyped handoff sizing: the restored Explorer proof showed the remaining
+    `exec_vm_pool_headroom` red gate was not a failed retype, root CSpace wall, map-cap wall, or
+    BOOTBOOT artifact-size failure. The single boot Untyped handed to the rootserver was still fixed
+    at 256 MiB while the normal QEMU launch provides 1 GiB and the desktop workload had legitimately
+    reached roughly 253 MiB live. The current repair sizes the power-of-two rootserver Untyped from
+    the BOOTBOOT free map: prefer 512 MiB when available, preserve the existing 256 MiB minimum for
+    smaller spec maps, and keep the executive headroom gate unchanged. Validation note from the first
+    retry: the default 1 GiB QEMU map did not contain a 512 MiB aligned free extent after BOOTBOOT's
+    reservations, so the allocator correctly fell back to 256 MiB and the desktop proof remained
+    `297/298` with `ut-free=9286KiB`. The runner now defaults to 2 GiB (`QEMU_MEMORY` remains
+    overrideable) so the dynamic handoff can publish a real 512 MiB Untyped instead of depending on
+    an invalid unaligned range. Accepted proof:
+    `.tmp/run-headless-rootserver-ut-2g-20260817.log` boots below the BOOTBOOT image wall
+    (`text @... 15863808 bytes`), reserves `rootserver-ut @0x0000000020000000..0000000040000000`
+    with `size_bits=29`, reaches genuine Explorer shell chrome, and passes `298/298` executive
+    gates. The final pool gate keeps `exec_vm_pool_headroom` green with
+    `untyped=253959KiB/524288KiB`, `ut-free=270328KiB`, `ut-fails=0`,
+    `image-mapcap-fails=0`, `image-bank-fails=0`, `w32-bank-fails=0`, `slot-free=40103`, and
+    `frame-reg=10083/32768`; the framebuffer proof shows full-screen Explorer chrome
+    (`786432/786432` non-background pixels, at least 32 unique colors).

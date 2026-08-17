@@ -8600,7 +8600,8 @@ unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
 // heap at 93 %; `HEAP_FRAMES`; the VAD map). Every pool that backs a hosted process's private
 // memory is now MEASURED — a high-water mark next to its capacity — and printed at the gate, so the
 // NEXT exhaustion names itself instead of surfacing as a mysterious `STATUS_INSUFFICIENT_RESOURCES`.
-/// Cumulative successful bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`, 256 MiB).
+/// Cumulative successful bytes carved out of the single boot Untyped (`CAP_INIT_UNTYPED`; size from
+/// BootInfo).
 /// This is diagnostic churn: live runway is tracked separately because root-cap delete can return
 /// typed objects to the parent Untyped and recycled root slots can be retyped again.
 pub(crate) static UT_RETYPE_BYTES: AtomicU64 = AtomicU64::new(0);
