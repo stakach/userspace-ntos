@@ -226,6 +226,7 @@ pub enum HostedProviderArgumentMarshal {
     CallerInUnicodeString,
     CallerInAnsiString,
     CallerInBuffer { length_arg: u8 },
+    CallerInOwnedAllocation { length_arg: u8 },
     CallerOutBuffer { length_arg: u8 },
     CallerInMiniportCharacteristics { length_arg: u8 },
     CallerInProtocolCharacteristics { length_arg: u8 },
@@ -420,7 +421,9 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutPointer,
             CallerOutPhysicalAddress,
         ]),
-        "NdisFreeMemory" => export_policy(&[CallerInBuffer { length_arg: 1 }, Scalar, Scalar]),
+        "NdisFreeMemory" => {
+            export_policy(&[CallerInOwnedAllocation { length_arg: 1 }, Scalar, Scalar])
+        }
         "NdisTransferData" => export_policy(&[
             CallerOutStatus,
             ProviderHandle,
@@ -1026,6 +1029,18 @@ mod tests {
         assert_eq!(
             policy.args[0],
             HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg: 1 }
+        );
+        assert_eq!(policy.args[1], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
+    }
+
+    #[test]
+    fn ndis_free_memory_policy_requires_owned_allocation() {
+        let policy = hosted_provider_export_marshal_policy("ndis.sys", "NdisFreeMemory").unwrap();
+        assert_eq!(policy.argument_count, 3);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerInOwnedAllocation { length_arg: 1 }
         );
         assert_eq!(policy.args[1], HostedProviderArgumentMarshal::Scalar);
         assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);

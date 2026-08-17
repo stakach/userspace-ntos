@@ -7285,3 +7285,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the `NdisAllocateMemoryWithTag` caller-pointer slice: `cargo fmt --all`, `cargo
   test -p nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 NDIS caller allocation ownership/free slice (2026-08-17, in progress): caller-visible NDIS
+  pool pointers are now registered in a bounded ownership table keyed by dependent hosted-driver
+  instance and component VA. `NdisFreeMemory` no longer uses the generic input-buffer marshaller; its
+  policy now requires a `CallerInOwnedAllocation`, validates that the pointer came from the provider
+  marshaller for the same dependent component, passes a benign provider argument through the real
+  export call, and frees the dependent hosted-pool block after completion. Allocation setup also
+  schedules a failure-only deferred free so `NdisAllocateMemoryWithTag` cannot leak a reserved
+  dependent-pool block if the provider reports failure before the pointer is published.
+  Review adjustment: the remaining `MiniportInitialize` provider-export blockers are now data
+  marshalling rather than allocation lifetime: add `CallerOutBuffer` support for
+  `NdisReadPciSlotInformation`, then implement `CallerInOutU32` and resource-list copyout/copyin for
+  `NdisMQueryAdapterResources`.
+
+  Validation for the NDIS caller allocation ownership/free slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

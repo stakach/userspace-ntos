@@ -2372,6 +2372,46 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
     Some(block)
 }
 
+unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
+    if inst.exec_pool_va == 0
+        || p < FSD_POOL_VADDR + POOL_DATA_OFF
+        || p >= component_pool_end()
+    {
+        return false;
+    }
+    let Some(p_exec) = inst.exec_pool_va.checked_add(p - FSD_POOL_VADDR) else {
+        return false;
+    };
+    if p_exec < inst.exec_pool_va + 16 {
+        return false;
+    }
+    let Some(head_slot_exec) = inst.exec_pool_va.checked_add(8) else {
+        return false;
+    };
+    let mut cur = read_volatile(head_slot_exec as *const u64);
+    let mut steps = 0u64;
+    while cur != 0 && steps < POOL_FREE_LIST_MAX {
+        if cur == p {
+            FSD_POOL_DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if cur < FSD_POOL_VADDR + POOL_DATA_OFF || cur >= component_pool_end() {
+            break;
+        }
+        let Some(cur_exec) = inst.exec_pool_va.checked_add(cur - FSD_POOL_VADDR) else {
+            break;
+        };
+        if cur_exec < inst.exec_pool_va + 16 {
+            break;
+        }
+        cur = read_volatile((cur_exec - 8) as *const u64);
+        steps += 1;
+    }
+    write_volatile((p_exec - 8) as *mut u64, read_volatile(head_slot_exec as *const u64));
+    write_volatile(head_slot_exec as *mut u64, p);
+    true
+}
+
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
     let sh = inst.exec_shared_va;
     let irp_c = read_volatile((sh + SH_ACTIVE_IRP) as *const u64);
@@ -11896,10 +11936,22 @@ struct ProviderMarshalCopyout {
 }
 
 #[derive(Clone, Copy)]
+struct ProviderMarshalDeferredFree {
+    dependent_instance: usize,
+    component_va: u64,
+    condition: u8,
+}
+
+const PROVIDER_MARSHAL_FREE_ALWAYS: u8 = 1;
+const PROVIDER_MARSHAL_FREE_ON_FAILURE: u8 = 2;
+
+#[derive(Clone, Copy)]
 struct ProviderMarshalState {
     cursor: u64,
     copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     copyout_count: usize,
+    deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    deferred_free_count: usize,
 }
 
 impl ProviderMarshalState {
@@ -11915,6 +11967,12 @@ impl ProviderMarshalState {
                 fixed_bytes: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             copyout_count: 0,
+            deferred_frees: [ProviderMarshalDeferredFree {
+                dependent_instance: 0,
+                component_va: 0,
+                condition: 0,
+            }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+            deferred_free_count: 0,
         }
     }
 }
@@ -11936,6 +11994,25 @@ impl HostedProviderCallbackRecord {
             dependent_instance: 0,
             target: 0,
             callback_offset: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderPointerAllocation {
+    present: bool,
+    dependent_instance: usize,
+    component_va: u64,
+    bytes: u64,
+}
+
+impl HostedProviderPointerAllocation {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            dependent_instance: 0,
+            component_va: 0,
+            bytes: 0,
         }
     }
 }
@@ -11963,6 +12040,13 @@ static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
 static HOSTED_PROVIDER_CALLBACK_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
+static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
+    HOSTED_PROVIDER_POINTER_ALLOCATION_CAP] =
+    [HostedProviderPointerAllocation::empty(); HOSTED_PROVIDER_POINTER_ALLOCATION_CAP];
+static HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -12407,6 +12491,95 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
     record.present.then_some(record)
 }
 
+unsafe fn register_hosted_provider_pointer_allocation(
+    dependent_instance: usize,
+    component_va: u64,
+    bytes: u64,
+) -> bool {
+    if component_va == 0 || bytes == 0 {
+        return false;
+    }
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
+        as *mut HostedProviderPointerAllocation;
+    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if !record.present {
+            *record = HostedProviderPointerAllocation {
+                present: true,
+                dependent_instance,
+                component_va,
+                bytes,
+            };
+            return true;
+        }
+        index += 1;
+    }
+    if bounded_count >= HOSTED_PROVIDER_POINTER_ALLOCATION_CAP {
+        HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    *records.add(bounded_count) = HostedProviderPointerAllocation {
+        present: true,
+        dependent_instance,
+        component_va,
+        bytes,
+    };
+    HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.store((bounded_count + 1) as u64, Ordering::Relaxed);
+    true
+}
+
+unsafe fn hosted_provider_pointer_allocation_matches(
+    dependent_instance: usize,
+    component_va: u64,
+    bytes: u64,
+) -> bool {
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
+        as *const HostedProviderPointerAllocation;
+    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.dependent_instance == dependent_instance
+            && record.component_va == component_va
+            && (bytes == 0 || bytes <= record.bytes)
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+unsafe fn take_hosted_provider_pointer_allocation(
+    dependent_instance: usize,
+    component_va: u64,
+) -> Option<HostedProviderPointerAllocation> {
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
+        as *mut HostedProviderPointerAllocation;
+    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && record.dependent_instance == dependent_instance
+            && record.component_va == component_va
+        {
+            let taken = *record;
+            *record = HostedProviderPointerAllocation::empty();
+            return Some(taken);
+        }
+        index += 1;
+    }
+    HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
 unsafe fn provider_marshal_emit_callback_thunk(
     provider_instance: usize,
     dependent_instance: usize,
@@ -12508,6 +12681,24 @@ fn provider_marshal_add_copyout_with_fixed(
     Some(())
 }
 
+fn provider_marshal_add_deferred_free(
+    state: &mut ProviderMarshalState,
+    dependent_instance: usize,
+    component_va: u64,
+    condition: u8,
+) -> Option<()> {
+    if state.deferred_free_count >= state.deferred_frees.len() || condition == 0 {
+        return None;
+    }
+    state.deferred_frees[state.deferred_free_count] = ProviderMarshalDeferredFree {
+        dependent_instance,
+        component_va,
+        condition,
+    };
+    state.deferred_free_count += 1;
+    Some(())
+}
+
 unsafe fn provider_marshal_output_cell(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -12550,12 +12741,19 @@ unsafe fn provider_marshal_output_pointer_from_length(
     let Some(allocated_component_va) = hosted_instance_pool_alloc(dependent_inst, length) else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
+    if !register_hosted_provider_pointer_allocation(dependent_index, allocated_component_va, length)
+    {
+        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let Some((provider_component_va, provider_exec_va)) =
         provider_marshal_alloc(state, provider_shared, 8)
     else {
+        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
+        hosted_instance_pool_free(dependent_inst, allocated_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    provider_marshal_add_copyout_with_fixed(
+    if provider_marshal_add_copyout_with_fixed(
         state,
         dependent_exec_va,
         provider_exec_va,
@@ -12564,8 +12762,47 @@ unsafe fn provider_marshal_output_pointer_from_length(
         0,
         8,
     )
-    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    .is_none()
+    {
+        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
+        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if provider_marshal_add_deferred_free(
+        state,
+        dependent_index,
+        allocated_component_va,
+        PROVIDER_MARSHAL_FREE_ON_FAILURE,
+    )
+    .is_none()
+    {
+        take_hosted_provider_pointer_allocation(dependent_index, allocated_component_va);
+        hosted_instance_pool_free(dependent_inst, allocated_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_owned_allocation(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    arg_value: u64,
+    length: u64,
+) -> Result<u64, i32> {
+    if arg_value == 0 {
+        return Ok(0);
+    }
+    if !hosted_provider_pointer_allocation_matches(dependent_index, arg_value, length) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    provider_marshal_add_deferred_free(
+        state,
+        dependent_index,
+        arg_value,
+        PROVIDER_MARSHAL_FREE_ALWAYS,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(0)
 }
 
 unsafe fn provider_marshal_unicode_string(
@@ -12719,6 +12956,18 @@ unsafe fn prepare_provider_export_marshal(
             | HostedProviderArgumentMarshal::ProviderHandle
             | HostedProviderArgumentMarshal::CallerContext
             | HostedProviderArgumentMarshal::CallerInDriverObject => arg,
+            HostedProviderArgumentMarshal::CallerInOwnedAllocation { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_owned_allocation(
+                    &mut state,
+                    dependent_index,
+                    arg,
+                    args[length_index],
+                )?
+            }
             HostedProviderArgumentMarshal::CallerOutStatus => provider_marshal_output_cell(
                 &mut state,
                 dependent_index,
@@ -12787,11 +13036,12 @@ unsafe fn prepare_provider_export_marshal(
 }
 
 unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result: u64) {
+    let success = result == STATUS_SUCCESS as u64;
     let mut index = 0usize;
     while index < state.copyout_count {
         let copyout = state.copyouts[index];
         if copyout.fixed_bytes != 0 {
-            let value = if result == STATUS_SUCCESS as u64 {
+            let value = if success {
                 copyout.fixed_success_value
             } else {
                 copyout.fixed_failure_value
@@ -12804,6 +13054,28 @@ unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result:
         }
         copy_bytes(copyout.dependent_exec_va, copyout.provider_exec_va, copyout.bytes);
         index += 1;
+    }
+    let mut free_index = 0usize;
+    while free_index < state.deferred_free_count {
+        let deferred = state.deferred_frees[free_index];
+        let should_free = match deferred.condition {
+            PROVIDER_MARSHAL_FREE_ALWAYS => true,
+            PROVIDER_MARSHAL_FREE_ON_FAILURE => !success,
+            _ => false,
+        };
+        if should_free {
+            if let Some(inst) = instance(deferred.dependent_instance) {
+                if take_hosted_provider_pointer_allocation(
+                    deferred.dependent_instance,
+                    deferred.component_va,
+                )
+                .is_some()
+                {
+                    hosted_instance_pool_free(inst, deferred.component_va);
+                }
+            }
+        }
+        free_index += 1;
     }
 }
 
