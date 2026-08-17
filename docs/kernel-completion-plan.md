@@ -7778,3 +7778,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `image-mapcap-fails=0`, `image-bank-fails=0`, `w32-bank-fails=0`, `slot-free=40103`, and
     `frame-reg=10083/32768`; the framebuffer proof shows full-screen Explorer chrome
     (`786432/786432` non-background pixels, at least 32 unique colors).
+  - `[x]` B3 NDIS provider-domain protocol registration slice: `nt-hosted-runtime` now owns the
+    checked x64 `NDIS_PROTOCOL_CHARACTERISTICS` layouts for NDIS 3.0, 4.0, and 5.x, including the
+    real callback slots and embedded `NDIS_STRING Name` offset. The executive's provider-domain
+    marshal path now handles `CallerInProtocolCharacteristics`: it copies the bounded protocol table
+    into the provider scratch window, copies the embedded protocol name buffer into provider-owned
+    scratch, and replaces non-null protocol callbacks with typed reverse thunks instead of handing
+    NDIS dependent-component function pointers. Provider callback records now carry a miniport vs.
+    protocol kind tag, so overlapping offsets such as `0x08` and `0x68` are dispatched by contract
+    rather than guessed from the slot number. The first protocol callback bridges cover the real
+    ReactOS registration path: NDIS `BindAdapterHandler` receives dependent-side status and
+    `NDIS_STRING` copies for adapter and registry names, and `PnPEventHandler` receives a bounded
+    `NET_PNP_EVENT` copy. This should let TCPIP register with the callable `ndis.sys` provider and
+    enter its nested `NdisOpenAdapter` path without private NDIS images or synthetic binds.
+    Validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`, `cargo check --manifest-path
+    components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+    Review adjustment: rerun the serialized desktop gate and require `NdisRegisterProtocol` to move
+    past provider-domain marshal/unsupported-callback failures. The likely next real B3 mechanism is
+    caller/provider shadowing for NDIS packet, buffer, and request objects, because TCPIP
+    legitimately dereferences `NDIS_PACKET`/`NDIS_BUFFER` fields while the provider must still own
+    NDIS pool bookkeeping.

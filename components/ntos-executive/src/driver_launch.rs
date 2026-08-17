@@ -35,16 +35,17 @@ use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
     hosted_provider_has_export_marshal_policies, ndis_miniport_characteristics_layout,
-    plan_hosted_driver_image, plan_hosted_provider_import_binding,
-    plan_hosted_provider_import_thunk,
+    ndis_protocol_characteristics_layout, plan_hosted_driver_image,
+    plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
     HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
     HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
     HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
-    HostedProviderImportThunkPlan,
-    NdisMiniportCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
+    HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
+    NdisProtocolCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
     HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -488,6 +489,11 @@ const NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64: u64 = 0x50;
 const NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64: u64 = 0x58;
 const NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64: u64 = 0x60;
 const NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64: u64 = 0x68;
+const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT: u8 = 1;
+const HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL: u8 = 2;
+const NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64: u64 = 0x80;
+const NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64: u64 = 0x70;
+const NDIS_NET_PNP_EVENT_LEN_X64: u64 = 0x98;
 const NDIS_MEDIUM_ENTRY_BYTES_X64: u64 = 4;
 const NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP: u64 = 64;
 const PROVIDER_CALLBACK_STACK_QWORDS: usize = SH_PROVIDER_EXPORT_STACK_QWORDS as usize;
@@ -12430,6 +12436,7 @@ struct HostedProviderCallbackRecord {
     dependent_instance: usize,
     target: u64,
     callback_offset: u64,
+    callback_kind: u8,
 }
 
 impl HostedProviderCallbackRecord {
@@ -12440,6 +12447,7 @@ impl HostedProviderCallbackRecord {
             dependent_instance: 0,
             target: 0,
             callback_offset: 0,
+            callback_kind: 0,
         }
     }
 }
@@ -13147,6 +13155,7 @@ unsafe fn register_hosted_provider_callback_record(
     dependent_instance: usize,
     target: u64,
     callback_offset: u64,
+    callback_kind: u8,
 ) -> Option<u64> {
     let count = HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed) as usize;
     if count >= HOSTED_PROVIDER_CALLBACK_RECORD_CAP {
@@ -13161,6 +13170,7 @@ unsafe fn register_hosted_provider_callback_record(
         dependent_instance,
         target,
         callback_offset,
+        callback_kind,
     };
     HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.store((count + 1) as u64, Ordering::Relaxed);
     Some((count as u64).saturating_add(1))
@@ -13745,6 +13755,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
     dependent_instance: usize,
     target: u64,
     callback_offset: u64,
+    callback_kind: u8,
 ) -> Result<u64, i32> {
     let Some((exec_va, run_va, thunk_index)) = allocate_instance_executable_thunk(provider_instance)
     else {
@@ -13755,6 +13766,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         dependent_instance,
         target,
         callback_offset,
+        callback_kind,
     ) else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -14388,6 +14400,43 @@ unsafe fn provider_marshal_unicode_string(
     Ok(provider_desc_va)
 }
 
+unsafe fn provider_marshal_embedded_unicode_string_buffer(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    provider_desc_exec: u64,
+    dependent_desc_exec: u64,
+) -> Result<(), i32> {
+    let length = read_unaligned(dependent_desc_exec as *const u16) as u64;
+    let maximum = read_unaligned((dependent_desc_exec + 2) as *const u16) as u64;
+    let buffer = read_unaligned((dependent_desc_exec + 8) as *const u64);
+    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let provider_buffer_va = if length == 0 {
+        0
+    } else {
+        let Some(buffer_exec) =
+            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let buffer_bytes = length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+        let Some((provider_buffer_va, provider_buffer_exec)) =
+            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+        else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        copy_bytes(provider_buffer_exec, buffer_exec, length);
+        provider_buffer_va
+    };
+    write_unaligned(provider_desc_exec as *mut u16, length as u16);
+    write_unaligned((provider_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned((provider_desc_exec + 8) as *mut u64, provider_buffer_va);
+    Ok(())
+}
+
 unsafe fn provider_marshal_miniport_characteristics(
     state: &mut ProviderMarshalState,
     provider_instance: usize,
@@ -14462,6 +14511,99 @@ unsafe fn provider_marshal_miniport_characteristics(
                 dependent_index,
                 target,
                 offset,
+                HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT,
+            )?;
+            write_unaligned((provider_exec_va + offset) as *mut u64, thunk_va);
+        }
+        callback_index += 1;
+    }
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_protocol_characteristics(
+    state: &mut ProviderMarshalState,
+    provider_instance: usize,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    supplied_len: u64,
+) -> Result<u64, i32> {
+    let Some(header_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let major = read_unaligned(header_exec as *const u8);
+    let minor = read_unaligned((header_exec + 1) as *const u8);
+    let layout = match ndis_protocol_characteristics_layout(major, minor, supplied_len) {
+        Ok(layout) => layout,
+        Err(NdisProtocolCharacteristicsLayoutError::BadVersion) => {
+            return Err(STATUS_INVALID_PARAMETER)
+        }
+        Err(NdisProtocolCharacteristicsLayoutError::BufferTooSmall) => {
+            return Err(STATUS_INVALID_PARAMETER)
+        }
+    };
+    if layout.required_len > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        layout.required_len,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+
+    let mut callback_count = 0u64;
+    let mut callback_index = 0usize;
+    while callback_index < layout.callback_count as usize {
+        let Some(offset) = layout.callback_offset(callback_index) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if read_unaligned((dependent_exec_va + offset) as *const u64) != 0 {
+            callback_count = callback_count.saturating_add(1);
+        }
+        callback_index += 1;
+    }
+    if callback_count > 0
+        && (callback_count > hosted_provider_callback_record_available()
+            || callback_count > instance_executable_thunk_available(provider_instance))
+    {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, layout.required_len)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    copy_bytes(provider_exec_va, dependent_exec_va, layout.required_len);
+
+    provider_marshal_embedded_unicode_string_buffer(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        provider_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
+        dependent_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
+    )?;
+
+    callback_index = 0;
+    while callback_index < layout.callback_count as usize {
+        let Some(offset) = layout.callback_offset(callback_index) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let target = read_unaligned((dependent_exec_va + offset) as *const u64);
+        if target != 0 {
+            let thunk_va = provider_marshal_emit_callback_thunk(
+                provider_instance,
+                dependent_index,
+                target,
+                offset,
+                HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL,
             )?;
             write_unaligned((provider_exec_va + offset) as *mut u64, thunk_va);
         }
@@ -14593,6 +14735,21 @@ unsafe fn prepare_provider_export_marshal(
                     return Err(STATUS_INVALID_PARAMETER);
                 }
                 provider_marshal_miniport_characteristics(
+                    &mut state,
+                    provider_instance,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInProtocolCharacteristics { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_protocol_characteristics(
                     &mut state,
                     provider_instance,
                     dependent_index,
@@ -15799,6 +15956,224 @@ unsafe fn service_ndis_reconfigure_callback(
     Ok(result)
 }
 
+unsafe fn provider_callback_unicode_string_length(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_desc_component: u64,
+) -> Result<u64, i32> {
+    let Some(provider_desc_exec) =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_desc_component, 16)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let length = read_unaligned(provider_desc_exec as *const u16) as u64;
+    let maximum = read_unaligned((provider_desc_exec + 2) as *const u16) as u64;
+    let buffer = read_unaligned((provider_desc_exec + 8) as *const u64);
+    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if length != 0
+        && component_to_exec_va_for_instance(provider_instance, provider_inst, buffer, length)
+            .is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(length)
+}
+
+unsafe fn provider_callback_unicode_string_buffer_bytes(length: u64) -> Result<u64, i32> {
+    if length == 0 {
+        Ok(0)
+    } else {
+        length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn provider_callback_copy_unicode_string(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_desc_component: u64,
+    dependent_desc_exec: u64,
+    dependent_buffer_component: u64,
+    dependent_buffer_exec: u64,
+) -> Result<(), i32> {
+    let Some(provider_desc_exec) =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_desc_component, 16)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let length = read_unaligned(provider_desc_exec as *const u16) as u64;
+    let maximum = read_unaligned((provider_desc_exec + 2) as *const u16) as u64;
+    let buffer = read_unaligned((provider_desc_exec + 8) as *const u64);
+    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let dependent_buffer = if length == 0 {
+        0
+    } else {
+        let Some(provider_buffer_exec) =
+            component_to_exec_va_for_instance(provider_instance, provider_inst, buffer, length)
+        else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        copy_bytes(dependent_buffer_exec, provider_buffer_exec, length);
+        dependent_buffer_component
+    };
+    write_unaligned(dependent_desc_exec as *mut u16, length as u16);
+    write_unaligned((dependent_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned((dependent_desc_exec + 8) as *mut u64, dependent_buffer);
+    Ok(())
+}
+
+unsafe fn service_ndis_protocol_bind_adapter_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, i32> {
+    let device_len = provider_callback_unicode_string_length(provider_instance, provider_inst, arg2)?;
+    let registry_len =
+        provider_callback_unicode_string_length(provider_instance, provider_inst, arg3)?;
+    let device_buffer_bytes = provider_callback_unicode_string_buffer_bytes(device_len)?;
+    let registry_buffer_bytes = provider_callback_unicode_string_buffer_bytes(registry_len)?;
+    let status_off = 0u64;
+    let device_desc_off = 8u64;
+    let device_buffer_off = device_desc_off + 16;
+    let registry_desc_off = provider_marshal_align8(device_buffer_off + device_buffer_bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let registry_buffer_off = registry_desc_off + 16;
+    let used = provider_marshal_align8(registry_buffer_off + registry_buffer_bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    let provider_status_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_base_exec, used);
+
+    provider_callback_copy_unicode_string(
+        provider_instance,
+        provider_inst,
+        arg2,
+        dependent_base_exec + device_desc_off,
+        dependent_base_component + device_buffer_off,
+        dependent_base_exec + device_buffer_off,
+    )?;
+    provider_callback_copy_unicode_string(
+        provider_instance,
+        provider_inst,
+        arg3,
+        dependent_base_exec + registry_desc_off,
+        dependent_base_component + registry_buffer_off,
+        dependent_base_exec + registry_buffer_off,
+    )?;
+
+    let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    stack_args[0] = provider_stack[0];
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [
+            dependent_base_component + status_off,
+            arg1,
+            dependent_base_component + device_desc_off,
+            dependent_base_component + registry_desc_off,
+        ],
+        stack_args,
+    )?;
+    copy_bytes(provider_status_exec, dependent_base_exec + status_off, 4);
+    Ok(result)
+}
+
+unsafe fn service_ndis_protocol_pnp_event_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+) -> Result<u64, i32> {
+    let provider_event_exec = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        arg1,
+        NDIS_NET_PNP_EVENT_LEN_X64,
+    )
+    .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_buffer = read_unaligned((provider_event_exec + 8) as *const u64);
+    let provider_buffer_len = read_unaligned((provider_event_exec + 16) as *const u32) as u64;
+    let buffer_off = provider_marshal_align8(NDIS_NET_PNP_EVENT_LEN_X64)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let used = provider_marshal_align8(buffer_off + provider_buffer_len)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if provider_buffer_len != 0
+        && component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            provider_buffer,
+            provider_buffer_len,
+        )
+        .is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_base_exec, used);
+    copy_bytes(
+        dependent_base_exec,
+        provider_event_exec,
+        NDIS_NET_PNP_EVENT_LEN_X64,
+    );
+    if provider_buffer_len == 0 {
+        write_unaligned((dependent_base_exec + 8) as *mut u64, 0);
+    } else {
+        let provider_buffer_exec = component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            provider_buffer,
+            provider_buffer_len,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+        copy_bytes(
+            dependent_base_exec + buffer_off,
+            provider_buffer_exec,
+            provider_buffer_len,
+        );
+        write_unaligned(
+            (dependent_base_exec + 8) as *mut u64,
+            dependent_base_component + buffer_off,
+        );
+    }
+
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, dependent_base_component, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
 pub(crate) unsafe fn service_hosted_provider_callback(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
@@ -15832,6 +16207,8 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     if record.provider_instance != provider_instance
         || record.target == 0
         || record.callback_offset == 0
+        || (record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL)
         || dependent_inst.fault_ep == 0
         || dependent_inst.pml4 == 0
         || dependent_inst.reply_cap == 0
@@ -15847,89 +16224,120 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let callback_args = [arg0, arg1, arg2, arg3];
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
-    let result = match record.callback_offset {
-        NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-            arg2,
-            arg3,
-            provider_stack,
-        ),
-        NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-            arg2,
-            arg3,
-            provider_stack,
-            false,
-            true,
-        ),
-        NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-            arg2,
-            arg3,
-            provider_stack,
-            true,
-            false,
-        ),
-        NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-        ),
-        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-            arg2,
-        ),
-        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => service_ndis_reconfigure_callback(
-            provider_instance,
-            provider_inst,
-            record,
-            dependent_inst,
-            exec_code_va,
-            arg0,
-            arg1,
-            arg2,
-        ),
-        NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => dispatch_dependent_provider_callback(
-            record,
-            dependent_inst,
-            exec_code_va,
-            [arg0, 0, 0, 0],
-            [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-        ),
-        NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Err(STATUS_NOT_SUPPORTED),
+    let result = match record.callback_kind {
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
+            NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                provider_stack,
+            ),
+            NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                provider_stack,
+                false,
+                true,
+            ),
+            NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                provider_stack,
+                true,
+                false,
+            ),
+            NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+            ),
+            NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+            ),
+            NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => service_ndis_reconfigure_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+            ),
+            NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
+            | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
+            | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
+            | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
+            | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => {
+                dispatch_dependent_provider_callback(
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    [arg0, 0, 0, 0],
+                    [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+                )
+            }
+            NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64
+            | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Err(STATUS_NOT_SUPPORTED),
+            _ => Err(STATUS_NOT_SUPPORTED),
+        },
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => match record.callback_offset {
+            NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => {
+                service_ndis_protocol_bind_adapter_callback(
+                    provider_instance,
+                    provider_inst,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
+                    provider_stack,
+                )
+            }
+            NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => service_ndis_protocol_pnp_event_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+            ),
+            _ => Err(STATUS_NOT_SUPPORTED),
+        },
         _ => Err(STATUS_NOT_SUPPORTED),
     };
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);

@@ -20,6 +20,11 @@ pub const NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x88;
 pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
 pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
 pub const NDIS_MINIPORT_INTERRUPT_LEN_X64: u64 = 0x98;
+pub const NDIS_PROTOCOL_CHARACTERISTICS_CALLBACK_CAP: usize = 19;
+pub const NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64: u64 = 0x58;
+pub const NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x68;
+pub const NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x90;
+pub const NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0xd0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
@@ -313,6 +318,18 @@ pub enum NdisMiniportCharacteristicsLayoutError {
     BufferTooSmall,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdisProtocolCharacteristicsLayout {
+    pub required_len: u64,
+    pub callback_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NdisProtocolCharacteristicsLayoutError {
+    BadVersion,
+    BufferTooSmall,
+}
+
 impl NdisMiniportCharacteristicsLayout {
     pub const fn callback_offset(self, index: usize) -> Option<u64> {
         if index >= self.callback_count as usize {
@@ -356,6 +373,49 @@ pub fn ndis_miniport_characteristics_layout(
     };
     if supplied_len < layout.required_len {
         return Err(NdisMiniportCharacteristicsLayoutError::BufferTooSmall);
+    }
+    Ok(layout)
+}
+
+impl NdisProtocolCharacteristicsLayout {
+    pub const fn callback_offset(self, index: usize) -> Option<u64> {
+        if index >= self.callback_count as usize {
+            return None;
+        }
+        match index {
+            0..=9 => Some(0x08 + (index as u64) * 0x08),
+            10..=14 => Some(0x68 + ((index as u64) - 10) * 0x08),
+            15..=18 => Some(0xb0 + ((index as u64) - 15) * 0x08),
+            _ => None,
+        }
+    }
+}
+
+pub fn ndis_protocol_characteristics_layout(
+    major: u8,
+    minor: u8,
+    supplied_len: u64,
+) -> Result<NdisProtocolCharacteristicsLayout, NdisProtocolCharacteristicsLayoutError> {
+    let layout = match major {
+        0x03 => NdisProtocolCharacteristicsLayout {
+            required_len: NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64,
+            callback_count: 10,
+        },
+        0x04 => NdisProtocolCharacteristicsLayout {
+            required_len: NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64,
+            callback_count: 15,
+        },
+        0x05 => match minor {
+            0x00 | 0x01 => NdisProtocolCharacteristicsLayout {
+                required_len: NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64,
+                callback_count: NDIS_PROTOCOL_CHARACTERISTICS_CALLBACK_CAP as u8,
+            },
+            _ => return Err(NdisProtocolCharacteristicsLayoutError::BadVersion),
+        },
+        _ => return Err(NdisProtocolCharacteristicsLayoutError::BadVersion),
+    };
+    if supplied_len < layout.required_len {
+        return Err(NdisProtocolCharacteristicsLayoutError::BufferTooSmall);
     }
     Ok(layout)
 }
@@ -1427,6 +1487,67 @@ mod tests {
         assert_eq!(
             ndis_miniport_characteristics_layout(6, 0, NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64),
             Err(NdisMiniportCharacteristicsLayoutError::BadVersion)
+        );
+    }
+
+    #[test]
+    fn ndis_protocol_characteristics_layout_follows_nt5_versions() {
+        assert_eq!(
+            ndis_protocol_characteristics_layout(3, 0, NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64),
+            Ok(NdisProtocolCharacteristicsLayout {
+                required_len: NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64,
+                callback_count: 10,
+            })
+        );
+        assert_eq!(
+            ndis_protocol_characteristics_layout(4, 0, NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64),
+            Ok(NdisProtocolCharacteristicsLayout {
+                required_len: NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64,
+                callback_count: 15,
+            })
+        );
+        assert_eq!(
+            ndis_protocol_characteristics_layout(5, 1, NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64)
+                .unwrap()
+                .callback_count,
+            NDIS_PROTOCOL_CHARACTERISTICS_CALLBACK_CAP as u8
+        );
+    }
+
+    #[test]
+    fn ndis_protocol_characteristics_callback_offsets_match_x64_slots() {
+        assert_eq!(NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64, 0x58);
+
+        let ndis40 =
+            ndis_protocol_characteristics_layout(4, 0, NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64)
+                .unwrap();
+        assert_eq!(ndis40.callback_offset(0), Some(0x08));
+        assert_eq!(ndis40.callback_offset(9), Some(0x50));
+        assert_eq!(ndis40.callback_offset(10), Some(0x68));
+        assert_eq!(ndis40.callback_offset(14), Some(0x88));
+        assert_eq!(ndis40.callback_offset(15), None);
+
+        let ndis50 =
+            ndis_protocol_characteristics_layout(5, 0, NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64)
+                .unwrap();
+        assert_eq!(ndis50.callback_offset(15), Some(0xb0));
+        assert_eq!(ndis50.callback_offset(18), Some(0xc8));
+        assert_eq!(ndis50.callback_offset(19), None);
+    }
+
+    #[test]
+    fn ndis_protocol_characteristics_layout_rejects_bad_headers() {
+        assert_eq!(
+            ndis_protocol_characteristics_layout(4, 0, NDIS40_PROTOCOL_CHARACTERISTICS_LEN_X64 - 1),
+            Err(NdisProtocolCharacteristicsLayoutError::BufferTooSmall)
+        );
+        assert_eq!(
+            ndis_protocol_characteristics_layout(5, 2, NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64),
+            Err(NdisProtocolCharacteristicsLayoutError::BadVersion)
+        );
+        assert_eq!(
+            ndis_protocol_characteristics_layout(6, 0, NDIS50_PROTOCOL_CHARACTERISTICS_LEN_X64),
+            Err(NdisProtocolCharacteristicsLayoutError::BadVersion)
         );
     }
 
