@@ -225,21 +225,45 @@ pub enum HostedProviderArgumentMarshal {
     CallerInDriverObject,
     CallerInUnicodeString,
     CallerInAnsiString,
-    CallerInBuffer { length_arg: u8 },
-    CallerInOwnedAllocation { length_arg: u8 },
-    CallerOutBuffer { length_arg: u8 },
-    CallerInMiniportCharacteristics { length_arg: u8 },
-    CallerInProtocolCharacteristics { length_arg: u8 },
+    CallerInBuffer {
+        length_arg: u8,
+    },
+    CallerInOwnedAllocation {
+        length_arg: u8,
+    },
+    CallerOutBuffer {
+        length_arg: u8,
+    },
+    CallerInMiniportCharacteristics {
+        length_arg: u8,
+    },
+    CallerInProtocolCharacteristics {
+        length_arg: u8,
+    },
     CallerInPacket,
     CallerInOutPacket,
     CallerInOutRequest,
-    CallerInOutResourceList { length_pointer_arg: u8 },
+    CallerInOutResourceList {
+        length_pointer_arg: u8,
+    },
     CallerInOutMiniportInterrupt,
-    CallerInPointerArray { count_arg: u8 },
+    CallerInPointerArray {
+        count_arg: u8,
+    },
     CallerOutStatus,
     CallerOutHandle,
     CallerOutPointer,
-    CallerOutPointerFromLength { length_arg: u8 },
+    CallerOutPointerFromLength {
+        length_arg: u8,
+    },
+    CallerOutIoPortRange {
+        initial_port_arg: u8,
+        length_arg: u8,
+    },
+    CallerOutMmioMapping {
+        physical_address_arg: u8,
+        length_arg: u8,
+    },
     CallerOutU32,
     CallerInOutU32,
     CallerOutPhysicalAddress,
@@ -409,10 +433,24 @@ pub fn hosted_provider_export_marshal_policy(
             Scalar,
         ]),
         "NdisMDeregisterIoPortRange" => export_policy(&[ProviderHandle, Scalar, Scalar, Scalar]),
-        "NdisMMapIoSpace" => export_policy(&[CallerOutPointer, ProviderHandle, Scalar, Scalar]),
-        "NdisMRegisterIoPortRange" => {
-            export_policy(&[CallerOutPointer, ProviderHandle, Scalar, Scalar])
-        }
+        "NdisMMapIoSpace" => export_policy(&[
+            CallerOutMmioMapping {
+                physical_address_arg: 2,
+                length_arg: 3,
+            },
+            ProviderHandle,
+            Scalar,
+            Scalar,
+        ]),
+        "NdisMRegisterIoPortRange" => export_policy(&[
+            CallerOutIoPortRange {
+                initial_port_arg: 2,
+                length_arg: 3,
+            },
+            ProviderHandle,
+            Scalar,
+            Scalar,
+        ]),
         "NdisMUnmapIoSpace" => export_policy(&[ProviderHandle, Scalar, Scalar]),
         "NdisMAllocateSharedMemory" => export_policy(&[
             ProviderHandle,
@@ -1078,6 +1116,30 @@ mod tests {
         assert_eq!(
             policy.args[3],
             HostedProviderArgumentMarshal::CallerInOutU32
+        );
+    }
+
+    #[test]
+    fn ndis_port_and_mmio_mapping_policies_are_typed_resources() {
+        let port =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMRegisterIoPortRange").unwrap();
+        assert_eq!(port.argument_count, 4);
+        assert_eq!(
+            port.args[0],
+            HostedProviderArgumentMarshal::CallerOutIoPortRange {
+                initial_port_arg: 2,
+                length_arg: 3,
+            }
+        );
+
+        let mmio = hosted_provider_export_marshal_policy("ndis.sys", "NdisMMapIoSpace").unwrap();
+        assert_eq!(mmio.argument_count, 4);
+        assert_eq!(
+            mmio.args[0],
+            HostedProviderArgumentMarshal::CallerOutMmioMapping {
+                physical_address_arg: 2,
+                length_arg: 3,
+            }
         );
     }
 

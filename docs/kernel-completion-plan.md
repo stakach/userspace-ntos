@@ -7335,3 +7335,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the `NdisMQueryAdapterResources` in/out slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 typed I/O-port/MMIO provider mapping slice (2026-08-17, in progress): `NdisMRegisterIoPortRange`
+  and `NdisMMapIoSpace` no longer use the generic `CallerOutPointer` policy. They now have typed
+  resource policies that validate requested ranges against the dependent miniport's granted
+  `SH_RESOURCE_IO_PORT_*` or `SH_RESOURCE_MMIO_*` projection and publish fixed dependent-visible
+  results only after the real provider export succeeds. The provider-export service now projects the
+  dependent component's resource identity into the provider shared frame before dispatching `ndis.sys`,
+  so provider HAL calls such as `HalGetBusDataByOffset`, `HalTranslateBusAddress`, and `MmMapIoSpace`
+  see the miniport's actual grants. MMIO mapping evidence written by the provider-side
+  `MmMapIoSpace` shim is copied back to the dependent shared frame for resource-manager replay.
+  Review adjustment: continue B3 with `NdisMAllocateSharedMemory` and `NdisMFreeSharedMemory`. Those
+  should bind to the hosted DMA/common-buffer record model and return both a dependent-visible VA and
+  physical/logical address, not a generic pool pointer.
+
+  Validation for the typed I/O-port/MMIO provider mapping slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

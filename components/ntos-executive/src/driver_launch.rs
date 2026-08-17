@@ -11952,6 +11952,7 @@ struct ProviderMarshalState {
     copyout_count: usize,
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
+    resource_mapping_copyback: bool,
 }
 
 impl ProviderMarshalState {
@@ -11973,6 +11974,7 @@ impl ProviderMarshalState {
                 condition: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
+            resource_mapping_copyback: false,
         }
     }
 }
@@ -12801,6 +12803,95 @@ unsafe fn provider_marshal_resource_list(
     )
 }
 
+unsafe fn provider_marshal_fixed_output_pointer(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    success_value: u64,
+) -> Result<u64, i32> {
+    if success_value == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 8)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    provider_marshal_add_copyout_with_fixed(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        8,
+        success_value,
+        0,
+        8,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_io_port_range(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    initial_port: u64,
+    length: u64,
+) -> Result<u64, i32> {
+    let sh = dependent_inst.exec_shared_va;
+    let grant_start = read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+    let grant_len = read_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    if length == 0 || !range_within_grant(grant_start, grant_len, initial_port, length) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    provider_marshal_fixed_output_pointer(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        arg_value,
+        initial_port,
+    )
+}
+
+unsafe fn provider_marshal_mmio_mapping(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    physical_address: u64,
+    length: u64,
+) -> Result<u64, i32> {
+    let sh = dependent_inst.exec_shared_va;
+    let grant_start = read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64);
+    let grant_len = read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64);
+    let grant_va = read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64);
+    if length == 0
+        || grant_va == 0
+        || !range_within_grant(grant_start, grant_len, physical_address, length)
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    state.resource_mapping_copyback = true;
+    provider_marshal_fixed_output_pointer(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        arg_value,
+        grant_va + (physical_address - grant_start),
+    )
+}
+
 unsafe fn provider_marshal_output_pointer_from_length(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -13129,6 +13220,48 @@ unsafe fn prepare_provider_export_marshal(
                     args[length_index],
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutIoPortRange {
+                initial_port_arg,
+                length_arg,
+            } => {
+                let initial_port_index = initial_port_arg as usize;
+                let length_index = length_arg as usize;
+                if initial_port_index >= policy.argument_count as usize
+                    || length_index >= policy.argument_count as usize
+                {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_io_port_range(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[initial_port_index],
+                    args[length_index],
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerOutMmioMapping {
+                physical_address_arg,
+                length_arg,
+            } => {
+                let physical_address_index = physical_address_arg as usize;
+                let length_index = length_arg as usize;
+                if physical_address_index >= policy.argument_count as usize
+                    || length_index >= policy.argument_count as usize
+                {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_mmio_mapping(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[physical_address_index],
+                    args[length_index],
+                )?
+            }
             HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg } => {
                 let length_index = length_arg as usize;
                 if length_index >= policy.argument_count as usize {
@@ -13192,6 +13325,55 @@ unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result:
         }
         free_index += 1;
     }
+}
+
+const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 13] = [
+    SH_RESOURCE_MMIO_PHYS,
+    SH_RESOURCE_MMIO_LEN,
+    SH_RESOURCE_MMIO_VA,
+    SH_RESOURCE_INTERRUPT_VECTOR,
+    SH_RESOURCE_INTERRUPT_AFFINITY,
+    SH_RESOURCE_INTERFACE_TYPE,
+    SH_RESOURCE_BUS_NUMBER,
+    SH_RESOURCE_ADDRESS,
+    SH_RESOURCE_PCI_VENDOR_DEVICE,
+    SH_RESOURCE_PCI_CLASS_REV,
+    SH_RESOURCE_PCI_IRQ,
+    SH_RESOURCE_IO_PORT_BASE,
+    SH_RESOURCE_IO_PORT_LEN,
+];
+
+unsafe fn project_provider_resource_state(dependent_shared: u64, provider_shared: u64) {
+    let mut index = 0usize;
+    while index < PROVIDER_RESOURCE_PROJECTION_OFFSETS.len() {
+        let offset = PROVIDER_RESOURCE_PROJECTION_OFFSETS[index];
+        write_volatile(
+            (provider_shared + offset) as *mut u64,
+            read_volatile((dependent_shared + offset) as *const u64),
+        );
+        index += 1;
+    }
+    write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
+    write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+}
+
+unsafe fn complete_provider_resource_mapping(
+    state: &ProviderMarshalState,
+    dependent_shared: u64,
+    provider_shared: u64,
+    result: u64,
+) {
+    if !state.resource_mapping_copyback || result != STATUS_SUCCESS as u64 {
+        return;
+    }
+    write_volatile(
+        (dependent_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
+        read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
+    );
+    write_volatile(
+        (dependent_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
+        read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
+    );
 }
 
 pub(crate) unsafe fn service_hosted_provider_export(
@@ -13280,6 +13462,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         Err(status) => return hosted_provider_export_failure(status),
     };
 
+    project_provider_resource_state(dependent_channel.shared_va, provider_shared);
     write_volatile(
         (provider_shared + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_PROVIDER_EXPORT,
@@ -13347,6 +13530,12 @@ pub(crate) unsafe fn service_hosted_provider_export(
     }
     let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
     complete_provider_export_marshal(&marshal_state, result);
+    complete_provider_resource_mapping(
+        &marshal_state,
+        dependent_channel.shared_va,
+        provider_shared,
+        result,
+    );
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
