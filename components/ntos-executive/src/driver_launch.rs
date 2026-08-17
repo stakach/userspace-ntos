@@ -32,16 +32,16 @@ use nt_dma_manager::{
     DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
 use nt_hosted_runtime::{
-    classify_hosted_provider_domain, encode_hosted_provider_import_thunk,
-    hosted_provider_export_marshal_policy, ndis_miniport_characteristics_layout,
-    plan_hosted_driver_image,
+    classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
+    encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
+    ndis_miniport_characteristics_layout, plan_hosted_driver_image,
     plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
-    HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderDomainDescriptor,
-    HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderExportCallPlan,
-    HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
-    HostedProviderImportBindingError, HostedProviderImportThunkError,
-    HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
-    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
+    HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
+    HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
+    HostedProviderImportBindingError, HostedProviderImportThunkError, HostedProviderImportThunkPlan,
+    NdisMiniportCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -480,6 +480,7 @@ pub const FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL: u64 = 0x777;
 pub const FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL: u64 = 0x778;
 pub const FSD_SERVICE_REGISTRY_LABEL: u64 = 0x779;
 pub const FSD_SERVICE_PROVIDER_EXPORT_LABEL: u64 = 0x77A;
+pub const FSD_SERVICE_PROVIDER_CALLBACK_LABEL: u64 = 0x77B;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -502,6 +503,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
             | FSD_SERVICE_REGISTRY_LABEL
             | FSD_SERVICE_PROVIDER_EXPORT_LABEL
+            | FSD_SERVICE_PROVIDER_CALLBACK_LABEL
     )
 }
 
@@ -11850,6 +11852,27 @@ impl ProviderMarshalState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HostedProviderCallbackRecord {
+    present: bool,
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+}
+
+impl HostedProviderCallbackRecord {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider_instance: 0,
+            dependent_instance: 0,
+            target: 0,
+            callback_offset: 0,
+        }
+    }
+}
+
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
 const HOSTED_PROVIDER_SUMMARY_CAP: usize = 128;
 static mut HOSTED_PROVIDER_SUMMARIES: [HostedProviderSummary; HOSTED_PROVIDER_SUMMARY_CAP] =
@@ -11866,6 +11889,13 @@ static HOSTED_PROVIDER_SINGLETON_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_CALLBACK_RECORD_CAP: usize = 256;
+static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
+    HOSTED_PROVIDER_CALLBACK_RECORD_CAP] =
+    [HostedProviderCallbackRecord::empty(); HOSTED_PROVIDER_CALLBACK_RECORD_CAP];
+static HOSTED_PROVIDER_CALLBACK_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -12250,6 +12280,98 @@ fn hosted_provider_export_failure(status: i32) -> u64 {
     status as u32 as u64
 }
 
+fn hosted_provider_callback_failure(status: i32) -> u64 {
+    status as u32 as u64
+}
+
+unsafe fn hosted_provider_callback_record_available() -> u64 {
+    let count = HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed);
+    (HOSTED_PROVIDER_CALLBACK_RECORD_CAP as u64).saturating_sub(count)
+}
+
+unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
+    let Some(inst) = instance(instance_index) else {
+        return 0;
+    };
+    if !inst.used || inst.thunk_len == 0 {
+        return 0;
+    }
+    let slots = inst.thunk_len / HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN;
+    slots.saturating_sub(inst.thunk_next)
+}
+
+unsafe fn register_hosted_provider_callback_record(
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+) -> Option<u64> {
+    let count = HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed) as usize;
+    if count >= HOSTED_PROVIDER_CALLBACK_RECORD_CAP {
+        HOSTED_PROVIDER_CALLBACK_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_RECORDS)
+        as *mut HostedProviderCallbackRecord;
+    *records.add(count) = HostedProviderCallbackRecord {
+        present: true,
+        provider_instance,
+        dependent_instance,
+        target,
+        callback_offset,
+    };
+    HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.store((count + 1) as u64, Ordering::Relaxed);
+    Some((count as u64).saturating_add(1))
+}
+
+unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderCallbackRecord> {
+    if cookie == 0 {
+        return None;
+    }
+    let index = cookie.checked_sub(1)? as usize;
+    if index >= HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed) as usize
+        || index >= HOSTED_PROVIDER_CALLBACK_RECORD_CAP
+    {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_RECORDS)
+        as *const HostedProviderCallbackRecord;
+    let record = *records.add(index);
+    record.present.then_some(record)
+}
+
+unsafe fn provider_marshal_emit_callback_thunk(
+    provider_instance: usize,
+    dependent_instance: usize,
+    target: u64,
+    callback_offset: u64,
+) -> Result<u64, i32> {
+    let Some((exec_va, run_va, thunk_index)) = allocate_instance_executable_thunk(provider_instance)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let Some(callback_cookie) = register_hosted_provider_callback_record(
+        provider_instance,
+        dependent_instance,
+        target,
+        callback_offset,
+    ) else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let thunk = HostedProviderCallbackThunkPlan {
+        thunk_va: run_va,
+        thunk_offset: thunk_index.saturating_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN),
+        callback_gate: hosted_provider_callback_gate_va(),
+        callback_cookie,
+    };
+    let slot = core::slice::from_raw_parts_mut(
+        exec_va as *mut u8,
+        HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
+    );
+    encode_hosted_provider_callback_thunk(thunk, slot).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(thunk.thunk_va)
+}
+
 fn provider_marshal_align8(value: u64) -> Option<u64> {
     value.checked_add(7).map(|value| value & !7)
 }
@@ -12375,6 +12497,7 @@ unsafe fn provider_marshal_unicode_string(
 
 unsafe fn provider_marshal_miniport_characteristics(
     state: &mut ProviderMarshalState,
+    provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -12409,15 +12532,22 @@ unsafe fn provider_marshal_miniport_characteristics(
         return Err(STATUS_INVALID_PARAMETER);
     };
 
+    let mut callback_count = 0u64;
     let mut callback_index = 0usize;
     while callback_index < layout.callback_count as usize {
         let Some(offset) = layout.callback_offset(callback_index) else {
             return Err(STATUS_INVALID_PARAMETER);
         };
         if read_unaligned((dependent_exec_va + offset) as *const u64) != 0 {
-            return Err(STATUS_NOT_SUPPORTED);
+            callback_count = callback_count.saturating_add(1);
         }
         callback_index += 1;
+    }
+    if callback_count > 0
+        && (callback_count > hosted_provider_callback_record_available()
+            || callback_count > instance_executable_thunk_available(provider_instance))
+    {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
 
     let Some((provider_component_va, provider_exec_va)) =
@@ -12426,11 +12556,30 @@ unsafe fn provider_marshal_miniport_characteristics(
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     copy_bytes(provider_exec_va, dependent_exec_va, layout.required_len);
+
+    callback_index = 0;
+    while callback_index < layout.callback_count as usize {
+        let Some(offset) = layout.callback_offset(callback_index) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let target = read_unaligned((dependent_exec_va + offset) as *const u64);
+        if target != 0 {
+            let thunk_va = provider_marshal_emit_callback_thunk(
+                provider_instance,
+                dependent_index,
+                target,
+                offset,
+            )?;
+            write_unaligned((provider_exec_va + offset) as *mut u64, thunk_va);
+        }
+        callback_index += 1;
+    }
     Ok(provider_component_va)
 }
 
 unsafe fn prepare_provider_export_marshal(
     policy: HostedProviderExportMarshalPolicy,
+    provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -12489,6 +12638,7 @@ unsafe fn prepare_provider_export_marshal(
                 }
                 provider_marshal_miniport_characteristics(
                     &mut state,
+                    provider_instance,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
@@ -12588,6 +12738,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     }
     let marshal_state = match prepare_provider_export_marshal(
         policy,
+        singleton.instance,
         dependent_index,
         dependent_inst,
         provider_shared,
@@ -12678,6 +12829,37 @@ pub(crate) unsafe fn service_hosted_provider_export(
         print_str(b"\n");
     }
     result
+}
+
+pub(crate) unsafe fn service_hosted_provider_callback(
+    provider_channel: &crate::spawn_hosts::PumpChannel,
+    callback_cookie: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> u64 {
+    HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let _ = (
+        arg0,
+        arg1,
+        arg2,
+        read_volatile((provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64),
+    );
+    let Some((provider_instance, _provider_inst)) = instance_by_shared_va(provider_channel.shared_va)
+    else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(record) = hosted_provider_callback_record(callback_cookie) else {
+        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    };
+    if record.provider_instance != provider_instance
+        || record.target == 0
+        || record.callback_offset == 0
+        || instance(record.dependent_instance).is_none()
+    {
+        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    }
+    hosted_provider_callback_failure(STATUS_NOT_SUPPORTED)
 }
 
 unsafe fn add_provider_domain_if_callable(
@@ -14416,6 +14598,35 @@ fn hosted_provider_export_gate_va() -> u64 {
     hosted_provider_export_gate as *const () as usize as u64
 }
 
+core::arch::global_asm!(
+    ".text",
+    ".globl hosted_provider_callback_gate",
+    "hosted_provider_callback_gate:",
+    // Entry from a generated provider reverse-callback thunk:
+    //   rax = provider callback cookie
+    //   rcx/rdx/r8/r9 + caller stack = original Win64 callback arguments.
+    "mov r11, rsp",
+    "sub rsp, 0x48",
+    "mov [rsp + 0x20], r9",
+    "mov [rsp + 0x28], r11",
+    "mov r9, r8",
+    "mov r8, rdx",
+    "mov rdx, rcx",
+    "mov rcx, rax",
+    "call s_hosted_provider_callback_gate_body",
+    "add rsp, 0x48",
+    "ret",
+);
+
+extern "win64" {
+    fn hosted_provider_callback_gate();
+}
+
+#[allow(dead_code)]
+fn hosted_provider_callback_gate_va() -> u64 {
+    hosted_provider_callback_gate as *const () as usize as u64
+}
+
 #[no_mangle]
 extern "win64" fn s_hosted_provider_export_gate_body(
     provider_export_rva: u64,
@@ -14454,6 +14665,48 @@ extern "win64" fn s_hosted_provider_export_gate_body(
             provider_domain_cookie,
             arg0,
             arg1,
+        );
+        result
+    }
+}
+
+#[no_mangle]
+extern "win64" fn s_hosted_provider_callback_gate_body(
+    callback_cookie: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    caller_rsp: u64,
+) -> u64 {
+    unsafe {
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG2) as *mut u64,
+            arg2,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG3) as *mut u64,
+            arg3,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
+            caller_rsp,
+        );
+        let mut index = 0u64;
+        while index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+            let value = read_volatile((caller_rsp + 0x28 + index * 8) as *const u64);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + index * 8) as *mut u64,
+                value,
+            );
+            index += 1;
+        }
+        let (_label, result, _, _, _) = call_on4(
+            (FSD_SERVICE_PROVIDER_CALLBACK_LABEL << 12) | 4,
+            callback_cookie,
+            arg0,
+            arg1,
+            arg2,
         );
         result
     }

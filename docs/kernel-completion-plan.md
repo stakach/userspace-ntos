@@ -7224,3 +7224,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the live executable thunk metadata slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 provider reverse-callback record/gate slice (2026-08-17, in progress): the executive now emits
+  provider-visible reverse callback thunks while marshalling nonzero
+  `NDIS_MINIPORT_CHARACTERISTICS` callback slots. Each thunk is allocated from the provider
+  component's executable thunk arena, rewritten into the provider scratch copy of the miniport
+  characteristics table, and tied to a bounded callback-cookie record containing the provider
+  instance, dependent miniport instance, original target, and NDIS callback-table offset. A new
+  provider-callback gate captures Win64 register and stack arguments into the provider shared frame,
+  and the pump services the corresponding label by validating cookie/provider/dependent identity and
+  returning `STATUS_NOT_SUPPORTED`. This keeps the boundary honest: NDIS can no longer receive raw
+  dependent code pointers, but the actual dependent-component callback dispatcher and argument
+  marshalling still remain to be implemented before publishing the provider export gate.
+  Review adjustment: next B3 work should replace the fail-closed provider-callback service with a
+  real dependent pump path for the first required callback, `MiniportInitialize`, including output
+  status/index cells and provider-to-dependent buffer/handle translation.
+
+  Validation for the provider reverse-callback record/gate slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.
