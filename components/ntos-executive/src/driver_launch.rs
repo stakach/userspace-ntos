@@ -11667,6 +11667,7 @@ impl HostedProviderSummary {
 struct HostedProviderSingleton {
     present: bool,
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    instance: usize,
     exec_va: u64,
     run_va: u64,
     image_offset: u64,
@@ -11683,6 +11684,7 @@ impl HostedProviderSingleton {
         Self {
             present: false,
             provider: HostedAscii::empty(),
+            instance: 0,
             exec_va: 0,
             run_va: 0,
             image_offset: 0,
@@ -11910,6 +11912,7 @@ unsafe fn set_hosted_provider_singleton_right(index: usize, frame_index: usize, 
 
 unsafe fn register_hosted_provider_singleton(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    instance: usize,
     exec_va: u64,
     run_va: u64,
     image_offset: u64,
@@ -11939,6 +11942,7 @@ unsafe fn register_hosted_provider_singleton(
         if existing.image_offset == image_offset
             && existing.image_len == image_len
             && existing.image_frames == image_frames
+            && existing.instance == instance
             && existing.pool_base == pool_base
             && existing.pool_frames == pool_frames
         {
@@ -11968,9 +11972,11 @@ unsafe fn register_hosted_provider_singleton(
     }
     let singletons =
         core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
+    let provider_domain_cookie = (count as u64).saturating_add(1);
     *singletons.add(count) = HostedProviderSingleton {
         present: true,
         provider,
+        instance,
         exec_va,
         run_va,
         image_offset,
@@ -11979,7 +11985,7 @@ unsafe fn register_hosted_provider_singleton(
         pool_base,
         pool_frames,
         export_call_gate: 0,
-        provider_domain_cookie: 0,
+        provider_domain_cookie,
     };
     HOSTED_PROVIDER_SINGLETON_COUNT.store((count + 1) as u64, Ordering::Relaxed);
     print_str(b"[driver-launch] provider singleton published ");
@@ -11988,6 +11994,8 @@ unsafe fn register_hosted_provider_singleton(
     print_u64(image_frames);
     print_str(b" pool-frames=");
     print_u64(pool_frames);
+    print_str(b" cookie=");
+    print_u64(provider_domain_cookie);
     print_str(b"\n");
     true
 }
@@ -15968,6 +15976,7 @@ unsafe fn load_driver_reserved(
             let singleton_image_frames = frames_for_image_len(image_len as u64)?;
             if !register_hosted_provider_singleton(
                 provider,
+                instance,
                 primary_exec_va,
                 primary_run_va,
                 planned_images.primary_offset,

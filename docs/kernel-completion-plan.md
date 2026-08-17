@@ -7052,3 +7052,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the thunk-table wiring slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 provider singleton identity slice (2026-08-17, in progress): provider singleton records now
+  carry the owning hosted-driver instance and publish a compact nonzero provider-domain cookie as
+  reset-safe metadata. The cookie is still inert because `export_call_gate` remains zero, so
+  dependent imports continue to resolve through private dependency images. Review adjustment: the
+  provider export gate can now route by explicit cookie to a concrete provider component instance
+  instead of inferring from provider DLL names or process-local singleton state.
+
+  Validation for the singleton identity slice: `cargo fmt --all`, executive `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`.
