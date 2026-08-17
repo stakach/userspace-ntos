@@ -7135,3 +7135,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the NDIS provider marshal-policy slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 provider export marshal-executor foundation (2026-08-17, in progress): the executive
+  provider-export service now consumes the runtime marshal policy at the real gate boundary rather
+  than only using it as an import/RVA filter. The shared provider-export frame reserves a bounded
+  provider-owned scratch window, the service identifies the dependent component from the caller's
+  shared frame, captures all four register arguments plus the eight-qword stack tail into a fixed
+  policy-sized argument array, and rewrites only the conservative pointer forms currently safe to
+  execute across provider domains: scalar/provider handles, caller context tokens, small output cells
+  (`NDIS_STATUS`, handles, `ULONG`, and physical-address outputs), and input `UNICODE_STRING`
+  descriptors with copied buffers. Output cells are copied back to the dependent only after the
+  provider component completes. All wider shapes, including callback tables, packet/request objects,
+  resource-list buffers, generic input/output buffers, and caller-side pointer returns still fail
+  closed with `STATUS_NOT_SUPPORTED`, so private dependency loading remains the truthful boot path
+  until those shapes are implemented.
+  Review adjustment: next B3 work should add the reverse callback-table identity for
+  `NdisMRegisterMiniport`/miniport callbacks, then implement provider-owned allocation/mapping
+  handoff for pointer-returning NDIS calls before publishing `export_call_gate`.
+
+  Validation for the provider export marshal-executor foundation: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.

@@ -35,9 +35,11 @@ use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_import_thunk,
     hosted_provider_export_marshal_policy, plan_hosted_driver_image,
     plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
-    HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
-    HostedProviderExportCallPlan, HostedProviderImportBinding, HostedProviderImportBindingError,
-    HostedDriverImagePlanError, HostedProviderImportThunkError, HostedProviderImportThunkPlan,
+    HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderDomainDescriptor,
+    HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderExportCallPlan,
+    HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
+    HostedProviderImportBindingError, HostedProviderImportThunkError,
+    HostedProviderImportThunkPlan, HOSTED_PROVIDER_EXPORT_ARG_CAP,
     HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
 use nt_io_abi::{ioctl, major};
@@ -413,8 +415,11 @@ pub const SH_PROVIDER_EXPORT_ARG3: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x08; // in: 
 pub const SH_PROVIDER_EXPORT_CALLER_RSP: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x10; // in: dependent stack
 pub const SH_PROVIDER_EXPORT_STACK_BASE: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x18; // in: stack args
 pub const SH_PROVIDER_EXPORT_STACK_QWORDS: u64 = 8;
+pub const SH_PROVIDER_EXPORT_MARSHAL_BASE: u64 =
+    SH_PROVIDER_EXPORT_STACK_BASE + SH_PROVIDER_EXPORT_STACK_QWORDS * 8;
+pub const SH_PROVIDER_EXPORT_MARSHAL_BYTES: u64 = 0x800;
 pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 =
-    0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8;
+    0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8 + SH_PROVIDER_EXPORT_MARSHAL_BYTES;
 pub const SH_DPC_QUEUE_BASE: u64 =
     SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
@@ -11813,6 +11818,34 @@ struct PlannedHostedImages {
     total_frames: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderMarshalCopyout {
+    dependent_exec_va: u64,
+    provider_exec_va: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderMarshalState {
+    cursor: u64,
+    copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    copyout_count: usize,
+}
+
+impl ProviderMarshalState {
+    const fn empty() -> Self {
+        Self {
+            cursor: 0,
+            copyouts: [ProviderMarshalCopyout {
+                dependent_exec_va: 0,
+                provider_exec_va: 0,
+                bytes: 0,
+            }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+            copyout_count: 0,
+        }
+    }
+}
+
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
 const HOSTED_PROVIDER_SUMMARY_CAP: usize = 128;
 static mut HOSTED_PROVIDER_SUMMARIES: [HostedProviderSummary; HOSTED_PROVIDER_SUMMARY_CAP] =
@@ -12213,6 +12246,198 @@ fn hosted_provider_export_failure(status: i32) -> u64 {
     status as u32 as u64
 }
 
+fn provider_marshal_align8(value: u64) -> Option<u64> {
+    value.checked_add(7).map(|value| value & !7)
+}
+
+unsafe fn provider_marshal_zero(exec_va: u64, bytes: u64) {
+    let mut offset = 0u64;
+    while offset < bytes {
+        write_unaligned((exec_va + offset) as *mut u8, 0);
+        offset += 1;
+    }
+}
+
+unsafe fn provider_marshal_alloc(
+    state: &mut ProviderMarshalState,
+    provider_shared: u64,
+    bytes: u64,
+) -> Option<(u64, u64)> {
+    if bytes == 0 {
+        return None;
+    }
+    let start = provider_marshal_align8(state.cursor)?;
+    let end = start.checked_add(bytes)?;
+    if end > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return None;
+    }
+    state.cursor = end;
+    let component_va = FSD_SHARED_VADDR
+        .checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?
+        .checked_add(start)?;
+    let exec_va = provider_shared
+        .checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?
+        .checked_add(start)?;
+    provider_marshal_zero(exec_va, bytes);
+    Some((component_va, exec_va))
+}
+
+fn provider_marshal_add_copyout(
+    state: &mut ProviderMarshalState,
+    dependent_exec_va: u64,
+    provider_exec_va: u64,
+    bytes: u64,
+) -> Option<()> {
+    if state.copyout_count >= state.copyouts.len() {
+        return None;
+    }
+    state.copyouts[state.copyout_count] = ProviderMarshalCopyout {
+        dependent_exec_va,
+        provider_exec_va,
+        bytes,
+    };
+    state.copyout_count += 1;
+    Some(())
+}
+
+unsafe fn provider_marshal_output_cell(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    bytes: u64,
+) -> Result<u64, i32> {
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, bytes)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    provider_marshal_add_copyout(state, dependent_exec_va, provider_exec_va, bytes)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_unicode_string(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    let Some(desc_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 16)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let length = read_unaligned(desc_exec as *const u16) as u64;
+    let maximum = read_unaligned((desc_exec + 2) as *const u16) as u64;
+    let buffer = read_unaligned((desc_exec + 8) as *const u64);
+    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some((provider_desc_va, provider_desc_exec)) =
+        provider_marshal_alloc(state, provider_shared, 16)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let provider_buffer_va = if length == 0 {
+        0
+    } else {
+        let Some(buffer_exec) =
+            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let buffer_bytes = length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+        let Some((provider_buffer_va, provider_buffer_exec)) =
+            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+        else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        copy_bytes(provider_buffer_exec, buffer_exec, length);
+        provider_buffer_va
+    };
+    write_unaligned(provider_desc_exec as *mut u16, length as u16);
+    write_unaligned((provider_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned((provider_desc_exec + 8) as *mut u64, provider_buffer_va);
+    Ok(provider_desc_va)
+}
+
+unsafe fn prepare_provider_export_marshal(
+    policy: HostedProviderExportMarshalPolicy,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    args: &mut [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+) -> Result<ProviderMarshalState, i32> {
+    if policy.argument_count as usize > args.len() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if policy.stack_qwords as u64 > SH_PROVIDER_EXPORT_STACK_QWORDS {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut state = ProviderMarshalState::empty();
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        let arg = args[index];
+        args[index] = match policy.args[index] {
+            HostedProviderArgumentMarshal::Scalar
+            | HostedProviderArgumentMarshal::ProviderHandle
+            | HostedProviderArgumentMarshal::CallerContext
+            | HostedProviderArgumentMarshal::CallerInDriverObject => arg,
+            HostedProviderArgumentMarshal::CallerOutStatus => provider_marshal_output_cell(
+                &mut state,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+                4,
+            )?,
+            HostedProviderArgumentMarshal::CallerOutHandle
+            | HostedProviderArgumentMarshal::CallerOutU32
+            | HostedProviderArgumentMarshal::CallerOutPhysicalAddress => {
+                let bytes = match policy.args[index] {
+                    HostedProviderArgumentMarshal::CallerOutU32 => 4,
+                    _ => 8,
+                };
+                provider_marshal_output_cell(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    bytes,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInUnicodeString => provider_marshal_unicode_string(
+                &mut state,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+            )?,
+            _ => return Err(STATUS_NOT_SUPPORTED),
+        };
+        index += 1;
+    }
+    Ok(state)
+}
+
+unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState) {
+    let mut index = 0usize;
+    while index < state.copyout_count {
+        let copyout = state.copyouts[index];
+        copy_bytes(copyout.dependent_exec_va, copyout.provider_exec_va, copyout.bytes);
+        index += 1;
+    }
+}
+
 pub(crate) unsafe fn service_hosted_provider_export(
     dependent_channel: &crate::spawn_hosts::PumpChannel,
     provider_export_rva: u64,
@@ -12236,14 +12461,14 @@ pub(crate) unsafe fn service_hosted_provider_export(
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
     let descriptor = hosted_provider_domain_descriptor(singleton);
-    if !loaded_pe_export_rva_has_marshal_policy(
+    let Some(policy) = loaded_pe_export_rva_marshal_policy(
         singleton.provider.as_str(),
         singleton.exec_va,
         singleton.image_len,
         provider_export_rva,
-    ) {
+    ) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
-    }
+    };
     match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
         Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
         Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
@@ -12251,10 +12476,11 @@ pub(crate) unsafe fn service_hosted_provider_export(
         }
         Err(_) => return hosted_provider_export_failure(STATUS_INVALID_PARAMETER),
     }
-    if instance_by_shared_va(dependent_channel.shared_va)
-        .map(|(index, _)| index == singleton.instance)
-        .unwrap_or(false)
-    {
+    let Some((dependent_index, dependent_inst)) = instance_by_shared_va(dependent_channel.shared_va)
+    else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
+    if dependent_index == singleton.instance {
         return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
     }
     let Some(provider_inst) = instance(singleton.instance) else {
@@ -12272,6 +12498,31 @@ pub(crate) unsafe fn service_hosted_provider_export(
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
     let provider_shared = provider_inst.exec_shared_va;
+
+    let mut args = [0u64; HOSTED_PROVIDER_EXPORT_ARG_CAP];
+    args[0] = arg0;
+    args[1] = arg1;
+    args[2] = arg2;
+    args[3] = arg3;
+    let mut stack_index = 0u64;
+    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+        args[4 + stack_index as usize] = read_volatile(
+            (dependent_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8)
+                as *const u64,
+        );
+        stack_index += 1;
+    }
+    let marshal_state = match prepare_provider_export_marshal(
+        policy,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        &mut args,
+    ) {
+        Ok(state) => state,
+        Err(status) => return hosted_provider_export_failure(status),
+    };
+
     write_volatile(
         (provider_shared + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_PROVIDER_EXPORT,
@@ -12280,23 +12531,19 @@ pub(crate) unsafe fn service_hosted_provider_export(
         (provider_shared + SH_REQ_MINOR) as *mut u64,
         provider_export_rva,
     );
-    write_volatile((provider_shared + SH_REQ_FSCTL) as *mut u64, arg0);
-    write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, arg1);
-    write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, arg2);
-    write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, arg3);
+    write_volatile((provider_shared + SH_REQ_FSCTL) as *mut u64, args[0]);
+    write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, args[1]);
+    write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
+    write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, args[3]);
     write_volatile(
         (provider_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
         caller_rsp,
     );
-    let mut stack_index = 0u64;
+    stack_index = 0;
     while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
-        let value = read_volatile(
-            (dependent_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8)
-                as *const u64,
-        );
         write_volatile(
             (provider_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8) as *mut u64,
-            value,
+            args[4 + stack_index as usize],
         );
         stack_index += 1;
     }
@@ -12341,6 +12588,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         register_instance_ready(singleton.instance, false);
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
+    complete_provider_export_marshal(&marshal_state);
     let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
@@ -15383,80 +15631,80 @@ unsafe fn lookup_loaded_pe_export_target(
     None
 }
 
-unsafe fn loaded_pe_export_rva_has_marshal_policy(
+unsafe fn loaded_pe_export_rva_marshal_policy(
     provider: &str,
     image_va: u64,
     image_len: u32,
     provider_export_rva: u64,
-) -> bool {
+) -> Option<HostedProviderExportMarshalPolicy> {
     let cap = image_len as u64;
     let Some(e) = loaded_pe_u32(image_va, cap, 0x3c) else {
-        return false;
+        return None;
     };
     let e = e as u64;
     if loaded_pe_u32(image_va, cap, e) != Some(0x0000_4550) {
-        return false;
+        return None;
     }
     let Some(opt) = e.checked_add(24) else {
-        return false;
+        return None;
     };
     let Some(export_dir_rva) = opt.checked_add(112) else {
-        return false;
+        return None;
     };
     let Some(export_rva) = loaded_pe_u32(image_va, cap, export_dir_rva) else {
-        return false;
+        return None;
     };
     let export_rva = export_rva as u64;
     let Some(export_size_rva) = opt.checked_add(112 + 4) else {
-        return false;
+        return None;
     };
     let Some(export_size) = loaded_pe_u32(image_va, cap, export_size_rva) else {
-        return false;
+        return None;
     };
     let export_size = export_size as u64;
     if export_rva == 0 || export_size == 0 || export_rva > cap.saturating_sub(40) {
-        return false;
+        return None;
     }
     if provider_export_rva >= export_rva
         && provider_export_rva < export_rva.saturating_add(export_size)
     {
-        return false;
+        return None;
     }
     let Some(number_of_functions_rva) = export_rva.checked_add(20) else {
-        return false;
+        return None;
     };
     let Some(number_of_functions) = loaded_pe_u32(image_va, cap, number_of_functions_rva) else {
-        return false;
+        return None;
     };
     let number_of_functions = number_of_functions as u64;
     let Some(number_of_names_rva) = export_rva.checked_add(24) else {
-        return false;
+        return None;
     };
     let Some(number_of_names) = loaded_pe_u32(image_va, cap, number_of_names_rva) else {
-        return false;
+        return None;
     };
     if number_of_names > MAX_LOADED_EXPORT_NAMES {
-        return false;
+        return None;
     }
     let Some(address_of_functions_rva) = export_rva.checked_add(28) else {
-        return false;
+        return None;
     };
     let Some(address_of_functions) = loaded_pe_u32(image_va, cap, address_of_functions_rva) else {
-        return false;
+        return None;
     };
     let address_of_functions = address_of_functions as u64;
     let Some(address_of_names_rva) = export_rva.checked_add(32) else {
-        return false;
+        return None;
     };
     let Some(address_of_names) = loaded_pe_u32(image_va, cap, address_of_names_rva) else {
-        return false;
+        return None;
     };
     let address_of_names = address_of_names as u64;
     let Some(address_of_ordinals_rva) = export_rva.checked_add(36) else {
-        return false;
+        return None;
     };
     let Some(address_of_ordinals) = loaded_pe_u32(image_va, cap, address_of_ordinals_rva) else {
-        return false;
+        return None;
     };
     let address_of_ordinals = address_of_ordinals as u64;
     let mut i = 0u32;
@@ -15466,47 +15714,47 @@ unsafe fn loaded_pe_export_rva_has_marshal_policy(
             .checked_mul(4)
             .and_then(|offset| address_of_names.checked_add(offset))
         else {
-            return false;
+            return None;
         };
         let Some(name_rva) = loaded_pe_u32(image_va, cap, name_entry_rva) else {
-            return false;
+            return None;
         };
         let name_rva = name_rva as u64;
         let Some(ordinal_entry_rva) = index
             .checked_mul(2)
             .and_then(|offset| address_of_ordinals.checked_add(offset))
         else {
-            return false;
+            return None;
         };
         let Some(ordinal_index) = loaded_pe_u16(image_va, cap, ordinal_entry_rva) else {
-            return false;
+            return None;
         };
         let ordinal_index = ordinal_index as u64;
         if ordinal_index >= number_of_functions {
-            return false;
+            return None;
         }
         let Some(function_entry_rva) = ordinal_index
             .checked_mul(4)
             .and_then(|offset| address_of_functions.checked_add(offset))
         else {
-            return false;
+            return None;
         };
         let Some(func_rva) = loaded_pe_u32(image_va, cap, function_entry_rva) else {
-            return false;
+            return None;
         };
         let func_rva = func_rva as u64;
         if func_rva == provider_export_rva {
             let mut name_buf = [0u8; 128];
             let Some(name) = read_pe_ascii(image_va, cap, name_rva, 0, &mut name_buf) else {
-                return false;
+                return None;
             };
-            if hosted_provider_export_marshal_policy(provider, name).is_some() {
-                return true;
+            if let Some(policy) = hosted_provider_export_marshal_policy(provider, name) {
+                return Some(policy);
             }
         }
         i += 1;
     }
-    false
+    None
 }
 
 unsafe fn lookup_loaded_dependency_export_target(
