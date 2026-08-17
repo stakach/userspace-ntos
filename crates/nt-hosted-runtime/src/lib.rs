@@ -117,11 +117,117 @@ pub enum HostedProviderImagePlanError {
     ExceedsFrameCapacity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderDomainDescriptor {
+    pub image_offset: u64,
+    pub image_len: u64,
+    pub image_frames: u64,
+    pub pool_base: u64,
+    pub pool_frames: u64,
+    pub export_call_gate: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderDomainBinding {
+    pub image_offset: u64,
+    pub image_len: u64,
+    pub image_frames: u64,
+    pub pool_base: u64,
+    pub pool_frames: u64,
+    pub export_call_gate: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderDomainStatus {
+    Absent,
+    MetadataOnly,
+    Callable(HostedProviderDomainBinding),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderDomainError {
+    ImageOffsetUnaligned,
+    EmptyImage,
+    EmptyImageFrames,
+    ImageFrameCapacityOverflow,
+    ImageExceedsFrames,
+    EmptyPoolFrames,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderExportCallPlan {
+    pub export_call_gate: u64,
+    pub provider_export_rva: u64,
+    pub provider_export_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderExportCallError {
+    Overflow,
+    ExportOutsideImage,
+}
+
 pub fn page_align_up(value: u64) -> Result<u64, HostedProviderImagePlanError> {
     match value.checked_add(PAGE_SIZE - 1) {
         Some(value) => Ok(value & !(PAGE_SIZE - 1)),
         None => Err(HostedProviderImagePlanError::Overflow),
     }
+}
+
+pub fn classify_hosted_provider_domain(
+    descriptor: Option<HostedProviderDomainDescriptor>,
+) -> Result<HostedProviderDomainStatus, HostedProviderDomainError> {
+    let Some(descriptor) = descriptor else {
+        return Ok(HostedProviderDomainStatus::Absent);
+    };
+    if descriptor.image_offset & (PAGE_SIZE - 1) != 0 {
+        return Err(HostedProviderDomainError::ImageOffsetUnaligned);
+    }
+    if descriptor.image_len == 0 {
+        return Err(HostedProviderDomainError::EmptyImage);
+    }
+    if descriptor.image_frames == 0 {
+        return Err(HostedProviderDomainError::EmptyImageFrames);
+    }
+    let Some(image_frame_capacity) = descriptor.image_frames.checked_mul(PAGE_SIZE) else {
+        return Err(HostedProviderDomainError::ImageFrameCapacityOverflow);
+    };
+    if descriptor.image_len > image_frame_capacity {
+        return Err(HostedProviderDomainError::ImageExceedsFrames);
+    }
+    if descriptor.pool_frames == 0 {
+        return Err(HostedProviderDomainError::EmptyPoolFrames);
+    }
+    if descriptor.export_call_gate == 0 {
+        return Ok(HostedProviderDomainStatus::MetadataOnly);
+    }
+    Ok(HostedProviderDomainStatus::Callable(
+        HostedProviderDomainBinding {
+            image_offset: descriptor.image_offset,
+            image_len: descriptor.image_len,
+            image_frames: descriptor.image_frames,
+            pool_base: descriptor.pool_base,
+            pool_frames: descriptor.pool_frames,
+            export_call_gate: descriptor.export_call_gate,
+        },
+    ))
+}
+
+pub fn plan_hosted_provider_export_call(
+    binding: HostedProviderDomainBinding,
+    provider_export_rva: u64,
+) -> Result<HostedProviderExportCallPlan, HostedProviderExportCallError> {
+    if provider_export_rva >= binding.image_len {
+        return Err(HostedProviderExportCallError::ExportOutsideImage);
+    }
+    let Some(provider_export_offset) = binding.image_offset.checked_add(provider_export_rva) else {
+        return Err(HostedProviderExportCallError::Overflow);
+    };
+    Ok(HostedProviderExportCallPlan {
+        export_call_gate: binding.export_call_gate,
+        provider_export_rva,
+        provider_export_offset,
+    })
 }
 
 pub fn plan_provider_prefixed_image(
@@ -417,6 +523,109 @@ mod tests {
         assert_eq!(
             plan_provider_prefixed_image(&[u64::MAX], 0, &[], 0, u64::MAX),
             Err(HostedProviderImagePlanError::Overflow)
+        );
+    }
+
+    #[test]
+    fn provider_domain_classifies_absent_metadata_and_callable_domains() {
+        assert_eq!(
+            classify_hosted_provider_domain(None),
+            Ok(HostedProviderDomainStatus::Absent)
+        );
+
+        let metadata_only = HostedProviderDomainDescriptor {
+            image_offset: 0,
+            image_len: 0x12_345,
+            image_frames: 0x13,
+            pool_base: 0x8800_0000,
+            pool_frames: 4,
+            export_call_gate: 0,
+        };
+        assert_eq!(
+            classify_hosted_provider_domain(Some(metadata_only)),
+            Ok(HostedProviderDomainStatus::MetadataOnly)
+        );
+
+        let callable = HostedProviderDomainDescriptor {
+            export_call_gate: 0xfeed,
+            ..metadata_only
+        };
+        assert_eq!(
+            classify_hosted_provider_domain(Some(callable)),
+            Ok(HostedProviderDomainStatus::Callable(
+                HostedProviderDomainBinding {
+                    image_offset: callable.image_offset,
+                    image_len: callable.image_len,
+                    image_frames: callable.image_frames,
+                    pool_base: callable.pool_base,
+                    pool_frames: callable.pool_frames,
+                    export_call_gate: callable.export_call_gate,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_domain_rejects_invalid_metadata() {
+        let valid = HostedProviderDomainDescriptor {
+            image_offset: 0,
+            image_len: 0x1000,
+            image_frames: 1,
+            pool_base: 0x8800_0000,
+            pool_frames: 1,
+            export_call_gate: 0,
+        };
+        assert_eq!(
+            classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
+                image_offset: 1,
+                ..valid
+            })),
+            Err(HostedProviderDomainError::ImageOffsetUnaligned)
+        );
+        assert_eq!(
+            classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
+                image_len: 0,
+                ..valid
+            })),
+            Err(HostedProviderDomainError::EmptyImage)
+        );
+        assert_eq!(
+            classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
+                image_len: 0x1001,
+                ..valid
+            })),
+            Err(HostedProviderDomainError::ImageExceedsFrames)
+        );
+        assert_eq!(
+            classify_hosted_provider_domain(Some(HostedProviderDomainDescriptor {
+                pool_frames: 0,
+                ..valid
+            })),
+            Err(HostedProviderDomainError::EmptyPoolFrames)
+        );
+    }
+
+    #[test]
+    fn provider_export_call_plan_uses_gate_without_direct_client_jump() {
+        let binding = HostedProviderDomainBinding {
+            image_offset: 0x40_000,
+            image_len: 0x20_000,
+            image_frames: 0x20,
+            pool_base: 0x8800_0000,
+            pool_frames: 8,
+            export_call_gate: 0xbeef,
+        };
+        assert_eq!(
+            plan_hosted_provider_export_call(binding, 0x1234),
+            Ok(HostedProviderExportCallPlan {
+                export_call_gate: 0xbeef,
+                provider_export_rva: 0x1234,
+                provider_export_offset: 0x41_234,
+            })
+        );
+        assert_eq!(
+            plan_hosted_provider_export_call(binding, binding.image_len),
+            Err(HostedProviderExportCallError::ExportOutsideImage)
         );
     }
 }

@@ -31,7 +31,10 @@ use nt_compat_exports::DriverExportRegistry;
 use nt_dma_manager::{
     DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
-use nt_hosted_runtime::{plan_provider_prefixed_image, HostedProviderImagePlanError};
+use nt_hosted_runtime::{
+    classify_hosted_provider_domain, plan_provider_prefixed_image, HostedProviderDomainDescriptor,
+    HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderImagePlanError,
+};
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
@@ -12016,6 +12019,19 @@ fn dependency_name_list_contains(
         .any(|existing| hosted_ascii_eq_ignore_case(existing, provider))
 }
 
+fn print_hosted_provider_domain_error(error: HostedProviderDomainError) {
+    match error {
+        HostedProviderDomainError::ImageOffsetUnaligned => print_str(b"image-offset-unaligned"),
+        HostedProviderDomainError::EmptyImage => print_str(b"empty-image"),
+        HostedProviderDomainError::EmptyImageFrames => print_str(b"empty-image-frames"),
+        HostedProviderDomainError::ImageFrameCapacityOverflow => {
+            print_str(b"image-frame-capacity-overflow")
+        }
+        HostedProviderDomainError::ImageExceedsFrames => print_str(b"image-exceeds-frames"),
+        HostedProviderDomainError::EmptyPoolFrames => print_str(b"empty-pool-frames"),
+    }
+}
+
 unsafe fn add_shared_provider_if_registered(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     shared_providers: &mut Vec<PlannedSharedProviderImage>,
@@ -12026,9 +12042,6 @@ unsafe fn add_shared_provider_if_registered(
     let Some((singleton_index, singleton)) = find_hosted_provider_singleton(&provider) else {
         return Some(false);
     };
-    if singleton.export_call_gate == 0 {
-        return Some(false);
-    }
     if singleton.image_frames == 0
         || singleton.image_frames as usize > HOSTED_PROVIDER_SINGLETON_FRAME_CAP
     {
@@ -12037,16 +12050,38 @@ unsafe fn add_shared_provider_if_registered(
         print_str(b"\n");
         return None;
     }
+    let descriptor = HostedProviderDomainDescriptor {
+        image_offset: singleton.image_offset,
+        image_len: singleton.image_len as u64,
+        image_frames: singleton.image_frames,
+        pool_base: singleton.pool_base,
+        pool_frames: singleton.pool_frames,
+        export_call_gate: singleton.export_call_gate,
+    };
+    let binding = match classify_hosted_provider_domain(Some(descriptor)) {
+        Ok(HostedProviderDomainStatus::Callable(binding)) => binding,
+        Ok(HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly) => {
+            return Some(false)
+        }
+        Err(error) => {
+            print_str(b"[driver-launch] registered provider domain invalid ");
+            print_str(provider.as_bytes());
+            print_str(b" reason=");
+            print_hosted_provider_domain_error(error);
+            print_str(b"\n");
+            return None;
+        }
+    };
     shared_providers.try_reserve_exact(1).ok()?;
     shared_providers.push(PlannedSharedProviderImage {
         provider,
         singleton_index,
-        image_offset: singleton.image_offset,
+        image_offset: binding.image_offset,
         prefix_offset: 0,
-        image_len: singleton.image_len,
-        image_frames: singleton.image_frames,
-        pool_base: singleton.pool_base,
-        pool_frames: singleton.pool_frames,
+        image_len: binding.image_len as u32,
+        image_frames: binding.image_frames,
+        pool_base: binding.pool_base,
+        pool_frames: binding.pool_frames,
     });
     HOSTED_PROVIDER_SHARED_MAPPINGS.fetch_add(1, Ordering::Relaxed);
     Some(true)

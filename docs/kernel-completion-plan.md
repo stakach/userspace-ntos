@@ -6942,10 +6942,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Explorer shell chrome painted, preserves `dma_desc_addr/ok=128/128`, `dma_dev_tx/rx=0/1`, and
   `dma_dev_cause/fail=144/0`, and reports provider evidence
   `primary=10 private-deps=2 private-deps-with-primary=2 duplicate-private-deps=2 overflow=0`.
-  Review adjustment: the next B3 slice should register successful primary provider images as
-  singleton provider runtime domains, place dependents after the provider prefix, skip rerunning
-  provider `DriverEntry`, share the provider-domain pool, and then re-test NDIS protocol
-  bind/packet-filter evidence before expanding RX/TX packet proofs.
+  Review adjustment: the direct provider-prefix mapping prep is complete, but it is not the next
+  executable boundary by itself. The next B3 slice must first add a provider-domain export-call
+  transport so dependents enter the provider-owned runtime context instead of aliasing raw image or
+  pool frames into their own VSpaces; only then should NDIS protocol bind/packet-filter evidence
+  move to shared-provider semantics before expanding RX/TX packet proofs.
 
   B3 shared-provider runtime domain (2026-08-17, in progress): successful root provider primary
   loads whose image is relocated at a stable component offset and has no private dependency copies
@@ -6962,3 +6963,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `shared-maps=0`, and `shared-pools=0`; private NDIS support images are still loaded for TCPIP and
   E1000, E1000 `START_DEVICE` succeeds with the generic DMA/interrupt evidence intact, and Explorer
   reaches full shell chrome pixels with `298/298` checks passing.
+
+  B3 provider-domain export boundary (2026-08-17, in progress): the raw `export_call_gate != 0`
+  check has been moved into `nt-hosted-runtime` as a host-tested provider-domain classifier. The
+  runtime model now distinguishes absent provider records, metadata-only records, and callable
+  provider domains, rejects malformed singleton metadata, and models an export-call plan that
+  carries a provider-domain gate plus provider export RVA/offset rather than permitting a dependent
+  component to jump directly into a provider image. The executive now uses that classifier before
+  admitting any planned shared-provider image, so today's gate-free singleton records still require
+  private support images and the future callable path has a named, test-covered boundary. Review
+  adjustment: the next B3 slice should instantiate a real executive export-call gate for provider
+  domains, then bind dependent import thunks to that gate and prove a narrow NDIS export call enters
+  provider-owned context before enabling shared-provider image/pool planning.
+
+  Validation for the classifier slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. A serialized desktop observation
+  `.tmp/run-desktop-20260817-105455.log` was manually interrupted after roughly six minutes because
+  the live desktop workload kept making forward progress instead of reaching the harness sentinel.
+  That observation is not an accepted desktop proof, but it preserved the provider boundary evidence
+  (`singletons=8`, `shared-maps=0`, `shared-pools=0`) and progressed through real Explorer launch,
+  win32k dispatches, nested api0 callbacks, shell resource mapping, and shell window creation without
+  a provider-domain regression. The latest accepted desktop proof remains
+  `.tmp/run-desktop-20260817-104324.log`.
