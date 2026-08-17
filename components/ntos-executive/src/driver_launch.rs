@@ -1020,21 +1020,13 @@ unsafe fn discard_completed_file_records(fid: u64) -> u64 {
     discarded
 }
 
-unsafe fn cancel_pending_irps_for_file(fid: u64, device_object: u64) -> u64 {
+unsafe fn cancel_pending_irps_for_file(fid: u64, _device_object: u64) -> u64 {
     let mut cancelled = 0u64;
     loop {
         let Some(target) = find_pending_irp_cancel_target(fid) else {
             break;
         };
-        write_unaligned((target.irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
-        write_unaligned((target.irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, 0);
-        write_unaligned(
-            (target.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64,
-            0,
-        );
-        let cancel: extern "win64" fn(u64, u64) =
-            core::mem::transmute(target.cancel_routine as *const ());
-        cancel(device_object, target.irp);
+        let cancelled_this = s_io_cancel_irp(target.irp);
         let discarded = discard_completed_file_records(fid);
         let trace = FSD_CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace < 32 {
@@ -1046,9 +1038,14 @@ unsafe fn cancel_pending_irps_for_file(fid: u64, device_object: u64) -> u64 {
             print_str(b" routine=0x");
             print_hex((target.cancel_routine >> 32) as u32);
             print_hex(target.cancel_routine as u32);
+            print_str(b" invoked=");
+            print_u64(cancelled_this as u64);
             print_str(b" discarded=");
             print_u64(discarded);
             print_str(b"\n");
+        }
+        if cancelled_this == 0 {
+            break;
         }
         cancelled += 1;
         if cancelled >= FSD_PENDING_IRP_CAP as u64 {
@@ -6266,11 +6263,9 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
         return 0;
     }
     unsafe {
+        let old = hosted_raise_irql(DISPATCH_LEVEL);
         write_unaligned((irp + WDM_X64_IRP_CANCEL_OFFSET) as *mut u8, 1);
-        write_unaligned(
-            (irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8,
-            DISPATCH_LEVEL,
-        );
+        write_unaligned((irp + WDM_X64_IRP_CANCEL_IRQL_OFFSET) as *mut u8, old);
         let routine = read_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
         write_unaligned((irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *mut u64, 0);
         if routine != 0 {
@@ -6281,12 +6276,12 @@ extern "win64" fn s_io_cancel_irp(irp: u64) -> u8 {
                 0
             };
             let f: extern "win64" fn(u64, u64) = core::mem::transmute(routine as *const ());
-            let old = hosted_raise_irql(DISPATCH_LEVEL);
             f(device, irp);
-            hosted_lower_irql(old);
+            return 1;
         }
+        hosted_lower_irql(old);
     }
-    1
+    0
 }
 
 /// `PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT)`.

@@ -35,6 +35,7 @@ struct SecImageForwardPolicy {
 static GUI_CLIENTINFO_SEED_TRACE: AtomicU64 = AtomicU64::new(0);
 static INTERACTIVE_SHELL_CREATE_WINDOW_ATTEMPT_MASK: AtomicU64 = AtomicU64::new(0);
 static SHELL_LAUNCH_QUIESCE_DUMPED: AtomicU64 = AtomicU64::new(0);
+static LSA_READINESS_QUIESCE_DUMPED: AtomicU64 = AtomicU64::new(0);
 static SHELL_CHROME_QUIESCE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 static GUI_MESSAGE_DIAG_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_FLUSH_ICACHE_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2306,6 +2307,103 @@ unsafe fn dump_shell_launch_quiesce(
                 );
             }
         }
+    }
+}
+
+unsafe fn dump_lsa_readiness_quiesce(
+    nt_handler: &ExecNtHandler,
+    loaded_images: &HostedLoadedImageTable,
+    reg: &nt_dll_registry::Registry,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]; MAX_PI],
+) {
+    if LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+
+    let services_pi =
+        live_hosted_pi_for_role(nt_handler, nt_exe_image::HostedProcessRole::ServiceControlManager);
+    let lsass_pi =
+        live_hosted_pi_for_role(nt_handler, nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
+    if services_pi.is_none()
+        && lsass_pi.is_none()
+        && LSASS_SRM_CONNECTED.load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    if LSA_READINESS_QUIESCE_DUMPED.fetch_or(1, Ordering::Relaxed) & 1 != 0 {
+        return;
+    }
+
+    print_str(b"[lsa-readiness] no lsa_rpc_server_active before quiesce");
+    print_str(b" services-pi=");
+    match services_pi {
+        Some(pi) => print_u64(pi as u64),
+        None => print_str(b"none"),
+    }
+    print_str(b" lsass-pi=");
+    match lsass_pi {
+        Some(pi) => print_u64(pi as u64),
+        None => print_str(b"none"),
+    }
+    print_str(b" services-spawned=");
+    print_u64(SERVICES_SPAWNED.load(Ordering::Relaxed));
+    print_str(b" lsass-spawned=");
+    print_u64(LSASS_SPAWNED.load(Ordering::Relaxed));
+    print_str(b" srm-port=0x");
+    print_hex_u64(SRM_COMMAND_PORT_OBJECT_HANDLE.load(Ordering::Relaxed));
+    print_str(b" srm-connected=");
+    print_u64(LSASS_SRM_CONNECTED.load(Ordering::Relaxed));
+    print_str(b" named-events=");
+    print_u64(SERVICES_NAMED_EVENTS.load(Ordering::Relaxed));
+    print_str(b" query-dir=");
+    print_u64(SERVICES_QUERY_DIR_OBJECT.load(Ordering::Relaxed));
+    print_str(b"\n");
+
+    print_str(b"[lsa-readiness] lpc auth-port=0x");
+    print_hex_u64(LSA_AUTH_PORT_OBJECT_HANDLE.load(Ordering::Relaxed));
+    print_str(b" pending=0x");
+    print_hex_u64(LSA_PENDING_CONN.load(Ordering::Relaxed));
+    print_str(b" delivered=");
+    print_u64(LSA_CONNECT_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" completed=");
+    print_u64(LSA_CONNECT_COMPLETED.load(Ordering::Relaxed));
+    print_str(b" requests=");
+    print_u64(LSA_REQUESTS_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" replies=");
+    print_u64(LSA_REPLIES_DELIVERED.load(Ordering::Relaxed));
+    print_str(b" rpc-clients=");
+    print_u64(LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed));
+    print_str(b" workers=");
+    print_u64(LSA_RPC_EXTRA_WORKERS_CLAIMED.load(Ordering::Relaxed));
+    print_str(b" worker-ssn=");
+    print_u64(LSA_WORKER_SYSCALLS.load(Ordering::Relaxed));
+    print_str(b"\n");
+
+    if let Some(pi) = services_pi {
+        dump_hosted_main_thread_quiesce(
+            b"services-readiness",
+            pi,
+            nt_handler,
+            loaded_images,
+            reg,
+            ntdll,
+            procs,
+            pfilled,
+        );
+    }
+    if let Some(pi) = lsass_pi {
+        dump_hosted_main_thread_quiesce(
+            b"lsass-readiness",
+            pi,
+            nt_handler,
+            loaded_images,
+            reg,
+            ntdll,
+            procs,
+            pfilled,
+        );
     }
 }
 
@@ -5131,6 +5229,14 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     last_progress_t = now;
                 } else {
+                    dump_lsa_readiness_quiesce(
+                        &nt_handler,
+                        &*hosted_loaded_images,
+                        &reg,
+                        ntdll,
+                        procs,
+                        pfilled,
+                    );
                     dump_interactive_shell_frontier_quiesce(
                         &nt_handler,
                         &*hosted_loaded_images,
@@ -5146,6 +5252,14 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+            dump_lsa_readiness_quiesce(
+                &nt_handler,
+                &*hosted_loaded_images,
+                &reg,
+                ntdll,
+                procs,
+                pfilled,
+            );
             dump_interactive_shell_frontier_quiesce(
                 &nt_handler,
                 &*hosted_loaded_images,
@@ -15402,6 +15516,14 @@ pub(crate) unsafe fn service_sec_image(
         stop = quiesce_cm_status as u64;
     }
     dump_interactive_logon_quiesce(
+        &nt_handler,
+        &*hosted_loaded_images,
+        &reg,
+        ntdll,
+        procs,
+        pfilled,
+    );
+    dump_lsa_readiness_quiesce(
         &nt_handler,
         &*hosted_loaded_images,
         &reg,

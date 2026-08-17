@@ -8074,12 +8074,18 @@ static mut SHARED_IMAGE_MAPPING_CHUNKS: Option<Vec<*mut SharedImageMappingChunk>
 static SHARED_IMAGE_MAPPING_DIRTY: AtomicBool = AtomicBool::new(false);
 static SHARED_IMAGE_MAPPING_LIVE: AtomicU64 = AtomicU64::new(0);
 const IMAGE_MAP_CAP_BANK_RADIX: u32 = 12;
-const IMAGE_MAP_CAP_BANK_SLOTS: u64 = 1u64 << IMAGE_MAP_CAP_BANK_RADIX;
+const IMAGE_MAP_CAP_BANK_SEGMENT_SLOTS: u64 = 1u64 << IMAGE_MAP_CAP_BANK_RADIX;
 const IMAGE_MAP_CAP_BANK_GUARD_BADGE: u64 = 64 - IMAGE_MAP_CAP_BANK_RADIX as u64;
-static IMAGE_MAP_CAP_BANK_RAW: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-static IMAGE_MAP_CAP_BANK_CNODE: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-static IMAGE_MAP_CAP_BANK_NEXT: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-static IMAGE_MAP_CAP_BANK_LIVE: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+const IMAGE_MAP_CAP_BANK_SEGMENTS: usize = 16;
+const IMAGE_MAP_CAP_BANK_SLOTS: u64 =
+    IMAGE_MAP_CAP_BANK_SEGMENT_SLOTS * IMAGE_MAP_CAP_BANK_SEGMENTS as u64;
+static IMAGE_MAP_CAP_BANK_RAW: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
+    [const { AtomicU64::new(0) }; IMAGE_MAP_CAP_BANK_SEGMENTS];
+static IMAGE_MAP_CAP_BANK_CNODE: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
+    [const { AtomicU64::new(0) }; IMAGE_MAP_CAP_BANK_SEGMENTS];
+static IMAGE_MAP_CAP_BANK_NEXT: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
 static IMAGE_MAP_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
@@ -8098,12 +8104,12 @@ pub(crate) fn take_shared_image_mapping_dirty() -> bool {
     SHARED_IMAGE_MAPPING_DIRTY.swap(false, Ordering::Relaxed)
 }
 
-unsafe fn image_map_cap_bank_ensure(pi: usize) -> Option<u64> {
-    if pi >= MAX_PI {
+unsafe fn image_map_cap_bank_ensure_segment(segment: usize) -> Option<u64> {
+    if segment >= IMAGE_MAP_CAP_BANK_SEGMENTS {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let existing = IMAGE_MAP_CAP_BANK_CNODE[pi].load(Ordering::Relaxed);
+    let existing = IMAGE_MAP_CAP_BANK_CNODE[segment].load(Ordering::Relaxed);
     if existing != 0 {
         return Some(existing);
     }
@@ -8135,21 +8141,22 @@ unsafe fn image_map_cap_bank_ensure(pi: usize) -> Option<u64> {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    IMAGE_MAP_CAP_BANK_RAW[pi].store(raw, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_CNODE[pi].store(cnode, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_NEXT[pi].store(0, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_LIVE[pi].store(0, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_RAW[segment].store(raw, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_CNODE[segment].store(cnode, Ordering::Relaxed);
     Some(cnode)
 }
 
-unsafe fn image_map_cap_bank_next_slot(pi: usize) -> Option<u16> {
-    let next = IMAGE_MAP_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
+unsafe fn image_map_cap_bank_next_slot() -> Option<(u64, u64, u16)> {
+    let next = IMAGE_MAP_CAP_BANK_NEXT.load(Ordering::Relaxed);
     if next >= IMAGE_MAP_CAP_BANK_SLOTS {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    IMAGE_MAP_CAP_BANK_NEXT[pi].store(next + 1, Ordering::Relaxed);
-    Some(next as u16)
+    Some((
+        next,
+        next / IMAGE_MAP_CAP_BANK_SEGMENT_SLOTS,
+        (next % IMAGE_MAP_CAP_BANK_SEGMENT_SLOTS) as u16,
+    ))
 }
 
 unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImageMappingCap> {
@@ -8158,16 +8165,17 @@ unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImage
         return None;
     }
     let pi = pi as usize;
-    let cnode = image_map_cap_bank_ensure(pi)?;
-    let slot = image_map_cap_bank_next_slot(pi)?;
+    let (next, segment, slot) = image_map_cap_bank_next_slot()?;
+    let cnode = image_map_cap_bank_ensure_segment(segment as usize)?;
     let label = cnode_move_root_to_cnode_r(cnode, slot as u64, root_cap);
     if label != 0 {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    IMAGE_MAP_CAP_BANK_NEXT.store(next + 1, Ordering::Relaxed);
     recycle_deleted_root_slot(root_cap);
     IMAGE_MAP_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_LIVE[pi].fetch_add(1, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].fetch_add(1, Ordering::Relaxed);
     let live = IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     note_high_water(&IMAGE_MAP_CAP_BANK_LIVE_HW, live);
     Some(SharedImageMappingCap::Bank { cnode, slot })
@@ -8189,7 +8197,7 @@ unsafe fn image_map_cap_bank_take_root(
         return Err(label);
     }
     IMAGE_MAP_CAP_BANK_TO_ROOT.fetch_add(1, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_LIVE[pi as usize].fetch_sub(1, Ordering::Relaxed);
+    IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi as usize].fetch_sub(1, Ordering::Relaxed);
     IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
     Ok(root_cap)
 }
@@ -8197,7 +8205,7 @@ unsafe fn image_map_cap_bank_take_root(
 unsafe fn image_map_cap_bank_delete(pi: u8, cnode: u64, slot: u16) -> bool {
     let label = cnode_delete_in_cnode_r(cnode, slot as u64);
     if label == 0 {
-        IMAGE_MAP_CAP_BANK_LIVE[pi as usize].fetch_sub(1, Ordering::Relaxed);
+        IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi as usize].fetch_sub(1, Ordering::Relaxed);
         IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
         true
     } else {
@@ -8285,19 +8293,16 @@ unsafe fn shared_image_mapping_remove_at(
 }
 
 fn image_map_cap_bank_live_next_totals() -> (u64, u64) {
-    let mut live = 0u64;
-    let mut next = 0u64;
-    for pi in 0..MAX_PI {
-        live += IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed);
-        next += IMAGE_MAP_CAP_BANK_NEXT[pi].load(Ordering::Relaxed);
-    }
-    (live, next)
+    (
+        IMAGE_MAP_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed),
+        IMAGE_MAP_CAP_BANK_NEXT.load(Ordering::Relaxed),
+    )
 }
 
 fn image_map_cap_bank_live_process_count() -> u64 {
     let mut count = 0u64;
     for pi in 0..MAX_PI {
-        if IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed) != 0 {
+        if IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed) != 0 {
             count += 1;
         }
     }
@@ -8311,7 +8316,7 @@ fn print_image_map_cap_bank_top_pi() {
         let mut best_pi = usize::MAX;
         let mut best_live = 0u64;
         for pi in 0..MAX_PI {
-            let live = IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed);
+            let live = IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed);
             if !used[pi] && live > best_live {
                 best_pi = pi;
                 best_live = live;
@@ -8517,11 +8522,8 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
         }
         chunk_index += 1;
     }
-    if pi <= u8::MAX as u64 {
-        let pi = pi as usize;
-        if pi < MAX_PI && IMAGE_MAP_CAP_BANK_LIVE[pi].load(Ordering::Relaxed) == 0 {
-            IMAGE_MAP_CAP_BANK_NEXT[pi].store(0, Ordering::Relaxed);
-        }
+    if IMAGE_MAP_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed) == 0 {
+        IMAGE_MAP_CAP_BANK_NEXT.store(0, Ordering::Relaxed);
     }
     removed
 }

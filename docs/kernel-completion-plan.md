@@ -7653,3 +7653,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Continue by identifying the exact late LSASS loader/syscall/RPC gap from the real main-thread
     execution state; do not synthesize the readiness event and do not launch userinit/explorer by
     hand.
+  - `[~]` Follow-up desktop retry `.tmp/run-desktop-lsass-frontier-20260817.log` reconfirms the same
+    frontier from a committed baseline: no BOOTBOOT failure, no CNode exhaustion, `w32-bank-fails=0`,
+    natural background paint, services.exe/LSASS started, and real SRM two-port handoff completed.
+    The run was manually interrupted after output stopped during a periodic census line, before the
+    watchdog emitted a final gate. Treat this as a visibility gap first: add a bounded LSASS/services
+    quiesce snapshot around the no-readiness frontier, then rerun so the next proof identifies the
+    exact running thread and call site instead of relying on a partial census.
+  - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural smell,
+    not a resource problem to solve by inflating the monolithic image. The preferred direction is a
+    small seL4/rootserver boot image plus an initrd-loaded NT personality set: executive, isolated NT
+    services, hosted drivers, win32k assets, and our ntdll as separately loaded artifacts with explicit
+    manifests and capability handoff. Keep this as a packaging/ownership cleanup item; it should not
+    block the current LSASS desktop repair unless the BOOTBOOT limit reappears.
+  - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
+    showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
+    `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
+    `exec_userinit_process_spawned` passed without synthetic shell launch. That run exposed a
+    different resource bug instead: shared-image mapping caps still used per-client bank CNodes, so
+    the later service wave parked `wlansvc.exe`/`svchost.exe` with `image-map-resource` while
+    `image-mapcap-fails=3`/`image-bank-fails=3`.
+  - `[x]` Shared-image cap-bank repair: the SEC_IMAGE map-cap bank now uses lazy global child-CNode
+    segments plus per-process live accounting, rather than a per-process CNode fanout. The follow-up
+    `.tmp/run-desktop-global-image-bank-20260817.log` clears the image-bank frontier
+    (`image-mapcap-fails=0`, `image-bank-fails=0`) and reaches genuine Explorer/user32/win32k icon
+    traffic. It then exposes the same structural problem in win32k's USER/GDI retained mapping caps:
+    `w32-bank` reached `53767/53767/10/21` before late service GUI attaches exhausted the kernel CNode
+    pool.
+  - `[x]` Win32k client cap-bank repair: the win32k USER heap, live GDI handle-table, and GDI
+    user-attributes map-cap bank now uses lazy global child-CNode segments plus a static owner/free
+    index, rather than per-client CNodes or heap-backed lifetime records. A first global-bank retry
+    exposed that bump-heap-backed records could be reused under late service-loop churn, producing
+    corrupted release metadata (`w32-bank-release failed` with UTF-16-looking CNode values). The
+    accepted repair keeps owner tags and recycled slots in reset-safe static arrays, so process
+    teardown deletes exactly the caps owned by that `EPROCESS` and reusable slots never depend on
+    allocator lifetime. Validation: `cargo fmt --all`, `git diff --check`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and serialized desktop proof
+    `.tmp/run-desktop-w32-owner-map-20260817.log`.
+  - `[~]` Current frontier after the owner-map repair: the latest desktop proof reaches the harness
+    sentinel with no BOOTBOOT error, `image-bank-fails=0`, `w32-bank-fails=0`, clean VM/resource
+    counters, real LSASS readiness, logon action return, default-user profile staging/copy, profile
+    hive load/checkpoint, and GDI user-batch flushes. The remaining blocker is later and generic:
+    winlogon parks in our `NtWaitForSingleObject` on anonymous dispatcher event handle `0x3c`
+    (object 82), which was passed as the completion event for a pending `NtReadFile` on
+    `\pipe\ntsvcs`. The next repair target is real asynchronous file/pipe I/O completion event
+    signaling and waiter redrive; do not synthesize `WlxActivateUserShell`, `userinit.exe`, Explorer,
+    or the event signal.
