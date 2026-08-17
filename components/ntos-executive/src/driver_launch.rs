@@ -32,8 +32,10 @@ use nt_dma_manager::{
     DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
 use nt_hosted_runtime::{
-    classify_hosted_provider_domain, plan_provider_prefixed_image, HostedProviderDomainDescriptor,
-    HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderImagePlanError,
+    classify_hosted_provider_domain, plan_hosted_provider_import_binding,
+    plan_provider_prefixed_image, HostedProviderDomainDescriptor, HostedProviderDomainError,
+    HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderImportBinding,
+    HostedProviderImportBindingError, HostedProviderImagePlanError,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -11554,6 +11556,12 @@ struct LoadedDependencyImage {
     image_len: u32,
 }
 
+#[derive(Clone, Copy)]
+struct LoadedPeExportTarget {
+    rva: u64,
+    run_va: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostedProviderLoadRole {
     PrimaryService,
@@ -11591,6 +11599,8 @@ impl HostedProviderSummary {
 struct HostedProviderSingleton {
     present: bool,
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    exec_va: u64,
+    run_va: u64,
     image_offset: u64,
     image_len: u32,
     image_frames: u64,
@@ -11604,6 +11614,8 @@ impl HostedProviderSingleton {
         Self {
             present: false,
             provider: HostedAscii::empty(),
+            exec_va: 0,
+            run_va: 0,
             image_offset: 0,
             image_len: 0,
             image_frames: 0,
@@ -11826,6 +11838,8 @@ unsafe fn set_hosted_provider_singleton_right(index: usize, frame_index: usize, 
 
 unsafe fn register_hosted_provider_singleton(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    exec_va: u64,
+    run_va: u64,
     image_offset: u64,
     image_len: u32,
     image_frames: u64,
@@ -11885,6 +11899,8 @@ unsafe fn register_hosted_provider_singleton(
     *singletons.add(count) = HostedProviderSingleton {
         present: true,
         provider,
+        exec_va,
+        run_va,
         image_offset,
         image_len,
         image_frames,
@@ -12032,6 +12048,33 @@ fn print_hosted_provider_domain_error(error: HostedProviderDomainError) {
     }
 }
 
+fn print_hosted_provider_import_binding_error(error: HostedProviderImportBindingError) {
+    match error {
+        HostedProviderImportBindingError::Domain(error) => print_hosted_provider_domain_error(error),
+        HostedProviderImportBindingError::Export(error) => match error {
+            nt_hosted_runtime::HostedProviderExportCallError::Overflow => {
+                print_str(b"export-offset-overflow")
+            }
+            nt_hosted_runtime::HostedProviderExportCallError::ExportOutsideImage => {
+                print_str(b"export-outside-image")
+            }
+        },
+    }
+}
+
+fn hosted_provider_domain_descriptor(
+    singleton: HostedProviderSingleton,
+) -> HostedProviderDomainDescriptor {
+    HostedProviderDomainDescriptor {
+        image_offset: singleton.image_offset,
+        image_len: singleton.image_len as u64,
+        image_frames: singleton.image_frames,
+        pool_base: singleton.pool_base,
+        pool_frames: singleton.pool_frames,
+        export_call_gate: singleton.export_call_gate,
+    }
+}
+
 unsafe fn add_shared_provider_if_registered(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     shared_providers: &mut Vec<PlannedSharedProviderImage>,
@@ -12050,15 +12093,9 @@ unsafe fn add_shared_provider_if_registered(
         print_str(b"\n");
         return None;
     }
-    let descriptor = HostedProviderDomainDescriptor {
-        image_offset: singleton.image_offset,
-        image_len: singleton.image_len as u64,
-        image_frames: singleton.image_frames,
-        pool_base: singleton.pool_base,
-        pool_frames: singleton.pool_frames,
-        export_call_gate: singleton.export_call_gate,
-    };
-    let binding = match classify_hosted_provider_domain(Some(descriptor)) {
+    let binding = match classify_hosted_provider_domain(Some(hosted_provider_domain_descriptor(
+        singleton,
+    ))) {
         Ok(HostedProviderDomainStatus::Callable(binding)) => binding,
         Ok(HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly) => {
             return Some(false)
@@ -13012,6 +13049,78 @@ unsafe fn log_unresolved_driver_import(dll: &str, name: &str) {
     }
 }
 
+unsafe fn log_provider_domain_export_thunk_missing(
+    dll: &str,
+    name: &str,
+    plan: HostedProviderExportCallPlan,
+) {
+    if DRIVER_UNRESOLVED_IMPORTS_LOGGED < 48 {
+        DRIVER_UNRESOLVED_IMPORTS_LOGGED += 1;
+        print_str(b"[driver-import] provider-domain thunk missing ");
+        for &b in dll.as_bytes() {
+            debug_put_char(b);
+        }
+        debug_put_char(b'!');
+        for &b in name.as_bytes() {
+            debug_put_char(b);
+        }
+        print_str(b" gate=0x");
+        print_hex((plan.export_call_gate >> 32) as u32);
+        print_hex(plan.export_call_gate as u32);
+        print_str(b" rva=0x");
+        print_hex(plan.provider_export_rva as u32);
+        print_str(b"\n");
+    }
+}
+
+unsafe fn lookup_hosted_provider_singleton_export_plan(
+    provider: &str,
+    name: &str,
+) -> Option<HostedProviderExportCallPlan> {
+    let mut provider_name = HostedAscii::<HOSTED_DEP_PROVIDER_MAX>::empty();
+    if !provider_name.set_str(provider) {
+        return None;
+    }
+    let Some((_singleton_index, singleton)) = find_hosted_provider_singleton(&provider_name) else {
+        return None;
+    };
+    let descriptor = hosted_provider_domain_descriptor(singleton);
+    match classify_hosted_provider_domain(Some(descriptor)) {
+        Ok(HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly) => {
+            return None
+        }
+        Ok(HostedProviderDomainStatus::Callable(_binding)) => {}
+        Err(error) => {
+            print_str(b"[driver-import] provider-domain singleton invalid ");
+            print_str(provider.as_bytes());
+            print_str(b" reason=");
+            print_hosted_provider_domain_error(error);
+            print_str(b"\n");
+            return None;
+        }
+    }
+    let export = lookup_loaded_pe_export_target(
+        singleton.exec_va,
+        singleton.run_va,
+        singleton.image_len,
+        name,
+    )?;
+    match plan_hosted_provider_import_binding(Some(descriptor), export.rva) {
+        Ok(HostedProviderImportBinding::PrivateDependencyRequired) => None,
+        Ok(HostedProviderImportBinding::ProviderDomainCall(plan)) => Some(plan),
+        Err(error) => {
+            print_str(b"[driver-import] provider-domain export invalid ");
+            print_str(provider.as_bytes());
+            debug_put_char(b'!');
+            print_str(name.as_bytes());
+            print_str(b" reason=");
+            print_hosted_provider_import_binding_error(error);
+            print_str(b"\n");
+            None
+        }
+    }
+}
+
 /// Resolve a hosted-driver import `DLL!NAME` to its IAT-slot trampoline VA through the SHARED
 /// [`DriverExportRegistry`]. Only kernel-provider DLLs backed by the executive (`ntoskrnl` and `hal`)
 /// are accepted here; dependency images such as `ndis.sys` must be mapped and resolved as real images.
@@ -13028,6 +13137,10 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
     }
     if hosted_dependency_provider_dll(dll) {
         unsafe {
+            if let Some(plan) = lookup_hosted_provider_singleton_export_plan(dll, name) {
+                log_provider_domain_export_thunk_missing(dll, name, plan);
+                return None;
+            }
             if let Some(addr) = lookup_loaded_dependency_export(dll, name) {
                 return Some(addr);
             }
@@ -14775,12 +14888,12 @@ unsafe fn loaded_pe_u32(image_va: u64, cap: u64, rva: u64) -> Option<u32> {
     Some(read_unaligned((image_va + rva) as *const u32))
 }
 
-unsafe fn lookup_loaded_pe_export(
+unsafe fn lookup_loaded_pe_export_target(
     image_va: u64,
     run_va: u64,
     image_len: u32,
     export_name: &str,
-) -> Option<u64> {
+) -> Option<LoadedPeExportTarget> {
     let cap = image_len as u64;
     let e = loaded_pe_u32(image_va, cap, 0x3c)? as u64;
     if loaded_pe_u32(image_va, cap, e)? != 0x0000_4550 {
@@ -14832,20 +14945,30 @@ unsafe fn lookup_loaded_pe_export(
             if func_rva >= cap {
                 return None;
             }
-            return Some(run_va + func_rva);
+            return Some(LoadedPeExportTarget {
+                rva: func_rva,
+                run_va: run_va.checked_add(func_rva)?,
+            });
         }
         i += 1;
     }
     None
 }
 
-unsafe fn lookup_loaded_dependency_export(provider: &str, name: &str) -> Option<u64> {
+unsafe fn lookup_loaded_dependency_export_target(
+    provider: &str,
+    name: &str,
+) -> Option<LoadedPeExportTarget> {
     let images = (*core::ptr::addr_of!(HOSTED_DEP_IMAGES)).as_ref()?;
     let dep = images
         .iter()
         .copied()
         .find(|dep| hosted_dependency_provider_matches(*dep, provider))?;
-    lookup_loaded_pe_export(dep.exec_va, dep.run_va, dep.image_len, name)
+    lookup_loaded_pe_export_target(dep.exec_va, dep.run_va, dep.image_len, name)
+}
+
+unsafe fn lookup_loaded_dependency_export(provider: &str, name: &str) -> Option<u64> {
+    Some(lookup_loaded_dependency_export_target(provider, name)?.run_va)
 }
 
 /// Parse a driver PE at `src_va` (raw file bytes), copy its sections into `dst_va` (frames pre-mapped
@@ -15649,6 +15772,8 @@ unsafe fn load_driver_reserved(
             let singleton_image_frames = frames_for_image_len(image_len as u64)?;
             if !register_hosted_provider_singleton(
                 provider,
+                primary_exec_va,
+                primary_run_va,
                 planned_images.primary_offset,
                 image_len,
                 singleton_image_frames,

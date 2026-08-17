@@ -167,6 +167,18 @@ pub enum HostedProviderExportCallError {
     ExportOutsideImage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderImportBinding {
+    PrivateDependencyRequired,
+    ProviderDomainCall(HostedProviderExportCallPlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderImportBindingError {
+    Domain(HostedProviderDomainError),
+    Export(HostedProviderExportCallError),
+}
+
 pub fn page_align_up(value: u64) -> Result<u64, HostedProviderImagePlanError> {
     match value.checked_add(PAGE_SIZE - 1) {
         Some(value) => Ok(value & !(PAGE_SIZE - 1)),
@@ -228,6 +240,25 @@ pub fn plan_hosted_provider_export_call(
         provider_export_rva,
         provider_export_offset,
     })
+}
+
+pub fn plan_hosted_provider_import_binding(
+    descriptor: Option<HostedProviderDomainDescriptor>,
+    provider_export_rva: u64,
+) -> Result<HostedProviderImportBinding, HostedProviderImportBindingError> {
+    match classify_hosted_provider_domain(descriptor)
+        .map_err(HostedProviderImportBindingError::Domain)?
+    {
+        HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly => {
+            Ok(HostedProviderImportBinding::PrivateDependencyRequired)
+        }
+        HostedProviderDomainStatus::Callable(binding) => {
+            Ok(HostedProviderImportBinding::ProviderDomainCall(
+                plan_hosted_provider_export_call(binding, provider_export_rva)
+                    .map_err(HostedProviderImportBindingError::Export)?,
+            ))
+        }
+    }
 }
 
 pub fn plan_provider_prefixed_image(
@@ -626,6 +657,90 @@ mod tests {
         assert_eq!(
             plan_hosted_provider_export_call(binding, binding.image_len),
             Err(HostedProviderExportCallError::ExportOutsideImage)
+        );
+    }
+
+    #[test]
+    fn provider_import_binding_requires_private_dependency_without_callable_domain() {
+        assert_eq!(
+            plan_hosted_provider_import_binding(None, 0x1234),
+            Ok(HostedProviderImportBinding::PrivateDependencyRequired)
+        );
+
+        assert_eq!(
+            plan_hosted_provider_import_binding(
+                Some(HostedProviderDomainDescriptor {
+                    image_offset: 0,
+                    image_len: 0x20_000,
+                    image_frames: 0x20,
+                    pool_base: 0x9000_0000,
+                    pool_frames: 8,
+                    export_call_gate: 0,
+                }),
+                0x1234,
+            ),
+            Ok(HostedProviderImportBinding::PrivateDependencyRequired)
+        );
+    }
+
+    #[test]
+    fn provider_import_binding_uses_callable_domain_export_plan() {
+        assert_eq!(
+            plan_hosted_provider_import_binding(
+                Some(HostedProviderDomainDescriptor {
+                    image_offset: 0x60_000,
+                    image_len: 0x20_000,
+                    image_frames: 0x20,
+                    pool_base: 0x9000_0000,
+                    pool_frames: 8,
+                    export_call_gate: 0xcafe,
+                }),
+                0x2345,
+            ),
+            Ok(HostedProviderImportBinding::ProviderDomainCall(
+                HostedProviderExportCallPlan {
+                    export_call_gate: 0xcafe,
+                    provider_export_rva: 0x2345,
+                    provider_export_offset: 0x62_345,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_import_binding_reports_domain_and_export_errors() {
+        assert_eq!(
+            plan_hosted_provider_import_binding(
+                Some(HostedProviderDomainDescriptor {
+                    image_offset: 1,
+                    image_len: 0x20_000,
+                    image_frames: 0x20,
+                    pool_base: 0x9000_0000,
+                    pool_frames: 8,
+                    export_call_gate: 0xcafe,
+                }),
+                0x1234,
+            ),
+            Err(HostedProviderImportBindingError::Domain(
+                HostedProviderDomainError::ImageOffsetUnaligned
+            ))
+        );
+
+        assert_eq!(
+            plan_hosted_provider_import_binding(
+                Some(HostedProviderDomainDescriptor {
+                    image_offset: 0,
+                    image_len: 0x20_000,
+                    image_frames: 0x20,
+                    pool_base: 0x9000_0000,
+                    pool_frames: 8,
+                    export_call_gate: 0xcafe,
+                }),
+                0x20_000,
+            ),
+            Err(HostedProviderImportBindingError::Export(
+                HostedProviderExportCallError::ExportOutsideImage
+            ))
         );
     }
 }

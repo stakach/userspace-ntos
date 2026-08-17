@@ -6986,3 +6986,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   win32k dispatches, nested api0 callbacks, shell resource mapping, and shell window creation without
   a provider-domain regression. The latest accepted desktop proof remains
   `.tmp/run-desktop-20260817-104324.log`.
+
+  B3 provider-domain import binding slice (2026-08-17, in progress): the provider-domain model now
+  has a host-tested import-binding decision: absent and metadata-only singleton records require a
+  private dependency image, while callable domains produce an export-call plan keyed by the real
+  provider export RVA. The executive records provider singleton `exec_va`/`run_va` metadata, the PE
+  export lookup now preserves `{export_rva, run_va}`, and dependency import resolution fails closed
+  if a callable provider singleton appears before real per-import thunks exist. Current gate-free
+  singleton records remain passive, so the desktop path still loads private NDIS/TCPIP support images
+  rather than aliasing provider frames or returning a synthetic success. Review adjustment: the next
+  B3 slice is the actual thunk transport: allocate per-dependent import thunks, package the provider
+  export RVA plus win64 arguments, dispatch the call into the provider-owned component context, and
+  only then allow shared-provider image/pool planning to proceed beyond metadata.
+
+  Validation for the import-binding slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`,
+  executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+  x86_64-unknown-none`, and `git diff --check`. No new serialized desktop proof was accepted for
+  this metadata-only slice; the latest accepted full desktop proof remains
+  `.tmp/run-desktop-20260817-104324.log`.
