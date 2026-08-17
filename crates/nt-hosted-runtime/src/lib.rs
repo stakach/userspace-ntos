@@ -278,9 +278,17 @@ pub enum HostedProviderArgumentMarshal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderExportSideEffect {
+    None,
+    NdisInitializeWrapper,
+    NdisMiniportRegistration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedProviderExportMarshalPolicy {
     pub argument_count: u8,
     pub stack_qwords: u8,
+    pub side_effect: HostedProviderExportSideEffect,
     pub args: [HostedProviderArgumentMarshal; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 }
 
@@ -362,6 +370,13 @@ fn ascii_eq_ignore_case(a: &str, b: &str) -> bool {
 fn export_policy(
     args: &[HostedProviderArgumentMarshal],
 ) -> Option<HostedProviderExportMarshalPolicy> {
+    export_policy_with_side_effect(args, HostedProviderExportSideEffect::None)
+}
+
+fn export_policy_with_side_effect(
+    args: &[HostedProviderArgumentMarshal],
+    side_effect: HostedProviderExportSideEffect,
+) -> Option<HostedProviderExportMarshalPolicy> {
     if args.len() > HOSTED_PROVIDER_EXPORT_ARG_CAP {
         return None;
     }
@@ -374,6 +389,7 @@ fn export_policy(
     Some(HostedProviderExportMarshalPolicy {
         argument_count: args.len() as u8,
         stack_qwords: args.len().saturating_sub(4) as u8,
+        side_effect,
         args: all,
     })
 }
@@ -406,17 +422,23 @@ pub fn hosted_provider_export_marshal_policy(
             export_policy(&[CallerOutPointerFromLength { length_arg: 1 }, Scalar, Scalar])
         }
         "NdisMInitializeScatterGatherDma" => export_policy(&[ProviderHandle, Scalar, Scalar]),
-        "NdisInitializeWrapper" => export_policy(&[
-            CallerOutHandle,
-            CallerInDriverObject,
-            CallerInUnicodeString,
-            Scalar,
-        ]),
-        "NdisMRegisterMiniport" => export_policy(&[
-            ProviderHandle,
-            CallerInMiniportCharacteristics { length_arg: 2 },
-            Scalar,
-        ]),
+        "NdisInitializeWrapper" => export_policy_with_side_effect(
+            &[
+                CallerOutHandle,
+                CallerInDriverObject,
+                CallerInUnicodeString,
+                Scalar,
+            ],
+            HostedProviderExportSideEffect::NdisInitializeWrapper,
+        ),
+        "NdisMRegisterMiniport" => export_policy_with_side_effect(
+            &[
+                ProviderHandle,
+                CallerInMiniportCharacteristics { length_arg: 2 },
+                Scalar,
+            ],
+            HostedProviderExportSideEffect::NdisMiniportRegistration,
+        ),
         "NdisMSetAttributesEx" => {
             export_policy(&[ProviderHandle, CallerContext, Scalar, Scalar, Scalar])
         }
@@ -1038,6 +1060,18 @@ mod tests {
             assert!(policy.argument_count as usize <= HOSTED_PROVIDER_EXPORT_ARG_CAP);
             assert!(policy.stack_qwords <= 8);
         }
+        assert_eq!(
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisInitializeWrapper")
+                .unwrap()
+                .side_effect,
+            HostedProviderExportSideEffect::NdisInitializeWrapper
+        );
+        assert_eq!(
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMRegisterMiniport")
+                .unwrap()
+                .side_effect,
+            HostedProviderExportSideEffect::NdisMiniportRegistration
+        );
     }
 
     #[test]

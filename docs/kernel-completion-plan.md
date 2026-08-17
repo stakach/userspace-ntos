@@ -7403,3 +7403,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the callable-provider publication and NDIS buffer slice: `cargo fmt --all`,
   `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 provider-owned NDIS miniport dispatch route slice (2026-08-17, in progress):
+  `NdisInitializeWrapper` and `NdisMRegisterMiniport` are now marked as side-effecting provider
+  exports in `nt-hosted-runtime`. The executive no longer expects an NDIS miniport image such as
+  `e1000.sys` to publish its own WDM `DriverExtension->AddDevice`; instead, the
+  `NdisInitializeWrapper` marshal path allocates a persistent provider-side `DRIVER_OBJECT` shadow
+  for the dependent miniport and passes that shadow to callable `ndis.sys`. When
+  `NdisMRegisterMiniport` succeeds, the executive verifies that NDIS wrote both
+  `DriverExtension->AddDevice` and a PnP `MajorFunction` into that provider-side shadow, then
+  records a dynamic provider dispatch route keyed by the dependent hosted-driver instance and the
+  provider wrapper handle. AddDevice and later IRP dispatches now select this route dynamically:
+  registry identity is published into the provider shared frame for AddDevice, `SH_DRVOBJ` points at
+  the provider miniport shadow for provider-owned dispatch, and resource/DMA/interface side effects
+  are projected between the dependent device binding and the provider component around each routed
+  IRP. This deliberately fails closed if NDIS does not publish a real route; no private NDIS image
+  fallback or synthetic AddDevice path was added.
+  Review adjustment: boot-test this route against `./run.sh --desktop`. The expected next proof is
+  that the earlier `generic hardware AddDevice failed status=0xc0000010` moves forward to a real
+  NDIS `NdisIAddDevice`/StartDevice path. If it fails, inspect the provider route logs and the first
+  real NDIS PnP/miniport callback that fails, keeping the provider-domain boundary dynamic and
+  multi-device-capable.
+
+  Validation for the provider-owned NDIS miniport dispatch route slice so far: `cargo fmt --all`,
+  `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

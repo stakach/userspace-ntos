@@ -39,19 +39,21 @@ use nt_hosted_runtime::{
     plan_hosted_provider_import_thunk,
     HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
     HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
-    HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
-    HostedProviderImportBindingError, HostedProviderImportThunkError, HostedProviderImportThunkPlan,
+    HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
+    HostedProviderExportSideEffect, HostedProviderImportBinding, HostedProviderImportBindingError,
+    HostedProviderImportThunkError, HostedProviderImportThunkPlan,
     NdisMiniportCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
     HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
-    write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp, CreateOptions,
-    DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType, DispatchContext,
-    DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId, DriverPeerId, FileId,
-    InformationParameters, IoManager, IoParameters, IrpId, IrpProjection, MajorFunctionTable,
-    ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmFileObjectInit, WdmIoStackLocationInit,
-    WdmIoStackParameters, WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
+    CreateOptions, DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType,
+    DispatchContext, DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId,
+    DriverPeerId, FileId, InformationParameters, IoManager, IoParameters, IrpId, IrpProjection,
+    MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmDriverObjectInit,
+    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
+    WDM_X64_DRIVER_EXTENSION_OFFSET,
     WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
     WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
@@ -468,9 +470,22 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 
 const PASSIVE_LEVEL: u8 = 0;
 const DISPATCH_LEVEL: u8 = 2;
+const NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64: u64 = 0x08;
+const NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64: u64 = 0x10;
+const NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64: u64 = 0x18;
+const NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64: u64 = 0x20;
+const NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64: u64 = 0x28;
 const NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64: u64 = 0x30;
+const NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64: u64 = 0x38;
+const NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64: u64 = 0x40;
+const NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64: u64 = 0x48;
+const NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64: u64 = 0x50;
+const NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64: u64 = 0x58;
+const NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64: u64 = 0x60;
+const NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64: u64 = 0x68;
 const NDIS_MEDIUM_ENTRY_BYTES_X64: u64 = 4;
 const NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP: u64 = 64;
+const PROVIDER_CALLBACK_STACK_QWORDS: usize = SH_PROVIDER_EXPORT_STACK_QWORDS as usize;
 
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
 /// Distinct from the small fault labels (VMFault=6, …), so the executive tells them apart.
@@ -11993,6 +12008,43 @@ const PROVIDER_MARSHAL_FREE_ALWAYS: u8 = 1;
 const PROVIDER_MARSHAL_FREE_ON_FAILURE: u8 = 2;
 
 #[derive(Clone, Copy)]
+struct HostedProviderDispatchRoute {
+    used: bool,
+    dependent_instance: usize,
+    provider_instance: usize,
+    provider_domain_cookie: u64,
+    dependent_driver_object: u64,
+    provider_driver_object: u64,
+    provider_driver_extension: u64,
+    provider_wrapper_handle: u64,
+    provider_add_device: u64,
+}
+
+impl HostedProviderDispatchRoute {
+    const fn empty() -> Self {
+        Self {
+            used: false,
+            dependent_instance: 0,
+            provider_instance: 0,
+            provider_domain_cookie: 0,
+            dependent_driver_object: 0,
+            provider_driver_object: 0,
+            provider_driver_extension: 0,
+            provider_wrapper_handle: 0,
+            provider_add_device: 0,
+        }
+    }
+
+    fn add_device_ready(self) -> bool {
+        self.used
+            && self.provider_instance != self.dependent_instance
+            && self.provider_domain_cookie != 0
+            && self.provider_driver_object != 0
+            && self.provider_add_device != 0
+    }
+}
+
+#[derive(Clone, Copy)]
 struct ProviderMarshalState {
     cursor: u64,
     copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
@@ -12003,6 +12055,8 @@ struct ProviderMarshalState {
     dma_state_copyback: bool,
     dma_free_logical: u64,
     dma_free_len: u64,
+    ndis_route_index: usize,
+    ndis_initialize_wrapper_handle_exec_va: u64,
 }
 
 impl ProviderMarshalState {
@@ -12028,6 +12082,8 @@ impl ProviderMarshalState {
             dma_state_copyback: false,
             dma_free_logical: 0,
             dma_free_len: 0,
+            ndis_route_index: usize::MAX,
+            ndis_initialize_wrapper_handle_exec_va: 0,
         }
     }
 }
@@ -12102,6 +12158,7 @@ static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation
 static HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_DISPATCH_ROUTES: Option<Vec<HostedProviderDispatchRoute>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -12554,6 +12611,269 @@ unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderC
         as *const HostedProviderCallbackRecord;
     let record = *records.add(index);
     record.present.then_some(record)
+}
+
+unsafe fn hosted_provider_dispatch_routes_mut() -> &'static mut Vec<HostedProviderDispatchRoute> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_dispatch_routes() -> Option<&'static Vec<HostedProviderDispatchRoute>> {
+    (*core::ptr::addr_of!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_ref()
+}
+
+unsafe fn hosted_provider_dispatch_route(index: usize) -> Option<HostedProviderDispatchRoute> {
+    hosted_provider_dispatch_routes()?
+        .get(index)
+        .copied()
+        .filter(|route| route.used)
+}
+
+unsafe fn hosted_provider_dispatch_route_for_instance(
+    dependent_instance: usize,
+) -> Option<HostedProviderDispatchRoute> {
+    hosted_provider_dispatch_routes()?
+        .iter()
+        .copied()
+        .find(|route| route.used && route.dependent_instance == dependent_instance)
+}
+
+unsafe fn hosted_provider_dispatch_route_for_wrapper(
+    provider_instance: usize,
+    provider_wrapper_handle: u64,
+) -> Option<(usize, HostedProviderDispatchRoute)> {
+    if provider_wrapper_handle == 0 {
+        return None;
+    }
+    hosted_provider_dispatch_routes()?
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, route)| {
+            route.used
+                && route.provider_instance == provider_instance
+                && route.provider_wrapper_handle == provider_wrapper_handle
+        })
+}
+
+unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usize) {
+    let Some(routes) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_mut() else {
+        return;
+    };
+    for route in routes.iter_mut() {
+        if route.used
+            && (route.dependent_instance == instance_index || route.provider_instance == instance_index)
+        {
+            clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
+            *route = HostedProviderDispatchRoute::empty();
+        }
+    }
+}
+
+unsafe fn initialize_provider_driver_object_shadow_for_instance(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    driver_object: u64,
+    driver_extension: u64,
+) -> Result<(), i32> {
+    let Some(driver_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        driver_object,
+        WDM_X64_DRIVER_OBJECT_SIZE as u64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(extension_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        driver_extension,
+        WDM_X64_DRIVER_EXTENSION_SIZE as u64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let mut offset = 0u64;
+    while offset < WDM_X64_DRIVER_EXTENSION_SIZE as u64 {
+        write_unaligned((extension_exec + offset) as *mut u64, 0);
+        offset += 8;
+    }
+    let driver_bytes =
+        core::slice::from_raw_parts_mut(driver_exec as *mut u8, WDM_X64_DRIVER_OBJECT_SIZE);
+    write_wdm_driver_object(
+        driver_bytes,
+        WdmDriverObjectInit {
+            size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+            device_object: 0,
+            driver_extension,
+            driver_unload: 0,
+        },
+    )
+    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    offset = WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64;
+    while offset + 8 <= WDM_X64_DRIVER_OBJECT_SIZE as u64 {
+        write_unaligned(
+            (driver_exec + offset) as *mut u64,
+            fsd_invalid_device_request as *const () as usize as u64,
+        );
+        offset += 8;
+    }
+    Ok(())
+}
+
+unsafe fn register_hosted_provider_driver_object_shadow(
+    provider_instance: usize,
+    provider_domain_cookie: u64,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    dependent_driver_object: u64,
+) -> Result<usize, i32> {
+    if dependent_driver_object == 0 || provider_domain_cookie == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_driver_object,
+        WDM_X64_DRIVER_OBJECT_SIZE as u64,
+    )
+    .is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if let Some(routes) = hosted_provider_dispatch_routes() {
+        if let Some((index, route)) = routes.iter().copied().enumerate().find(|(_, route)| {
+            route.used
+                && route.provider_instance == provider_instance
+                && route.dependent_instance == dependent_instance
+                && route.dependent_driver_object == dependent_driver_object
+        }) {
+            if route.provider_driver_object != 0 {
+                return Ok(index);
+            }
+        }
+    }
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(provider_driver_object) =
+        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_OBJECT_SIZE as u64)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let Some(provider_driver_extension) =
+        hosted_instance_pool_alloc(provider_inst, WDM_X64_DRIVER_EXTENSION_SIZE as u64)
+    else {
+        hosted_instance_pool_free(provider_inst, provider_driver_object);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if let Err(status) = initialize_provider_driver_object_shadow_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_driver_object,
+        provider_driver_extension,
+    ) {
+        hosted_instance_pool_free(provider_inst, provider_driver_extension);
+        hosted_instance_pool_free(provider_inst, provider_driver_object);
+        return Err(status);
+    }
+    let routes = hosted_provider_dispatch_routes_mut();
+    let route = HostedProviderDispatchRoute {
+        used: true,
+        dependent_instance,
+        provider_instance,
+        provider_domain_cookie,
+        dependent_driver_object,
+        provider_driver_object,
+        provider_driver_extension,
+        provider_wrapper_handle: 0,
+        provider_add_device: 0,
+    };
+    if let Some((index, slot)) = routes.iter_mut().enumerate().find(|(_, slot)| !slot.used) {
+        *slot = route;
+        Ok(index)
+    } else {
+        routes.push(route);
+        Ok(routes.len() - 1)
+    }
+}
+
+unsafe fn set_hosted_provider_route_wrapper(
+    route_index: usize,
+    provider_wrapper_handle: u64,
+) -> Result<(), i32> {
+    if provider_wrapper_handle == 0 {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let routes = hosted_provider_dispatch_routes_mut();
+    let Some(route) = routes.get_mut(route_index) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if !route.used {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    route.provider_wrapper_handle = provider_wrapper_handle;
+    Ok(())
+}
+
+unsafe fn complete_hosted_provider_miniport_registration(
+    provider_instance: usize,
+    provider_wrapper_handle: u64,
+) -> Result<(), i32> {
+    let Some((route_index, route)) =
+        hosted_provider_dispatch_route_for_wrapper(provider_instance, provider_wrapper_handle)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(extension_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        route.provider_driver_extension,
+        WDM_X64_DRIVER_EXTENSION_SIZE as u64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let add_device = read_unaligned(
+        (extension_exec + WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET) as *const u64,
+    );
+    let Some(driver_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        route.provider_driver_object,
+        WDM_X64_DRIVER_OBJECT_SIZE as u64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let pnp_dispatch = read_unaligned(
+        (driver_exec + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64 + IRP_MJ_PNP * 8)
+            as *const u64,
+    );
+    if add_device == 0 || pnp_dispatch == 0 {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let routes = hosted_provider_dispatch_routes_mut();
+    let Some(slot) = routes.get_mut(route_index) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if !slot.used {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    slot.provider_add_device = add_device;
+    print_str(b"[driver-launch] provider miniport route published dependent-inst=");
+    print_u64(slot.dependent_instance as u64);
+    print_str(b" provider-inst=");
+    print_u64(provider_instance as u64);
+    print_str(b" drv=0x");
+    print_hex64(slot.provider_driver_object);
+    print_str(b" add=0x");
+    print_hex64(add_device);
+    print_str(b"\n");
+    Ok(())
 }
 
 unsafe fn register_hosted_provider_pointer_allocation(
@@ -13193,6 +13513,28 @@ unsafe fn provider_marshal_ndis_buffer(
     Ok(arg_value)
 }
 
+unsafe fn provider_marshal_driver_object_shadow(
+    state: &mut ProviderMarshalState,
+    provider_instance: usize,
+    provider_domain_cookie: u64,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    let route_index = register_hosted_provider_driver_object_shadow(
+        provider_instance,
+        provider_domain_cookie,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+    )?;
+    let Some(route) = hosted_provider_dispatch_route(route_index) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    state.ndis_route_index = route_index;
+    Ok(route.provider_driver_object)
+}
+
 unsafe fn provider_marshal_unicode_string(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -13324,6 +13666,7 @@ unsafe fn provider_marshal_miniport_characteristics(
 unsafe fn prepare_provider_export_marshal(
     policy: HostedProviderExportMarshalPolicy,
     provider_instance: usize,
+    provider_domain_cookie: u64,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -13342,8 +13685,21 @@ unsafe fn prepare_provider_export_marshal(
         args[index] = match policy.args[index] {
             HostedProviderArgumentMarshal::Scalar
             | HostedProviderArgumentMarshal::ProviderHandle
-            | HostedProviderArgumentMarshal::CallerContext
-            | HostedProviderArgumentMarshal::CallerInDriverObject => arg,
+            | HostedProviderArgumentMarshal::CallerContext => arg,
+            HostedProviderArgumentMarshal::CallerInDriverObject => {
+                if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper {
+                    provider_marshal_driver_object_shadow(
+                        &mut state,
+                        provider_instance,
+                        provider_domain_cookie,
+                        dependent_index,
+                        dependent_inst,
+                        arg,
+                    )?
+                } else {
+                    arg
+                }
+            }
             HostedProviderArgumentMarshal::CallerInOwnedAllocation { length_arg } => {
                 let length_index = length_arg as usize;
                 if length_index >= policy.argument_count as usize {
@@ -13371,14 +13727,21 @@ unsafe fn prepare_provider_export_marshal(
                     HostedProviderArgumentMarshal::CallerOutU32 => 4,
                     _ => 8,
                 };
-                provider_marshal_output_cell(
+                let provider_arg = provider_marshal_output_cell(
                     &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
                     arg,
                     bytes,
-                )?
+                )?;
+                if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper
+                    && matches!(policy.args[index], HostedProviderArgumentMarshal::CallerOutHandle)
+                {
+                    state.ndis_initialize_wrapper_handle_exec_va =
+                        provider_shared + (provider_arg - FSD_SHARED_VADDR);
+                }
+                provider_arg
             }
             HostedProviderArgumentMarshal::CallerInOutU32 => provider_marshal_inout_cell(
                 &mut state,
@@ -13583,6 +13946,38 @@ unsafe fn complete_provider_export_marshal(state: &ProviderMarshalState, result:
             }
         }
         free_index += 1;
+    }
+}
+
+unsafe fn complete_provider_export_side_effects(
+    policy: HostedProviderExportMarshalPolicy,
+    state: &ProviderMarshalState,
+    provider_instance: usize,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    result: u64,
+) -> Result<(), i32> {
+    match policy.side_effect {
+        HostedProviderExportSideEffect::None => Ok(()),
+        HostedProviderExportSideEffect::NdisInitializeWrapper => {
+            if state.ndis_route_index == usize::MAX {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let provider_handle_exec = state.ndis_initialize_wrapper_handle_exec_va;
+            if provider_handle_exec == 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let provider_wrapper_handle = read_unaligned(provider_handle_exec as *const u64);
+            if provider_wrapper_handle == 0 {
+                return Ok(());
+            }
+            set_hosted_provider_route_wrapper(state.ndis_route_index, provider_wrapper_handle)
+        }
+        HostedProviderExportSideEffect::NdisMiniportRegistration => {
+            if result != STATUS_SUCCESS as u64 {
+                return Ok(());
+            }
+            complete_hosted_provider_miniport_registration(provider_instance, args[0])
+        }
     }
 }
 
@@ -13864,6 +14259,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     let marshal_state = match prepare_provider_export_marshal(
         policy,
         singleton.instance,
+        singleton.provider_domain_cookie,
         dependent_index,
         dependent_inst,
         provider_shared,
@@ -13942,7 +14338,25 @@ pub(crate) unsafe fn service_hosted_provider_export(
         register_instance_ready(singleton.instance, false);
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
-    let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
+    let mut result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
+    if let Err(status) = complete_provider_export_side_effects(
+        policy,
+        &marshal_state,
+        singleton.instance,
+        &args,
+        result,
+    ) {
+        print_str(b"[driver-import] provider side effect failed cookie=");
+        print_u64(provider_domain_cookie);
+        print_str(b" status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        if policy.side_effect == HostedProviderExportSideEffect::NdisMiniportRegistration
+            && result == STATUS_SUCCESS as u64
+        {
+            result = status as u32 as u64;
+        }
+    }
     complete_provider_dma_state(
         &marshal_state,
         dependent_binding,
@@ -13972,122 +14386,41 @@ pub(crate) unsafe fn service_hosted_provider_export(
     result
 }
 
-pub(crate) unsafe fn service_hosted_provider_callback(
-    provider_channel: &crate::spawn_hosts::PumpChannel,
-    callback_cookie: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-) -> u64 {
-    HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let arg3 = read_volatile(
-        (provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
-    );
-    let stack0 = read_volatile(
-        (provider_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE) as *const u64,
-    );
-    let stack1 = read_volatile(
-        (provider_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + 8) as *const u64,
-    );
-    let Some((provider_instance, provider_inst)) = instance_by_shared_va(provider_channel.shared_va)
-    else {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    };
-    let Some(record) = hosted_provider_callback_record(callback_cookie) else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-    if record.provider_instance != provider_instance
-        || record.target == 0
-        || record.callback_offset == 0
-        || instance(record.dependent_instance).is_none()
-    {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    }
-    if record.callback_offset != NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 {
-        return hosted_provider_callback_failure(STATUS_NOT_SUPPORTED);
-    }
-    if arg3 == 0 || arg3 > NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    }
-    let Some(medium_bytes) = arg3.checked_mul(NDIS_MEDIUM_ENTRY_BYTES_X64) else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-    if 0x10u64
-        .checked_add(medium_bytes)
-        .filter(|used| *used <= SH_PROVIDER_EXPORT_MARSHAL_BYTES)
-        .is_none()
-    {
-        return hosted_provider_callback_failure(STATUS_INSUFFICIENT_RESOURCES);
-    }
-
-    let Some(provider_open_status_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
-    else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-    let Some(provider_selected_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 4)
-    else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-    let Some(provider_medium_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, medium_bytes)
-    else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-
-    let Some(dependent_inst) = instance(record.dependent_instance) else {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    };
-    if dependent_inst.fault_ep == 0
-        || dependent_inst.pml4 == 0
-        || dependent_inst.reply_cap == 0
-        || dependent_inst.driver_object == 0
-    {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    }
-    let Some(exec_code_va) =
-        ExecVaWindow::try_for_instance(record.dependent_instance).map(|win| win.code_va)
-    else {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    };
-
+unsafe fn dispatch_dependent_provider_callback(
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    args: [u64; 4],
+    stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, i32> {
     let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_open_status_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_selected_component = dependent_open_status_component + 8;
-    let dependent_medium_component = dependent_open_status_component + 0x10;
-    let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_selected_exec = dependent_open_status_exec + 8;
-    let dependent_medium_exec = dependent_open_status_exec + 0x10;
-    provider_marshal_zero(dependent_open_status_exec, 0x10 + medium_bytes);
-    copy_bytes(dependent_medium_exec, provider_medium_exec, medium_bytes);
-
+    let dependent_binding = if dependent_inst.device_id == 0 {
+        None
+    } else {
+        hosted_device_binding_by_device_id(dependent_inst.device_id)
+    };
+    if let Some(binding) = dependent_binding {
+        restore_hosted_device_resource_state(binding, dependent_shared, false)
+            .map_err(|status| status.raw())?;
+    }
     write_volatile(
         (dependent_shared + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_PROVIDER_CALLBACK,
     );
     write_volatile((dependent_shared + SH_REQ_MINOR) as *mut u64, record.target);
-    write_volatile(
-        (dependent_shared + SH_REQ_FSCTL) as *mut u64,
-        dependent_open_status_component,
-    );
-    write_volatile(
-        (dependent_shared + SH_REQ_INLEN) as *mut u64,
-        dependent_selected_component,
-    );
-    write_volatile(
-        (dependent_shared + SH_REQ_OUTLEN) as *mut u64,
-        dependent_medium_component,
-    );
-    write_volatile((dependent_shared + SH_REQ_FILEID) as *mut u64, arg3);
-    write_volatile(
-        (dependent_shared + SH_PROVIDER_EXPORT_STACK_BASE) as *mut u64,
-        stack0,
-    );
-    write_volatile(
-        (dependent_shared + SH_PROVIDER_EXPORT_STACK_BASE + 8) as *mut u64,
-        stack1,
-    );
+    write_volatile((dependent_shared + SH_REQ_FSCTL) as *mut u64, args[0]);
+    write_volatile((dependent_shared + SH_REQ_INLEN) as *mut u64, args[1]);
+    write_volatile((dependent_shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
+    write_volatile((dependent_shared + SH_REQ_FILEID) as *mut u64, args[3]);
+    let mut stack_index = 0usize;
+    while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
+        write_volatile(
+            (dependent_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index as u64 * 8)
+                as *mut u64,
+            stack_args[stack_index],
+        );
+        stack_index += 1;
+    }
     write_volatile(
         (dependent_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
         0,
@@ -14126,15 +14459,390 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let pr = crate::spawn_hosts::component_pump(&ch);
     if !pr.completed {
         register_instance_ready(record.dependent_instance, false);
-        return hosted_provider_callback_failure(STATUS_UNSUCCESSFUL);
+        return Err(STATUS_UNSUCCESSFUL);
+    }
+    if let Some(binding) = dependent_binding {
+        refresh_hosted_device_resource_state(binding, dependent_shared);
     }
     let dispatch_status = read_volatile((dependent_shared + SH_REQ_STATUS) as *const i32);
     if dispatch_status != STATUS_SUCCESS {
-        return hosted_provider_callback_failure(dispatch_status);
+        return Err(dispatch_status);
     }
+    Ok(read_volatile((dependent_shared + SH_REQ_INFO) as *const u64))
+}
+
+unsafe fn provider_callback_marshal_window(
+    payload_bytes: u64,
+    trailing_cells: u64,
+) -> Result<(u64, u64), i32> {
+    let cell_base = provider_marshal_align8(payload_bytes).ok_or(STATUS_INVALID_PARAMETER)?;
+    let used = cell_base
+        .checked_add(trailing_cells.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    Ok((cell_base, used))
+}
+
+unsafe fn service_ndis_initialize_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, i32> {
+    if arg3 == 0 || arg3 > NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let medium_bytes = arg3
+        .checked_mul(NDIS_MEDIUM_ENTRY_BYTES_X64)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    provider_callback_marshal_window(0x10 + medium_bytes, 0)?;
+
+    let provider_open_status_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_selected_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_medium_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, medium_bytes)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_open_status_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_selected_component = dependent_open_status_component + 8;
+    let dependent_medium_component = dependent_open_status_component + 0x10;
+    let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_selected_exec = dependent_open_status_exec + 8;
+    let dependent_medium_exec = dependent_open_status_exec + 0x10;
+    provider_marshal_zero(dependent_open_status_exec, 0x10 + medium_bytes);
+    copy_bytes(dependent_medium_exec, provider_medium_exec, medium_bytes);
+
+    let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    stack_args[0] = provider_stack[0];
+    stack_args[1] = provider_stack[1];
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [
+            dependent_open_status_component,
+            dependent_selected_component,
+            dependent_medium_component,
+            arg3,
+        ],
+        stack_args,
+    )?;
     copy_bytes(provider_open_status_exec, dependent_open_status_exec, 4);
     copy_bytes(provider_selected_exec, dependent_selected_exec, 4);
-    read_volatile((dependent_shared + SH_REQ_INFO) as *const u64)
+    Ok(result)
+}
+
+unsafe fn service_ndis_query_set_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    input_buffer: bool,
+    output_buffer: bool,
+) -> Result<u64, i32> {
+    let bytes0_provider = provider_stack[0];
+    let bytes1_provider = provider_stack[1];
+    if bytes0_provider == 0 || bytes1_provider == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if arg3 > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let (cell_base, used) = provider_callback_marshal_window(arg3, 2)?;
+    let provider_bytes0_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, bytes0_provider, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_bytes1_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, bytes1_provider, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_info_exec = if arg3 == 0 {
+        0
+    } else {
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, arg3)
+            .ok_or(STATUS_INVALID_PARAMETER)?
+    };
+
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_info_component = if arg3 == 0 {
+        0
+    } else {
+        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
+    };
+    let dependent_info_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_bytes0_component =
+        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
+    let dependent_bytes1_component = dependent_bytes0_component + 8;
+    let dependent_bytes0_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
+    let dependent_bytes1_exec = dependent_bytes0_exec + 8;
+    provider_marshal_zero(dependent_info_exec, used);
+    if input_buffer && arg3 != 0 {
+        copy_bytes(dependent_info_exec, provider_info_exec, arg3);
+    }
+
+    let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    stack_args[0] = dependent_bytes0_component;
+    stack_args[1] = dependent_bytes1_component;
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, arg1, dependent_info_component, arg3],
+        stack_args,
+    )?;
+    copy_bytes(provider_bytes0_exec, dependent_bytes0_exec, 4);
+    copy_bytes(provider_bytes1_exec, dependent_bytes1_exec, 4);
+    if output_buffer && result == STATUS_SUCCESS as u64 && arg3 != 0 {
+        copy_bytes(provider_info_exec, dependent_info_exec, arg3);
+    }
+    Ok(result)
+}
+
+unsafe fn service_ndis_reset_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+) -> Result<u64, i32> {
+    provider_callback_marshal_window(1, 0)?;
+    let provider_reset_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_reset_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_reset_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_reset_exec, 8);
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [dependent_reset_component, arg1, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )?;
+    copy_bytes(provider_reset_exec, dependent_reset_exec, 1);
+    Ok(result)
+}
+
+unsafe fn service_ndis_isr_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> Result<u64, i32> {
+    provider_callback_marshal_window(0x10, 0)?;
+    let provider_recognized_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_queue_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 1)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_recognized_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_queue_component = dependent_recognized_component + 8;
+    let dependent_recognized_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_queue_exec = dependent_recognized_exec + 8;
+    provider_marshal_zero(dependent_recognized_exec, 0x10);
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [dependent_recognized_component, dependent_queue_component, arg2, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )?;
+    copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
+    copy_bytes(provider_queue_exec, dependent_queue_exec, 1);
+    Ok(result)
+}
+
+unsafe fn service_ndis_reconfigure_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> Result<u64, i32> {
+    provider_callback_marshal_window(4, 0)?;
+    let provider_open_status_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_open_status_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_open_status_exec, 8);
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [dependent_open_status_component, arg1, arg2, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )?;
+    copy_bytes(provider_open_status_exec, dependent_open_status_exec, 4);
+    Ok(result)
+}
+
+pub(crate) unsafe fn service_hosted_provider_callback(
+    provider_channel: &crate::spawn_hosts::PumpChannel,
+    callback_cookie: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> u64 {
+    HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let arg3 = read_volatile(
+        (provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
+    );
+    let mut provider_stack = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    let mut stack_index = 0usize;
+    while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
+        provider_stack[stack_index] = read_volatile(
+            (provider_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index as u64 * 8)
+                as *const u64,
+        );
+        stack_index += 1;
+    }
+    let Some((provider_instance, provider_inst)) = instance_by_shared_va(provider_channel.shared_va)
+    else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(record) = hosted_provider_callback_record(callback_cookie) else {
+        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    };
+    let Some(dependent_inst) = instance(record.dependent_instance) else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+    if record.provider_instance != provider_instance
+        || record.target == 0
+        || record.callback_offset == 0
+        || dependent_inst.fault_ep == 0
+        || dependent_inst.pml4 == 0
+        || dependent_inst.reply_cap == 0
+        || dependent_inst.driver_object == 0
+    {
+        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    }
+    let Some(exec_code_va) =
+        ExecVaWindow::try_for_instance(record.dependent_instance).map(|win| win.code_va)
+    else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+
+    let result = match record.callback_offset {
+        NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            provider_stack,
+        ),
+        NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            provider_stack,
+            false,
+            true,
+        ),
+        NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            provider_stack,
+            true,
+            false,
+        ),
+        NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+        ),
+        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+            arg2,
+        ),
+        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => service_ndis_reconfigure_callback(
+            provider_instance,
+            provider_inst,
+            record,
+            dependent_inst,
+            exec_code_va,
+            arg0,
+            arg1,
+            arg2,
+        ),
+        NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => dispatch_dependent_provider_callback(
+            record,
+            dependent_inst,
+            exec_code_va,
+            [arg0, 0, 0, 0],
+            [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+        ),
+        NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Err(STATUS_NOT_SUPPORTED),
+        _ => Err(STATUS_NOT_SUPPORTED),
+    };
+    match result {
+        Ok(value) => value,
+        Err(status) => hosted_provider_callback_failure(status),
+    }
 }
 
 unsafe fn add_provider_domain_if_callable(
@@ -15666,13 +16374,18 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
 /// This is the EXACT body the retired inline `dispatch_loop` ran per request.
 unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let major = req.sel;
+    let request_drv = match read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64) {
+        0 => req.drv,
+        drv => drv,
+    };
     if major == FSD_DISPATCH_UNLOAD {
-        let unload = read_volatile((req.drv + WDM_X64_DRIVER_UNLOAD_OFFSET as u64) as *const u64);
+        let unload =
+            read_volatile((request_drv + WDM_X64_DRIVER_UNLOAD_OFFSET as u64) as *const u64);
         if unload == 0 {
             return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
         }
         let f: extern "win64" fn(u64) = core::mem::transmute(unload as *const ());
-        f(req.drv);
+        f(request_drv);
         return (0, 0);
     }
     if major == FSD_DISPATCH_INTERRUPT {
@@ -15742,12 +16455,12 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, pdo);
         write_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *mut u64, 0);
         let add: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
-        let status = add(req.drv, pdo);
+        let status = add(request_drv, pdo);
         let fdo = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
         return (status, fdo);
     }
     if major == FSD_DISPATCH_VIDEO_ADD_DEVICE {
-        return component_dispatch_video_add_device(req.drv);
+        return component_dispatch_video_add_device(request_drv);
     }
     if major == FSD_DISPATCH_VIDEO_FIND_ADAPTER {
         let find_adapter =
@@ -15813,7 +16526,7 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     if major == FSD_DISPATCH_PROVIDER_CALLBACK {
         return component_dispatch_provider_callback();
     }
-    let mj_base = req.drv + 0x70;
+    let mj_base = request_drv + 0x70;
     let handler = read_volatile((mj_base + major * 8) as *const u64);
     if handler != 0 {
         run_irp(major, handler)
@@ -19319,6 +20032,8 @@ struct HostedDeviceResourceState {
     pci_irq: u32,
     io_port_base: u64,
     dma_broker_va: u64,
+    dma_frame_base: u64,
+    dma_pages: u64,
     video_memory_phys: u64,
     video_memory_len: u64,
     video_memory_caller_va: u64,
@@ -19910,6 +20625,10 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         dma_broker_va: previous_state
             .map(|state| state.dma_broker_va)
             .unwrap_or(0),
+        dma_frame_base: previous_state
+            .map(|state| state.dma_frame_base)
+            .unwrap_or(0),
+        dma_pages: previous_state.map(|state| state.dma_pages).unwrap_or(0),
         video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
         video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
         video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
@@ -20137,6 +20856,69 @@ unsafe fn restore_hosted_device_resource_state(
     copy_hosted_io_port_cap_to_instance(inst, state)?;
     write_hosted_resource_state_projection(sh, state, reset_dpc_queue);
     Ok(state)
+}
+
+unsafe fn copy_provider_dispatch_side_effects(dst_sh: u64, src_sh: u64) {
+    write_volatile(
+        (dst_sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
+        read_volatile((src_sh + SH_ROOT_PDO_FORWARDED_MINOR) as *const u64),
+    );
+    write_volatile(
+        (dst_sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
+        read_volatile((src_sh + SH_ROOT_PDO_FORWARDED_STATUS) as *const i32),
+    );
+    write_volatile(
+        (dst_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *mut u16,
+        read_volatile((src_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *const u16),
+    );
+    write_volatile(
+        (dst_sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *mut u16,
+        read_volatile((src_sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *const u16),
+    );
+    write_volatile(
+        (dst_sh + SH_DEVICE_INTERFACE_STATE) as *mut u32,
+        read_volatile((src_sh + SH_DEVICE_INTERFACE_STATE) as *const u32),
+    );
+    copy_bytes(
+        dst_sh + SH_DEVICE_INTERFACE_LINK_BUF,
+        src_sh + SH_DEVICE_INTERFACE_LINK_BUF,
+        SH_CAPTURED_PATH_BYTES as u64,
+    );
+    copy_bytes(
+        dst_sh + SH_DEVICE_INTERFACE_TARGET_BUF,
+        src_sh + SH_DEVICE_INTERFACE_TARGET_BUF,
+        SH_CAPTURED_PATH_BYTES as u64,
+    );
+}
+
+unsafe fn project_provider_device_dispatch_state(
+    binding: HostedDeviceBinding,
+    dependent_sh: u64,
+    provider_inst: DriverInstance,
+    provider_sh: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .unwrap_or_else(|| read_hosted_device_resource_state_from_shared(binding, dependent_sh));
+    if state.driver_id != binding.driver_id || state.instance != binding.instance {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    copy_hosted_io_port_cap_to_instance(provider_inst, state)?;
+    write_hosted_resource_state_projection(provider_sh, state, false);
+    copy_provider_dma_allocation_records(provider_sh, dependent_sh);
+    copy_provider_dispatch_side_effects(provider_sh, dependent_sh);
+    clear_shared_device_interface_state_at(provider_sh);
+    Ok(())
+}
+
+unsafe fn import_provider_device_dispatch_state(
+    binding: HostedDeviceBinding,
+    dependent_sh: u64,
+    provider_sh: u64,
+) {
+    let state = read_hosted_device_resource_state_from_shared(binding, provider_sh);
+    write_hosted_resource_state_projection(dependent_sh, state, false);
+    copy_provider_dma_allocation_records(dependent_sh, provider_sh);
+    copy_provider_dispatch_side_effects(dependent_sh, provider_sh);
 }
 
 fn io_port_in_range(port: u16, base: u64, len: u64) -> bool {
@@ -21441,6 +22223,9 @@ fn clear_instance(i: usize) {
     clear_hosted_driver_waits_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
     clear_hosted_device_bindings_for_instance(i);
+    unsafe {
+        clear_hosted_provider_dispatch_routes_for_instance(i);
+    }
     if let Some(inst) = instance(i) {
         unsafe {
             clear_driver_object_extensions_for_driver_object(inst.driver_object);
@@ -22608,6 +23393,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     }
 
     let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_DRVOBJ) as *mut u64, inst.driver_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_UNLOAD);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
@@ -22692,6 +23478,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     }
 
     let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_DRVOBJ) as *mut u64, inst.driver_object);
     write_volatile(
         (sh + SH_REQ_MAJOR) as *mut u64,
         FSD_DISPATCH_VIDEO_ADD_DEVICE,
@@ -22747,12 +23534,82 @@ unsafe fn dispatch_video_add_device_for_instance(
     })
 }
 
+unsafe fn dispatch_provider_add_device_for_instance(
+    route: HostedProviderDispatchRoute,
+) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
+    if !route.add_device_ready() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let Some(provider_inst) = instance(route.provider_instance) else {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    };
+    if provider_inst.fault_ep == 0 || provider_inst.pml4 == 0 || provider_inst.reply_cap == 0 {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let sh = provider_inst.exec_shared_va;
+    write_volatile((sh + SH_DRVOBJ) as *mut u64, route.provider_driver_object);
+    write_volatile((sh + SH_ADD_DEVICE) as *mut u64, route.provider_add_device);
+    write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_ADD_DEVICE);
+    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
+    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((sh + SH_DEVOBJ) as *mut u64, 0);
+    clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
+    clear_shared_device_interface_state_at(sh);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: provider_inst.fault_ep,
+        pml4: provider_inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va: ExecVaWindow::try_for_instance(route.provider_instance)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
+            .code_va,
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: provider_inst.tcb,
+        reply_cap: provider_inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(route.provider_instance, false);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    nt_status::NtStatus(pr.status).to_result()?;
+    let fdo_object = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    let pdo_object = read_volatile((sh + SH_REQ_FILEID) as *const u64);
+    if fdo_object == 0 || pdo_object == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(AddDeviceDispatchResult {
+        pdo_object,
+        fdo_object,
+        fdo_name: shared_device_name_ascii_at(sh),
+    })
+}
+
 unsafe fn dispatch_add_device_for_instance(
     index: usize,
     inst: DriverInstance,
 ) -> Result<AddDeviceDispatchResult, nt_status::NtStatus> {
     if inst.driver_object == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if let Some(route) = hosted_provider_dispatch_route_for_instance(index) {
+        return dispatch_provider_add_device_for_instance(route);
     }
     if inst.add_device == 0 {
         if hosted_instance_video_port_initialized(inst) {
@@ -22764,6 +23621,8 @@ unsafe fn dispatch_add_device_for_instance(
     }
 
     let sh = inst.exec_shared_va;
+    write_volatile((sh + SH_DRVOBJ) as *mut u64, inst.driver_object);
+    write_volatile((sh + SH_ADD_DEVICE) as *mut u64, inst.add_device);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_ADD_DEVICE);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
@@ -22836,6 +23695,16 @@ where
         build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
     let registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
     publish_shared_registry_identity_at(inst.exec_shared_va, &registry_identity)?;
+    let provider_add_device_shared = hosted_provider_dispatch_route_for_instance(index)
+        .and_then(|route| instance(route.provider_instance).map(|provider| provider.exec_shared_va));
+    if let Some(provider_shared) = provider_add_device_shared {
+        if let Err(status) = publish_shared_registry_identity_at(provider_shared, &registry_identity)
+        {
+            clear_shared_registry_identity_at(inst.exec_shared_va);
+            release_hosted_registry_identity(registry_identity_id);
+            return Err(status);
+        }
+    }
     write_volatile(
         core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
         registry_identity_id,
@@ -22849,6 +23718,9 @@ where
         Ok(add_device) => add_device,
         Err(status) => {
             clear_shared_registry_identity_at(inst.exec_shared_va);
+            if let Some(provider_shared) = provider_add_device_shared {
+                clear_shared_registry_identity_at(provider_shared);
+            }
             release_hosted_registry_identity(registry_identity_id);
             return Err(status);
         }
@@ -22858,6 +23730,9 @@ where
             && !hosted_ascii_eq_ignore_case(&fdo_name, &registry_identity.export_name)
         {
             clear_shared_registry_identity_at(inst.exec_shared_va);
+            if let Some(provider_shared) = provider_add_device_shared {
+                clear_shared_registry_identity_at(provider_shared);
+            }
             release_hosted_registry_identity(registry_identity_id);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -22867,6 +23742,9 @@ where
             Some(path) => Some(path),
             None => {
                 clear_shared_registry_identity_at(inst.exec_shared_va);
+                if let Some(provider_shared) = provider_add_device_shared {
+                    clear_shared_registry_identity_at(provider_shared);
+                }
                 release_hosted_registry_identity(registry_identity_id);
                 return Err(nt_status::NtStatus::INVALID_PARAMETER);
             }
@@ -22882,6 +23760,9 @@ where
         Ok(device_id) => device_id,
         Err(status) => {
             clear_shared_registry_identity_at(inst.exec_shared_va);
+            if let Some(provider_shared) = provider_add_device_shared {
+                clear_shared_registry_identity_at(provider_shared);
+            }
             release_hosted_registry_identity(registry_identity_id);
             return Err(status);
         }
@@ -22902,6 +23783,9 @@ where
         Ok(device_id) => device_id,
         Err(status) => {
             clear_shared_registry_identity_at(inst.exec_shared_va);
+            if let Some(provider_shared) = provider_add_device_shared {
+                clear_shared_registry_identity_at(provider_shared);
+            }
             release_hosted_registry_identity(registry_identity_id);
             return Err(status);
         }
@@ -22916,6 +23800,9 @@ where
     ) {
         let _ = io_manager_mut().destroy_device(device_id);
         clear_shared_registry_identity_at(inst.exec_shared_va);
+        if let Some(provider_shared) = provider_add_device_shared {
+            clear_shared_registry_identity_at(provider_shared);
+        }
         release_hosted_registry_identity(registry_identity_id);
         return Err(status);
     }
@@ -22925,6 +23812,9 @@ where
         clear_hosted_device_binding_by_device_id(device_id.raw());
         let _ = io_manager_mut().destroy_device(device_id);
         clear_shared_registry_identity_at(inst.exec_shared_va);
+        if let Some(provider_shared) = provider_add_device_shared {
+            clear_shared_registry_identity_at(provider_shared);
+        }
         return Err(status);
     }
 
@@ -22933,6 +23823,9 @@ where
         table[index].device_id = device_id.raw();
         table[index].device_object = add_device.fdo_object;
         table[index].ready = true;
+    }
+    if let Some(provider_shared) = provider_add_device_shared {
+        clear_shared_registry_identity_at(provider_shared);
     }
     Ok(device_id.raw())
 }
@@ -24241,13 +25134,40 @@ unsafe fn dispatch_irp_for_instance(
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    let d = instance(inst)?;
-    if !d.ready {
+    let dependent_inst = instance(inst)?;
+    if !dependent_inst.ready {
         return None;
+    }
+    let mut dispatch_index = inst;
+    let mut d = dependent_inst;
+    let mut sh = d.exec_shared_va;
+    let mut driver_object = d.driver_object;
+    let mut provider_binding = None;
+    if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
+        if !route.add_device_ready() {
+            return Some((STATUS_INVALID_DEVICE_REQUEST, 0));
+        }
+        let binding = hosted_device_binding_by_device_object(device_object)
+            .or_else(|| hosted_device_binding_by_device_id(dependent_inst.device_id))?;
+        let provider_inst = instance(route.provider_instance)?;
+        if provider_inst.fault_ep == 0 || provider_inst.pml4 == 0 || provider_inst.reply_cap == 0 {
+            return None;
+        }
+        project_provider_device_dispatch_state(
+            binding,
+            dependent_inst.exec_shared_va,
+            provider_inst,
+            provider_inst.exec_shared_va,
+        )
+        .ok()?;
+        dispatch_index = route.provider_instance;
+        d = provider_inst;
+        sh = provider_inst.exec_shared_va;
+        driver_object = route.provider_driver_object;
+        provider_binding = Some(binding);
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;
-    let sh = d.exec_shared_va;
     // Copy input into the instance's ARG frame (mapped RW in both AS); the component-side builder
     // moves it into SystemBuffer, Type3InputBuffer, or the read/write buffer as required.
     let arg = d.exec_arg_va;
@@ -24255,6 +25175,7 @@ unsafe fn dispatch_irp_for_instance(
     for i in 0..inlen {
         write_volatile((arg + i as u64) as *mut u8, in_data[i]);
     }
+    write_volatile((sh + SH_DRVOBJ) as *mut u64, driver_object);
     write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
     write_volatile((sh + SH_REQ_MAJOR) as *mut u64, major);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, minor);
@@ -24280,7 +25201,7 @@ unsafe fn dispatch_irp_for_instance(
         pml4,
         code_va: 0,
         image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
-        exec_code_va: ExecVaWindow::try_for_instance(inst)?.code_va,
+        exec_code_va: ExecVaWindow::try_for_instance(dispatch_index)?.code_va,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -24305,7 +25226,7 @@ unsafe fn dispatch_irp_for_instance(
     // returned.
     let dispatch_seq = FSD_DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     FSD_ACTIVE_DISPATCH_SEQ.store(dispatch_seq, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_INST.store(inst as u64, Ordering::Relaxed);
+    FSD_ACTIVE_DISPATCH_INST.store(dispatch_index as u64, Ordering::Relaxed);
     FSD_ACTIVE_DISPATCH_MAJOR.store(major, Ordering::Relaxed);
     FSD_ACTIVE_DISPATCH_FSCTL.store(fsctl, Ordering::Relaxed);
     FSD_ACTIVE_DISPATCH_FID.store(file_id, Ordering::Relaxed);
@@ -24315,7 +25236,7 @@ unsafe fn dispatch_irp_for_instance(
     let trace_dispatch = dispatch_seq <= FSD_DISPATCH_TRACE_CAP;
     if trace_dispatch {
         print_str(b"[fsd-svc] ENTER inst=");
-        print_u64(inst as u64);
+        print_u64(dispatch_index as u64);
         print_str(b" #");
         print_u64(dispatch_seq);
         print_str(b" major=");
@@ -24336,7 +25257,7 @@ unsafe fn dispatch_irp_for_instance(
     FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);
     if trace_dispatch {
         print_str(b"[fsd-svc] EXIT inst=");
-        print_u64(inst as u64);
+        print_u64(dispatch_index as u64);
         print_str(b" #");
         print_u64(dispatch_seq);
         print_str(b" major=");
@@ -24350,26 +25271,32 @@ unsafe fn dispatch_irp_for_instance(
     // Attribute any bugcheck the component raised to THIS instance — the executive is the only side
     // that knows which hosted component it just drove.
     if FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before {
-        FSD_BUGCHECK_INSTANCE.store(inst as u64 + 1, Ordering::Relaxed);
+        FSD_BUGCHECK_INSTANCE.store(dispatch_index as u64 + 1, Ordering::Relaxed);
         print_str(b"[fsd-bugcheck] raised by hosted driver instance=");
-        print_u64(inst as u64);
+        print_u64(dispatch_index as u64);
         print_str(b" during IRP_MJ_");
         print_u64(major);
         print_str(b" -> dispatch failed CLEANLY (component still serving)\n");
     }
     if !pr.completed {
         print_str(b"[fsd-svc] IRP fault wall inst=");
-        print_u64(inst as u64);
+        print_u64(dispatch_index as u64);
         print_str(b" addr=0x");
         print_hex(pr.wall_addr as u32);
         print_str(b" -> instance RETIRED (component suspended by the pump)\n");
         // ★ Transport risk R2: the pump has SUSPENDED this component's TCB, and its reply object is
         // left bound to a thread that will never run again. Retire the instance so no later dispatch
         // can `reply_on` that stale binding (which the kernel would deliver as a FAULT reply).
-        register_instance_ready(inst, false);
+        register_instance_ready(dispatch_index, false);
+        if dispatch_index != inst {
+            register_instance_ready(inst, false);
+        }
         return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
     }
     let st = pr.status;
+    if let Some(binding) = provider_binding {
+        import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
+    }
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
     // Copy the driver's projected output bytes back out.
