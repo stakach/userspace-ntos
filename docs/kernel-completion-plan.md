@@ -7017,3 +7017,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
   Validation for the thunk-layout slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`, and
   `git diff --check`.
+
+  B3 provider import resolver-shape slice (2026-08-17, in progress): the executive PE loader no
+  longer treats import resolution as a raw `u64` function-pointer lookup internally. `load_pe_into`
+  now receives a state-capable resolver over a structured `DriverImportRequest` that includes the
+  provider DLL, export name, and IAT slot RVA, and writes the resulting `DriverImportResolution` into
+  the IAT. The current FSD resolver still returns only direct VAs, so behavior is unchanged for
+  gate-free provider metadata, but the loader now has the exact seam needed for a thunk-table-backed
+  resolver to return per-import provider thunk VAs without another loader-wide refactor. Review
+  adjustment: next B3 work should allocate the dependent thunk table and turn callable-provider
+  import bindings into `ProviderThunk` resolutions; the provider-context gate handler remains the
+  execution boundary that must be implemented before enabling shared providers.
+
+  Validation for the resolver-shape slice: `cargo fmt --all`, executive `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`.

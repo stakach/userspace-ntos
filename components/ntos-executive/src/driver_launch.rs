@@ -36,6 +36,7 @@ use nt_hosted_runtime::{
     plan_provider_prefixed_image, HostedProviderDomainDescriptor, HostedProviderDomainError,
     HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderImportBinding,
     HostedProviderImportBindingError, HostedProviderImagePlanError,
+    HostedProviderImportThunkPlan,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -11562,6 +11563,29 @@ struct LoadedPeExportTarget {
     run_va: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DriverImportRequest<'a> {
+    dll: &'a str,
+    name: &'a str,
+    iat_slot_rva: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DriverImportResolution {
+    DirectVa(u64),
+    #[allow(dead_code)]
+    ProviderThunk(HostedProviderImportThunkPlan),
+}
+
+impl DriverImportResolution {
+    fn iat_value(self) -> u64 {
+        match self {
+            Self::DirectVa(va) => va,
+            Self::ProviderThunk(thunk) => thunk.thunk_va,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostedProviderLoadRole {
     PrimaryService,
@@ -13171,6 +13195,14 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
         log_unresolved_driver_import(dll, name);
     }
     None
+}
+
+fn fsd_resolve_import(request: DriverImportRequest<'_>) -> Option<DriverImportResolution> {
+    let _ = request.iat_slot_rva;
+    Some(DriverImportResolution::DirectVa(fsd_export_addr(
+        request.dll,
+        request.name,
+    )?))
 }
 
 // --- the FSD component entry -----------------------------------------------------------------
@@ -14984,7 +15016,7 @@ unsafe fn load_pe_into(
     run_va: u64,
     max_frames: u64,
     rights_out: &mut [u64],
-    resolve: fn(&str, &str) -> Option<u64>,
+    resolve: &mut impl for<'a> FnMut(DriverImportRequest<'a>) -> Option<DriverImportResolution>,
 ) -> Option<(u32, u32)> {
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va + e;
@@ -15195,8 +15227,12 @@ unsafe fn load_pe_into(
                 let mut name_buf = [0u8; 128];
                 let name =
                     read_pe_ascii(dst_va, cap, thunk & 0x7FFF_FFFF_FFFF_FFFF, 2, &mut name_buf)?;
-                let addr = resolve(dll, name)?;
-                write_unaligned((dst_va + slot_rva) as *mut u64, addr);
+                let resolution = resolve(DriverImportRequest {
+                    dll,
+                    name,
+                    iat_slot_rva: slot_rva,
+                })?;
+                write_unaligned((dst_va + slot_rva) as *mut u64, resolution.iat_value());
                 k = k.checked_add(1)?;
             }
             desc_rva = desc_rva.checked_add(20)?;
@@ -15292,13 +15328,14 @@ unsafe fn load_hosted_dependency_images(
 
         let dep_exec_va = code_va + dep_offset;
         let dep_run_va = run_va + dep_offset;
+        let mut resolve_import = fsd_resolve_import;
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
             dep_exec_va,
             dep_run_va,
             dep_frames,
             dep_rights,
-            fsd_export_addr,
+            &mut resolve_import,
         )?;
         if dep_image_len as u64 > dep_frames * 0x1000 {
             return None;
@@ -15574,13 +15611,14 @@ unsafe fn load_driver_reserved(
     let primary_run_va = run_va + planned_images.primary_offset;
     let primary_frames = img_frames - primary_frame_offset;
     let primary_rights = &mut rights[primary_frame_offset as usize..];
+    let mut resolve_import = fsd_resolve_import;
     let (entry_rva, image_len) = load_pe_into(
         src_va,
         primary_exec_va,
         primary_run_va,
         primary_frames,
         primary_rights,
-        fsd_export_addr,
+        &mut resolve_import,
     )?;
     let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
