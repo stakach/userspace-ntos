@@ -8,6 +8,8 @@
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
+pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 23;
+pub const HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRange {
@@ -179,6 +181,21 @@ pub enum HostedProviderImportBindingError {
     Export(HostedProviderExportCallError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedProviderImportThunkPlan {
+    pub thunk_va: u64,
+    pub thunk_offset: u64,
+    pub export_call_gate: u64,
+    pub provider_export_rva: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedProviderImportThunkError {
+    Overflow,
+    ThunkOutsideTable,
+    OutputTooSmall,
+}
+
 pub fn page_align_up(value: u64) -> Result<u64, HostedProviderImagePlanError> {
     match value.checked_add(PAGE_SIZE - 1) {
         Some(value) => Ok(value & !(PAGE_SIZE - 1)),
@@ -259,6 +276,49 @@ pub fn plan_hosted_provider_import_binding(
             ))
         }
     }
+}
+
+pub fn plan_hosted_provider_import_thunk(
+    thunk_table_va: u64,
+    thunk_table_len: u64,
+    thunk_index: u64,
+    export_plan: HostedProviderExportCallPlan,
+) -> Result<HostedProviderImportThunkPlan, HostedProviderImportThunkError> {
+    let Some(thunk_offset) = thunk_index.checked_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN) else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    let Some(thunk_end) = thunk_offset.checked_add(HOSTED_PROVIDER_IMPORT_THUNK_LEN as u64) else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    if thunk_end > thunk_table_len {
+        return Err(HostedProviderImportThunkError::ThunkOutsideTable);
+    }
+    let Some(thunk_va) = thunk_table_va.checked_add(thunk_offset) else {
+        return Err(HostedProviderImportThunkError::Overflow);
+    };
+    Ok(HostedProviderImportThunkPlan {
+        thunk_va,
+        thunk_offset,
+        export_call_gate: export_plan.export_call_gate,
+        provider_export_rva: export_plan.provider_export_rva,
+    })
+}
+
+pub fn encode_hosted_provider_import_thunk(
+    thunk: HostedProviderImportThunkPlan,
+    out: &mut [u8],
+) -> Result<(), HostedProviderImportThunkError> {
+    if out.len() < HOSTED_PROVIDER_IMPORT_THUNK_LEN {
+        return Err(HostedProviderImportThunkError::OutputTooSmall);
+    }
+    out[..HOSTED_PROVIDER_IMPORT_THUNK_LEN].copy_from_slice(&[
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, imm64
+        0x49, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, // mov r11, imm64
+        0x41, 0xff, 0xe3, // jmp r11
+    ]);
+    out[2..10].copy_from_slice(&thunk.provider_export_rva.to_le_bytes());
+    out[12..20].copy_from_slice(&thunk.export_call_gate.to_le_bytes());
+    Ok(())
 }
 
 pub fn plan_provider_prefixed_image(
@@ -741,6 +801,73 @@ mod tests {
             Err(HostedProviderImportBindingError::Export(
                 HostedProviderExportCallError::ExportOutsideImage
             ))
+        );
+    }
+
+    #[test]
+    fn provider_import_thunk_planner_assigns_fixed_slots() {
+        let export_plan = HostedProviderExportCallPlan {
+            export_call_gate: 0x1111_2222_3333_4444,
+            provider_export_rva: 0x4567,
+            provider_export_offset: 0x84_567,
+        };
+        assert_eq!(
+            plan_hosted_provider_import_thunk(0x7000_0000, 0x100, 3, export_plan),
+            Ok(HostedProviderImportThunkPlan {
+                thunk_va: 0x7000_0060,
+                thunk_offset: 0x60,
+                export_call_gate: export_plan.export_call_gate,
+                provider_export_rva: export_plan.provider_export_rva,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_import_thunk_planner_rejects_table_overflow() {
+        let export_plan = HostedProviderExportCallPlan {
+            export_call_gate: 0x1111_2222_3333_4444,
+            provider_export_rva: 0x4567,
+            provider_export_offset: 0x84_567,
+        };
+        assert_eq!(
+            plan_hosted_provider_import_thunk(0x7000_0000, 0x40, 2, export_plan),
+            Err(HostedProviderImportThunkError::ThunkOutsideTable)
+        );
+        assert_eq!(
+            plan_hosted_provider_import_thunk(0x7000_0000, u64::MAX, u64::MAX, export_plan),
+            Err(HostedProviderImportThunkError::Overflow)
+        );
+        assert_eq!(
+            plan_hosted_provider_import_thunk(u64::MAX, 0x100, 1, export_plan),
+            Err(HostedProviderImportThunkError::Overflow)
+        );
+    }
+
+    #[test]
+    fn provider_import_thunk_encoder_preserves_win64_arguments_for_gate() {
+        let thunk = HostedProviderImportThunkPlan {
+            thunk_va: 0x7000_0020,
+            thunk_offset: 0x20,
+            export_call_gate: 0x1111_2222_3333_4444,
+            provider_export_rva: 0x5566_7788_99aa_bbcc,
+        };
+        let mut out = [0xcc; HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize];
+        encode_hosted_provider_import_thunk(thunk, &mut out).unwrap();
+        assert_eq!(
+            &out[..HOSTED_PROVIDER_IMPORT_THUNK_LEN],
+            &[
+                0x48, 0xb8, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x49, 0xbb, 0x44, 0x44,
+                0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0x41, 0xff, 0xe3,
+            ]
+        );
+        assert!(out[HOSTED_PROVIDER_IMPORT_THUNK_LEN..]
+            .iter()
+            .all(|byte| *byte == 0xcc));
+
+        let mut too_small = [0u8; HOSTED_PROVIDER_IMPORT_THUNK_LEN - 1];
+        assert_eq!(
+            encode_hosted_provider_import_thunk(thunk, &mut too_small),
+            Err(HostedProviderImportThunkError::OutputTooSmall)
         );
     }
 }
