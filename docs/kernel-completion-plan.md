@@ -7243,3 +7243,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the provider reverse-callback record/gate slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 `MiniportInitialize` provider-callback dispatch slice (2026-08-17, in progress): provider and
+  dependent export/callback gates now run a re-entrant wait loop while parked in executive services.
+  If the executive replies to a parked provider-export or provider-callback call with the normal
+  hosted dispatch tag, the gate services that nested request through the component's real
+  `fsd_dispatch`, publishes status/info, and waits again for the original service result. The
+  provider-callback service now implements the first real reverse callback shape:
+  `NDIS_MINIPORT_CHARACTERISTICS.InitializeHandler` at the NT5 x64 callback-table offset. It
+  marshals `OpenErrorStatus` and `SelectedMediumIndex` as dependent output cells, copies the provider
+  `NDIS_MEDIUM` array into dependent shared scratch, passes `MiniportAdapterContext` and
+  `WrapperConfigurationContext` as opaque provider handles on the stack, pumps the owning dependent
+  miniport component, and copies output cells back to the provider after completion. Other callback
+  slots still return `STATUS_NOT_SUPPORTED` until their argument contracts are implemented.
+  Review adjustment: next B3 work should continue from the nested exports triggered by real
+  `MiniportInitialize`: pointer-returning NDIS allocations/mappings (`NdisAllocateMemoryWithTag`,
+  `NdisMMapIoSpace`, `NdisMRegisterIoPortRange`, shared memory) need provider-owned allocation
+  handles that can be returned to and dereferenced by the dependent miniport without private NDIS
+  image copies.
+
+  Validation for the `MiniportInitialize` provider-callback dispatch slice: `cargo fmt --all`,
+  `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
