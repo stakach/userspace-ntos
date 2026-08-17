@@ -47,6 +47,20 @@ impl Disposition {
             _ => Disposition::ContinueSearch, // 1 and anything else → search (the safe default)
         }
     }
+
+    /// Encode this language-handler disposition as the raw `EXCEPTION_DISPOSITION` integer.
+    ///
+    /// This is intentionally distinct from C `__except` filter results below:
+    /// `EXCEPTION_CONTINUE_SEARCH` is a filter result with value 0, while the language-handler
+    /// disposition `ExceptionContinueSearch` is value 1.
+    pub const fn as_raw(self) -> i32 {
+        match self {
+            Disposition::ContinueExecution => 0,
+            Disposition::ContinueSearch => 1,
+            Disposition::NestedException => 2,
+            Disposition::CollidedUnwind => 3,
+        }
+    }
 }
 
 /// `EXCEPTION_RECORD` (the load-bearing fields): the code, flags, and faulting address.
@@ -1961,6 +1975,19 @@ mod tests {
         assert_eq!(Disposition::from_raw(2), Disposition::NestedException);
         assert_eq!(Disposition::from_raw(3), Disposition::CollidedUnwind);
         assert_eq!(Disposition::from_raw(99), Disposition::ContinueSearch);
+    }
+
+    #[test]
+    fn disposition_raw_values_are_not_c_filter_values() {
+        assert_eq!(Disposition::ContinueExecution.as_raw(), 0);
+        assert_eq!(Disposition::ContinueSearch.as_raw(), 1);
+        assert_eq!(Disposition::NestedException.as_raw(), 2);
+        assert_eq!(Disposition::CollidedUnwind.as_raw(), 3);
+        assert_eq!(EXCEPTION_CONTINUE_SEARCH, 0);
+        assert_ne!(
+            Disposition::ContinueSearch.as_raw(),
+            EXCEPTION_CONTINUE_SEARCH
+        );
     }
 
     // ------------------------------------------------------------------------------------------

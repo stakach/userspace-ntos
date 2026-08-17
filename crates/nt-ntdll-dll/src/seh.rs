@@ -900,7 +900,7 @@ pub unsafe fn c_specific_handler(
     dispatcher_context: *mut c_void,
 ) -> i32 {
     if dispatcher_context.is_null() {
-        return ex::EXCEPTION_CONTINUE_SEARCH;
+        return ex::Disposition::ContinueSearch.as_raw();
     }
     // SAFETY: the dispatcher passed a valid DISPATCHER_CONTEXT.
     let disp = unsafe { &mut *(dispatcher_context as *mut DispatcherContext) };
@@ -908,13 +908,13 @@ pub unsafe fn c_specific_handler(
     let control_pc = disp.control_pc;
     let scope_table = disp.handler_data as *const u8; // SCOPE_TABLE VA
     if scope_table.is_null() {
-        return ex::EXCEPTION_CONTINUE_SEARCH;
+        return ex::Disposition::ContinueSearch.as_raw();
     }
     // SCOPE_TABLE: Count @0, then Count × { Begin, End, Handler, Target } (4 u32s each).
     // SAFETY: scope_table is a mapped read-only .xdata region.
     let count = unsafe { core::ptr::read_unaligned(scope_table as *const u32) } as usize;
     if count == 0 || count > 4096 {
-        return ex::EXCEPTION_CONTINUE_SEARCH;
+        return ex::Disposition::ContinueSearch.as_raw();
     }
     let pc_rva = (control_pc.wrapping_sub(image_base)) as u32;
 
@@ -951,7 +951,7 @@ pub unsafe fn c_specific_handler(
                     && (flags & ex::EXCEPTION_TARGET_UNWIND != 0)
                     && disp.target_ip == image_base + s.target as u64
                 {
-                    return ex::EXCEPTION_CONTINUE_SEARCH;
+                    return ex::Disposition::ContinueSearch.as_raw();
                 }
                 if s.target == 0 {
                     // A __finally: call it with (AbnormalTermination=TRUE, EstablisherFrame).
@@ -965,7 +965,7 @@ pub unsafe fn c_specific_handler(
                 }
             }
         }
-        return ex::EXCEPTION_CONTINUE_SEARCH;
+        return ex::Disposition::ContinueSearch.as_raw();
     }
 
     // SEARCH pass: find the first __except whose filter says EXECUTE.
@@ -999,7 +999,7 @@ pub unsafe fn c_specific_handler(
             }
         };
         if verdict == ex::EXCEPTION_CONTINUE_EXECUTION {
-            return ex::EXCEPTION_CONTINUE_EXECUTION;
+            return ex::Disposition::ContinueExecution.as_raw();
         }
         if verdict == ex::EXCEPTION_EXECUTE_HANDLER {
             // Unwind to the __except body — does not return.
@@ -1021,11 +1021,11 @@ pub unsafe fn c_specific_handler(
                 );
             }
             // Not reached.
-            return ex::EXCEPTION_CONTINUE_SEARCH;
+            return ex::Disposition::ContinueSearch.as_raw();
         }
         // CONTINUE_SEARCH → next scope.
     }
-    ex::EXCEPTION_CONTINUE_SEARCH
+    ex::Disposition::ContinueSearch.as_raw()
 }
 
 // =================================================================================================

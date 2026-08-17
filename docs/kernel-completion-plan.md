@@ -7691,12 +7691,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
     x86_64-unknown-none`, and serialized desktop proof
     `.tmp/run-desktop-w32-owner-map-20260817.log`.
-  - `[~]` Current frontier after the owner-map repair: the latest desktop proof reaches the harness
-    sentinel with no BOOTBOOT error, `image-bank-fails=0`, `w32-bank-fails=0`, clean VM/resource
-    counters, real LSASS readiness, logon action return, default-user profile staging/copy, profile
-    hive load/checkpoint, and GDI user-batch flushes. The remaining blocker is later and generic:
-    winlogon parks in our `NtWaitForSingleObject` on anonymous dispatcher event handle `0x3c`
-    (object 82), which was passed as the completion event for a pending `NtReadFile` on
-    `\pipe\ntsvcs`. The next repair target is real asynchronous file/pipe I/O completion event
-    signaling and waiter redrive; do not synthesize `WlxActivateUserShell`, `userinit.exe`, Explorer,
-    or the event signal.
+  - `[x]` Async pipe completion redrive diagnosis: the same desktop proof showed that early
+    `\pipe\ntsvcs` async read completion does wake the caller through the caller-supplied event
+    handle; the later winlogon wait on `\pipe\ntsvcs` was a symptom, not the root cause. The real
+    owner of the stalled SCM path was `services.exe` exiting after `ScmLogEvent` raced EventLog
+    startup: `RegisterEventSourceW` opened `\pipe\EventLog` before the EventLog service had published
+    it, rpcrt4 raised `RPC_S_SERVER_UNAVAILABLE`, and our live ntdll let `RpcRaiseException` return
+    to rpcrt4's fail-fast tail instead of transferring to the `RpcExcept(EXCEPTION_EXECUTE_HANDLER)`
+    body.
+  - `[x]` ntdll x64 SEH disposition repair: `__C_specific_handler` now returns real
+    `EXCEPTION_DISPOSITION` values (`ExceptionContinueExecution = 0`,
+    `ExceptionContinueSearch = 1`, etc.) instead of reusing C `__except` filter constants, where
+    `EXCEPTION_CONTINUE_SEARCH = 0`. This keeps user-mode RPC exceptions catchable by ReactOS
+    advapi32/rpcrt4 code and should prevent the EventLog startup race from killing SCM. Validation:
+    `cargo fmt --all`, `cargo test -p nt-ntdll exception`, and `./scripts/build_ntdll_dll.sh`.
+  - `[~]` Current frontier after the SEH repair: rebuild the desktop image with the staged
+    `.tmp/nt-ntdll.dll`, rerun `./run.sh --desktop`, and confirm the log no longer contains
+    rpcrt4's `handler continued execution` fail-fast path or `services.exe` self-termination after
+    the first EventLog RPC race. If SCM survives, the next blocker should be a later real shell path:
+    either winlogon's `ROpenSCManagerW` gets a real SCM response and userinit/Explorer launch
+    resumes, or the run exposes the next unimplemented kernel/ntdll primitive. Do not synthesize
+    `WlxActivateUserShell`, `userinit.exe`, Explorer, EventLog, or the SCM response.
