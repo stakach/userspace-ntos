@@ -32,11 +32,13 @@ use nt_dma_manager::{
     DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
 };
 use nt_hosted_runtime::{
+    encode_hosted_provider_import_thunk,
     classify_hosted_provider_domain, plan_hosted_provider_import_binding,
-    plan_provider_prefixed_image, HostedProviderDomainDescriptor, HostedProviderDomainError,
-    HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderImportBinding,
-    HostedProviderImportBindingError, HostedProviderImagePlanError,
-    HostedProviderImportThunkPlan,
+    plan_hosted_provider_import_thunk, plan_provider_prefixed_image,
+    HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
+    HostedProviderExportCallPlan, HostedProviderImportBinding, HostedProviderImportBindingError,
+    HostedProviderImagePlanError, HostedProviderImportThunkError, HostedProviderImportThunkPlan,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -11547,6 +11549,9 @@ const HOSTED_DEP_PATH_MAX: usize = 96;
 const HOSTED_DRIVER_DEP_PATH_PREFIX: &[u8] = b"reactos\\system32\\drivers\\";
 const MAX_RAW_IMPORT_DESCRIPTORS: u32 = 256;
 const MAX_LOADED_EXPORT_NAMES: u32 = 1024;
+const HOSTED_PROVIDER_IMPORT_THUNK_FRAMES: u64 = 1;
+const HOSTED_PROVIDER_IMPORT_THUNK_TABLE_LEN: u64 =
+    HOSTED_PROVIDER_IMPORT_THUNK_FRAMES * 0x1000;
 
 #[derive(Clone, Copy)]
 struct LoadedDependencyImage {
@@ -11583,6 +11588,45 @@ impl DriverImportResolution {
             Self::DirectVa(va) => va,
             Self::ProviderThunk(thunk) => thunk.thunk_va,
         }
+    }
+}
+
+trait DriverImportResolver {
+    fn resolve_import(&mut self, request: DriverImportRequest<'_>) -> Option<DriverImportResolution>;
+}
+
+struct HostedProviderImportThunkWriter {
+    exec_va: u64,
+    run_va: u64,
+    len: u64,
+    next: u64,
+}
+
+impl HostedProviderImportThunkWriter {
+    fn new(exec_va: u64, run_va: u64, len: u64) -> Self {
+        Self {
+            exec_va,
+            run_va,
+            len,
+            next: 0,
+        }
+    }
+
+    unsafe fn emit(
+        &mut self,
+        plan: HostedProviderExportCallPlan,
+    ) -> Result<HostedProviderImportThunkPlan, HostedProviderImportThunkError> {
+        let thunk = plan_hosted_provider_import_thunk(self.run_va, self.len, self.next, plan)?;
+        let slot = core::slice::from_raw_parts_mut(
+            (self.exec_va + thunk.thunk_offset) as *mut u8,
+            HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
+        );
+        encode_hosted_provider_import_thunk(thunk, slot)?;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(HostedProviderImportThunkError::Overflow)?;
+        Ok(thunk)
     }
 }
 
@@ -11699,6 +11743,8 @@ struct PlannedHostedImages {
     provider_prefix_len: u64,
     primary_offset: u64,
     private_dependency_offset: u64,
+    provider_thunk_offset: u64,
+    provider_thunk_frames: u64,
     total_frames: u64,
 }
 
@@ -12083,6 +12129,14 @@ fn print_hosted_provider_import_binding_error(error: HostedProviderImportBinding
                 print_str(b"export-outside-image")
             }
         },
+    }
+}
+
+fn print_hosted_provider_import_thunk_error(error: HostedProviderImportThunkError) {
+    match error {
+        HostedProviderImportThunkError::Overflow => print_str(b"thunk-overflow"),
+        HostedProviderImportThunkError::ThunkOutsideTable => print_str(b"thunk-table-exhausted"),
+        HostedProviderImportThunkError::OutputTooSmall => print_str(b"thunk-output-too-small"),
     }
 }
 
@@ -13197,12 +13251,43 @@ pub fn fsd_export_addr(dll: &str, name: &str) -> Option<u64> {
     None
 }
 
-fn fsd_resolve_import(request: DriverImportRequest<'_>) -> Option<DriverImportResolution> {
-    let _ = request.iat_slot_rva;
-    Some(DriverImportResolution::DirectVa(fsd_export_addr(
-        request.dll,
-        request.name,
-    )?))
+struct HostedProviderImportResolver<'a> {
+    thunks: Option<&'a mut HostedProviderImportThunkWriter>,
+}
+
+impl DriverImportResolver for HostedProviderImportResolver<'_> {
+    fn resolve_import(&mut self, request: DriverImportRequest<'_>) -> Option<DriverImportResolution> {
+        let _ = request.iat_slot_rva;
+        if hosted_dependency_provider_dll(request.dll) {
+            unsafe {
+                if let Some(plan) =
+                    lookup_hosted_provider_singleton_export_plan(request.dll, request.name)
+                {
+                    let Some(writer) = self.thunks.as_mut() else {
+                        log_provider_domain_export_thunk_missing(request.dll, request.name, plan);
+                        return None;
+                    };
+                    match writer.emit(plan) {
+                        Ok(thunk) => return Some(DriverImportResolution::ProviderThunk(thunk)),
+                        Err(error) => {
+                            print_str(b"[driver-import] provider-domain thunk refused ");
+                            print_str(request.dll.as_bytes());
+                            debug_put_char(b'!');
+                            print_str(request.name.as_bytes());
+                            print_str(b" reason=");
+                            print_hosted_provider_import_thunk_error(error);
+                            print_str(b"\n");
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(DriverImportResolution::DirectVa(fsd_export_addr(
+            request.dll,
+            request.name,
+        )?))
+    }
 }
 
 // --- the FSD component entry -----------------------------------------------------------------
@@ -14862,13 +14947,38 @@ unsafe fn plan_hosted_images(
         return None;
     }
 
+    let provider_thunk_frames = if shared_providers.is_empty() {
+        0
+    } else {
+        HOSTED_PROVIDER_IMPORT_THUNK_FRAMES
+    };
+    let provider_thunk_offset = if provider_thunk_frames == 0 {
+        0
+    } else {
+        align_up_4k(layout.total_image_len)?
+    };
+    let total_frames = if provider_thunk_frames == 0 {
+        layout.total_frames
+    } else {
+        let required = provider_thunk_offset
+            .checked_add(provider_thunk_frames.checked_mul(0x1000)?)?
+            / 0x1000;
+        if required > FSD_IMAGE_MAX_FRAMES {
+            print_str(b"[driver-launch] provider thunk table exceeds image capacity\n");
+            return None;
+        }
+        layout.total_frames.max(required)
+    };
+
     Some(PlannedHostedImages {
         shared_providers,
         dependencies,
         provider_prefix_len: layout.provider_prefix_len,
         primary_offset: layout.primary_offset,
         private_dependency_offset: layout.private_dependency_offset,
-        total_frames: layout.total_frames,
+        provider_thunk_offset,
+        provider_thunk_frames,
+        total_frames,
     })
 }
 
@@ -15016,7 +15126,7 @@ unsafe fn load_pe_into(
     run_va: u64,
     max_frames: u64,
     rights_out: &mut [u64],
-    resolve: &mut impl for<'a> FnMut(DriverImportRequest<'a>) -> Option<DriverImportResolution>,
+    resolver: &mut impl DriverImportResolver,
 ) -> Option<(u32, u32)> {
     let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
     let nt = src_va + e;
@@ -15227,7 +15337,7 @@ unsafe fn load_pe_into(
                 let mut name_buf = [0u8; 128];
                 let name =
                     read_pe_ascii(dst_va, cap, thunk & 0x7FFF_FFFF_FFFF_FFFF, 2, &mut name_buf)?;
-                let resolution = resolve(DriverImportRequest {
+                let resolution = resolver.resolve_import(DriverImportRequest {
                     dll,
                     name,
                     iat_slot_rva: slot_rva,
@@ -15282,6 +15392,7 @@ unsafe fn load_hosted_dependency_images(
     shared_va: u64,
     img_frames: u64,
     rights: &mut [u64],
+    mut provider_thunks: Option<&mut HostedProviderImportThunkWriter>,
 ) -> Option<LoadedSupportImages> {
     clear_support_image_records(shared_va);
 
@@ -15328,14 +15439,16 @@ unsafe fn load_hosted_dependency_images(
 
         let dep_exec_va = code_va + dep_offset;
         let dep_run_va = run_va + dep_offset;
-        let mut resolve_import = fsd_resolve_import;
+        let mut resolver = HostedProviderImportResolver {
+            thunks: provider_thunks.as_deref_mut(),
+        };
         let (dep_entry_rva, dep_image_len) = load_pe_into(
             planned.src_va,
             dep_exec_va,
             dep_run_va,
             dep_frames,
             dep_rights,
-            &mut resolve_import,
+            &mut resolver,
         )?;
         if dep_image_len as u64 > dep_frames * 0x1000 {
             return None;
@@ -15523,6 +15636,32 @@ unsafe fn load_driver_reserved(
         map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
         i += 1;
     }
+    if planned_images.provider_thunk_frames != 0 {
+        if planned_images.provider_thunk_offset & 0xfff != 0
+            || planned_images.provider_thunk_frames != HOSTED_PROVIDER_IMPORT_THUNK_FRAMES
+        {
+            print_str(b"[driver-launch] provider thunk table layout invalid\n");
+            return None;
+        }
+        let thunk_frame = planned_images.provider_thunk_offset / 0x1000;
+        if thunk_frame
+            .checked_add(planned_images.provider_thunk_frames)
+            .filter(|end| *end <= img_frames)
+            .is_none()
+        {
+            print_str(b"[driver-launch] provider thunk table outside image window\n");
+            return None;
+        }
+        let mut frame = 0u64;
+        while frame < planned_images.provider_thunk_frames {
+            rights_vec[(thunk_frame + frame) as usize] = 2;
+            frame += 1;
+        }
+        zero(
+            code_va + planned_images.provider_thunk_offset,
+            planned_images.provider_thunk_frames * 0x1000,
+        );
+    }
     let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
     let rights = Box::leak(rights_vec.into_boxed_slice());
     // POOL frames. Provider dependents share the provider-domain pool; standalone drivers allocate
@@ -15588,6 +15727,15 @@ unsafe fn load_driver_reserved(
     // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
     //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
     register_planned_shared_provider_images(&planned_images, code_va, run_va)?;
+    let mut provider_thunk_writer = if planned_images.provider_thunk_frames == 0 {
+        None
+    } else {
+        Some(HostedProviderImportThunkWriter::new(
+            code_va + planned_images.provider_thunk_offset,
+            run_va + planned_images.provider_thunk_offset,
+            HOSTED_PROVIDER_IMPORT_THUNK_TABLE_LEN,
+        ))
+    };
     let support_images = load_hosted_dependency_images(
         &planned_images,
         instance,
@@ -15596,6 +15744,7 @@ unsafe fn load_driver_reserved(
         win.shared_va,
         img_frames,
         rights,
+        provider_thunk_writer.as_mut(),
     )?;
     if planned_images.primary_offset & 0xfff != 0 {
         return None;
@@ -15611,14 +15760,16 @@ unsafe fn load_driver_reserved(
     let primary_run_va = run_va + planned_images.primary_offset;
     let primary_frames = img_frames - primary_frame_offset;
     let primary_rights = &mut rights[primary_frame_offset as usize..];
-    let mut resolve_import = fsd_resolve_import;
+    let mut resolver = HostedProviderImportResolver {
+        thunks: provider_thunk_writer.as_mut(),
+    };
     let (entry_rva, image_len) = load_pe_into(
         src_va,
         primary_exec_va,
         primary_run_va,
         primary_frames,
         primary_rights,
-        &mut resolve_import,
+        &mut resolver,
     )?;
     let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");

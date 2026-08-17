@@ -7032,3 +7032,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the resolver-shape slice: `cargo fmt --all`, executive `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
   `git diff --check`.
+
+  B3 provider thunk-table wiring slice (2026-08-17, in progress): the executive hosted-driver image
+  planner now reserves a provider thunk table inside the component image lane only when callable
+  shared providers are actually planned. The thunk frame is mapped writable in the executive during
+  load, marked RX in the component's W^X rights table, zeroed before use, and populated through a
+  stateful import resolver using the host-tested thunk planner/encoder. Callable provider imports now
+  resolve to `ProviderThunk` IAT values when a thunk table exists; if a callable provider is observed
+  without a thunk table, resolution still fails closed. Gate-free singleton metadata continues to
+  plan zero thunk frames and load private dependency images unchanged. Review adjustment: the loader
+  side of provider thunk generation is now present but remains dormant until real provider export
+  gates are published. The next B3 boundary is implementing the gate entry itself: capture the
+  dependent's win64 call frame, dispatch the requested provider export RVA inside the provider-owned
+  component context, and return the provider result without direct image/pool aliasing.
+
+  Validation for the thunk-table wiring slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.
