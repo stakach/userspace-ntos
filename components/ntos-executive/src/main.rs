@@ -5734,12 +5734,17 @@ fn winlogon_profile_directory_spec(passed: &mut u64) {
             // only way GetProfilesDirectoryW can return TRUE and the only way CreateUserProfileW
             // is reachable at all.
             && reads >= 1
-            // … and legacy profile/WinMM probes now open real read-only disk files through
-            // NtCreateFile instead of falling straight into the unserved namespace branch.
-            && NT_CREATE_FILE_READONLY_FAT_OPENS.load(Ordering::Relaxed) >= 1
+            // … and CreateUserProfileW created the real per-SID ProfileList key/value set and copied
+            // the default profile into the writable overlay. Earlier runs used a read-only FAT probe
+            // as a proxy; the stronger invariant is the concrete profile materialisation.
+            && PROFILE_LIST_SID_KEYS_CREATED.load(Ordering::Relaxed) >= 1
+            && PROFILE_LIST_PROFILE_IMAGE_PATH_SETS.load(Ordering::Relaxed) >= 1
+            && PROFILE_LIST_REFCOUNT_SETS.load(Ordering::Relaxed) >= 1
+            && crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1
+            && crate::writable_fs::PROFILE_COPY_FILES.load(Ordering::Relaxed) >= 1
             // ... while any ordinary misses under that same mounted namespace stay real filesystem
-            // misses, not unserved-namespace misses. A fully satisfied boot is allowed to
-            // have zero misses.
+            // misses, not unserved-namespace misses. A fully satisfied boot is allowed to have zero
+            // misses.
             && NT_CREATE_FILE_UNSERVED_NAMESPACE.load(Ordering::Relaxed) == 0
             // … off the same real logon this batch inherits (unchanged clauses).
             && LSA_LOGON_REPLY_STATUS.load(Ordering::Relaxed) == 0

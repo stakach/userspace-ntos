@@ -7711,12 +7711,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-ntdll.dll` removed rpcrt4's `handler continued execution` fail-fast path and services.exe no
     longer self-terminates after the early EventLog RPC race. SCM now survives into its real first-boot
     registry work instead of dying before the service database/listener can exist.
-  - `[~]` Current frontier after the SEH repair: services.exe remains alive but is still busy in the
+  - `[x]` Configuration Manager copy frontier after the SEH repair: services.exe remained alive but
+    was still busy in the
     ReactOS `ScmCreateLastKnownGoodControlSet` / `RegCopyTreeW` path before
-    `ScmCreateServiceDatabase` and `ScmStartRpcServer`. The serialized desktop proof shows repeated
-    `NtOpenKey`, `NtCreateKey`, and `NtEnumerateKey` traffic, no SCM listener, and therefore no real
-    winlogon SCM response or userinit/Explorer launch. Continue by improving the generic Configuration
-    Manager path that this real control-set copy exercises: journal-backed mutable hive value-copy
-    should use existing live value payloads, and long registry copy traversal must provide progress
-    visibility without synthesizing SCM, `WlxActivateUserShell`, `userinit.exe`, Explorer, EventLog, or
-    any shell response.
+    `ScmCreateServiceDatabase` and `ScmStartRpcServer`. The fix keeps the durable hive journal in the
+    canonical replay format while applying verified same-hive value copies through the live shared
+    payload path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and desktop proof `.tmp/run-desktop-hive-shared-copy-20260817.log`.
+  - `[~]` Current frontier after the journaled hive-copy repair: the desktop proof reaches genuine
+    LSA logon, `NtCreateToken`, profile copy, `NtLoadKey`, `WlxActivateUserShell`, userinit launch,
+    and Explorer launch. The summary moves to `292/298`; `exec_svc_rpc_listener_multiplex`,
+    `exec_winlogon_user_shell_activated`, all userinit gates, Explorer process/create-window capture,
+    real Explorer callbacks, GDI user batch flushing, and full-framebuffer non-background pixels pass.
+    Remaining work is now narrower and real: remove the stale optional read-only FAT probe requirement
+    from `exec_winlogon_profile_directory_resolved`, recover VM headroom/resource accounting for the
+    enlarged desktop/service set, and fix Explorer shell chrome so `RegisterWindowMessage`,
+    client-installed WndProc, shell COM class opens, BeginPaint/EndPaint, and batched GDI flush happen
+    through the normal ReactOS/user32/win32k paths. The quiesce dump shows Explorer at
+    `shlwapi+0x11c0f`/`shdocvw` with RIP `0x8028b240` not resolved to a committed image page; use that
+    as the next live diagnosis target, not a shell-specific fallback.
