@@ -7097,3 +7097,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the provider export stack-tail replay slice: `cargo fmt --all`, executive `cargo
   check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
   `git diff --check`.
+
+  B3 provider-domain no-alias cleanup slice (2026-08-17, in progress): callable provider planning
+  no longer carries the rejected shared-image/shared-pool mapping machinery forward. The
+  host-tested runtime image planner now lays out only the dependent primary image plus any private
+  dependency images; provider-domain participation is tracked separately as a thunk-allocation fact.
+  The executive dependency-closure walker can suppress a private dependency when a callable singleton
+  exists, but it records a provider-domain binding instead of importing the provider's image frames
+  or pool frames into the dependent component. Singleton metadata no longer stores per-frame alias
+  caps or W^X rights for dependents. Runtime evidence now prints `provider-domains=` rather than
+  `shared-maps=`/`shared-pools=` for this path. The gate is still unpublished, so current boot
+  behavior remains truthful private dependency loading until the pointer marshalling proof exists.
+  Review adjustment: next B3 work should define/export the narrow cross-component pointer policy for
+  the NDIS provider calls observed in `tcpip.sys` and `e1000.sys`, then publish `export_call_gate`
+  for providers that pass that proof.
+
+  Validation for the provider-domain no-alias cleanup slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.

@@ -26617,7 +26617,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if provider_sharing.primary_services != 0
         || provider_sharing.private_dependencies != 0
         || provider_sharing.singleton_providers != 0
-        || provider_sharing.shared_provider_mappings != 0
+        || provider_sharing.provider_domain_bindings != 0
     {
         print_str(b"[driver-launch] hosted provider sharing primary=");
         print_u64(provider_sharing.primary_services);
@@ -26639,10 +26639,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.overflowed_load_records);
         print_str(b" singletons=");
         print_u64(provider_sharing.singleton_providers);
-        print_str(b" shared-maps=");
-        print_u64(provider_sharing.shared_provider_mappings);
-        print_str(b" shared-pools=");
-        print_u64(provider_sharing.shared_provider_pool_mappings);
+        print_str(b" provider-domains=");
+        print_u64(provider_sharing.provider_domain_bindings);
         print_str(b" singleton-overflows=");
         print_u64(provider_sharing.singleton_overflows);
         print_str(b" singleton-conflicts=");

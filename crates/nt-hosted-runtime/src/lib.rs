@@ -105,8 +105,7 @@ pub enum RuntimeLayoutError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostedProviderImagePlan {
-    pub provider_prefix_len: u64,
+pub struct HostedDriverImagePlan {
     pub primary_offset: u64,
     pub private_dependency_offset: u64,
     pub total_image_len: u64,
@@ -114,7 +113,7 @@ pub struct HostedProviderImagePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostedProviderImagePlanError {
+pub enum HostedDriverImagePlanError {
     Overflow,
     ExceedsFrameCapacity,
 }
@@ -201,10 +200,10 @@ pub enum HostedProviderImportThunkError {
     OutputTooSmall,
 }
 
-pub fn page_align_up(value: u64) -> Result<u64, HostedProviderImagePlanError> {
+pub fn page_align_up(value: u64) -> Result<u64, HostedDriverImagePlanError> {
     match value.checked_add(PAGE_SIZE - 1) {
         Some(value) => Ok(value & !(PAGE_SIZE - 1)),
-        None => Err(HostedProviderImagePlanError::Overflow),
+        None => Err(HostedDriverImagePlanError::Overflow),
     }
 }
 
@@ -334,29 +333,21 @@ pub fn encode_hosted_provider_import_thunk(
     Ok(())
 }
 
-pub fn plan_provider_prefixed_image(
-    shared_provider_image_lens: &[u64],
+pub fn plan_hosted_driver_image(
     primary_image_len: u64,
     private_dependency_image_lens: &[u64],
     minimum_frames: u64,
     frame_capacity: u64,
-) -> Result<HostedProviderImagePlan, HostedProviderImagePlanError> {
-    let mut provider_prefix_len = 0u64;
-    for len in shared_provider_image_lens {
-        provider_prefix_len = provider_prefix_len
-            .checked_add(page_align_up(*len)?)
-            .ok_or(HostedProviderImagePlanError::Overflow)?;
-    }
-
-    let primary_offset = provider_prefix_len;
+) -> Result<HostedDriverImagePlan, HostedDriverImagePlanError> {
+    let primary_offset = 0u64;
     let private_dependency_offset = primary_offset
         .checked_add(page_align_up(primary_image_len)?)
-        .ok_or(HostedProviderImagePlanError::Overflow)?;
+        .ok_or(HostedDriverImagePlanError::Overflow)?;
     let mut total_image_len = private_dependency_offset;
     for len in private_dependency_image_lens {
         total_image_len = total_image_len
             .checked_add(page_align_up(*len)?)
-            .ok_or(HostedProviderImagePlanError::Overflow)?;
+            .ok_or(HostedDriverImagePlanError::Overflow)?;
     }
 
     let planned_frames = page_align_up(total_image_len)? / PAGE_SIZE;
@@ -366,11 +357,10 @@ pub fn plan_provider_prefixed_image(
         planned_frames
     };
     if total_frames > frame_capacity {
-        return Err(HostedProviderImagePlanError::ExceedsFrameCapacity);
+        return Err(HostedDriverImagePlanError::ExceedsFrameCapacity);
     }
 
-    Ok(HostedProviderImagePlan {
-        provider_prefix_len,
+    Ok(HostedDriverImagePlan {
         primary_offset,
         private_dependency_offset,
         total_image_len,
@@ -593,12 +583,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_prefixed_image_plan_preserves_current_no_provider_layout() {
-        let plan = plan_provider_prefixed_image(&[], 0x21_234, &[0x10], 64, 128).unwrap();
+    fn hosted_driver_image_plan_preserves_current_private_dependency_layout() {
+        let plan = plan_hosted_driver_image(0x21_234, &[0x10], 64, 128).unwrap();
         assert_eq!(
             plan,
-            HostedProviderImagePlan {
-                provider_prefix_len: 0,
+            HostedDriverImagePlan {
                 primary_offset: 0,
                 private_dependency_offset: 0x22_000,
                 total_image_len: 0x23_000,
@@ -608,25 +597,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_prefixed_image_plan_places_primary_after_shared_providers() {
-        let plan =
-            plan_provider_prefixed_image(&[0x23_001], 0x8_400, &[0x41_000, 0x1], 0, 128).unwrap();
-        assert_eq!(plan.provider_prefix_len, 0x24_000);
-        assert_eq!(plan.primary_offset, 0x24_000);
-        assert_eq!(plan.private_dependency_offset, 0x2d_000);
-        assert_eq!(plan.total_image_len, 0x6f_000);
-        assert_eq!(plan.total_frames, 0x6f);
+    fn hosted_driver_image_plan_places_private_dependencies_after_primary() {
+        let plan = plan_hosted_driver_image(0x8_400, &[0x41_000, 0x1], 0, 128).unwrap();
+        assert_eq!(plan.primary_offset, 0);
+        assert_eq!(plan.private_dependency_offset, 0x9_000);
+        assert_eq!(plan.total_image_len, 0x4b_000);
+        assert_eq!(plan.total_frames, 0x4b);
     }
 
     #[test]
-    fn provider_prefixed_image_plan_rejects_capacity_and_overflow() {
+    fn hosted_driver_image_plan_rejects_capacity_and_overflow() {
         assert_eq!(
-            plan_provider_prefixed_image(&[0x20_000], 0x20_000, &[], 0, 0x3),
-            Err(HostedProviderImagePlanError::ExceedsFrameCapacity)
+            plan_hosted_driver_image(0x20_000, &[], 0, 0x1),
+            Err(HostedDriverImagePlanError::ExceedsFrameCapacity)
         );
         assert_eq!(
-            plan_provider_prefixed_image(&[u64::MAX], 0, &[], 0, u64::MAX),
-            Err(HostedProviderImagePlanError::Overflow)
+            plan_hosted_driver_image(u64::MAX, &[], 0, u64::MAX),
+            Err(HostedDriverImagePlanError::Overflow)
         );
     }
 
