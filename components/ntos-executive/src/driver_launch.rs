@@ -491,8 +491,21 @@ const NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64: u64 = 0x60;
 const NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64: u64 = 0x68;
 const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL: u8 = 2;
+const NDIS_PROTOCOL_OPEN_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x08;
+const NDIS_PROTOCOL_CLOSE_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x10;
+const NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x18;
+const NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x20;
+const NDIS_PROTOCOL_RESET_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x28;
+const NDIS_PROTOCOL_REQUEST_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x30;
+const NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64: u64 = 0x38;
+const NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x40;
+const NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64: u64 = 0x48;
+const NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x50;
+const NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64: u64 = 0x68;
 const NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64: u64 = 0x80;
 const NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64: u64 = 0x70;
+const NDIS_PROTOCOL_UNBIND_ADAPTER_CALLBACK_OFFSET_X64: u64 = 0x78;
+const NDIS_PROTOCOL_UNLOAD_CALLBACK_OFFSET_X64: u64 = 0x88;
 const NDIS_NET_PNP_EVENT_LEN_X64: u64 = 0x98;
 const NDIS_MEDIUM_ENTRY_BYTES_X64: u64 = 4;
 const NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP: u64 = 64;
@@ -5316,6 +5329,22 @@ extern "win64" fn s_io_delete_device(dev: u64) {
                     Err(_) => return,
                 }
             }
+        } else if let Some((index, inst)) = instance_by_device_object(dev) {
+            if inst.device_id != 0 {
+                let device_id = nt_io_manager::DeviceId(inst.device_id);
+                match io_manager_mut().destroy_device(device_id) {
+                    Ok(_) => {
+                        let table = driver_instances_mut();
+                        if index < table.len() && table[index].device_object == dev {
+                            table[index].device_id = 0;
+                            table[index].device_object = 0;
+                            table[index].ready = false;
+                        }
+                    }
+                    Err(nt_status::NtStatus::DELETE_PENDING) => return,
+                    Err(_) => return,
+                }
+            }
         }
 
         crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
@@ -5687,6 +5716,7 @@ unsafe fn hosted_registry_identity_id_by_pdo_object(pdo: u64) -> Option<HostedRe
 unsafe fn hosted_device_object_known(device_object: u64) -> bool {
     device_object != 0
         && (hosted_device_binding_by_device_object(device_object).is_some()
+            || instance_by_device_object(device_object).is_some()
             || read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == device_object)
 }
 
@@ -12941,6 +12971,53 @@ fn print_ndis_miniport_callback_name(offset: u64) {
     }
 }
 
+fn print_ndis_protocol_callback_name(offset: u64) {
+    match offset {
+        NDIS_PROTOCOL_OPEN_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64 => {
+            print_str(b"OpenAdapterComplete")
+        }
+        NDIS_PROTOCOL_CLOSE_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64 => {
+            print_str(b"CloseAdapterComplete")
+        }
+        NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"SendComplete"),
+        NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
+            print_str(b"TransferDataComplete")
+        }
+        NDIS_PROTOCOL_RESET_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"ResetComplete"),
+        NDIS_PROTOCOL_REQUEST_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"RequestComplete"),
+        NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => print_str(b"Receive"),
+        NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"ReceiveComplete"),
+        NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => print_str(b"Status"),
+        NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"StatusComplete"),
+        NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => print_str(b"ReceivePacket"),
+        NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => print_str(b"BindAdapter"),
+        NDIS_PROTOCOL_UNBIND_ADAPTER_CALLBACK_OFFSET_X64 => print_str(b"UnbindAdapter"),
+        NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => print_str(b"PnPEvent"),
+        NDIS_PROTOCOL_UNLOAD_CALLBACK_OFFSET_X64 => print_str(b"Unload"),
+        _ => print_str(b"unknown"),
+    }
+}
+
+fn print_hosted_provider_callback_kind_name(kind: u8) {
+    match kind {
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => print_str(b"miniport"),
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => print_str(b"protocol"),
+        _ => print_str(b"unknown"),
+    }
+}
+
+fn print_hosted_provider_callback_name(record: HostedProviderCallbackRecord) {
+    match record.callback_kind {
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => {
+            print_ndis_miniport_callback_name(record.callback_offset)
+        }
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => {
+            print_ndis_protocol_callback_name(record.callback_offset)
+        }
+        _ => print_str(b"unknown"),
+    }
+}
+
 unsafe fn trace_hosted_provider_export(
     phase: &[u8],
     provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
@@ -13046,8 +13123,10 @@ unsafe fn trace_hosted_provider_callback(
     print_u64(record.dependent_instance as u64);
     print_str(b" off=0x");
     print_hex(record.callback_offset as u32);
+    print_str(b" kind=");
+    print_hosted_provider_callback_kind_name(record.callback_kind);
     print_str(b" ");
-    print_ndis_miniport_callback_name(record.callback_offset);
+    print_hosted_provider_callback_name(record);
     print_str(b" target=");
     print_hex64(record.target);
     print_str(b" args=");
@@ -13095,6 +13174,10 @@ unsafe fn trace_hosted_provider_callback_wall(
     print_u64(record.dependent_instance as u64);
     print_str(b" off=0x");
     print_hex(record.callback_offset as u32);
+    print_str(b" kind=");
+    print_hosted_provider_callback_kind_name(record.callback_kind);
+    print_str(b" ");
+    print_hosted_provider_callback_name(record);
     print_str(b" target=");
     print_hex64(record.target);
     print_str(b" status=0x");
@@ -13939,6 +14022,90 @@ unsafe fn provider_marshal_output_buffer(
     )
 }
 
+unsafe fn provider_marshal_input_buffer(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    bytes: u64,
+) -> Result<u64, i32> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, bytes)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    copy_bytes(provider_exec_va, dependent_exec_va, bytes);
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_ansi_string(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    if arg_value == 0 {
+        return Ok(0);
+    }
+    let Some(desc_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 16)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let length = read_unaligned((desc_exec + ANSI_STRING_LENGTH_OFFSET) as *const u16) as u64;
+    let maximum = read_unaligned((desc_exec + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16)
+        as u64;
+    let buffer = read_unaligned((desc_exec + ANSI_STRING_BUFFER_OFFSET) as *const u64);
+    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some((provider_desc_va, provider_desc_exec)) =
+        provider_marshal_alloc(state, provider_shared, 16)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let provider_buffer_va = if length == 0 {
+        0
+    } else {
+        let Some(buffer_exec) =
+            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let buffer_bytes = length.checked_add(1).ok_or(STATUS_INVALID_PARAMETER)?;
+        let Some((provider_buffer_va, provider_buffer_exec)) =
+            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+        else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        copy_bytes(provider_buffer_exec, buffer_exec, length);
+        provider_buffer_va
+    };
+    write_unaligned(
+        (provider_desc_exec + ANSI_STRING_LENGTH_OFFSET) as *mut u16,
+        length as u16,
+    );
+    write_unaligned(
+        (provider_desc_exec + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
+        length.saturating_add(1) as u16,
+    );
+    write_unaligned(
+        (provider_desc_exec + ANSI_STRING_BUFFER_OFFSET) as *mut u64,
+        provider_buffer_va,
+    );
+    Ok(provider_desc_va)
+}
+
 unsafe fn provider_marshal_resource_list(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -14707,6 +14874,47 @@ unsafe fn prepare_provider_export_marshal(
                 provider_shared,
                 arg,
             )?,
+            HostedProviderArgumentMarshal::CallerInAnsiString => provider_marshal_ansi_string(
+                &mut state,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+            )?,
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_input_buffer(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInArray {
+                count_arg,
+                element_size,
+            } => {
+                let count_index = count_arg as usize;
+                if count_index >= policy.argument_count as usize || element_size == 0 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let bytes = args[count_index]
+                    .checked_mul(element_size as u64)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                provider_marshal_input_buffer(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    bytes,
+                )?
+            }
             HostedProviderArgumentMarshal::CallerInNdisBuffer => provider_marshal_ndis_buffer(
                 &mut state,
                 provider_instance,
@@ -15450,7 +15658,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     let dependent_binding = if dependent_inst.device_id == 0 {
         None
     } else {
-        hosted_device_binding_by_device_id(dependent_inst.device_id)
+        hosted_resource_binding_by_device_id(dependent_inst.device_id)
     };
     let marshal_state = match prepare_provider_export_marshal(
         policy,
@@ -15644,7 +15852,7 @@ unsafe fn dispatch_dependent_provider_callback(
     let dependent_binding = if dependent_inst.device_id == 0 {
         None
     } else {
-        hosted_device_binding_by_device_id(dependent_inst.device_id)
+        hosted_resource_binding_by_device_id(dependent_inst.device_id)
     };
     if let Some(binding) = dependent_binding {
         restore_hosted_device_resource_state(binding, dependent_shared, false)
@@ -20380,6 +20588,7 @@ unsafe fn load_driver_reserved(
     let faults = pr.faults;
     let demand = pr.demand;
     let finished = pr.completed;
+    let active_reply_cap = pr.reply_cap;
     let (wall_ip, wall_addr, wall_label) = (pr.wall_ip, pr.wall_addr, pr.wall_label);
 
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
@@ -20496,7 +20705,7 @@ unsafe fn load_driver_reserved(
         device_id: 0,
         tcb,
         cnode,
-        reply_cap,
+        reply_cap: active_reply_cap,
     };
     let device_id = match register_io_device(driver_id, &dc) {
         Ok(device_id) => device_id,
@@ -21322,14 +21531,6 @@ fn register_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_st
         DeviceFlags::BUFFERED_IO,
         0,
     )?;
-    register_hosted_device_binding(
-        driver_id,
-        device_id.raw(),
-        dc.instance,
-        dc.devobj,
-        0,
-        INVALID_HOSTED_REGISTRY_IDENTITY_ID,
-    )?;
     Ok(device_id.raw())
 }
 
@@ -21957,6 +22158,15 @@ fn hosted_device_binding_by_device_id(device_id: u64) -> Option<HostedDeviceBind
         .iter()
         .copied()
         .find(|slot| slot.used && slot.device_id != 0 && slot.device_id == device_id)
+}
+
+fn hosted_resource_binding_by_device_id(device_id: u64) -> Option<HostedDeviceBinding> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    if binding.pdo_object == 0 {
+        return None;
+    }
+    unsafe { hosted_device_resource_state_by_device_id(device_id)? };
+    Some(binding)
 }
 
 fn hosted_device_binding_by_device_object(device_object: u64) -> Option<HostedDeviceBinding> {
@@ -26873,12 +27083,8 @@ pub(crate) unsafe fn cancel_pending_file_irps(
     device_id: u64,
     file_id: u64,
 ) -> Result<u64, u32> {
-    let binding = hosted_device_binding_by_device_id(device_id)
-        .ok_or(STATUS_DEVICE_NOT_READY as u32)?;
-    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    if !inst.ready || inst.driver_id == 0 || binding.device_object == 0 {
+    let (instance, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
+    if !inst.ready || inst.driver_id == 0 || device_object == 0 {
         return Err(STATUS_DEVICE_NOT_READY as u32);
     }
     if io_manager_mut()
@@ -26889,10 +27095,10 @@ pub(crate) unsafe fn cancel_pending_file_irps(
     }
     let mut out = [];
     let (status, cancelled) = dispatch_irp_for_instance(
-        binding.instance,
+        instance,
         FSD_DISPATCH_CANCEL_PENDING_FILE,
         0,
-        binding.device_object,
+        device_object,
         0,
         file_id,
         &[],
@@ -26910,14 +27116,26 @@ fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
     require_hosted_device_ready_for_dispatch(device_id).is_ok()
 }
 
+fn hosted_dispatch_instance_for_device_id(
+    device_id: u64,
+) -> Result<(usize, DriverInstance, u64), u32> {
+    if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
+        let Some(inst) = instance(binding.instance) else {
+            return Err(STATUS_DEVICE_NOT_READY as u32);
+        };
+        if inst.driver_id != binding.driver_id {
+            return Err(STATUS_DEVICE_NOT_READY as u32);
+        }
+        return Ok((binding.instance, inst, binding.device_object));
+    }
+    instance_by_device_id(device_id)
+        .map(|(index, inst)| (index, inst, inst.device_object))
+        .ok_or(STATUS_DEVICE_NOT_READY as u32)
+}
+
 fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {
-    let Some(binding) = hosted_device_binding_by_device_id(device_id) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    if !inst.ready || inst.driver_id == 0 || binding.device_object == 0 {
+    let (_, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
+    if !inst.ready || inst.driver_id == 0 || device_object == 0 {
         return Err(STATUS_DEVICE_NOT_READY as u32);
     }
     if io_manager_mut()

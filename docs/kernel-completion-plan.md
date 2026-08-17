@@ -7798,3 +7798,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     caller/provider shadowing for NDIS packet, buffer, and request objects, because TCPIP
     legitimately dereferences `NDIS_PACKET`/`NDIS_BUFFER` fields while the provider must still own
     NDIS pool bookkeeping.
+  - `[x]` B3 hosted control-device/resource-binding split (2026-08-18): hosted control devices are no
+    longer registered as fake resource-backed device bindings. `register_io_device` now publishes only
+    through the I/O Manager, while real PnP FDO bindings keep the resource/DMA/registry projection
+    path. Dispatch and cancellation use the PnP binding when one exists and fall back to the owning
+    hosted control-device instance only for normal I/O Manager control devices. Provider-domain export
+    and callback resource projection now explicitly require a resource binding, preventing
+    `tcpip.sys` control devices such as `\Device\Tcp` from failing provider callbacks while trying to
+    restore non-existent hardware grants. The same slice fixed the hosted pump reply-cap lifetime for
+    components that park one reply object during waits and resume on a fresh receive cap, and corrected
+    the `NdisOpenAdapter` medium-list policy from byte-buffer length to `NDIS_MEDIUM` element count.
+    Validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Serialized desktop evidence in
+    `.tmp/run-desktop-b3-control-binding-20260818-102500.log` proves the intended next boundary:
+    TCPIP's real protocol `BindAdapter` now enters callable `ndis.sys` and starts the nested
+    `NdisOpenAdapter` export (`rva=0x14bd0`) instead of failing the control-device resource restore.
+    The run still stops short of desktop gates because that real open-adapter path returns `0x21`;
+    provider sharing reports `exports=19/20 callbacks=8/9`, and
+    `exec_generic_pci_provider_domain_serviced` remains red. Review adjustment: continue B3 inside
+    the real NDIS open/binding path, with typed adapter-binding/request/packet/buffer shadowing as
+    needed, not with private NDIS images or synthetic protocol binds.

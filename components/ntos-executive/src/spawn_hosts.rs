@@ -1350,6 +1350,10 @@ pub(crate) struct PumpResult {
     /// Pointer-width dispatch return. For IRP components this mirrors `status`; for win32k it is
     /// the full handler RAX, needed by NtUser/NtGdi APIs that return handles or LONG_PTR values.
     pub result: u64,
+    /// The reply object the pump was using when it returned. Hosted driver worker waits can park
+    /// one reply object and continue receiving on a fresh one; callers that persist the dispatch
+    /// transport must retain this final active cap.
+    pub reply_cap: u64,
     pub completed: bool,
     pub callback_suspended: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
@@ -1412,7 +1416,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     let outcome = component_pump_loop(ch, first, &mut reply_cap);
     pump_leave_depth(owns_depth, outcome.callback_suspended);
     pump_suspend_walled_component(ch, outcome);
-    pump_result_from_outcome(ch, outcome)
+    pump_result_from_outcome(ch, outcome, reply_cap)
 }
 
 #[inline(never)]
@@ -2217,7 +2221,11 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
 }
 
 #[inline(never)]
-unsafe fn pump_result_from_outcome(ch: &PumpChannel, outcome: PumpLoopOutcome) -> PumpResult {
+unsafe fn pump_result_from_outcome(
+    ch: &PumpChannel,
+    outcome: PumpLoopOutcome,
+    reply_cap: u64,
+) -> PumpResult {
     let (status, result) = if outcome.completed {
         // Proof-of-wiring: count each serviced dispatch by kind.
         match ch.caps.kind {
@@ -2246,6 +2254,7 @@ unsafe fn pump_result_from_outcome(ch: &PumpChannel, outcome: PumpLoopOutcome) -
     PumpResult {
         status,
         result,
+        reply_cap,
         completed: outcome.completed,
         callback_suspended: outcome.callback_suspended,
         wall_ip: outcome.wall_ip,

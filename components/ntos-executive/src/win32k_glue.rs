@@ -2462,6 +2462,7 @@ unsafe fn resume_suspended_user_callback_component(
         return crate::spawn_hosts::PumpResult {
             status: 0xC000_000Du32 as i32,
             result: 0xC000_000Du32 as u64,
+            reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
             wall_ip: 0,
@@ -2515,6 +2516,7 @@ unsafe fn resume_suspended_user_callback_component(
         return crate::spawn_hosts::PumpResult {
             status: 0xC000_000Du32 as i32,
             result: 0xC000_000Du32 as u64,
+            reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
             wall_ip: 0,

@@ -234,6 +234,10 @@ pub enum HostedProviderArgumentMarshal {
     CallerInBuffer {
         length_arg: u8,
     },
+    CallerInArray {
+        count_arg: u8,
+        element_size: u8,
+    },
     CallerInOwnedAllocation {
         length_arg: u8,
     },
@@ -629,7 +633,10 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutStatus,
             CallerOutHandle,
             CallerOutU32,
-            CallerInBuffer { length_arg: 5 },
+            CallerInArray {
+                count_arg: 5,
+                element_size: 4,
+            },
             Scalar,
             ProviderHandle,
             CallerContext,
@@ -1214,7 +1221,10 @@ mod tests {
         assert_eq!(policy.stack_qwords, 7);
         assert_eq!(
             policy.args[4],
-            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 5 }
+            HostedProviderArgumentMarshal::CallerInArray {
+                count_arg: 5,
+                element_size: 4,
+            }
         );
         assert_eq!(
             policy.args[8],
