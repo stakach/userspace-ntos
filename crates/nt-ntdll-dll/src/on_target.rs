@@ -2571,22 +2571,36 @@ unsafe fn publish_import_reference_edges(
     let count_ptrs = core::ptr::addr_of_mut!(IMPORT_REFERENCE_COUNT_PTRS).cast::<u64>();
     let next_counts = core::ptr::addr_of_mut!(IMPORT_REFERENCE_NEXT_COUNTS).cast::<u16>();
     let defer_bases = core::ptr::addr_of_mut!(IMPORT_REFERENCE_DEFER_BASES).cast::<u64>();
+    let table = core::ptr::addr_of!(MODULE_TABLE);
+    let mut visited = [0u64; MODULE_TABLE_CAP];
+    let mut visited_count = 0usize;
+    for edge in import_edges.as_slice() {
+        if edge.increment_existing {
+            // LdrpUpdateLoadCount recurses through an imported DLL's already-loaded dependencies.
+            // The matching release path does the same, so incrementing only the immediate import can
+            // over-release transitive dependencies when a runtime DLL is later unloaded.
+            let status = unsafe {
+                collect_reference_modules_dfs(table, edge.base, &mut visited, &mut visited_count)
+            };
+            if status != 0 {
+                return status;
+            }
+        }
+    }
+
     let mut planned = 0usize;
     let mut deferred = 0usize;
-    for edge in import_edges.as_slice() {
-        if !edge.increment_existing {
-            continue;
-        }
-        if unsafe { ldr_entry_for_base(edge.base) } == 0 {
+    for &base in &visited[..visited_count] {
+        if unsafe { ldr_entry_for_base(base) } == 0 {
             if deferred == MODULE_TABLE_CAP {
                 return STATUS_NO_MEMORY as u32;
             }
-            unsafe { core::ptr::write(defer_bases.add(deferred), edge.base) };
+            unsafe { core::ptr::write(defer_bases.add(deferred), base) };
             deferred += 1;
             continue;
         }
         let (count_ptr, next) = match unsafe {
-            crate::exports::ldr_plan_module_reference(edge.base, false)
+            crate::exports::ldr_plan_module_reference(base, false)
         } {
             Ok(plan) => plan,
             Err(status) => return status,

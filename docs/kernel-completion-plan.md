@@ -7667,7 +7667,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     drivers, win32k assets, and our ntdll. The kernel should discover those artifacts through explicit
     manifests and capability handoff instead of baking them into one large binary blob. Keep this as a
     packaging/ownership cleanup item; it should not block the current desktop repair unless the
-    BOOTBOOT limit reappears.
+    BOOTBOOT limit reappears. The 2026-08-17 desktop proof with the restored shell path still showed
+    `text @... 15855616 bytes`, so the boot image is below the hard limit but too close to keep
+    treating monolithic growth as acceptable.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
@@ -7719,7 +7721,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     payload path. Validation: `cargo fmt --all`, `cargo test -p nt-hive-core`,
     `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
     x86_64-unknown-none`, and desktop proof `.tmp/run-desktop-hive-shared-copy-20260817.log`.
-  - `[~]` Current frontier after the journaled hive-copy repair: the desktop proof reaches genuine
+  - `[x]` Current frontier after the journaled hive-copy repair: the desktop proof reaches genuine
     LSA logon, `NtCreateToken`, profile copy, `NtLoadKey`, `WlxActivateUserShell`, userinit launch,
     and Explorer launch. The summary moves to `292/298`; `exec_svc_rpc_listener_multiplex`,
     `exec_winlogon_user_shell_activated`, all userinit gates, Explorer process/create-window capture,
@@ -7731,3 +7733,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     through the normal ReactOS/user32/win32k paths. The quiesce dump shows Explorer at
     `shlwapi+0x11c0f`/`shdocvw` with RIP `0x8028b240` not resolved to a committed image page; use that
     as the next live diagnosis target, not a shell-specific fallback.
+  - `[x]` ntdll recursive loader-reference repair: the Explorer `0x8028b240` frontier was a loader
+    reference-accounting bug, not a kernel image-fault fallback problem. ReactOS recursively bumps the
+    load count for an already-loaded import's dependency graph and recursively releases the same graph
+    on unload; our ntdll only retained the immediate import while release walked transitively. A
+    runtime optional shell DLL could therefore over-release a transitive dependency such as `advapi32`
+    while `shlwapi`/`shdocvw` still needed it. The on-target loader now publishes recursive existing
+    import reference increments before runtime import publication, matching the existing recursive
+    release path. Validation: `cargo fmt --all`, `cargo test -p nt-ntdll
+    recursive_existing_import_references_balance_recursive_release`, `./scripts/build_ntdll_dll.sh`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`.
+  - `[~]` Current frontier after restored Explorer shell chrome: serialized desktop proof
+    `.tmp/run-desktop-loader-recursive-ref-20260817.log` reaches the sentinel with `297/298`
+    executive checks passing. The restored path is genuine: profile hive copy/load,
+    `WlxActivateUserShell`, userinit launch, Explorer launch, `RegisterWindowMessage` capture,
+    client-installed WndProc, shell COM class opens, real api0 redirects, BeginPaint/EndPaint,
+    GDI batch flushing, and full-framebuffer Explorer shell chrome all pass. The only red gate is
+    `exec_vm_pool_headroom`: `ut-free=8992KiB`, `ut-live-hw=253151KiB`, `cslots=218179/258479`,
+    `image-mapcap-fails=0`, `image-bank-fails=0`, `w32-bank-fails=0`, and frame-reg census top
+    owners are `pi=6`, `pi=2`, `pi=3`, `pi=10`, `pi=7`, and `pi=4`. Continue with mechanism-level
+    resource accounting/release and boot packaging separation; do not relax the gate and do not add
+    image-fault or Explorer-specific fallbacks.

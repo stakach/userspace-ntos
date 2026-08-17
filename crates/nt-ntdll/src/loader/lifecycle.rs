@@ -428,6 +428,34 @@ mod tests {
     }
 
     #[test]
+    fn recursive_existing_import_references_balance_recursive_release() {
+        // A runtime module imports an already-loaded module B. B itself imports C. ReactOS updates
+        // B and C when retaining B, and the unload path later releases B and C recursively. Updating
+        // only B would let the later recursive release tear C down while B is still loaded.
+        let original_b = 1;
+        let original_c = 1;
+
+        let retained_b = plan_reference_add(original_b, false);
+        let retained_c = plan_reference_add(original_c, false);
+        assert_eq!(retained_b, 2);
+        assert_eq!(retained_c, 2);
+
+        assert_eq!(
+            plan_reference_release(retained_b, 1),
+            ReferenceReleasePlan::DecrementTo(original_b)
+        );
+        assert_eq!(
+            plan_reference_release(retained_c, 1),
+            ReferenceReleasePlan::DecrementTo(original_c)
+        );
+
+        assert_eq!(
+            plan_reference_release(original_c, 1),
+            ReferenceReleasePlan::TeardownRequired
+        );
+    }
+
+    #[test]
     fn get_dll_handle_ex_selects_reference_behavior() {
         assert_eq!(
             get_dll_handle_action(0, true),
