@@ -7660,12 +7660,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     watchdog emitted a final gate. Treat this as a visibility gap first: add a bounded LSASS/services
     quiesce snapshot around the no-readiness frontier, then rerun so the next proof identifies the
     exact running thread and call site instead of relying on a partial census.
-  - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural smell,
-    not a resource problem to solve by inflating the monolithic image. The preferred direction is a
-    small seL4/rootserver boot image plus an initrd-loaded NT personality set: executive, isolated NT
-    services, hosted drivers, win32k assets, and our ntdll as separately loaded artifacts with explicit
-    manifests and capability handoff. Keep this as a packaging/ownership cleanup item; it should not
-    block the current LSASS desktop repair unless the BOOTBOOT limit reappears.
+  - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural
+    smell, not a resource problem to solve by inflating the monolithic image. The preferred direction
+    is a small seL4/rootserver boot image loaded directly by BOOTBOOT, plus an initrd/folder manifest
+    that carries the NT personality set as separate artifacts: executive, isolated NT services, hosted
+    drivers, win32k assets, and our ntdll. The kernel should discover those artifacts through explicit
+    manifests and capability handoff instead of baking them into one large binary blob. Keep this as a
+    packaging/ownership cleanup item; it should not block the current desktop repair unless the
+    BOOTBOOT limit reappears.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
@@ -7705,10 +7707,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `EXCEPTION_CONTINUE_SEARCH = 0`. This keeps user-mode RPC exceptions catchable by ReactOS
     advapi32/rpcrt4 code and should prevent the EventLog startup race from killing SCM. Validation:
     `cargo fmt --all`, `cargo test -p nt-ntdll exception`, and `./scripts/build_ntdll_dll.sh`.
-  - `[~]` Current frontier after the SEH repair: rebuild the desktop image with the staged
-    `.tmp/nt-ntdll.dll`, rerun `./run.sh --desktop`, and confirm the log no longer contains
-    rpcrt4's `handler continued execution` fail-fast path or `services.exe` self-termination after
-    the first EventLog RPC race. If SCM survives, the next blocker should be a later real shell path:
-    either winlogon's `ROpenSCManagerW` gets a real SCM response and userinit/Explorer launch
-    resumes, or the run exposes the next unimplemented kernel/ntdll primitive. Do not synthesize
-    `WlxActivateUserShell`, `userinit.exe`, Explorer, EventLog, or the SCM response.
+  - `[x]` SEH desktop retry: `.tmp/run-desktop-seh-disposition-20260817.log` confirms the staged
+    `nt-ntdll.dll` removed rpcrt4's `handler continued execution` fail-fast path and services.exe no
+    longer self-terminates after the early EventLog RPC race. SCM now survives into its real first-boot
+    registry work instead of dying before the service database/listener can exist.
+  - `[~]` Current frontier after the SEH repair: services.exe remains alive but is still busy in the
+    ReactOS `ScmCreateLastKnownGoodControlSet` / `RegCopyTreeW` path before
+    `ScmCreateServiceDatabase` and `ScmStartRpcServer`. The serialized desktop proof shows repeated
+    `NtOpenKey`, `NtCreateKey`, and `NtEnumerateKey` traffic, no SCM listener, and therefore no real
+    winlogon SCM response or userinit/Explorer launch. Continue by improving the generic Configuration
+    Manager path that this real control-set copy exercises: journal-backed mutable hive value-copy
+    should use existing live value payloads, and long registry copy traversal must provide progress
+    visibility without synthesizing SCM, `WlxActivateUserShell`, `userinit.exe`, Explorer, EventLog, or
+    any shell response.

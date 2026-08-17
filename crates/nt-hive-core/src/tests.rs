@@ -844,6 +844,101 @@ fn manager_boot_mutate_flush_survives_restart() {
 }
 
 #[test]
+fn manager_live_apply_can_share_value_payload_while_log_replays_bytes() {
+    let mut mgr = HiveManager::new(MemoryHiveIoProvider::new());
+    let mut hive = mgr.boot(HiveKind::System).unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::CreateKey {
+            path: r"ControlSet001\Enum\PCI\VEN_8086",
+        },
+    )
+    .unwrap();
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::CreateKey {
+            path: r"ControlSet002\Enum\PCI\VEN_8086",
+        },
+    )
+    .unwrap();
+
+    let mut large = alloc::vec::Vec::new();
+    large.resize(128 * 1024, 0x7b);
+    large[0] = 0x31;
+    let last = large.len() - 1;
+    large[last] = 0xd4;
+    mgr.mutate(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"ControlSet001\Enum\PCI\VEN_8086",
+            name: "AllocConfig",
+            value_type: RegistryValueType::ResourceList,
+            data: &large,
+        },
+    )
+    .unwrap();
+
+    let source_key = hive
+        .open_key(r"ControlSet001\Enum\PCI\VEN_8086")
+        .expect("source key");
+    let dest_key = hive
+        .open_key(r"ControlSet002\Enum\PCI\VEN_8086")
+        .expect("destination key");
+    let (source_value, _, _, source_data) = hive.value_ref_by_index(source_key, 0).unwrap();
+    let source_ptr = source_data.as_ptr();
+    let source_log_data = source_data.to_vec();
+    mgr.mutate_with_live_apply(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"ControlSet002\Enum\PCI\VEN_8086",
+            name: "AllocConfig",
+            value_type: RegistryValueType::ResourceList,
+            data: &source_log_data,
+        },
+        |hive| {
+            hive.set_value_from_existing_value(
+                dest_key,
+                "AllocConfig",
+                RegistryValueType::ResourceList,
+                source_value,
+            )
+        },
+    )
+    .unwrap();
+
+    let source_data = hive.query_value(source_key, "AllocConfig").unwrap().1;
+    let dest_data = hive.query_value(dest_key, "AllocConfig").unwrap().1;
+    assert_eq!(source_data.as_ptr(), source_ptr);
+    assert_eq!(dest_data.as_ptr(), source_ptr);
+    assert_eq!(dest_data[0], 0x31);
+    assert_eq!(dest_data[dest_data.len() - 1], 0xd4);
+
+    mgr.mutate_with_live_apply(
+        &mut hive,
+        HiveLogOp::SetValue {
+            path: r"ControlSet002\Enum\PCI\VEN_8086",
+            name: "ReplayOnly",
+            value_type: RegistryValueType::Dword,
+            data: &99u32.to_le_bytes(),
+        },
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(hive.query_dword(dest_key, "ReplayOnly"), Some(99));
+
+    mgr.provider_mut().crash();
+    let provider = mgr.into_provider();
+    let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
+    let booted_dest = booted
+        .open_key(r"ControlSet002\Enum\PCI\VEN_8086")
+        .expect("booted destination key");
+    let booted_data = booted.query_value(booted_dest, "AllocConfig").unwrap().1;
+    assert_eq!(booted_data[0], 0x31);
+    assert_eq!(booted_data[booted_data.len() - 1], 0xd4);
+    assert_eq!(booted.query_dword(booted_dest, "ReplayOnly"), Some(99));
+}
+
+#[test]
 fn manager_replays_deletes_and_key_metadata_after_checkpoint() {
     let mut mgr = HiveManager::new(MemoryHiveIoProvider::new());
     let mut hive = mgr.boot(HiveKind::Software).unwrap();

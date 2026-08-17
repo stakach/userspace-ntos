@@ -265,6 +265,34 @@ impl<P: HiveIoProvider> HiveManager<P> {
         Ok(())
     }
 
+    /// Journal one mutation, then let the caller apply an equivalent live mutation.
+    ///
+    /// This keeps the durable record in the canonical replay format while allowing live hives to
+    /// use richer in-memory operations, such as sharing an already-owned value payload during a
+    /// subtree copy. If the live fast path declines the mutation, the journal record is replayed so
+    /// the caller still observes the logged state.
+    pub fn mutate_with_live_apply<F>(
+        &mut self,
+        hive: &mut Hive,
+        op: HiveLogOp,
+        apply: F,
+    ) -> Result<(), HiveIoError>
+    where
+        F: FnOnce(&mut Hive) -> bool,
+    {
+        let seq = self.next_log_sequence;
+        let rec = encode_log_record(&op, seq);
+        self.provider.append_log_record(&rec)?;
+        if self.flush_mode == FlushMode::Strict {
+            self.provider.flush_log()?;
+        }
+        if !apply(hive) {
+            replay_log(hive, &rec, seq - 1);
+        }
+        self.next_log_sequence += 1;
+        Ok(())
+    }
+
     /// Checkpoint / lazy flush (spec §13.4): write a fresh image + truncate the log + clear the
     /// dirty set. Leaves the previous image intact on a write fault (spec §18.1).
     pub fn flush(&mut self, hive: &mut Hive) -> Result<(), HiveIoError> {
