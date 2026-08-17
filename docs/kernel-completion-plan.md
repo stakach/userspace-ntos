@@ -7585,7 +7585,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     syscall context evidence to find the first save/restore mismatch, and keep the boundary exact:
     do not synthesize `SetWindowStationUser` success, do not manufacture shell launches, and do not
     substitute a stack pointer without proving the correct kernel context transition.
-  - `[~]` Follow-up callback-context evidence: `.tmp/run-desktop-callback-rsp-20260817-full.log`
+  - `[x]` Follow-up callback-context evidence: `.tmp/run-desktop-callback-rsp-20260817-full.log`
     proves the chained win32k user-callback restore path writes a valid outer stack back to the
     winlogon TCB (`saved-rsp/out-rsp=0x1000105c3cf8`) before `NtUserSwitchDesktop` returns. That
     narrows the `rsp=0x3` failure to the next raw hosted syscall entry/reply boundary rather than
@@ -7594,8 +7594,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     used by the executive and verifies an UnknownSyscall fault reply restores `RAX`, resume IP,
     `RSP`, and flags from MR0/MR15/MR16/MR17. Added bounded `[interactive-ssn-ctx]` tracing at the
     executive high-SSN service boundary so the next desktop run can prove whether `SSN 0x1286`
-    arrives with a valid MR16 stack and corrupts on reply, or arrives already poisoned.
-  - `[~]` Follow-up syscall-reply context fix: `.tmp/run-desktop-interactive-ctx-20260817-full.log`
+    arrives with a valid MR16 stack and corrupts on reply, or arrives already poisoned. Closed by the
+    authoritative UnknownSyscall context repair below.
+  - `[x]` Follow-up syscall-reply context fix: `.tmp/run-desktop-interactive-ctx-20260817-full.log`
     proves `SSN 0x1286` arrives at the executive with `sp=0x3` after a valid callback restore, so
     the corruption happened before the service body for `NtUserSetWindowStationUser`. The immediate
     fix under validation makes the ordinary hosted UnknownSyscall reply path capture all 18 incoming
@@ -7607,7 +7608,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     require the post-`NtUserSwitchDesktop` raw user32 path to enter the next syscall with a valid
     stack. If later waits show the same shape, promote the compact parked-wait resume records
     (`resume_ip/sp/flags/status`) to carry the full saved syscall reply context as the same generic
-    transport rule.
+    transport rule. Closed by the authoritative UnknownSyscall context repair below.
   - `[x]` Follow-up callback ABI check: `.tmp/run-desktop-syscall-reply-context-20260817-full.log`
     shows the full-frame synchronous reply fix is necessary cleanup but not sufficient for the
     `rsp=0x3` frontier: `SSN 0x1286` still enters with `caller-sp=3`, while the last API15
@@ -7641,7 +7642,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     make the quiesce gate finish reliably after hive checkpointing, then continue the real winlogon
     GINA/logon path until `WlxActivateUserShell`, profile hive load, genuine userinit launch, and
     explorer chrome pixels reappear.
-  - `[~]` Current frontier after segmented win32k client cap banking: the desktop run is no longer
+  - `[x]` Current frontier after segmented win32k client cap banking: the desktop run is no longer
     stopped by BOOTBOOT size, root CSpace pressure, kernel CNode backing, or the raw user32 syscall
     context bug. The latest serialized trace reaches genuine background pixels, services.exe,
     LSASS, `\SeLsaCommandPort` creation, `\SeRmCommandPort` acceptance/completion, and the reverse
@@ -7652,14 +7653,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `LsarStartRpcServer`/`RpcServerListen`/`lsa_rpc_server_active` readiness path in this proof.
     Continue by identifying the exact late LSASS loader/syscall/RPC gap from the real main-thread
     execution state; do not synthesize the readiness event and do not launch userinit/explorer by
-    hand.
-  - `[~]` Follow-up desktop retry `.tmp/run-desktop-lsass-frontier-20260817.log` reconfirms the same
+    hand. Closed by the LSASS readiness visibility and later shell-launch proofs below.
+  - `[x]` Follow-up desktop retry `.tmp/run-desktop-lsass-frontier-20260817.log` reconfirms the same
     frontier from a committed baseline: no BOOTBOOT failure, no CNode exhaustion, `w32-bank-fails=0`,
     natural background paint, services.exe/LSASS started, and real SRM two-port handoff completed.
     The run was manually interrupted after output stopped during a periodic census line, before the
     watchdog emitted a final gate. Treat this as a visibility gap first: add a bounded LSASS/services
     quiesce snapshot around the no-readiness frontier, then rerun so the next proof identifies the
-    exact running thread and call site instead of relying on a partial census.
+    exact running thread and call site instead of relying on a partial census. Closed by the LSASS
+    readiness visibility and later shell-launch proofs below.
   - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural
     smell, not a resource problem to solve by inflating the monolithic image. The preferred direction
     is a small rust-micro seL4/rootserver boot image loaded directly by BOOTBOOT, plus an
