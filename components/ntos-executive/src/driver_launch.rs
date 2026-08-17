@@ -411,7 +411,10 @@ pub const SH_SUPPORT_RECORD_BYTES: u64 = SH_SUPPORT_RECORD_CAPACITY * SH_SUPPORT
 pub const SH_PROVIDER_EXPORT_ARG2: u64 = SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES; // in: captured r8
 pub const SH_PROVIDER_EXPORT_ARG3: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x08; // in: captured r9
 pub const SH_PROVIDER_EXPORT_CALLER_RSP: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x10; // in: dependent stack
-pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 = 0x20;
+pub const SH_PROVIDER_EXPORT_STACK_BASE: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x18; // in: stack args
+pub const SH_PROVIDER_EXPORT_STACK_QWORDS: u64 = 8;
+pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 =
+    0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8;
 pub const SH_DPC_QUEUE_BASE: u64 =
     SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
@@ -2889,8 +2892,8 @@ core::arch::global_asm!(
     "mov r15, rcx",
     "mov rsp, [rcx]",
     "jmp qword ptr [rcx + 8]",
-    ".globl fsd_guarded_call4",
-    "fsd_guarded_call4:", // rcx = handler, rdx/r8/r9/stack = args, stack = jump buffer
+    ".globl fsd_guarded_call_tail8",
+    "fsd_guarded_call_tail8:", // rcx = handler, rdx/r8/r9/stack = args, stack = tail/jump buffer
     "push rbp",
     "push rbx",
     "push rsi",
@@ -2900,8 +2903,9 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "mov r14, [rsp + 0x68]",
-    "mov r15, [rsp + 0x70]",
-    "lea rax, [rip + 19f]",
+    "mov r13, [rsp + 0x70]",
+    "mov r15, [rsp + 0x78]",
+    "lea rax, [rip + 29f]",
     "mov [r15], rsp",
     "mov [r15 + 8], rax",
     "mov r10, rcx",
@@ -2910,9 +2914,25 @@ core::arch::global_asm!(
     "mov r8, r9",
     "mov r9, r14",
     "and rsp, -16",
-    "sub rsp, 0x20",
+    "sub rsp, 0x60",
+    "mov rax, [r13]",
+    "mov [rsp + 0x20], rax",
+    "mov rax, [r13 + 0x08]",
+    "mov [rsp + 0x28], rax",
+    "mov rax, [r13 + 0x10]",
+    "mov [rsp + 0x30], rax",
+    "mov rax, [r13 + 0x18]",
+    "mov [rsp + 0x38], rax",
+    "mov rax, [r13 + 0x20]",
+    "mov [rsp + 0x40], rax",
+    "mov rax, [r13 + 0x28]",
+    "mov [rsp + 0x48], rax",
+    "mov rax, [r13 + 0x30]",
+    "mov [rsp + 0x50], rax",
+    "mov rax, [r13 + 0x38]",
+    "mov [rsp + 0x58], rax",
     "call r10",
-    "19:",
+    "29:",
     "mov rsp, [r15]",
     "pop r15",
     "pop r14",
@@ -2927,12 +2947,13 @@ core::arch::global_asm!(
 
 extern "win64" {
     fn fsd_guarded_call(handler: u64, devobj: u64, irp: u64, jb: *mut u64) -> i32;
-    fn fsd_guarded_call4(
+    fn fsd_guarded_call_tail8(
         handler: u64,
         arg0: u64,
         arg1: u64,
         arg2: u64,
         arg3: u64,
+        tail_base: u64,
         jb: *mut u64,
     ) -> u64;
     fn fsd_guarded_longjmp(jb: *mut u64) -> !;
@@ -12259,7 +12280,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     let arg3 = read_volatile(
         (dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
     );
-    let _caller_rsp = read_volatile(
+    let caller_rsp = read_volatile(
         (dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64,
     );
     let Some((_singleton_index, singleton)) =
@@ -12308,6 +12329,22 @@ pub(crate) unsafe fn service_hosted_provider_export(
     write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, arg1);
     write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, arg2);
     write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, arg3);
+    write_volatile(
+        (provider_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
+        caller_rsp,
+    );
+    let mut stack_index = 0u64;
+    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+        let value = read_volatile(
+            (dependent_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8)
+                as *const u64,
+        );
+        write_volatile(
+            (provider_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8) as *mut u64,
+            value,
+        );
+        stack_index += 1;
+    }
     write_volatile((provider_shared + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((provider_shared + SH_REQ_INFO) as *mut u64, 0);
     write_volatile((provider_shared + SH_ACTIVE_IRP) as *mut u64, 0);
@@ -13735,7 +13772,15 @@ unsafe fn component_dispatch_provider_export() -> (i32, u64) {
     jb[0] = 0;
     jb[1] = 0;
     jb[2] = 0;
-    let result = fsd_guarded_call4(export, arg0, arg1, arg2, arg3, jb.as_mut_ptr());
+    let result = fsd_guarded_call_tail8(
+        export,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE,
+        jb.as_mut_ptr(),
+    );
     let bugchecked = jb[2] != 0;
     jb[1] = 0;
     jb[2] = 0;
@@ -14109,6 +14154,15 @@ extern "win64" fn s_hosted_provider_export_gate_body(
             (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
             caller_rsp,
         );
+        let mut index = 0u64;
+        while index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+            let value = read_volatile((caller_rsp + 0x28 + index * 8) as *const u64);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + index * 8) as *mut u64,
+                value,
+            );
+            index += 1;
+        }
         let (_label, result, _, _, _) = call_on4(
             (FSD_SERVICE_PROVIDER_EXPORT_LABEL << 12) | 4,
             provider_export_rva,

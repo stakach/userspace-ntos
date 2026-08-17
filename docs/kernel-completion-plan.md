@@ -7080,3 +7080,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the provider export transport slice: `cargo fmt --all`, executive `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
   `git diff --check`.
+
+  B3 provider export stack-tail replay slice (2026-08-17, in progress): the provider-domain gate
+  now preserves the dependent caller's bounded Win64 stack tail instead of only the first four
+  register arguments. The dependent-side gate copies eight qwords after the return-address and
+  shadow-space slots into the shared frame; the executive validates the provider cookie/export pair
+  and transfers that tail into the provider component's shared frame; provider dispatch then rebuilds
+  the first four register arguments plus the copied stack tail before invoking the provider export
+  in the provider-owned runtime context. The gate remains deliberately unpublished because pointer
+  arguments still need an explicit marshalling policy before private NDIS/TCPIP dependency images can
+  be replaced by callable shared providers. Review adjustment: the next B3 slice should define that
+  pointer policy for a narrow NDIS export proof, publish `export_call_gate` only for validated
+  provider domains, and keep private dependency loading as the truthful path until the proof is
+  accepted.
+
+  Validation for the provider export stack-tail replay slice: `cargo fmt --all`, executive `cargo
+  check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`.
