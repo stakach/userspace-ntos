@@ -240,6 +240,7 @@ pub enum HostedProviderArgumentMarshal {
     CallerInProtocolCharacteristics {
         length_arg: u8,
     },
+    CallerInNdisBuffer,
     CallerInPacket,
     CallerInOutPacket,
     CallerInOutRequest,
@@ -377,13 +378,26 @@ fn export_policy(
     })
 }
 
+const HOSTED_PROVIDER_EXPORT_POLICY_DLLS: [&str; 1] = ["ndis.sys"];
+
+pub fn hosted_provider_has_export_marshal_policies(provider_dll: &str) -> bool {
+    let mut index = 0usize;
+    while index < HOSTED_PROVIDER_EXPORT_POLICY_DLLS.len() {
+        if ascii_eq_ignore_case(provider_dll, HOSTED_PROVIDER_EXPORT_POLICY_DLLS[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 pub fn hosted_provider_export_marshal_policy(
     provider_dll: &str,
     export_name: &str,
 ) -> Option<HostedProviderExportMarshalPolicy> {
     use HostedProviderArgumentMarshal::*;
 
-    if !ascii_eq_ignore_case(provider_dll, "ndis.sys") {
+    if !hosted_provider_has_export_marshal_policies(provider_dll) {
         return None;
     }
 
@@ -469,6 +483,7 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutDmaCommonBuffer { length_arg: 1 },
             CallerOutPhysicalAddress,
         ]),
+        "NDIS_BUFFER_TO_SPAN_PAGES" => export_policy(&[CallerInNdisBuffer]),
         "NdisFreeMemory" => {
             export_policy(&[CallerInOwnedAllocation { length_arg: 1 }, Scalar, Scalar])
         }
@@ -995,6 +1010,10 @@ mod tests {
 
     #[test]
     fn ndis_provider_policy_covers_observed_e1000_imports() {
+        assert!(hosted_provider_has_export_marshal_policies("NDIS.SYS"));
+        assert!(hosted_provider_has_export_marshal_policies("ndis.sys"));
+        assert!(!hosted_provider_has_export_marshal_policies("tcpip.sys"));
+
         for export in [
             "NdisAllocateMemoryWithTag",
             "NdisMInitializeScatterGatherDma",
@@ -1031,6 +1050,7 @@ mod tests {
             "NdisOpenAdapter",
             "NdisCloseAdapter",
             "NdisRegisterProtocol",
+            "NDIS_BUFFER_TO_SPAN_PAGES",
             "NdisFreePacket",
             "NdisAllocatePacket",
             "NdisGetFirstBufferFromPacket",
@@ -1176,6 +1196,17 @@ mod tests {
                 length_arg: 1,
                 physical_address_arg: 4,
             }
+        );
+    }
+
+    #[test]
+    fn ndis_buffer_span_policy_treats_buffer_as_typed_mdl_header() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NDIS_BUFFER_TO_SPAN_PAGES").unwrap();
+        assert_eq!(policy.argument_count, 1);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerInNdisBuffer
         );
     }
 

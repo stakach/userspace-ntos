@@ -7371,3 +7371,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the NDIS shared-DMA provider slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 callable-provider publication slice (2026-08-17): provider singleton publication
+  now advertises the executive provider-domain export gate only when `nt-hosted-runtime` has a
+  marshal-policy family for that provider DLL. This keeps unknown providers as metadata-only records
+  and moves `ndis.sys` into the real callable-domain path without adding a private-image fallback.
+  The first serialized boot proof with this change,
+  `.tmp/run-headless-b3-provider-gate-20260817-180804.log`, showed the intended transition:
+  `ndis.sys` published an `export-gate`, provider sharing reported `provider-domains=2`, and
+  Explorer later reached real win32k traffic. It did not reach the desktop PASS marker; the early B3
+  hardware gates went red because `tcpip.sys` exposed the next honest provider-boundary gap,
+  `ndis.sys!NDIS_BUFFER_TO_SPAN_PAGES`, as a missing marshal policy. The follow-up slice adds a
+  typed `CallerInNdisBuffer` policy for that export. Caller-local NDIS buffers are copied as MDL
+  headers into the provider marshal frame, while provider-owned NDIS buffer handles are passed
+  through only after validation in the provider component's address space. The follow-up serialized
+  boot proof, `.tmp/run-headless-b3-ndis-buffer-20260817-181641.log`, clears that import-resolution
+  blocker: there are no missing provider marshal policies, `ndis.sys` publishes an export gate,
+  provider sharing reports `provider-domains=2`, `NtLoadKey` mounts the Administrator profile hive,
+  `WlxActivateUserShell` reads the real `Userinit` SOFTWARE value, `userinit.exe` starts, and
+  `explorer.exe` plus `kbswitch.exe` reach real win32k traffic. The run was stopped manually before
+  the desktop PASS marker after Explorer reached 11,734 native/win32k syscalls with 2,613 win32k
+  dispatches.
+  Review adjustment: B3 now moves to the dependent miniport registration side effects under callable
+  NDIS. In the same boot proof, `e1000.sys` DriverEntry returns success but the hosted verdict is
+  `0x7` with no AddDevice pointer, so generic PnP correctly reports
+  `generic hardware AddDevice failed status=0xc0000010`. Repair the
+  `NdisMRegisterMiniport`/driver-object publication path so the provider-domain call reflects the
+  miniport's dynamic registration back to the dependent driver object. Do not reintroduce private
+  NDIS dependency loading or synthetic AddDevice fallbacks for callable-provider cases.
+
+  Validation for the callable-provider publication and NDIS buffer slice: `cargo fmt --all`,
+  `cargo test -p nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

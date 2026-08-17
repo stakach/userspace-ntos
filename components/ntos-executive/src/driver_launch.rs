@@ -34,8 +34,9 @@ use nt_dma_manager::{
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
-    ndis_miniport_characteristics_layout, plan_hosted_driver_image,
-    plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
+    hosted_provider_has_export_marshal_policies, ndis_miniport_characteristics_layout,
+    plan_hosted_driver_image, plan_hosted_provider_import_binding,
+    plan_hosted_provider_import_thunk,
     HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
     HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
     HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy, HostedProviderImportBinding,
@@ -3165,6 +3166,7 @@ const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
 const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_INVALID_PARAMETER_MIX: i32 = 0xC000_0030u32 as i32;
+const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
 const STATUS_SEMAPHORE_LIMIT_EXCEEDED: i32 = 0xC000_0047u32 as i32;
@@ -12286,6 +12288,11 @@ unsafe fn register_hosted_provider_singleton(
     let singletons =
         core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
     let provider_domain_cookie = (count as u64).saturating_add(1);
+    let export_call_gate = if hosted_provider_has_export_marshal_policies(provider.as_str()) {
+        hosted_provider_export_gate_va()
+    } else {
+        0
+    };
     *singletons.add(count) = HostedProviderSingleton {
         present: true,
         provider,
@@ -12297,7 +12304,7 @@ unsafe fn register_hosted_provider_singleton(
         image_frames,
         pool_base,
         pool_frames,
-        export_call_gate: 0,
+        export_call_gate,
         provider_domain_cookie,
     };
     HOSTED_PROVIDER_SINGLETON_COUNT.store((count + 1) as u64, Ordering::Relaxed);
@@ -12309,6 +12316,11 @@ unsafe fn register_hosted_provider_singleton(
     print_u64(pool_frames);
     print_str(b" cookie=");
     print_u64(provider_domain_cookie);
+    if export_call_gate != 0 {
+        print_str(b" export-gate=0x");
+        print_hex((export_call_gate >> 32) as u32);
+        print_hex(export_call_gate as u32);
+    }
     print_str(b"\n");
     true
 }
@@ -13147,6 +13159,40 @@ unsafe fn provider_marshal_owned_allocation(
     Ok(0)
 }
 
+unsafe fn provider_marshal_ndis_buffer(
+    state: &mut ProviderMarshalState,
+    provider_instance: usize,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    if arg_value == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mdl_bytes = nt_mdl::MDL_SIZE as u64;
+    if let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, mdl_bytes)
+    {
+        let Some((provider_component_va, provider_exec_va)) =
+            provider_marshal_alloc(state, provider_shared, mdl_bytes)
+        else {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        copy_bytes(provider_exec_va, dependent_exec_va, mdl_bytes);
+        return Ok(provider_component_va);
+    }
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if component_to_exec_va_for_instance(provider_instance, provider_inst, arg_value, mdl_bytes)
+        .is_none()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(arg_value)
+}
+
 unsafe fn provider_marshal_unicode_string(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -13344,6 +13390,14 @@ unsafe fn prepare_provider_export_marshal(
             )?,
             HostedProviderArgumentMarshal::CallerInUnicodeString => provider_marshal_unicode_string(
                 &mut state,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+            )?,
+            HostedProviderArgumentMarshal::CallerInNdisBuffer => provider_marshal_ndis_buffer(
+                &mut state,
+                provider_instance,
                 dependent_index,
                 dependent_inst,
                 provider_shared,
@@ -23212,8 +23266,6 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     {
         state.mmio_broker_va = mmio_broker_va;
         state.dma_broker_va = dma_broker_va;
-        state.dma_frame_base = dma_frame_base;
-        state.dma_pages = dma_pages;
     }
     Ok(())
 }
