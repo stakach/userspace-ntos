@@ -12722,6 +12722,27 @@ unsafe fn provider_marshal_output_cell(
     Ok(provider_component_va)
 }
 
+unsafe fn provider_marshal_output_buffer(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    bytes: u64,
+) -> Result<u64, i32> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    provider_marshal_output_cell(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        arg_value,
+        bytes,
+    )
+}
+
 unsafe fn provider_marshal_output_pointer_from_length(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -12999,6 +13020,20 @@ unsafe fn prepare_provider_export_marshal(
                 provider_shared,
                 arg,
             )?,
+            HostedProviderArgumentMarshal::CallerOutBuffer { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_output_buffer(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
             HostedProviderArgumentMarshal::CallerInMiniportCharacteristics { length_arg } => {
                 let length_index = length_arg as usize;
                 if length_index >= policy.argument_count as usize {

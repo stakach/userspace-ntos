@@ -1047,6 +1047,19 @@ mod tests {
     }
 
     #[test]
+    fn ndis_read_pci_policy_copies_caller_output_buffer() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisReadPciSlotInformation")
+                .unwrap();
+        assert_eq!(policy.argument_count, 5);
+        assert_eq!(policy.stack_qwords, 1);
+        assert_eq!(
+            policy.args[3],
+            HostedProviderArgumentMarshal::CallerOutBuffer { length_arg: 4 }
+        );
+    }
+
+    #[test]
     fn ndis_miniport_characteristics_layout_follows_nt5_versions() {
         assert_eq!(
             ndis_miniport_characteristics_layout(3, 0, NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64),

@@ -7302,3 +7302,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the NDIS caller allocation ownership/free slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 `NdisReadPciSlotInformation` output-buffer slice (2026-08-17, in progress): the provider export
+  marshaller now handles `CallerOutBuffer { length_arg }`. It validates the dependent caller buffer,
+  allocates zeroed provider scratch of the requested byte length, passes that provider-visible buffer
+  to the real export, and copies the bytes back to the dependent component during marshal
+  completion. The runtime policy for `NdisReadPciSlotInformation` is pinned by a unit test:
+  argument 3 is the caller output buffer and argument 4, carried on the Win64 stack, supplies the
+  byte count.
+  Review adjustment: `NdisMQueryAdapterResources` is now the next `MiniportInitialize` export
+  blocker. Implement its `CallerInOutU32` BufferSize cell first, then the resource-list copyout path
+  that supports the NT5 two-call sizing pattern (`ResourceList == NULL`, `*BufferSize == 0` returns
+  `NDIS_STATUS_RESOURCES` and the required size; the second call copies the resource list).
+
+  Validation for the `NdisReadPciSlotInformation` output-buffer slice: `cargo fmt --all`, `cargo
+  test -p nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
