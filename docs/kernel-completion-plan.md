@@ -7208,3 +7208,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the hosted executable thunk arena cleanup: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 live executable thunk metadata slice (2026-08-17, in progress): hosted driver instances now
+  retain the executable thunk arena after PE import resolution. `DriverComponent` and the live
+  `DriverInstance` snapshot carry the executive-side base, component-side base, arena length, and
+  next free slot after load-time provider-import thunks; a runtime allocator can hand out additional
+  slots without disturbing already-emitted import thunks. This is the metadata bridge needed by
+  `NdisMRegisterMiniport` marshalling to emit provider-visible reverse callback thunks from the
+  provider's own executable image window instead of using scratch data or cross-mapping dependent
+  code.
+  Review adjustment: next B3 work should add bounded callback-cookie records, use the live thunk
+  allocator while copying nonzero miniport callback slots, and introduce the provider callback gate
+  service that pumps the owning dependent component.
+
+  Validation for the live executable thunk metadata slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.

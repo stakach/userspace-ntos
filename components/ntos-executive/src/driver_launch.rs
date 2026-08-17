@@ -11704,6 +11704,10 @@ impl HostedExecutableThunkWriter {
             .ok_or(HostedProviderImportThunkError::Overflow)?;
         Ok(thunk)
     }
+
+    fn next_index(&self) -> u64 {
+        self.next
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15109,6 +15113,14 @@ pub(crate) struct DriverComponent {
     /// Number of component image frames mapped at [`FSD_CODE_VA`] for this driver and its support
     /// provider images.
     pub image_frames: u64,
+    /// Executive-side base of the executable thunk arena appended to this hosted image, if any.
+    pub exec_thunk_va: u64,
+    /// Component-side base of the executable thunk arena appended to this hosted image, if any.
+    pub run_thunk_va: u64,
+    /// Executable thunk arena byte length.
+    pub thunk_len: u64,
+    /// First free thunk slot after load-time provider-import thunk emission.
+    pub thunk_next: u64,
     /// This driver's instance index in [`DRIVER_INSTANCES`].
     pub instance: usize,
     /// Canonical executive/I/O route id for this driver binding.
@@ -16457,6 +16469,20 @@ unsafe fn load_driver_reserved(
     clear_dma_allocation_records(win.shared_va);
     clear_shared_device_interface_state_at(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);
+    let (exec_thunk_va, run_thunk_va, thunk_len, thunk_next) =
+        if planned_images.executable_thunk_frames == 0 {
+            (0, 0, 0, 0)
+        } else {
+            (
+                code_va + planned_images.executable_thunk_offset,
+                run_va + planned_images.executable_thunk_offset,
+                planned_images.executable_thunk_frames * 0x1000,
+                executable_thunk_writer
+                    .as_ref()
+                    .map(|writer| writer.next_index())
+                    .unwrap_or(0),
+            )
+        };
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -16496,6 +16522,10 @@ unsafe fn load_driver_reserved(
             exec_stack_va: win.stack_va,
             exec_arg_va: win.arg_va,
             image_frames: img_frames,
+            exec_thunk_va,
+            run_thunk_va,
+            thunk_len,
+            thunk_next,
             tcb,
             cnode,
             reply_cap,
@@ -16647,6 +16677,10 @@ unsafe fn load_driver_reserved(
         exec_stack_va: win.stack_va,
         exec_arg_va: win.arg_va,
         image_frames: img_frames,
+        exec_thunk_va,
+        run_thunk_va,
+        thunk_len,
+        thunk_next,
         instance,
         driver_id,
         device_id: 0,
@@ -19198,6 +19232,10 @@ pub(crate) struct DriverInstance {
     pub exec_stack_va: u64,
     pub exec_arg_va: u64,
     pub image_frames: u64,
+    pub exec_thunk_va: u64,
+    pub run_thunk_va: u64,
+    pub thunk_len: u64,
+    pub thunk_next: u64,
     pub tcb: u64,
     pub cnode: u64,
     pub reply_cap: u64,
@@ -19219,6 +19257,10 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_stack_va: 0,
     exec_arg_va: 0,
     image_frames: 0,
+    exec_thunk_va: 0,
+    run_thunk_va: 0,
+    thunk_len: 0,
+    thunk_next: 0,
     tcb: 0,
     cnode: 0,
     reply_cap: 0,
@@ -19756,6 +19798,10 @@ fn register_instance(dc: &DriverComponent) {
         exec_stack_va: dc.exec_stack_va,
         exec_arg_va: dc.exec_arg_va,
         image_frames: dc.image_frames,
+        exec_thunk_va: dc.exec_thunk_va,
+        run_thunk_va: dc.run_thunk_va,
+        thunk_len: dc.thunk_len,
+        thunk_next: dc.thunk_next,
         tcb: dc.tcb,
         cnode: dc.cnode,
         reply_cap: dc.reply_cap,
@@ -19771,6 +19817,28 @@ fn register_instance(dc: &DriverComponent) {
         ready: dc.finished && dc.devobj != 0,
         used: true,
     };
+}
+
+#[allow(dead_code)]
+unsafe fn allocate_instance_executable_thunk(instance: usize) -> Option<(u64, u64, u64)> {
+    let table = driver_instances_mut();
+    let inst = table.get_mut(instance)?;
+    if !inst.used || inst.exec_thunk_va == 0 || inst.run_thunk_va == 0 || inst.thunk_len == 0 {
+        return None;
+    }
+    let thunk_offset = inst
+        .thunk_next
+        .checked_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)?;
+    let thunk_end = thunk_offset.checked_add(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN)?;
+    if thunk_end > inst.thunk_len {
+        return None;
+    }
+    let thunk_index = inst.thunk_next;
+    let exec_va = inst.exec_thunk_va.checked_add(thunk_offset)?;
+    let run_va = inst.run_thunk_va.checked_add(thunk_offset)?;
+    let next = inst.thunk_next.checked_add(1)?;
+    inst.thunk_next = next;
+    Some((exec_va, run_va, thunk_index))
 }
 
 pub(crate) fn driver_object_id(driver_id: u64) -> u64 {
