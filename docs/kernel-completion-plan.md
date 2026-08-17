@@ -7063,3 +7063,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the singleton identity slice: `cargo fmt --all`, executive `cargo check
   --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
   `git diff --check`.
+
+  B3 provider export transport slice (2026-08-17, in progress): the hosted-driver pump now
+  recognizes a provider-export service label from a dependent component and routes it by
+  provider-domain cookie to a concrete provider instance. The dependent-side gate stub captures the
+  thunk's provider export RVA, provider cookie, the first four Win64 argument registers, and the
+  dependent caller stack pointer; the executive validates the cookie/export pair, fills the provider
+  component's shared frame with a special provider-export dispatch selector, and drives the provider
+  through the normal component pump so the export runs in the provider-owned VSpace and can make
+  nested hosted-driver service calls. The gate remains deliberately unpublished because stack-tail
+  argument replay is only captured, not yet reconstructed on the provider call frame. Review
+  adjustment: next B3 work should replay the dependent caller's stack arguments into the provider
+  call frame, then publish `export_call_gate` for a narrow provider proof and enable shared-provider
+  planning behind that proof.
+
+  Validation for the provider export transport slice: `cargo fmt --all`, executive `cargo check
+  --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+  `git diff --check`.

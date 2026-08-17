@@ -1569,6 +1569,18 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PROVIDER_EXPORT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let result = crate::driver_launch::service_hosted_provider_export(
+                ch,
+                msg.m0,
+                msg.m1,
+                msg.m2,
+                msg.m3,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, result);
+            continue;
         } else if label == 6 {
             outcome.faults += 1;
             if !pump_service_vm_fault(

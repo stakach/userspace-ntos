@@ -408,7 +408,12 @@ pub const SH_SUPPORT_RECORD_STATUS: u64 = 0x08;
 pub const SH_SUPPORT_RECORD_VERDICT: u64 = 0x0C;
 pub const SH_SUPPORT_RECORDS: u64 = SH_HANDOFF_ARENA_BASE; // in/out: support DriverEntry records
 pub const SH_SUPPORT_RECORD_BYTES: u64 = SH_SUPPORT_RECORD_CAPACITY * SH_SUPPORT_RECORD_SIZE;
-pub const SH_DPC_QUEUE_BASE: u64 = SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES; // out: queued KDPC pointers
+pub const SH_PROVIDER_EXPORT_ARG2: u64 = SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES; // in: captured r8
+pub const SH_PROVIDER_EXPORT_ARG3: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x08; // in: captured r9
+pub const SH_PROVIDER_EXPORT_CALLER_RSP: u64 = SH_PROVIDER_EXPORT_ARG2 + 0x10; // in: dependent stack
+pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 = 0x20;
+pub const SH_DPC_QUEUE_BASE: u64 =
+    SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
 pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
     ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
@@ -465,6 +470,7 @@ pub const FSD_SERVICE_KE_PULSE_EVENT_LABEL: u64 = 0x776;
 pub const FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL: u64 = 0x777;
 pub const FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL: u64 = 0x778;
 pub const FSD_SERVICE_REGISTRY_LABEL: u64 = 0x779;
+pub const FSD_SERVICE_PROVIDER_EXPORT_LABEL: u64 = 0x77A;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -473,6 +479,7 @@ pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
 pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
 pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
 pub const FSD_DISPATCH_VIDEO_ADD_DEVICE: u64 = u64::MAX - 0x778;
+pub const FSD_DISPATCH_PROVIDER_EXPORT: u64 = u64::MAX - 0x779;
 
 pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
     matches!(
@@ -485,6 +492,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_KE_WAIT_MULTIPLE_LABEL
             | FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
             | FSD_SERVICE_REGISTRY_LABEL
+            | FSD_SERVICE_PROVIDER_EXPORT_LABEL
     )
 }
 
@@ -2881,10 +2889,52 @@ core::arch::global_asm!(
     "mov r15, rcx",
     "mov rsp, [rcx]",
     "jmp qword ptr [rcx + 8]",
+    ".globl fsd_guarded_call4",
+    "fsd_guarded_call4:", // rcx = handler, rdx/r8/r9/stack = args, stack = jump buffer
+    "push rbp",
+    "push rbx",
+    "push rsi",
+    "push rdi",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov r14, [rsp + 0x68]",
+    "mov r15, [rsp + 0x70]",
+    "lea rax, [rip + 19f]",
+    "mov [r15], rsp",
+    "mov [r15 + 8], rax",
+    "mov r10, rcx",
+    "mov rcx, rdx",
+    "mov rdx, r8",
+    "mov r8, r9",
+    "mov r9, r14",
+    "and rsp, -16",
+    "sub rsp, 0x20",
+    "call r10",
+    "19:",
+    "mov rsp, [r15]",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rdi",
+    "pop rsi",
+    "pop rbx",
+    "pop rbp",
+    "ret",
 );
 
 extern "win64" {
     fn fsd_guarded_call(handler: u64, devobj: u64, irp: u64, jb: *mut u64) -> i32;
+    fn fsd_guarded_call4(
+        handler: u64,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        jb: *mut u64,
+    ) -> u64;
     fn fsd_guarded_longjmp(jb: *mut u64) -> !;
 }
 
@@ -11773,6 +11823,9 @@ static HOSTED_PROVIDER_SHARED_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_SHARED_POOL_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_SINGLETON_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_SINGLETON_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES);
@@ -11883,6 +11936,25 @@ unsafe fn find_hosted_provider_singleton(
     while index < bounded_count {
         let singleton = hosted_provider_singleton_at(index);
         if singleton.present && hosted_ascii_eq_ignore_case(&singleton.provider, provider) {
+            return Some((index, singleton));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn find_hosted_provider_singleton_by_cookie(
+    provider_domain_cookie: u64,
+) -> Option<(usize, HostedProviderSingleton)> {
+    if provider_domain_cookie == 0 {
+        return None;
+    }
+    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let singleton = hosted_provider_singleton_at(index);
+        if singleton.present && singleton.provider_domain_cookie == provider_domain_cookie {
             return Some((index, singleton));
         }
         index += 1;
@@ -12166,6 +12238,132 @@ fn hosted_provider_domain_descriptor(
         export_call_gate: singleton.export_call_gate,
         provider_domain_cookie: singleton.provider_domain_cookie,
     }
+}
+
+fn hosted_provider_export_failure(status: i32) -> u64 {
+    HOSTED_PROVIDER_EXPORT_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    status as u32 as u64
+}
+
+pub(crate) unsafe fn service_hosted_provider_export(
+    dependent_channel: &crate::spawn_hosts::PumpChannel,
+    provider_export_rva: u64,
+    provider_domain_cookie: u64,
+    arg0: u64,
+    arg1: u64,
+) -> u64 {
+    HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let arg2 = read_volatile(
+        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG2) as *const u64,
+    );
+    let arg3 = read_volatile(
+        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
+    );
+    let _caller_rsp = read_volatile(
+        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64,
+    );
+    let Some((_singleton_index, singleton)) =
+        find_hosted_provider_singleton_by_cookie(provider_domain_cookie)
+    else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let descriptor = hosted_provider_domain_descriptor(singleton);
+    match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
+        Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
+        Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
+            return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY)
+        }
+        Err(_) => return hosted_provider_export_failure(STATUS_INVALID_PARAMETER),
+    }
+    if instance_by_shared_va(dependent_channel.shared_va)
+        .map(|(index, _)| index == singleton.instance)
+        .unwrap_or(false)
+    {
+        return hosted_provider_export_failure(STATUS_INVALID_PARAMETER);
+    }
+    let Some(provider_inst) = instance(singleton.instance) else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
+    if provider_inst.fault_ep == 0
+        || provider_inst.pml4 == 0
+        || provider_inst.reply_cap == 0
+        || provider_inst.driver_object == 0
+    {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    }
+    let Some(exec_code_va) = ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
+    else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let provider_shared = provider_inst.exec_shared_va;
+    write_volatile(
+        (provider_shared + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_PROVIDER_EXPORT,
+    );
+    write_volatile(
+        (provider_shared + SH_REQ_MINOR) as *mut u64,
+        provider_export_rva,
+    );
+    write_volatile((provider_shared + SH_REQ_FSCTL) as *mut u64, arg0);
+    write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, arg1);
+    write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, arg2);
+    write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, arg3);
+    write_volatile((provider_shared + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((provider_shared + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_IRP) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_IOSL) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_DATA) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
+
+    let image_frames = if provider_inst.image_frames == 0 {
+        singleton.image_frames
+    } else {
+        provider_inst.image_frames
+    };
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: provider_inst.fault_ep,
+        pml4: provider_inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va,
+        shared_va: provider_shared,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: provider_inst.tcb,
+        reply_cap: provider_inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile(
+                (provider_shared + SH_RESOURCE_IO_PORT_CAP) as *const u64,
+            ) != 0,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(singleton.instance, false);
+        return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
+    }
+    let result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
+    HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
+        print_str(b"[driver-import] provider-domain export dispatched cookie=");
+        print_u64(provider_domain_cookie);
+        print_str(b" rva=0x");
+        print_hex(provider_export_rva as u32);
+        print_str(b" result=0x");
+        print_hex((result >> 32) as u32);
+        print_hex(result as u32);
+        print_str(b" frames=");
+        print_u64(image_frames);
+        print_str(b"\n");
+    }
+    result
 }
 
 unsafe fn add_shared_provider_if_registered(
@@ -13523,6 +13721,30 @@ unsafe fn component_dispatch_video_start_io() -> (i32, u64) {
     )
 }
 
+unsafe fn component_dispatch_provider_export() -> (i32, u64) {
+    let export_rva = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+    let export = match FSD_CODE_VA.checked_add(export_rva) {
+        Some(export) => export,
+        None => return (STATUS_INVALID_PARAMETER, 0),
+    };
+    let arg0 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+    let arg1 = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
+    let arg2 = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+    let arg3 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+    let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
+    jb[0] = 0;
+    jb[1] = 0;
+    jb[2] = 0;
+    let result = fsd_guarded_call4(export, arg0, arg1, arg2, arg3, jb.as_mut_ptr());
+    let bugchecked = jb[2] != 0;
+    jb[1] = 0;
+    jb[2] = 0;
+    if bugchecked {
+        return (STATUS_UNSUCCESSFUL, 0);
+    }
+    (STATUS_SUCCESS, result)
+}
+
 /// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
 /// DriverEntry-preamble → dispatch-loop shape to [`crate::spawn_hosts::component_main`], plugging the
 /// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
@@ -13759,6 +13981,9 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     if major == FSD_DISPATCH_VIDEO_START_IO {
         return component_dispatch_video_start_io();
     }
+    if major == FSD_DISPATCH_PROVIDER_EXPORT {
+        return component_dispatch_provider_export();
+    }
     let mj_base = req.drv + 0x70;
     let handler = read_volatile((mj_base + major * 8) as *const u64);
     if handler != 0 {
@@ -13829,6 +14054,70 @@ unsafe fn call_on5(
 ) -> (u64, u64, u64, u64, u64) {
     core::ptr::write_volatile((crate::IPCBUF_VADDR + 8 + 4 * 8) as *mut u64, arg4);
     call_on4(msginfo, arg0, arg1, arg2, arg3)
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl hosted_provider_export_gate",
+    "hosted_provider_export_gate:",
+    // Entry from a generated provider-import thunk:
+    //   rax = provider export RVA, r10 = provider-domain cookie
+    //   rcx/rdx/r8/r9 + caller stack = original Win64 export arguments.
+    "mov r11, rsp",
+    "sub rsp, 0x48",
+    "mov [rsp + 0x20], r8",
+    "mov [rsp + 0x28], r9",
+    "mov [rsp + 0x30], r11",
+    "mov r8, rcx",
+    "mov r9, rdx",
+    "mov rcx, rax",
+    "mov rdx, r10",
+    "call s_hosted_provider_export_gate_body",
+    "add rsp, 0x48",
+    "ret",
+);
+
+extern "win64" {
+    fn hosted_provider_export_gate();
+}
+
+#[allow(dead_code)]
+fn hosted_provider_export_gate_va() -> u64 {
+    hosted_provider_export_gate as *const () as usize as u64
+}
+
+#[no_mangle]
+extern "win64" fn s_hosted_provider_export_gate_body(
+    provider_export_rva: u64,
+    provider_domain_cookie: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    caller_rsp: u64,
+) -> u64 {
+    unsafe {
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG2) as *mut u64,
+            arg2,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG3) as *mut u64,
+            arg3,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
+            caller_rsp,
+        );
+        let (_label, result, _, _, _) = call_on4(
+            (FSD_SERVICE_PROVIDER_EXPORT_LABEL << 12) | 4,
+            provider_export_rva,
+            provider_domain_cookie,
+            arg0,
+            arg1,
+        );
+        result
+    }
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT and invoke the FSD's
