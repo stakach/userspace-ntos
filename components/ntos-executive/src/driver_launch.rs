@@ -33,8 +33,8 @@ use nt_dma_manager::{
 };
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_import_thunk,
-    plan_hosted_driver_image, plan_hosted_provider_import_binding,
-    plan_hosted_provider_import_thunk,
+    hosted_provider_export_marshal_policy, plan_hosted_driver_image,
+    plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
     HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
     HostedProviderExportCallPlan, HostedProviderImportBinding, HostedProviderImportBindingError,
     HostedDriverImagePlanError, HostedProviderImportThunkError, HostedProviderImportThunkPlan,
@@ -12236,6 +12236,14 @@ pub(crate) unsafe fn service_hosted_provider_export(
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
     let descriptor = hosted_provider_domain_descriptor(singleton);
+    if !loaded_pe_export_rva_has_marshal_policy(
+        singleton.provider.as_str(),
+        singleton.exec_va,
+        singleton.image_len,
+        provider_export_rva,
+    ) {
+        return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
+    }
     match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
         Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
         Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
@@ -13337,6 +13345,21 @@ unsafe fn log_provider_domain_export_thunk_missing(
     }
 }
 
+unsafe fn log_provider_domain_export_policy_missing(dll: &str, name: &str) {
+    if DRIVER_UNRESOLVED_IMPORTS_LOGGED < 48 {
+        DRIVER_UNRESOLVED_IMPORTS_LOGGED += 1;
+        print_str(b"[driver-import] provider-domain marshal policy missing ");
+        for &b in dll.as_bytes() {
+            debug_put_char(b);
+        }
+        debug_put_char(b'!');
+        for &b in name.as_bytes() {
+            debug_put_char(b);
+        }
+        print_str(b"\n");
+    }
+}
+
 unsafe fn lookup_hosted_provider_singleton_export_plan(
     provider: &str,
     name: &str,
@@ -13362,6 +13385,10 @@ unsafe fn lookup_hosted_provider_singleton_export_plan(
             print_str(b"\n");
             return None;
         }
+    }
+    if hosted_provider_export_marshal_policy(provider, name).is_none() {
+        log_provider_domain_export_policy_missing(provider, name);
+        return None;
     }
     let export = lookup_loaded_pe_export_target(
         singleton.exec_va,
@@ -15354,6 +15381,132 @@ unsafe fn lookup_loaded_pe_export_target(
         i += 1;
     }
     None
+}
+
+unsafe fn loaded_pe_export_rva_has_marshal_policy(
+    provider: &str,
+    image_va: u64,
+    image_len: u32,
+    provider_export_rva: u64,
+) -> bool {
+    let cap = image_len as u64;
+    let Some(e) = loaded_pe_u32(image_va, cap, 0x3c) else {
+        return false;
+    };
+    let e = e as u64;
+    if loaded_pe_u32(image_va, cap, e) != Some(0x0000_4550) {
+        return false;
+    }
+    let Some(opt) = e.checked_add(24) else {
+        return false;
+    };
+    let Some(export_dir_rva) = opt.checked_add(112) else {
+        return false;
+    };
+    let Some(export_rva) = loaded_pe_u32(image_va, cap, export_dir_rva) else {
+        return false;
+    };
+    let export_rva = export_rva as u64;
+    let Some(export_size_rva) = opt.checked_add(112 + 4) else {
+        return false;
+    };
+    let Some(export_size) = loaded_pe_u32(image_va, cap, export_size_rva) else {
+        return false;
+    };
+    let export_size = export_size as u64;
+    if export_rva == 0 || export_size == 0 || export_rva > cap.saturating_sub(40) {
+        return false;
+    }
+    if provider_export_rva >= export_rva
+        && provider_export_rva < export_rva.saturating_add(export_size)
+    {
+        return false;
+    }
+    let Some(number_of_functions_rva) = export_rva.checked_add(20) else {
+        return false;
+    };
+    let Some(number_of_functions) = loaded_pe_u32(image_va, cap, number_of_functions_rva) else {
+        return false;
+    };
+    let number_of_functions = number_of_functions as u64;
+    let Some(number_of_names_rva) = export_rva.checked_add(24) else {
+        return false;
+    };
+    let Some(number_of_names) = loaded_pe_u32(image_va, cap, number_of_names_rva) else {
+        return false;
+    };
+    if number_of_names > MAX_LOADED_EXPORT_NAMES {
+        return false;
+    }
+    let Some(address_of_functions_rva) = export_rva.checked_add(28) else {
+        return false;
+    };
+    let Some(address_of_functions) = loaded_pe_u32(image_va, cap, address_of_functions_rva) else {
+        return false;
+    };
+    let address_of_functions = address_of_functions as u64;
+    let Some(address_of_names_rva) = export_rva.checked_add(32) else {
+        return false;
+    };
+    let Some(address_of_names) = loaded_pe_u32(image_va, cap, address_of_names_rva) else {
+        return false;
+    };
+    let address_of_names = address_of_names as u64;
+    let Some(address_of_ordinals_rva) = export_rva.checked_add(36) else {
+        return false;
+    };
+    let Some(address_of_ordinals) = loaded_pe_u32(image_va, cap, address_of_ordinals_rva) else {
+        return false;
+    };
+    let address_of_ordinals = address_of_ordinals as u64;
+    let mut i = 0u32;
+    while i < number_of_names {
+        let index = i as u64;
+        let Some(name_entry_rva) = index
+            .checked_mul(4)
+            .and_then(|offset| address_of_names.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(name_rva) = loaded_pe_u32(image_va, cap, name_entry_rva) else {
+            return false;
+        };
+        let name_rva = name_rva as u64;
+        let Some(ordinal_entry_rva) = index
+            .checked_mul(2)
+            .and_then(|offset| address_of_ordinals.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(ordinal_index) = loaded_pe_u16(image_va, cap, ordinal_entry_rva) else {
+            return false;
+        };
+        let ordinal_index = ordinal_index as u64;
+        if ordinal_index >= number_of_functions {
+            return false;
+        }
+        let Some(function_entry_rva) = ordinal_index
+            .checked_mul(4)
+            .and_then(|offset| address_of_functions.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(func_rva) = loaded_pe_u32(image_va, cap, function_entry_rva) else {
+            return false;
+        };
+        let func_rva = func_rva as u64;
+        if func_rva == provider_export_rva {
+            let mut name_buf = [0u8; 128];
+            let Some(name) = read_pe_ascii(image_va, cap, name_rva, 0, &mut name_buf) else {
+                return false;
+            };
+            if hosted_provider_export_marshal_policy(provider, name).is_some() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 unsafe fn lookup_loaded_dependency_export_target(

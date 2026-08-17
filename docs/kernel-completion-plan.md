@@ -7115,3 +7115,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the provider-domain no-alias cleanup slice: `cargo fmt --all`, `cargo test -p
   nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
   --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 NDIS provider marshal-policy slice (2026-08-17, in progress): `nt-hosted-runtime` now owns a
+  host-tested export marshal policy table for the exact `ndis.sys` imports observed in the staged
+  ReactOS `e1000.sys` and `tcpip.sys` binaries. The table records argument count, stack-tail width,
+  and caller-memory roles for output status/handle slots, callback tables, caller context handles,
+  packet/request objects, resource lists, physical-address outputs, and variable-length buffers. The
+  policy pins `NdisOpenAdapter` as the widest current call at 11 arguments, which remains inside the
+  eight-qword stack-tail transport. The executive import resolver now refuses callable provider
+  thunks without a policy, and the provider-export service revalidates the requested RVA by walking
+  the provider export directory back to a named export with policy coverage before dispatch. The gate
+  remains unpublished because this slice defines the allowed shapes but does not yet copy/translate
+  those caller-memory shapes into provider-owned temporary storage or reverse callback thunks.
+  Review adjustment: next B3 work should implement the marshal executor for the first miniport
+  initialization calls (`NdisInitializeWrapper`, `NdisMRegisterMiniport`, and
+  `NdisMSetAttributesEx`) and the matching provider-to-dependent callback identity needed by real
+  miniport registration.
+
+  Validation for the NDIS provider marshal-policy slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+  --target x86_64-unknown-none`, and `git diff --check`.
