@@ -12722,6 +12722,30 @@ unsafe fn provider_marshal_output_cell(
     Ok(provider_component_va)
 }
 
+unsafe fn provider_marshal_inout_cell(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    bytes: u64,
+) -> Result<u64, i32> {
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, bytes)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    copy_bytes(provider_exec_va, dependent_exec_va, bytes);
+    provider_marshal_add_copyout(state, dependent_exec_va, provider_exec_va, bytes)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_component_va)
+}
+
 unsafe fn provider_marshal_output_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -12734,6 +12758,40 @@ unsafe fn provider_marshal_output_buffer(
         return Ok(0);
     }
     provider_marshal_output_cell(
+        state,
+        dependent_index,
+        dependent_inst,
+        provider_shared,
+        arg_value,
+        bytes,
+    )
+}
+
+unsafe fn provider_marshal_resource_list(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    length_pointer: u64,
+) -> Result<u64, i32> {
+    let Some(length_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, length_pointer, 4)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let bytes = read_unaligned(length_exec as *const u32) as u64;
+    if arg_value == 0 {
+        return if bytes == 0 {
+            Ok(0)
+        } else {
+            Err(STATUS_INVALID_PARAMETER)
+        };
+    }
+    if bytes == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    provider_marshal_inout_cell(
         state,
         dependent_index,
         dependent_inst,
@@ -13013,6 +13071,14 @@ unsafe fn prepare_provider_export_marshal(
                     bytes,
                 )?
             }
+            HostedProviderArgumentMarshal::CallerInOutU32 => provider_marshal_inout_cell(
+                &mut state,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+                4,
+            )?,
             HostedProviderArgumentMarshal::CallerInUnicodeString => provider_marshal_unicode_string(
                 &mut state,
                 dependent_index,
@@ -13042,6 +13108,20 @@ unsafe fn prepare_provider_export_marshal(
                 provider_marshal_miniport_characteristics(
                     &mut state,
                     provider_instance,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    args[length_index],
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInOutResourceList { length_pointer_arg } => {
+                let length_index = length_pointer_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                provider_marshal_resource_list(
+                    &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,

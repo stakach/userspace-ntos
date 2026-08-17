@@ -7318,3 +7318,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   Validation for the `NdisReadPciSlotInformation` output-buffer slice: `cargo fmt --all`, `cargo
   test -p nt-hosted-runtime`, executive `cargo check --manifest-path
   components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+
+  B3 `NdisMQueryAdapterResources` in/out slice (2026-08-17, in progress): the provider export
+  marshaller now supports `CallerInOutU32` and `CallerInOutResourceList { length_pointer_arg }`.
+  The BufferSize `PUINT` is copied into provider scratch before the real NDIS export and copied back
+  after completion. The resource-list argument reads the caller's original BufferSize cell before the
+  cell is rewritten for the provider call, supports the first NT5 sizing call with
+  `ResourceList == NULL && *BufferSize == 0`, and copies the second-call resource-list buffer through
+  provider scratch. Runtime tests now pin the `NdisMQueryAdapterResources` policy shape.
+  Review adjustment: the remaining e1000 `MiniportInitialize` blockers move into typed hardware
+  resource mappings: `NdisMRegisterIoPortRange`, `NdisMMapIoSpace`, and
+  `NdisMAllocateSharedMemory`. These should not reuse generic pool-pointer policy; they need
+  resource-manager/DMA-backed mapping policies that return dependent-visible VAs or I/O-port cookies
+  tied to the device resources granted to the miniport instance.
+
+  Validation for the `NdisMQueryAdapterResources` in/out slice: `cargo fmt --all`, `cargo test -p
+  nt-hosted-runtime`, executive `cargo check --manifest-path
+  components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.

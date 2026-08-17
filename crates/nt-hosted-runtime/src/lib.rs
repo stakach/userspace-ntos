@@ -1060,6 +1060,28 @@ mod tests {
     }
 
     #[test]
+    fn ndis_query_adapter_resources_policy_uses_size_pointer() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMQueryAdapterResources")
+                .unwrap();
+        assert_eq!(policy.argument_count, 4);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerOutStatus
+        );
+        assert_eq!(
+            policy.args[2],
+            HostedProviderArgumentMarshal::CallerInOutResourceList {
+                length_pointer_arg: 3
+            }
+        );
+        assert_eq!(
+            policy.args[3],
+            HostedProviderArgumentMarshal::CallerInOutU32
+        );
+    }
+
+    #[test]
     fn ndis_miniport_characteristics_layout_follows_nt5_versions() {
         assert_eq!(
             ndis_miniport_characteristics_layout(3, 0, NDIS30_MINIPORT_CHARACTERISTICS_LEN_X64),
