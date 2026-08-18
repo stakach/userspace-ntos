@@ -100,13 +100,6 @@ nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
 # Security Reference Monitor — its heap-free se_exports primitive backs win32k's SeExports data
 # export (well-known SIDs / privilege LUIDs) + SeQueryAuthenticationIdToken (SYSTEM auth LUID).
 nt-security = { path = "../../crates/nt-security" }
-# KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
-nt-wdf-types = { path = "../../crates/nt-wdf-types" }
-nt-wdf-object = { path = "../../crates/nt-wdf-object" }
-nt-wdf-request = { path = "../../crates/nt-wdf-request" }
-nt-wdf-queue = { path = "../../crates/nt-wdf-queue" }
-nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
-
 [profile.release]
 panic = "abort"
 opt-level = "s"

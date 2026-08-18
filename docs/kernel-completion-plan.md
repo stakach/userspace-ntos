@@ -69,9 +69,13 @@ network setup seeder, with host coverage for two generated NIC bindings and an o
 needs a live-driver proof because the current ReactOS E1000 path uses classic Ethernet lookahead
 receive. Runtime PnP matching now parses the specific PCI instance location before generic
 hardware IDs, so repeated identical NIC devnodes no longer collapse to the first enumerated
-function. The remaining B3 packet frontier is true TX traffic from the real stack, live proof of
-packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`, and repeated-device
-runtime boot coverage under the same dynamic devnode/resource path.
+function. Repeated-device runtime boot coverage is now accepted: `.tmp/run-headless-b3-two-e1000-after-ndis-shadow.log`
+boots with two generated E1000 NICs, the extern rootserver discovers nine live device untypeds
+(architectural MMIO plus two E1000 BARs and the shifted AHCI BARs), both E1000 devnodes run
+AddDevice/StartDevice through the generic path, provider sharing reports `exports=91/91` with
+zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrome paints with
+`292/292` checks passing. The remaining B3 packet frontier is true TX traffic from the real stack
+and live proof of packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -2727,10 +2731,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 - B3 cleanup continued. The old direct e1000 TX liveness proof has been retired from the executive:
   the raw TX descriptor programming, NIC-specific DMA scratch mapping, `exec_nic_*` gates, and
   e1000 transmit-register constants are gone. The pre-storage step now only registers a generic
-  hosted PCI grant for the enumerated device: it maps the BAR cap run needed by the legacy KMDF
-  fixture, allocates a per-device common-buffer frame run, maps that grant into the PCI requester's
-  IOMMU domain, and publishes it as an existing hosted PCI grant for later registry-selected launch
-  discovery. Registry-selected PCI grant discovery now also allocates and IOMMU-maps DMA/common-buffer
+  hosted PCI grant for the enumerated device: it claims a BAR frame-cap run without installing a
+  root-executive MMIO alias, allocates a per-device common-buffer frame run, maps that grant into the
+  PCI requester's IOMMU domain, and publishes it as an existing hosted PCI grant for later
+  registry-selected launch discovery. Registry-selected PCI grant discovery now also allocates and
+  IOMMU-maps DMA/common-buffer
   grants for newly claimed PCI devnodes, and its gate requires zero DMA failures for claimed grants.
   Validation: `cargo fmt --all`,
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
@@ -7977,10 +7982,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and a missing exact function fails closed instead of falling back to the first generic match.
     Validation: `cargo test -p nt-pnp -- --nocapture`, `cargo test -p nt-hive-core --
     --nocapture`, and `NTOS_GENERATED_E1000_COUNT=2 cargo run -q --release -p nt-hive-core
-    --bin gen_hive -- .tmp/generated-e1000-2-hive.dat` (12 KiB output, no warnings). Remaining
-    proof is real TX packet traffic from the TCPIP stack through the same dynamic provider-domain
-    route, live packet-array receive with a miniport that reaches the internal NDIS helper, and
-    repeated-device runtime boot coverage. Do not reintroduce private provider images,
+    --bin gen_hive -- .tmp/generated-e1000-2-hive.dat` (12 KiB output, no warnings). Repeated-device
+    runtime validation exposed one lower-level static identity that still had to be removed: the
+    rust-micro rootserver published hardcoded E1000/AHCI device untypeds for one QEMU PCI layout, so
+    a second E1000 moved AHCI BAR5 to `0x81081000` and the NT executive failed
+    `exec_ahci_abar_claimed` before NT startup. The accepted fix removes those hardcoded PCI BAR
+    untypeds from `rust-micro::rootserver::DEVICE_UTS`; extern-rootserver boots now keep only the
+    architectural low/IOAPIC/HPET/LAPIC untypeds static, discover endpoint PCI memory BARs from live
+    config space, size-probe and restore them, filter framebuffer overlap back to the BOOTBOOT
+    framebuffer untyped, and use the same computed list for CSpace caps and BootInfo metadata. The
+    same cleanup removes the obsolete executive `kmdf_host` boot fixture and `NIC_VADDR` alias:
+    WDF/KMDF proof remains in the dedicated WDF harness components until it is wired through
+    registry-selected PnP like other hardware drivers. The follow-up repeated-NIC failure exposed a
+    real packet/MDL lifetime gap rather than a devnode matching problem: bridge-owned NDIS packet and
+    MDL shadows now carry explicit ownership, stale shadows are replaced per provider/dependent
+    instance, dependent-origin packets/MDLs can be projected into the provider domain on demand, and
+    bridge-owned descriptors are freed only by the lifecycle that allocated them. Serialized proof
+    `.tmp/run-headless-b3-two-e1000-after-ndis-shadow.log` reaches the desktop with two E1000
+    devices, shows `[rootserver] device-untypeds=9`, runs both E1000 AddDevice/StartDevice paths,
+    keeps `exec_generic_pci_provider_domain_serviced` green with `exports=91/91` and
+    `export-rejections=0`, passes `exec_lsa_worker_route`, and paints Explorer shell chrome with
+    `292/292` checks passing. Validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime`,
+    executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, rust-micro
+    `cargo +nightly check -Z build-std=core -Z unstable-options -Z json-target-spec --target
+    triplets/mykernel-x86.json --release --features spec,extern-rootserver`, `git diff --check`,
+    and the serialized two-E1000 proof. Remaining proof is real TX packet traffic from the TCPIP
+    stack through the same dynamic provider-domain route and live packet-array receive with a
+    miniport that reaches the internal NDIS helper. Do not reintroduce private provider images,
     protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full

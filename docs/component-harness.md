@@ -41,10 +41,11 @@ structural families**, not four variants of one:
   fault-recv loop pumps them: fill the shared frame → `ep_send(DISPATCH_LABEL)` → recv, demand-mapping
   page faults and replying, until the component sends its DONE label. **These two are near-identical in
   shape** and are the real consolidation target.
-* **Family B — one-shot lifecycle runners** (`driver_host` + `kmdf_host`): pre-map everything, run a
-  fixed lifecycle to completion internally, write a verdict to their shared frame, `SYS_SEND` on
-  `CT_RESULT_NTFN`, and park. The executive `ep_recv`s the result notification ONCE; there is NO
-  demand-map dispatch loop (their fault EP is armed for crash-containment only — `main.rs:6632`, `:6722`).
+* **Family B — one-shot lifecycle runners** (`driver_host`; the former executive `kmdf_host` boot fixture
+  has been retired): pre-map everything, run a fixed lifecycle to completion internally, write a verdict to
+  the shared frame, `SYS_SEND` on `CT_RESULT_NTFN`, and park. The executive `ep_recv`s the result
+  notification ONCE; there is NO demand-map dispatch loop (the fault EP is armed for crash-containment
+  only).
 
 The design therefore delivers a **`component_main` harness for Family A** (the recv→dispatch→reply
 server loop + its executive-side pump), parameterised by a `dispatch(req) -> reply` callback and a set of
@@ -123,15 +124,16 @@ capability-gated branches of ONE loop (§2.4).
 `:39-81`, host a real `.sys` via `driver_pe::sys_start` `:86-88`, write verdict `:89/:95`,
 `SYS_SEND CT_RESULT_NTFN` `:96`, park `:97-99`. Executive side: `ep_recv(dh_result)` ONCE `main.rs:6633`.
 
-`kmdf_host_entry` `kmdf_host.rs:766-779`: read entry RVA `:769`, `run(entry_rva)` (full WDF lifecycle
-`:633-761`), write verdict `:771`, `SYS_SEND CT_RESULT_NTFN` `:775`, park `:776-778`. Executive side:
-`ep_recv(kmdf_result)` ONCE `main.rs:6723`.
-
 **No recv→dispatch→reply loop; no demand-map pump.** Shared frames are ad-hoc verdict scratch
-(`RESLIST_VADDR+0x200/0x210` for driver-host; `KMDF_SHARED_VADDR+0/8/0x10` for kmdf). fault EP is
-containment-only. What Family B DOES share with Family A is the top of the file — nothing routes IRPs to
-them today. They already share `spawn_component` + the `DriverExportRegistry` IAT mechanism
-(`FSD_EXPORTS` `driver_launch.rs:668`, `KMDF_EXPORTS` `kmdf_host.rs:488`, win32k's own export registry).
+(`RESLIST_VADDR+0x200/0x210` for driver-host). The fault EP is containment-only. What Family B DOES share
+with Family A is the top of the file — nothing routes IRPs to it today. It already shares
+`spawn_component` + the `DriverExportRegistry` IAT mechanism (`FSD_EXPORTS` in `driver_launch.rs`,
+win32k's own export registry).
+
+The former executive `kmdf_host` one-shot fixture has been removed from the desktop boot path because it
+bound WDF hardware proof to an early, single-NIC BAR choice before registry-backed PnP device selection.
+KMDF/WDF coverage remains in the dedicated driver-host harnesses (`driver-host-wdf`, `driver-host-pnp`,
+`driver-host-direg`) until WDF is wired into the same registry-selected PnP driver launch boundary.
 
 ### 1.4 The irreducible win32k-specific behaviours (MUST survive exactly)
 
@@ -315,11 +317,11 @@ DriverEntry preamble differences that MUST be parameterised (not hard-coded): DR
 
 ### 2.6 Family B fold (`run_once`)
 
-`driver_host_entry` / `kmdf_host_entry` share only: run a fixed body → write verdict → `SYS_SEND
-CT_RESULT_NTFN` → park. Extract a `run_once(body: unsafe fn() -> u32, verdict_va: u64)` that runs `body`,
-stores its verdict, signals `CT_RESULT_NTFN`, and parks. The bodies (CM_RESOURCE_LIST/DMA vs WDF
-lifecycle) stay component-specific. This is a small win (the notify+park epilogue) and is OPTIONAL — do it
-last, low priority; it is NOT the point of this task.
+`driver_host_entry` shares only the one-shot shape: run a fixed body → write verdict → `SYS_SEND
+CT_RESULT_NTFN` → park. Extracting a `run_once(body: unsafe fn() -> u32, verdict_va: u64)` would still be
+a small win for remaining fixtures, but the retired executive `kmdf_host` should not be resurrected for
+desktop boot. WDF belongs behind the same registry-selected PnP driver boundary as other hardware
+drivers.
 
 ---
 
@@ -355,12 +357,10 @@ step is a separate commit = a rollback point.
 * Verify: same npfs spec set as Step 1. Full gate 180/98.
 * Rollback: revert; keep `fsd_component_entry` bespoke.
 
-### Step 3 — fold Family B onto `run_once` (OPTIONAL, low-risk, do before win32k for confidence)
-* `driver_host_entry` + `kmdf_host_entry` call `run_once(body, verdict_va)`.
-* Verify: `exec_driver_host_drove_nic` (`main.rs:6640`), `exec_sys_driver_entry_ok`,
-  `exec_sys_start_reached_real_nic`, `exec_kmdf_driver_create`, `exec_kmdf_adddevice_queue`,
-  `exec_kmdf_prepare_hw_read_real_nic`, `exec_kmdf_ioctl`, `exec_kmdf_remove`, `exec_kmdf_read_real_nic`.
-  Full gate 180/98.
+### Step 3 — fold remaining Family B fixtures onto `run_once` (OPTIONAL)
+* Any remaining one-shot fixture entry calls `run_once(body, verdict_va)`.
+* Verify: the remaining one-shot WDM fixture gates, plus the normal desktop boot gates. The retired
+  executive KMDF fixture is not part of this verification set.
 * Rollback: revert.
 
 ### Step 4 — migrate win32k LAST, capability-gating every specific
@@ -445,11 +445,11 @@ close.
   MajorFunction[major]`. This IS the Family-A shape §1.2 — the canonical persistent-driver substrate.
 
 * **How a user "specifies a driver to run" TODAY:** there is **no user-facing driver list / class
-  registry / boot enumeration**. `load_driver` has exactly ONE call site: `main.rs:7165`, hardcoded
-  `load_driver(&fs, b"reactos\\system32\\drivers\\npfs.sys", DriverClass::Fsd)`. The two *fixture*
-  drivers (PnpMmioInterruptTest.sys, KmdfBasicTest.sys) do NOT go through `load_driver` at all — they are
-  read by-path with `load_file_to_pool` then handed to the bespoke `driver_host_entry`/`kmdf_host_entry`
-  one-shot fixtures (`main.rs:6669-6720`) = Family B. So "run a driver" today = one hardcoded FSD.
+  registry / boot enumeration**. `load_driver` has historically had exactly ONE call site, a hardcoded
+  `load_driver(&fs, b"reactos\\system32\\drivers\\npfs.sys", DriverClass::Fsd)`. One-shot fixture
+  drivers do not go through `load_driver`; WDF/KMDF proof now lives in dedicated harness components
+  instead of the executive desktop boot path. So "run a driver" today = one hardcoded FSD plus the newer
+  registry-selected hosted PnP launch frontier tracked in the completion plan.
 
 * **How `.sys` files reach the by-path FS:** `rust-micro/scripts/make_image.sh:145-164` stages
   `nt-driver-test-fixtures/fixtures/*.sys` into `::reactos/system32/drivers/`; real ReactOS drivers
@@ -482,14 +482,13 @@ A real user-specified driver (FS filter, NIC, class driver, …) registers Major
 caps false** — the npfs substrate. **This is the canonical, default path for a general persistent
 driver.**
 
-Family B (driver-host + kmdf_host) is a **TEST-lifecycle fixture shape** — it runs a fixed
-DriverEntry→AddDevice→Start→IOCTL→Remove script once, writes a verdict, and parks. It exists to *exercise
-and prove* the WDM/KMDF import surface end-to-end in isolation; it is NOT how a general persistent driver
-runs, and a user driver must NOT be forced onto it. The design keeps Family B on its thin `run_once`
-(§2.6) for the fixtures, while **`load_driver(path, class)` spawns general drivers as Family-A IRP
-dispatch servers** through the unified harness. (A future device driver that needs a persistent IRP loop
-AND device caps = Family A with the `Device` class's granted caps — §5.4 — still through `component_main`,
-never a bespoke loop.)
+Family B is a **TEST-lifecycle fixture shape** — it runs a fixed DriverEntry→AddDevice→Start→IOCTL→Remove
+script once, writes a verdict, and parks. It exists to *exercise and prove* driver import surfaces in
+isolation; it is NOT how a general persistent driver runs, and a user driver must NOT be forced onto it.
+WDF/KMDF coverage currently belongs to the dedicated harness components, while **`load_driver(path,
+class)` spawns general drivers as Family-A IRP dispatch servers** through the unified harness. A future
+device driver that needs a persistent IRP loop AND device caps = Family A with the `Device` class's
+granted caps (§5.4), still through `component_main`, never a bespoke loop.
 
 ### 5.4 Class → capabilities mapping (declarative, no per-driver code)
 

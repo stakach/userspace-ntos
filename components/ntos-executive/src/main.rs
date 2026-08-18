@@ -24,7 +24,6 @@ mod alpc_selftest;
 mod cm_server;
 mod io_server;
 mod isr;
-mod kmdf_host;
 mod lpc_server;
 mod ntoskrnl_shared;
 mod server;
@@ -1220,9 +1219,6 @@ pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
 pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
-/// Where the executive maps the full real PCI NIC BAR for the legacy KMDF hardware fixture.
-/// Hosted PnP drivers get per-device component windows published through `HostedPnpPciResourceWindow`.
-pub const NIC_VADDR: u64 = 0x0000_0100_10D0_0000;
 /// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
 /// the sector data buffer in the storage cluster before IPCBUF.
 pub const AHCI_VADDR: u64 = 0x0000_0100_105F_4000;
@@ -23764,8 +23760,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // depending on the storage host, but it does not drive e1000 registers directly. Multiple NICs
     // are deliberately deferred to the later registry-selected launch-plan discovery; class-code
     // selection cannot know which devnode/service owns the grant.
-    let mut kmdf_nic_bar_base = 0u64; // the real NIC BAR caps, handed to the KMDF fixture below.
-    let mut nic_bar_pages = 0u64;
     let mut hosted_pci_hardware_grants = Vec::new();
     let mut hosted_pci_existing_grants = 0u64;
     let mut hosted_pci_existing_grant_failures = 0u64;
@@ -23783,7 +23777,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         {
             if let Some(mem_bar) = device.first_memory_bar() {
                 let nic_mmio = mem_bar.base;
-                nic_bar_pages = mem_bar.size.div_ceil(0x1000).max(1);
+                let nic_bar_pages = mem_bar.size.div_ceil(0x1000).max(1);
                 print_str(b"[driver-launch] pre-storage hosted PCI grant bus=0 dev=");
                 print_u64(pre_hive_nic_dev as u64);
                 print_str(b" func=");
@@ -23795,9 +23789,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b" (irq ");
                 print_u64(pre_hive_nic_irq as u64);
                 print_str(b")\n");
-                let nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, nic_bar_pages);
-                if nic_bar_base != 0 {
-                    kmdf_nic_bar_base = nic_bar_base;
+                if let Some(nic_mmio_run) = claim_device_frame_caps(bi, nic_mmio, nic_bar_pages) {
                     let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
                     print_str(b"[driver-launch] pre-storage hosted PCI DMA mint=");
                     print_u64(dma_iommu.mint_err);
@@ -23811,8 +23803,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         if let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) {
                             if let Some(grant) = HostedPciHardwareGrant::for_device(
                                 device,
-                                nic_bar_base,
-                                nic_bar_pages,
+                                nic_mmio_run.base,
+                                nic_mmio_run.pages,
                                 interrupt_vector,
                                 false,
                                 Some(dma_grant),
@@ -23861,10 +23853,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     publish_hosted_pnp_resource_context(&pci_devices, &[], &[]);
-
-    // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
-    // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
-    // the FS mount (search "DEFERRED DRIVER-HOST").
 
     // --- P2: real block I/O in an ISOLATED host with VT-d-CONFINED DMA. The executive is the
     // Tier-1 broker: it enables Bus Master, claims the AHCI BAR + a DMA frame, gives the AHCI
@@ -24558,163 +24546,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 && copied_magic == source_magic
                 && ld_magic == source_magic
                 && ld_faults >= 1,
-            &mut passed,
-        );
-    }
-
-    // ==== DEFERRED KMDF hosting — driver-model migration ========================================
-    // The WDM hardware proof now runs through the registry-selected generic hosted-driver path
-    // below. KMDF still has a dedicated host while WDF framework bring-up remains a separate frontier.
-    //
-    // ---- KMDF DRIVER HOST: host a real KMDF driver (KmdfBasicTest.sys) through the FULL WDF
-    // lifecycle (DriverEntry → WdfDriverCreate → AddDevice → EvtDevicePrepareHardware → D0Entry →
-    // IOCTLs → REMOVE) in a SEPARATE isolated host — crash-contained on the microkernel.
-    {
-        print_str(b"[ntos-exec] KMDF host: loading real KmdfBasicTest.sys BY-PATH\n");
-        let mut kmdf_pe_base = 0u64;
-        for i in 0..kmdf_host::KMDF_PE_FRAMES {
-            let f = alloc_slot();
-            if i == 0 {
-                kmdf_pe_base = f;
-            }
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-            let _ = page_map(
-                f,
-                kmdf_host::KMDF_CODE_VA + i * 0x1000,
-                RW_NX,
-                CAP_INIT_THREAD_VSPACE,
-            );
-        }
-        let kmdf_entry = exec_fs()
-            .and_then(|fs| load_file_to_pool(&fs, b"reactos\\system32\\drivers\\KmdfBasicTest.sys"))
-            .and_then(|(va, sz)| {
-                kmdf_host::load_into(core::slice::from_raw_parts(va as *const u8, sz as usize))
-            })
-            .unwrap_or(0);
-        let kmdf_shared = alloc_slot();
-        let _ = untyped_retype(
-            CAP_INIT_UNTYPED,
-            OBJ_X86_4K_PAGE,
-            PAGING_BITS,
-            1,
-            kmdf_shared,
-        );
-        let _ = page_map(
-            kmdf_shared,
-            kmdf_host::KMDF_SHARED_VADDR,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        );
-        core::ptr::write_volatile(kmdf_host::KMDF_SHARED_VADDR as *mut u64, kmdf_entry as u64);
-        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *mut u32, 0);
-        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *mut u32, 0);
-        print_str(b"[ntos-exec] loaded KmdfBasicTest.sys BY-PATH; FxDriverEntry rva=");
-        print_hex(kmdf_entry);
-        print_str(b"\n");
-        let kmdf_result = make_object(OBJ_NOTIFICATION);
-        let kmdf_result_badged = alloc_slot();
-        let _ = syscall5(
-            SYS_SEND,
-            CAP_INIT_THREAD_CNODE,
-            LBL_CNODE_MINT << 12,
-            kmdf_result_badged,
-            kmdf_result,
-            ISR_DONE_BADGE,
-        );
-        let kmdf_fault = make_object(OBJ_ENDPOINT);
-        // Inlined descriptor (was spawn_kmdf_host): image RWX (WDF fn-table/globals live in .bss), a
-        // heap (WdfRuntime + Wdf*Create allocate), the KMDF PE (RWX), a shared word, and (optionally)
-        // the real e1000 NIC BAR at NIC_VADDR for MmMapIoSpace. Deep stack.
-        {
-            let mut regions: [Region; 4] = [
-                Region {
-                    source: FrameSource::FreshZeroed,
-                    base_va: allocator::HEAP_BASE as u64,
-                    count: allocator::SERVICE_HEAP_FRAMES,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-                Region {
-                    source: FrameSource::Alias(kmdf_pe_base),
-                    base_va: kmdf_host::KMDF_CODE_VA,
-                    count: kmdf_host::KMDF_PE_FRAMES,
-                    rights: Rights::Uniform(3 /* RWX */),
-                    pts: 0,
-                },
-                Region {
-                    source: FrameSource::Alias(kmdf_shared),
-                    base_va: kmdf_host::KMDF_SHARED_VADDR,
-                    count: 1,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-                Region {
-                    source: FrameSource::Alias(0),
-                    base_va: NIC_VADDR,
-                    count: 0,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: 0,
-                },
-            ];
-            if kmdf_nic_bar_base != 0 {
-                regions[3] = Region {
-                    source: FrameSource::Alias(kmdf_nic_bar_base),
-                    base_va: NIC_VADDR,
-                    count: nic_bar_pages,
-                    rights: Rights::Uniform(RW_NX),
-                    pts: pts_for(nic_bar_pages),
-                };
-            }
-            let d = ComponentDescriptor {
-                entry: kmdf_host::kmdf_host_entry,
-                image_rights: Rights::Uniform(3), // RWX
-                map_heap_pt: true,
-                stack_base: STACK_BASE,
-                stack_frames: 16, // 64 KiB — WDF call chains are deep
-                stack_dedicated_pt: false,
-                regions: &regions,
-                granted: GrantedCaps {
-                    irq_ntfn: None,
-                    result_ntfn: Some(kmdf_result_badged),
-                    fault_ep: Some(kmdf_fault),
-                    io_port: None,
-                },
-                prio: 100,
-                gs_base: None,
-                caps: HostCaps::default(),
-            };
-            let _ = spawn_component(&d);
-        }
-        let _ = kmdf_fault;
-        let (_z, _b, _s, _m) = ep_recv(kmdf_result);
-        let kv = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *const u32);
-        print_str(b"[ntos-exec] KMDF host lifecycle verdict bits=0x");
-        print_hex(kv);
-        print_str(b"\n");
-        check(b"exec_kmdf_driver_create", (kv & 1) != 0, &mut passed);
-        check(b"exec_kmdf_adddevice_queue", (kv & 2) != 0, &mut passed);
-        check(
-            b"exec_kmdf_prepare_hw_read_real_nic",
-            (kv & 4) != 0,
-            &mut passed,
-        );
-        check(b"exec_kmdf_ioctl", (kv & 8) != 0, &mut passed);
-        check(b"exec_kmdf_remove", (kv & 16) != 0, &mut passed);
-        let kmdf_ctrl =
-            core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *const u32);
-        let direct_ctrl = if kmdf_nic_bar_base != 0 {
-            core::ptr::read_volatile(NIC_VADDR as *const u32)
-        } else {
-            0
-        };
-        print_str(b"[ntos-exec] KMDF driver read real NIC CTRL=0x");
-        print_hex(kmdf_ctrl);
-        print_str(b" (direct read=0x");
-        print_hex(direct_ctrl);
-        print_str(b")\n");
-        check(
-            b"exec_kmdf_read_real_nic",
-            kmdf_ctrl != 0 && kmdf_ctrl != 0xFFFF_FFFF && kmdf_ctrl == direct_ctrl,
             &mut passed,
         );
     }
