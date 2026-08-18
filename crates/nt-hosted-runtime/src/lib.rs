@@ -281,6 +281,9 @@ pub enum HostedProviderArgumentMarshal {
     CallerInPointerArray {
         count_arg: u8,
     },
+    CallerInOutPacketArray {
+        count_arg: u8,
+    },
     CallerOutStatus,
     CallerOutHandle,
     CallerOutPointer,
@@ -733,6 +736,29 @@ pub fn hosted_provider_export_marshal_policy(
         "NdisReturnPackets" => void_export_policy(&[CallerInPointerArray { count_arg: 1 }, Scalar]),
         _ => None,
     }
+}
+
+pub fn hosted_provider_internal_marshal_policy(
+    provider_dll: &str,
+    internal_name: &str,
+) -> Option<HostedProviderExportMarshalPolicy> {
+    use HostedProviderArgumentMarshal::*;
+
+    if !hosted_provider_has_export_marshal_policies(provider_dll) {
+        return None;
+    }
+
+    if ascii_eq_ignore_case(provider_dll, "ndis.sys")
+        && ascii_eq_ignore_case(internal_name, "MiniIndicateReceivePacket")
+    {
+        return void_export_policy(&[
+            ProviderHandle,
+            CallerInOutPacketArray { count_arg: 2 },
+            Scalar,
+        ]);
+    }
+
+    None
 }
 
 pub fn page_align_up(value: u64) -> Result<u64, HostedDriverImagePlanError> {
@@ -1508,6 +1534,27 @@ mod tests {
             HostedProviderArgumentMarshal::CallerInPointerArray { count_arg: 1 }
         );
         assert_eq!(policy.args[1], HostedProviderArgumentMarshal::Scalar);
+    }
+
+    #[test]
+    fn ndis_internal_packet_indicate_policy_maps_packet_arrays_with_copyback() {
+        let policy =
+            hosted_provider_internal_marshal_policy("ndis.sys", "MiniIndicateReceivePacket")
+                .unwrap();
+        assert_eq!(policy.argument_count, 3);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        assert_eq!(
+            policy.args[1],
+            HostedProviderArgumentMarshal::CallerInOutPacketArray { count_arg: 2 }
+        );
+        assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
     }
 
     #[test]

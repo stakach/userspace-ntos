@@ -60,9 +60,12 @@ non-background pixels. Validation for this slice: `cargo fmt --all`,
 components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, serialized
 `QEMU_MEMORY=2G ./run.sh --desktop`, and `git diff --check`. Review adjustment: descriptor
 discovery, provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure, and
-registry-derived receive stimulus are closed. The remaining B3 packet frontier is true TX traffic
-from the real stack, packet-array receive if a real miniport reaches the internal NDIS helper, and
-repeated-device scaling under the same dynamic devnode/resource path.
+registry-derived receive stimulus are closed. The packet-array receive infrastructure now has local
+generic wiring through provider-internal NDIS miniport-block handlers, but still needs a live-driver
+proof because the current ReactOS E1000 path uses classic Ethernet lookahead receive. The remaining
+B3 packet frontier is true TX traffic from the real stack, live proof of packet-array receive with a
+miniport that reaches `MiniIndicateReceivePacket`, and repeated-device scaling under the same
+dynamic devnode/resource path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -7942,10 +7945,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/run-desktop-20260818-160505.log` reaches real Explorer shell chrome with `298/298`, shows
     E1000 RX traffic (`dma_dev_tx/rx=0/1`), keeps `exec_generic_pci_provider_domain_serviced` PASS
     with `pci_provider_exports=43/43`, passes `exec_lsa_worker_route`, and has no provider callback,
-    export, buffer, or hosted-work wall/reject lines. The remaining proof is real TX packet traffic
-    from the TCPIP stack through the same dynamic provider-domain route, packet-array receive if a
-    real miniport reaches the internal NDIS helper, and repeated-device scaling. Do not reintroduce
-    private provider images, protocol-specific fallbacks, or per-driver special cases.
+    export, buffer, or hosted-work wall/reject lines. The current packet-array follow-up locally
+    closes the missing generic NDIS 4/5 shape: miniport-block mirrors now project the provider's real
+    internal `PacketIndicateHandler` by discovering its runtime pointer from the provider-owned
+    `NDIS_MINIPORT_BLOCK`, registering a typed internal marshal policy for that image RVA, and
+    emitting the normal provider-domain thunk into the dependent miniport. Packet-array marshal now
+    has copyback semantics for provider NDIS mutations, provider packet/MDL shadows are keyed by
+    provider plus dependent instance so miniport and protocol domains can view the same provider
+    packet safely, and the miniport `SendPackets`/`ReturnPacket` callback slots are bridged through
+    the same shadow projection path. Local validation: `cargo fmt --all`,
+    `cargo test -p nt-hosted-runtime -- --nocapture`, and executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`. Remaining proof is a serialized desktop regression for this wiring, real
+    TX packet traffic from the TCPIP stack through the same dynamic provider-domain route, live
+    packet-array receive with a miniport that reaches the internal NDIS helper, and repeated-device
+    scaling. Do not reintroduce private provider images, protocol-specific fallbacks, or per-driver
+    special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
