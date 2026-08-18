@@ -849,18 +849,24 @@ pub(crate) unsafe fn spawn_sec_image(
         // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
         // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
         // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
-        // table base on its only run. Hosted image policy decides whether this process participates
-        // in the Win32 client runtime; the table frames are RO-mapped lazily on that client's win32k
-        // dispatch path.
+        // table base on its only run. The table is allocated inside win32k's USER heap, so the PEB
+        // value must be the USER-heap client alias of that server allocation; the committed heap
+        // prefix is projected when the process enters the Win32 client runtime.
         if seed_gdi_shared_handle_table {
             let gdi_server_base = core::ptr::read_volatile(
                 (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
                     as *const u64,
             );
-            core::ptr::write_volatile(
-                (scr + 0x1000 + 0xf8) as *mut u64,
-                win32k_subsystem::GDI_SHARED_TABLE_VA + (gdi_server_base & 0xfff),
-            );
+            if let Some(gdi_client_base) =
+                win32k_subsystem::win32k_heap_server_to_client(gdi_server_base)
+            {
+                core::ptr::write_volatile((scr + 0x1000 + 0xf8) as *mut u64, gdi_client_base);
+            } else {
+                print_str(b"[spawn-env] GDI shared handle table seed unavailable server=0x");
+                print_hex((gdi_server_base >> 32) as u32);
+                print_hex(gdi_server_base as u32);
+                print_str(b"\n");
+            }
         }
         let peb_target_map = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
         if pi == 0 {

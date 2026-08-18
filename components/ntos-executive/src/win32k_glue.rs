@@ -91,6 +91,12 @@ static WIN32K_CLIENT_CAP_BANK_OWNER: [AtomicU8; WIN32K_CLIENT_CAP_BANK_SLOTS as 
     [const { AtomicU8::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
 static WIN32K_CLIENT_CAP_BANK_FREE_NEXT: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SLOTS as usize] =
     [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
+static WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
+static WIN32K_POOL_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
+static GDI_USERVM_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
+    [const { AtomicU64::new(0) }; MAX_PI];
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -3244,26 +3250,34 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     })
 }
 
-unsafe fn map_static_win32k_arena_into_client(
+unsafe fn map_win32k_arena_prefix_into_client(
     pml4: u64,
     pi: usize,
     frame_base: u64,
     client_base: u64,
-    frames: u64,
+    max_frames: u64,
+    target_frames: u64,
+    mapped_frames: &[AtomicU64; MAX_PI],
     mapped_guard: &AtomicU64,
+    rights: u64,
     label: &[u8],
 ) -> bool {
-    if frame_base == 0 {
+    if frame_base == 0 || pi >= MAX_PI || pi >= 64 || max_frames == 0 {
         return false;
     }
 
+    let target_frames = target_frames.min(max_frames);
+    if target_frames == 0 {
+        return false;
+    }
     let bit = 1u64 << pi;
-    if mapped_guard.load(Ordering::Relaxed) & bit != 0 {
+    let already_mapped = mapped_frames[pi].load(Ordering::Relaxed).min(max_frames);
+    if already_mapped >= target_frames {
+        mapped_guard.fetch_or(bit, Ordering::Relaxed);
         return true;
     }
 
-    const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER;
-    for p in 0..(frames + 511) / 512 {
+    for p in (already_mapped + 511) / 512..(target_frames + 511) / 512 {
         if !win32k_client_cap_bank_map_page_table(
             pml4,
             pi,
@@ -3274,7 +3288,7 @@ unsafe fn map_static_win32k_arena_into_client(
             return false;
         }
     }
-    for i in 0..frames {
+    for i in already_mapped..target_frames {
         let (cp, copy_error) = copy_cap_r(frame_base + i);
         if copy_error != 0 {
             print_str(b"[win32k-svc] failed to copy ");
@@ -3291,7 +3305,7 @@ unsafe fn map_static_win32k_arena_into_client(
             }
             return false;
         }
-        let map_error = page_map_r(cp, client_base + i * 0x1000, RO_NX, pml4);
+        let map_error = page_map_r(cp, client_base + i * 0x1000, rights, pml4);
         if map_error != 0 {
             print_str(b"[win32k-svc] failed to map ");
             print_str(label);
@@ -3318,6 +3332,7 @@ unsafe fn map_static_win32k_arena_into_client(
             let _ = cnode_delete_recycle_r(cp);
             return false;
         }
+        mapped_frames[pi].store(i + 1, Ordering::Relaxed);
     }
 
     mapped_guard.fetch_or(bit, Ordering::Relaxed);
@@ -3549,6 +3564,9 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(
         GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
         GDI_USERVM_MAPPED.fetch_and(bit, Ordering::Relaxed);
     }
+    WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
+    WIN32K_POOL_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
+    GDI_USERVM_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
 
     let live = WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed);
     if live == 0 {
@@ -3662,15 +3680,19 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(
 pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
     let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
-    let bit = 1u64 << pi;
-    let already_mapped = WIN32K_CLIENT_MAPPED.load(Ordering::Relaxed) & bit != 0;
-    if !map_static_win32k_arena_into_client(
+    let already_mapped = (pi < MAX_PI
+        && WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0)
+        || (pi < 64 && WIN32K_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
+    if !map_win32k_arena_prefix_into_client(
         pml4,
         pi,
         heap_base,
         win32k_subsystem::CSRSS_W32_SHARED_VA,
         win32k_subsystem::WIN32K_HEAP_FRAMES,
+        win32k_subsystem::win32k_user_heap_committed_frames(),
+        &WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES,
         &WIN32K_CLIENT_MAPPED,
+        2 | PAGE_EXECUTE_NEVER,
         b"win32k USER heap",
     ) {
         return None;
@@ -3696,15 +3718,19 @@ pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> O
 pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
     let pool_base = WIN32K_POOL_FRAME_BASE.load(Ordering::Relaxed);
-    let bit = 1u64 << pi;
-    let already_mapped = WIN32K_POOL_CLIENT_MAPPED.load(Ordering::Relaxed) & bit != 0;
-    if !map_static_win32k_arena_into_client(
+    let already_mapped = (pi < MAX_PI
+        && WIN32K_POOL_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0)
+        || (pi < 64 && WIN32K_POOL_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
+    if !map_win32k_arena_prefix_into_client(
         pml4,
         pi,
         pool_base,
         win32k_subsystem::CSRSS_W32_POOL_VA,
         win32k_subsystem::WIN32K_POOL_FRAMES,
+        win32k_subsystem::WIN32K_POOL_FRAMES,
+        &WIN32K_POOL_CLIENT_MAPPED_FRAMES,
         &WIN32K_POOL_CLIENT_MAPPED,
+        2 | PAGE_EXECUTE_NEVER,
         b"win32k POOL",
     ) {
         return None;
@@ -3722,16 +3748,13 @@ pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option
     Some(delta)
 }
 
-/// ★ DIALOG BATCH 3 — RO-map the GDI shared handle table into GUI client `pi`'s VSpace at
-/// [`win32k_subsystem::GDI_SHARED_TABLE_VA`]. Client-side gdi32 validates every GDI handle through
-/// `GdiSharedHandleTable[handle & 0xffff]` (base = `PEB->GdiSharedHandleTable`, PEB+0xf8). In real
-/// Windows win32k allocates this table from a GdiPool section + RO-maps it into every GUI process; our
-/// host allocates the frames ONCE (globally, zero-initialized — a zero `entry.Type@0xc` mismatches
-/// gdi32's type-bits check → gdi32 takes its `invalid handle` path instead of NULL-derefing at RVA
-/// 0x535a), then RO-maps that same table into each client. Per-pi guarded (mirrors
-/// [`map_win32k_pool_into_client`]). The section allocation is deliberately left at its original
-/// heap address to preserve win32k's allocation order. Its containing pages are mapped at
-/// `GDI_SHARED_TABLE_VA`, and the returned client pointer retains the section's intra-page offset.
+/// Publish the GDI shared handle table pointer for GUI client `pi`.
+///
+/// ReactOS win32k returns a user-mode pointer from `GDI_MapHandleTable`, then gdi32 caches
+/// `PEB->GdiSharedHandleTable` during process setup. Our table is allocated inside win32k's USER heap,
+/// so the correct client pointer is the USER-heap alias of that allocation. The committed USER heap
+/// prefix mapping installed here covers the table pages; a second table window would retain duplicate
+/// frame caps for every GUI process.
 pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usize) -> u64 {
     let server_base = core::ptr::read_volatile(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE) as *const u64,
@@ -3742,88 +3765,37 @@ pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usiz
     let heap_frames = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
     if server_base < win32k_subsystem::WIN32K_HEAP_VADDR
         || size < win32k_subsystem::GDI_HANDLE_COUNT * win32k_subsystem::GDI_TABLE_ENTRY_SIZE
-        || size > 0x0020_0000
+        || size > win32k_subsystem::GDI_SHARED_TABLE_MAX_BYTES
         || heap_frames == 0
     {
         return 0;
     }
     let server_page = server_base & !0xfff;
     let intra_page = server_base - server_page;
-    let client_base = win32k_subsystem::GDI_SHARED_TABLE_VA + intra_page;
     let source_offset = (server_page - win32k_subsystem::WIN32K_HEAP_VADDR) / 0x1000;
+    let Some(client_base) = win32k_subsystem::win32k_heap_server_to_client(server_base) else {
+        return 0;
+    };
     let frames = (intra_page + size + 0xfff) / 0x1000;
     if source_offset + frames > win32k_subsystem::WIN32K_HEAP_FRAMES {
         return 0;
     }
-    let bit = 1u64 << pi;
-    if GDI_SHARED_TABLE_MAPPED.load(Ordering::Relaxed) & bit != 0 {
-        return client_base; // already mapped into this process's VSpace
-    }
-    const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER; // read-only, non-executable
-                                               // The 1 GiB PD covering 0x8000_0000..0xC000_0000 already exists in the client; the table window is
-                                               // fresh, so allocate + map one PT per 2 MiB sub-range up front.
-    for p in 0..(frames + 511) / 512 {
-        if !win32k_client_cap_bank_map_page_table(
-            pml4,
-            pi,
-            win32k_subsystem::GDI_SHARED_TABLE_VA + p * 0x20_0000,
-            b"live GDI handle table",
-            p,
-        ) {
-            return 0;
-        }
-    }
-    for i in 0..frames {
-        let (cp, copy_error) = copy_cap_r(heap_frames + source_offset + i);
-        if copy_error != 0 {
-            print_str(b"[win32k-svc] failed to copy live GDI handle table frame for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(i as u32);
-            print_str(b" error=");
-            print_u64(copy_error);
-            print_str(b"\n");
-            return 0;
-        }
-        let map_error = page_map_r(
-            cp,
-            win32k_subsystem::GDI_SHARED_TABLE_VA + i * 0x1000,
-            RO_NX,
-            pml4,
-        );
-        if map_error != 0 {
-            print_str(b"[win32k-svc] failed to map live GDI handle table into pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(i as u32);
-            print_str(b" error=");
-            print_u64(map_error);
-            print_str(b"\n");
-            let _ = cnode_delete_recycle_r(cp);
-            return 0;
-        }
-        if !win32k_client_cap_bank_store(pi, cp) {
-            print_str(b"[win32k-svc] failed to retain live GDI handle table mapping cap for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(i as u32);
-            print_str(b"\n");
-            let _ = page_unmap_r(cp);
-            let _ = cnode_delete_recycle_r(cp);
-            return 0;
-        }
+    if map_win32k_user_heap_into_client(pml4, pi).is_none() {
+        return 0;
     }
     GDI_SHARED_TABLE_FRAME_BASE.store(heap_frames + source_offset, Ordering::Relaxed);
-    GDI_SHARED_TABLE_MAPPED.fetch_or(bit, Ordering::Relaxed);
-    print_str(b"[win32k-svc] RO-mapped live GDI handle table into pi 0x");
-    print_hex(pi as u32);
-    print_str(b" @0x");
-    print_hex(win32k_subsystem::GDI_SHARED_TABLE_VA as u32);
-    print_str(b" bytes=0x");
-    print_hex(size as u32);
-    print_str(b" client-table=0x");
-    print_hex(client_base as u32);
-    print_str(b"\n");
+    if pi < 64
+        && GDI_SHARED_TABLE_MAPPED.fetch_or(1u64 << pi, Ordering::Relaxed) & (1u64 << pi) == 0
+    {
+        print_str(b"[win32k-svc] GDI handle table uses USER heap alias in pi 0x");
+        print_hex(pi as u32);
+        print_str(b" bytes=0x");
+        print_hex(size as u32);
+        print_str(b" client-table=0x");
+        print_hex((client_base >> 32) as u32);
+        print_hex(client_base as u32);
+        print_str(b"\n");
+    }
     client_base
 }
 
@@ -3832,66 +3804,26 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
     if base == 0 {
         return false;
     }
-    let bit = 1u64 << pi;
-    if GDI_USERVM_MAPPED.load(Ordering::Relaxed) & bit != 0 {
-        return true;
+    let already_mapped =
+        pi < MAX_PI && GDI_USERVM_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0;
+    let mapped = map_win32k_arena_prefix_into_client(
+        pml4,
+        pi,
+        base,
+        win32k_subsystem::WIN32K_USERVM_VADDR,
+        win32k_subsystem::WIN32K_USERVM_FRAMES,
+        win32k_subsystem::win32k_uservm_committed_frames(),
+        &GDI_USERVM_CLIENT_MAPPED_FRAMES,
+        &GDI_USERVM_MAPPED,
+        RW_NX,
+        b"live GDI user attributes",
+    );
+    if mapped && !already_mapped {
+        print_str(b"[win32k-svc] RW-mapped live GDI user attributes into pi 0x");
+        print_hex(pi as u32);
+        print_str(b"\n");
     }
-    for page_table in 0..(win32k_subsystem::WIN32K_USERVM_FRAMES + 511) / 512 {
-        if !win32k_client_cap_bank_map_page_table(
-            pml4,
-            pi,
-            win32k_subsystem::WIN32K_USERVM_VADDR + page_table * 0x20_0000,
-            b"live GDI user attributes",
-            page_table,
-        ) {
-            return false;
-        }
-    }
-    for frame in 0..win32k_subsystem::WIN32K_USERVM_FRAMES {
-        let (cp, copy_error) = copy_cap_r(base + frame);
-        if copy_error != 0 {
-            print_str(b"[win32k-svc] failed to copy live GDI user attributes frame for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(frame as u32);
-            print_str(b" error=");
-            print_u64(copy_error);
-            print_str(b"\n");
-            return false;
-        }
-        let map_error = page_map_r(
-            cp,
-            win32k_subsystem::WIN32K_USERVM_VADDR + frame * 0x1000,
-            RW_NX,
-            pml4,
-        );
-        if map_error != 0 {
-            print_str(b"[win32k-svc] failed to map live GDI user attributes into pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(frame as u32);
-            print_str(b" error=");
-            print_u64(map_error);
-            print_str(b"\n");
-            let _ = cnode_delete_recycle_r(cp);
-            return false;
-        }
-        if !win32k_client_cap_bank_store(pi, cp) {
-            print_str(b"[win32k-svc] failed to retain live GDI user attributes mapping cap for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(frame as u32);
-            print_str(b"\n");
-            let _ = page_unmap_r(cp);
-            let _ = cnode_delete_recycle_r(cp);
-            return false;
-        }
-    }
-    GDI_USERVM_MAPPED.fetch_or(bit, Ordering::Relaxed);
-    print_str(b"[win32k-svc] RW-mapped live GDI user attributes into pi 0x");
-    print_hex(pi as u32);
-    print_str(b"\n");
-    true
+    mapped
 }
 
 // --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---

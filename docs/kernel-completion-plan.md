@@ -87,9 +87,24 @@ ReactOS exposes it as a macro to an internal NDIS helper, so packet-array receiv
 provider-internal projection target if a real miniport reaches that path. Local validation is green:
 `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, and executive
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
-Review adjustment: the next B3 acceptance step is a serialized desktop/headless boot proof that shows
-E1000 receive indication reaching TCPIP through the provider-domain path, or exposes the next real
-OID/filter/interrupt mechanism gap.
+The serialized boot proof `.tmp/run-headless-b3-receive-indications-20260818-123659.log` accepts the
+projection as non-regressing in the full OS path: E1000 initializes through the provider `ndis.sys`,
+the miniport block mirror is published for provider instance 0/dependent instance 6, generic PCI
+provider-domain service/resource/DMA-descriptor gates pass, and Explorer shell chrome paints with
+`298/298` checks passing. That run does not yet show real receive-indication traffic, so the
+remaining B3 acceptance target is a genuine RX/TX data-plane stimulus that reaches TCPIP through
+the provider-domain route, including packet-array receive if ReactOS reaches the internal NDIS
+helper path.
+
+B3 win32k shared-map capacity slice (2026-08-18): the post-desktop CNode pressure was structural, not
+a BOOTBOOT/initrd-size problem. GUI client attach no longer projects a duplicate fixed GDI handle-table
+window or the full 16 MiB USER heap / 4 MiB GDI user-attribute arena into every process. Instead,
+clients receive the real ReactOS `PEB->GdiSharedHandleTable` contract through the table's USER-heap
+alias, and win32k extends each process's retained mapping caps only to the committed USER/GDI prefixes.
+Serialized proof `.tmp/run-headless-w32-prefix-maps-20260818.log` reaches Explorer shell chrome with
+`298/298`, passes the generic PCI provider-domain/resource/DMA gates, shows no CNode exhaustion, and
+keeps final/gate pool counters green: `w32-bank=34636/47569/12/12`, `w32-bank-fails=0`, plus successful
+late GUI-helper releases for `pi=15`, `pi=17`, `pi=14`, and `pi=13`.
 
 Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
@@ -7893,14 +7908,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     passes all desktop shell chrome gates with `298/298` executive checks.
   - `[~]` B3 remaining NDIS data-plane and capacity work (2026-08-18): continue from the same
     dynamic provider-domain path. `MiniportTransferData`, `TransferDataComplete`, and exported
-    Ethernet receive indication helpers now have local provider-domain wiring; the next required
-    proof is a serialized boot showing E1000 receive indication reaching TCPIP through that route,
-    plus continued work on packet-array receive if a real miniport reaches the internal NDIS helper,
-    real TX traffic from scatter/gather descriptors, and repeated-device scaling. Do not reintroduce
-    private provider images, protocol-specific fallbacks, or per-driver special cases. The latest proof
-    also exposes the next
-    generic post-desktop capacity frontier: after explorer paints, late GUI helper attachment can fill
-    the segmented win32k map-cap bank (`w32-bank=81920/81920/15/20`, `w32-bank-fails=1`) even though
-    the main `exec_win32k_pool_no_exhaustion` and explorer gates stay green. Treat that as a real
-    lifetime/scaling bug in shared USER/GDI mapping cap ownership before using repeated NIC/service
-    runs as evidence of full OS capacity.
+    Ethernet receive indication helpers now have local provider-domain wiring and a serialized
+    full-OS boot proof: `.tmp/run-headless-b3-receive-indications-20260818-123659.log` reaches
+    Explorer shell chrome with `298/298`, keeps the generic PCI provider-domain/resource/DMA gates
+    green, and publishes the dependent miniport-block mirror during E1000 start. The remaining proof
+    is actual RX/TX packet traffic through that dynamic provider-domain route, plus packet-array
+    receive if a real miniport reaches the internal NDIS helper, and repeated-device scaling. Do not
+    reintroduce private provider images, protocol-specific fallbacks, or per-driver special cases.
+  - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
+    BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
+    16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
+    arena into every GUI process. GUI attach now keeps the real ReactOS
+    `PEB->GdiSharedHandleTable` contract by seeding the table's USER-heap alias, removes the separate
+    fixed GDI table VSpace projection, and extends per-process retained caps only to the committed
+    USER/GDI prefixes. Teardown clears the per-process prefix counters and reclaims the retained caps.
+    Serialized proof `.tmp/run-headless-w32-prefix-maps-20260818.log` reaches Explorer shell chrome
+    with `298/298`, keeps the B3 provider-domain/resource/DMA gates green, avoids CNode exhaustion,
+    and closes with `w32-bank=34636/47569/12/12`, `w32-bank-fails=0`. Late GUI helpers release their
+    retained maps cleanly (`pi=15` released 3267 caps, `pi=17` 3284, `pi=14` 3282, `pi=13` 3282).
+    Review adjustment: B3 can continue at the real RX/TX traffic stimulus and packet-array receive
+    projection path without carrying this shared-map capacity failure as an active blocker.

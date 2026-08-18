@@ -21860,11 +21860,10 @@ static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE. Frame-cap base of the GDI shared handle table (a
 /// `GDI_TABLE_ENTRY[GDI_HANDLE_COUNT]` array — client-side gdi32 validates every GDI handle through it,
-/// reached via `PEB->GdiSharedHandleTable`). In real Windows win32k allocates this from a GdiPool
-/// section + RO-maps it into every GUI process; our host allocates + zero-inits it once here, then
-/// RO-maps it into the client (`map_gdi_shared_handle_table_into_client`). 0 until allocated.
+/// reached via `PEB->GdiSharedHandleTable`). The table is allocated once inside win32k's USER heap and
+/// GUI clients receive the USER-heap alias of that allocation. 0 until allocated.
 static GDI_SHARED_TABLE_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
-/// Per-pi bit set once the GDI shared handle table has been RO-mapped into that GUI client's VSpace.
+/// Per-pi bit set once the GDI shared handle table alias is available in that GUI client's VSpace.
 static GDI_SHARED_TABLE_MAPPED: AtomicU64 = AtomicU64::new(0);
 static GDI_USERVM_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Latched (=1) the first time the executive seeds winlogon's PEB->GdiSharedHandleTable + gdi32's
@@ -28581,7 +28580,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // (2) client-side gdi32 validates every GDI handle through GdiSharedHandleTable[handle&0xffff]
     // (base = PEB->GdiSharedHandleTable, PEB+0xf8), which was NULL in winlogon → gdi32 NULL-deref at RVA
     // 0x535a on the dialog's DC/font setup. Fix: seed PEB->GdiSharedHandleTable at spawn (img_spawn.rs)
-    // so gdi32's GdiProcessSetup caches it, + RO-map a real GDI handle table into winlogon
+    // so gdi32's GdiProcessSetup caches the USER-heap alias of the real GDI handle table, then project
+    // that committed USER-heap prefix into winlogon
     // (win32k_glue::map_gdi_shared_handle_table_into_client). With both, msgina's WlxLoggedOutSAS →
     // WlxDialogBoxParam → DIALOG_CreateIndirect drives a CASCADE of NtUserCreateWindowEx (#32770) — the
     // dialog frame + its child controls (Static labels, Edit fields, Buttons). WINLOGON_DIALOG_WINDOWS

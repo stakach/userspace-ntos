@@ -839,7 +839,7 @@ fn record_hosted_client_gdi_mapping(nt_handler: &ExecNtHandler, pi: usize, gdi_v
     if first {
         print_str(b"[client-gdi] ");
         print_str(image.leaf);
-        print_str(b" handle table mapped @0x");
+        print_str(b" handle table alias @0x");
         print_hex((gdi_va >> 32) as u32);
         print_hex(gdi_va as u32);
         print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
@@ -14516,9 +14516,9 @@ pub(crate) unsafe fn service_sec_image(
                         old_pti,
                     );
                 }
-                // ★ CLIENT-GDI HANDLE-TABLE MAPPING. GUI clients whose PEB+0xf8 was seeded before
-                // gdi32's GdiProcessSetup must also have the live win32k GDI table projected into
-                // their VSpace before client-side GdiValidateHandle runs. Winlogon needs this for the
+                // ★ CLIENT-GDI HANDLE-TABLE ALIAS. GUI clients whose PEB+0xf8 was seeded before
+                // gdi32's GdiProcessSetup must have the live win32k USER heap prefix and user-attribute
+                // area projected before client-side GdiValidateHandle runs. Winlogon needs this for the
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
                 if uses_client_gdi {

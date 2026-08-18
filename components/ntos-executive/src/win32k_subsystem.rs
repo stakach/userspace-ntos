@@ -163,24 +163,19 @@ pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
 const _: () = assert!(CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000 <= CSRSS_W32_POOL_VA);
 const _: () = assert!(CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
 
-// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE window. gdi32's client-side validity check indexes
-// `GdiSharedHandleTable[handle & 0xffff]` (0x18-byte GDI_TABLE_ENTRY each — KernelData@0, ProcessId@8,
-// Type@0xc, UserData@0x10; ntgdihdl.h). The base pointer is `PEB->GdiSharedHandleTable` (PEB+0xf8);
-// gdi32's `GdiProcessSetup` (RVA 0x1100) copies it into its cached global (gdi32 RVA 0x4e188). We
-// RO-map a full GDI_HANDLE_COUNT (0x10000) entry array so ANY handle&0xffff index is in-bounds (no
-// fault on the read), zero-initialized (a zero entry.Type mismatches the validity check → gdi32 takes
-// its `invalid handle` branch rather than a NULL-deref). Sits ABOVE the POOL client window
-// (0x9900_0000 + 8 MiB = 0x9980_0000) and below the NLS section (0xA000_0000).
-pub const GDI_SHARED_TABLE_VA: u64 = 0x0000_0000_9C00_0000;
+// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE. gdi32's client-side validity check indexes
+// `GdiSharedHandleTable[handle & 0xffff]` (0x18-byte GDI_TABLE_ENTRY each; ntgdihdl.h). The base
+// pointer is `PEB->GdiSharedHandleTable` (PEB+0xf8), copied once by gdi32's `GdiProcessSetup`.
+// ReactOS win32k allocates the table from session USER/GDI memory and returns a process-local user
+// pointer. Our table is allocated inside the win32k USER heap and exposed through that heap's client
+// alias; no separate fixed GDI-table VSpace window is reserved.
 /// GDI handle count (ReactOS GDI_HANDLE_COUNT) — the index space of `handle & 0xffff`.
 pub const GDI_HANDLE_COUNT: u64 = 0x1_0000;
 /// sizeof(GDI_TABLE_ENTRY) on x64 (KernelData 8 + ProcessId/Type union 8 + UserData 8).
 pub const GDI_TABLE_ENTRY_SIZE: u64 = 0x18;
-/// Frames spanning the GDI table (0x10000 * 0x18 = 0x18_0000 = 1.5 MiB = 384 frames).
-pub const GDI_SHARED_TABLE_FRAMES: u64 = (GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE + 0xfff) / 0x1000;
-const _: () =
-    assert!(GDI_SHARED_TABLE_VA + GDI_SHARED_TABLE_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
-const _: () = assert!(GDI_SHARED_TABLE_VA >= CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000);
+/// Maximum accepted mapped section size for the shared GDI table allocation.
+pub const GDI_SHARED_TABLE_MAX_BYTES: u64 = 0x0020_0000;
+const _: () = assert!(GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE <= GDI_SHARED_TABLE_MAX_BYTES);
 
 // USERCONNECT / SHAREDINFO x64 field offsets (references/reactos win32ss/include/ntuser.h): a
 // USERCONNECT is { ULONG ulVersion; ULONG ulCurrentVersion; DWORD dwDispatchCount; SHAREDINFO
@@ -3817,6 +3812,28 @@ unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
 
 pub(crate) fn win32k_user_heap_delta() -> u64 {
     WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA
+}
+
+pub(crate) unsafe fn win32k_user_heap_committed_frames() -> u64 {
+    let used = read_volatile(WIN32K_HEAP_VADDR as *const u64).max(POOL_DATA_OFF);
+    ((used + 0xfff) / 0x1000).clamp(1, WIN32K_HEAP_FRAMES)
+}
+
+pub(crate) fn win32k_uservm_committed_frames() -> u64 {
+    let mut high_slot = WIN32K_USERVM_NEXT_SLOT
+        .load(Ordering::Relaxed)
+        .clamp(USERVM_FIRST_SLOT as u64, USERVM_SLOT_COUNT as u64) as usize;
+    let allocated = WIN32K_USERVM_ALLOC_MASK.load(Ordering::Relaxed);
+    let mut slot = USERVM_SLOT_COUNT;
+    while slot > USERVM_FIRST_SLOT {
+        slot -= 1;
+        if allocated & (1u64 << slot) != 0 {
+            high_slot = high_slot.max(slot + 1);
+            break;
+        }
+    }
+    let frames = (high_slot as u64 * USERVM_GRANULARITY + 0xfff) / 0x1000;
+    frames.clamp(USERVM_GRANULARITY / 0x1000, WIN32K_USERVM_FRAMES)
 }
 
 pub(crate) fn win32k_heap_server_to_client(addr: u64) -> Option<u64> {
