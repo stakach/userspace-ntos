@@ -254,6 +254,13 @@ pub enum HostedProviderArgumentMarshal {
     CallerInNdisBuffer,
     CallerInPacket,
     CallerInOutPacket,
+    CallerOutNdisPacket,
+    CallerOutNdisBuffer {
+        virtual_address_arg: u8,
+        length_arg: u8,
+    },
+    CallerOutNdisBufferFromPacket,
+    CallerOutNdisBufferVirtualAddress,
     CallerInOutRequest,
     CallerInOutResourceList {
         length_pointer_arg: u8,
@@ -294,6 +301,7 @@ pub enum HostedProviderExportSideEffect {
     NdisInitializeWrapper,
     NdisMiniportRegistration,
     NdisMiniportInterruptDeregistration,
+    NdisPacketFree,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -627,6 +635,7 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutU32,
         ]),
         "NdisSend" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInPacket]),
+        "NdisMSendComplete" => void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar]),
         "NdisRequest" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInOutRequest]),
         "NdisDeregisterProtocol" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
         "NdisOpenAdapter" => void_export_policy(&[
@@ -653,14 +662,18 @@ pub fn hosted_provider_export_marshal_policy(
             CallerInProtocolCharacteristics { length_arg: 3 },
             Scalar,
         ]),
-        "NdisFreePacket" => void_export_policy(&[CallerInOutPacket]),
+        "NdisFreePacket" => export_policy_with_effect_and_result(
+            &[CallerInOutPacket],
+            HostedProviderExportSideEffect::NdisPacketFree,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisAllocatePacket" => {
-            void_export_policy(&[CallerOutStatus, CallerOutPointer, ProviderHandle])
+            void_export_policy(&[CallerOutStatus, CallerOutNdisPacket, ProviderHandle])
         }
         "NdisGetFirstBufferFromPacket" => void_export_policy(&[
             CallerInPacket,
-            CallerOutPointer,
-            CallerOutPointer,
+            CallerOutNdisBufferFromPacket,
+            CallerOutNdisBufferVirtualAddress,
             CallerOutU32,
             CallerOutU32,
         ]),
@@ -672,9 +685,12 @@ pub fn hosted_provider_export_marshal_policy(
         "NdisFreePacketPool" => void_export_policy(&[ProviderHandle]),
         "NdisAllocateBuffer" => void_export_policy(&[
             CallerOutStatus,
-            CallerOutPointer,
+            CallerOutNdisBuffer {
+                virtual_address_arg: 3,
+                length_arg: 4,
+            },
             ProviderHandle,
-            CallerInBuffer { length_arg: 4 },
+            Scalar,
             Scalar,
         ]),
         "NdisReturnPackets" => void_export_policy(&[CallerInPointerArray { count_arg: 1 }, Scalar]),
@@ -1162,6 +1178,7 @@ mod tests {
             "NdisMFreeSharedMemory",
             "NdisMDeregisterInterrupt",
             "NdisMRegisterInterrupt",
+            "NdisMSendComplete",
             "NdisMDeregisterIoPortRange",
             "NdisMMapIoSpace",
             "NdisMRegisterIoPortRange",
@@ -1193,6 +1210,7 @@ mod tests {
         for export in [
             "NdisTransferData",
             "NdisSend",
+            "NdisMSendComplete",
             "NdisRequest",
             "NdisDeregisterProtocol",
             "NdisOpenAdapter",
@@ -1360,6 +1378,108 @@ mod tests {
                 length_arg: 1,
                 physical_address_arg: 4,
             }
+        );
+    }
+
+    #[test]
+    fn ndis_packet_lifetime_policies_are_typed_shadows() {
+        let alloc =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisAllocatePacket").unwrap();
+        assert_eq!(alloc.argument_count, 3);
+        assert_eq!(
+            alloc.args[0],
+            HostedProviderArgumentMarshal::CallerOutStatus
+        );
+        assert_eq!(
+            alloc.args[1],
+            HostedProviderArgumentMarshal::CallerOutNdisPacket
+        );
+        assert_eq!(alloc.args[2], HostedProviderArgumentMarshal::ProviderHandle);
+
+        let free = hosted_provider_export_marshal_policy("ndis.sys", "NdisFreePacket").unwrap();
+        assert_eq!(free.argument_count, 1);
+        assert_eq!(
+            free.args[0],
+            HostedProviderArgumentMarshal::CallerInOutPacket
+        );
+        assert_eq!(
+            free.side_effect,
+            HostedProviderExportSideEffect::NdisPacketFree
+        );
+    }
+
+    #[test]
+    fn ndis_buffer_lifetime_policies_are_typed_shadows() {
+        let alloc =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisAllocateBuffer").unwrap();
+        assert_eq!(alloc.argument_count, 5);
+        assert_eq!(
+            alloc.args[0],
+            HostedProviderArgumentMarshal::CallerOutStatus
+        );
+        assert_eq!(
+            alloc.args[1],
+            HostedProviderArgumentMarshal::CallerOutNdisBuffer {
+                virtual_address_arg: 3,
+                length_arg: 4,
+            }
+        );
+        assert_eq!(alloc.args[2], HostedProviderArgumentMarshal::ProviderHandle);
+        assert_eq!(alloc.args[3], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(alloc.args[4], HostedProviderArgumentMarshal::Scalar);
+    }
+
+    #[test]
+    fn ndis_get_first_buffer_policy_maps_typed_outputs() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisGetFirstBufferFromPacket")
+                .unwrap();
+        assert_eq!(policy.argument_count, 5);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerInPacket
+        );
+        assert_eq!(
+            policy.args[1],
+            HostedProviderArgumentMarshal::CallerOutNdisBufferFromPacket
+        );
+        assert_eq!(
+            policy.args[2],
+            HostedProviderArgumentMarshal::CallerOutNdisBufferVirtualAddress
+        );
+        assert_eq!(policy.args[3], HostedProviderArgumentMarshal::CallerOutU32);
+        assert_eq!(policy.args[4], HostedProviderArgumentMarshal::CallerOutU32);
+    }
+
+    #[test]
+    fn ndis_return_packets_policy_maps_packet_arrays() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisReturnPackets").unwrap();
+        assert_eq!(policy.argument_count, 2);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerInPointerArray { count_arg: 1 }
+        );
+        assert_eq!(policy.args[1], HostedProviderArgumentMarshal::Scalar);
+    }
+
+    #[test]
+    fn ndis_send_complete_policy_maps_packet_completion() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMSendComplete").unwrap();
+        assert_eq!(policy.argument_count, 3);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        assert_eq!(
+            policy.args[1],
+            HostedProviderArgumentMarshal::CallerInOutPacket
+        );
+        assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
         );
     }
 

@@ -39,6 +39,33 @@ unsafe fn zero_scratch_page(va: u64) {
     core::ptr::write_bytes(va as *mut u8, 0, 0x1000);
 }
 
+#[inline]
+unsafe fn spawn_paging_retype(slot: u64, object_type: u64) {
+    let _ = untyped_retype(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
+}
+
+#[inline]
+unsafe fn checked_spawn_paging_map(
+    slot: u64,
+    map_label: u64,
+    page: u64,
+    pml4: u64,
+    level: &[u8],
+) {
+    let error = paging_struct_map_r(slot, map_label, page, pml4);
+    if error != 0 {
+        print_str(b"[spawn-paging] map ");
+        print_str(level);
+        print_str(b" failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn paging map failed");
+    }
+}
+
 unsafe fn register_spawn_private_mapping(pi: u64, base: u64, size: u64, protect: u32) {
     let _ = process_committed_mapping_register(
         pi,
@@ -489,8 +516,8 @@ unsafe fn reserve_sec_image_page_tables(pml4: u64, image_va: u64, extent: u64) -
     let mut va = start;
     loop {
         let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, va, pml4);
+        spawn_paging_retype(pt, OBJ_X86_PAGE_TABLE);
+        checked_spawn_paging_map(pt, LBL_X86_PAGE_TABLE_MAP, va, pml4, b"pt");
         mapped += 1;
         if va == end {
             break;
@@ -552,12 +579,12 @@ pub(crate) unsafe fn spawn_sec_image(
         print_str(b"\n");
     }
     let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    spawn_paging_retype(pdpt, OBJ_X86_PDPT);
     let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    spawn_paging_retype(pd, OBJ_X86_PAGE_DIRECTORY);
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
+    checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
     let image_pts = reserve_sec_image_page_tables(pml4, PE_LOAD_BASE, main_image_size);
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
@@ -578,8 +605,8 @@ pub(crate) unsafe fn spawn_sec_image(
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if let Some((ntdll_base, ntdll_pe)) = ntdll {
         let npt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
-        let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
+        spawn_paging_retype(npt, OBJ_X86_PAGE_TABLE);
+        checked_spawn_paging_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4, b"ntdll-pt");
         if setup_env {
             assert!(
                 register_image_committed_mappings(pi, ntdll_pe, ntdll_base),

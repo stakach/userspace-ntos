@@ -27009,64 +27009,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // LdrpInitialize's RVA from the loaded ntdll's export table (never hardcode — it drifts
                 // across builds) and pass it to the spawn trampoline so it calls OUR loader entry.
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
+                    let ntdll_exports = ntdll_pe.exports().unwrap_or_else(|_| Vec::new());
+                    let ntdll_export_rva = |name: &str| -> u64 {
+                        ntdll_exports
+                            .iter()
+                            .find(|e| e.name == name)
+                            .map(|e| e.rva as u64)
+                            .unwrap_or(0)
+                    };
+                    let smss_ldrp_rva = ntdll_export_rva("LdrpInitialize");
+                    let callback_dispatcher_rva = ntdll_export_rva("KiUserCallbackDispatcher");
+                    let apc_dispatcher_rva = ntdll_export_rva("KiUserApcDispatcher");
+                    let ldr_initialize_thunk_rva = ntdll_export_rva("LdrInitializeThunk");
+                    let tp_worker_rva = ntdll_export_rva("RtlpWorkerThread");
+                    let tp_completion_worker_rva = ntdll_export_rva("RtlpCompletionWorkerThread");
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
                     // absolute self-pointers at the preferred base otherwise.
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
-                    // Derive OUR LdrpInitialize RVA from the (single, ours) ntdll export table.
-                    let smss_ldrp_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "LdrpInitialize")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
-                    let callback_dispatcher_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "KiUserCallbackDispatcher")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
-                    let apc_dispatcher_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "KiUserApcDispatcher")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
-                    let ldr_initialize_thunk_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "LdrInitializeThunk")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
-                    let tp_worker_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "RtlpWorkerThread")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
-                    let tp_completion_worker_rva = ntdll_pe
-                        .exports()
-                        .ok()
-                        .and_then(|es| {
-                            es.into_iter()
-                                .find(|e| e.name == "RtlpCompletionWorkerThread")
-                                .map(|e| e.rva as u64)
-                        })
-                        .unwrap_or(0);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.

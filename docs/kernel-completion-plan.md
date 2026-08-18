@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-17
+Last updated: 2026-08-18
 
 ## Objective
 
@@ -40,29 +40,26 @@ invariants from the real workload. The latest ntdll loader-list cleanup also rem
 `PEB_LDR_DATA.EntryInProgress` dependency from `RtlPcToFileHeader`, which unblocked the dynamic
 `userinit.exe` to `explorer.exe` shell path without adding kernel launch policy.
 
-Current B3 packet-model slice (2026-08-17): the generic hosted PCI resource window now publishes a
-root-side MMIO alias alongside the component BAR mapping, using the same growable resource alias
-allocator as DMA and root-bus proof windows. The root alias lets the executive act as a
-bus-mastering device model from recorded per-devnode resources instead of reading through a hosted
-component VSpace or matching a service name. `nt-dma-manager` now has host-tested exact replay for
-broker-provided common buffers/map-transfer mappings and a descriptor-completion primitive that
-validates the descriptor ring plus descriptor-owned buffer through the owner-scoped DMA decoder
-before writing hardware completion bits. The executive replays runtime DMA allocation records
-idempotently, decodes e1000 TX/RX ring registers from the MMIO alias, completes TX descriptors from
-`TDH..TDT`, stages one bounded RX Ethernet frame at `RDH`, advances `RDH`, and raises e1000
-interrupt cause bits through the hardware cause-set register before dispatching the connected ISR.
-Hardware evidence now reports persistent `dma_dev_tx/rx` and `dma_dev_cause/fail` counters so a
-later DPC clearing descriptor `DD` does not erase the proof. Validation for this slice:
-`cargo fmt --all`, `cargo test -p nt-dma-manager`, executive `cargo check --manifest-path
-components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
-Review adjustment: the descriptor-completion/device-model foundation and serialized desktop proof
-are closed. The remaining B3 packet frontier is real NDIS receive indication after protocol
-bind/packet-filter setup, TX traffic from the real scatter/gather send route, and repeated-device
-scaling under the same dynamic devnode/resource path. The next loader cleanup is the provider
-identity boundary: ReactOS `ndis.sys` owns global protocol/miniport lists, so TCPIP and E1000 must
-call a shared provider runtime domain instead of each loading a private dependency copy.
+Current B3 provider-domain packet slice (2026-08-18): the shared-provider direction is now a real
+provider-owned export and callback transport, not image-only sharing. Observed NDIS open, bind,
+request, packet, buffer, and send-completion calls now cross from TCPIP/E1000 into the provider
+`ndis.sys` runtime through typed marshal policy. Packet and MDL shadows are keyed by provider and
+dependent instances, miniport send callbacks receive dependent-domain packet/MDL/scatter-gather
+views, provider packet state is synchronized back after in/out completions, and
+`NdisMSendComplete` re-enters provider NDIS before dispatching TCPIP's real `SendComplete`. The
+clean serialized proof `.tmp/run-headless-b3-clean-packet-send-20260818-113558.log` reaches
+`298/298`, keeps `exports=28/28` with zero export rejections, passes
+`exec_generic_pci_provider_domain_serviced`, proves `exec_dbgk_remote_breakin_reports_breakpoint`,
+and reaches genuine Explorer shell chrome with full-framebuffer non-background pixels. Validation
+for this slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, serialized `QEMU_MEMORY=2G ./run.sh`, and `git diff --check`. Review
+adjustment: descriptor discovery, provider-domain NDIS bring-up, and packet/MDL send-completion
+are closed. The remaining B3 packet frontier is real receive indication and transfer-data
+completion after protocol bind/packet-filter setup, TX traffic from the real scatter/gather route,
+and repeated-device scaling under the same dynamic devnode/resource path.
 
-Current shared-provider prep (2026-08-17): hosted component spawning now accepts an explicit image
+Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
 driver image mapping through that list. This preserves current private image behavior while removing
 the contiguous-cap assumption needed before provider-owned frames can be mixed with dependent-owned
@@ -84,39 +81,32 @@ passing, Explorer shell chrome painted, generic e1000 descriptor-completion evid
 provider-sharing evidence reporting `private-deps-with-primary=2`, `duplicate-private-deps=2`, and
 `overflow=0`.
 
-Current shared-provider runtime-domain implementation (2026-08-17, in progress): image-only sharing
-was rejected as an unsafe halfway point. ReactOS provider globals can hold pool pointers, and every
-hosted component maps `FSD_POOL_VADDR` in its own VSpace; sharing only `ndis.sys` image/data while
-keeping separate pools would make those global pointers resolve to different physical pool frames in
-TCPIP and E1000. A follow-up direct image+pool sharing experiment also proved insufficient: E1000's
-`START_DEVICE` jumped into an unmapped shared-provider address after NDIS was executed from the
-dependent component's VSpace, because the provider's executable state, DATA/SHARED pages, and
-callback/call context are not represented by image and pool frames alone. The executive now treats
-published provider singletons as reset-safe metadata only unless the provider record exposes a real
-export-call gate. Without that gate, dependents continue to load and initialize honest private
-support images; the kernel does not claim singleton-provider semantics it cannot yet enforce. The
-next B3 mechanism is a provider-domain export transport that enters the provider-owned runtime
-context and marshals NT kernel pointers/IRPs without substituting raw image frames into dependents.
-The serialized desktop proof `.tmp/run-desktop-20260817-104324.log` restores the full
-`298/298` desktop path with `shared-maps=0`, E1000 `START_DEVICE` success, and Explorer shell chrome
-painted.
+Current shared-provider runtime-domain implementation (2026-08-18): image-only sharing was rejected
+as an unsafe halfway point. ReactOS provider globals can hold pool pointers, and every hosted
+component maps `FSD_POOL_VADDR` in its own VSpace; sharing only `ndis.sys` image/data while keeping
+separate pools would make those global pointers resolve to different physical pool frames in TCPIP
+and E1000. The implemented model keeps the provider as an executable runtime domain: dependents call
+provider exports through per-dependent thunks, the executive enters the provider-owned service loop,
+and typed marshal policy projects only the caller-owned NT/NDIS objects required by the export. This
+is now proven for the observed NDIS provider surface used by TCPIP/E1000 through
+`.tmp/run-headless-b3-clean-packet-send-20260818-113558.log`; shared image/pool substitution remains
+rejected unless it is paired with an equivalent provider-owned call context and object-lifetime
+model.
 
-Latest accepted B3 packet proof (2026-08-17):
-`.tmp/run-desktop-shared-image-stable-chunks-20260817-092332.log` reaches the harness sentinel with
-`298/298` executive-to-isolated-service checks passing after the shared-image mapping registry was
-made stable across late Explorer dependency-load churn. The prior `!@src/main.rs:8216` dependency
-loader stop is gone; process-map caps are still removed and deleted/recycled normally, but mapping
-chunk storage is no longer freed and reused while live image mapping code is still re-entering the
-registry. The proof preserves the B3 hardware model evidence for the registry-selected PCI `E1000`
-path: `dma_desc_addr/ok=128/128`, `dma_dev_tx/rx=0/1`, and `dma_dev_cause/fail=144/0`. It also
-keeps memory/resource gates clean with `image-mapcap-fails=0`, `image-bank-fails=0`,
-`unmap-fails=0`, `ut-fails=0`, `registry=0`, and `asid-fails=0`. The desktop path remains genuine:
-real profile hive load, `WlxActivateUserShell`, `userinit.exe`, `explorer.exe`, shell COM class
-opens, 887 real user callbacks, 246 GDI user-batch flushes, and
-`exec_explorer_shell_chrome_painted`; `[explorer-fb]` reports `786432/786432` non-background pixels
-with at least 32 distinct non-background colors.
+Latest accepted B3 packet proof (2026-08-18):
+`.tmp/run-headless-b3-clean-packet-send-20260818-113558.log` reaches the harness sentinel with
+`298/298` executive-to-isolated-service checks passing after typed NDIS packet/MDL shadowing,
+miniport send callback projection, provider `NdisMSendComplete`, and TCPIP protocol
+`SendComplete` dispatch were wired through the provider-domain transport. The proof keeps
+provider-sharing evidence green (`exports=28/28`, `export-rejections=0`,
+`exec_generic_pci_provider_domain_serviced` PASS), keeps the Dbgk remote-breakin gate green after
+the selftest selector stopped treating benign private-endpoint messages as the final debug event,
+and preserves the genuine desktop path: real profile hive load, `WlxActivateUserShell`,
+`userinit.exe`, `explorer.exe`, shell COM class opens, 876 real user-callback redirects, 246 GDI
+user-batch flushes, and `exec_explorer_shell_chrome_painted`. `[explorer-fb]` reports
+`786432/786432` non-background pixels with at least 32 distinct non-background colors.
 
-Latest accepted desktop proof (2026-08-16):
+Previous accepted descriptor desktop proof (2026-08-16):
 `.tmp/run-headless-b3-dma-packet-desc-timerbind-20260816.log` reaches the harness sentinel with
 `297/297` executive-to-isolated-service checks passing after the generic hosted DMA descriptor
 observation slice and timer proof binding cleanup. The production delay-timer notification remains
@@ -1372,12 +1362,12 @@ notification-package fallbacks.
   creates its service-owned system threads and the desktop paint gate is green again. Hosted WDM DMA
   now includes the NT5 map-register and scatter/gather operation set backed by the per-devnode IOMMU
   grant. Generic descriptor completion and the first e1000 register-profile bus-master model are in
-  place and proven through the full desktop shell path, so remaining B3 work is real NDIS receive
-  indication after protocol bind/packet-filter setup, TX traffic from the real scatter/gather send
-  route, and repeated-device scaling under the same dynamic devnode/resource path. The active loader
-  cleanup is replacing private dependency copies of stateful provider `.sys` images with shared
-  provider mappings; current code now has the generic cap-list image mapping and provider-load
-  evidence needed to wire `ndis.sys` as a real singleton provider next.
+  place and proven through the full desktop shell path. The provider-domain path now routes the
+  observed NDIS open/bind/request/packet/buffer/send-completion surface through the shared
+  `ndis.sys` runtime with typed packet/MDL shadows instead of private provider semantics. Remaining
+  B3 work is real NDIS receive indication after protocol bind/packet-filter setup, transfer-data
+  completion, TX traffic from the real scatter/gather send route, and repeated-device scaling under
+  the same dynamic devnode/resource path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -7840,3 +7830,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ownership. The next useful slice is packet/buffer/send/receive lifetime and completion semantics
     across miniport, NDIS provider, and TCPIP domains, preserving the same dynamic multi-driver path and
     avoiding private provider images or protocol-specific fallbacks.
+  - `[x]` B3 NDIS packet/MDL send-completion slice (2026-08-18): the hosted runtime marshal
+    policy now distinguishes packet and buffer lifetime from raw pointer marshalling.
+    `NdisAllocatePacket` returns a typed packet shadow, `NdisAllocateBuffer` returns a typed
+    MDL/data shadow, `NdisGetFirstBufferFromPacket` maps provider-domain MDL/data outputs back to
+    caller-domain MDLs, `NdisReturnPackets` translates packet pointer arrays, and `NdisFreePacket`
+    is an explicit packet-lifetime side effect. The executive now keeps provider/dependent packet
+    and MDL shadow registries keyed by both endpoint instances, rewrites NDIS packet head/tail
+    chains through the shadow table before provider exports, copies caller data into provider-owned
+    buffers before send/transfer calls, and copies provider data back on in/out packet completions.
+    The same shadow table now carries a bounded dependent-side scatter/gather mirror for packet
+    callback projection: provider NDIS can call a miniport's real `MiniportSend` with a
+    dependent-domain packet/MDL/SG view, the callback result is synchronized back to the provider
+    packet, and `NdisMSendComplete` is marshalled as an ordinary provider export so miniports can
+    complete sends through provider NDIS. Provider protocol callback dispatch now covers
+    `SendComplete`, handing TCPIP its dependent packet and letting TCPIP release it through the
+    nested `NdisFreePacket` path. Instance teardown and packet free clear the dependent packet/SG
+    mirrors through the same endpoint lifecycle as provider callback and miniport interrupt records.
+    The follow-up spawn-pager repair adds checked seL4 map-result handling to the live SEC_IMAGE
+    page-table setup, so a structural image-skeleton map failure reports at the point of failure
+    instead of presenting as a silent `smss` stall. The Dbgk remote-breakin proof selector was also
+    tightened to continue past benign private-endpoint messages until the real debug exception or
+    target exit arrives. Validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and serialized `QEMU_MEMORY=2G ./run.sh` in
+    `.tmp/run-headless-b3-clean-packet-send-20260818-113558.log`. That clean proof has no temporary
+    diagnostic progress traces, keeps the provider-domain gates green (`exports=28/28`,
+    `export-rejections=0`, `exec_generic_pci_provider_domain_serviced` PASS), passes
+    `exec_dbgk_remote_breakin_reports_breakpoint`, reaches genuine userinit/explorer launch, and
+    passes all desktop shell chrome gates with `298/298` executive checks.
+  - `[~]` B3 remaining NDIS data-plane and capacity work (2026-08-18): continue from the same
+    dynamic provider-domain path with `MiniportTransferData`, `TransferDataComplete`, receive
+    indications, and repeated-device scaling; do not reintroduce private provider images,
+    protocol-specific fallbacks, or per-driver special cases. The latest proof also exposes the next
+    generic post-desktop capacity frontier: after explorer paints, late GUI helper attachment can fill
+    the segmented win32k map-cap bank (`w32-bank=81920/81920/15/20`, `w32-bank-fails=1`) even though
+    the main `exec_win32k_pool_no_exhaustion` and explorer gates stay green. Treat that as a real
+    lifetime/scaling bug in shared USER/GDI mapping cap ownership before using repeated NIC/service
+    runs as evidence of full OS capacity.

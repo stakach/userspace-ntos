@@ -18986,26 +18986,34 @@ pub(crate) unsafe fn service_sec_image(
                         // the break-in code has run; the private endpoint means any later selected
                         // message still belongs to this throwaway thread.
                         let mut f1 = None;
+                        let mut saw_breakin_marker = false;
                         let mut f1_guard = 0;
-                        while f1_guard < 4 {
+                        while f1_guard < 8 {
                             f1_guard += 1;
                             let (_fb, mi_r, m0_r, m1_r, _m2_r, _m3_r) =
                                 recv_full_r12(brk_ep, reply_a);
                             let ran = marker(0x00);
                             if ran == 0x11 || ran == 0x12 {
-                                dbgk_brk_trace(b"f1", mi_r, m0_r, m1_r, ran);
-                                f1 = Some((mi_r, m0_r));
-                                break;
+                                saw_breakin_marker = true;
+                                let label = mi_r >> 12;
+                                if label == 4 || label == 2 {
+                                    dbgk_brk_trace(b"f1", mi_r, m0_r, m1_r, ran);
+                                    f1 = Some((mi_r, m0_r));
+                                    break;
+                                }
+                                dbgk_brk_trace(b"f1-wait", mi_r, m0_r, m1_r, ran);
+                                continue;
                             }
                             dbgk_brk_trace(b"f1-foreign", mi_r, m0_r, m1_r, ran);
                         }
+                        if saw_breakin_marker
+                            && marker(0x00) == 0x11
+                            && marker(0x08) == SMSS_PEB_VA
+                            && marker(0x18) == selftests::DBGK_BREAKIN_PARAM
+                        {
+                            br_ok |= 0x0010;
+                        }
                         if let Some((f1_mi, f1_m0)) = f1 {
-                            if marker(0x00) == 0x11
-                                && marker(0x08) == SMSS_PEB_VA
-                                && marker(0x18) == selftests::DBGK_BREAKIN_PARAM
-                            {
-                                br_ok |= 0x0010;
-                            }
                             // ── 0x0020 — ★ IT HIT THE BREAKPOINT, and the debugger sees it.
                             // The byte it read is the write-through; the `int3` (DebugException,
                             // label 4) is forwarded through the live fault-loop entry and its reporter
