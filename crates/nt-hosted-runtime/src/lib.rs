@@ -20,6 +20,18 @@ pub const NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x88;
 pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
 pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
 pub const NDIS_MINIPORT_INTERRUPT_LEN_X64: u64 = 0x98;
+pub const NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64: u64 = 0x190;
+pub const NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64: u64 = 0x1b0;
+pub const NDIS_MINIPORT_BLOCK_SEND_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x1b8;
+pub const NDIS_MINIPORT_BLOCK_SEND_RESOURCES_HANDLER_OFFSET_X64: u64 = 0x1c0;
+pub const NDIS_MINIPORT_BLOCK_RESET_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x1c8;
+pub const NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64: u64 = 0x280;
+pub const NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x298;
+pub const NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64: u64 = 0x2b0;
+pub const NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2b8;
+pub const NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2c0;
+pub const NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2c8;
+pub const NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2d0;
 pub const NDIS_PROTOCOL_CHARACTERISTICS_CALLBACK_CAP: usize = 19;
 pub const NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64: u64 = 0x58;
 pub const NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x68;
@@ -635,7 +647,29 @@ pub fn hosted_provider_export_marshal_policy(
             CallerOutU32,
         ]),
         "NdisSend" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInPacket]),
+        "EthFilterDprIndicateReceive" => void_export_policy(&[
+            ProviderHandle,
+            Scalar,
+            CallerInBuffer { length_arg: 4 },
+            CallerInBuffer { length_arg: 4 },
+            Scalar,
+            CallerInBuffer { length_arg: 6 },
+            Scalar,
+            Scalar,
+        ]),
+        "EthFilterDprIndicateReceiveComplete" => void_export_policy(&[ProviderHandle]),
+        "NdisMIndicateStatus" => void_export_policy(&[
+            ProviderHandle,
+            Scalar,
+            CallerInBuffer { length_arg: 3 },
+            Scalar,
+        ]),
+        "NdisMIndicateStatusComplete" => void_export_policy(&[ProviderHandle]),
+        "NdisMQueryInformationComplete" => void_export_policy(&[ProviderHandle, Scalar]),
+        "NdisMSetInformationComplete" => void_export_policy(&[ProviderHandle, Scalar]),
+        "NdisMResetComplete" => void_export_policy(&[ProviderHandle, Scalar, Scalar]),
         "NdisMSendComplete" => void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar]),
+        "NdisMSendResourcesAvailable" => void_export_policy(&[ProviderHandle]),
         "NdisMTransferDataComplete" => {
             void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar, Scalar])
         }
@@ -1181,7 +1215,15 @@ mod tests {
             "NdisMFreeSharedMemory",
             "NdisMDeregisterInterrupt",
             "NdisMRegisterInterrupt",
+            "EthFilterDprIndicateReceive",
+            "EthFilterDprIndicateReceiveComplete",
+            "NdisMIndicateStatus",
+            "NdisMIndicateStatusComplete",
+            "NdisMQueryInformationComplete",
+            "NdisMSetInformationComplete",
+            "NdisMResetComplete",
             "NdisMSendComplete",
+            "NdisMSendResourcesAvailable",
             "NdisMTransferDataComplete",
             "NdisMDeregisterIoPortRange",
             "NdisMMapIoSpace",
@@ -1553,10 +1595,20 @@ mod tests {
             "NdisMDeregisterInterrupt",
             "NdisMDeregisterIoPortRange",
             "NdisMUnmapIoSpace",
+            "EthFilterDprIndicateReceive",
+            "EthFilterDprIndicateReceiveComplete",
+            "NdisMIndicateStatus",
+            "NdisMIndicateStatusComplete",
+            "NdisMQueryInformationComplete",
+            "NdisMSetInformationComplete",
+            "NdisMResetComplete",
             "NdisTerminateWrapper",
             "NdisFreeMemory",
             "NdisTransferData",
             "NdisSend",
+            "NdisMSendComplete",
+            "NdisMSendResourcesAvailable",
+            "NdisMTransferDataComplete",
             "NdisRequest",
             "NdisDeregisterProtocol",
             "NdisOpenAdapter",
@@ -1590,6 +1642,71 @@ mod tests {
             policy.args[0],
             HostedProviderArgumentMarshal::CallerInNdisBuffer
         );
+    }
+
+    #[test]
+    fn ndis_receive_indication_policies_map_real_provider_helpers() {
+        let receive =
+            hosted_provider_export_marshal_policy("ndis.sys", "EthFilterDprIndicateReceive")
+                .unwrap();
+        assert_eq!(receive.argument_count, 8);
+        assert_eq!(receive.stack_qwords, 4);
+        assert_eq!(
+            receive.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        assert_eq!(receive.args[1], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            receive.args[2],
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 4 }
+        );
+        assert_eq!(
+            receive.args[3],
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 4 }
+        );
+        assert_eq!(receive.args[4], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            receive.args[5],
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 6 }
+        );
+        assert_eq!(receive.args[6], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(receive.args[7], HostedProviderArgumentMarshal::Scalar);
+
+        let status =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMIndicateStatus").unwrap();
+        assert_eq!(status.argument_count, 4);
+        assert_eq!(
+            status.args[2],
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 3 }
+        );
+    }
+
+    #[test]
+    fn ndis_miniport_block_callback_offsets_match_reactos_nt5_x64() {
+        assert_eq!(NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, 0x190);
+        assert_eq!(
+            NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64,
+            0x1b0
+        );
+        assert_eq!(NDIS_MINIPORT_BLOCK_SEND_COMPLETE_HANDLER_OFFSET_X64, 0x1b8);
+        assert_eq!(NDIS_MINIPORT_BLOCK_SEND_RESOURCES_HANDLER_OFFSET_X64, 0x1c0);
+        assert_eq!(NDIS_MINIPORT_BLOCK_RESET_COMPLETE_HANDLER_OFFSET_X64, 0x1c8);
+        assert_eq!(
+            NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
+            0x280
+        );
+        assert_eq!(
+            NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+            0x298
+        );
+        assert_eq!(NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64, 0x2b0);
+        assert_eq!(
+            NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64,
+            0x2b8
+        );
+        assert_eq!(NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, 0x2c0);
+        assert_eq!(NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64, 0x2c8);
+        assert_eq!(NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64, 0x2d0);
     }
 
     #[test]

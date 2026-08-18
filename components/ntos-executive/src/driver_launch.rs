@@ -44,7 +44,17 @@ use nt_hosted_runtime::{
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
     NdisProtocolCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_INTERRUPT_LEN_X64,
+    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_RESET_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_SEND_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_SEND_RESOURCES_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, NDIS_MINIPORT_INTERRUPT_LEN_X64,
     NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{ioctl, major};
@@ -526,6 +536,8 @@ const NDIS_PACKET_EXTENSION_LEN_X64: u64 = 0x68;
 const NDIS_PACKET_SCATTER_GATHER_INFO_INDEX_X64: u64 = 5;
 const NDIS_PACKET_MAX_SHADOW_LEN_X64: u64 = 0x4000;
 const NDIS_PACKET_BUFFER_CHAIN_MAX: u64 = 64;
+const NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64: u64 =
+    NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64 + 8;
 const PROVIDER_CALLBACK_STACK_QWORDS: usize = SH_PROVIDER_EXPORT_STACK_QWORDS as usize;
 
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
@@ -12565,6 +12577,47 @@ impl HostedProviderMiniportInterruptShadow {
 }
 
 #[derive(Clone, Copy)]
+struct HostedProviderNdisMiniportBlockMirror {
+    present: bool,
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_component_va: u64,
+    dependent_component_va: u64,
+    send_complete_thunk: u64,
+    send_resources_thunk: u64,
+    reset_complete_thunk: u64,
+    eth_rx_indicate_thunk: u64,
+    eth_rx_complete_thunk: u64,
+    status_thunk: u64,
+    status_complete_thunk: u64,
+    td_complete_thunk: u64,
+    query_complete_thunk: u64,
+    set_complete_thunk: u64,
+}
+
+impl HostedProviderNdisMiniportBlockMirror {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider_instance: 0,
+            dependent_instance: 0,
+            provider_component_va: 0,
+            dependent_component_va: 0,
+            send_complete_thunk: 0,
+            send_resources_thunk: 0,
+            reset_complete_thunk: 0,
+            eth_rx_indicate_thunk: 0,
+            eth_rx_complete_thunk: 0,
+            status_thunk: 0,
+            status_complete_thunk: 0,
+            td_complete_thunk: 0,
+            query_complete_thunk: 0,
+            set_complete_thunk: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct HostedProviderCallbackRecord {
     present: bool,
     provider_instance: usize,
@@ -12666,6 +12719,14 @@ static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: [HostedProviderMiniportIn
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP: usize = 128;
+static mut HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS:
+    [HostedProviderNdisMiniportBlockMirror; HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP] =
+    [HostedProviderNdisMiniportBlockMirror::empty();
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP];
+static HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_PROVIDER_DISPATCH_ROUTES: Option<Vec<HostedProviderDispatchRoute>> = None;
 
 unsafe fn hosted_dependency_images_mut() -> &'static mut Vec<LoadedDependencyImage> {
@@ -13420,6 +13481,21 @@ unsafe fn hosted_provider_dispatch_route_for_instance(
         .iter()
         .copied()
         .find(|route| route.used && route.dependent_instance == dependent_instance)
+}
+
+unsafe fn hosted_provider_dispatch_route_for_pair(
+    provider_instance: usize,
+    dependent_instance: usize,
+) -> Option<(usize, HostedProviderDispatchRoute)> {
+    hosted_provider_dispatch_routes()?
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, route)| {
+            route.used
+                && route.provider_instance == provider_instance
+                && route.dependent_instance == dependent_instance
+        })
 }
 
 unsafe fn hosted_provider_dispatch_route_for_wrapper(
@@ -14653,6 +14729,7 @@ unsafe fn provider_marshal_ndis_packet(
 unsafe fn provider_marshal_ndis_packet_array(
     state: &mut ProviderMarshalState,
     provider_instance: usize,
+    provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
     provider_shared: u64,
@@ -14679,16 +14756,25 @@ unsafe fn provider_marshal_ndis_packet_array(
         let provider_packet = if dependent_packet == 0 {
             0
         } else {
-            find_hosted_provider_ndis_packet_shadow_by_dependent(
+            let shadow = find_hosted_provider_ndis_packet_shadow_by_dependent(
                 provider_instance,
                 dependent_instance,
                 dependent_packet,
             )
-            .map(|(_, shadow)| shadow.provider_component_va)
+            .map(|(_, shadow)| shadow)
             .ok_or_else(|| {
                 HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
                 STATUS_INVALID_PARAMETER
-            })?
+            })?;
+            sync_ndis_packet_shadow_to_provider(
+                provider_instance,
+                provider_inst,
+                dependent_instance,
+                dependent_inst,
+                shadow,
+                true,
+            )?;
+            shadow.provider_component_va
         };
         write_unaligned((provider_exec_va + index * 8) as *mut u64, provider_packet);
         index += 1;
@@ -15328,6 +15414,467 @@ unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(instance
                 hosted_instance_pool_free(provider_inst, record.provider_component_va);
             }
             *record = HostedProviderMiniportInterruptShadow::empty();
+        }
+        index += 1;
+    }
+}
+
+unsafe fn provider_marshal_emit_import_thunk_for_instance(
+    dependent_instance: usize,
+    provider: &str,
+    export_name: &str,
+    expected_provider_domain_cookie: u64,
+) -> Result<u64, i32> {
+    let Some(export_plan) = lookup_hosted_provider_singleton_export_plan(provider, export_name)
+    else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    if export_plan.provider_domain_cookie != expected_provider_domain_cookie {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_inst) = instance(dependent_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some((exec_va, _run_va, thunk_index)) =
+        allocate_instance_executable_thunk(dependent_instance)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let thunk = plan_hosted_provider_import_thunk(
+        dependent_inst.run_thunk_va,
+        dependent_inst.thunk_len,
+        thunk_index,
+        export_plan,
+    )
+    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let slot = core::slice::from_raw_parts_mut(
+        exec_va as *mut u8,
+        HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
+    );
+    encode_hosted_provider_import_thunk(thunk, slot).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(thunk.thunk_va)
+}
+
+unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_component_va: u64,
+) -> Option<(usize, HostedProviderNdisMiniportBlockMirror)> {
+    if provider_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.provider_component_va == provider_component_va
+        {
+            return Some((index, record));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Option<HostedProviderNdisMiniportBlockMirror> {
+    if dependent_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+        {
+            return Some(record);
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn provider_marshal_provider_handle(
+    provider_instance: usize,
+    dependent_instance: usize,
+    handle: u64,
+) -> Result<u64, i32> {
+    if handle == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(mirror) = hosted_provider_ndis_miniport_block_mirror_by_dependent(
+        provider_instance,
+        dependent_instance,
+        handle,
+    ) else {
+        let Some(provider_inst) = instance(provider_instance) else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        if component_to_exec_va_for_instance(provider_instance, provider_inst, handle, 1).is_none()
+        {
+            HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        return Ok(handle);
+    };
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(dependent_inst) = instance(dependent_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    refresh_hosted_provider_ndis_miniport_block_mirror(provider_inst, dependent_inst, mirror)?;
+    Ok(mirror.provider_component_va)
+}
+
+unsafe fn register_hosted_provider_ndis_miniport_block_mirror(
+    mirror: HostedProviderNdisMiniportBlockMirror,
+) -> bool {
+    if mirror.provider_component_va == 0
+        || mirror.dependent_component_va == 0
+        || mirror.provider_instance == mirror.dependent_instance
+        || mirror.send_complete_thunk == 0
+        || mirror.send_resources_thunk == 0
+        || mirror.reset_complete_thunk == 0
+        || mirror.eth_rx_indicate_thunk == 0
+        || mirror.eth_rx_complete_thunk == 0
+        || mirror.status_thunk == 0
+        || mirror.status_complete_thunk == 0
+        || mirror.td_complete_thunk == 0
+        || mirror.query_complete_thunk == 0
+        || mirror.set_complete_thunk == 0
+    {
+        return false;
+    }
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *mut HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if !record.present {
+            *record = mirror;
+            return true;
+        }
+        index += 1;
+    }
+    if bounded_count >= HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    *records.add(bounded_count) = mirror;
+    HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT
+        .store((bounded_count + 1) as u64, Ordering::Relaxed);
+    true
+}
+
+unsafe fn write_hosted_provider_ndis_miniport_block_mirror_cell(
+    provider_exec: u64,
+    dependent_exec: u64,
+    offset: u64,
+    value: u64,
+) -> Result<(), i32> {
+    if offset > NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64.saturating_sub(8) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let provider_value = read_unaligned((provider_exec + offset) as *const u64);
+    write_unaligned(
+        (dependent_exec + offset) as *mut u64,
+        if provider_value == 0 { 0 } else { value },
+    );
+    Ok(())
+}
+
+unsafe fn refresh_hosted_provider_ndis_miniport_block_mirror(
+    provider_inst: DriverInstance,
+    dependent_inst: DriverInstance,
+    mirror: HostedProviderNdisMiniportBlockMirror,
+) -> Result<(), i32> {
+    let Some(provider_exec) = component_to_exec_va_for_instance(
+        mirror.provider_instance,
+        provider_inst,
+        mirror.provider_component_va,
+        NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(dependent_exec) = component_to_exec_va_for_instance(
+        mirror.dependent_instance,
+        dependent_inst,
+        mirror.dependent_component_va,
+        NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+
+    provider_marshal_zero(
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    );
+    let eth_db =
+        read_unaligned((provider_exec + NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64) as *const u64);
+    write_unaligned(
+        (dependent_exec + NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64) as *mut u64,
+        eth_db,
+    );
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_SEND_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.send_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_SEND_RESOURCES_HANDLER_OFFSET_X64,
+        mirror.send_resources_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_RESET_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.reset_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
+        mirror.eth_rx_indicate_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.eth_rx_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64,
+        mirror.status_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.status_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.td_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.query_complete_thunk,
+    )?;
+    write_hosted_provider_ndis_miniport_block_mirror_cell(
+        provider_exec,
+        dependent_exec,
+        NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64,
+        mirror.set_complete_thunk,
+    )
+}
+
+unsafe fn refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+) -> Result<(), i32> {
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    let mut matched = false;
+    while index < bounded_count {
+        let mirror = *records.add(index);
+        if mirror.present
+            && mirror.provider_instance == provider_instance
+            && mirror.dependent_instance == dependent_instance
+        {
+            matched = true;
+            refresh_hosted_provider_ndis_miniport_block_mirror(
+                provider_inst,
+                dependent_inst,
+                mirror,
+            )?;
+        }
+        index += 1;
+    }
+    if !matched {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    Ok(())
+}
+
+unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_domain_cookie: u64,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    provider_component_va: u64,
+) -> Result<HostedProviderNdisMiniportBlockMirror, i32> {
+    if provider_component_va == 0
+        || component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            provider_component_va,
+            NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+        )
+        .is_none()
+    {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_component_va) = hosted_instance_pool_alloc(
+        dependent_inst,
+        NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    ) else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_component_va,
+        NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    )
+    .is_none()
+    {
+        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let mut mirror = HostedProviderNdisMiniportBlockMirror {
+        present: true,
+        provider_instance,
+        dependent_instance,
+        provider_component_va,
+        dependent_component_va,
+        ..HostedProviderNdisMiniportBlockMirror::empty()
+    };
+
+    macro_rules! emit_or_free {
+        ($export:expr) => {
+            match provider_marshal_emit_import_thunk_for_instance(
+                dependent_instance,
+                "ndis.sys",
+                $export,
+                provider_domain_cookie,
+            ) {
+                Ok(thunk) => thunk,
+                Err(status) => {
+                    hosted_instance_pool_free(dependent_inst, dependent_component_va);
+                    return Err(status);
+                }
+            }
+        };
+    }
+
+    mirror.send_complete_thunk = emit_or_free!("NdisMSendComplete");
+    mirror.send_resources_thunk = emit_or_free!("NdisMSendResourcesAvailable");
+    mirror.reset_complete_thunk = emit_or_free!("NdisMResetComplete");
+    mirror.eth_rx_indicate_thunk = emit_or_free!("EthFilterDprIndicateReceive");
+    mirror.eth_rx_complete_thunk = emit_or_free!("EthFilterDprIndicateReceiveComplete");
+    mirror.status_thunk = emit_or_free!("NdisMIndicateStatus");
+    mirror.status_complete_thunk = emit_or_free!("NdisMIndicateStatusComplete");
+    mirror.td_complete_thunk = emit_or_free!("NdisMTransferDataComplete");
+    mirror.query_complete_thunk = emit_or_free!("NdisMQueryInformationComplete");
+    mirror.set_complete_thunk = emit_or_free!("NdisMSetInformationComplete");
+
+    if let Err(status) =
+        refresh_hosted_provider_ndis_miniport_block_mirror(provider_inst, dependent_inst, mirror)
+    {
+        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        return Err(status);
+    }
+    if !register_hosted_provider_ndis_miniport_block_mirror(mirror) {
+        hosted_instance_pool_free(dependent_inst, dependent_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    print_str(b"[provider-ndis] miniport block mirror provider-inst=");
+    print_u64(provider_instance as u64);
+    print_str(b" dependent-inst=");
+    print_u64(dependent_instance as u64);
+    print_str(b" provider=0x");
+    print_hex64(provider_component_va);
+    print_str(b" dependent=0x");
+    print_hex64(dependent_component_va);
+    print_str(b"\n");
+    Ok(mirror)
+}
+
+unsafe fn ensure_hosted_provider_ndis_miniport_block_mirror(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_domain_cookie: u64,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    provider_component_va: u64,
+) -> Result<HostedProviderNdisMiniportBlockMirror, i32> {
+    if let Some((_index, mirror)) = hosted_provider_ndis_miniport_block_mirror_by_provider(
+        provider_instance,
+        dependent_instance,
+        provider_component_va,
+    ) {
+        refresh_hosted_provider_ndis_miniport_block_mirror(
+            provider_inst,
+            dependent_inst,
+            mirror,
+        )?;
+        return Ok(mirror);
+    }
+    allocate_hosted_provider_ndis_miniport_block_mirror(
+        provider_instance,
+        provider_inst,
+        provider_domain_cookie,
+        dependent_instance,
+        dependent_inst,
+        provider_component_va,
+    )
+}
+
+unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(instance_index: usize) {
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *mut HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && (record.provider_instance == instance_index
+                || record.dependent_instance == instance_index)
+        {
+            if let Some(dependent_inst) = instance(record.dependent_instance) {
+                hosted_instance_pool_free(dependent_inst, record.dependent_component_va);
+            }
+            *record = HostedProviderNdisMiniportBlockMirror::empty();
         }
         index += 1;
     }
@@ -16383,8 +16930,10 @@ unsafe fn prepare_provider_export_marshal(
         let arg = args[index];
         args[index] = match policy.args[index] {
             HostedProviderArgumentMarshal::Scalar
-            | HostedProviderArgumentMarshal::ProviderHandle
             | HostedProviderArgumentMarshal::CallerContext => arg,
+            HostedProviderArgumentMarshal::ProviderHandle => {
+                provider_marshal_provider_handle(provider_instance, dependent_index, arg)?
+            }
             HostedProviderArgumentMarshal::CallerInDriverObject => {
                 if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper {
                     provider_marshal_driver_object_shadow(
@@ -16777,9 +17326,13 @@ unsafe fn prepare_provider_export_marshal(
                 if count_index >= policy.argument_count as usize {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
+                let Some(provider_inst) = instance(provider_instance) else {
+                    return Err(STATUS_DEVICE_NOT_READY);
+                };
                 provider_marshal_ndis_packet_array(
                     &mut state,
                     provider_instance,
+                    provider_inst,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
@@ -17695,9 +18248,22 @@ unsafe fn service_ndis_initialize_callback(
     let dependent_medium_exec = dependent_open_status_exec + 0x10;
     provider_marshal_zero(dependent_open_status_exec, 0x10 + medium_bytes);
     copy_bytes(dependent_medium_exec, provider_medium_exec, medium_bytes);
+    let Some((_route_index, route)) =
+        hosted_provider_dispatch_route_for_pair(provider_instance, record.dependent_instance)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let miniport_block_mirror = ensure_hosted_provider_ndis_miniport_block_mirror(
+        provider_instance,
+        provider_inst,
+        route.provider_domain_cookie,
+        record.dependent_instance,
+        dependent_inst,
+        provider_stack[0],
+    )?;
 
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
-    stack_args[0] = provider_stack[0];
+    stack_args[0] = miniport_block_mirror.dependent_component_va;
     stack_args[1] = provider_stack[1];
     let result = dispatch_dependent_provider_callback(
         record,
@@ -17713,6 +18279,13 @@ unsafe fn service_ndis_initialize_callback(
     )?;
     copy_bytes(provider_open_status_exec, dependent_open_status_exec, 4);
     copy_bytes(provider_selected_exec, dependent_selected_exec, 4);
+    if result == STATUS_SUCCESS as u64 {
+        refresh_hosted_provider_ndis_miniport_block_mirror(
+            provider_inst,
+            dependent_inst,
+            miniport_block_mirror,
+        )?;
+    }
     Ok(result)
 }
 
@@ -18286,6 +18859,198 @@ unsafe fn service_ndis_protocol_transfer_data_complete_callback(
     )
 }
 
+unsafe fn service_ndis_protocol_receive_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, i32> {
+    let header_bytes = arg3;
+    let lookahead_component = provider_stack[0];
+    let lookahead_bytes = provider_stack[1];
+    let packet_bytes = provider_stack[2];
+    let lookahead_off = provider_marshal_align8(header_bytes).ok_or(STATUS_INVALID_PARAMETER)?;
+    let used = provider_marshal_align8(
+        lookahead_off
+            .checked_add(lookahead_bytes)
+            .ok_or(STATUS_INVALID_PARAMETER)?,
+    )
+    .ok_or(STATUS_INVALID_PARAMETER)?;
+    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let provider_header_exec = if header_bytes == 0 {
+        0
+    } else {
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, header_bytes)
+            .ok_or(STATUS_INVALID_PARAMETER)?
+    };
+    let provider_lookahead_exec = if lookahead_bytes == 0 {
+        0
+    } else {
+        component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            lookahead_component,
+            lookahead_bytes,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER)?
+    };
+
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_base_exec, used);
+    let dependent_header_component = if header_bytes == 0 {
+        0
+    } else {
+        copy_bytes(dependent_base_exec, provider_header_exec, header_bytes);
+        dependent_base_component
+    };
+    let dependent_lookahead_component = if lookahead_bytes == 0 {
+        0
+    } else {
+        copy_bytes(
+            dependent_base_exec + lookahead_off,
+            provider_lookahead_exec,
+            lookahead_bytes,
+        );
+        dependent_base_component + lookahead_off
+    };
+
+    let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    stack_args[0] = dependent_lookahead_component;
+    stack_args[1] = lookahead_bytes;
+    stack_args[2] = packet_bytes;
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, arg1, dependent_header_component, header_bytes],
+        stack_args,
+    )
+}
+
+unsafe fn service_ndis_protocol_receive_complete_callback(
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+) -> Result<u64, i32> {
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, 0, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
+unsafe fn service_ndis_protocol_status_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<u64, i32> {
+    let used = provider_marshal_align8(arg3).ok_or(STATUS_INVALID_PARAMETER)?;
+    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let provider_status_exec = if arg3 == 0 {
+        0
+    } else {
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, arg3)
+            .ok_or(STATUS_INVALID_PARAMETER)?
+    };
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_status_component = if arg3 == 0 {
+        0
+    } else {
+        let dependent_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+        provider_marshal_zero(dependent_exec, used);
+        copy_bytes(dependent_exec, provider_status_exec, arg3);
+        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
+    };
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, arg1, dependent_status_component, arg3],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
+unsafe fn service_ndis_protocol_status_complete_callback(
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+) -> Result<u64, i32> {
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, 0, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
+unsafe fn service_ndis_protocol_receive_packet_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+) -> Result<u64, i32> {
+    let shadow = provider_callback_packet_shadow(provider_instance, record, arg1)?;
+    sync_ndis_packet_shadow_to_dependent(
+        provider_instance,
+        provider_inst,
+        record.dependent_instance,
+        dependent_inst,
+        shadow,
+    )?;
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, shadow.dependent_component_va, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )?;
+    let Some((_index, refreshed)) =
+        find_hosted_provider_ndis_packet_shadow_by_dependent(
+            provider_instance,
+            record.dependent_instance,
+            shadow.dependent_component_va,
+        )
+    else {
+        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    sync_ndis_packet_shadow_to_provider(
+        provider_instance,
+        provider_inst,
+        record.dependent_instance,
+        dependent_inst,
+        refreshed,
+        true,
+    )?;
+    Ok(result)
+}
+
 pub(crate) unsafe fn service_hosted_provider_callback(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
@@ -18336,7 +19101,23 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let callback_args = [arg0, arg1, arg2, arg3];
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
-    let result = match record.callback_kind {
+    let preflight = if record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
+        && record.callback_offset != NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64
+    {
+        refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
+            provider_instance,
+            provider_inst,
+            record.dependent_instance,
+            dependent_inst,
+        )
+    } else {
+        Ok(())
+    };
+
+    let result = if let Err(status) = preflight {
+        Err(status)
+    } else {
+        match record.callback_kind {
         HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
             NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
                 provider_instance,
@@ -18495,9 +19276,60 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                     arg3,
                 )
             }
+            NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => service_ndis_protocol_receive_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                provider_stack,
+            ),
+            NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
+                service_ndis_protocol_receive_complete_callback(
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                )
+            }
+            NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => service_ndis_protocol_status_callback(
+                provider_instance,
+                provider_inst,
+                record,
+                dependent_inst,
+                exec_code_va,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+            ),
+            NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
+                service_ndis_protocol_status_complete_callback(
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                )
+            }
+            NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
+                service_ndis_protocol_receive_packet_callback(
+                    provider_instance,
+                    provider_inst,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                    arg1,
+                )
+            }
             _ => Err(STATUS_NOT_SUPPORTED),
         },
         _ => Err(STATUS_NOT_SUPPORTED),
+        }
     };
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
@@ -25904,6 +26736,7 @@ fn clear_instance(i: usize) {
     unsafe {
         clear_hosted_provider_ndis_shadows_for_instance(i);
         clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
+        clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i);
         clear_hosted_provider_dispatch_routes_for_instance(i);
     }
     if let Some(inst) = instance(i) {

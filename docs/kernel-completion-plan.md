@@ -55,9 +55,9 @@ for this slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocaptu
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
 x86_64-unknown-none`, serialized `QEMU_MEMORY=2G ./run.sh`, and `git diff --check`. Review
 adjustment: descriptor discovery, provider-domain NDIS bring-up, and packet/MDL send-completion
-are closed. The remaining B3 packet frontier is real receive indication after protocol
-bind/packet-filter setup, TX traffic from the real scatter/gather route, and repeated-device
-scaling under the same dynamic devnode/resource path.
+are closed. The remaining B3 packet frontier is boot-proving real receive indication after
+protocol bind/packet-filter setup, TX traffic from the real scatter/gather route, and
+repeated-device scaling under the same dynamic devnode/resource path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -69,10 +69,27 @@ validation is green: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --no
 executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
 x86_64-unknown-none`. Review adjustment: this closes the transport/completion gap, but the current
 ReactOS e1000 miniport registers no `TransferDataHandler` and receives full lookahead buffers. The
-next B3 acceptance work should boot-test this slice, then wire the receive indication callbacks
-(`Receive`, `ReceiveComplete`, and later `ReceivePacket`) plus any observed generic dependent NDIS
-helper exports such as `NdisQueryPacket`/`NdisQueryBuffer` when a miniport actually exercises a
-transfer-data implementation.
+next B3 acceptance work should boot-test this slice and the receive-indication projection below,
+then add any observed generic dependent NDIS helper exports such as `NdisQueryPacket`/
+`NdisQueryBuffer` when a miniport actually exercises a transfer-data implementation.
+
+B3 receive-indication projection slice (2026-08-18): provider-owned NDIS miniport handles now have a
+dependent-domain `NDIS_MINIPORT_BLOCK` projection for the callback slots that ReactOS miniport macros
+legitimately dereference. `MiniportInitialize` receives the dependent projection, while provider
+export marshalling translates that handle back to the provider block before calling NDIS. The
+projection refreshes from the provider block before later miniport callbacks, copies the provider
+`EthDB`, and installs dependent thunks for exported provider helpers including
+`EthFilterDprIndicateReceive`, `EthFilterDprIndicateReceiveComplete`, status, send/resource,
+reset, transfer-data, query, and set completions. The executive now dispatches protocol `Receive`,
+`ReceiveComplete`, `Status`, `StatusComplete`, and packet-array receive callbacks with typed buffer
+and packet projection. `NdisMIndicateReceivePacket` is intentionally not treated as a provider export:
+ReactOS exposes it as a macro to an internal NDIS helper, so packet-array receive remains a separate
+provider-internal projection target if a real miniport reaches that path. Local validation is green:
+`cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, and executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+Review adjustment: the next B3 acceptance step is a serialized desktop/headless boot proof that shows
+E1000 receive indication reaching TCPIP through the provider-domain path, or exposes the next real
+OID/filter/interrupt mechanism gap.
 
 Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
@@ -7875,9 +7892,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `exec_dbgk_remote_breakin_reports_breakpoint`, reaches genuine userinit/explorer launch, and
     passes all desktop shell chrome gates with `298/298` executive checks.
   - `[~]` B3 remaining NDIS data-plane and capacity work (2026-08-18): continue from the same
-    dynamic provider-domain path with `MiniportTransferData`, `TransferDataComplete`, receive
-    indications, and repeated-device scaling; do not reintroduce private provider images,
-    protocol-specific fallbacks, or per-driver special cases. The latest proof also exposes the next
+    dynamic provider-domain path. `MiniportTransferData`, `TransferDataComplete`, and exported
+    Ethernet receive indication helpers now have local provider-domain wiring; the next required
+    proof is a serialized boot showing E1000 receive indication reaching TCPIP through that route,
+    plus continued work on packet-array receive if a real miniport reaches the internal NDIS helper,
+    real TX traffic from scatter/gather descriptors, and repeated-device scaling. Do not reintroduce
+    private provider images, protocol-specific fallbacks, or per-driver special cases. The latest proof
+    also exposes the next
     generic post-desktop capacity frontier: after explorer paints, late GUI helper attachment can fill
     the segmented win32k map-cap bank (`w32-bank=81920/81920/15/20`, `w32-bank-fails=1`) even though
     the main `exec_win32k_pool_no_exhaustion` and explorer gates stay green. Treat that as a real
