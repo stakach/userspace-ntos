@@ -386,10 +386,45 @@ fn find_device_for_id_pattern<'a>(devices: &'a [PciDevice], id: &str) -> Option<
     devices.iter().find(|device| pattern.matches(device))
 }
 
+fn parse_hex_u8_token(token: &str) -> Option<u8> {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() || bytes.len() > 2 {
+        return None;
+    }
+    let mut value = 0u8;
+    for &byte in bytes {
+        value = (value << 4) | hex_nibble(byte)?;
+    }
+    Some(value)
+}
+
+fn pci_instance_location(instance_id: &str) -> Option<(u8, u8, u8)> {
+    if !starts_with_pci_prefix(instance_id) {
+        return None;
+    }
+    let instance = instance_id
+        .rsplit(|ch| ch == '\\' || ch == '/' || ch == '#')
+        .next()?;
+    let mut bus_token = None;
+    let mut request_token = None;
+    for token in instance.split('&') {
+        bus_token = request_token;
+        request_token = Some(token);
+    }
+    let bus = parse_hex_u8_token(bus_token?)?;
+    let request = parse_hex_u8_token(request_token?)?;
+    let dev = (request >> 3) & 0x1f;
+    let func = request & 0x07;
+    Some((bus, dev, func))
+}
+
 /// Resolve a registry-imported PCI devnode to the enumerated PCI function it represents.
 ///
-/// Match order mirrors NT's ID ranking for this boundary: hardware IDs first, then the `Enum\PCI`
-/// instance path as a specific fallback, then compatible IDs from most to least specific.
+/// A complete `Enum\PCI` instance path can carry the bus and device/function in its final segment.
+/// That location is the most specific identity when repeated identical functions exist. If it is
+/// present, the match is exact and still checked against the instance's vendor/device/class
+/// constraints. Devnodes without a usable location fall back to NT's normal ID ranking: hardware
+/// IDs, then the instance path as an ID pattern, then compatible IDs from most to least specific.
 pub fn find_pci_device_for_devnode<'a, H, C>(
     devices: &'a [PciDevice],
     instance_id: &str,
@@ -400,6 +435,16 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
+    if let Some((bus, dev, func)) = pci_instance_location(instance_id) {
+        let device = devices
+            .iter()
+            .find(|device| device.bus == bus && device.dev == dev && device.func == func)?;
+        if parse_pci_id_pattern(instance_id).is_some_and(|pattern| !pattern.matches(device)) {
+            return None;
+        }
+        return Some(device);
+    }
+
     for id in hardware_ids {
         if let Some(device) = find_device_for_id_pattern(devices, id.as_ref()) {
             return Some(device);
@@ -899,6 +944,83 @@ mod tests {
         .unwrap();
         assert_eq!(dev.vendor, 0x8086);
         assert_eq!(dev.device, 0x100E);
+    }
+
+    #[test]
+    fn matches_repeated_pci_devices_by_instance_location() {
+        let devices = vec![
+            PciDevice {
+                bus: 0,
+                dev: 3,
+                func: 0,
+                vendor: 0x8086,
+                device: 0x100E,
+                class: 0x020000,
+                irq_line: 11,
+                irq_pin: 1,
+                bars: vec![Bar {
+                    index: 0,
+                    is_io: false,
+                    is_64bit: false,
+                    base: 0xFEBC_0000,
+                    size: 0x2_0000,
+                }],
+            },
+            PciDevice {
+                bus: 0,
+                dev: 4,
+                func: 0,
+                vendor: 0x8086,
+                device: 0x100E,
+                class: 0x020000,
+                irq_line: 10,
+                irq_pin: 1,
+                bars: vec![Bar {
+                    index: 0,
+                    is_io: false,
+                    is_64bit: false,
+                    base: 0xFEBA_0000,
+                    size: 0x2_0000,
+                }],
+            },
+        ];
+
+        let first = find_pci_device_for_devnode(
+            &devices,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&18",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[r"PCI\CC_020000"],
+        )
+        .unwrap();
+        let second = find_pci_device_for_devnode(
+            &devices,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&20",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[r"PCI\CC_020000"],
+        )
+        .unwrap();
+
+        assert_eq!(first.dev, 3);
+        assert_eq!(first.first_memory_bar().unwrap().base, 0xFEBC_0000);
+        assert_eq!(second.dev, 4);
+        assert_eq!(second.first_memory_bar().unwrap().base, 0xFEBA_0000);
+    }
+
+    #[test]
+    fn exact_pci_instance_location_does_not_fall_back_to_generic_id() {
+        let m = nic_mock();
+        let devs = enumerate_bus(
+            0,
+            |d, f, o| m.read(d, f, o),
+            |d, f, o, v| m.write(d, f, o, v),
+        );
+        let dev = find_pci_device_for_devnode(
+            &devs,
+            r"PCI\VEN_8086&DEV_100E\3&11583659&0&20",
+            &[r"PCI\VEN_8086&DEV_100E"],
+            &[r"PCI\CC_020000"],
+        );
+        assert!(dev.is_none());
     }
 
     #[test]
