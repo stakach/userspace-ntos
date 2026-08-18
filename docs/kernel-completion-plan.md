@@ -7922,9 +7922,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `PEB->GdiSharedHandleTable` contract by seeding the table's USER-heap alias, removes the separate
     fixed GDI table VSpace projection, and extends per-process retained caps only to the committed
     USER/GDI prefixes. Teardown clears the per-process prefix counters and reclaims the retained caps.
-    Serialized proof `.tmp/run-headless-w32-prefix-maps-20260818.log` reaches Explorer shell chrome
-    with `298/298`, keeps the B3 provider-domain/resource/DMA gates green, avoids CNode exhaustion,
-    and closes with `w32-bank=34636/47569/12/12`, `w32-bank-fails=0`. Late GUI helpers release their
-    retained maps cleanly (`pi=15` released 3267 caps, `pi=17` 3284, `pi=14` 3282, `pi=13` 3282).
+    Serialized proof `.tmp/run-headless-w32-gdi-alias-20260818-rerun.log` reaches Explorer shell
+    chrome with `298/298`, keeps the B3 provider-domain/resource/DMA gates green, avoids CNode
+    exhaustion, and closes with `w32-bank=35969/35969/14/9`, `w32-bank-fails=0`,
+    `image-bank-fails=0`. Winlogon, userinit, and explorer all publish the GDI handle table through
+    the USER-heap alias (`0x98101020`) with live user attributes, and the final gate retains broad
+    CSpace headroom (`slot-free=39051`).
     Review adjustment: B3 can continue at the real RX/TX traffic stimulus and packet-array receive
     projection path without carrying this shared-map capacity failure as an active blocker.
