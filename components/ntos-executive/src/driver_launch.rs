@@ -201,6 +201,7 @@ const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_
 const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
+const FSD_HOSTED_SYSTEM_RANGE_START: u64 = FSD_CODE_VA;
 
 /// Shared handoff arena (executive ↔ host): entry rva in, verdict + MajorFunction table + device
 /// object out, then the IRP request/reply fields. The arena extends up to the ARG window so hosted
@@ -3430,7 +3431,10 @@ static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
 
 unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
     let mm_system_range_start = exec_data_va + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
-    write_volatile(mm_system_range_start as *mut u64, 0xFFFF_0800_0000_0000);
+    write_volatile(
+        mm_system_range_start as *mut u64,
+        FSD_HOSTED_SYSTEM_RANGE_START,
+    );
 
     let io_file_object_type_cell = exec_data_va + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
     let io_file_object_type_body = exec_data_va + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
@@ -26092,6 +26096,13 @@ const E1000_RX_DESCRIPTOR_DONE_EOP: u8 = 0x03;
 const E1000_TX_DESCRIPTOR_DONE: u8 = 0x01;
 const HOSTED_E1000_RX_STIMULUS_LEN: u16 = 60;
 
+#[derive(Clone, Copy)]
+struct HostedE1000StimulusConfig {
+    sender_mac: [u8; 6],
+    sender_ip: [u8; 4],
+    target_ip: [u8; 4],
+}
+
 fn hosted_e1000_profile_matches(state: HostedDeviceResourceState) -> bool {
     if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS {
         return false;
@@ -26102,6 +26113,156 @@ fn hosted_e1000_profile_matches(state: HostedDeviceResourceState) -> bool {
     vendor == E1000_VENDOR_INTEL
         && device == E1000_DEVICE_82540EM
         && pci_class == E1000_PCI_CLASS_NETWORK_ETHERNET
+}
+
+fn strip_nt_device_prefix(value: &str) -> Option<&str> {
+    const PREFIX: &str = r"\Device\";
+    if ascii_prefix_eq_ignore_case(value, PREFIX) {
+        Some(&value[PREFIX.len()..])
+    } else {
+        None
+    }
+}
+
+unsafe fn hosted_e1000_interface_name_for_binding(
+    binding: HostedDeviceBinding,
+) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
+    let identity = hosted_registry_identity(binding.registry_identity_id)?;
+    if !identity.has_linkage_export() {
+        return None;
+    }
+    let suffix = strip_nt_device_prefix(identity.export_name.as_str())?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let mut interface = HostedAscii::<HOSTED_EXPORT_NAME_MAX>::empty();
+    if interface.set_str(suffix) {
+        Some(interface)
+    } else {
+        None
+    }
+}
+
+fn hosted_e1000_tcpip_interface_path(
+    interface: &HostedAscii<HOSTED_EXPORT_NAME_MAX>,
+) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    let mut path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
+    if path.push_str(
+        r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\",
+    ) && path.push_ascii(interface)
+    {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn parse_ipv4_ascii_bytes(bytes: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut index = 0usize;
+    let mut value = 0u16;
+    let mut digits = 0u8;
+    for &byte in bytes {
+        if byte.is_ascii_digit() {
+            if digits == 3 {
+                return None;
+            }
+            value = value
+                .checked_mul(10)?
+                .checked_add((byte - b'0') as u16)?;
+            if value > 255 {
+                return None;
+            }
+            digits += 1;
+        } else if byte == b'.' {
+            if digits == 0 || index >= 3 {
+                return None;
+            }
+            out[index] = value as u8;
+            index += 1;
+            value = 0;
+            digits = 0;
+        } else {
+            return None;
+        }
+    }
+    if digits == 0 || index != 3 {
+        return None;
+    }
+    out[index] = value as u8;
+    Some(out)
+}
+
+fn parse_ipv4_from_registry_multi_sz(data: &[u8]) -> Option<[u8; 4]> {
+    if data.len() & 1 != 0 {
+        return None;
+    }
+    let mut first = [0u8; 15];
+    let mut len = 0usize;
+    for pair in data.chunks_exact(2) {
+        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        if unit == 0 {
+            break;
+        }
+        if unit > 0x7f || len == first.len() {
+            return None;
+        }
+        first[len] = unit as u8;
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    let address = parse_ipv4_ascii_bytes(&first[..len])?;
+    if address == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(address)
+    }
+}
+
+unsafe fn hosted_e1000_registry_ipv4(
+    interface: &HostedAscii<HOSTED_EXPORT_NAME_MAX>,
+    value_name: &str,
+) -> Option<[u8; 4]> {
+    let key_path = hosted_e1000_tcpip_interface_path(interface)?;
+    let mut data = [0u8; 128];
+    let (value_type, data_len) =
+        crate::config_manager_query_value(key_path.as_str(), value_name, &mut data).ok()?;
+    if value_type != REG_MULTI_SZ || data_len > data.len() {
+        return None;
+    }
+    parse_ipv4_from_registry_multi_sz(&data[..data_len])
+}
+
+fn hosted_e1000_sender_mac(binding: HostedDeviceBinding) -> [u8; 6] {
+    let id = binding.device_id
+        ^ binding.driver_id.rotate_left(13)
+        ^ ((binding.instance as u64).rotate_left(29));
+    [
+        0x02,
+        0x00,
+        ((id >> 24) & 0xff) as u8,
+        ((id >> 16) & 0xff) as u8,
+        ((id >> 8) & 0xff) as u8,
+        (id & 0xff) as u8,
+    ]
+}
+
+unsafe fn hosted_e1000_stimulus_config(
+    binding: HostedDeviceBinding,
+) -> Option<HostedE1000StimulusConfig> {
+    let interface = hosted_e1000_interface_name_for_binding(binding)?;
+    let target_ip = hosted_e1000_registry_ipv4(&interface, "IPAddress")?;
+    let sender_ip = hosted_e1000_registry_ipv4(&interface, "DefaultGateway")?;
+    if sender_ip == target_ip {
+        return None;
+    }
+    Some(HostedE1000StimulusConfig {
+        sender_mac: hosted_e1000_sender_mac(binding),
+        sender_ip,
+        target_ip,
+    })
 }
 
 unsafe fn hosted_mmio_read_u32(state: HostedDeviceResourceState, offset: u64) -> Option<u32> {
@@ -26194,27 +26355,27 @@ unsafe fn hosted_dma_record_alias_for_logical_range(
     None
 }
 
-unsafe fn write_hosted_e1000_rx_stimulus_frame(alias_va: u64, len: u16) {
+unsafe fn write_hosted_e1000_rx_stimulus_frame(
+    alias_va: u64,
+    len: u16,
+    config: HostedE1000StimulusConfig,
+) {
     let len = len as usize;
     let frame = core::slice::from_raw_parts_mut(alias_va as *mut u8, len);
     for byte in frame.iter_mut() {
         *byte = 0;
     }
-    let prefix = [
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination: broadcast
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // source: locally administered
-        0x08, 0x06, // EtherType: ARP
-        0x00, 0x01, // hardware type: Ethernet
-        0x08, 0x00, // protocol type: IPv4
-        0x06, 0x04, // address sizes
-        0x00, 0x01, // opcode: request
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // sender MAC
-        10, 0, 2, 2, // sender IPv4
-        0, 0, 0, 0, 0, 0, // target MAC
-        10, 0, 2, 15, // target IPv4
-    ];
-    let copy_len = prefix.len().min(frame.len());
-    frame[..copy_len].copy_from_slice(&prefix[..copy_len]);
+    if frame.len() < 42 {
+        return;
+    }
+    frame[0..6].fill(0xff);
+    frame[6..12].copy_from_slice(&config.sender_mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x06]);
+    frame[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01]);
+    frame[22..28].copy_from_slice(&config.sender_mac);
+    frame[28..32].copy_from_slice(&config.sender_ip);
+    frame[32..38].fill(0);
+    frame[38..42].copy_from_slice(&config.target_ip);
 }
 
 unsafe fn drive_hosted_e1000_tx_descriptors(
@@ -26332,6 +26493,9 @@ unsafe fn drive_hosted_e1000_rx_descriptor(
     if ring[base + 12] & E1000_RX_DESCRIPTOR_DONE != 0 {
         return report;
     }
+    let Some(stimulus_config) = hosted_e1000_stimulus_config(binding) else {
+        return report;
+    };
     match hosted_dma_manager_mut().complete_fixed_descriptor_at(
         hosted_dma_owner(binding),
         ring_logical,
@@ -26348,7 +26512,11 @@ unsafe fn drive_hosted_e1000_rx_descriptor(
                 completion.buffer_backing_va,
                 HOSTED_E1000_RX_STIMULUS_LEN as u64,
             ) {
-                write_hosted_e1000_rx_stimulus_frame(buffer_alias, HOSTED_E1000_RX_STIMULUS_LEN);
+                write_hosted_e1000_rx_stimulus_frame(
+                    buffer_alias,
+                    HOSTED_E1000_RX_STIMULUS_LEN,
+                    stimulus_config,
+                );
                 let new_head = ((head + 1) % descriptor_count) as u32;
                 let _ = hosted_mmio_write_u32(state, E1000_REG_RDH, new_head);
                 report.rx_completed = 1;

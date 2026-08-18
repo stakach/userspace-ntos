@@ -22,6 +22,7 @@ mod reactos_registration;
 
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{
+    reactos_network_ipv4_defaults_for_interface,
     seed_reactos_default_user_shell_folders_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes,
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
@@ -31,7 +32,7 @@ pub use reactos_registration::{
     seed_reactos_network_setup_into_target, seed_reactos_print_setup_in_mutable_hives,
     seed_reactos_print_setup_into_target, seed_reactos_user_profile_shell_folders_in_mutable_hives,
     seed_reactos_user_profile_shell_folders_into_target, utf16le_sz,
-    ReactOsComClassRegistrationScript, ReactOsNetworkSetupSeedStats,
+    ReactOsComClassRegistrationScript, ReactOsNetworkIpv4Defaults, ReactOsNetworkSetupSeedStats,
     ReactOsPrintEnvironmentRegistration, ReactOsPrintSetupSeedStats, ReactOsProfileShellFolder,
     ReactOsProfileShellFolderSeedStats, ReactOsSetupSeedTarget, CLSID_REBAR_BAND_SITE,
     CLSID_START_MENU, REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,

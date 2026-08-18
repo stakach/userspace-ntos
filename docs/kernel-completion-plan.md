@@ -42,21 +42,26 @@ invariants from the real workload. The latest ntdll loader-list cleanup also rem
 
 Current B3 provider-domain packet slice (2026-08-18): the shared-provider direction is now a real
 provider-owned export and callback transport, not image-only sharing. Observed NDIS open, bind,
-request, packet, buffer, and send-completion calls now cross from TCPIP/E1000 into the provider
-`ndis.sys` runtime through typed marshal policy. Packet and MDL shadows are keyed by provider and
-dependent instances, miniport send callbacks receive dependent-domain packet/MDL/scatter-gather
-views, provider packet state is synchronized back after in/out completions, and
-`NdisMSendComplete` re-enters provider NDIS before dispatching TCPIP's real `SendComplete`. The
-clean serialized proof `.tmp/run-headless-b3-clean-packet-send-20260818-113558.log` reaches
-`298/298`, keeps `exports=28/28` with zero export rejections, passes
-`exec_generic_pci_provider_domain_serviced`, proves `exec_dbgk_remote_breakin_reports_breakpoint`,
-and reaches genuine Explorer shell chrome with full-framebuffer non-background pixels. Validation
-for this slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, executive
-`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-x86_64-unknown-none`, serialized `QEMU_MEMORY=2G ./run.sh`, and `git diff --check`. Review
-adjustment: descriptor discovery, provider-domain NDIS bring-up, and packet/MDL send-completion
-are closed. The remaining B3 packet frontier is boot-proving real receive indication after
-protocol bind/packet-filter setup, TX traffic from the real scatter/gather route, and
+request, packet, buffer, send-completion, work-item, and receive paths now cross from TCPIP/E1000
+into the provider `ndis.sys` runtime through typed marshal policy. Packet and MDL shadows are keyed
+by provider and dependent instances, miniport send callbacks receive dependent-domain
+packet/MDL/scatter-gather views, provider packet state is synchronized back after in/out
+completions, and `NdisMSendComplete` re-enters provider NDIS before dispatching TCPIP's real
+`SendComplete`. The sparse LiveCD setup now provisions deterministic static TCPIP interface config
+for discovered NIC identities while preserving explicit registry config, and the E1000 receive
+stimulus derives its sender/target IPv4 tuple from the live Config Manager TCPIP interface key. The
+hosted-driver `MmSystemRangeStart` data export now matches the hosted FSD system range so ReactOS
+TCPIP accepts hosted pool pointers during queued reconfiguration. The clean serialized desktop
+proof `.tmp/run-desktop-20260818-160505.log` reaches `298/298`, keeps
+`pci_provider_exports=43/43` with zero provider rejections or callback/work walls, passes
+`exec_lsa_worker_route`, and reaches genuine Explorer shell chrome with full-framebuffer
+non-background pixels. Validation for this slice: `cargo fmt --all`,
+`cargo test -p nt-hive-core -- --nocapture`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, serialized
+`QEMU_MEMORY=2G ./run.sh --desktop`, and `git diff --check`. Review adjustment: descriptor
+discovery, provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure, and
+registry-derived receive stimulus are closed. The remaining B3 packet frontier is true TX traffic
+from the real stack, packet-array receive if a real miniport reaches the internal NDIS helper, and
 repeated-device scaling under the same dynamic devnode/resource path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
@@ -7927,10 +7932,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `BindAdapter`/`Receive`/`ReceiveComplete` callbacks completing, keeps
     `exec_generic_pci_provider_domain_serviced` PASS with `exports=35/35`,
     `export-rejections=0`, and has no `hosted-work`, unbound-reply, provider-callback-wall,
-    provider-export-reject, or provider-buffer-reject lines. The remaining proof is real TX packet
-    traffic through the same dynamic provider-domain route, packet-array receive if a real miniport
-    reaches the internal NDIS helper, and repeated-device scaling. Do not reintroduce private
-    provider images, protocol-specific fallbacks, or per-driver special cases.
+    provider-export-reject, or provider-buffer-reject lines. The follow-up dynamic configuration
+    slice removes the last synthetic address input from this path: sparse setup now seeds static
+    TCPIP interface config for discovered NICs, preserves explicit registry config, and E1000 RX
+    packet stimulus derives the ARP sender/target addresses from the live TCPIP interface key reached
+    through the hosted `Linkage\Export` device identity. Hosted drivers also receive an
+    `MmSystemRangeStart` value that matches their low hosted FSD system range, fixing ReactOS TCPIP's
+    queued `ASSERT_KM_POINTER` reconfigure fault without per-driver policy. Serialized desktop proof
+    `.tmp/run-desktop-20260818-160505.log` reaches real Explorer shell chrome with `298/298`, shows
+    E1000 RX traffic (`dma_dev_tx/rx=0/1`), keeps `exec_generic_pci_provider_domain_serviced` PASS
+    with `pci_provider_exports=43/43`, passes `exec_lsa_worker_route`, and has no provider callback,
+    export, buffer, or hosted-work wall/reject lines. The remaining proof is real TX packet traffic
+    from the TCPIP stack through the same dynamic provider-domain route, packet-array receive if a
+    real miniport reaches the internal NDIS helper, and repeated-device scaling. Do not reintroduce
+    private provider images, protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute

@@ -80,6 +80,80 @@ impl ReactOsNetworkSetupSeedStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReactOsNetworkIpv4Defaults {
+    pub address: [u8; 4],
+    pub subnet_mask: [u8; 4],
+    pub default_gateway: [u8; 4],
+}
+
+impl ReactOsNetworkIpv4Defaults {
+    pub fn address_string(self) -> String {
+        ipv4_to_string(self.address)
+    }
+
+    pub fn subnet_mask_string(self) -> String {
+        ipv4_to_string(self.subnet_mask)
+    }
+
+    pub fn default_gateway_string(self) -> String {
+        ipv4_to_string(self.default_gateway)
+    }
+}
+
+fn ipv4_to_string(address: [u8; 4]) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        address[0], address[1], address[2], address[3]
+    )
+}
+
+fn trailing_decimal_seed(value: &str) -> Option<u32> {
+    let bytes = value.as_bytes();
+    let mut start = bytes.len();
+    while start != 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == bytes.len() {
+        return None;
+    }
+    let mut seed = 0u32;
+    for &digit in &bytes[start..] {
+        seed = seed
+            .saturating_mul(10)
+            .saturating_add((digit - b'0') as u32);
+    }
+    Some(seed)
+}
+
+fn ascii_hash_seed(value: &str) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for &byte in value.as_bytes() {
+        hash ^= byte.to_ascii_uppercase() as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+/// Deterministic installed-boot IPv4 defaults for a registry-discovered network interface.
+///
+/// ReactOS TCPIP consumes static `IPAddress`/`SubnetMask` values only when `EnableDHCP` is disabled.
+/// The sparse LiveCD hive has no DHCP client path here, so setup must materialize a real interface
+/// address instead of the old installer placeholder `0.0.0.0`.
+pub fn reactos_network_ipv4_defaults_for_interface(
+    interface_name: &str,
+) -> ReactOsNetworkIpv4Defaults {
+    let seed =
+        trailing_decimal_seed(interface_name).unwrap_or_else(|| ascii_hash_seed(interface_name));
+    let third_octet = 2u32 + (seed % 253);
+    let second_octet = (seed / 253) & 0xff;
+    ReactOsNetworkIpv4Defaults {
+        address: [10, second_octet as u8, third_octet as u8, 15],
+        subnet_mask: [255, 255, 255, 0],
+        default_gateway: [10, second_octet as u8, third_octet as u8, 2],
+    }
+}
+
 const NET_CLASS_GUID: &str = "{4D36E972-E325-11CE-BFC1-08002BE10318}";
 const TCPIP_LINKAGE_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Linkage";
@@ -335,6 +409,14 @@ fn dword_bytes(value: u32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+fn setup_dword_value(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() == 4 {
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else {
+        None
+    }
+}
+
 fn set_setup_dword<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     path: &str,
@@ -392,6 +474,26 @@ fn decode_setup_multi_sz(bytes: &[u8]) -> Vec<String> {
     out
 }
 
+fn setup_multi_sz_data_is_unspecified(bytes: &[u8]) -> bool {
+    let values = decode_setup_multi_sz(bytes);
+    values.is_empty()
+        || values
+            .iter()
+            .all(|value| value.trim().is_empty() || value.trim() == "0.0.0.0")
+}
+
+fn setup_multi_sz_value_is_missing_or_unspecified<T: ReactOsSetupSeedTarget>(
+    target: &T,
+    path: &str,
+    name: &str,
+) -> bool {
+    match target.query_value(path, name) {
+        Some((RegistryValueType::MultiSz, data)) => setup_multi_sz_data_is_unspecified(&data),
+        Some(_) => false,
+        None => !target.has_value(path, name),
+    }
+}
+
 fn set_setup_value_if_missing<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     path: &str,
@@ -429,19 +531,60 @@ fn set_setup_dword_if_missing<T: ReactOsSetupSeedTarget>(
     )
 }
 
-fn set_setup_multi_sz_if_missing<T: ReactOsSetupSeedTarget>(
+fn set_setup_dword_if_missing_or_defaulted<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    path: &str,
+    name: &str,
+    value: u32,
+    defaulted_existing_value: Option<u32>,
+) -> bool {
+    match target.query_value(path, name) {
+        Some((RegistryValueType::Dword, data)) => {
+            if let (Some(existing), Some(defaulted)) =
+                (setup_dword_value(&data), defaulted_existing_value)
+            {
+                if existing != defaulted {
+                    return false;
+                }
+                set_setup_dword(target, path, name, value)
+            } else {
+                false
+            }
+        }
+        Some(_) => false,
+        None if target.has_value(path, name) => false,
+        None => set_setup_dword(target, path, name, value),
+    }
+}
+
+fn set_setup_multi_sz_if_missing_or_unspecified<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     path: &str,
     name: &str,
     values: &[&str],
 ) -> bool {
-    set_setup_value_if_missing(
-        target,
-        path,
-        name,
-        RegistryValueType::MultiSz,
-        nt_config_manager::encode_multi_sz(values),
-    )
+    match target.query_value(path, name) {
+        Some((RegistryValueType::MultiSz, data)) => {
+            if setup_multi_sz_data_is_unspecified(&data) {
+                target.set_value(
+                    path,
+                    name,
+                    RegistryValueType::MultiSz,
+                    nt_config_manager::encode_multi_sz(values),
+                )
+            } else {
+                false
+            }
+        }
+        Some(_) => false,
+        None if target.has_value(path, name) => false,
+        None => target.set_value(
+            path,
+            name,
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(values),
+        ),
+    }
 }
 
 fn append_setup_multi_sz_values<T: ReactOsSetupSeedTarget>(
@@ -1243,16 +1386,44 @@ fn seed_reactos_network_bindings_into_target<T: ReactOsSetupSeedTarget>(
         }
 
         let interface_path = join_key_path(TCPIP_INTERFACES_PATH, &adapter.interface_name);
-        if set_setup_multi_sz_if_missing(target, &interface_path, "DefaultGateway", &["0.0.0.0"]) {
+        let ip_was_unspecified =
+            setup_multi_sz_value_is_missing_or_unspecified(target, &interface_path, "IPAddress");
+        let ipv4_defaults = reactos_network_ipv4_defaults_for_interface(&adapter.interface_name);
+        let default_gateway = ipv4_defaults.default_gateway_string();
+        let ip_address = ipv4_defaults.address_string();
+        let subnet_mask = ipv4_defaults.subnet_mask_string();
+        if set_setup_multi_sz_if_missing_or_unspecified(
+            target,
+            &interface_path,
+            "DefaultGateway",
+            &[default_gateway.as_str()],
+        ) {
             stats.tcpip_interface_values += 1;
         }
-        if set_setup_multi_sz_if_missing(target, &interface_path, "IPAddress", &["0.0.0.0"]) {
+        if set_setup_multi_sz_if_missing_or_unspecified(
+            target,
+            &interface_path,
+            "IPAddress",
+            &[ip_address.as_str()],
+        ) {
             stats.tcpip_interface_values += 1;
         }
-        if set_setup_multi_sz_if_missing(target, &interface_path, "SubnetMask", &["0.0.0.0"]) {
+        if set_setup_multi_sz_if_missing_or_unspecified(
+            target,
+            &interface_path,
+            "SubnetMask",
+            &[subnet_mask.as_str()],
+        ) {
             stats.tcpip_interface_values += 1;
         }
-        if set_setup_dword_if_missing(target, &interface_path, "EnableDHCP", 1) {
+        let defaulted_enable_dhcp = if ip_was_unspecified { Some(1) } else { None };
+        if set_setup_dword_if_missing_or_defaulted(
+            target,
+            &interface_path,
+            "EnableDHCP",
+            0,
+            defaulted_enable_dhcp,
+        ) {
             stats.tcpip_interface_values += 1;
         }
         if set_setup_dword_if_missing(target, &interface_path, "InterfaceMetric", 0) {
@@ -2033,7 +2204,10 @@ mod tests {
             ])
         );
 
-        for slot in ["0000", "0001"] {
+        for (slot, expected_ip, expected_gateway) in [
+            ("0000", "10.0.2.15", "10.0.2.2"),
+            ("0001", "10.0.3.15", "10.0.3.2"),
+        ] {
             let interface = format!("E1000_{}", slot);
             let expected_export = format!(r"\Device\{}", interface);
             let linkage_path = format!(
@@ -2062,12 +2236,22 @@ mod tests {
                 .open_key(&join_key_path(TCPIP_INTERFACES_PATH, &interface))
                 .expect("TCPIP interface");
             assert_eq!(
+                cm.registry()
+                    .query_multi_string(interface_key, "DefaultGateway"),
+                Some(alloc::vec![alloc::string::String::from(expected_gateway)])
+            );
+            assert_eq!(
                 cm.registry().query_multi_string(interface_key, "IPAddress"),
-                Some(alloc::vec![alloc::string::String::from("0.0.0.0")])
+                Some(alloc::vec![alloc::string::String::from(expected_ip)])
+            );
+            assert_eq!(
+                cm.registry()
+                    .query_multi_string(interface_key, "SubnetMask"),
+                Some(alloc::vec![alloc::string::String::from("255.255.255.0")])
             );
             assert_eq!(
                 cm.registry().query_dword(interface_key, "EnableDHCP"),
-                Some(1)
+                Some(0)
             );
             assert_eq!(
                 cm.registry().query_dword(interface_key, "InterfaceMetric"),
@@ -2084,6 +2268,92 @@ mod tests {
         assert_eq!(
             cm.registry().query_string(connection, "Name").as_deref(),
             Some("Local Area Connection 2")
+        );
+
+        let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(second_stats, ReactOsNetworkSetupSeedStats::default());
+    }
+
+    #[test]
+    fn network_binding_seed_preserves_explicit_tcpip_interface_config() {
+        let mut cm = config_manager_with_two_e1000_nics();
+        let interface_path = join_key_path(TCPIP_INTERFACES_PATH, "E1000_0000");
+        let interface_key = cm.registry_mut().create_key(&interface_path);
+        cm.registry_mut().set_value(
+            interface_key,
+            "DefaultGateway",
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(&["192.0.2.1"]),
+        );
+        cm.registry_mut().set_value(
+            interface_key,
+            "IPAddress",
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(&["192.0.2.44"]),
+        );
+        cm.registry_mut().set_value(
+            interface_key,
+            "SubnetMask",
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(&["255.255.255.128"]),
+        );
+        cm.registry_mut().set_value(
+            interface_key,
+            "EnableDHCP",
+            RegistryValueType::Dword,
+            dword_bytes(1),
+        );
+
+        let stats = seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(
+            stats,
+            ReactOsNetworkSetupSeedStats {
+                ndis_service_values: 5,
+                tcpip_service_values: 5,
+                tcpip_parameter_values: 8,
+                tcpip_linkage_values: 3,
+                tcpip_interface_values: 6,
+                network_adapter_class_values: 12,
+                network_connection_values: 8,
+                afd_service_values: 5,
+            }
+        );
+
+        let interface_key = cm
+            .registry()
+            .open_key(&interface_path)
+            .expect("TCPIP interface");
+        assert_eq!(
+            cm.registry()
+                .query_multi_string(interface_key, "DefaultGateway"),
+            Some(alloc::vec![alloc::string::String::from("192.0.2.1")])
+        );
+        assert_eq!(
+            cm.registry().query_multi_string(interface_key, "IPAddress"),
+            Some(alloc::vec![alloc::string::String::from("192.0.2.44")])
+        );
+        assert_eq!(
+            cm.registry()
+                .query_multi_string(interface_key, "SubnetMask"),
+            Some(alloc::vec![alloc::string::String::from("255.255.255.128")])
+        );
+        assert_eq!(
+            cm.registry().query_dword(interface_key, "EnableDHCP"),
+            Some(1)
+        );
+
+        let second_interface = cm
+            .registry()
+            .open_key(&join_key_path(TCPIP_INTERFACES_PATH, "E1000_0001"))
+            .expect("second TCPIP interface");
+        assert_eq!(
+            cm.registry()
+                .query_multi_string(second_interface, "IPAddress"),
+            Some(alloc::vec![alloc::string::String::from("10.0.3.15")])
+        );
+        assert_eq!(
+            cm.registry().query_dword(second_interface, "EnableDHCP"),
+            Some(0)
         );
 
         let second_stats = seed_reactos_network_setup_in_config_manager(&mut cm);
@@ -2133,13 +2403,25 @@ mod tests {
         );
 
         let interface = r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\E1000_0001";
+        let (ty, data) = hive_value_bytes(&hives, interface, "DefaultGateway");
+        assert_eq!(ty, RegistryValueType::MultiSz);
+        assert_eq!(
+            decode_setup_multi_sz(data),
+            alloc::vec![alloc::string::String::from("10.0.3.2")]
+        );
         let (ty, data) = hive_value_bytes(&hives, interface, "IPAddress");
         assert_eq!(ty, RegistryValueType::MultiSz);
         assert_eq!(
             decode_setup_multi_sz(data),
-            alloc::vec![alloc::string::String::from("0.0.0.0")]
+            alloc::vec![alloc::string::String::from("10.0.3.15")]
         );
-        assert_eq!(hive_dword(&hives, interface, "EnableDHCP"), 1);
+        let (ty, data) = hive_value_bytes(&hives, interface, "SubnetMask");
+        assert_eq!(ty, RegistryValueType::MultiSz);
+        assert_eq!(
+            decode_setup_multi_sz(data),
+            alloc::vec![alloc::string::String::from("255.255.255.0")]
+        );
+        assert_eq!(hive_dword(&hives, interface, "EnableDHCP"), 0);
 
         let connection = r"\Registry\Machine\System\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}\E1000_0001\Connection";
         let (ty, data) = hive_value_bytes(&hives, connection, "Name");
