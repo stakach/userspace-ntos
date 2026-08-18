@@ -509,6 +509,14 @@ const NDIS_PROTOCOL_UNLOAD_CALLBACK_OFFSET_X64: u64 = 0x88;
 const NDIS_NET_PNP_EVENT_LEN_X64: u64 = 0x98;
 const NDIS_MEDIUM_ENTRY_BYTES_X64: u64 = 4;
 const NDIS_MINIPORT_INITIALIZE_MEDIUM_CAP: u64 = 64;
+const NDIS_REQUEST_LEN_X64: u64 = 0xb0;
+const NDIS_REQUEST_TYPE_OFFSET_X64: u64 = 0x20;
+const NDIS_REQUEST_INFORMATION_BUFFER_OFFSET_X64: u64 = 0x30;
+const NDIS_REQUEST_INFORMATION_BUFFER_LEN_OFFSET_X64: u64 = 0x38;
+const NDIS_REQUEST_BYTES_DONE_OFFSET_X64: u64 = 0x3c;
+const NDIS_REQUEST_BYTE_COUNTERS_LEN_X64: u64 = 8;
+const NDIS_REQUEST_QUERY_INFORMATION: u32 = 0;
+const NDIS_REQUEST_SET_INFORMATION: u32 = 1;
 const PROVIDER_CALLBACK_STACK_QWORDS: usize = SH_PROVIDER_EXPORT_STACK_QWORDS as usize;
 
 /// The IPC message label the dispatch loop uses to Send its ready/done signal on the fault EP.
@@ -12391,6 +12399,7 @@ struct ProviderMarshalState {
     copyout_count: usize,
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
+    resource_projection_required: bool,
     resource_mapping_copyback: bool,
     resource_state_copyback: bool,
     dma_state_copyback: bool,
@@ -12422,6 +12431,7 @@ impl ProviderMarshalState {
                 condition: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
+            resource_projection_required: false,
             resource_mapping_copyback: false,
             resource_state_copyback: false,
             dma_state_copyback: false,
@@ -14114,6 +14124,7 @@ unsafe fn provider_marshal_resource_list(
     arg_value: u64,
     length_pointer: u64,
 ) -> Result<u64, i32> {
+    state.resource_projection_required = true;
     let Some(length_exec) =
         component_to_exec_va_for_instance(dependent_index, dependent_inst, length_pointer, 4)
     else {
@@ -14165,6 +14176,7 @@ unsafe fn provider_marshal_miniport_interrupt(
         NDIS_MINIPORT_INTERRUPT_LEN_X64,
     )
     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    state.resource_projection_required = true;
     state.resource_state_copyback = true;
     state.miniport_interrupt_provider_instance = provider_instance;
     state.miniport_interrupt_provider_component_va = provider_arg;
@@ -14215,6 +14227,7 @@ unsafe fn provider_marshal_io_port_range(
     initial_port: u64,
     length: u64,
 ) -> Result<u64, i32> {
+    state.resource_projection_required = true;
     let sh = dependent_inst.exec_shared_va;
     let grant_start = read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64);
     let grant_len = read_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *const u64);
@@ -14240,6 +14253,7 @@ unsafe fn provider_marshal_mmio_mapping(
     physical_address: u64,
     length: u64,
 ) -> Result<u64, i32> {
+    state.resource_projection_required = true;
     let sh = dependent_inst.exec_shared_va;
     let grant_start = read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64);
     let grant_len = read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64);
@@ -14331,6 +14345,7 @@ unsafe fn provider_marshal_output_dma_common_buffer(
     arg_value: u64,
     length: u64,
 ) -> Result<u64, i32> {
+    state.resource_projection_required = true;
     let sh = dependent_inst.exec_shared_va;
     let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
     let grant_len = read_volatile((sh + SH_DMA_COMMON_LEN) as *const u64);
@@ -14365,6 +14380,7 @@ unsafe fn provider_marshal_input_dma_common_buffer(
     length: u64,
     physical_address: u64,
 ) -> Result<u64, i32> {
+    state.resource_projection_required = true;
     if length > u32::MAX as u64 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -14463,6 +14479,83 @@ unsafe fn provider_marshal_owned_allocation(
     )
     .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     Ok(0)
+}
+
+unsafe fn provider_marshal_ndis_request(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    if arg_value == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_request_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, NDIS_REQUEST_LEN_X64)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let request_type =
+        read_unaligned((dependent_request_exec + NDIS_REQUEST_TYPE_OFFSET_X64) as *const u32);
+    if request_type != NDIS_REQUEST_QUERY_INFORMATION
+        && request_type != NDIS_REQUEST_SET_INFORMATION
+    {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let info_buffer = read_unaligned(
+        (dependent_request_exec + NDIS_REQUEST_INFORMATION_BUFFER_OFFSET_X64) as *const u64,
+    );
+    let info_len = read_unaligned(
+        (dependent_request_exec + NDIS_REQUEST_INFORMATION_BUFFER_LEN_OFFSET_X64) as *const u32,
+    ) as u64;
+
+    let Some((provider_request_component, provider_request_exec)) =
+        provider_marshal_alloc(state, provider_shared, NDIS_REQUEST_LEN_X64)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    copy_bytes(provider_request_exec, dependent_request_exec, NDIS_REQUEST_LEN_X64);
+    provider_marshal_add_copyout(
+        state,
+        dependent_request_exec + NDIS_REQUEST_BYTES_DONE_OFFSET_X64,
+        provider_request_exec + NDIS_REQUEST_BYTES_DONE_OFFSET_X64,
+        NDIS_REQUEST_BYTE_COUNTERS_LEN_X64,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+
+    if info_len == 0 {
+        write_unaligned(
+            (provider_request_exec + NDIS_REQUEST_INFORMATION_BUFFER_OFFSET_X64) as *mut u64,
+            0,
+        );
+        return Ok(provider_request_component);
+    }
+    if info_buffer == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_info_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, info_buffer, info_len)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_info_component, provider_info_exec)) =
+        provider_marshal_alloc(state, provider_shared, info_len)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if request_type == NDIS_REQUEST_SET_INFORMATION {
+        copy_bytes(provider_info_exec, dependent_info_exec, info_len);
+    }
+    if request_type == NDIS_REQUEST_QUERY_INFORMATION {
+        provider_marshal_add_copyout(state, dependent_info_exec, provider_info_exec, info_len)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    }
+    write_unaligned(
+        (provider_request_exec + NDIS_REQUEST_INFORMATION_BUFFER_OFFSET_X64) as *mut u64,
+        provider_info_component,
+    );
+    Ok(provider_request_component)
 }
 
 unsafe fn provider_marshal_ndis_buffer(
@@ -14898,12 +14991,18 @@ unsafe fn prepare_provider_export_marshal(
             HostedProviderArgumentMarshal::CallerInArray {
                 count_arg,
                 element_size,
+                count_width,
             } => {
                 let count_index = count_arg as usize;
                 if count_index >= policy.argument_count as usize || element_size == 0 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                let bytes = args[count_index]
+                let count = match count_width {
+                    4 => args[count_index] & u32::MAX as u64,
+                    8 => args[count_index],
+                    _ => return Err(STATUS_INVALID_PARAMETER),
+                };
+                let bytes = count
                     .checked_mul(element_size as u64)
                     .ok_or(STATUS_INVALID_PARAMETER)?;
                 provider_marshal_input_buffer(
@@ -14918,6 +15017,13 @@ unsafe fn prepare_provider_export_marshal(
             HostedProviderArgumentMarshal::CallerInNdisBuffer => provider_marshal_ndis_buffer(
                 &mut state,
                 provider_instance,
+                dependent_index,
+                dependent_inst,
+                provider_shared,
+                arg,
+            )?,
+            HostedProviderArgumentMarshal::CallerInOutRequest => provider_marshal_ndis_request(
+                &mut state,
                 dependent_index,
                 dependent_inst,
                 provider_shared,
@@ -15673,9 +15779,14 @@ pub(crate) unsafe fn service_hosted_provider_export(
         Err(status) => return hosted_provider_export_failure(status),
     };
 
-    if let Err(status) = project_provider_resource_state(dependent_channel.shared_va, provider_shared)
-    {
-        return hosted_provider_export_failure(status);
+    if dependent_binding.is_some() {
+        if let Err(status) =
+            project_provider_resource_state(dependent_channel.shared_va, provider_shared)
+        {
+            return hosted_provider_export_failure(status);
+        }
+    } else if marshal_state.resource_projection_required {
+        return hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST);
     }
     write_volatile(
         (provider_shared + SH_REQ_MAJOR) as *mut u64,

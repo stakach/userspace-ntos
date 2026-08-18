@@ -7819,3 +7819,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `exec_generic_pci_provider_domain_serviced` remains red. Review adjustment: continue B3 inside
     the real NDIS open/binding path, with typed adapter-binding/request/packet/buffer shadowing as
     needed, not with private NDIS images or synthetic protocol binds.
+  - `[x]` B3 real NDIS open/request/bind provider-domain slice (2026-08-18): provider export marshaling
+    now distinguishes protocol/control-domain calls from hardware-resource calls. Resource projection is
+    required only by resource-list, interrupt, port, MMIO, and DMA marshal paths; provider exports that
+    operate on pure NDIS protocol/control state no longer need a fake device resource binding, while
+    resource-bearing exports still fail closed when no binding exists. The `NdisOpenAdapter`
+    medium-list policy now carries the explicit width of its count argument, matching the x64 ReactOS
+    `UINT MediumArraySize` stack slot instead of treating stale high stack bytes as part of the count.
+    `CallerInOutRequest` is now a typed legacy x64 `NDIS_REQUEST` marshal: the request body is copied
+    into provider scratch, query/set information buffers are mapped in the correct direction, and only
+    the bytes-done/needed counters are copied back to the TCPIP caller. Serialized desktop evidence
+    `.tmp/run-desktop-b3-ndis-request-clean-rerun-20260818.log` proves this slice end to end:
+    provider-domain NDIS exports complete with zero export rejections (`exports=28/28`), the generic
+    PCI provider-domain gate passes, real userinit and Explorer launch, GDI batch flushing returns, and
+    Explorer shell chrome reaches full-framebuffer proof with `298/298` executive checks passing.
+    Validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, serialized `QEMU_MEMORY=2G ./run.sh --desktop`, and `git diff --check`.
+    Review adjustment: B3 should now move from provider-domain bring-up to real network data-plane
+    ownership. The next useful slice is packet/buffer/send/receive lifetime and completion semantics
+    across miniport, NDIS provider, and TCPIP domains, preserving the same dynamic multi-driver path and
+    avoiding private provider images or protocol-specific fallbacks.

@@ -237,6 +237,7 @@ pub enum HostedProviderArgumentMarshal {
     CallerInArray {
         count_arg: u8,
         element_size: u8,
+        count_width: u8,
     },
     CallerInOwnedAllocation {
         length_arg: u8,
@@ -636,6 +637,7 @@ pub fn hosted_provider_export_marshal_policy(
             CallerInArray {
                 count_arg: 5,
                 element_size: 4,
+                count_width: 4,
             },
             Scalar,
             ProviderHandle,
@@ -1224,6 +1226,7 @@ mod tests {
             HostedProviderArgumentMarshal::CallerInArray {
                 count_arg: 5,
                 element_size: 4,
+                count_width: 4,
             }
         );
         assert_eq!(
