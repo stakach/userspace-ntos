@@ -636,6 +636,9 @@ pub fn hosted_provider_export_marshal_policy(
         ]),
         "NdisSend" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInPacket]),
         "NdisMSendComplete" => void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar]),
+        "NdisMTransferDataComplete" => {
+            void_export_policy(&[ProviderHandle, CallerInOutPacket, Scalar, Scalar])
+        }
         "NdisRequest" => void_export_policy(&[CallerOutStatus, ProviderHandle, CallerInOutRequest]),
         "NdisDeregisterProtocol" => void_export_policy(&[CallerOutStatus, ProviderHandle]),
         "NdisOpenAdapter" => void_export_policy(&[
@@ -1179,6 +1182,7 @@ mod tests {
             "NdisMDeregisterInterrupt",
             "NdisMRegisterInterrupt",
             "NdisMSendComplete",
+            "NdisMTransferDataComplete",
             "NdisMDeregisterIoPortRange",
             "NdisMMapIoSpace",
             "NdisMRegisterIoPortRange",
@@ -1211,6 +1215,7 @@ mod tests {
             "NdisTransferData",
             "NdisSend",
             "NdisMSendComplete",
+            "NdisMTransferDataComplete",
             "NdisRequest",
             "NdisDeregisterProtocol",
             "NdisOpenAdapter",
@@ -1477,6 +1482,27 @@ mod tests {
             HostedProviderArgumentMarshal::CallerInOutPacket
         );
         assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+    }
+
+    #[test]
+    fn ndis_transfer_data_complete_policy_maps_packet_completion() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMTransferDataComplete").unwrap();
+        assert_eq!(policy.argument_count, 4);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        assert_eq!(
+            policy.args[1],
+            HostedProviderArgumentMarshal::CallerInOutPacket
+        );
+        assert_eq!(policy.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(policy.args[3], HostedProviderArgumentMarshal::Scalar);
         assert_eq!(
             policy.result_semantics,
             HostedProviderExportResultSemantics::Void

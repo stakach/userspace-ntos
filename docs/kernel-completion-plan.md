@@ -55,9 +55,24 @@ for this slice: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocaptu
 `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
 x86_64-unknown-none`, serialized `QEMU_MEMORY=2G ./run.sh`, and `git diff --check`. Review
 adjustment: descriptor discovery, provider-domain NDIS bring-up, and packet/MDL send-completion
-are closed. The remaining B3 packet frontier is real receive indication and transfer-data
-completion after protocol bind/packet-filter setup, TX traffic from the real scatter/gather route,
-and repeated-device scaling under the same dynamic devnode/resource path.
+are closed. The remaining B3 packet frontier is real receive indication after protocol
+bind/packet-filter setup, TX traffic from the real scatter/gather route, and repeated-device
+scaling under the same dynamic devnode/resource path.
+
+B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
+real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
+shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
+The asynchronous half is also wired: dependent miniports can call provider `NdisMTransferDataComplete`
+through a typed void export policy, and provider NDIS can re-enter the dependent protocol's real
+`TransferDataCompleteHandler` with the packet projected back into the protocol domain. Local
+validation is green: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, and
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`. Review adjustment: this closes the transport/completion gap, but the current
+ReactOS e1000 miniport registers no `TransferDataHandler` and receives full lookahead buffers. The
+next B3 acceptance work should boot-test this slice, then wire the receive indication callbacks
+(`Receive`, `ReceiveComplete`, and later `ReceivePacket`) plus any observed generic dependent NDIS
+helper exports such as `NdisQueryPacket`/`NdisQueryBuffer` when a miniport actually exercises a
+transfer-data implementation.
 
 Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted

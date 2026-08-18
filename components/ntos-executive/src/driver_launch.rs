@@ -17879,6 +17879,24 @@ unsafe fn service_ndis_reconfigure_callback(
     Ok(result)
 }
 
+unsafe fn provider_callback_packet_shadow(
+    provider_instance: usize,
+    record: HostedProviderCallbackRecord,
+    provider_packet: u64,
+) -> Result<HostedProviderNdisPacketShadow, i32> {
+    let Some((_index, shadow)) =
+        find_hosted_provider_ndis_packet_shadow_by_provider(provider_instance, provider_packet)
+    else {
+        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if shadow.dependent_instance != record.dependent_instance {
+        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(shadow)
+}
+
 unsafe fn service_ndis_send_callback(
     provider_instance: usize,
     provider_inst: DriverInstance,
@@ -17889,16 +17907,7 @@ unsafe fn service_ndis_send_callback(
     arg1: u64,
     arg2: u64,
 ) -> Result<u64, i32> {
-    let Some((_index, shadow)) =
-        find_hosted_provider_ndis_packet_shadow_by_provider(provider_instance, arg1)
-    else {
-        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    if shadow.dependent_instance != record.dependent_instance {
-        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    }
+    let shadow = provider_callback_packet_shadow(provider_instance, record, arg1)?;
     sync_ndis_packet_shadow_to_dependent(
         provider_instance,
         provider_inst,
@@ -17931,6 +17940,76 @@ unsafe fn service_ndis_send_callback(
         refreshed,
         true,
     )?;
+    Ok(result)
+}
+
+unsafe fn service_ndis_transfer_data_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, i32> {
+    if arg1 == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    provider_callback_marshal_window(8, 0)?;
+    let provider_bytes_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 4)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let shadow = provider_callback_packet_shadow(provider_instance, record, arg0)?;
+    sync_ndis_packet_shadow_to_dependent(
+        provider_instance,
+        provider_inst,
+        record.dependent_instance,
+        dependent_inst,
+        shadow,
+    )?;
+
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let dependent_bytes_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_bytes_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    provider_marshal_zero(dependent_bytes_exec, 8);
+
+    let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    stack_args[0] = provider_stack[0];
+    stack_args[1] = provider_stack[1];
+    let result = dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [
+            shadow.dependent_component_va,
+            dependent_bytes_component,
+            arg2,
+            arg3,
+        ],
+        stack_args,
+    )?;
+    copy_bytes(provider_bytes_exec, dependent_bytes_exec, 4);
+    if result == STATUS_SUCCESS as u64 {
+        let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
+            provider_instance,
+            record.dependent_instance,
+            shadow.dependent_component_va,
+        ) else {
+            HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        sync_ndis_packet_shadow_to_provider(
+            provider_instance,
+            provider_inst,
+            record.dependent_instance,
+            dependent_inst,
+            refreshed,
+            true,
+        )?;
+    }
     Ok(result)
 }
 
@@ -18162,16 +18241,7 @@ unsafe fn service_ndis_protocol_send_complete_callback(
     arg1: u64,
     arg2: u64,
 ) -> Result<u64, i32> {
-    let Some((_index, shadow)) =
-        find_hosted_provider_ndis_packet_shadow_by_provider(provider_instance, arg1)
-    else {
-        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    if shadow.dependent_instance != record.dependent_instance {
-        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    }
+    let shadow = provider_callback_packet_shadow(provider_instance, record, arg1)?;
     sync_ndis_packet_shadow_to_dependent(
         provider_instance,
         provider_inst,
@@ -18184,6 +18254,34 @@ unsafe fn service_ndis_protocol_send_complete_callback(
         dependent_inst,
         exec_code_va,
         [arg0, shadow.dependent_component_va, arg2, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
+unsafe fn service_ndis_protocol_transfer_data_complete_callback(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<u64, i32> {
+    let shadow = provider_callback_packet_shadow(provider_instance, record, arg1)?;
+    sync_ndis_packet_shadow_to_dependent(
+        provider_instance,
+        provider_inst,
+        record.dependent_instance,
+        dependent_inst,
+        shadow,
+    )?;
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [arg0, shadow.dependent_component_va, arg2, arg3],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
     )
 }
@@ -18332,7 +18430,20 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                 arg1,
                 arg2,
             ),
-            NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Err(STATUS_NOT_SUPPORTED),
+            NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
+                service_ndis_transfer_data_callback(
+                    provider_instance,
+                    provider_inst,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
+                    provider_stack,
+                )
+            }
             _ => Err(STATUS_NOT_SUPPORTED),
         },
         HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => match record.callback_offset {
@@ -18369,6 +18480,19 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                     arg0,
                     arg1,
                     arg2,
+                )
+            }
+            NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
+                service_ndis_protocol_transfer_data_complete_callback(
+                    provider_instance,
+                    provider_inst,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
                 )
             }
             _ => Err(STATUS_NOT_SUPPORTED),
