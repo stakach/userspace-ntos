@@ -27111,6 +27111,22 @@ struct HostedDmaPacketModelReport {
     failures: u64,
 }
 
+impl HostedDmaPacketModelReport {
+    fn is_empty(self) -> bool {
+        self.tx_completed == 0
+            && self.rx_completed == 0
+            && self.interrupt_causes == 0
+            && self.failures == 0
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.tx_completed = self.tx_completed.saturating_add(other.tx_completed);
+        self.rx_completed = self.rx_completed.saturating_add(other.rx_completed);
+        self.interrupt_causes |= other.interrupt_causes;
+        self.failures = self.failures.saturating_add(other.failures);
+    }
+}
+
 const E1000_VENDOR_INTEL: u32 = 0x8086;
 const E1000_DEVICE_82540EM: u32 = 0x100e;
 const E1000_PCI_CLASS_NETWORK_ETHERNET: u32 = 0x020000;
@@ -27574,6 +27590,31 @@ unsafe fn drive_hosted_e1000_rx_descriptor(
     report
 }
 
+unsafe fn raise_hosted_e1000_packet_interrupt_causes(
+    state: HostedDeviceResourceState,
+    report: &mut HostedDmaPacketModelReport,
+) {
+    if report.interrupt_causes != 0
+        && !hosted_mmio_write_u32(state, E1000_REG_ICS, report.interrupt_causes as u32)
+    {
+        report.failures = report.failures.saturating_add(1);
+    }
+}
+
+unsafe fn drive_hosted_e1000_tx_packet_model(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) -> Result<HostedDmaPacketModelReport, nt_status::NtStatus> {
+    if !hosted_e1000_profile_matches(state) {
+        return Ok(HostedDmaPacketModelReport::default());
+    }
+    replay_hosted_dma_allocation_records(binding, sh)?;
+    let mut report = drive_hosted_e1000_tx_descriptors(binding, state, sh);
+    raise_hosted_e1000_packet_interrupt_causes(state, &mut report);
+    Ok(report)
+}
+
 unsafe fn drive_hosted_e1000_packet_model(
     binding: HostedDeviceBinding,
     state: HostedDeviceResourceState,
@@ -27585,15 +27626,8 @@ unsafe fn drive_hosted_e1000_packet_model(
     replay_hosted_dma_allocation_records(binding, sh)?;
     let mut report = drive_hosted_e1000_tx_descriptors(binding, state, sh);
     let rx = drive_hosted_e1000_rx_descriptor(binding, state, sh);
-    report.tx_completed = report.tx_completed.saturating_add(rx.tx_completed);
-    report.rx_completed = report.rx_completed.saturating_add(rx.rx_completed);
-    report.interrupt_causes |= rx.interrupt_causes;
-    report.failures = report.failures.saturating_add(rx.failures);
-    if report.interrupt_causes != 0 {
-        if !hosted_mmio_write_u32(state, E1000_REG_ICS, report.interrupt_causes as u32) {
-            report.failures = report.failures.saturating_add(1);
-        }
-    }
+    report.merge(rx);
+    raise_hosted_e1000_packet_interrupt_causes(state, &mut report);
     Ok(report)
 }
 
@@ -27601,11 +27635,7 @@ unsafe fn record_hosted_dma_packet_model_report(
     device_id: u64,
     report: HostedDmaPacketModelReport,
 ) {
-    if report.tx_completed == 0
-        && report.rx_completed == 0
-        && report.interrupt_causes == 0
-        && report.failures == 0
-    {
+    if report.is_empty() {
         return;
     }
     if let Some(state) = hosted_device_resource_states_mut()
@@ -30930,20 +30960,10 @@ pub(crate) unsafe fn start_hosted_device(
 /// The executive resolves the canonical `nt-resource-manager` interrupt id for the devnode, then
 /// drives the hosted component's dispatcher so the driver's ISR runs in the same VSpace that
 /// registered it with `IoConnectInterrupt`.
-pub(crate) unsafe fn inject_hosted_device_interrupt(
-    device_id: u64,
+unsafe fn dispatch_hosted_device_interrupt_once(
+    binding: HostedDeviceBinding,
+    sh: u64,
 ) -> Result<HostedInterruptDelivery, nt_status::NtStatus> {
-    let binding = hosted_device_binding_by_device_id(device_id)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if !inst.ready {
-        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
-    }
-
-    let sh = inst.exec_shared_va;
-    let state = restore_hosted_device_resource_state(binding, sh, true)?;
-    let packet_model_report = drive_hosted_e1000_packet_model(binding, state, sh)?;
     let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
     let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
@@ -30976,13 +30996,41 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     nt_status::NtStatus(status).to_result()?;
     refresh_hosted_device_resource_state(binding, sh);
-    record_hosted_dma_packet_model_report(device_id, packet_model_report);
 
     Ok(HostedInterruptDelivery {
         interrupt_id: tokens.interrupt_id,
         vector: tokens.vector,
         claimed: info != 0,
     })
+}
+
+pub(crate) unsafe fn inject_hosted_device_interrupt(
+    device_id: u64,
+) -> Result<HostedInterruptDelivery, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if !inst.ready {
+        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+    }
+
+    let sh = inst.exec_shared_va;
+    let state = restore_hosted_device_resource_state(binding, sh, true)?;
+    let mut packet_model_report = drive_hosted_e1000_packet_model(binding, state, sh)?;
+    let mut delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
+
+    let state = restore_hosted_device_resource_state(binding, sh, false)?;
+    let tx_report = drive_hosted_e1000_tx_packet_model(binding, state, sh)?;
+    let redrive_needed = tx_report.interrupt_causes != 0;
+    packet_model_report.merge(tx_report);
+    if redrive_needed {
+        let tx_delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
+        delivery.claimed |= tx_delivery.claimed;
+    }
+    record_hosted_dma_packet_model_report(device_id, packet_model_report);
+
+    Ok(delivery)
 }
 
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove

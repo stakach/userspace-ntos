@@ -1429,10 +1429,10 @@ notification-package fallbacks.
   grant. Generic descriptor completion and the first e1000 register-profile bus-master model are in
   place and proven through the full desktop shell path. The provider-domain path now routes the
   observed NDIS open/bind/request/packet/buffer/send-completion surface through the shared
-  `ndis.sys` runtime with typed packet/MDL shadows instead of private provider semantics. Remaining
-  B3 work is real NDIS receive indication after protocol bind/packet-filter setup, transfer-data
-  completion, TX traffic from the real scatter/gather send route, and repeated-device scaling under
-  the same dynamic devnode/resource path.
+  `ndis.sys` runtime with typed packet/MDL shadows instead of private provider semantics.
+  Transfer-data/completion wiring and repeated-device scaling are proven at this frontier. Remaining
+  B3 work is true TCPIP-originated TX traffic through the real scatter/gather send route and live
+  packet-array receive proof with a miniport that reaches the internal NDIS helper.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -8010,7 +8010,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and the serialized two-E1000 proof. Remaining proof is real TX packet traffic from the TCPIP
     stack through the same dynamic provider-domain route and live packet-array receive with a
     miniport that reaches the internal NDIS helper. Do not reintroduce private provider images,
-    protocol-specific fallbacks, or per-driver special cases.
+    protocol-specific fallbacks, or per-driver special cases. Current TX work factors hosted
+    interrupt delivery from E1000 packet modeling and adds a bounded TX-only redrive after the first
+    ISR/DPC/work-item drain; the redrive only completes descriptors posted by the real miniport and
+    then re-enters the normal interrupt path for real E1000/NDIS send completion.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
