@@ -4,10 +4,17 @@
 //! host, and path-dep builds (the executive) don't build bins, so this is invisible there.
 
 use nt_config_manager::{
-    encode_multi_sz, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
-    SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
+    encode_multi_sz, ConfigManager, SERVICE_BOOT_START, SERVICE_DEMAND_START,
+    SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
 };
-use nt_hive_core::{encode_image, CellId, Hive, HiveKind, RegistryValueType};
+use nt_hive_core::{
+    encode_image, import_control_set_class_into_config_manager,
+    import_control_set_enum_into_config_manager, import_control_set_services_into_config_manager,
+    reactos_network_ipv4_defaults_for_interface,
+    seed_reactos_network_bindings_from_config_manager_into_target,
+    seed_reactos_network_setup_into_target, CellId, Hive, HiveKind, ReactOsSetupSeedTarget,
+    RegistryValueType, CURRENT_CONTROL_SET_TARGET,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -22,6 +29,33 @@ const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
 const BOCHS_PDO_NAME: &str = r"\Device\NTPNP_PCI0002";
 const GENERATED_HIVE_STORAGE_WINDOW: usize = 7 * 4096;
+
+#[derive(Clone, Copy)]
+struct GeneratedNetworkAdapter {
+    service_name: &'static str,
+    service_image_path: &'static str,
+    driver_key: &'static str,
+    instance_id: &'static str,
+    pdo_name: &'static str,
+    hardware_ids: &'static [&'static str],
+    compatible_ids: &'static [&'static str],
+    export_name: &'static str,
+    root_device: &'static str,
+    driver_desc: &'static str,
+}
+
+const GENERATED_NETWORK_ADAPTERS: &[GeneratedNetworkAdapter] = &[GeneratedNetworkAdapter {
+    service_name: "E1000",
+    service_image_path: r"system32\drivers\e1000.sys",
+    driver_key: E1000_DRIVER_KEY,
+    instance_id: E1000_INSTANCE_ID,
+    pdo_name: r"\Device\NTPNP_PCI0001",
+    hardware_ids: &[r"PCI\VEN_8086&DEV_100E"],
+    compatible_ids: &[r"PCI\CC_020000", r"PCI\CC_0200"],
+    export_name: E1000_EXPORT_NAME,
+    root_device: E1000_INTERFACE_NAME,
+    driver_desc: E1000_DRIVER_DESC,
+}];
 
 const GENERATED_SERVICE_GROUP_ORDER: &[&str] = &[
     "Video",
@@ -67,12 +101,93 @@ fn utf16le_sz(s: &str) -> Vec<u8> {
     bytes
 }
 
-fn set_sz(hive: &mut Hive, key: CellId, name: &str, value: &str) {
-    hive.set_value(key, name, RegistryValueType::Sz, utf16le_sz(value));
-}
-
 fn set_expand_sz(hive: &mut Hive, key: CellId, name: &str, value: &str) {
     hive.set_value(key, name, RegistryValueType::ExpandSz, utf16le_sz(value));
+}
+
+fn generated_hive_system_path(path: &str) -> Option<String> {
+    let mut components = path.split('\\').filter(|component| !component.is_empty());
+    if !components.next()?.eq_ignore_ascii_case("Registry")
+        || !components.next()?.eq_ignore_ascii_case("Machine")
+        || !components.next()?.eq_ignore_ascii_case("System")
+        || !components.next()?.eq_ignore_ascii_case("CurrentControlSet")
+    {
+        return None;
+    }
+
+    let mut out = String::from("ControlSet001");
+    for component in components {
+        out.push('\\');
+        out.push_str(component);
+    }
+    Some(out)
+}
+
+struct GeneratedHiveSetupSeedTarget<'a> {
+    hive: &'a mut Hive,
+}
+
+impl ReactOsSetupSeedTarget for GeneratedHiveSetupSeedTarget<'_> {
+    fn create_key(&mut self, path: &str) -> bool {
+        let Some(path) = generated_hive_system_path(path) else {
+            return false;
+        };
+        self.hive.create_key(&path);
+        true
+    }
+
+    fn set_value(
+        &mut self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
+        let Some(path) = generated_hive_system_path(path) else {
+            return false;
+        };
+        let key = self.hive.create_key(&path);
+        self.hive.set_value(key, name, value_type, data)
+    }
+
+    fn has_value(&self, path: &str, name: &str) -> bool {
+        let Some(path) = generated_hive_system_path(path) else {
+            return false;
+        };
+        self.hive
+            .open_key(&path)
+            .and_then(|key| self.hive.query_value(key, name))
+            .is_some()
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        let Some(path) = generated_hive_system_path(path) else {
+            return false;
+        };
+        self.hive
+            .open_key(&path)
+            .and_then(|key| self.hive.query_value(key, name))
+            .is_some_and(|(existing_type, existing_data)| {
+                existing_type == value_type && existing_data == data
+            })
+    }
+
+    fn query_value(&self, path: &str, name: &str) -> Option<(RegistryValueType, Vec<u8>)> {
+        let path = generated_hive_system_path(path)?;
+        self.hive
+            .open_key(&path)
+            .and_then(|key| self.hive.query_value(key, name))
+            .map(|(value_type, data)| (value_type, data.to_vec()))
+    }
 }
 
 fn install_service_group_order(hive: &mut Hive) {
@@ -85,91 +200,100 @@ fn install_service_group_order(hive: &mut Hive) {
     );
 }
 
-fn install_kernel_driver_service(
-    hive: &mut Hive,
-    service_name: &str,
-    image_path: &str,
-    start_type: u32,
-    error_control: u32,
-    group: Option<&str>,
-) -> CellId {
-    let key = hive.create_key(&format!(r"ControlSet001\Services\{}", service_name));
-    set_expand_sz(hive, key, "ImagePath", image_path);
+fn install_generated_network_adapter(hive: &mut Hive, adapter: GeneratedNetworkAdapter) {
+    let key = hive.create_key(&format!(r"ControlSet001\Services\{}", adapter.service_name));
+    set_expand_sz(hive, key, "ImagePath", adapter.service_image_path);
     hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
-    hive.set_dword(key, "Start", start_type);
-    hive.set_dword(key, "ErrorControl", error_control);
-    if let Some(group) = group {
-        set_sz(hive, key, "Group", group);
-    }
-    key
-}
-
-fn install_network_stack_services(hive: &mut Hive) {
-    // ReactOS hivesys.inf marks NDIS as boot-start in the `NDIS Wrapper` group. It is not PnP-bound
-    // here; hosted E1000 loads the real ndis.sys image as its dependency until the support-driver
-    // lifecycle grows into a standalone boot-driver service.
-    install_kernel_driver_service(
-        hive,
-        "Ndis",
-        r"system32\drivers\ndis.sys",
-        SERVICE_BOOT_START,
-        1,
-        Some("NDIS Wrapper"),
+    hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
+    hive.set_dword(key, "ErrorControl", 0x1);
+    hive.set_value(key, "Group", RegistryValueType::Sz, utf16le_sz("NDIS"));
+    hive.set_value(
+        key,
+        "ClassGUID",
+        RegistryValueType::Sz,
+        utf16le_sz(NET_CLASS_GUID),
     );
 
-    // nettcpip.inf installs TCPIP as a system-start kernel driver in PNP_TDI with these base
-    // Parameters values. Keeping them in the generated SYSTEM hive lets the next B3 slice activate
-    // TCPIP through the same service metadata without adding kernel-side service-name policy.
-    install_kernel_driver_service(
-        hive,
-        "Tcpip",
-        r"system32\drivers\tcpip.sys",
-        SERVICE_SYSTEM_START,
-        1,
-        Some("PNP_TDI"),
+    let devnode = hive.create_key(&format!(r"ControlSet001\Enum\{}", adapter.instance_id));
+    hive.set_value(
+        devnode,
+        "Service",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.service_name),
     );
-    let params = hive.create_key(r"ControlSet001\Services\Tcpip\Parameters");
-    set_expand_sz(
-        hive,
-        params,
-        "DataBasePath",
-        r"%SystemRoot%\System32\drivers\etc",
+    hive.set_value(
+        devnode,
+        "PdoName",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.pdo_name),
     );
-    set_sz(hive, params, "Domain", "");
-    set_sz(hive, params, "Hostname", "ROSHost");
-    set_sz(hive, params, "NameServer", "");
-    hive.set_dword(params, "ForwardBroadcasts", 0);
-    hive.set_dword(params, "IPEnableRouter", 0);
-    set_sz(hive, params, "SearchList", "");
-    hive.set_dword(params, "EnableSecurityFilters", 0);
-    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Adapters");
-    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\Interfaces");
-    hive.create_key(r"ControlSet001\Services\Tcpip\Parameters\PersistentRoutes");
+    hive.set_value(
+        devnode,
+        "Driver",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.driver_key),
+    );
+    hive.set_value(
+        devnode,
+        "HardwareID",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(adapter.hardware_ids),
+    );
+    hive.set_value(
+        devnode,
+        "CompatibleIDs",
+        RegistryValueType::MultiSz,
+        encode_multi_sz(adapter.compatible_ids),
+    );
 
-    let linkage = hive.create_key(r"ControlSet001\Services\Tcpip\Linkage");
+    let class_key = hive.create_key(&format!(
+        r"ControlSet001\Control\Class\{}",
+        adapter.driver_key
+    ));
+    hive.set_value(
+        class_key,
+        "DriverDesc",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.driver_desc),
+    );
+    let linkage = hive.create_key(&format!(
+        r"ControlSet001\Control\Class\{}\Linkage",
+        adapter.driver_key
+    ));
     hive.set_value(
         linkage,
-        "Bind",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[E1000_EXPORT_NAME]),
+        "Export",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.export_name),
     );
-
-    let interface = hive.create_key(&format!(
-        r"ControlSet001\Services\Tcpip\Parameters\Interfaces\{}",
-        E1000_INTERFACE_NAME
-    ));
-    hive.set_dword(interface, "EnableDHCP", 1);
-    hive.set_dword(interface, "InterfaceMetric", 0);
-
-    // afd_reg.inf installs AFD as a system-start kernel driver in the TDI group.
-    install_kernel_driver_service(
-        hive,
-        "Afd",
-        r"system32\drivers\afd.sys",
-        SERVICE_SYSTEM_START,
-        1,
-        Some("TDI"),
+    hive.set_value(
+        linkage,
+        "RootDevice",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.root_device),
     );
+}
+
+fn install_generated_network_adapters(hive: &mut Hive, adapters: &[GeneratedNetworkAdapter]) {
+    for &adapter in adapters {
+        install_generated_network_adapter(hive, adapter);
+    }
+}
+
+fn import_generated_hive_config_manager(hive: &Hive) -> ConfigManager {
+    let mut cm = ConfigManager::new();
+    let _ =
+        import_control_set_services_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+    let _ = import_control_set_enum_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+    let _ = import_control_set_class_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+    cm
+}
+
+fn seed_generated_network_setup(hive: &mut Hive) {
+    let cm = import_generated_hive_config_manager(hive);
+    let mut target = GeneratedHiveSetupSeedTarget { hive };
+    let mut stats = seed_reactos_network_setup_into_target(&mut target);
+    seed_reactos_network_bindings_from_config_manager_into_target(&mut target, &cm, &mut stats);
 }
 
 fn workspace_relative_path(relative: &str) -> PathBuf {
@@ -657,85 +781,8 @@ fn build_hive() -> Hive {
         encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"]),
     );
 
-    // ReactOS Intel PRO/1000 miniport. The kernel discovers this via ordinary boot/system driver
-    // and devnode metadata; NDIS consumes the class Linkage\Export value during AddDevice.
-    let key = hive.create_key(r"ControlSet001\Services\E1000");
-    hive.set_value(
-        key,
-        "ImagePath",
-        RegistryValueType::ExpandSz,
-        utf16le_sz(r"system32\drivers\e1000.sys"),
-    );
-    hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
-    hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
-    hive.set_dword(key, "ErrorControl", 0x1);
-    hive.set_value(key, "Group", RegistryValueType::Sz, utf16le_sz("NDIS"));
-    hive.set_value(
-        key,
-        "ClassGUID",
-        RegistryValueType::Sz,
-        utf16le_sz(NET_CLASS_GUID),
-    );
-
-    install_network_stack_services(&mut hive);
-
-    let devnode_path = format!(r"ControlSet001\Enum\{}", E1000_INSTANCE_ID);
-    let devnode = hive.create_key(&devnode_path);
-    hive.set_value(
-        devnode,
-        "Service",
-        RegistryValueType::Sz,
-        utf16le_sz("E1000"),
-    );
-    hive.set_value(
-        devnode,
-        "PdoName",
-        RegistryValueType::Sz,
-        utf16le_sz(r"\Device\NTPNP_PCI0001"),
-    );
-    hive.set_value(
-        devnode,
-        "Driver",
-        RegistryValueType::Sz,
-        utf16le_sz(E1000_DRIVER_KEY),
-    );
-    hive.set_value(
-        devnode,
-        "HardwareID",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"PCI\VEN_8086&DEV_100E"]),
-    );
-    hive.set_value(
-        devnode,
-        "CompatibleIDs",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(&[r"PCI\CC_020000", r"PCI\CC_0200"]),
-    );
-
-    let class_key = hive.create_key(&format!(
-        r"ControlSet001\Control\Class\{}",
-        E1000_DRIVER_KEY
-    ));
-    hive.set_value(
-        class_key,
-        "DriverDesc",
-        RegistryValueType::Sz,
-        utf16le_sz(E1000_DRIVER_DESC),
-    );
-    let linkage_path = format!(r"ControlSet001\Control\Class\{}\Linkage", E1000_DRIVER_KEY);
-    let linkage = hive.create_key(&linkage_path);
-    hive.set_value(
-        linkage,
-        "Export",
-        RegistryValueType::Sz,
-        utf16le_sz(E1000_EXPORT_NAME),
-    );
-    hive.set_value(
-        linkage,
-        "RootDevice",
-        RegistryValueType::Sz,
-        utf16le_sz(E1000_INTERFACE_NAME),
-    );
+    install_generated_network_adapters(&mut hive, GENERATED_NETWORK_ADAPTERS);
+    seed_generated_network_setup(&mut hive);
 
     let bochs = bochs_display_install_from_staged_inf()
         .expect("staged ReactOS bochsmp.inf must describe the display miniport");
@@ -940,10 +987,46 @@ mod tests {
                 encode_multi_sz(&[E1000_EXPORT_NAME]).as_slice()
             ))
         );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Export"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[r"\Device\Tcpip_E1000_0000"]).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Route"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[E1000_INTERFACE_NAME]).as_slice()
+            ))
+        );
         let tcpip_interface = hive
             .open_key(r"ControlSet001\Services\Tcpip\Parameters\Interfaces\E1000_0000")
             .expect("Tcpip interface");
-        assert_eq!(hive.query_dword(tcpip_interface, "EnableDHCP"), Some(1));
+        let ipv4 = reactos_network_ipv4_defaults_for_interface(E1000_INTERFACE_NAME);
+        assert_eq!(hive.query_dword(tcpip_interface, "EnableDHCP"), Some(0));
+        assert_eq!(
+            hive.query_value(tcpip_interface, "IPAddress"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[ipv4.address_string().as_str()]).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_interface, "DefaultGateway"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[ipv4.default_gateway_string().as_str()]).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_interface, "SubnetMask"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[ipv4.subnet_mask_string().as_str()]).as_slice()
+            ))
+        );
         assert_eq!(
             hive.query_dword(tcpip_interface, "InterfaceMetric"),
             Some(0)
@@ -1002,6 +1085,78 @@ mod tests {
         assert!(position("Ndis") < position("Tcpip"));
         assert!(position("Tcpip") < position("E1000"));
         assert!(position("E1000") < position("Afd"));
+    }
+
+    #[test]
+    fn generated_network_setup_derives_multiple_adapter_bindings() {
+        let second_adapter = GeneratedNetworkAdapter {
+            service_name: "E1000",
+            service_image_path: r"system32\drivers\e1000.sys",
+            driver_key: r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0001",
+            instance_id: r"PCI\VEN_8086&DEV_100E\3&11583659&0&19",
+            pdo_name: r"\Device\NTPNP_PCI0002",
+            hardware_ids: &[r"PCI\VEN_8086&DEV_100E"],
+            compatible_ids: &[r"PCI\CC_020000", r"PCI\CC_0200"],
+            export_name: r"\Device\E1000_0001",
+            root_device: "E1000_0001",
+            driver_desc: E1000_DRIVER_DESC,
+        };
+        let adapters = [GENERATED_NETWORK_ADAPTERS[0], second_adapter];
+        let mut hive = Hive::new(HiveKind::System);
+        install_service_group_order(&mut hive);
+        install_generated_network_adapters(&mut hive, &adapters);
+        seed_generated_network_setup(&mut hive);
+
+        let tcpip_linkage = hive
+            .open_key(r"ControlSet001\Services\Tcpip\Linkage")
+            .expect("Tcpip linkage");
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Bind"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[E1000_EXPORT_NAME, r"\Device\E1000_0001"]).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Export"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[r"\Device\Tcpip_E1000_0000", r"\Device\Tcpip_E1000_0001"])
+                    .as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Route"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[E1000_INTERFACE_NAME, "E1000_0001"]).as_slice()
+            ))
+        );
+
+        for interface in [E1000_INTERFACE_NAME, "E1000_0001"] {
+            let key = hive
+                .open_key(&format!(
+                    r"ControlSet001\Services\Tcpip\Parameters\Interfaces\{}",
+                    interface
+                ))
+                .expect("TCPIP interface");
+            let ipv4 = reactos_network_ipv4_defaults_for_interface(interface);
+            assert_eq!(hive.query_dword(key, "EnableDHCP"), Some(0));
+            assert_eq!(
+                hive.query_value(key, "IPAddress"),
+                Some((
+                    RegistryValueType::MultiSz,
+                    encode_multi_sz(&[ipv4.address_string().as_str()]).as_slice()
+                ))
+            );
+            assert_eq!(
+                hive.query_value(key, "DefaultGateway"),
+                Some((
+                    RegistryValueType::MultiSz,
+                    encode_multi_sz(&[ipv4.default_gateway_string().as_str()]).as_slice()
+                ))
+            );
+        }
     }
 
     #[test]

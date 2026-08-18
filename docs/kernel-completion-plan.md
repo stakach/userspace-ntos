@@ -62,11 +62,13 @@ components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, serialized
 discovery, provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure, and
 registry-derived receive stimulus are closed. The packet-array receive infrastructure now has
 generic wiring through provider-internal NDIS miniport-block handlers and a clean serialized
-desktop regression proof. It still needs a live-driver proof because the current ReactOS E1000 path
-uses classic Ethernet lookahead receive. The remaining B3 packet frontier is true TX traffic from
-the real stack, live proof of packet-array receive with a miniport that reaches
-`MiniIndicateReceivePacket`, and repeated-device scaling under the same dynamic devnode/resource
-path.
+desktop regression proof. The generated-hive fallback no longer carries a separate hardcoded TCPIP
+binding path; it imports its own devnodes/classes into Config Manager and runs the same dynamic
+network setup seeder, with host coverage for two generated NIC bindings. Packet-array still needs a
+live-driver proof because the current ReactOS E1000 path uses classic Ethernet lookahead receive.
+The remaining B3 packet frontier is true TX traffic from the real stack, live proof of packet-array
+receive with a miniport that reaches `MiniIndicateReceivePacket`, and repeated-device runtime
+scaling under the same dynamic devnode/resource path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -7961,10 +7963,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/run-desktop-b3-packet-array-20260818-1629.log` keeps the provider-domain PCI/DMA gates
     green, reaches real userinit and Explorer, paints genuine Explorer shell chrome, and exits with
     `298/298` checks passing; the proof has no provider export/buffer rejects or hosted work/callback
-    walls. Remaining proof is real TX packet traffic from the TCPIP stack through the same dynamic
-    provider-domain route, live packet-array receive with a miniport that reaches the internal NDIS
-    helper, and repeated-device scaling. Do not reintroduce private provider images,
-    protocol-specific fallbacks, or per-driver special cases.
+    walls. The generated fallback SYSTEM hive also now derives its TCPIP linkage/interface state by
+    importing generated devnodes/classes into Config Manager and running the shared ReactOS network
+    setup seeder; the old single-adapter TCPIP writer is removed, and host tests cover two generated
+    NIC bindings with distinct static IPv4 defaults. Remaining proof is real TX packet traffic from
+    the TCPIP stack through the same dynamic provider-domain route, live packet-array receive with a
+    miniport that reaches the internal NDIS helper, and repeated-device runtime scaling. Do not
+    reintroduce private provider images, protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
