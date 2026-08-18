@@ -64,13 +64,14 @@ registry-derived receive stimulus are closed. The packet-array receive infrastru
 generic wiring through provider-internal NDIS miniport-block handlers and a clean serialized
 desktop regression proof. The generated-hive fallback no longer carries a separate hardcoded TCPIP
 binding path; it imports its own devnodes/classes into Config Manager and runs the same dynamic
-network setup seeder, with host coverage for two generated NIC bindings. Packet-array still needs a
-live-driver proof because the current ReactOS E1000 path uses classic Ethernet lookahead receive.
-Runtime PnP matching now parses the specific PCI instance location before generic hardware IDs, so
-repeated identical NIC devnodes no longer collapse to the first enumerated function. The remaining
-B3 packet frontier is true TX traffic from the real stack, live proof of packet-array receive with
-a miniport that reaches `MiniIndicateReceivePacket`, and repeated-device runtime boot coverage
-under the same dynamic devnode/resource path.
+network setup seeder, with host coverage for two generated NIC bindings and an opt-in
+`NTOS_GENERATED_E1000_COUNT` build-tool knob for repeated-NIC proof images. Packet-array still
+needs a live-driver proof because the current ReactOS E1000 path uses classic Ethernet lookahead
+receive. Runtime PnP matching now parses the specific PCI instance location before generic
+hardware IDs, so repeated identical NIC devnodes no longer collapse to the first enumerated
+function. The remaining B3 packet frontier is true TX traffic from the real stack, live proof of
+packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`, and repeated-device
+runtime boot coverage under the same dynamic devnode/resource path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -7968,15 +7969,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     walls. The generated fallback SYSTEM hive also now derives its TCPIP linkage/interface state by
     importing generated devnodes/classes into Config Manager and running the shared ReactOS network
     setup seeder; the old single-adapter TCPIP writer is removed, and host tests cover two generated
-    NIC bindings with distinct static IPv4 defaults. The runtime PnP matcher now treats a complete
-    `Enum\PCI` instance path as the most specific identity: it parses the final bus/device/function
-    segment before trying generic hardware IDs, so repeated identical NICs bind to distinct PCI
-    functions and a missing exact function fails closed instead of falling back to the first generic
-    match. Validation: `cargo test -p nt-pnp -- --nocapture`. Remaining proof is real TX packet
-    traffic from the TCPIP stack through the same dynamic provider-domain route, live packet-array
-    receive with a miniport that reaches the internal NDIS helper, and repeated-device runtime
-    boot coverage. Do not reintroduce private provider images, protocol-specific fallbacks, or
-    per-driver special cases.
+    NIC bindings with distinct static IPv4 defaults. The build tool now accepts
+    `NTOS_GENERATED_E1000_COUNT` so repeated-NIC boot images can be generated without adding a
+    second hand-written adapter table. The runtime PnP matcher now treats a complete `Enum\PCI`
+    instance path as the most specific identity: it parses the final bus/device/function segment
+    before trying generic hardware IDs, so repeated identical NICs bind to distinct PCI functions
+    and a missing exact function fails closed instead of falling back to the first generic match.
+    Validation: `cargo test -p nt-pnp -- --nocapture`, `cargo test -p nt-hive-core --
+    --nocapture`, and `NTOS_GENERATED_E1000_COUNT=2 cargo run -q --release -p nt-hive-core
+    --bin gen_hive -- .tmp/generated-e1000-2-hive.dat` (12 KiB output, no warnings). Remaining
+    proof is real TX packet traffic from the TCPIP stack through the same dynamic provider-domain
+    route, live packet-array receive with a miniport that reaches the internal NDIS helper, and
+    repeated-device runtime boot coverage. Do not reintroduce private provider images,
+    protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute

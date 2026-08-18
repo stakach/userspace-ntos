@@ -4,13 +4,16 @@
 //! host, and path-dep builds (the executive) don't build bins, so this is invisible there.
 
 use nt_config_manager::{
-    encode_multi_sz, ConfigManager, SERVICE_BOOT_START, SERVICE_DEMAND_START,
-    SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
+    encode_multi_sz, ConfigManager, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER,
+    SERVICE_SYSTEM_START,
 };
+#[cfg(test)]
+use nt_config_manager::{SERVICE_BOOT_START, SERVICE_DEMAND_START};
+#[cfg(test)]
+use nt_hive_core::reactos_network_ipv4_defaults_for_interface;
 use nt_hive_core::{
     encode_image, import_control_set_class_into_config_manager,
     import_control_set_enum_into_config_manager, import_control_set_services_into_config_manager,
-    reactos_network_ipv4_defaults_for_interface,
     seed_reactos_network_bindings_from_config_manager_into_target,
     seed_reactos_network_setup_into_target, CellId, Hive, HiveKind, ReactOsSetupSeedTarget,
     RegistryValueType, CURRENT_CONTROL_SET_TARGET,
@@ -28,34 +31,25 @@ const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochs
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
 const BOCHS_PDO_NAME: &str = r"\Device\NTPNP_PCI0002";
+#[cfg(test)]
 const GENERATED_HIVE_STORAGE_WINDOW: usize = 7 * 4096;
 
-#[derive(Clone, Copy)]
 struct GeneratedNetworkAdapter {
-    service_name: &'static str,
+    service_name: String,
     service_image_path: &'static str,
-    driver_key: &'static str,
-    instance_id: &'static str,
-    pdo_name: &'static str,
+    driver_key: String,
+    instance_id: String,
+    pdo_name: String,
     hardware_ids: &'static [&'static str],
     compatible_ids: &'static [&'static str],
-    export_name: &'static str,
-    root_device: &'static str,
+    export_name: String,
+    root_device: String,
     driver_desc: &'static str,
 }
 
-const GENERATED_NETWORK_ADAPTERS: &[GeneratedNetworkAdapter] = &[GeneratedNetworkAdapter {
-    service_name: "E1000",
-    service_image_path: r"system32\drivers\e1000.sys",
-    driver_key: E1000_DRIVER_KEY,
-    instance_id: E1000_INSTANCE_ID,
-    pdo_name: r"\Device\NTPNP_PCI0001",
-    hardware_ids: &[r"PCI\VEN_8086&DEV_100E"],
-    compatible_ids: &[r"PCI\CC_020000", r"PCI\CC_0200"],
-    export_name: E1000_EXPORT_NAME,
-    root_device: E1000_INTERFACE_NAME,
-    driver_desc: E1000_DRIVER_DESC,
-}];
+const GENERATED_E1000_MAX_COUNT: usize = 29;
+const GENERATED_E1000_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_8086&DEV_100E"];
+const GENERATED_E1000_COMPATIBLE_IDS: &[&str] = &[r"PCI\CC_020000", r"PCI\CC_0200"];
 
 const GENERATED_SERVICE_GROUP_ORDER: &[&str] = &[
     "Video",
@@ -200,7 +194,63 @@ fn install_service_group_order(hive: &mut Hive) {
     );
 }
 
-fn install_generated_network_adapter(hive: &mut Hive, adapter: GeneratedNetworkAdapter) {
+fn generated_e1000_adapter(index: usize) -> GeneratedNetworkAdapter {
+    assert!(
+        index < GENERATED_E1000_MAX_COUNT,
+        "generated E1000 index exceeds one PCI bus"
+    );
+    if index == 0 {
+        return GeneratedNetworkAdapter {
+            service_name: String::from("E1000"),
+            service_image_path: r"system32\drivers\e1000.sys",
+            driver_key: String::from(E1000_DRIVER_KEY),
+            instance_id: String::from(E1000_INSTANCE_ID),
+            pdo_name: String::from(r"\Device\NTPNP_PCI0001"),
+            hardware_ids: GENERATED_E1000_HARDWARE_IDS,
+            compatible_ids: GENERATED_E1000_COMPATIBLE_IDS,
+            export_name: String::from(E1000_EXPORT_NAME),
+            root_device: String::from(E1000_INTERFACE_NAME),
+            driver_desc: E1000_DRIVER_DESC,
+        };
+    }
+
+    let dev = 3 + index as u8;
+    let request = dev << 3;
+    GeneratedNetworkAdapter {
+        service_name: String::from("E1000"),
+        service_image_path: r"system32\drivers\e1000.sys",
+        driver_key: format!(r"{}\{:04}", NET_CLASS_GUID, index),
+        instance_id: format!(r"PCI\VEN_8086&DEV_100E\3&11583659&0&{:02X}", request),
+        pdo_name: format!(r"\Device\NTPNP_E1000_{:04}", index),
+        hardware_ids: GENERATED_E1000_HARDWARE_IDS,
+        compatible_ids: GENERATED_E1000_COMPATIBLE_IDS,
+        export_name: format!(r"\Device\E1000_{:04}", index),
+        root_device: format!("E1000_{:04}", index),
+        driver_desc: E1000_DRIVER_DESC,
+    }
+}
+
+fn generated_e1000_adapters(count: usize) -> Vec<GeneratedNetworkAdapter> {
+    assert!(
+        count > 0 && count <= GENERATED_E1000_MAX_COUNT,
+        "NTOS_GENERATED_E1000_COUNT must be in 1..=29"
+    );
+    (0..count).map(generated_e1000_adapter).collect()
+}
+
+fn generated_e1000_count_from_env() -> usize {
+    match std::env::var("NTOS_GENERATED_E1000_COUNT") {
+        Ok(value) => value
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("NTOS_GENERATED_E1000_COUNT must be an integer in 1..=29")),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("NTOS_GENERATED_E1000_COUNT must be valid UTF-8")
+        }
+    }
+}
+
+fn install_generated_network_adapter(hive: &mut Hive, adapter: &GeneratedNetworkAdapter) {
     let key = hive.create_key(&format!(r"ControlSet001\Services\{}", adapter.service_name));
     set_expand_sz(hive, key, "ImagePath", adapter.service_image_path);
     hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
@@ -219,19 +269,19 @@ fn install_generated_network_adapter(hive: &mut Hive, adapter: GeneratedNetworkA
         devnode,
         "Service",
         RegistryValueType::Sz,
-        utf16le_sz(adapter.service_name),
+        utf16le_sz(&adapter.service_name),
     );
     hive.set_value(
         devnode,
         "PdoName",
         RegistryValueType::Sz,
-        utf16le_sz(adapter.pdo_name),
+        utf16le_sz(&adapter.pdo_name),
     );
     hive.set_value(
         devnode,
         "Driver",
         RegistryValueType::Sz,
-        utf16le_sz(adapter.driver_key),
+        utf16le_sz(&adapter.driver_key),
     );
     hive.set_value(
         devnode,
@@ -264,18 +314,18 @@ fn install_generated_network_adapter(hive: &mut Hive, adapter: GeneratedNetworkA
         linkage,
         "Export",
         RegistryValueType::Sz,
-        utf16le_sz(adapter.export_name),
+        utf16le_sz(&adapter.export_name),
     );
     hive.set_value(
         linkage,
         "RootDevice",
         RegistryValueType::Sz,
-        utf16le_sz(adapter.root_device),
+        utf16le_sz(&adapter.root_device),
     );
 }
 
 fn install_generated_network_adapters(hive: &mut Hive, adapters: &[GeneratedNetworkAdapter]) {
-    for &adapter in adapters {
+    for adapter in adapters {
         install_generated_network_adapter(hive, adapter);
     }
 }
@@ -721,7 +771,7 @@ fn install_display_miniport(hive: &mut Hive, install: &DisplayMiniportInstall) {
     hive.set_dword(device, "VgaCompatible", install.vga_compatible);
 }
 
-fn build_hive() -> Hive {
+fn build_hive_with_e1000_count(e1000_count: usize) -> Hive {
     let mut hive = Hive::new(HiveKind::System);
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
@@ -781,7 +831,8 @@ fn build_hive() -> Hive {
         encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"]),
     );
 
-    install_generated_network_adapters(&mut hive, GENERATED_NETWORK_ADAPTERS);
+    let network_adapters = generated_e1000_adapters(e1000_count);
+    install_generated_network_adapters(&mut hive, &network_adapters);
     seed_generated_network_setup(&mut hive);
 
     let bochs = bochs_display_install_from_staged_inf()
@@ -791,11 +842,16 @@ fn build_hive() -> Hive {
     hive
 }
 
+#[cfg(test)]
+fn build_hive() -> Hive {
+    build_hive_with_e1000_count(1)
+}
+
 fn main() {
     let out = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "hive.dat".to_string());
-    let hive = build_hive();
+    let hive = build_hive_with_e1000_count(generated_e1000_count_from_env());
     let bytes = encode_image(&hive);
     std::fs::write(&out, &bytes).expect("write hive image");
     eprintln!("gen_hive: wrote {} ({} bytes)", out, bytes.len());
@@ -1089,19 +1145,7 @@ mod tests {
 
     #[test]
     fn generated_network_setup_derives_multiple_adapter_bindings() {
-        let second_adapter = GeneratedNetworkAdapter {
-            service_name: "E1000",
-            service_image_path: r"system32\drivers\e1000.sys",
-            driver_key: r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0001",
-            instance_id: r"PCI\VEN_8086&DEV_100E\3&11583659&0&19",
-            pdo_name: r"\Device\NTPNP_PCI0002",
-            hardware_ids: &[r"PCI\VEN_8086&DEV_100E"],
-            compatible_ids: &[r"PCI\CC_020000", r"PCI\CC_0200"],
-            export_name: r"\Device\E1000_0001",
-            root_device: "E1000_0001",
-            driver_desc: E1000_DRIVER_DESC,
-        };
-        let adapters = [GENERATED_NETWORK_ADAPTERS[0], second_adapter];
+        let adapters = generated_e1000_adapters(2);
         let mut hive = Hive::new(HiveKind::System);
         install_service_group_order(&mut hive);
         install_generated_network_adapters(&mut hive, &adapters);
