@@ -7291,7 +7291,7 @@ extern "win64" fn s_io_get_dma_adapter(
         if ops == 0 {
             return 0;
         }
-        let adapter = pool_alloc(0x40);
+        let adapter = pool_alloc(HOSTED_DMA_ADAPTER_SIZE);
         if adapter == 0 {
             pool_free(ops);
             return 0;
@@ -7361,9 +7361,9 @@ extern "win64" fn s_io_get_dma_adapter(
             s_dma_build_mdl_from_scatter_gather_list as *const () as usize as u64,
         );
 
-        // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8.
+        // DMA_ADAPTER: Version@0, Size@2, DmaOperations@8, followed by hosted bridge metadata.
         write_unaligned(adapter as *mut u16, 1);
-        write_unaligned((adapter + 2) as *mut u16, 0x40);
+        write_unaligned((adapter + 2) as *mut u16, HOSTED_DMA_ADAPTER_SIZE as u16);
         write_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *mut u64, ops);
         write_unaligned(
             (adapter + HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET) as *mut u64,
@@ -7372,6 +7372,18 @@ extern "win64" fn s_io_get_dma_adapter(
         write_unaligned(
             (adapter + HOSTED_DMA_ADAPTER_ID_OFFSET) as *mut u64,
             adapter_id,
+        );
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_GRANT_VA_OFFSET) as *mut u64,
+            grant_va,
+        );
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_GRANT_LEN_OFFSET) as *mut u64,
+            grant_len,
+        );
+        write_unaligned(
+            (adapter + HOSTED_DMA_ADAPTER_GRANT_LOGICAL_OFFSET) as *mut u64,
+            grant_logical,
         );
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *mut u64,
@@ -7414,9 +7426,21 @@ const HOSTED_DMA_RECORD_KIND_MAP_TRANSFER: u64 = 2;
 const HOSTED_DMA_RECORD_FLAG_WRITE_TO_DEVICE: u64 = 1;
 const HOSTED_DMA_MAP_REGISTER_SIGNATURE: u64 = 0x4D41_5052_4547_3031; // "MAPREG01"
 const HOSTED_DMA_ADAPTER_SIGNATURE: u64 = 0x444D_4144_4150_3031; // "DMADAP01"
+const HOSTED_DMA_ADAPTER_SIZE: u64 = 0x40;
 const HOSTED_DMA_ADAPTER_OPS_OFFSET: u64 = 0x08;
 const HOSTED_DMA_ADAPTER_SIGNATURE_OFFSET: u64 = 0x10;
 const HOSTED_DMA_ADAPTER_ID_OFFSET: u64 = 0x18;
+const HOSTED_DMA_ADAPTER_GRANT_VA_OFFSET: u64 = 0x20;
+const HOSTED_DMA_ADAPTER_GRANT_LEN_OFFSET: u64 = 0x28;
+const HOSTED_DMA_ADAPTER_GRANT_LOGICAL_OFFSET: u64 = 0x30;
+
+#[derive(Clone, Copy)]
+struct HostedDmaAdapterMetadata {
+    adapter_id: u64,
+    grant_va: u64,
+    grant_len: u64,
+    grant_logical: u64,
+}
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {
@@ -7536,14 +7560,31 @@ unsafe fn dma_adapter_blob_id(adapter: u64) -> Option<u64> {
     ))
 }
 
+unsafe fn dma_adapter_metadata(adapter: u64) -> Option<HostedDmaAdapterMetadata> {
+    let adapter_id = dma_adapter_blob_id(adapter)?;
+    let ops = read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64);
+    let grant_va = read_unaligned((adapter + HOSTED_DMA_ADAPTER_GRANT_VA_OFFSET) as *const u64);
+    let grant_len = read_unaligned((adapter + HOSTED_DMA_ADAPTER_GRANT_LEN_OFFSET) as *const u64);
+    let grant_logical =
+        read_unaligned((adapter + HOSTED_DMA_ADAPTER_GRANT_LOGICAL_OFFSET) as *const u64);
+    if ops == 0 || grant_va == 0 || grant_len == 0 || grant_logical == 0 {
+        return None;
+    }
+    Some(HostedDmaAdapterMetadata {
+        adapter_id,
+        grant_va,
+        grant_len,
+        grant_logical,
+    })
+}
+
 unsafe fn dma_adapter_blob_matches(adapter: u64, adapter_id: u64) -> bool {
     if adapter_id == 0 {
         return false;
     }
-    dma_adapter_blob_id(adapter)
-        .map(|id| id == adapter_id)
+    dma_adapter_metadata(adapter)
+        .map(|metadata| metadata.adapter_id == adapter_id)
         .unwrap_or(false)
-        && read_unaligned((adapter + HOSTED_DMA_ADAPTER_OPS_OFFSET) as *const u64) != 0
 }
 
 /// `AllocateCommonBuffer` — allocate a bounded slice from the PnP-granted DMA common-buffer window.
@@ -7554,19 +7595,11 @@ extern "win64" fn s_dma_allocate_common_buffer(
     _cache_enabled: u8,
 ) -> u64 {
     unsafe {
-        let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
-        let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
-        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
-        let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
+            return 0;
+        };
         let requested = length as u64;
-        if adapter == 0
-            || !dma_adapter_blob_matches(adapter, adapter_id)
-            || grant_va == 0
-            || grant_len == 0
-            || grant_logical == 0
-            || requested == 0
-            || requested > grant_len
-        {
+        if requested == 0 || requested > metadata.grant_len {
             return 0;
         }
 
@@ -7581,11 +7614,16 @@ extern "win64" fn s_dma_allocate_common_buffer(
             let Some(end) = aligned.checked_add(requested) else {
                 return 0;
             };
-            if end > grant_len {
+            if end > metadata.grant_len {
                 return 0;
             }
             if let Some(next_offset) =
-                dma_allocation_range_overlaps(FSD_SHARED_VADDR, grant_logical, aligned, requested)
+                dma_allocation_range_overlaps(
+                    FSD_SHARED_VADDR,
+                    metadata.grant_logical,
+                    aligned,
+                    requested,
+                )
             {
                 offset = next_offset;
                 continue;
@@ -7594,8 +7632,8 @@ extern "win64" fn s_dma_allocate_common_buffer(
             break;
         }
 
-        let va = grant_va + offset;
-        let logical = grant_logical + offset;
+        let va = metadata.grant_va + offset;
+        let logical = metadata.grant_logical + offset;
         // Common-buffer allocation does not promise zeroed memory, and provider-domain NDIS must
         // not dereference a VA that belongs to the dependent miniport VSpace.
         write_volatile(
@@ -7702,20 +7740,13 @@ extern "win64" fn s_dma_free_common_buffer(
 }
 
 unsafe fn dma_active_adapter_and_grant(adapter: u64) -> Option<(u64, u64, u64)> {
-    let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
-    let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
-    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
-    let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
-    if adapter == 0
-        || !dma_adapter_blob_matches(adapter, adapter_id)
-        || grant_va == 0
-        || grant_len == 0
-        || grant_logical == 0
-    {
-        None
-    } else {
-        Some((grant_va, grant_len, grant_logical))
-    }
+    dma_adapter_metadata(adapter).map(|metadata| {
+        (
+            metadata.grant_va,
+            metadata.grant_len,
+            metadata.grant_logical,
+        )
+    })
 }
 
 unsafe fn dma_mdl_transfer_window(mdl: u64, current_va: u64, requested: u64) -> Option<(u64, u64)> {
@@ -7788,7 +7819,7 @@ extern "win64" fn s_dma_map_transfer(
     write_to_device: u8,
 ) -> i64 {
     unsafe {
-        let Some((grant_va, grant_len, grant_logical)) = dma_active_adapter_and_grant(adapter) else {
+        let Some(metadata) = dma_adapter_metadata(adapter) else {
             return 0;
         };
         if map_register_base == 0
@@ -7798,7 +7829,8 @@ extern "win64" fn s_dma_map_transfer(
             return 0;
         }
         let requested = read_unaligned(length) as u64;
-        let Some((source_va, mapped_len)) = dma_mdl_transfer_window(mdl, current_va, requested) else {
+        let Some((source_va, mapped_len)) = dma_mdl_transfer_window(mdl, current_va, requested)
+        else {
             write_unaligned(length, 0);
             return 0;
         };
@@ -7817,13 +7849,16 @@ extern "win64" fn s_dma_map_transfer(
                 write_unaligned(length, 0);
                 return 0;
             };
-            if end > grant_len {
+            if end > metadata.grant_len {
                 write_unaligned(length, 0);
                 return 0;
             }
-            if let Some(next_offset) =
-                dma_allocation_range_overlaps(FSD_SHARED_VADDR, grant_logical, aligned, mapped_len)
-            {
+            if let Some(next_offset) = dma_allocation_range_overlaps(
+                FSD_SHARED_VADDR,
+                metadata.grant_logical,
+                aligned,
+                mapped_len,
+            ) {
                 offset = next_offset;
                 continue;
             }
@@ -7831,8 +7866,8 @@ extern "win64" fn s_dma_map_transfer(
             break;
         }
 
-        let bounce_va = grant_va + offset;
-        let logical = grant_logical + offset;
+        let bounce_va = metadata.grant_va + offset;
+        let logical = metadata.grant_logical + offset;
         if write_to_device != 0 {
             dma_copy_bytes(bounce_va, source_va, mapped_len);
         } else {
@@ -18374,6 +18409,10 @@ unsafe fn prepare_provider_export_marshal(
         };
         index += 1;
     }
+    if policy.side_effect == HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization {
+        state.resource_projection_required = true;
+        state.dma_state_copyback = true;
+    }
     Ok(state)
 }
 
@@ -18464,6 +18503,7 @@ unsafe fn complete_provider_export_side_effects(
             }
             complete_hosted_provider_miniport_registration(provider_instance, args[0])
         }
+        HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization => Ok(()),
         HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration => Ok(()),
         HostedProviderExportSideEffect::NdisPacketFree => Ok(()),
     }

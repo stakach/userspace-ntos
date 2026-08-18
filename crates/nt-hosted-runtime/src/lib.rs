@@ -315,6 +315,7 @@ pub enum HostedProviderExportSideEffect {
     None,
     NdisInitializeWrapper,
     NdisMiniportRegistration,
+    NdisScatterGatherDmaInitialization,
     NdisMiniportInterruptDeregistration,
     NdisPacketFree,
 }
@@ -545,7 +546,10 @@ pub fn hosted_provider_export_marshal_policy(
         "NdisAllocateMemoryWithTag" => {
             export_policy(&[CallerOutPointerFromLength { length_arg: 1 }, Scalar, Scalar])
         }
-        "NdisMInitializeScatterGatherDma" => export_policy(&[ProviderHandle, Scalar, Scalar]),
+        "NdisMInitializeScatterGatherDma" => export_policy_with_side_effect(
+            &[ProviderHandle, Scalar, Scalar],
+            HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization,
+        ),
         "NdisInitializeWrapper" => export_policy_with_effect_and_result(
             &[
                 CallerOutHandle,
@@ -1274,6 +1278,12 @@ mod tests {
                 .unwrap()
                 .side_effect,
             HostedProviderExportSideEffect::NdisMiniportRegistration
+        );
+        assert_eq!(
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMInitializeScatterGatherDma")
+                .unwrap()
+                .side_effect,
+            HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization
         );
     }
 

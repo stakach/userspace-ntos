@@ -1438,7 +1438,12 @@ notification-package fallbacks.
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
   storage from the number of registry-selected candidates instead of truncating at an eight-entry
   inline array. Runtime PnP device-status overlays now use a growable cache rather than a 64-entry
-  table.
+  table. Provider-domain DMA adapters now retain the devnode-granted common-buffer window inside the
+  component-local `DMA_ADAPTER`, so `NdisMInitializeScatterGatherDma` can publish real SG-capable
+  NDIS state without later `NdisSend` calls depending on transient executive/shared projection
+  fields. The remaining B3 send work is below that boundary: ReactOS provider NDIS reaches the real
+  send path but still reports `STATUS_INSUFFICIENT_RESOURCES` before the E1000 miniport posts a TX
+  descriptor.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -8029,3 +8034,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     CSpace headroom (`slot-free=39051`).
     Review adjustment: B3 can continue at the real RX/TX traffic stimulus and packet-array receive
     projection path without carrying this shared-map capacity failure as an active blocker.
+  - `[~]` B3 provider-DMA adapter lifetime checkpoint (2026-08-18): the first repeated-NIC TX proof
+    regression came from treating the executive-owned hosted DMA manager as visible inside provider
+    `ndis.sys`. The provider shim now copies the selected devnode grant VA, length, and logical base
+    into the provider-local `DMA_ADAPTER` allocated by `IoGetDmaAdapter`, and
+    `NdisMInitializeScatterGatherDma` is marked as a resource-projection/copyback side effect so the
+    real ReactOS miniport block stores an SG-capable adapter object across later protocol sends.
+    Validation: `cargo fmt --all`, `cargo test -p nt-dma-manager`, `cargo test -p nt-hosted-runtime`,
+    executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and serialized
+    `NTOS_GENERATED_E1000_COUNT=2 QEMU_MEMORY=2G ./run.sh -netdev user,id=ntnet1 -device
+    e1000,netdev=ntnet1` in `.tmp/run-headless-b3-provider-dma-projection-records.log`. The proof
+    reaches Explorer shell chrome with `292/292`, starts both E1000 devices, keeps
+    `exec_generic_pci_provider_domain_serviced` green, and shows `NdisMInitializeScatterGatherDma`
+    returning success. Remaining B3 work is the true send data plane: `NdisSend` still reports
+    `0xc000009a` before any TX descriptor is posted (`dma_desc_common/map=256/0`,
+    `dma_dev_tx/rx=0/2`), so the next slice must diagnose and fix the generic packet/MDL SG
+    marshalling path rather than adding E1000-specific behavior.
