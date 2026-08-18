@@ -7911,10 +7911,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Ethernet receive indication helpers now have local provider-domain wiring and a serialized
     full-OS boot proof: `.tmp/run-headless-b3-receive-indications-20260818-123659.log` reaches
     Explorer shell chrome with `298/298`, keeps the generic PCI provider-domain/resource/DMA gates
-    green, and publishes the dependent miniport-block mirror during E1000 start. The remaining proof
-    is actual RX/TX packet traffic through that dynamic provider-domain route, plus packet-array
-    receive if a real miniport reaches the internal NDIS helper, and repeated-device scaling. Do not
-    reintroduce private provider images, protocol-specific fallbacks, or per-driver special cases.
+    green, and publishes the dependent miniport-block mirror during E1000 start. The follow-up
+    provider-domain proof removed the last inline work-item behavior from this path: hosted
+    `IoQueueWorkItem`/`ExQueueWorkItem` now enqueue per instance and the executive drains the FIFO
+    through the guarded hosted component trampoline at `PASSIVE_LEVEL` after provider callbacks,
+    provider exports, and ordinary hosted IRP dispatch. The drain reloads the current instance
+    transport before nested requests so hosted waits that rotate reply caps remain call-bound, and it
+    fails closed on work drops, runaway queues, callback walls, or worker bugchecks. The same patch
+    keeps provider callback KIRQL projected into dependent callbacks, preserves provider/dependent
+    MMIO mapping state across projections, initializes projected provider DPC queues without wiping
+    evidence, treats NDIS length/count stack slots as 32-bit typed values, and corrects
+    `NdisAllocateBuffer` so the ReactOS zero pool handle is a scalar rather than a provider handle.
+    Serialized proof `.tmp/run-headless-b3-workqueue-current-reply.log` reaches real Explorer shell
+    chrome with `298/298`, shows E1000 RX traffic (`dma_dev_tx/rx=0/1`) and real TCPIP
+    `BindAdapter`/`Receive`/`ReceiveComplete` callbacks completing, keeps
+    `exec_generic_pci_provider_domain_serviced` PASS with `exports=35/35`,
+    `export-rejections=0`, and has no `hosted-work`, unbound-reply, provider-callback-wall,
+    provider-export-reject, or provider-buffer-reject lines. The remaining proof is real TX packet
+    traffic through the same dynamic provider-domain route, packet-array receive if a real miniport
+    reaches the internal NDIS helper, and repeated-device scaling. Do not reintroduce private
+    provider images, protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute

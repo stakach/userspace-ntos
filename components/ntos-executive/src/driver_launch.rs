@@ -440,8 +440,24 @@ pub const SH_PROVIDER_EXPORT_MARSHAL_BASE: u64 =
 pub const SH_PROVIDER_EXPORT_MARSHAL_BYTES: u64 = 0x800;
 pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 =
     0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8 + SH_PROVIDER_EXPORT_MARSHAL_BYTES;
+pub const SH_WORK_QUEUE_BASE: u64 =
+    SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // in/out: queued Ex/Io work items
+pub const SH_WORK_QUEUE_HEAD: u64 = SH_WORK_QUEUE_BASE;
+pub const SH_WORK_QUEUE_TAIL: u64 = SH_WORK_QUEUE_HEAD + 0x08;
+pub const SH_WORK_QUEUE_DROPS: u64 = SH_WORK_QUEUE_TAIL + 0x08;
+pub const SH_WORK_QUEUE_DRAINED: u64 = SH_WORK_QUEUE_DROPS + 0x08;
+pub const SH_WORK_QUEUE_ENTRIES: u64 = SH_WORK_QUEUE_BASE + 0x20;
+pub const SH_WORK_QUEUE_ENTRY_SIZE: u64 = 0x28;
+pub const SH_WORK_QUEUE_ENTRY_KIND: u64 = 0x00;
+pub const SH_WORK_QUEUE_ENTRY_WORK_ITEM: u64 = 0x08;
+pub const SH_WORK_QUEUE_ENTRY_ROUTINE: u64 = 0x10;
+pub const SH_WORK_QUEUE_ENTRY_ARG0: u64 = 0x18;
+pub const SH_WORK_QUEUE_ENTRY_ARG1: u64 = 0x20;
+pub const SH_WORK_QUEUE_CAPACITY: u64 = 256;
+pub const SH_WORK_QUEUE_ARENA_BYTES: u64 =
+    0x20 + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE;
 pub const SH_DPC_QUEUE_BASE: u64 =
-    SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // out: queued KDPC pointers
+    SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
 pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
     ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
@@ -452,6 +468,8 @@ const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES <= SH_HANDOFF_ARENA_LIMIT);
 const _: () = assert!(SH_DPC_QUEUE_BASE > SH_SUPPORT_RECORDS);
+const _: () = assert!(SH_WORK_QUEUE_BASE >= SH_PROVIDER_EXPORT_MARSHAL_BASE);
+const _: () = assert!(SH_WORK_QUEUE_ENTRIES + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE <= SH_DPC_QUEUE_BASE);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
@@ -486,6 +504,8 @@ pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/t
 
 const PASSIVE_LEVEL: u8 = 0;
 const DISPATCH_LEVEL: u8 = 2;
+const HOSTED_WORK_QUEUE_KIND_EX: u64 = 1;
+const HOSTED_WORK_QUEUE_KIND_IO: u64 = 2;
 const NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64: u64 = 0x08;
 const NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64: u64 = 0x10;
 const NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64: u64 = 0x18;
@@ -699,6 +719,10 @@ static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
 static HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP: u64 = 16;
+static HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_CAP: u64 = 16;
+static HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_CAP: u64 = 16;
 
 #[inline]
 fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
@@ -6362,6 +6386,47 @@ extern "win64" fn s_io_allocate_work_item(device_object: u64) -> u64 {
     }
 }
 
+#[inline]
+unsafe fn hosted_work_queue_slot(shared_va: u64, index: u64) -> u64 {
+    shared_va + SH_WORK_QUEUE_ENTRIES + (index % SH_WORK_QUEUE_CAPACITY) * SH_WORK_QUEUE_ENTRY_SIZE
+}
+
+unsafe fn enqueue_hosted_work_item(
+    kind: u64,
+    work_item: u64,
+    routine: u64,
+    arg0: u64,
+    arg1: u64,
+) -> bool {
+    if routine == 0 {
+        return false;
+    }
+    let head = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_HEAD) as *const u64);
+    let tail = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_TAIL) as *const u64);
+    if tail.wrapping_sub(head) >= SH_WORK_QUEUE_CAPACITY {
+        let drops = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *const u64);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *mut u64,
+            drops.saturating_add(1),
+        );
+        return false;
+    }
+    let slot = hosted_work_queue_slot(FSD_SHARED_VADDR, tail);
+    write_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *mut u64, kind);
+    write_volatile(
+        (slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *mut u64,
+        work_item,
+    );
+    write_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *mut u64, routine);
+    write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *mut u64, arg0);
+    write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *mut u64, arg1);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_WORK_QUEUE_TAIL) as *mut u64,
+        tail.wrapping_add(1),
+    );
+    true
+}
+
 /// `VOID IoQueueWorkItem(PIO_WORKITEM, PIO_WORKITEM_ROUTINE, WORK_QUEUE_TYPE, PVOID)`.
 extern "win64" fn s_io_queue_work_item(
     work_item: u64,
@@ -6376,8 +6441,13 @@ extern "win64" fn s_io_queue_work_item(
         let device_object = read_unaligned((work_item + 0x20) as *const u64);
         write_unaligned((work_item + 0x28) as *mut u64, worker_routine);
         write_unaligned((work_item + 0x30) as *mut u64, context);
-        let f: extern "win64" fn(u64, u64) = core::mem::transmute(worker_routine as *const ());
-        f(device_object, context);
+        let _ = enqueue_hosted_work_item(
+            HOSTED_WORK_QUEUE_KIND_IO,
+            work_item,
+            worker_routine,
+            device_object,
+            context,
+        );
     }
 }
 
@@ -8778,8 +8848,13 @@ extern "win64" fn s_ex_queue_work_item(work_item: u64, _queue_type: u32) {
         let routine = read_unaligned((work_item + 0x10) as *const u64);
         let parameter = read_unaligned((work_item + 0x18) as *const u64);
         if routine != 0 {
-            let f: extern "win64" fn(u64) = core::mem::transmute(routine as *const ());
-            f(parameter);
+            let _ = enqueue_hosted_work_item(
+                HOSTED_WORK_QUEUE_KIND_EX,
+                work_item,
+                routine,
+                parameter,
+                0,
+            );
         }
     }
 }
@@ -9582,6 +9657,26 @@ unsafe fn clear_dpc_queue_projection(sh: u64) {
     write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
     write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, 0);
     write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_DPC_QUEUE_CAPACITY) as *mut u64,
+        SH_DPC_QUEUE_DERIVED_CAPACITY,
+    );
+    let mut slot = 0u64;
+    while slot < SH_DPC_QUEUE_DERIVED_CAPACITY {
+        write_volatile(
+            (sh + SH_DPC_QUEUE_BASE + slot * SH_DPC_QUEUE_ENTRY_SIZE) as *mut u64,
+            0,
+        );
+        slot += 1;
+    }
+}
+
+unsafe fn ensure_dpc_queue_projection(sh: u64) {
+    if dpc_queue_capacity(sh) != 0 {
+        return;
+    }
+    write_volatile((sh + SH_DPC_QUEUE_HEAD) as *mut u64, 0);
+    write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
     write_volatile(
         (sh + SH_DPC_QUEUE_CAPACITY) as *mut u64,
         SH_DPC_QUEUE_DERIVED_CAPACITY,
@@ -12689,6 +12784,10 @@ static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
+static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
+static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 96;
 const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
@@ -13236,6 +13335,30 @@ unsafe fn trace_hosted_provider_export(
         print_hex((result >> 32) as u32);
         print_hex(result as u32);
     }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_export_rejection(
+    provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
+    provider_domain_cookie: u64,
+    provider_export_rva: u64,
+    status: i32,
+    stage: &[u8],
+) {
+    let trace = HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_CAP {
+        return;
+    }
+    print_str(b"[provider-export-reject] provider=");
+    print_str(provider.as_bytes());
+    print_str(b" cookie=");
+    print_u64(provider_domain_cookie);
+    print_str(b" rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status as u32);
     print_str(b"\n");
 }
 
@@ -16081,8 +16204,9 @@ unsafe fn provider_marshal_input_buffer(
         return Ok(0);
     }
     let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+        provider_marshal_input_buffer_exec_va(dependent_index, dependent_inst, arg_value, bytes)
     else {
+        trace_provider_input_buffer_marshal_rejection(dependent_index, dependent_inst, arg_value, bytes);
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
@@ -16092,6 +16216,74 @@ unsafe fn provider_marshal_input_buffer(
     };
     copy_bytes(provider_exec_va, dependent_exec_va, bytes);
     Ok(provider_component_va)
+}
+
+unsafe fn trace_provider_input_buffer_marshal_rejection(
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) {
+    let trace = HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_CAP {
+        return;
+    }
+    print_str(b"[provider-buffer-reject] dependent-inst=");
+    print_u64(dependent_index as u64);
+    print_str(b" device-id=");
+    print_u64(dependent_inst.device_id);
+    print_str(b" va=");
+    print_hex64(component_va);
+    print_str(b" bytes=");
+    print_u64(bytes);
+    if dependent_inst.device_id != 0 {
+        if let Some(state) = hosted_device_resource_state_by_device_id(dependent_inst.device_id) {
+            print_str(b" state-inst=");
+            print_u64(state.instance as u64);
+            print_str(b" dma-va=");
+            print_hex64(state.evidence.dma_common_va);
+            print_str(b" dma-len=");
+            print_u64(state.evidence.dma_common_len);
+            print_str(b" dma-broker=");
+            print_hex64(state.dma_broker_va);
+        } else {
+            print_str(b" state=missing");
+        }
+    }
+    print_str(b"\n");
+}
+
+unsafe fn provider_marshal_input_buffer_exec_va(
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    component_to_exec_va_for_instance(dependent_index, dependent_inst, component_va, bytes)
+        .or_else(|| {
+            let device_id = dependent_inst.device_id;
+            if device_id == 0 {
+                return None;
+            }
+            let state = hosted_device_resource_state_by_device_id(device_id)?;
+            if state.instance != dependent_index {
+                return None;
+            }
+            hosted_dma_alias_for_component_va(state, component_va, bytes)
+        })
+}
+
+fn provider_marshal_u32_arg(
+    policy: HostedProviderExportMarshalPolicy,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    arg_index: usize,
+) -> Result<u64, i32> {
+    if arg_index >= policy.argument_count as usize {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // NDIS size/count parameters are UINT/ULONG. On Win64 stack slots the low
+    // 32 bits are the typed value and the high 32 bits are not contractual.
+    Ok(args[arg_index] & u32::MAX as u64)
 }
 
 unsafe fn provider_marshal_ansi_string(
@@ -16950,14 +17142,11 @@ unsafe fn prepare_provider_export_marshal(
             }
             HostedProviderArgumentMarshal::CallerInOwnedAllocation { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_owned_allocation(
                     &mut state,
                     dependent_index,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerOutStatus => {
@@ -17020,16 +17209,13 @@ unsafe fn prepare_provider_export_marshal(
             )?,
             HostedProviderArgumentMarshal::CallerInBuffer { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_input_buffer(
                     &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInArray {
@@ -17112,11 +17298,10 @@ unsafe fn prepare_provider_export_marshal(
             } => {
                 let virtual_address_index = virtual_address_arg as usize;
                 let length_index = length_arg as usize;
-                if virtual_address_index >= policy.argument_count as usize
-                    || length_index >= policy.argument_count as usize
-                {
+                if virtual_address_index >= policy.argument_count as usize {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
+                let length = provider_marshal_u32_arg(policy, args, length_index)?;
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
                 };
@@ -17129,7 +17314,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_shared,
                     arg,
                     args[virtual_address_index],
-                    args[length_index],
+                    length,
                 )?;
                 args[virtual_address_index] = state.ndis_buffer_out_provider_data_component_va;
                 provider_arg
@@ -17161,23 +17346,17 @@ unsafe fn prepare_provider_export_marshal(
             )?,
             HostedProviderArgumentMarshal::CallerOutBuffer { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_output_buffer(
                     &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInMiniportCharacteristics { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_miniport_characteristics(
                     &mut state,
                     provider_instance,
@@ -17185,14 +17364,11 @@ unsafe fn prepare_provider_export_marshal(
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInProtocolCharacteristics { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_protocol_characteristics(
                     &mut state,
                     provider_instance,
@@ -17200,7 +17376,7 @@ unsafe fn prepare_provider_export_marshal(
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInOutResourceList { length_pointer_arg } => {
@@ -17250,7 +17426,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_shared,
                     arg,
                     args[initial_port_index],
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerOutMmioMapping {
@@ -17271,21 +17447,18 @@ unsafe fn prepare_provider_export_marshal(
                     provider_shared,
                     arg,
                     args[physical_address_index],
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerOutDmaCommonBuffer { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_output_dma_common_buffer(
                     &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInDmaCommonBuffer {
@@ -17303,29 +17476,23 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_inst,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                     args[physical_address_index],
                 )?
             }
             HostedProviderArgumentMarshal::CallerOutPointerFromLength { length_arg } => {
                 let length_index = length_arg as usize;
-                if length_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 provider_marshal_output_pointer_from_length(
                     &mut state,
                     dependent_index,
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[length_index],
+                    provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
             }
             HostedProviderArgumentMarshal::CallerInPointerArray { count_arg } => {
                 let count_index = count_arg as usize;
-                if count_index >= policy.argument_count as usize {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
                 };
@@ -17337,7 +17504,7 @@ unsafe fn prepare_provider_export_marshal(
                     dependent_inst,
                     provider_shared,
                     arg,
-                    args[count_index],
+                    provider_marshal_u32_arg(policy, args, count_index)?,
                 )?
             }
             _ => return Err(STATUS_NOT_SUPPORTED),
@@ -17455,6 +17622,9 @@ const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 13] = [
     SH_RESOURCE_IO_PORT_LEN,
 ];
 
+const PROVIDER_MMIO_MAPPING_STATE_OFFSETS: [u64; 2] =
+    [SH_RESOURCE_MMIO_MAPPED_PHYS, SH_RESOURCE_MMIO_MAPPED_LEN];
+
 const PROVIDER_DMA_PROJECTION_OFFSETS: [u64; 11] = [
     SH_DMA_COMMON_VA,
     SH_DMA_COMMON_LEN,
@@ -17495,6 +17665,18 @@ unsafe fn copy_provider_dma_projection_fields(dst_shared: u64, src_shared: u64) 
     let mut index = 0usize;
     while index < PROVIDER_DMA_PROJECTION_OFFSETS.len() {
         let offset = PROVIDER_DMA_PROJECTION_OFFSETS[index];
+        write_volatile(
+            (dst_shared + offset) as *mut u64,
+            read_volatile((src_shared + offset) as *const u64),
+        );
+        index += 1;
+    }
+}
+
+unsafe fn copy_provider_mmio_mapping_state(dst_shared: u64, src_shared: u64) {
+    let mut index = 0usize;
+    while index < PROVIDER_MMIO_MAPPING_STATE_OFFSETS.len() {
+        let offset = PROVIDER_MMIO_MAPPING_STATE_OFFSETS[index];
         write_volatile(
             (dst_shared + offset) as *mut u64,
             read_volatile((src_shared + offset) as *const u64),
@@ -17588,8 +17770,7 @@ unsafe fn project_provider_resource_state(
         );
         index += 1;
     }
-    write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
-    write_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    copy_provider_mmio_mapping_state(provider_shared, dependent_shared);
     copy_provider_interrupt_state(provider_shared, dependent_shared);
     project_provider_dma_state(dependent_shared, provider_shared)?;
     Ok(())
@@ -17614,14 +17795,7 @@ unsafe fn complete_provider_resource_mapping(
         return;
     }
     if state.resource_mapping_copyback {
-        write_volatile(
-            (dependent_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
-            read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64),
-        );
-        write_volatile(
-            (dependent_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
-            read_volatile((provider_shared + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64),
-        );
+        copy_provider_mmio_mapping_state(dependent_shared, provider_shared);
     }
     if state.resource_state_copyback {
         copy_provider_interrupt_state(dependent_shared, provider_shared);
@@ -17926,16 +18100,39 @@ pub(crate) unsafe fn service_hosted_provider_export(
         &mut args,
     ) {
         Ok(state) => state,
-        Err(status) => return hosted_provider_export_failure(status),
+        Err(status) => {
+            trace_hosted_provider_export_rejection(
+                &singleton.provider,
+                provider_domain_cookie,
+                provider_export_rva,
+                status,
+                b"marshal",
+            );
+            return hosted_provider_export_failure(status);
+        }
     };
 
     if dependent_binding.is_some() {
         if let Err(status) =
             project_provider_resource_state(dependent_channel.shared_va, provider_shared)
         {
+            trace_hosted_provider_export_rejection(
+                &singleton.provider,
+                provider_domain_cookie,
+                provider_export_rva,
+                status,
+                b"resource",
+            );
             return hosted_provider_export_failure(status);
         }
     } else if marshal_state.resource_projection_required {
+        trace_hosted_provider_export_rejection(
+            &singleton.provider,
+            provider_domain_cookie,
+            provider_export_rva,
+            STATUS_INVALID_DEVICE_REQUEST,
+            b"resource-required",
+        );
         return hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST);
     }
     write_volatile(
@@ -18025,8 +18222,16 @@ pub(crate) unsafe fn service_hosted_provider_export(
             print_str(b"\n");
         }
         register_instance_ready(singleton.instance, false);
+        trace_hosted_provider_export_rejection(
+            &singleton.provider,
+            provider_domain_cookie,
+            provider_export_rva,
+            STATUS_UNSUCCESSFUL,
+            b"pump",
+        );
         return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
     }
+    let provider_inst = instance(singleton.instance).unwrap_or(provider_inst);
     let mut result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
     if let Err(status) = complete_provider_export_side_effects(
         policy,
@@ -18071,6 +18276,16 @@ pub(crate) unsafe fn service_hosted_provider_export(
         &args,
         result,
     );
+    if let Err(status) = drain_hosted_work_queue_for_instance(singleton.instance, provider_inst) {
+        trace_hosted_provider_export_rejection(
+            &singleton.provider,
+            provider_domain_cookie,
+            provider_export_rva,
+            status,
+            b"work-queue",
+        );
+        return hosted_provider_export_failure(status);
+    }
     complete_provider_resource_mapping(
         policy,
         &marshal_state,
@@ -18109,6 +18324,81 @@ pub(crate) unsafe fn service_hosted_provider_export(
     result
 }
 
+#[derive(Clone, Copy)]
+enum HostedComponentDispatchError {
+    Status(i32),
+    Wall(crate::spawn_hosts::PumpResult),
+}
+
+unsafe fn dispatch_hosted_component_target(
+    instance_index: usize,
+    inst: DriverInstance,
+    exec_code_va: u64,
+    target: u64,
+    args: [u64; 4],
+    stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+) -> Result<u64, HostedComponentDispatchError> {
+    let inst = instance(instance_index).unwrap_or(inst);
+    let shared = inst.exec_shared_va;
+    write_volatile(
+        (shared + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_PROVIDER_CALLBACK,
+    );
+    write_volatile((shared + SH_REQ_MINOR) as *mut u64, target);
+    write_volatile((shared + SH_REQ_FSCTL) as *mut u64, args[0]);
+    write_volatile((shared + SH_REQ_INLEN) as *mut u64, args[1]);
+    write_volatile((shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
+    write_volatile((shared + SH_REQ_FILEID) as *mut u64, args[3]);
+    let mut stack_index = 0usize;
+    while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
+        write_volatile(
+            (shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index as u64 * 8) as *mut u64,
+            stack_args[stack_index],
+        );
+        stack_index += 1;
+    }
+    write_volatile((shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64, 0);
+    write_volatile((shared + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((shared + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((shared + SH_ACTIVE_IRP) as *mut u64, 0);
+    write_volatile((shared + SH_ACTIVE_IOSL) as *mut u64, 0);
+    write_volatile((shared + SH_ACTIVE_DATA) as *mut u64, 0);
+    write_volatile((shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+    write_volatile((shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: inst.fault_ep,
+        pml4: inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va,
+        shared_va: shared,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: inst.tcb,
+        reply_cap: inst.reply_cap,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: read_volatile((shared + SH_RESOURCE_IO_PORT_CAP) as *const u64) != 0,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        register_instance_ready(instance_index, false);
+        return Err(HostedComponentDispatchError::Wall(pr));
+    }
+    let dispatch_status = read_volatile((shared + SH_REQ_STATUS) as *const i32);
+    if dispatch_status != STATUS_SUCCESS {
+        return Err(HostedComponentDispatchError::Status(dispatch_status));
+    }
+    Ok(read_volatile((shared + SH_REQ_INFO) as *const u64))
+}
+
 unsafe fn dispatch_dependent_provider_callback(
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
@@ -18126,73 +18416,177 @@ unsafe fn dispatch_dependent_provider_callback(
         restore_hosted_device_resource_state(binding, dependent_shared, false)
             .map_err(|status| status.raw())?;
     }
-    write_volatile(
-        (dependent_shared + SH_REQ_MAJOR) as *mut u64,
-        FSD_DISPATCH_PROVIDER_CALLBACK,
-    );
-    write_volatile((dependent_shared + SH_REQ_MINOR) as *mut u64, record.target);
-    write_volatile((dependent_shared + SH_REQ_FSCTL) as *mut u64, args[0]);
-    write_volatile((dependent_shared + SH_REQ_INLEN) as *mut u64, args[1]);
-    write_volatile((dependent_shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
-    write_volatile((dependent_shared + SH_REQ_FILEID) as *mut u64, args[3]);
-    let mut stack_index = 0usize;
-    while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
-        write_volatile(
-            (dependent_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index as u64 * 8)
-                as *mut u64,
-            stack_args[stack_index],
-        );
-        stack_index += 1;
-    }
-    write_volatile(
-        (dependent_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
-        0,
-    );
-    write_volatile((dependent_shared + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((dependent_shared + SH_REQ_INFO) as *mut u64, 0);
-    write_volatile((dependent_shared + SH_ACTIVE_IRP) as *mut u64, 0);
-    write_volatile((dependent_shared + SH_ACTIVE_IOSL) as *mut u64, 0);
-    write_volatile((dependent_shared + SH_ACTIVE_DATA) as *mut u64, 0);
-    write_volatile((dependent_shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
-    write_volatile((dependent_shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
-
-    let ch = crate::spawn_hosts::PumpChannel {
-        fault_ep: dependent_inst.fault_ep,
-        pml4: dependent_inst.pml4,
-        code_va: 0,
-        image_frames: 0,
+    match dispatch_hosted_component_target(
+        record.dependent_instance,
+        dependent_inst,
         exec_code_va,
-        shared_va: dependent_shared,
-        dispatch_label: FSD_DISPATCH_LABEL,
-        demand_cap: 256,
-        trace_faults: false,
-        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        tcb: dependent_inst.tcb,
-        reply_cap: dependent_inst.reply_cap,
-        client_pi: 0,
-        caps: crate::spawn_hosts::HostCaps {
-            dispatch_server: true,
-            kind: crate::spawn_hosts::ReqKind::Irp,
-            io_port_faults: read_volatile(
-                (dependent_shared + SH_RESOURCE_IO_PORT_CAP) as *const u64,
-            ) != 0,
-            ..crate::spawn_hosts::HostCaps::default()
-        },
+        record.target,
+        args,
+        stack_args,
+    ) {
+        Ok(result) => {
+            if let Some(binding) = dependent_binding {
+                refresh_hosted_device_resource_state(binding, dependent_shared);
+            }
+            Ok(result)
+        }
+        Err(HostedComponentDispatchError::Status(status)) => {
+            if let Some(binding) = dependent_binding {
+                refresh_hosted_device_resource_state(binding, dependent_shared);
+            }
+            Err(status)
+        }
+        Err(HostedComponentDispatchError::Wall(pr)) => {
+            trace_hosted_provider_callback_wall(record, dependent_inst, pr);
+            Err(STATUS_UNSUCCESSFUL)
+        }
+    }
+}
+
+unsafe fn trace_hosted_work_queue_wall(
+    instance_index: usize,
+    kind: u64,
+    work_item: u64,
+    routine: u64,
+    arg0: u64,
+    arg1: u64,
+    pr: crate::spawn_hosts::PumpResult,
+) {
+    let trace = HOSTED_WORK_QUEUE_WALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_WORK_QUEUE_WALL_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-work-wall] inst=");
+    print_u64(instance_index as u64);
+    print_str(b" kind=");
+    print_u64(kind);
+    print_str(b" work-item=");
+    print_hex64(work_item);
+    print_str(b" routine=");
+    print_hex64(routine);
+    print_str(b" args=");
+    print_hex64(arg0);
+    print_str(b",");
+    print_hex64(arg1);
+    print_str(b" status=0x");
+    print_hex(pr.status as u32);
+    print_str(b" wall-ip=");
+    print_hex64(pr.wall_ip);
+    print_str(b" wall-addr=");
+    print_hex64(pr.wall_addr);
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_work_queue_capacity(
+    instance_index: usize,
+    head: u64,
+    tail: u64,
+    drops: u64,
+    drained: u64,
+) {
+    let trace = HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-work-capacity] inst=");
+    print_u64(instance_index as u64);
+    print_str(b" head=");
+    print_u64(head);
+    print_str(b" tail=");
+    print_u64(tail);
+    print_str(b" drops=");
+    print_u64(drops);
+    print_str(b" drained=");
+    print_u64(drained);
+    print_str(b" cap=");
+    print_u64(SH_WORK_QUEUE_CAPACITY);
+    print_str(b"\n");
+}
+
+unsafe fn drain_hosted_work_queue_for_instance(
+    instance_index: usize,
+    inst: DriverInstance,
+) -> Result<u64, i32> {
+    let shared = inst.exec_shared_va;
+    let Some(exec_code_va) = ExecVaWindow::try_for_instance(instance_index).map(|win| win.code_va)
+    else {
+        return Err(STATUS_DEVICE_NOT_READY);
     };
-    let pr = crate::spawn_hosts::component_pump(&ch);
-    if !pr.completed {
-        trace_hosted_provider_callback_wall(record, dependent_inst, pr);
-        register_instance_ready(record.dependent_instance, false);
-        return Err(STATUS_UNSUCCESSFUL);
+    let saved_irql = read_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
+    let mut drained = 0u64;
+    let budget = SH_WORK_QUEUE_CAPACITY.saturating_mul(4);
+    while drained < budget {
+        let head = read_volatile((shared + SH_WORK_QUEUE_HEAD) as *const u64);
+        let tail = read_volatile((shared + SH_WORK_QUEUE_TAIL) as *const u64);
+        if head == tail {
+            break;
+        }
+        let slot = hosted_work_queue_slot(shared, head);
+        let kind = read_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *const u64);
+        let work_item = read_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *const u64);
+        let routine = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *const u64);
+        let arg0 = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *const u64);
+        let arg1 = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *const u64);
+        write_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *mut u64, 0);
+        write_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *mut u64, 0);
+        write_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *mut u64, 0);
+        write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *mut u64, 0);
+        write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *mut u64, 0);
+        write_volatile(
+            (shared + SH_WORK_QUEUE_HEAD) as *mut u64,
+            head.wrapping_add(1),
+        );
+        if routine == 0 {
+            continue;
+        }
+        let args = match kind {
+            HOSTED_WORK_QUEUE_KIND_EX => [arg0, 0, 0, 0],
+            HOSTED_WORK_QUEUE_KIND_IO => [arg0, arg1, 0, 0],
+            _ => continue,
+        };
+        write_volatile(
+            (shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+            PASSIVE_LEVEL,
+        );
+        match dispatch_hosted_component_target(
+            instance_index,
+            inst,
+            exec_code_va,
+            routine,
+            args,
+            [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+        ) {
+            Ok(_) => {
+                drained = drained.saturating_add(1);
+                let total = read_volatile((shared + SH_WORK_QUEUE_DRAINED) as *const u64);
+                write_volatile(
+                    (shared + SH_WORK_QUEUE_DRAINED) as *mut u64,
+                    total.saturating_add(1),
+                );
+            }
+            Err(HostedComponentDispatchError::Status(status)) => {
+                register_instance_ready(instance_index, false);
+                write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                return Err(status);
+            }
+            Err(HostedComponentDispatchError::Wall(pr)) => {
+                trace_hosted_work_queue_wall(instance_index, kind, work_item, routine, arg0, arg1, pr);
+                write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                return Err(STATUS_UNSUCCESSFUL);
+            }
+        }
     }
-    if let Some(binding) = dependent_binding {
-        refresh_hosted_device_resource_state(binding, dependent_shared);
+    let head = read_volatile((shared + SH_WORK_QUEUE_HEAD) as *const u64);
+    let tail = read_volatile((shared + SH_WORK_QUEUE_TAIL) as *const u64);
+    let drops = read_volatile((shared + SH_WORK_QUEUE_DROPS) as *const u64);
+    if drops != 0 || head != tail {
+        trace_hosted_work_queue_capacity(instance_index, head, tail, drops, drained);
+        register_instance_ready(instance_index, false);
+        write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let dispatch_status = read_volatile((dependent_shared + SH_REQ_STATUS) as *const i32);
-    if dispatch_status != STATUS_SUCCESS {
-        return Err(dispatch_status);
-    }
-    Ok(read_volatile((dependent_shared + SH_REQ_INFO) as *const u64))
+    write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+    Ok(drained)
 }
 
 unsafe fn provider_callback_marshal_window(
@@ -19101,236 +19495,270 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let callback_args = [arg0, arg1, arg2, arg3];
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
-    let preflight = if record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
-        && record.callback_offset != NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64
-    {
-        refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
-            provider_instance,
-            provider_inst,
-            record.dependent_instance,
-            dependent_inst,
-        )
-    } else {
-        Ok(())
-    };
+    let dependent_shared = dependent_inst.exec_shared_va;
+    let saved_dependent_irql =
+        read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
+    let callback_irql = read_volatile((provider_channel.shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
+    write_volatile(
+        (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+        callback_irql,
+    );
 
-    let result = if let Err(status) = preflight {
-        Err(status)
-    } else {
-        match record.callback_kind {
-        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
-            NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
+    let mut result = {
+        let preflight = if record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
+            && record.callback_offset != NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64
+        {
+            refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
                 provider_instance,
                 provider_inst,
-                record,
+                record.dependent_instance,
                 dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-                provider_stack,
-            ),
-            NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-                provider_stack,
-                false,
-                true,
-            ),
-            NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => service_ndis_query_set_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-                provider_stack,
-                true,
-                false,
-            ),
-            NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-            ),
-            NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-            ),
-            NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => service_ndis_reconfigure_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-            ),
-            NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
-            | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
-            | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
-            | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
-            | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => {
-                dispatch_dependent_provider_callback(
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    [arg0, 0, 0, 0],
-                    [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-                )
+            )
+        } else {
+            Ok(())
+        };
+
+        if let Err(status) = preflight {
+            Err(status)
+        } else {
+            match record.callback_kind {
+                HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
+                    NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                        arg3,
+                        provider_stack,
+                    ),
+                    NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => {
+                        service_ndis_query_set_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                            false,
+                            true,
+                        )
+                    }
+                    NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => {
+                        service_ndis_query_set_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                            true,
+                            false,
+                        )
+                    }
+                    NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                    ),
+                    NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                    ),
+                    NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_reconfigure_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                        )
+                    }
+                    NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
+                    | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
+                    | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
+                    | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
+                    | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => {
+                        dispatch_dependent_provider_callback(
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            [arg0, 0, 0, 0],
+                            [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+                        )
+                    }
+                    NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64 => service_ndis_send_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                    ),
+                    NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
+                        service_ndis_transfer_data_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                        )
+                    }
+                    _ => Err(STATUS_NOT_SUPPORTED),
+                },
+                HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => match record.callback_offset {
+                    NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_bind_adapter_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                        )
+                    }
+                    NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_pnp_event_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                        )
+                    }
+                    NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_send_complete_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                        )
+                    }
+                    NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_transfer_data_complete_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                        )
+                    }
+                    NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => service_ndis_protocol_receive_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                        arg3,
+                        provider_stack,
+                    ),
+                    NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_receive_complete_callback(
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                        )
+                    }
+                    NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => service_ndis_protocol_status_callback(
+                        provider_instance,
+                        provider_inst,
+                        record,
+                        dependent_inst,
+                        exec_code_va,
+                        arg0,
+                        arg1,
+                        arg2,
+                        arg3,
+                    ),
+                    NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_status_complete_callback(
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                        )
+                    }
+                    NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_receive_packet_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                        )
+                    }
+                    _ => Err(STATUS_NOT_SUPPORTED),
+                },
+                _ => Err(STATUS_NOT_SUPPORTED),
             }
-            NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64 => service_ndis_send_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-            ),
-            NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
-                service_ndis_transfer_data_callback(
-                    provider_instance,
-                    provider_inst,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                    arg2,
-                    arg3,
-                    provider_stack,
-                )
-            }
-            _ => Err(STATUS_NOT_SUPPORTED),
-        },
-        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => match record.callback_offset {
-            NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_bind_adapter_callback(
-                    provider_instance,
-                    provider_inst,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                    arg2,
-                    arg3,
-                    provider_stack,
-                )
-            }
-            NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => service_ndis_protocol_pnp_event_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-            ),
-            NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_send_complete_callback(
-                    provider_instance,
-                    provider_inst,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                    arg2,
-                )
-            }
-            NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_transfer_data_complete_callback(
-                    provider_instance,
-                    provider_inst,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                    arg2,
-                    arg3,
-                )
-            }
-            NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => service_ndis_protocol_receive_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-                provider_stack,
-            ),
-            NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_receive_complete_callback(
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                )
-            }
-            NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => service_ndis_protocol_status_callback(
-                provider_instance,
-                provider_inst,
-                record,
-                dependent_inst,
-                exec_code_va,
-                arg0,
-                arg1,
-                arg2,
-                arg3,
-            ),
-            NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_status_complete_callback(
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                )
-            }
-            NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
-                service_ndis_protocol_receive_packet_callback(
-                    provider_instance,
-                    provider_inst,
-                    record,
-                    dependent_inst,
-                    exec_code_va,
-                    arg0,
-                    arg1,
-                )
-            }
-            _ => Err(STATUS_NOT_SUPPORTED),
-        },
-        _ => Err(STATUS_NOT_SUPPORTED),
         }
     };
+    write_volatile(
+        (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+        saved_dependent_irql,
+    );
+    if result.is_ok() {
+        if let Some(dependent_inst) = instance(record.dependent_instance) {
+            if let Err(status) =
+                drain_hosted_work_queue_for_instance(record.dependent_instance, dependent_inst)
+            {
+                result = Err(status);
+            }
+        } else {
+            result = Err(STATUS_DEVICE_NOT_READY);
+        }
+    }
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
     match result {
@@ -25414,6 +25842,7 @@ unsafe fn project_provider_device_dispatch_state(
     }
     copy_hosted_io_port_cap_to_instance(provider_inst, state)?;
     write_hosted_resource_state_projection(provider_sh, state, false);
+    ensure_dpc_queue_projection(provider_sh);
     copy_provider_dma_allocation_records(provider_sh, dependent_sh);
     copy_provider_dispatch_side_effects(provider_sh, dependent_sh);
     clear_shared_device_interface_state_at(provider_sh);
@@ -25427,6 +25856,7 @@ unsafe fn import_provider_device_dispatch_state(
 ) {
     let state = read_hosted_device_resource_state_from_shared(binding, provider_sh);
     write_hosted_resource_state_projection(dependent_sh, state, false);
+    copy_provider_mmio_mapping_state(dependent_sh, provider_sh);
     copy_provider_dma_allocation_records(dependent_sh, provider_sh);
     copy_provider_dispatch_side_effects(dependent_sh, provider_sh);
 }
@@ -29806,16 +30236,25 @@ unsafe fn dispatch_irp_for_instance(
         }
         return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
     }
+    let d = instance(dispatch_index).unwrap_or(d);
+    let sh = d.exec_shared_va;
+    let arg = d.exec_arg_va;
     let st = pr.status;
-    if let Some(binding) = provider_binding {
-        import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
-    }
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
     // Copy the driver's projected output bytes back out.
     let outlen = (info as usize).min(out.len());
     for i in 0..outlen {
         out[i] = read_volatile((arg + i as u64) as *const u8);
+    }
+    if let Err(status) = drain_hosted_work_queue_for_instance(dispatch_index, d) {
+        if dispatch_index != inst {
+            register_instance_ready(inst, false);
+        }
+        return Some((status, 0));
+    }
+    if let Some(binding) = provider_binding {
+        import_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, sh);
     }
     Some((st, info))
 }

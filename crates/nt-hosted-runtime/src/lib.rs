@@ -726,7 +726,7 @@ pub fn hosted_provider_export_marshal_policy(
                 virtual_address_arg: 3,
                 length_arg: 4,
             },
-            ProviderHandle,
+            Scalar,
             Scalar,
             Scalar,
         ]),
@@ -1471,7 +1471,7 @@ mod tests {
                 length_arg: 4,
             }
         );
-        assert_eq!(alloc.args[2], HostedProviderArgumentMarshal::ProviderHandle);
+        assert_eq!(alloc.args[2], HostedProviderArgumentMarshal::Scalar);
         assert_eq!(alloc.args[3], HostedProviderArgumentMarshal::Scalar);
         assert_eq!(alloc.args[4], HostedProviderArgumentMarshal::Scalar);
     }
