@@ -60,12 +60,13 @@ non-background pixels. Validation for this slice: `cargo fmt --all`,
 components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, serialized
 `QEMU_MEMORY=2G ./run.sh --desktop`, and `git diff --check`. Review adjustment: descriptor
 discovery, provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure, and
-registry-derived receive stimulus are closed. The packet-array receive infrastructure now has local
-generic wiring through provider-internal NDIS miniport-block handlers, but still needs a live-driver
-proof because the current ReactOS E1000 path uses classic Ethernet lookahead receive. The remaining
-B3 packet frontier is true TX traffic from the real stack, live proof of packet-array receive with a
-miniport that reaches `MiniIndicateReceivePacket`, and repeated-device scaling under the same
-dynamic devnode/resource path.
+registry-derived receive stimulus are closed. The packet-array receive infrastructure now has
+generic wiring through provider-internal NDIS miniport-block handlers and a clean serialized
+desktop regression proof. It still needs a live-driver proof because the current ReactOS E1000 path
+uses classic Ethernet lookahead receive. The remaining B3 packet frontier is true TX traffic from
+the real stack, live proof of packet-array receive with a miniport that reaches
+`MiniIndicateReceivePacket`, and repeated-device scaling under the same dynamic devnode/resource
+path.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -7956,11 +7957,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the same shadow projection path. Local validation: `cargo fmt --all`,
     `cargo test -p nt-hosted-runtime -- --nocapture`, and executive
     `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
-    x86_64-unknown-none`. Remaining proof is a serialized desktop regression for this wiring, real
-    TX packet traffic from the TCPIP stack through the same dynamic provider-domain route, live
-    packet-array receive with a miniport that reaches the internal NDIS helper, and repeated-device
-    scaling. Do not reintroduce private provider images, protocol-specific fallbacks, or per-driver
-    special cases.
+    x86_64-unknown-none`. Serialized desktop regression
+    `.tmp/run-desktop-b3-packet-array-20260818-1629.log` keeps the provider-domain PCI/DMA gates
+    green, reaches real userinit and Explorer, paints genuine Explorer shell chrome, and exits with
+    `298/298` checks passing; the proof has no provider export/buffer rejects or hosted work/callback
+    walls. Remaining proof is real TX packet traffic from the TCPIP stack through the same dynamic
+    provider-domain route, live packet-array receive with a miniport that reaches the internal NDIS
+    helper, and repeated-device scaling. Do not reintroduce private provider images,
+    protocol-specific fallbacks, or per-driver special cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
