@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 ## Objective
 
@@ -123,6 +123,38 @@ Serialized proof `.tmp/run-headless-w32-prefix-maps-20260818.log` reaches Explor
 `298/298`, passes the generic PCI provider-domain/resource/DMA gates, shows no CNode exhaustion, and
 keeps final/gate pool counters green: `w32-bank=34636/47569/12/12`, `w32-bank-fails=0`, plus successful
 late GUI-helper releases for `pi=15`, `pi=17`, `pi=14`, and `pi=13`.
+
+Microkernel cap-state correctness slice (2026-08-18): the desktop regression review found real
+microkernel debt behind the enlarged extern rootserver CSpace. Frame, paging-structure, IO-frame, and
+IOPT map/unmap paths no longer repair cap state by scanning every CNode slot for a matching physical
+address; they update the invoked cap slot and fail closed if that slot cannot be resolved. ASID-to-PML4
+ownership now mirrors seL4's ASID-pool model with indexed kernel state maintained by CTE writes,
+instead of walking every CNode to find a `Cap::PML4` by ASID during frame unmap/delete. Rootserver ASID
+1 is explicitly re-registered after spec-state reset. Validation is green: `cargo fmt --manifest-path
+rust-micro/Cargo.toml`, `./scripts/build_kernel.sh`, `./scripts/run_specs.sh` through
+`All specs passed!`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+--target x86_64-unknown-none`, plus the new ASID assignment/delete regression in the microkernel
+invocation specs. Review adjustment: retry the serialized desktop boot from this microkernel baseline;
+if it still stalls near CSRSS/session image dependency loading, diagnose the next real scheduler,
+cap-delete/revoke, or user-mode loader gap instead of restoring CSpace scans or synthetic launch
+fallbacks.
+
+Microkernel active-user ownership slice (2026-08-19): trap/syscall attribution is now split from
+scheduler policy state. Return-to-user paths publish the TCB whose user context is being entered,
+while user-origin syscall, exception, IRQ, IPI, timer, notification, and remote-stall paths consult
+that active user before falling back to `current`. `SysDebugPutChar` remains observation-only:
+stale blocked bookkeeping is repaired for the thread that actually trapped instead of letting serial
+diagnostics redirect scheduling. The live hardware identity matcher now ignores `cur_domain`; the
+domain is scheduling policy, not proof of which user context reached the kernel, and a domain slice
+can expire before a user thread traps. Validation is green for `cargo fmt --manifest-path
+rust-micro/Cargo.toml`, `./scripts/build_kernel.sh extern-rootserver`, and serialized
+`./scripts/run_specs.sh` through `All specs passed!`; `.tmp/micro-specs-active-user-final-20260819.log`
+also moves past the earlier `network-snapshot-begin` stall, through E1000/bochsmp startup, setup
+network provisioning, SAMR pipe publication, LSASS thread-pool worker creation, and live LSASS/SCM
+pipe/IOCP traffic. Review adjustment: keep the microkernel baseline as healthy for the current boot
+path. The active blocker is back in NT services: `services.exe` quiesces before signalling the SCM
+start event, the original LSASS main thread has self-terminated after SAMR setup, no userinit/explorer
+exists yet, and the top services thread is parked around `user32+0x45ac0`.
 
 Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
@@ -7732,7 +7764,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     large binary blob. Keep this as a packaging/ownership cleanup item; it should not block the
     current desktop repair unless the BOOTBOOT limit reappears. The 2026-08-17 desktop proof with the
     restored shell path still showed `text @... 15855616 bytes`, so the boot image is below the hard
-    limit but too close to keep treating monolithic growth as acceptable.
+    limit but too close to keep treating monolithic growth as acceptable. Review adjustment
+    (2026-08-18): do not mask this by merely raising loader limits; split ownership remains the right
+    long-term shape once desktop correctness is stable again. Review adjustment (2026-08-19): the
+    active-user microkernel smoke build reports `text @... 15941632 bytes`, BOOTBOOT initrd
+    `8460800 bytes`, and staged Rust ntdll `1797120 bytes`, so the image is still below the 16 MiB
+    kernel wall but has little headroom. The preferred split remains BOOTBOOT loading only the
+    rust-micro seL4/rootserver image, with NT personalities/services/drivers carried as manifest
+    entries in initrd/folder storage.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
@@ -8051,3 +8090,144 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `0xc000009a` before any TX descriptor is posted (`dma_desc_common/map=256/0`,
     `dma_dev_tx/rx=0/2`), so the next slice must diagnose and fix the generic packet/MDL SG
     marshalling path rather than adding E1000-specific behavior.
+  - `[~]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
+    `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
+    and reached natural desktop background paint, but it regressed before LSASS created
+    `\LsaAuthenticationPort` (`234/292`, no userinit/explorer). The rejected proof showed the new
+    component-bank code reclaiming some caps while the driver lifecycle unload path still left other
+    mapped caps and provider records outside the teardown model. The follow-up slice makes the generic
+    component spawner bank paging objects, mapped image/region aliases, and IPC-buffer caps; records
+    source frame runs in `DriverInstance`; revokes hosted MMIO/DMA projection map caps per instance;
+    and clears provider singleton records when their backing component unloads. Review adjustment:
+    rerun the serialized two-NIC desktop proof before continuing the NDIS TX path. If LSASS readiness
+    still stalls, treat it as a live ntdll/runtime scheduling bug with the current readiness RIPs,
+    not as an accepted B3 cleanup success.
+    Timer ownership follow-up (2026-08-18): `.tmp/run-headless-b3-delay-arm-guard.log` proved the
+    component lifecycle cleanup and win32k loader capacity work now reach both E1000 StartDevice
+    paths, bochsmp video startup, dynamic `dxg.sys`, LSASS SRM setup, and natural winlogon desktop
+    background paint. It also exposed a real shared-timer ownership bug after LSASS listener startup:
+    the hardware comparator guard kept a short/late one-shot from being lost, but the service-loop
+    interrupt path could rearm an already-overdue deadman deadline instead of consuming it, and
+    shutdown still had a partial list of timed owners. The timer selector is now shared by rearm and
+    shutdown, nested watchdog rearm uses the same guarded comparator rule, and
+    `delay_timer_interrupt` drains service-side overdue watchdog work before choosing the next
+    comparator. Local validation: `cargo fmt --all`, `cargo test -p nt-delay-execution`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun the serialized two-NIC
+    desktop proof; an accepted result must reach genuine userinit/Explorer shell chrome without
+    provider-domain rejects, cap-bank failures, or timer/deadman storms.
+    Rejected follow-up proof `.tmp/run-headless-b3-timer-owner-20260818.log` got past both
+    generated E1000 StartDevice/interrupt paths and the root-bus DMA PnP StartDevice path with real
+    provider-domain RX/send-complete callbacks, but it then stopped making progress after loading
+    `bochsmp.sys` and before publishing DriverEntry evidence. The trace cap had been exhausted by
+    earlier driver loads, so the exact bochsmp stage was blind. A cleanup attempt then let contiguous
+    slot runs reuse arbitrary tracked recycled spans. That approach is now rejected:
+    `.tmp/run-headless-b3-recycled-runs-20260818.log` regressed earlier, wedging in the
+    DmaPnpPowerTest StartDevice path after the WDM forward-completion callback and before
+    `IoConnectInterrupt`. Contiguous run reuse needs an explicit owned-run bank or a stronger proof
+    that every descendant mapping/reference has been detached; generic scans of clear root live bits
+    are not enough. The allocator is back to bump-only contiguous runs, while single-slot recycling
+    remains in place. Review adjustment: rerun the serialized two-NIC desktop proof with the wider
+    generic driver-load trace cap and diagnose the first real post-timer blocker before returning to
+    NDIS TX.
+    Microkernel cap-state checkpoint (2026-08-18): `rust-micro` no longer carries broad CSpace scan
+    repairs for invoked Frame/PT/PD/PDPT/IOPT state updates, and ASID lookup is now an indexed
+    ASID-pool table maintained by PML4 CTE writes. Serialized validation
+    `./scripts/build_kernel.sh && ./scripts/run_specs.sh` completed all spec gates, including stale
+    reply handoff / bound-notification wake tests, the new page-table alias regression, the new ASID
+    table assignment/delete regression, and extern rootserver boot. The post-spec MCS demo was
+    manually interrupted after the success marker because it is an intentional repeating output loop.
+    Review adjustment: retry desktop from this stricter microkernel baseline and continue diagnosing
+    real stalls without reintroducing alias scans or fallback success paths.
+    Trace hygiene follow-up (2026-08-18): the LSASS/winlogon phase-specific native syscall return
+    probe, SEC_IMAGE spawn breadcrumbs, early service-init breadcrumbs, SMSS spawn breadcrumbs, and
+    temporary LAPIC/bochsmp TCB probes are removed. The runtime now keeps the useful evidence generic:
+    provider-domain, DMA scatter/gather, resource-grant, registry/profile, and compact periodic
+    census heartbeat traces remain bounded so multi-NIC/provider failures are still diagnosable
+    without flooding the serial path. Local validation: `cargo fmt --all`,
+    `cargo test -p nt-delay-execution`, `cargo test --manifest-path crates/nt-hive-core/Cargo.toml`,
+    `cargo test -p nt-hosted-runtime`, `cargo test -p nt-dma-manager`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, rust-micro `cargo fmt --manifest-path Cargo.toml &&
+    ./scripts/build_kernel.sh && ./scripts/run_specs.sh`, and `git diff --check`.
+    Microkernel behavior check: temporary live probes showed the LAPIC periodic tick fires and the
+    bochsmp component TCB is runnable, queued, schedulable, and reaches `DriverEntry`; the current
+    desktop blocker is therefore above the microkernel timer/scheduler layer unless a later proof
+    exposes new kernel evidence. Review adjustment: rerun the serialized desktop proof from this
+    cleaned baseline. An accepted result must reach genuine userinit/Explorer shell chrome without
+    provider-domain rejects, cap-bank failures, or timer/deadman storms before returning to the
+    remaining B3 TX data-plane work.
+    Delay wake/syscall ABI follow-up (2026-08-18): desktop proof
+    `.tmp/run-desktop-b3-clean-micro-20260819-072657.log` reached the stricter microkernel baseline,
+    dynamic LSASS listener setup, winlogon post-LSA registry reads, `msgina.dll` loading, and real
+    LSARPC named-pipe traffic, then stopped immediately after the second short LSASS worker
+    `NtDelayExecution` wake while the trace line was still printing the overdue-drain queue state.
+    The fix removes behavior-changing delay diagnostics from the post-reply timer path: wake evidence
+    is emitted before replying to the bound thread, overdue-drain accounting remains counter-based,
+    and `delay_timer_drain_overdue_without_badge` now rearms/acks without serial output after a wake.
+    The same slice hardens the seL4 userspace ABI boundary: ordinary `sel4-rt` stubs and direct
+    executive `SYS_CALL` wrappers explicitly clear the MCS reply register (`r12`) and direct-handoff
+    marker (`r13`), while the real reply-cap paths (`recv_full_r12`, `client_reply_recv_badge`, and
+    component pump reply calls) remain explicit opt-ins. Local validation: `cargo fmt --all`,
+    `cargo test -p nt-delay-execution`, `cargo test --manifest-path crates/nt-hive-core/Cargo.toml`,
+    `cargo test -p nt-hosted-runtime`, `cargo test -p nt-dma-manager`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, rust-micro `cargo fmt --manifest-path Cargo.toml &&
+    ./scripts/build_kernel.sh && ./scripts/run_specs.sh` through `All specs passed!`, and
+    `git diff --check`. Review adjustment: retry the serialized desktop proof; expected progress is
+    beyond LSASS worker-delay wake and into userinit/Explorer without weakening the microkernel
+    direct-handoff checks.
+    Microkernel DebugService / SCM frontier follow-up (2026-08-19): `rust-micro` now treats
+    user-mode `int 0x2d; int3` DebugService traps as observation-only x86 DebugService events. The
+    #GP handler recognizes selector error `0x16a`, services the ReactOS debug print/prompt cases,
+    advances RIP over the three-byte trap bundle, and resumes the same runnable user thread through
+    the iretq path instead of turning the diagnostic trap into a scheduling boundary. The ntdll
+    loader no longer emits the stale temporary loader `DbgPrint` probes that were only useful for
+    the previous frontier. Local validation: `cargo fmt --all`, `cargo test -p nt-ntdll
+    -- --nocapture`, `./scripts/build_ntdll_dll.sh`, rust-micro `cargo fmt --manifest-path
+    Cargo.toml`, `./scripts/build_kernel.sh`, and `./scripts/run_specs.sh` through `All specs
+    passed!`; the microkernel specs now include a regression for the DebugService trap skip. Serialized
+    proof `.tmp/run-headless-int2d-direct-20260819-114057.log` reaches natural win32k desktop
+    background paint and the runner success sentinel, so the old `ntdll+0x33221` loader trap strand is
+    closed.
+
+    The same proof still gates red (`243/292`) because winlogon parks correctly on the real
+    `\BaseNamedObjects\SvcctrlStartEvent_A3752DX` dispatcher object while `services.exe` has created
+    the SCM start/autostart events but has not signalled the start event. The services census is
+    dominated by real registry syscalls (`NtEnumerateValueKey`, `NtSetValueKey`, `NtEnumerateKey`,
+    `NtOpenKey`, `NtCreateKey`), consistent with ReactOS SCM still being in
+    `ScmCreateLastKnownGoodControlSet` / `ScmCreateServiceDatabase` before
+    `ScmGetBootAndSystemDriverState`, `RegisterServicesProcess`, and `ScmStartRpcServer`. Review
+    adjustment: keep the microkernel baseline as healthy for this path; add bounded services.exe
+    quiesce evidence, then fix the first concrete SCM registry/control-set/service-database semantic
+    gap without adding shortcuts or synthetic event signalling.
+    Stable HPET monotonic epoch follow-up (2026-08-19): services quiesce evidence from
+    `.tmp/run-headless-services-quiesce-20260819.log` showed the current live stall inside
+    `services.exe` returning from real `NtEnumerateKey`, with early IO-completion waits timing out
+    against deadlines that were computed before the HPET clock became the production monotonic
+    source. The fix keeps `monotonic_time_100ns()` on the pre-HPET fallback until the HPET main
+    counter is explicitly enabled, records a signed epoch offset at that handoff, and converts
+    monotonic wait deadlines back into raw HPET-counter time only at comparator arm sites. This keeps
+    the kernel timer mechanism generic across SCM, IOCP, dispatcher, keyed, pipe-name, user-timer,
+    driver-wait, and watchdog callers. Local validation so far: `cargo fmt --all`,
+    `cargo test -p nt-delay-execution -- --nocapture`, executive `cargo check --manifest-path
+    components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+    Review adjustment: run the serialized desktop proof next and inspect whether services advances
+    past registry enumeration into `NtQueryDirectoryObject`, `RegisterServicesProcess`, RPC start,
+    and the real SCM start-event signal.
+    Active-user ownership follow-up (2026-08-19): the microkernel now tracks the last user TCB entered
+    on each CPU separately from scheduler `current`, and all user-origin trap/IRQ/syscall attribution
+    paths consult that active owner before policy state. The live CPU identity matcher no longer
+    includes `cur_domain`, because a domain tick can clear or rotate the scheduler domain before the
+    running user context traps. `SysDebugPutChar` repairs stale blocked state only for the thread that
+    actually reached the kernel and otherwise remains transparent. Validation: rust-micro
+    `cargo fmt --manifest-path Cargo.toml`, `./scripts/build_kernel.sh extern-rootserver`, and
+    serialized `./scripts/run_specs.sh` in `.tmp/micro-specs-active-user-final-20260819.log` through
+    `All specs passed!`, E1000/bochsmp startup, dynamic setup provisioning, SAMR pipe publication,
+    LSASS thread-pool worker creation, and live LSASS/SCM named-pipe/IOCP traffic. The earlier
+    `network-snapshot-begin` hang is closed; the current blocker is services-side readiness before
+    user shell launch, with `services.exe` quiescing at `user32+0x45ac0`, `lsa-active=1`, and
+    `userinit=0 explorer=0` after the original LSASS main thread self-terminated. Review adjustment:
+    next code work should inspect the SCM control-set/service-database and user32 service-thread
+    transition around that RIP and stack, not weaken microkernel ownership or synthesize the SCM
+    start event.
