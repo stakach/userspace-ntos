@@ -763,6 +763,11 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
         "high-index func RVA via AoNO/AoF"
     );
     assert_eq!(
+        pe.export_rva_by_name("GetSystemTimeAsFileTime").unwrap(),
+        Some(gst.rva),
+        "direct lookup must match the full export table"
+    );
+    assert_eq!(
         gst.ordinal,
         5u16.wrapping_add(gst_ord as u16),
         "ordinal = base + AoNO index"
@@ -771,12 +776,16 @@ fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
     // Boundary names (first + last in the name array) resolve correctly.
     let first = find("AFirst").expect("first export"); // name index 0 -> ordinal N-1
     assert_eq!(first.rva, 0x1000 + (N - 1) * 0x10);
+    assert_eq!(pe.export_rva_by_name("AFirst").unwrap(), Some(first.rva));
     let last = find("ZLast").expect("last export"); // name index N-1 -> ordinal 0
     assert_eq!(last.rva, 0x1000);
+    assert_eq!(pe.export_rva_by_name("ZLast").unwrap(), Some(last.rva));
+    assert_eq!(pe.export_rva_by_name("MissingExport").unwrap(), None);
 
     // The forwarder export is present; its RVA is inside the export-dir range (a forwarder string),
     // NOT a concrete .text RVA — the on-target resolver follows it, but the parser reports the RVA.
     let fwd = find("FwdExport").expect("forwarder export");
+    assert_eq!(pe.export_rva_by_name("FwdExport").unwrap(), Some(fwd.rva));
     assert!(
         fwd.rva >= EDATA_VA && fwd.rva < EDATA_VA + edata_size,
         "forwarder RVA {:#x} must fall inside the export dir range [{:#x},{:#x})",

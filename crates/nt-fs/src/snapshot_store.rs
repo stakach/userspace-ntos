@@ -27,6 +27,21 @@ pub trait SnapshotBlockDevice {
     fn sector_count(&self) -> u64;
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError>;
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError>;
+
+    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        let sector_size = self.sector_size();
+        if sector_size == 0 || data.len() % sector_size != 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        let mut next_lba = lba;
+        for sector in data.chunks_exact(sector_size) {
+            self.write_sector(next_lba, sector)?;
+            next_lba = next_lba
+                .checked_add(1)
+                .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        }
+        Ok(())
+    }
 }
 
 /// Byte sink used by streaming snapshot encoders.
@@ -530,6 +545,19 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadSink for PayloadSectorWriter<'_, D> 
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         while !bytes.is_empty() {
+            if self.sector_offset == 0 && bytes.len() >= self.sector_size {
+                let full_len = bytes.len() - (bytes.len() % self.sector_size);
+                let sector_count = full_len / self.sector_size;
+                self.dev
+                    .write_sectors(self.slot_base + 1 + self.sector_index, &bytes[..full_len])?;
+                self.sector_index = self
+                    .sector_index
+                    .checked_add(sector_count as u64)
+                    .ok_or(SnapshotBlockStoreError::Corrupt)?;
+                self.written += full_len;
+                bytes = &bytes[full_len..];
+                continue;
+            }
             let copy = bytes.len().min(self.sector_size - self.sector_offset);
             self.sector[self.sector_offset..self.sector_offset + copy]
                 .copy_from_slice(&bytes[..copy]);

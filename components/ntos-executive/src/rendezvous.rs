@@ -23,8 +23,12 @@ unsafe fn rendezvous_recv_full_r12(
                 crate::delay_timer_nested_ack();
             }
             if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
+                if crate::watchdog_defer_if_hosted_work_can_run(tag) {
+                    continue;
+                }
+                crate::watchdog_confirm_trip();
                 print_str(tag);
-                print_str(b" deadman tripped while driving real server worker -> unwind\n");
+                print_str(b" deadman confirmed while driving real server worker -> unwind\n");
                 return received;
             }
             let tick = RENDEZVOUS_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);

@@ -40,18 +40,66 @@ unsafe fn zero_scratch_page(va: u64) {
 }
 
 #[inline]
-unsafe fn spawn_paging_retype(slot: u64, object_type: u64) {
-    let _ = untyped_retype(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
+unsafe fn trace_spawn_phase(pi: u64, stage: &[u8]) {
+    print_str(b"[spawn-sec-image] pi=");
+    print_u64(pi);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b"\n");
 }
 
 #[inline]
-unsafe fn checked_spawn_paging_map(
-    slot: u64,
-    map_label: u64,
-    page: u64,
-    pml4: u64,
-    level: &[u8],
-) {
+unsafe fn spawn_paging_retype(slot: u64, object_type: u64, stage: &[u8]) {
+    let error = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
+    if error != 0 {
+        print_str(b"[spawn-paging] retype ");
+        print_str(stage);
+        print_str(b" failed slot=0x");
+        print_hex((slot >> 32) as u32);
+        print_hex(slot as u32);
+        print_str(b" type=");
+        print_u64(object_type);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn paging retype failed");
+    }
+}
+
+#[inline]
+unsafe fn checked_spawn_object_retype(slot: u64, object_type: u64, bits: u32, stage: &[u8]) {
+    let error = untyped_retype_r(CAP_INIT_UNTYPED, object_type, bits, 1, slot);
+    if error != 0 {
+        print_str(b"[spawn-object] retype ");
+        print_str(stage);
+        print_str(b" failed slot=0x");
+        print_hex((slot >> 32) as u32);
+        print_hex(slot as u32);
+        print_str(b" type=");
+        print_u64(object_type);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn object retype failed");
+    }
+}
+
+#[inline]
+unsafe fn checked_spawn_asid(pml4: u64) {
+    let error = vspace_assign_asid(pml4);
+    if error != 0 {
+        print_str(b"[spawn-asid] assign failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn asid assignment failed");
+    }
+}
+
+#[inline]
+unsafe fn checked_spawn_paging_map(slot: u64, map_label: u64, page: u64, pml4: u64, level: &[u8]) {
     let error = paging_struct_map_r(slot, map_label, page, pml4);
     if error != 0 {
         print_str(b"[spawn-paging] map ");
@@ -66,18 +114,178 @@ unsafe fn checked_spawn_paging_map(
     }
 }
 
-unsafe fn register_spawn_private_mapping(pi: u64, base: u64, size: u64, protect: u32) {
-    let _ = process_committed_mapping_register(
-        pi,
-        nt_address_space::VmCommittedRange::private(base, size, protect),
-    );
+#[inline]
+unsafe fn checked_spawn_copy_cap(src: u64, stage: &[u8]) -> u64 {
+    let (cap, error) = copy_cap_r(src);
+    if error != 0 || cap == 0 {
+        print_str(b"[spawn-cap] copy ");
+        print_str(stage);
+        print_str(b" failed src=0x");
+        print_hex((src >> 32) as u32);
+        print_hex(src as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn cap copy failed");
+    }
+    cap
 }
 
-unsafe fn register_spawn_mapped_mapping(pi: u64, base: u64, size: u64, protect: u32) {
-    let _ = process_committed_mapping_register(
+#[inline]
+unsafe fn checked_spawn_page_map(
+    frame: u64,
+    vaddr: u64,
+    rights: u64,
+    vspace: u64,
+    stage: &[u8],
+) -> u64 {
+    let error = page_map_r(frame, vaddr, rights, vspace);
+    if error != 0 {
+        print_str(b"[spawn-map] ");
+        print_str(stage);
+        print_str(b" failed frame=0x");
+        print_hex((frame >> 32) as u32);
+        print_hex(frame as u32);
+        print_str(b" va=0x");
+        print_hex((vaddr >> 32) as u32);
+        print_hex(vaddr as u32);
+        print_str(b" vspace=0x");
+        print_hex((vspace >> 32) as u32);
+        print_hex(vspace as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn page map failed");
+    }
+    error
+}
+
+#[inline]
+unsafe fn checked_spawn_cnode_mint(cnode: u64, dest: u64, src: u64, badge: u64, stage: &[u8]) {
+    let error = cnode_mint_r(cnode, dest, src, badge);
+    if error != 0 {
+        print_str(b"[spawn-cnode] mint ");
+        print_str(stage);
+        print_str(b" failed cnode=0x");
+        print_hex((cnode >> 32) as u32);
+        print_hex(cnode as u32);
+        print_str(b" dest=0x");
+        print_hex((dest >> 32) as u32);
+        print_hex(dest as u32);
+        print_str(b" src=0x");
+        print_hex((src >> 32) as u32);
+        print_hex(src as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn cnode mint failed");
+    }
+}
+
+#[inline]
+unsafe fn checked_spawn_cnode_copy(cnode: u64, dest: u64, src: u64, stage: &[u8]) {
+    let error = cnode_copy_at_r(cnode, dest, src);
+    if error != 0 {
+        print_str(b"[spawn-cnode] copy ");
+        print_str(stage);
+        print_str(b" failed cnode=0x");
+        print_hex((cnode >> 32) as u32);
+        print_hex(cnode as u32);
+        print_str(b" dest=0x");
+        print_hex((dest >> 32) as u32);
+        print_hex(dest as u32);
+        print_str(b" src=0x");
+        print_hex((src >> 32) as u32);
+        print_hex(src as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn cnode copy failed");
+    }
+}
+
+#[inline]
+unsafe fn checked_spawn_tcb_op(error: u64, tcb: u64, stage: &[u8]) {
+    if error != 0 {
+        print_str(b"[spawn-tcb] ");
+        print_str(stage);
+        print_str(b" failed tcb=0x");
+        print_hex((tcb >> 32) as u32);
+        print_hex(tcb as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        panic!("spawn tcb operation failed");
+    }
+}
+
+unsafe fn checked_spawn_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64, stage: &[u8]) {
+    if !csrss_frame_put_at(pi, page, fr, alias) {
+        print_str(b"[spawn-frame] register ");
+        print_str(stage);
+        print_str(b" failed pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" frame=0x");
+        print_hex((fr >> 32) as u32);
+        print_hex(fr as u32);
+        print_str(b"\n");
+        panic!("spawn frame registration failed");
+    }
+}
+
+unsafe fn checked_register_spawn_private_mapping(
+    pi: u64,
+    base: u64,
+    size: u64,
+    protect: u32,
+    stage: &[u8],
+) {
+    if !process_committed_mapping_register(
+        pi,
+        nt_address_space::VmCommittedRange::private(base, size, protect),
+    ) {
+        print_str(b"[spawn-vad] register-private ");
+        print_str(stage);
+        print_str(b" failed pi=");
+        print_u64(pi);
+        print_str(b" base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" size=0x");
+        print_hex((size >> 32) as u32);
+        print_hex(size as u32);
+        print_str(b"\n");
+        panic!("spawn private mapping registration failed");
+    }
+}
+
+unsafe fn checked_register_spawn_mapped_mapping(
+    pi: u64,
+    base: u64,
+    size: u64,
+    protect: u32,
+    stage: &[u8],
+) {
+    if !process_committed_mapping_register(
         pi,
         nt_address_space::VmCommittedRange::mapped(base, size, protect),
-    );
+    ) {
+        print_str(b"[spawn-vad] register-mapped ");
+        print_str(stage);
+        print_str(b" failed pi=");
+        print_u64(pi);
+        print_str(b" base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" size=0x");
+        print_hex((size >> 32) as u32);
+        print_hex(size as u32);
+        print_str(b"\n");
+        panic!("spawn mapped mapping registration failed");
+    }
 }
 
 pub(crate) unsafe fn image_page_protection(
@@ -504,10 +712,10 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
     RW_NX // gap between sections — a zero page
 }
 
-/// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables
-/// present, image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. Process zero
-/// is the bootstrapped SMSS and starts immediately. Child processes remain suspended until their
-/// creator resumes the typed initial-thread handle returned by `NtCreateThread`.
+/// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables present,
+/// image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. The caller decides
+/// whether the initial TCB starts immediately; child processes normally remain suspended until their
+/// creator resumes the typed initial-thread handle returned by `NtResumeThread`.
 unsafe fn reserve_sec_image_page_tables(pml4: u64, image_va: u64, extent: u64) -> u64 {
     let span = extent.max(0x1000);
     let start = image_va & !0x1f_ffff;
@@ -516,7 +724,7 @@ unsafe fn reserve_sec_image_page_tables(pml4: u64, image_va: u64, extent: u64) -
     let mut va = start;
     loop {
         let pt = alloc_slot();
-        spawn_paging_retype(pt, OBJ_X86_PAGE_TABLE);
+        spawn_paging_retype(pt, OBJ_X86_PAGE_TABLE, b"image-pt");
         checked_spawn_paging_map(pt, LBL_X86_PAGE_TABLE_MAP, va, pml4, b"pt");
         mapped += 1;
         if va == end {
@@ -543,24 +751,26 @@ pub(crate) unsafe fn spawn_sec_image(
     image_path: &[u8],
     cmd_line: &[u8],
     seed_gdi_shared_handle_table: bool,
+    start_immediately: bool,
     // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
     // ReactOS ntdll's is 0x8e70 (its build-fixed RVA); OUR Rust ntdll's is DIFFERENT + not stable
     // across builds (0x1050 in the current build) — so the caller DERIVES it from OUR DLL's export
-    // table (nt-pe-loader) and passes it here. 0 = use the real-ntdll default (0x8e70), keeping the
-    // pi>=1 / flag-OFF path byte-identical.
+    // table (nt-pe-loader) and passes it here.
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
+    trace_spawn_phase(pi, b"begin");
     let pml4 = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    spawn_paging_retype(pml4, OBJ_X86_PML4, b"secimage-pml4");
     // ★ Give the VSpace a real ASID BEFORE anything is mapped into it. Without one, seL4's
     // `Page::Unmap` cannot find this vspace (`pml4_paddr_for_asid(0)` == "none") and every unmap of
     // this process's pages silently leaves the leaf PTE live — which surfaces much later as a
     // `seL4_DeleteFirst` phantom out-of-memory on the next commit at that VA. See `vspace_assign_asid`.
-    let _ = vspace_assign_asid(pml4);
+    checked_spawn_asid(pml4);
     // A newly allocated hosted VSpace owns a fresh NT committed-view table. Hosted slots are reused by
     // early diagnostics and later live processes, so stale ranges must be cleared at the address-space
     // creation boundary before spawn registers image and environment views.
     process_committed_mapping_reset(pi as usize);
+    trace_spawn_phase(pi, b"vspace");
     let main_image_size = image_extent(pe);
     let mut dropped_image_frames =
         csrss_frame_drop_process_range(pi, PE_LOAD_BASE, main_image_size);
@@ -579,9 +789,9 @@ pub(crate) unsafe fn spawn_sec_image(
         print_str(b"\n");
     }
     let pdpt = alloc_slot();
-    spawn_paging_retype(pdpt, OBJ_X86_PDPT);
+    spawn_paging_retype(pdpt, OBJ_X86_PDPT, b"image-pdpt");
     let pd = alloc_slot();
-    spawn_paging_retype(pd, OBJ_X86_PAGE_DIRECTORY);
+    spawn_paging_retype(pd, OBJ_X86_PAGE_DIRECTORY, b"image-pd");
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
     checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
@@ -589,12 +799,19 @@ pub(crate) unsafe fn spawn_sec_image(
     if pi == 6 {
         EXPLORER_IMAGE_PAGE_TABLES.store(image_pts, Ordering::Relaxed);
     }
-    if setup_env {
-        assert!(
-            register_image_committed_mappings(pi, pe, PE_LOAD_BASE),
-            "spawn image committed mapping table exhausted"
-        );
+    if !register_image_committed_mappings(pi, pe, PE_LOAD_BASE) {
+        print_str(b"[spawn-vad] image committed mapping failed pi=");
+        print_u64(pi);
+        print_str(b" base=0x");
+        print_hex((PE_LOAD_BASE >> 32) as u32);
+        print_hex(PE_LOAD_BASE as u32);
+        print_str(b" size=0x");
+        print_hex((main_image_size >> 32) as u32);
+        print_hex(main_image_size as u32);
+        print_str(b"\n");
+        panic!("spawn image committed mapping table exhausted");
     }
+    trace_spawn_phase(pi, b"image-vad");
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
     map_tp_worker_target_lane_pts(pml4);
@@ -605,15 +822,23 @@ pub(crate) unsafe fn spawn_sec_image(
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if let Some((ntdll_base, ntdll_pe)) = ntdll {
         let npt = alloc_slot();
-        spawn_paging_retype(npt, OBJ_X86_PAGE_TABLE);
+        spawn_paging_retype(npt, OBJ_X86_PAGE_TABLE, b"ntdll-pt");
         checked_spawn_paging_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4, b"ntdll-pt");
-        if setup_env {
-            assert!(
-                register_image_committed_mappings(pi, ntdll_pe, ntdll_base),
-                "hosted ntdll committed mapping table exhausted"
-            );
+        if !register_image_committed_mappings(pi, ntdll_pe, ntdll_base) {
+            let ntdll_size = image_extent(ntdll_pe);
+            print_str(b"[spawn-vad] ntdll committed mapping failed pi=");
+            print_u64(pi);
+            print_str(b" base=0x");
+            print_hex((ntdll_base >> 32) as u32);
+            print_hex(ntdll_base as u32);
+            print_str(b" size=0x");
+            print_hex((ntdll_size >> 32) as u32);
+            print_hex(ntdll_size as u32);
+            print_str(b"\n");
+            panic!("hosted ntdll committed mapping table exhausted");
         }
     }
+    trace_spawn_phase(pi, b"ntdll-vad");
     if setup_env {
         assert!(ensure_executive_paging(stack_mirror));
         assert!(ensure_executive_paging(scr_base));
@@ -623,17 +848,21 @@ pub(crate) unsafe fn spawn_sec_image(
             assert!(ensure_executive_paging(image_mirror));
         }
     }
+    trace_spawn_phase(pi, b"exec-mirrors");
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
-        let _ = page_map(copy_cap(f), STACK_BASE + i * 0x1000, RW_NX, pml4);
+        let stack_cap = checked_spawn_copy_cap(f, b"stack-target");
+        let _ = checked_spawn_page_map(stack_cap, STACK_BASE + i * 0x1000, RW_NX, pml4, b"stack");
         // Mirror the stack into the executive so it can read/write a syscall's stack-based
         // pointer args (copyin/copyout).
         if setup_env {
-            let _ = page_map(
-                copy_cap(f),
+            let mirror_cap = checked_spawn_copy_cap(f, b"stack-mirror");
+            let _ = checked_spawn_page_map(
+                mirror_cap,
                 stack_mirror + i * 0x1000,
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
+                b"stack-mirror",
             );
         }
         // Retain every process's initial stack frames for generic executive copyin/copyout. GUI
@@ -641,22 +870,30 @@ pub(crate) unsafe fn spawn_sec_image(
         // early transport diagnostic has `setup_env == false` and reuses pi 0 temporarily; do not
         // let its throwaway frames occupy the real smss keys.
         if setup_env {
-            csrss_frame_put(pi, STACK_BASE + i * 0x1000, f);
+            checked_spawn_frame_put_at(pi, STACK_BASE + i * 0x1000, f, 0, b"stack-frame");
         }
     }
     if setup_env {
-        register_spawn_private_mapping(
+        checked_register_spawn_private_mapping(
             pi,
             STACK_BASE,
             STACK_FRAMES * 0x1000,
             nt_address_space::PAGE_READWRITE,
+            b"stack",
         );
     }
     let ipcbuf = alloc_frame();
-    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let _ = checked_spawn_page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4, b"ipcbuf");
     if setup_env {
-        register_spawn_private_mapping(pi, IPCBUF_VADDR, 0x1000, nt_address_space::PAGE_READWRITE);
+        checked_register_spawn_private_mapping(
+            pi,
+            IPCBUF_VADDR,
+            0x1000,
+            nt_address_space::PAGE_READWRITE,
+            b"ipcbuf",
+        );
     }
+    trace_spawn_phase(pi, b"stack-ipc");
     // A Windows process environment so the image's startup runs: a TEB (GS anchor), a PEB whose
     // ProcessParameters (+0x20) points at a zeroed RTL_USER_PROCESS_PARAMETERS, and a trampoline
     // that loads RCX=PEB then jumps to the entry (the entry expects RCX = PEB). Each page is
@@ -678,7 +915,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let scr = scr_base;
         // TEB: self @0x30, PEB @0x60.
         let teb = alloc_frame();
-        let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE, b"teb-scratch");
         zero_scratch_page(scr);
         core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA); // NtTib.Self
         core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA); // ProcessEnvironmentBlock
@@ -708,15 +945,28 @@ pub(crate) unsafe fn spawn_sec_image(
         // Its own page is NOT registered as a client frame, so win32k can never be handed it.
         let acs_va = ACS_PAGE_VA; // private page, one past the two TEB pages
         core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
-        let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
-        csrss_frame_put(pi, SMSS_TEB_VA, teb);
+        let teb_client = checked_spawn_copy_cap(teb, b"teb-target");
+        let _ = checked_spawn_page_map(teb_client, SMSS_TEB_VA, RW_NX, pml4, b"teb-target");
+        checked_spawn_frame_put_at(pi, SMSS_TEB_VA, teb, 0, b"teb-head");
         // The x64 TEB is ~0x1818 bytes (TLS slots, ActiveFrame, FlsData …) — map a second page for
         // the TEB tail (StaticUnicodeString/Buffer), shared into the process like the first.
         let teb2 = alloc_frame();
-        let _ = page_map(teb2, scr + 0x5000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            teb2,
+            scr + 0x5000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"teb-tail-scratch",
+        );
         zero_scratch_page(scr + 0x5000);
         let acs_frame = alloc_frame();
-        let _ = page_map(acs_frame, scr + 0x8000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            acs_frame,
+            scr + 0x8000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"acs-scratch",
+        );
         zero_scratch_page(scr + 0x8000);
         let acs = scr + 0x8000; // ACS at offset 0 of its own page
         core::ptr::write_volatile((acs + 0x00) as *mut u64, 0); // ActiveFrame = NULL
@@ -725,8 +975,15 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x18) as *mut u32, 0); // Flags
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
-        let _ = page_map(copy_cap(acs_frame), acs_va, RW_NX, pml4);
-        register_spawn_private_mapping(pi, acs_va, 0x1000, nt_address_space::PAGE_READWRITE);
+        let acs_client = checked_spawn_copy_cap(acs_frame, b"acs-target");
+        let _ = checked_spawn_page_map(acs_client, acs_va, RW_NX, pml4, b"acs-target");
+        checked_register_spawn_private_mapping(
+            pi,
+            acs_va,
+            0x1000,
+            nt_address_space::PAGE_READWRITE,
+            b"acs",
+        );
         // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
         // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
         // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
@@ -748,17 +1005,31 @@ pub(crate) unsafe fn spawn_sec_image(
                                                                                              // DESKTOPINFO @ SMSS_DESKINFO_VA: pvDesktopBase@0x00, pvDesktopLimit@0x08, spwnd@0x10. A
                                                                                              // zeroed WND at +0x800 (same page, bracketed by base/limit so DesktopPtrToUser accepts it).
         let deskinfo = alloc_frame();
-        let _ = page_map(deskinfo, scr + 0x7000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            deskinfo,
+            scr + 0x7000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"deskinfo-scratch",
+        );
         zero_scratch_page(scr + 0x7000);
         core::ptr::write_volatile((scr + 0x7000 + 0x00) as *mut u64, SMSS_DESKINFO_VA); // pvDesktopBase
         core::ptr::write_volatile((scr + 0x7000 + 0x08) as *mut u64, SMSS_DESKINFO_VA + 0x1000); // pvDesktopLimit
         core::ptr::write_volatile((scr + 0x7000 + 0x10) as *mut u64, SMSS_DESKINFO_VA + 0x800); // spwnd -> zeroed WND
-        let _ = page_map(copy_cap(deskinfo), SMSS_DESKINFO_VA, RW_NX, pml4);
-        register_spawn_private_mapping(
+        let deskinfo_client = checked_spawn_copy_cap(deskinfo, b"deskinfo-target");
+        let _ = checked_spawn_page_map(
+            deskinfo_client,
+            SMSS_DESKINFO_VA,
+            RW_NX,
+            pml4,
+            b"deskinfo-target",
+        );
+        checked_register_spawn_private_mapping(
             pi,
             SMSS_DESKINFO_VA,
             0x1000,
             nt_address_space::PAGE_READWRITE,
+            b"deskinfo",
         );
         // TEB.Win32ThreadInfo (x64 TEB+0x78): user32 `GetThreadDesktopInfo()` first calls
         // `GetW32ThreadInfo()` (reads [TEB+0x78]) and returns NULL if it is NULL — SHORT-CIRCUITING
@@ -771,17 +1042,35 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
         crate::seed_teb_tail_canary(scr + 0x5000);
         crate::publish_process_teb_tail_alias(pi as usize, teb2);
-        let teb2_client_cap = copy_cap(teb2);
-        let _ = page_map(teb2_client_cap, SMSS_TEB_VA + 0x1000, RW_NX, pml4);
-        csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
-        register_spawn_private_mapping(pi, SMSS_TEB_VA, 0x2000, nt_address_space::PAGE_READWRITE);
+        let teb2_client_cap = checked_spawn_copy_cap(teb2, b"teb-tail-target");
+        let _ = checked_spawn_page_map(
+            teb2_client_cap,
+            SMSS_TEB_VA + 0x1000,
+            RW_NX,
+            pml4,
+            b"teb-tail-target",
+        );
+        checked_spawn_frame_put_at(pi, SMSS_TEB_VA + 0x1000, teb2, 0, b"teb-tail");
+        checked_register_spawn_private_mapping(
+            pi,
+            SMSS_TEB_VA,
+            0x2000,
+            nt_address_space::PAGE_READWRITE,
+            b"teb",
+        );
         // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's
         // TEB), but is mapped READ-ONLY there and copy-on-written on the first store. See
         // `W32_CLIENT_TEB_TAIL_PROTECTED`.
         crate::teb_tail_register(SMSS_TEB_VA + 0x1000);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
-        let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            peb,
+            scr + 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"peb-scratch",
+        );
         zero_scratch_page(scr + 0x1000);
         core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
@@ -868,31 +1157,31 @@ pub(crate) unsafe fn spawn_sec_image(
                 print_str(b"\n");
             }
         }
-        let peb_target_map = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
-        if pi == 0 {
-            let ldr = core::ptr::read_volatile((scr + 0x1000 + 0x18) as *const u64);
-            let params_ptr = core::ptr::read_volatile((scr + 0x1000 + 0x20) as *const u64);
-            print_str(b"[spawn-env] smss peb-map=");
-            print_u64(peb_target_map);
-            print_str(b" ldr=0x");
-            print_hex((ldr >> 32) as u32);
-            print_hex(ldr as u32);
-            print_str(b" params=0x");
-            print_hex((params_ptr >> 32) as u32);
-            print_hex(params_ptr as u32);
-            print_str(b"\n");
-        }
+        let peb_client = checked_spawn_copy_cap(peb, b"peb-target");
+        let _ = checked_spawn_page_map(peb_client, SMSS_PEB_VA, RW_NX, pml4, b"peb-target");
         // Cross-process process creation finishes by writing Peb->ProcessParameters through
         // NtWriteVirtualMemory. Register the live PEB frame and its persistent executive alias so
         // the generic remote-copy path updates the child rather than requiring an SSN-specific
         // synthetic success.
-        csrss_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000);
-        register_spawn_private_mapping(pi, SMSS_PEB_VA, 0x1000, nt_address_space::PAGE_READWRITE);
+        checked_spawn_frame_put_at(pi, SMSS_PEB_VA, peb, scr + 0x1000, b"peb");
+        checked_register_spawn_private_mapping(
+            pi,
+            SMSS_PEB_VA,
+            0x1000,
+            nt_address_space::PAGE_READWRITE,
+            b"peb",
+        );
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
         let nls_pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nls_pt);
-        let _ = paging_struct_map(nls_pt, LBL_X86_PAGE_TABLE_MAP, NLS_SMSS_ANSI_VA, pml4);
+        spawn_paging_retype(nls_pt, OBJ_X86_PAGE_TABLE, b"nls-pt");
+        checked_spawn_paging_map(
+            nls_pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            NLS_SMSS_ANSI_VA,
+            pml4,
+            b"nls-pt",
+        );
         for (start, va, frames) in [
             (
                 NLS_ANSI_START.load(Ordering::Relaxed),
@@ -911,13 +1200,15 @@ pub(crate) unsafe fn spawn_sec_image(
             ),
         ] {
             for i in 0..frames {
-                let _ = page_map(copy_cap(start + i), va + i * 0x1000, RW_NX, pml4);
+                let cap = checked_spawn_copy_cap(start + i, b"nls-target");
+                let _ = checked_spawn_page_map(cap, va + i * 0x1000, RW_NX, pml4, b"nls-target");
             }
-            register_spawn_mapped_mapping(
+            checked_register_spawn_mapped_mapping(
                 pi,
                 va,
                 frames * 0x1000,
                 nt_address_space::PAGE_READWRITE,
+                b"nls",
             );
         }
         // Process parameters: a real RTL_USER_PROCESS_PARAMETERS. LdrpInitializeProcess reads
@@ -928,7 +1219,8 @@ pub(crate) unsafe fn spawn_sec_image(
         // DllPath@0x50, ImagePathName@0x60, CommandLine@0x70 (each UNICODE_STRING = Len,MaxLen,_,Buf).
         let params = alloc_frame();
         let pp = scr + 0x3000;
-        let _ = page_map(params, pp, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ =
+            checked_spawn_page_map(params, pp, RW_NX, CAP_INIT_THREAD_VSPACE, b"params-scratch");
         zero_scratch_page(pp);
         core::ptr::write_volatile((pp + 0x00) as *mut u32, 0x1000); // MaximumLength
         core::ptr::write_volatile((pp + 0x04) as *mut u32, 0x1000); // Length
@@ -990,7 +1282,13 @@ pub(crate) unsafe fn spawn_sec_image(
         // OWN page (SMSS_PARAMS_VA+0x1000 — the next page in the same 2 MiB PT, no new PT needed).
         let env_frame = alloc_frame();
         let env_scr = scr + 0x4000;
-        let _ = page_map(env_frame, env_scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            env_frame,
+            env_scr,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"env-scratch",
+        );
         zero_scratch_page(env_scr);
         {
             let mut off: u64 = 0;
@@ -1014,47 +1312,41 @@ pub(crate) unsafe fn spawn_sec_image(
             core::ptr::write_volatile((pp + 0x3F0) as *mut u64, off);
         }
         core::ptr::write_volatile((pp + 0x80) as *mut u64, SMSS_PARAMS_VA + 0x1000); // Environment
-        let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
-        let _ = page_map(copy_cap(env_frame), SMSS_PARAMS_VA + 0x1000, RW_NX, pml4);
+        let params_client = checked_spawn_copy_cap(params, b"params-target");
+        let _ =
+            checked_spawn_page_map(params_client, SMSS_PARAMS_VA, RW_NX, pml4, b"params-target");
+        let env_client = checked_spawn_copy_cap(env_frame, b"env-target");
+        let _ = checked_spawn_page_map(
+            env_client,
+            SMSS_PARAMS_VA + 0x1000,
+            RW_NX,
+            pml4,
+            b"env-target",
+        );
         // win32k reads PsGetCurrentProcess()->Peb->ProcessParameters while attached to the
         // caller. Register the process parameters and environment alongside the PEB so those
         // dereferences resolve to this process's real pages.
-        csrss_frame_put_at(pi, SMSS_PARAMS_VA, params, pp);
-        csrss_frame_put_at(pi, SMSS_PARAMS_VA + 0x1000, env_frame, env_scr);
-        register_spawn_private_mapping(
+        checked_spawn_frame_put_at(pi, SMSS_PARAMS_VA, params, pp, b"params");
+        checked_spawn_frame_put_at(pi, SMSS_PARAMS_VA + 0x1000, env_frame, env_scr, b"env");
+        checked_register_spawn_private_mapping(
             pi,
             SMSS_PARAMS_VA,
             0x2000,
             nt_address_space::PAGE_READWRITE,
+            b"params-env",
         );
-        if pi == 0 {
-            let flags = core::ptr::read_volatile((pp + 0x08) as *const u32);
-            let env = core::ptr::read_volatile((pp + 0x80) as *const u64);
-            print_str(b"[spawn-env] smss params flags=0x");
-            print_hex(flags);
-            print_str(b" env=0x");
-            print_hex((env >> 32) as u32);
-            print_hex(env as u32);
-            print_str(b"\n");
-        }
         // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
         let kpdpt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, kpdpt);
+        spawn_paging_retype(kpdpt, OBJ_X86_PDPT, b"kuser-pdpt");
         let kpd = alloc_slot();
-        let _ = untyped_retype(
-            CAP_INIT_UNTYPED,
-            OBJ_X86_PAGE_DIRECTORY,
-            PAGING_BITS,
-            1,
-            kpd,
-        );
+        spawn_paging_retype(kpd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
         let kpt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, kpt);
-        let _ = paging_struct_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
-        let _ = paging_struct_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
-        let _ = paging_struct_map(kpt, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
+        spawn_paging_retype(kpt, OBJ_X86_PAGE_TABLE, b"kuser-pt");
+        checked_spawn_paging_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt");
+        checked_spawn_paging_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd");
+        checked_spawn_paging_map(kpt, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4, b"kuser-pt");
         // Build the KUSER page via a scratch mapping so we can populate the fields the Win32 create
         // path reads. KUSER_SHARED_DATA.ImageNumberLow(@0x260)/ImageNumberHigh(@0x262) bound the
         // machine types kernel32's CreateProcessInternalW allows (proc.c:3474 —
@@ -1064,11 +1356,24 @@ pub(crate) unsafe fn spawn_sec_image(
         // Offsets are the ReactOS KUSER_SHARED_DATA layout: ImageNumberLow@0x2c, ImageNumberHigh@0x2e.
         let kuser_f = alloc_frame();
         let kscr = scr + 0x6000; // next free page in the env-scratch window (past env at +0x4000/+0x5000)
-        let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            kuser_f,
+            kscr,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"kuser-scratch",
+        );
         zero_scratch_page(kscr);
         unsafe { initialize_kuser_snapshot(kscr) };
         kuser_page_alias_put(pi, kscr);
-        let _ = page_map(copy_cap(kuser_f), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
+        let kuser_client = checked_spawn_copy_cap(kuser_f, b"kuser-target");
+        let _ = checked_spawn_page_map(
+            kuser_client,
+            KUSER_VA,
+            2 | PAGE_EXECUTE_NEVER,
+            pml4,
+            b"kuser-target",
+        );
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
         // TEB/PEB/KUSER, NtQueryVirtualMemory, creates the process heap (RtlCreateHeap itself),
@@ -1079,7 +1384,13 @@ pub(crate) unsafe fn spawn_sec_image(
         // with RSP 16-aligned, so `call` gives LdrpInitialize a correctly-aligned frame.
         let _ = pe.entry_point_rva();
         let tramp = alloc_frame();
-        let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = checked_spawn_page_map(
+            tramp,
+            scr + 0x2000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+            b"tramp-scratch",
+        );
         zero_scratch_page(scr + 0x2000);
         let mut tb = alloc::vec::Vec::new();
         // Reserve 0x20 shadow space so LdrpInitialize's register-arg spills ([rsp+0x8..0x20]) land
@@ -1127,54 +1438,61 @@ pub(crate) unsafe fn spawn_sec_image(
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
-        let _ = page_map(copy_cap(tramp), SMSS_TRAMP_VA, /* RX */ 2, pml4);
-        register_spawn_private_mapping(
+        let tramp_client = checked_spawn_copy_cap(tramp, b"tramp-target");
+        let _ = checked_spawn_page_map(
+            tramp_client,
+            SMSS_TRAMP_VA,
+            /* RX */ 2,
+            pml4,
+            b"tramp-target",
+        );
+        checked_register_spawn_private_mapping(
             pi,
             SMSS_TRAMP_VA,
             0x1000,
             nt_address_space::PAGE_EXECUTE_READ,
+            b"trampoline",
         );
+        trace_spawn_phase(pi, b"env");
         SMSS_TRAMP_VA
     } else {
         PE_LOAD_BASE + pe.entry_point_rva() as u64
     };
+    trace_spawn_phase(pi, b"thread-objects");
     let raw = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    checked_spawn_object_retype(raw, OBJ_CNODE, CN_RADIX, b"secimage-cnode-raw");
     let cnode = alloc_slot();
-    let _ = syscall5(
-        SYS_SEND,
+    checked_spawn_cnode_mint(
         CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
         cnode,
         raw,
         CN_GUARD_BADGE,
+        b"secimage-cnode",
     );
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
-    let _ = syscall5(
-        SYS_SEND,
-        cnode,
-        LBL_CNODE_COPY << 12,
-        CT_FAULT,
-        fault_ep_c,
-        0,
-    );
+    checked_spawn_cnode_copy(cnode, CT_PML4, pml4, b"secimage-pml4");
+    checked_spawn_cnode_copy(cnode, CT_FAULT, fault_ep_c, b"secimage-fault");
     let tcb = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
-    let _ = syscall5(
-        SYS_SEND,
+    checked_spawn_object_retype(tcb, OBJ_TCB, 0, b"secimage-tcb");
+    checked_spawn_tcb_op(
+        tcb_set_space_r(tcb, CT_FAULT, cnode, pml4),
         tcb,
-        LBL_TCB_SET_IPC_BUFFER << 12,
-        IPCBUF_VADDR,
-        ipcbuf,
-        0,
+        b"secimage-set-space",
+    );
+    checked_spawn_tcb_op(
+        tcb_set_ipc_buffer_r(tcb, IPCBUF_VADDR, ipcbuf),
+        tcb,
+        b"secimage-set-ipc",
     );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, entry, stack_top, 0);
+    checked_spawn_tcb_op(
+        tcb_write_registers_r(tcb, entry, stack_top, 0),
+        tcb,
+        b"secimage-write-registers",
+    );
     if setup_env {
-        let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
+        checked_spawn_tcb_op(tcb_set_gs_base_r(tcb, SMSS_TEB_VA), tcb, b"secimage-set-gs");
     }
-    let _ = tcb_set_priority(tcb, prio);
+    checked_spawn_tcb_op(tcb_set_priority_r(tcb, prio), tcb, b"secimage-set-priority");
     // Transport selection (ntdll_plan Step 6.A): every hosted Windows thread gets the rust-micro
     // hosted-syscalls flag. The kernel now treats that flag as HYBRID:
     //   * OUR ntdll's explicit `Call(CT_FAULT, label=0x4E54)` envelope still dispatches natively and
@@ -1184,8 +1502,11 @@ pub(crate) unsafe fn spawn_sec_image(
     //     `SetWindowLongPtrW(hwnd, GWLP_WNDPROC=-4, ...)` depends on this; without the flag, -4 is
     //     `SysNBSendWait` and win32k never sees NtUserSetWindowLongPtr.
     let _native_transport = effective_ldrp_rva(ldrpinit_rva) != 0;
-    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    checked_spawn_tcb_op(
+        tcb_set_hosted_syscalls_r(tcb),
+        tcb,
+        b"secimage-set-hosted-syscalls",
+    );
     if let Err(e_sc) = attach_sched_context(tcb) {
         print_str(b"[thread-life] secimage SC attach failed tcb=0x");
         print_hex(tcb as u32);
@@ -1194,9 +1515,10 @@ pub(crate) unsafe fn spawn_sec_image(
         print_str(b"\n");
         park();
     }
-    if pi == 0 {
-        let _ = tcb_resume(tcb);
+    if start_immediately {
+        checked_spawn_tcb_op(tcb_resume_r(tcb), tcb, b"secimage-resume");
     }
+    trace_spawn_phase(pi, b"done");
     SecImageSpawn {
         pml4,
         main_tcb: tcb,
@@ -1416,12 +1738,14 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
         let mut temporary_cap = 0;
-        let mirrored =
-            if !allow_active_mirrors || pi == 2 && wl_listener_stack_contains(current, chunk) {
-                None
-            } else {
-                smss_mirror(current, chunk as u64)
-            };
+        let mirrored = if !allow_active_mirrors
+            || ACTIVE_CLIENT_PI.load(Ordering::Relaxed) != pi
+            || pi == 2 && wl_listener_stack_contains(current, chunk)
+        {
+            None
+        } else {
+            smss_mirror(current, chunk as u64)
+        };
         let source = if let Some(source) = mirrored {
             source
         } else {
@@ -1514,7 +1838,10 @@ pub(crate) unsafe fn client_write_mapped(
     if pi == 2 && wl_listener_stack_contains(va, src.len()) {
         return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
     }
-    smss_copyout(va, src) || client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base)
+    if client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base) {
+        return true;
+    }
+    ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, src)
 }
 
 pub(crate) unsafe fn client_write_u64_mapped(
@@ -1582,10 +1909,9 @@ pub(crate) unsafe fn client_copyout_mapped(
                     return false;
                 }
                 alias + (current & 0xfff)
-            } else if let Some(destination) =
-                (!unregistered_image_mapping(pi, page))
-                    .then(|| scratch_for(current, filled_pages, nfilled, scratch_base))
-                    .flatten()
+            } else if let Some(destination) = (!unregistered_image_mapping(pi, page))
+                .then(|| scratch_for(current, filled_pages, nfilled, scratch_base))
+                .flatten()
             {
                 destination
             } else {

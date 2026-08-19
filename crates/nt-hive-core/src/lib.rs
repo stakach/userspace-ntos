@@ -28,6 +28,7 @@ pub use reactos_registration::{
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes_into_target,
     seed_reactos_network_bindings_from_config_manager_into_target,
+    seed_reactos_network_bindings_from_pnp_driver_bindings_into_target,
     seed_reactos_network_setup_in_config_manager, seed_reactos_network_setup_in_mutable_hives,
     seed_reactos_network_setup_into_target, seed_reactos_print_setup_in_mutable_hives,
     seed_reactos_print_setup_into_target, seed_reactos_user_profile_shell_folders_in_mutable_hives,
@@ -43,11 +44,13 @@ pub use reactos_registration::{
 
 pub use codec::{
     decode_image, encode_image, encode_log_record, encoded_image_len, image_len_if_valid,
-    image_value_len_if_valid, replay_log, try_encode_image, try_encode_subtree_image,
-    HiveDecodeError, HiveEncodeError, HiveLogOp, HiveSubtreeEncodeError,
+    image_root_subkey_count_if_valid, image_value_len_if_valid, replay_log, try_encode_image,
+    try_encode_subtree_image, HiveDecodeError, HiveEncodeError, HiveLogOp, HiveSubtreeEncodeError,
+    HIVE_IMAGE_MAGIC,
 };
 pub use config_import::{
     import_control_set_class_into_config_manager, import_control_set_enum_into_config_manager,
+    import_control_set_network_into_config_manager,
     import_control_set_service_group_order_into_config_manager,
     import_control_set_services_into_config_manager,
 };

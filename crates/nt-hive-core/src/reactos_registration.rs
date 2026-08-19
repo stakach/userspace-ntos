@@ -1230,12 +1230,20 @@ fn network_driver_desc_for_binding(
 fn collect_reactos_network_adapter_bindings(
     cm: &nt_config_manager::ConfigManager,
 ) -> Vec<ReactOsNetworkAdapterBinding> {
+    let mut bindings = cm.boot_system_pnp_driver_bindings();
+    bindings.extend(cm.demand_start_pnp_driver_bindings());
+    collect_reactos_network_adapter_bindings_from_pnp_driver_bindings(cm, bindings)
+}
+
+fn collect_reactos_network_adapter_bindings_from_pnp_driver_bindings<I>(
+    cm: &nt_config_manager::ConfigManager,
+    bindings: I,
+) -> Vec<ReactOsNetworkAdapterBinding>
+where
+    I: IntoIterator<Item = nt_config_manager::PnpDriverBinding>,
+{
     let mut out = Vec::new();
-    for binding in cm
-        .boot_system_pnp_driver_bindings()
-        .into_iter()
-        .chain(cm.demand_start_pnp_driver_bindings())
-    {
+    for binding in bindings {
         for devnode in binding.devnodes {
             if !devnode_is_network_adapter(&binding.service, &devnode) {
                 continue;
@@ -1468,6 +1476,24 @@ pub fn seed_reactos_network_bindings_from_config_manager_into_target<T: ReactOsS
     stats: &mut ReactOsNetworkSetupSeedStats,
 ) {
     let adapters = collect_reactos_network_adapter_bindings(cm);
+    seed_reactos_network_bindings_into_target(target, &adapters, stats);
+}
+
+/// Seed TCPIP/linkage/interface registry state from an already enumerated set of PnP driver
+/// bindings. This is useful when the caller needs to observe or cache the Configuration Manager
+/// binding pass while keeping registry materialization in this crate.
+pub fn seed_reactos_network_bindings_from_pnp_driver_bindings_into_target<
+    T: ReactOsSetupSeedTarget,
+    I,
+>(
+    target: &mut T,
+    cm: &nt_config_manager::ConfigManager,
+    bindings: I,
+    stats: &mut ReactOsNetworkSetupSeedStats,
+) where
+    I: IntoIterator<Item = nt_config_manager::PnpDriverBinding>,
+{
+    let adapters = collect_reactos_network_adapter_bindings_from_pnp_driver_bindings(cm, bindings);
     seed_reactos_network_bindings_into_target(target, &adapters, stats);
 }
 

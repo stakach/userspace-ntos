@@ -21,10 +21,9 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
-    PciDevice, ResourceAssignment, RootBusResourceCatalog, RootBusResourceProfile,
-    ASSIGNMENT_CM_LIST_MAX_SIZE,
-    ROOT_DMA_TEST_RESOURCE_PROFILE,
+    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus, PciDevice,
+    ResourceAssignment, RootBusResourceCatalog, RootBusResourceProfile,
+    ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
@@ -65,11 +64,7 @@ where
     C: AsRef<str>,
 {
     unsafe {
-        root_bus_resource_catalog_mut()?.find_for_devnode(
-            instance_id,
-            hardware_ids,
-            compatible_ids,
-        )
+        root_bus_resource_catalog_mut()?.find_for_devnode(instance_id, hardware_ids, compatible_ids)
     }
 }
 

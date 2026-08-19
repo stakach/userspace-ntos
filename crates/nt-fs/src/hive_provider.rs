@@ -168,14 +168,12 @@ impl HiveIoProvider for NtFileHiveIoProvider<'_> {
         if r.status != STATUS_SUCCESS {
             return Err(HiveIoError::Io);
         }
-        let end = fs
-            .zw_query_standard_information(r.handle)
-            .map(|i| i.end_of_file)
-            .unwrap_or(0);
-        let (st, _) = fs.zw_write_file(r.handle, Some(end), bytes);
+        let (st, written) = fs.zw_append_file(r.handle, bytes);
         fs.zw_flush_buffers_file(r.handle);
         fs.zw_close(r.handle);
-        (st == STATUS_SUCCESS).then_some(()).ok_or(HiveIoError::Io)
+        (st == STATUS_SUCCESS && written == bytes.len())
+            .then_some(())
+            .ok_or(HiveIoError::Io)
     }
     fn truncate_log(&mut self) -> Result<(), HiveIoError> {
         self.write_file(&self.log_path.clone(), &[])

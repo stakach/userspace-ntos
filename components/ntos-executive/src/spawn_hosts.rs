@@ -10,8 +10,10 @@
 //! caps). Behaviour is byte-identical to the old bespoke spawners.
 #![allow(clippy::all)]
 use crate::*;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
+
+const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
 /// Where a region's frame caps come from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,6 +155,12 @@ pub(crate) struct ComponentDescriptor<'a> {
     /// differ per host (RO / RWX / W^X). The image skeleton (pdpt/pd/image PTs/cluster PT) is
     /// always built.
     pub image_rights: Rights,
+    /// Defer mapping the shared executive/runtime image until the component faults it in.
+    ///
+    /// This is only valid for components whose fault endpoint is actively driven by
+    /// [`component_pump`] from startup onward. Notification-only components such as storage and
+    /// faultless ISR helpers keep the eager path.
+    pub lazy_image: bool,
     /// Map the heap PT (`HEAP_BASE`) as part of the skeleton (kmdf/win32k need it before regions).
     pub map_heap_pt: bool,
     /// Stack: base VA, frame count, and whether it needs its OWN dedicated PT (win32k's stack is
@@ -186,9 +194,320 @@ pub(crate) struct SpawnedComponent {
     // the CNode is returned for a future teardown/revoke path (cap reclaim on component exit).
     #[allow(dead_code)]
     pub cnode: u64,
+    pub raw_cnode: u64,
+    pub sched_context: u64,
+    /// Shared owner-tagged bank that owns this component's mapped frame and paging caps.
+    pub map_cap_bank: ComponentMapCapBank,
     /// The cap slot of the first stack frame (win32k stashes this for later remaps). Only
     /// meaningful when the stack uses `FreshZeroed`.
     pub stack_frame_base: u64,
+    pub stack_frame_count: u64,
+}
+
+static COMPONENT_HANDOFF_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const COMPONENT_HANDOFF_TRACE_CAP: u64 = 48;
+static COMPONENT_SPAWN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const COMPONENT_SPAWN_TRACE_CAP: u64 = 256;
+static COMPONENT_ROOT_IMAGE_DEMAND_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const COMPONENT_ROOT_IMAGE_DEMAND_TRACE_CAP: u64 = 64;
+
+#[inline(never)]
+unsafe fn trace_component_spawn_stage(stage: &[u8], a: u64, b: u64) {
+    let trace = COMPONENT_SPAWN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= COMPONENT_SPAWN_TRACE_CAP {
+        return;
+    }
+    crate::print_str(b"[component-spawn] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" a=0x");
+    crate::print_hex(a as u32);
+    crate::print_str(b" b=0x");
+    crate::print_hex(b as u32);
+    crate::print_str(b"\n");
+}
+
+#[inline(never)]
+unsafe fn trace_component_handoff(stage: &[u8], tcb: u64, reply_cap: u64, detail: u64) {
+    let trace = COMPONENT_HANDOFF_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= COMPONENT_HANDOFF_TRACE_CAP {
+        return;
+    }
+    crate::print_str(b"[component-handoff] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" tcb=0x");
+    crate::print_hex(tcb as u32);
+    crate::print_str(b" reply=0x");
+    crate::print_hex(reply_cap as u32);
+    crate::print_str(b" detail=");
+    crate::print_u64(detail);
+    crate::print_str(b"\n");
+    crate::win32k_glue::trace_hosted_tcb_debug_state(stage, tcb, reply_cap);
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ComponentMapCapBank {
+    pub owner: u16,
+    pub count: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ComponentMapCapBankRelease {
+    pub caps: u64,
+    pub failures: u64,
+}
+
+const COMPONENT_MAP_CAP_BANK_RESERVED_SLOTS: u64 = 64;
+static COMPONENT_MAP_CAP_BANK_OWNER_NEXT: AtomicU64 = AtomicU64::new(1);
+static COMPONENT_MAP_CAP_ROOT_OWNER: [AtomicU16; ROOT_SLOT_TRACK_CAP] =
+    [const { AtomicU16::new(0) }; ROOT_SLOT_TRACK_CAP];
+
+#[inline]
+fn component_heap_pt_count(frames: u64) -> u64 {
+    frames.div_ceil(512).max(1)
+}
+
+#[inline]
+fn component_descriptor_map_cap_count(d: &ComponentDescriptor, img_count: u64) -> u64 {
+    let image_skeleton_caps = 2 + component_heap_pt_count(img_count) + 1;
+    let heap_caps = if d.map_heap_pt {
+        component_heap_pt_count(allocator::SERVICE_HEAP_FRAMES)
+    } else {
+        0
+    };
+    let stack_pt_caps = u64::from(d.stack_dedicated_pt);
+    let region_caps = d.regions.iter().fold(0u64, |acc, r| {
+        acc.saturating_add(r.pts).saturating_add(r.count)
+    });
+    image_skeleton_caps
+        .saturating_add(img_count)
+        .saturating_add(heap_caps)
+        .saturating_add(stack_pt_caps)
+        .saturating_add(1)
+        .saturating_add(region_caps)
+        .saturating_add(COMPONENT_MAP_CAP_BANK_RESERVED_SLOTS)
+}
+
+#[inline(never)]
+unsafe fn component_spawn_fail(stage: &[u8], subject: u64, error: u64) -> ! {
+    print_str(b"[component-spawn] ");
+    print_str(stage);
+    print_str(b" failed subject=0x");
+    print_hex((subject >> 32) as u32);
+    print_hex(subject as u32);
+    print_str(b" error=");
+    print_u64(error);
+    print_str(b"\n");
+    park()
+}
+
+#[inline(always)]
+unsafe fn component_expect(stage: &[u8], subject: u64, error: u64) {
+    if error != 0 {
+        component_spawn_fail(stage, subject, error);
+    }
+}
+
+#[inline(always)]
+unsafe fn component_alloc_slot(stage: &[u8]) -> u64 {
+    match try_alloc_slot() {
+        Some(slot) => slot,
+        None => component_spawn_fail(stage, 0, 4),
+    }
+}
+
+#[inline(always)]
+unsafe fn component_retype(stage: &[u8], obj: u64, bits: u32, dest: u64) {
+    let error = untyped_retype_r(CAP_INIT_UNTYPED, obj, bits, 1, dest);
+    component_expect(stage, dest, error);
+}
+
+#[inline(always)]
+unsafe fn component_copy(stage: &[u8], source: u64) -> u64 {
+    let (cap, error) = copy_cap_r(source);
+    if error != 0 {
+        component_spawn_fail(stage, source, error);
+    }
+    cap
+}
+
+unsafe fn component_alloc_frame_run(stage: &[u8], count: u64) -> u64 {
+    let Some(base) = try_alloc_slot_run(count) else {
+        component_spawn_fail(stage, count, 4);
+    };
+    let mut done = 0u64;
+    while done < count {
+        let remaining = count - done;
+        let batch = remaining.min(SEL4_RETYPE_FAN_OUT_LIMIT);
+        let slot = base + done;
+        let error = untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            batch as u32,
+            slot,
+        );
+        if error != 0 {
+            let mut j = 0u64;
+            while j < done {
+                let _ = cnode_delete_recycle_r(base + j);
+                j += 1;
+            }
+            while j < count {
+                recycle_deleted_root_slot(base + j);
+                j += 1;
+            }
+            component_spawn_fail(stage, slot, error);
+        }
+        done += batch;
+    }
+    base
+}
+
+unsafe fn component_map_cap_bank_create(count: u64) -> ComponentMapCapBank {
+    if count > ROOT_SLOT_TRACK_CAP as u64 {
+        component_spawn_fail(b"component-bank-capacity", count, 4);
+    }
+    let owner = COMPONENT_MAP_CAP_BANK_OWNER_NEXT.fetch_add(1, Ordering::Relaxed);
+    if owner == 0 || owner > u16::MAX as u64 {
+        component_spawn_fail(b"component-bank-owner", count, owner);
+    }
+    ComponentMapCapBank {
+        owner: owner as u16,
+        count: 0,
+    }
+}
+
+unsafe fn component_map_cap_bank_store(bank: &mut ComponentMapCapBank, root_cap: u64) {
+    if bank.owner == 0 {
+        component_spawn_fail(b"component-bank-owner", root_cap, 0);
+    }
+    let Some(owner_slot) = root_slot_index(root_cap) else {
+        component_spawn_fail(b"component-bank-root-slot", root_cap, bank.count);
+    };
+    if COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].swap(bank.owner, Ordering::Relaxed) != 0 {
+        component_spawn_fail(b"component-bank-owner-slot", root_cap, owner_slot as u64);
+    }
+    bank.count += 1;
+}
+
+unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    let Some(owner_slot) = root_slot_index(root_cap) else {
+        return false;
+    };
+    COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].swap(owner, Ordering::Relaxed) == 0
+}
+
+pub(crate) unsafe fn release_component_map_cap_bank(
+    bank: ComponentMapCapBank,
+) -> ComponentMapCapBankRelease {
+    if bank.owner == 0 || bank.count == 0 {
+        return ComponentMapCapBankRelease::default();
+    }
+    let mut released = 0u64;
+    let mut failures = 0u64;
+    let start = ROOT_CSPACE_START.load(Ordering::Relaxed);
+    let scan_limit = NEXT_SLOT
+        .load(Ordering::Relaxed)
+        .saturating_sub(start)
+        .min(ROOT_SLOT_TRACK_CAP as u64);
+    let mut owner_slot = 0usize;
+    while owner_slot < scan_limit as usize {
+        if COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].load(Ordering::Relaxed) == bank.owner {
+            let root_cap = start + owner_slot as u64;
+            if cnode_delete_recycle_r(root_cap) == 0 {
+                COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].store(0, Ordering::Relaxed);
+                released += 1;
+            } else {
+                failures += 1;
+            }
+        }
+        owner_slot += 1;
+    }
+    if released != bank.count {
+        failures = failures.saturating_add(bank.count.saturating_sub(released));
+    }
+    ComponentMapCapBankRelease {
+        caps: released,
+        failures,
+    }
+}
+
+unsafe fn component_map_paging_cap(
+    bank: &mut ComponentMapCapBank,
+    stage: &[u8],
+    object_type: u64,
+    map_label: u64,
+    va: u64,
+    pml4: u64,
+) {
+    let cap = component_alloc_slot(stage);
+    component_retype(stage, object_type, PAGING_BITS, cap);
+    let error = paging_struct_map_r(cap, map_label, va, pml4);
+    component_expect(stage, va, error);
+    component_map_cap_bank_store(bank, cap);
+}
+
+unsafe fn component_map_cluster_pt(pml4: u64, bank: &mut ComponentMapCapBank) {
+    component_map_paging_cap(
+        bank,
+        b"cluster-pt-map",
+        OBJ_X86_PAGE_TABLE,
+        LBL_X86_PAGE_TABLE_MAP,
+        WORK_CLUSTER_BASE,
+        pml4,
+    );
+}
+
+unsafe fn component_map_heap_pts(pml4: u64, frames: u64, bank: &mut ComponentMapCapBank) {
+    let windows = component_heap_pt_count(frames);
+    let mut window = 0u64;
+    while window < windows {
+        component_map_paging_cap(
+            bank,
+            b"heap-pt-map",
+            OBJ_X86_PAGE_TABLE,
+            LBL_X86_PAGE_TABLE_MAP,
+            allocator::HEAP_BASE as u64 + window * 0x20_0000,
+            pml4,
+        );
+        window += 1;
+    }
+}
+
+unsafe fn component_map_image_skeleton(pml4: u64, img_count: u64, bank: &mut ComponentMapCapBank) {
+    component_map_paging_cap(
+        bank,
+        b"image-pdpt-map",
+        OBJ_X86_PDPT,
+        LBL_X86_PDPT_MAP,
+        IMAGE_BASE,
+        pml4,
+    );
+    component_map_paging_cap(
+        bank,
+        b"image-pd-map",
+        OBJ_X86_PAGE_DIRECTORY,
+        LBL_X86_PAGE_DIRECTORY_MAP,
+        IMAGE_BASE,
+        pml4,
+    );
+    let npt = component_heap_pt_count(img_count);
+    let mut k = 0u64;
+    while k < npt {
+        component_map_paging_cap(
+            bank,
+            b"image-pt-map",
+            OBJ_X86_PAGE_TABLE,
+            LBL_X86_PAGE_TABLE_MAP,
+            IMAGE_BASE + k * 0x20_0000,
+            pml4,
+        );
+        k += 1;
+    }
+    component_map_cluster_pt(pml4, bank);
 }
 
 /// THE generic mechanism: build a fresh VSpace + CSpace + TCB for an isolated component from a
@@ -197,8 +516,11 @@ pub(crate) struct SpawnedComponent {
 pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponent {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
-    let pml4 = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    trace_component_spawn_stage(b"enter", d.entry as u64, img_count);
+    let mut map_cap_bank =
+        component_map_cap_bank_create(component_descriptor_map_cap_count(d, img_count));
+    let pml4 = component_alloc_slot(b"pml4-slot");
+    component_retype(b"pml4-retype", OBJ_X86_PML4, PAGING_BITS, pml4);
     let asid_error = vspace_assign_asid(pml4);
     if asid_error != 0 {
         print_str(b"[component-spawn] VSpace ASID assign failed pml4=0x");
@@ -207,110 +529,138 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
         print_u64(asid_error);
         print_str(b"\n");
     }
-    map_image_skeleton(pml4, img_count);
+    component_map_image_skeleton(pml4, img_count, &mut map_cap_bank);
     if d.map_heap_pt {
-        map_heap_pt(pml4);
+        component_map_heap_pts(pml4, allocator::SERVICE_HEAP_FRAMES, &mut map_cap_bank);
     }
-    // Executive image frames.
-    for i in 0..img_count {
-        let va = IMAGE_BASE + i * 0x1000;
-        let cp = alloc_slot();
-        let _ = syscall5(
-            SYS_SEND,
-            CAP_INIT_THREAD_CNODE,
-            LBL_CNODE_COPY << 12,
-            cp,
-            img_start + i,
-            0,
-        );
-        let _ = page_map(cp, va, rights_at(d.image_rights, i), pml4);
+    trace_component_spawn_stage(b"vspace-ready", pml4, map_cap_bank.count);
+    if d.lazy_image {
+        trace_component_spawn_stage(b"image-lazy", img_count, map_cap_bank.count);
+    } else {
+        // Executive image frames.
+        for i in 0..img_count {
+            if i < 16 || (i & 0x3f) == 0 {
+                trace_component_spawn_stage(b"image-loop", i, map_cap_bank.count);
+            }
+            let va = IMAGE_BASE + i * 0x1000;
+            let cp = component_copy(b"image-copy", img_start + i);
+            let error = page_map_r(cp, va, rights_at(d.image_rights, i), pml4);
+            component_expect(b"image-map", va, error);
+            component_map_cap_bank_store(&mut map_cap_bank, cp);
+            if i < 16 || (i & 0x3f) == 0 {
+                trace_component_spawn_stage(b"image-step", i, map_cap_bank.count);
+            }
+        }
+        trace_component_spawn_stage(b"image-mapped", img_count, map_cap_bank.count);
     }
     // Stack.
     if d.stack_dedicated_pt {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, d.stack_base, pml4);
+        component_map_paging_cap(
+            &mut map_cap_bank,
+            b"stack-pt-map",
+            OBJ_X86_PAGE_TABLE,
+            LBL_X86_PAGE_TABLE_MAP,
+            d.stack_base,
+            pml4,
+        );
     }
-    let mut stack_frame_base = 0u64;
+    let stack_frame_base = if d.stack_frames == 0 {
+        0
+    } else {
+        component_alloc_frame_run(b"stack-frame-run", d.stack_frames)
+    };
     for i in 0..d.stack_frames {
-        let f = alloc_slot();
-        if i == 0 {
-            stack_frame_base = f;
-        }
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, d.stack_base + i * 0x1000, RW_NX, pml4);
+        let f = stack_frame_base + i;
+        let va = d.stack_base + i * 0x1000;
+        let error = page_map_r(f, va, RW_NX, pml4);
+        component_expect(b"stack-frame-map", va, error);
     }
+    trace_component_spawn_stage(b"stack-mapped", stack_frame_base, d.stack_frames);
     // IPC buffer (always a fresh page at IPCBUF_VADDR).
-    let ipcbuf = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
-    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let ipcbuf = component_alloc_slot(b"ipcbuf-slot");
+    component_retype(b"ipcbuf-retype", OBJ_X86_4K_PAGE, PAGING_BITS, ipcbuf);
+    let error = page_map_r(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    component_expect(b"ipcbuf-map", IPCBUF_VADDR, error);
+    trace_component_spawn_stage(b"ipcbuf-mapped", ipcbuf, IPCBUF_VADDR);
     // Additional regions.
+    trace_component_spawn_stage(b"regions-begin", d.regions.len() as u64, map_cap_bank.count);
     for r in d.regions {
-        map_region(pml4, r);
+        map_region(pml4, r, &mut map_cap_bank);
     }
+    trace_component_spawn_stage(b"regions-end", d.regions.len() as u64, map_cap_bank.count);
     // CSpace: a guarded CNode holding PML4 + the granted caps.
-    let raw = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
-    let cnode = alloc_slot();
-    let _ = syscall5(
-        SYS_SEND,
-        CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
-        cnode,
-        raw,
-        CN_GUARD_BADGE,
-    );
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let raw = component_alloc_slot(b"cnode-raw-slot");
+    component_retype(b"cnode-raw-retype", OBJ_CNODE, CN_RADIX, raw);
+    let cnode = component_alloc_slot(b"cnode-slot");
+    let error = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE);
+    component_expect(b"cnode-mint", raw, error);
+    let error = cnode_copy_at_r(cnode, CT_PML4, pml4);
+    component_expect(b"cnode-pml4-copy", pml4, error);
     if let Some(c) = d.granted.irq_ntfn {
-        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IRQ_NTFN, c, 0);
+        let error = cnode_copy_at_r(cnode, CT_IRQ_NTFN, c);
+        component_expect(b"cnode-irq-copy", c, error);
     }
     if let Some(c) = d.granted.result_ntfn {
-        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_RESULT_NTFN, c, 0);
+        let error = cnode_copy_at_r(cnode, CT_RESULT_NTFN, c);
+        component_expect(b"cnode-result-copy", c, error);
     }
     if let Some(c) = d.granted.fault_ep {
-        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, c, 0);
+        let error = cnode_copy_at_r(cnode, CT_FAULT, c);
+        component_expect(b"cnode-fault-copy", c, error);
     }
     if let Some(c) = d.granted.io_port {
-        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IO_PORT, c, 0);
+        let error = cnode_copy_at_r(cnode, CT_IO_PORT, c);
+        component_expect(b"cnode-ioport-copy", c, error);
     }
+    trace_component_spawn_stage(b"cspace-ready", cnode, raw);
     // TCB.
-    let tcb = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let tcb = component_alloc_slot(b"tcb-slot");
+    component_retype(b"tcb-retype", OBJ_TCB, 0, tcb);
     // The fault-handler cap slot in the new CSpace is CT_FAULT when a fault EP was granted, else 0.
     let fault_slot = if d.granted.fault_ep.is_some() {
         CT_FAULT
     } else {
         0
     };
-    let _ = tcb_set_space(tcb, fault_slot, cnode, pml4);
-    let _ = syscall5(
-        SYS_SEND,
-        tcb,
-        LBL_TCB_SET_IPC_BUFFER << 12,
-        IPCBUF_VADDR,
-        ipcbuf,
-        0,
-    );
+    let error = tcb_set_space_r(tcb, fault_slot, cnode, pml4);
+    component_expect(b"tcb-set-space", tcb, error);
+    let error = tcb_set_ipc_buffer_r(tcb, IPCBUF_VADDR, ipcbuf);
+    component_expect(b"tcb-set-ipcbuf", tcb, error);
+    component_map_cap_bank_store(&mut map_cap_bank, ipcbuf);
     let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, d.entry as u64, stack_top, 0);
+    let error = tcb_write_registers_r(tcb, d.entry as u64, stack_top, 0);
+    component_expect(b"tcb-write-registers", tcb, error);
     let _ = tcb_set_priority(tcb, d.prio);
     if let Some(gs) = d.gs_base {
         let _ = tcb_set_gs_base(tcb, gs);
     }
-    if let Err(e_sc) = attach_sched_context(tcb) {
-        print_str(b"[thread-life] component SC attach failed tcb=0x");
-        print_hex(tcb as u32);
-        print_str(b" error=");
-        print_u64(e_sc);
-        print_str(b"\n");
-        park();
-    }
-    let _ = tcb_resume(tcb);
+    trace_component_spawn_stage(b"tcb-ready", tcb, d.prio);
+    let sched_context = match attach_sched_context(tcb) {
+        Ok(sc) => sc,
+        Err(e_sc) => {
+            print_str(b"[thread-life] component SC attach failed tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" error=");
+            print_u64(e_sc);
+            print_str(b"\n");
+            park();
+        }
+    };
+    trace_component_spawn_stage(b"sc-attached", tcb, sched_context);
+    trace_component_spawn_stage(b"resume-begin", tcb, sched_context);
+    let error = tcb_resume_r(tcb);
+    trace_component_spawn_stage(b"resume-end", tcb, error);
+    component_expect(b"tcb-resume", tcb, error);
+    trace_component_handoff(b"component-resume", tcb, 0, error);
     SpawnedComponent {
         pml4,
         tcb,
         cnode,
+        raw_cnode: raw,
+        sched_context,
+        map_cap_bank,
         stack_frame_base,
+        stack_frame_count: d.stack_frames,
     }
 }
 
@@ -325,23 +675,30 @@ fn rights_at(r: Rights, i: u64) -> u64 {
 
 /// Map one [`Region`] into `pml4`: optionally build dedicated PTs (one per 2 MiB), then map each
 /// frame from its source with its rights.
-unsafe fn map_region(pml4: u64, r: &Region) {
+unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
     for p in 0..r.pts {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, r.base_va + p * 0x20_0000, pml4);
+        let va = r.base_va + p * 0x20_0000;
+        component_map_paging_cap(
+            bank,
+            b"region-pt-map",
+            OBJ_X86_PAGE_TABLE,
+            LBL_X86_PAGE_TABLE_MAP,
+            va,
+            pml4,
+        );
     }
+    let fresh_base = if r.source == FrameSource::FreshZeroed && r.count != 0 {
+        component_alloc_frame_run(b"region-frame-run", r.count)
+    } else {
+        0
+    };
     let mut first = 0;
     for i in 0..r.count {
         let cap = match r.source {
-            FrameSource::FreshZeroed => {
-                let f = alloc_slot();
-                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-                f
-            }
-            FrameSource::Alias(base) => copy_cap(base + i),
+            FrameSource::FreshZeroed => fresh_base + i,
+            FrameSource::Alias(base) => component_copy(b"region-alias-copy", base + i),
             FrameSource::AliasList(frames) => match frames.get(i as usize).copied() {
-                Some(frame) => copy_cap(frame),
+                Some(frame) => component_copy(b"region-list-copy", frame),
                 None => {
                     print_str(b"[component-spawn] image cap list too short have=");
                     print_u64(frames.len() as u64);
@@ -359,7 +716,10 @@ unsafe fn map_region(pml4: u64, r: &Region) {
                 FrameSource::AliasList(frames) => frames.first().copied().unwrap_or(0),
             };
         }
-        let _ = page_map(cap, r.base_va + i * 0x1000, rights_at(r.rights, i), pml4);
+        let va = r.base_va + i * 0x1000;
+        let error = page_map_r(cap, va, rights_at(r.rights, i), pml4);
+        component_expect(b"region-map", va, error);
+        component_map_cap_bank_store(bank, cap);
     }
     if r.base_va == crate::win32k_subsystem::WIN32K_USERVM_VADDR && first != 0 {
         crate::WIN32K_USERVM_FRAME_BASE.store(first, Ordering::Relaxed);
@@ -379,6 +739,7 @@ pub(crate) unsafe fn spawn_isr(
     let d = ComponentDescriptor {
         entry,
         image_rights: Rights::Uniform(2), // RO
+        lazy_image: false,
         map_heap_pt: false,
         stack_base: STACK_BASE,
         stack_frames: STACK_FRAMES,
@@ -423,9 +784,9 @@ pub(crate) unsafe fn spawn_storage_host(
     winlogonbuf_start: u64,
 ) {
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
-    // Device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA frame, shared run.
-    // Then the staging buffers, each with its own dedicated PT(s). NLS + SYSTEM-hive share one
-    // input page table with each other, distinct from the relocated NTDLLBUF.
+    // Component heap, then device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA
+    // frame, shared run. Then the staging buffers, each with its own dedicated PT(s). NLS +
+    // SYSTEM-hive share one input page table with each other, distinct from the relocated NTDLLBUF.
     let mut regions: [Region; 32] = [Region {
         source: FrameSource::Alias(0),
         base_va: 0,
@@ -434,6 +795,14 @@ pub(crate) unsafe fn spawn_storage_host(
         pts: 0,
     }; 32];
     let mut n = 0usize;
+    regions[n] = Region {
+        source: FrameSource::FreshZeroed,
+        base_va: allocator::HEAP_BASE as u64,
+        count: allocator::SERVICE_HEAP_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 0,
+    };
+    n += 1;
     regions[n] = Region {
         source: FrameSource::Alias(ahci_bar_frame),
         base_va: AHCI_VADDR,
@@ -572,7 +941,8 @@ pub(crate) unsafe fn spawn_storage_host(
     let d = ComponentDescriptor {
         entry,
         image_rights: Rights::Uniform(2), // RO — the storage path writes no statics
-        map_heap_pt: false,
+        lazy_image: false,
+        map_heap_pt: true,
         stack_base: STACK_BASE,
         stack_frames: STACK_FRAMES,
         stack_dedicated_pt: false,
@@ -636,6 +1006,10 @@ pub(crate) struct PumpChannel {
     /// multi-instance hosted drivers, because every component runs at `FSD_CODE_VA` in its own VSpace
     /// while the executive maps each loaded image at a unique alias.
     pub exec_code_va: u64,
+    /// Rights used when demand-mapping the shared executive/runtime image at [`crate::IMAGE_BASE`].
+    pub root_image_rights: u64,
+    /// Component map-cap bank owner used to tag root-image demand-map caps for teardown.
+    pub root_image_map_owner: u16,
     /// The `SH_*` shared-frame base for this component.
     pub shared_va: u64,
     /// The DONE / ready label the server Sends when it re-parks (0x771 FSD / 0x770 win32k).
@@ -971,6 +1345,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         lateout("r9") m2,
         lateout("r15") m3,
         in("r12") reply_cap,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -1056,9 +1431,15 @@ fn pump_deadman_tripped() -> bool {
     if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) == 0 {
         return false;
     }
+    if unsafe { crate::watchdog_defer_if_hosted_work_can_run(b"component-pump") } {
+        return false;
+    }
+    unsafe {
+        crate::watchdog_confirm_trip();
+    }
     let n = PUMP_DEADMAN_UNWINDS.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
-        crate::print_str(b"[pump] deadman tripped during nested receive -> unwind to gate\n");
+        crate::print_str(b"[pump] deadman confirmed during nested receive -> unwind to gate\n");
     }
     true
 }
@@ -1166,6 +1547,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("r9") m2,
             lateout("r15") m3,
             in("r12") reply_cap,
+            in("r13") 0u64,
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
@@ -1322,6 +1704,7 @@ pub(crate) unsafe fn pump_reply_on(
         inout("r8") r1 => _,
         inout("r9") r2 => _,
         inout("r15") r3 => _,
+        in("r12") 0u64,
         in("r13") crate::SYS_REPLY_HANDOFF_MAGIC,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -1408,12 +1791,23 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     let request_tag = pump_request_tag(ch, resume_user_callback);
     let owns_depth = pump_enter_depth(ch, resume_user_callback);
     let mut reply_cap = ch.reply_cap;
+    if ch.initial == InitialAction::RecvFirst {
+        trace_component_handoff(b"pump-recvfirst-enter", ch.tcb, reply_cap, request_tag);
+    }
     let first = if let Some(msg) = pump_deliver_initial_request(ch, reply_cap, request_tag) {
         msg
     } else {
         pump_recv(ch, reply_cap)
     };
     let outcome = component_pump_loop(ch, first, &mut reply_cap);
+    if ch.initial == InitialAction::RecvFirst {
+        let detail = if outcome.completed {
+            ch.dispatch_label
+        } else {
+            outcome.wall_label
+        };
+        trace_component_handoff(b"pump-recvfirst-exit", ch.tcb, reply_cap, detail);
+    }
     pump_leave_depth(owns_depth, outcome.callback_suspended);
     pump_suspend_walled_component(ch, outcome);
     pump_result_from_outcome(ch, outcome, reply_cap)
@@ -1520,26 +1914,11 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, handle) = crate::driver_launch::service_hosted_driver_ps_create_system_thread(
-                ch,
-                msg.m0,
-                msg.m1,
-                msg.m2,
-                msg.m3,
-                msg.m4,
-                msg.badge,
-                *reply_cap,
-            );
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                2,
-                status as u32 as u64,
-                handle,
-                0,
-                0
-            );
+            let (status, handle) =
+                crate::driver_launch::service_hosted_driver_ps_create_system_thread(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, msg.badge, *reply_cap,
+                );
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, handle, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -1565,10 +1944,7 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Irp
         {
             let previous = crate::driver_launch::service_hosted_driver_ke_set_event(
-                ch,
-                msg.m0,
-                *reply_cap,
-                msg.badge,
+                ch, msg.m0, *reply_cap, msg.badge,
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u32 as u64);
             continue;
@@ -1576,10 +1952,7 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Irp
         {
             let previous = crate::driver_launch::service_hosted_driver_ke_pulse_event(
-                ch,
-                msg.m0,
-                *reply_cap,
-                msg.badge,
+                ch, msg.m0, *reply_cap, msg.badge,
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, previous as u32 as u64);
             continue;
@@ -1635,34 +2008,15 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Irp
         {
             let (status, out1, out2) = crate::driver_launch::service_hosted_driver_registry(
-                ch,
-                msg.m0,
-                msg.m1,
-                msg.m2,
-                msg.m3,
-                msg.badge,
-                *reply_cap,
+                ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
             );
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                3,
-                status as u32 as u64,
-                out1,
-                out2,
-                0
-            );
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 3, status as u32 as u64, out1, out2, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PROVIDER_EXPORT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
             let result = crate::driver_launch::service_hosted_provider_export(
-                ch,
-                msg.m0,
-                msg.m1,
-                msg.m2,
-                msg.m3,
+                ch, msg.m0, msg.m1, msg.m2, msg.m3,
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, result);
             continue;
@@ -1776,6 +2130,9 @@ unsafe fn pump_service_vm_fault(
     faults: u64,
     demand: u64,
 ) -> bool {
+    if pump_addr_in_root_image(addr) {
+        return pump_map_root_image_page(ch, ip, addr, fsr, demand);
+    }
     let in_image =
         ch.image_frames != 0 && addr >= ch.code_va && addr < ch.code_va + ch.image_frames * 0x1000;
     if ch.caps.client_attach {
@@ -1783,6 +2140,89 @@ unsafe fn pump_service_vm_fault(
     } else {
         pump_service_generic_fault(ch, label, ip, addr, in_image, faults, demand)
     }
+}
+
+#[inline]
+fn pump_addr_in_root_image(addr: u64) -> bool {
+    let image_frames = crate::IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    image_frames != 0
+        && addr >= crate::IMAGE_BASE
+        && addr < crate::IMAGE_BASE + image_frames * 0x1000
+}
+
+#[inline(never)]
+unsafe fn pump_map_root_image_page(
+    ch: &PumpChannel,
+    ip: u64,
+    addr: u64,
+    fsr: u64,
+    demand: u64,
+) -> bool {
+    let page = addr & !0xFFF;
+    let image_start = crate::IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let image_frames = crate::IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    if image_start == 0 || image_frames == 0 || page < crate::IMAGE_BASE {
+        return false;
+    }
+    let index = (page - crate::IMAGE_BASE) / 0x1000;
+    if index >= image_frames || ch.root_image_map_owner == 0 {
+        return false;
+    }
+    let rights = if ch.root_image_rights == 0 {
+        crate::RO_NX
+    } else {
+        ch.root_image_rights
+    };
+    let (cap, copy_error) = crate::copy_cap_r(image_start + index);
+    if copy_error != 0 {
+        crate::print_str(b"[component-image-fault] copy failed index=");
+        crate::print_u64(index);
+        crate::print_str(b" source=0x");
+        crate::print_hex((image_start + index) as u32);
+        crate::print_str(b" error=");
+        crate::print_u64(copy_error);
+        crate::print_str(b"\n");
+        return false;
+    }
+    let map = crate::page_map_r(cap, page, rights, ch.pml4);
+    if map == 0 {
+        if !component_map_cap_bank_tag(ch.root_image_map_owner, cap) {
+            crate::print_str(b"[component-image-fault] owner tag failed cap=0x");
+            crate::print_hex(cap as u32);
+            crate::print_str(b" owner=");
+            crate::print_u64(ch.root_image_map_owner as u64);
+            crate::print_str(b"\n");
+            let _ = crate::cnode_delete_recycle_r(cap);
+            return false;
+        }
+        let trace = COMPONENT_ROOT_IMAGE_DEMAND_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < COMPONENT_ROOT_IMAGE_DEMAND_TRACE_CAP {
+            crate::print_str(b"[component-image-fault] mapped index=");
+            crate::print_u64(index);
+            crate::print_str(b" page=0x");
+            crate::print_hex((page >> 32) as u32);
+            crate::print_hex(page as u32);
+            crate::print_str(b" ip=0x");
+            crate::print_hex((ip >> 32) as u32);
+            crate::print_hex(ip as u32);
+            crate::print_str(b" fsr=0x");
+            crate::print_hex(fsr as u32);
+            crate::print_str(b" demand=");
+            crate::print_u64(demand);
+            crate::print_str(b"\n");
+        }
+        return true;
+    }
+    crate::print_str(b"[component-image-fault] map failed index=");
+    crate::print_u64(index);
+    crate::print_str(b" page=0x");
+    crate::print_hex((page >> 32) as u32);
+    crate::print_hex(page as u32);
+    crate::print_str(b" error=");
+    crate::print_u64(map);
+    crate::print_str(b"\n");
+    let _ = crate::cnode_delete_recycle_r(cap);
+    false
 }
 
 #[inline(never)]
@@ -1961,24 +2401,24 @@ unsafe fn pump_service_io_port_fault(
         return None;
     };
     let image_len = image_frames.checked_mul(0x1000)?;
-    let exec_ip = if fault_ip >= component_code_va
-        && fault_ip < component_code_va.checked_add(image_len)?
-    {
-        if ch.exec_code_va == 0 {
-            return None;
-        }
-        let offset = fault_ip - component_code_va;
-        ch.exec_code_va.checked_add(offset)?
-    } else {
-        let executive_len = crate::IMAGE_FRAMES_COUNT
-            .load(Ordering::Relaxed)
-            .checked_mul(0x1000)?;
-        if fault_ip < crate::IMAGE_BASE || fault_ip >= crate::IMAGE_BASE.checked_add(executive_len)?
-        {
-            return None;
-        }
-        fault_ip
-    };
+    let exec_ip =
+        if fault_ip >= component_code_va && fault_ip < component_code_va.checked_add(image_len)? {
+            if ch.exec_code_va == 0 {
+                return None;
+            }
+            let offset = fault_ip - component_code_va;
+            ch.exec_code_va.checked_add(offset)?
+        } else {
+            let executive_len = crate::IMAGE_FRAMES_COUNT
+                .load(Ordering::Relaxed)
+                .checked_mul(0x1000)?;
+            if fault_ip < crate::IMAGE_BASE
+                || fault_ip >= crate::IMAGE_BASE.checked_add(executive_len)?
+            {
+                return None;
+            }
+            fault_ip
+        };
     let b0 = core::ptr::read_volatile(exec_ip as *const u8);
     let b1 = core::ptr::read_volatile((exec_ip + 1) as *const u8);
     let (is_in, bits, insn_len) = match (b0, b1) {

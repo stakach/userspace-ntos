@@ -306,6 +306,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     setup_env: bool,
+    start_immediately: bool,
     ldrpinit_rva: u64,
     client_process_id: u64,
     client_thread_id: u64,
@@ -327,6 +328,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         image.nt_image_path,
         image.command_line,
         image.role.uses_win32_client_gdi(),
+        start_immediately,
         ldrpinit_rva,
     )
 }

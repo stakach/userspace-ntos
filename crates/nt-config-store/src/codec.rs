@@ -4,18 +4,34 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// CRC-32C (Castagnoli, reflected poly 0x82F63B78) — the snapshot/journal checksum (spec §9.3).
-pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
+const CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut byte = 0usize;
+    while byte < table.len() {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0x82F6_3B78
             } else {
                 crc >> 1
             };
+            bit += 1;
         }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+}
+
+/// CRC-32C (Castagnoli, reflected poly 0x82F63B78) — the snapshot/journal checksum (spec §9.3).
+pub fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        let idx = ((crc ^ b as u32) & 0xff) as usize;
+        crc = (crc >> 8) ^ CRC32C_TABLE[idx];
     }
     !crc
 }

@@ -1104,6 +1104,24 @@ mod tests {
     }
 
     #[test]
+    fn completion_port_packets_preserve_null_apc_context() {
+        let mut ports = Ports::new();
+        let port = ports.create(&[], 0, false).unwrap();
+        let packet = CompletionPacket {
+            key_context: 0x1234_5678,
+            apc_context: 0,
+            status: STATUS_SUCCESS,
+            information: 72,
+        };
+
+        assert_eq!(ports.enqueue(port.id, packet), Ok(()));
+        assert_eq!(
+            ports.remove(port.id, RemoveMode::Poll),
+            Ok(RemoveResult::Packet(packet))
+        );
+    }
+
+    #[test]
     fn file_completion_binding_rejects_sync_rebind_and_capacity_overflow() {
         let mut files = FileCompletionTable::<2>::new();
         files.insert_file(10, 77, true).unwrap();

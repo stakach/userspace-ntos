@@ -156,6 +156,181 @@ path. The active blocker is back in NT services: `services.exe` quiesces before 
 start event, the original LSASS main thread has self-terminated after SAMR setup, no userinit/explorer
 exists yet, and the top services thread is parked around `user32+0x45ac0`.
 
+Current desktop retry after active-user repair (2026-08-19): serialized
+`QEMU_MEMORY=2G ./run.sh --desktop` now proves the microkernel baseline and BOOTBOOT handoff are not
+the active blocker. The same boot runs the microkernel specs through `All specs passed!`, passes the
+generic hardware gates, and loads/relocates/registers all six bootstrap `SEC_IMAGE` executables
+(`csrss.exe`, `winlogon.exe`, `services.exe`, `lsass.exe`, `userinit.exe`, `explorer.exe`). The
+frontier reproduces inside SCM's real first-boot control-set copy: `services.exe` quiesces in
+ntdll `NtSetValueKey`, with callers through `advapi32_vista`/`advapi32` matching ReactOS
+`ScmCreateLastKnownGoodControlSet()` -> `RegCopyTreeW`. Review adjustment: do not synthesize the SCM
+start event or bypass LastKnownGood. The cleanup target is the old service-loop lazy boot-hive
+checkpoint machinery: ordinary `NtCreateKey`/`NtSetValueKey` writes should append/flush CM journal
+records and advance the durable heap mark only, while explicit `NtFlushKey`, quiesce/shutdown, and
+unseeded primary-image seeding own full hive/image or writable-volume checkpoint work.
+
+Profile hive publication cleanup (2026-08-19): the old lazy service-loop whole-volume boot-hive
+checkpoint machinery has been removed from the hot syscall loop, and boot hive writes now stay on the
+ordinary CM journal path until an explicit flush/quiesce/shutdown checkpoint owns image work. The
+writable volume now supports extent-backed append logs and owned installed-file provisioning, so
+large hive sidecars no longer materialize into one growing buffer and setup-owned `ntuser.dat`
+publication installs the freshly encoded image without copying it into the blob store. Hive proofing
+is format-directed: `regf` files are parsed only by the `nt-hive-regf` navigator, and core
+`UNTHIVE1` checkpoints are validated by the bounded `nt-hive-core` image probes. Local validation is
+green for `cargo fmt --all`, focused `nt-fs` owned-provision/profile/append tests, focused
+`nt-hive-core` image/profile-seed tests, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Review adjustment: rerun the serialized desktop proof from this cleanup. If it still stalls, continue
+at the next real profile/SCM syscall boundary shown in the log; do not restore lazy whole-volume
+checkpointing or profile/shell fallbacks.
+
+Microkernel/live-boot sanity retry (2026-08-19): serialized desktop run
+`.tmp/run-desktop-20260819-182834.log` confirms the current BOOTBOOT handoff and rust-micro baseline
+are healthy for this boot shape. BOOTBOOT loaded the 8,473,088-byte initrd, the microkernel spec
+suite reached `All specs passed!`, and both the early SEC_IMAGE spawn selftest and the real
+`smss.exe` spawn reached `stage=done` after CNode/TCB creation, space setup, IPC-buffer setup,
+hosted-syscall enabling, sched-context attach, and resume. The previous `thread-objects` quiet point
+therefore did not reproduce as a low-level kernel invocation failure. The same retry also completed
+dynamic Config Manager network binding publication for three devnodes, with `tcpip-linkage=3`,
+`tcpip-ifaces=5`, `net-adapter-class=6`, and `net-connections=3`. The run was manually interrupted
+during later setup print provisioning after an overly short quiet-window read, so it is not an
+accepted desktop proof. Review adjustment: keep the temporary spawn micro-markers removed, treat the
+microkernel as green for this frontier unless a later live syscall hang produces a concrete kernel
+marker, and rerun the desktop proof with enough wall-clock budget to reach the harness sentinel.
+
+Follow-up live-boot sanity retry (2026-08-19):
+`.tmp/run-desktop-20260819-183535.log` keeps the same low-level verdict on a clean binary after the
+temporary SEC_IMAGE spawn micro-markers were removed. BOOTBOOT again loads the 8,473,088-byte initrd,
+the in-boot rust-micro spec suite reaches `All specs passed!`, the real `smss.exe` SEC_IMAGE path
+reaches `stage=done`, and the final pool/cap census has no untyped, frame-registry, image-bank,
+registry, ASID, or VM map failures. Setup-owned `Default User\ntuser.dat` publication now completes
+as a 130,682-byte core hive image, and dynamic network binding publication still completes for three
+NIC devnodes. The run does not reach the desktop: services creates `SvcctrlStartEvent_A3752DX` but
+does not signal it, winlogon waits on that event, `NtLoadKey` is never called, and no userinit or
+Explorer process exists. The current frontier is therefore SCM's real registry work after
+`CheckSetup()`, not BOOTBOOT, rust-micro object creation, or hosted SEC_IMAGE bring-up. Next action:
+trace the generic services registry sequence around ReactOS `RegCopyTreeW`/LastKnownGood and fix the
+first missing CM semantic without synthesizing SCM progress.
+
+SCM RegCopyTree journal/live-apply slice (2026-08-19): the latest low-level retry
+`.tmp/micro-specs-regcopytree-sanity-20260819-192528.log` again proves the rust-micro side is not the
+active blocker for this frontier: BOOTBOOT loads the 8,477,184-byte initrd, the in-boot microkernel
+specs reach `All specs passed!`, rootserver hardware gates pass, profile publication emits a real
+130,682-byte `Default User\ntuser.dat`, and dynamic network registry provisioning completes for
+three NIC devnodes. The run still stalls later in `services.exe` before `SvcctrlStartEvent_A3752DX`
+is signaled, with no `userinit.exe` or Explorer process. The services registry trace shows ReactOS
+SCM's real `ScmCreateLastKnownGoodControlSet()` / `RegCopyTreeW` copying `ControlSet001` into
+`ControlSet002` through `NtEnumerateValueKey`, `NtEnumerateKey`, `NtCreateKey`, and `NtSetValueKey`.
+The cleanup implemented for this slice keeps those writes on the CM journal path: mutable-hive
+create/set/delete/class/security operations now apply directly to resolved live hive cells while
+recording path-addressed journal records for durability, hive-log append writes go straight through
+the mounted writable volume without transient file objects, and quiesce no longer forces full
+primary-image compaction for boot hives that already have replayable sidecar logs. Successful
+registry enumeration and successful idempotent/overlay value writes are now forward-progress markers
+so long real SCM registry copies are not mistaken for idle. Review adjustment: rerun
+`QEMU_MEMORY=2G ./run.sh --desktop` after a fresh executive build; if services still stalls, inspect
+the next real SCM syscall boundary rather than synthesizing the SCM start event or user shell launch.
+
+SCM key-value information compatibility slice (2026-08-19): the next services stall showed high
+volume `NtEnumerateValueKey` traffic during the same real LastKnownGood `RegCopyTreeW` path. The
+executive's CM copyout layer now models the five NT `KEY_VALUE_INFORMATION_CLASS` records explicitly
+instead of treating unknown classes as full-information records: basic, full, partial, full-align64,
+and partial-align64 have their own header size, minimum buffer size, required length, and data
+offset rules. Query and enumerate now share one status/copyout helper, write `ResultLength` before
+returning, return `STATUS_BUFFER_TOO_SMALL` for buffers smaller than the fixed header, and return
+`STATUS_BUFFER_OVERFLOW` with the bounded prefix copied for retryable short buffers. Full-information
+zero-data values now report `DataOffset = 0xffffffff` and do not materialize alignment padding or
+data bytes. Local validation is green for `cargo fmt --all` and executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`.
+Review adjustment: rerun the serialized desktop proof. If SCM still does not signal
+`SvcctrlStartEvent_A3752DX`, classify the next real services syscall boundary from the log; keep the
+microkernel baseline healthy unless the run produces a concrete microkernel cap/scheduler fault.
+
+Microkernel debug-return handoff guard (2026-08-19): the syscall-entry audit found one more stale
+scheduler-policy edge that can obscure live NT service progress. When a user-origin
+`SysDebugPutChar` trap has CPU proof of a live user return path but no recoverable hosted entry TCB,
+the microkernel now clears this CPU's stale `direct_handoff` before returning through the asm tail.
+The syscall remains observation-only: it does not pick a scheduler victim, does not copy state into
+an unrelated TCB, and does not let old handoff policy survive a diagnostic byte from user mode. The
+new microkernel spec `SysDebugPutChar clears stale handoff without identity` covers a mismatched
+hosted `current`, a peer in `direct_handoff`, and a live raw CPU context. Validation is green for
+`cargo fmt --manifest-path rust-micro/Cargo.toml`, `./rust-micro/scripts/build_kernel.sh`, and
+`./rust-micro/scripts/run_specs.sh` through `All specs passed!` and the rootserver MCS completion
+marker. Review adjustment: keep this as a microkernel correctness guard for the current boot loop;
+if a future quiesce report points at `direct_handoff`, debug from the concrete TCB/cap state rather
+than adding NT-side wakeups or launch fallbacks.
+
+ntdll import-table residency slice (2026-08-19): the latest SCM stall moved from a registry API
+semantic into a Rust ntdll loader/IAT residency bug. `advapi32` reached real
+`RegCopyTreeW`/`NtCreateKey`, but the import walk could observe an untouched SEC_IMAGE import page
+before the current process had faulted the page resident, leaving some IAT slots snapped from zeroed
+descriptor/thunk data. The ntdll target loader now pre-faults import descriptors, ILT/IAT cells, and
+import-by-name hints before walking them, uses volatile string reads for export/import names, and
+bounds-checks name ordinals against the export function table. Validation is green for
+`cargo fmt --all`, `cargo test -p nt-ntdll -- --nocapture`, `./scripts/build_ntdll_dll.sh`, and
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`. Review adjustment: this removed the corrupt `advapi32` IAT evidence; the next
+serialized boot reached real `ntdll!NtCreateKey` instead of a wrong syscall stub.
+
+Hosted fault-endpoint quiesce ordering slice (2026-08-19): the follow-up serialized run proved the
+microkernel specs still pass in-boot, then stopped at a more precise services frontier:
+`services.exe` was blocked in the microkernel on a native syscall `Call` to the root fault endpoint
+while the rootserver quiesce gate ran before draining that queued sender. The executive now treats
+queued hosted fault-endpoint senders as generic runnable work by reading rust-micro TCB debug state
+for live hosted threads before accepting a progress-stall quiesce. This is not a services fallback:
+if any hosted process has already queued a syscall/exception to root, the service loop simply resets
+the idle window and lets the ordinary `recv` path consume the queued IPC. Local validation is green
+for `cargo fmt --all` and executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`. Review adjustment: rerun the
+serialized desktop proof and classify the next real boundary from the log; if rust-micro endpoint
+state shows a queued sender that is not delivered to `recv`, debug the microkernel receive path from
+that concrete cap/TCB state.
+
+Writable file flush hot-path cleanup (2026-08-19): the next serialized desktop retry
+`.tmp/run-desktop-hosted-ipc-quiesce-20260820.log` keeps the microkernel verdict green for this
+frontier. The run reaches the in-boot `All specs passed!` marker, the hosted fault-endpoint quiesce
+guard observes queued senders and lets the normal receive loop drain them, SCM signals
+`SvcctrlStartEvent_A3752DX`, winlogon advances past that wait, and a real dynamic `eventlog.exe`
+process is admitted and initialized. The new blocker is a writable-volume policy bug:
+ordinary EventLog `NtFlushBuffersFile` calls on `.Evt` handles set the service-loop whole-volume
+snapshot bit, so the hot syscall path immediately enters raw-reserve snapshot commits after each
+data-file flush. The retained cleanup makes writable-file flush resolve the concrete overlay file
+object and call `writable_fs::flush`/`nt-fs::zw_flush_buffers_file` for real handle validation and
+MemFs coherence, while removing the stale post-dispatch IOSB rewrite machinery. Full raw-reserve
+snapshot checkpoints remain owned by explicit registry save/flush checkpoints and quiesce/shutdown,
+not by every ordinary service data-file flush. Host coverage now locks valid/invalid
+`zw_flush_buffers_file` behavior. Review adjustment: rerun the serialized desktop proof after
+validation; if it still stalls, classify the next real NT boundary from the log rather than
+restoring hot-path whole-volume checkpointing.
+
+FAT/AHCI whole-file load cleanup (2026-08-19): the follow-up boot attempts show that BOOTBOOT,
+rust-micro specs, hosted process creation, and the dynamic by-path loader all make forward progress,
+but large PE reads are still expensive because the FAT volume uses one-sector clusters and the
+loader issued one AHCI command per sector. The AHCI read path now has a bounded multi-sector READ DMA
+EXT primitive using the same VT-d-confined DMA frame, and `fat_read_file` follows the real FAT chain
+to coalesce physically contiguous one-sector clusters before copying the bytes to the pool. Directory
+walks and partial file ranges remain on the single-sector path. Because the batched data window
+overlaps the FAT scratch/cache area after `0xA00`, the whole-file reader invalidates the FAT cache
+after any multi-sector copy instead of trusting overwritten cache state. Local validation is green
+for `cargo fmt --all`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`. Review
+adjustment: rerun the serialized desktop proof with enough wall-clock budget; if image loading is
+still the dominant delay, the next real storage cleanup is a larger dedicated DMA window rather than
+manual hosted-image staging.
+
+Live desktop retry after debug-return guard (2026-08-19): serialized
+`QEMU_MEMORY=2G ./run.sh --desktop` in `.tmp/run-desktop-micro-handoff-20260819-212955.log` was
+manually interrupted too early to be an accepted desktop proof, but it materially advances the
+frontier relative to the older SCM stall notes. The run reaches the in-boot microkernel
+`All specs passed!` marker, completes real setup-owned profile hive publication and dynamic network
+registry provisioning, starts real LSASS worker/listener threads, publishes and signals
+`\BaseNamedObjects\lsa_rpc_server_active`, wakes winlogon's waiter, loads `msv1_0.dll`, creates
+`\LsaAuthenticationPort`, arms `\lsarpc`, and demand-loads `sfc.dll` before the manual interrupt.
+Review adjustment: the active retry target is no longer BOOTBOOT, setup print provisioning, or the
+earlier unsignaled `lsa_rpc_server_active` wait. Let the next serialized desktop proof run to the
+harness gate or a real quiesce marker, then classify the next missing NT syscall/service boundary
+from that log.
+
 Shared-provider prep foundation (2026-08-17): hosted component spawning now accepts an explicit image
 frame cap list in addition to contiguous alias ranges, and the driver loader now builds every hosted
 driver image mapping through that list. This preserves current private image behavior while removing
@@ -5643,8 +5818,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   tracking is now split: the existing `writable_fs_dirty` still pins per-boot handle/tree allocations,
   while a module-local snapshot dirty bit is set only by durable tree mutations (create/overwrite,
   write, rename/delete, provisioning, and delete-on-close). Explicit atomic hive replacement and
-  `NtFlushBuffersFile` now request a commit-before-reply, but the service loop performs the actual
-  checkpoint only after it has pinned the live overlay heap mark. This preserves flush/save failure
+  registry hive save/flush checkpoints request a commit-before-reply, but the service loop performs
+  the actual checkpoint only after it has pinned the live overlay heap mark. Ordinary file
+  `NtFlushBuffersFile` remains a concrete MemFs file-object flush/validation boundary and does not
+  force a full raw-reserve snapshot in the hot syscall path. This preserves explicit save failure
   reporting without retaining temporary snapshot payloads as durable heap state. Validation:
   `cargo fmt --all` and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
@@ -5656,12 +5833,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
   `.tmp/run-headless-snapshot-first-20260812.log` mounted a fresh reserve, committed real snapshots
   through generation `38`, and reached real winlogon dialog paint, but later failed with
   `[writable-fs-snapshot] export failed err=out-of-memory` followed by the executive allocator panic
-  site. The retained fix removes in-handler checkpointing from `write_file_atomic`,
-  `NtFlushBuffersFile`, and default-user hive publication; flush-like syscalls instead set a
-  commit-required bit consumed by the service loop before reply. `MemFs::to_snapshot` also measures
-  the payload and writes one pre-sized snapshot buffer rather than building a separate payload vector
-  and output vector, and `SnapshotBlockStore::commit_next` reads only the two slot headers when
-  choosing the next generation. Host coverage locks the header-only commit path. Validation:
+  site. The retained fix removes in-handler checkpointing from `write_file_atomic` and default-user
+  hive publication; explicit hive/save checkpoints instead set a commit-required bit consumed by the
+  service loop before reply. Later EventLog boot evidence refined ordinary `NtFlushBuffersFile` back
+  down to a concrete file-object flush/validation operation so service data-file flushes do not
+  force whole-volume snapshots. `MemFs::to_snapshot` also measures the payload and writes one
+  pre-sized snapshot buffer rather than building a separate payload vector and output vector, and
+  `SnapshotBlockStore::commit_next` reads only the two slot headers when choosing the next
+  generation. Host coverage locks the header-only commit path. Validation:
   `cargo fmt --all`, `cargo test -p nt-fs`, and
   `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
   x86_64-unknown-none`. Review adjustment: rerun the same-disk proof from a freshly rebuilt image;
@@ -8231,3 +8410,85 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     next code work should inspect the SCM control-set/service-database and user32 service-thread
     transition around that RIP and stack, not weaken microkernel ownership or synthesize the SCM
     start event.
+    Cross-process client-copy and hosted-frame-run follow-up (2026-08-19): deferred callback
+    completion exposed that executive active-stack mirrors are process-local state, not a generic VA
+    cache. `client_copyin_process_mapped` now admits the active mirror only when the requested `pi`
+    matches `ACTIVE_CLIENT_PI`, and `client_write_mapped` writes the target process mapping first,
+    falling back to the active mirror only for the active process. This should stop nested
+    win32k/LSASS callback drains from copying a parked process's `USERCONNECT` output into a
+    different process with the same stack VA. The hosted driver/component frame-run allocator now
+    uses seL4's bounded `Untyped_Retype` fan-out batches for contiguous fresh page ranges instead
+    of thousands of one-page syscalls, keeping the current bochsmp frontier useful as a microkernel
+    retype/map stress proof without changing semantics or adding fallbacks. Local validation:
+    `cargo fmt --all` and executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+    --target x86_64-unknown-none`. Review adjustment: rerun the serialized desktop proof and confirm
+    the boot advances through PnP `bochsmp.sys`, services SCM readiness, and genuine
+    userinit/Explorer paint before closing this slice.
+    Bounded PnP registry snapshot follow-up (2026-08-19): serialized boot
+    `.tmp/run-headless-spawn-trace-20260819.log` passed the microkernel runtime/spec baseline,
+    dynamic hosted-driver launch through `bochsmp.sys`, and profile image publication, then stopped
+    inside the runtime PnP snapshot after `pnp-snapshot-config-begin`. The evidence points at the
+    executive registry transcode path rather than seL4 scheduling: raw SYSTEM imports zero usable
+    devnodes, while the generated CONFIG hive is the boot state already seeded into the live
+    Configuration Manager. The fix makes both generated-hive and REGF subtree imports path-bounded
+    with visited-key checks, adds crate tests for cyclic import protection, tightens raw SYSTEM Enum
+    detection to device-node-shaped keys, and makes the cached generated CONFIG hive the first
+    runtime PnP snapshot source when present. Local validation: `cargo fmt --all`,
+    `cargo test -p nt-hive-core config_manager_import_skips_cyclic_hive_subtrees -- --nocapture`,
+    `cargo test -p nt-hive-regf config_manager_import_skips_cyclic_regf_subtrees -- --nocapture`,
+    executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun the serialized desktop
+    proof next; accepted progress is `pnp-snapshot-config-end` with nonzero devnodes followed by
+    SCM/userinit/Explorer startup, without synthetic event signalling or boot-specific identity
+    fallbacks.
+    Lazy hosted root-image mapping follow-up (2026-08-19): the post-PnP capacity stall was a
+    structural component-spawn problem, not a BOOTBOOT file-size limit and not a proven microkernel
+    scheduler defect. Hosted driver and win32k components no longer eagerly copy/map every page of
+    the executive/rootserver image into every component VSpace. `spawn_component` builds the normal
+    address-space skeleton and demand-maps root-image pages on component faults, tagging those map
+    caps to the component owner for teardown. Serialized proof
+    `.tmp/run-headless-lazy-root-image-20260819.log` passes the microkernel runtime specs through
+    `All specs passed!`, starts E1000, DmaPnpPowerTest, and bochsmp through the dynamic PnP route,
+    publishes the hosted bochsmp video route, and keeps the generic hardware gates green. The run
+    then reaches `service_sec_image` initialization and reads the FS-backed core images
+    `csrss.exe`, `winlogon.exe`, `services.exe`, and `lsass.exe` before the next no-progress
+    frontier. Review adjustment: keep the microkernel baseline healthy; add a focused microkernel
+    cap-copy scalability spec only if a later proof points at cap operations again. The active NT
+    blocker is now SEC_IMAGE setup after bootstrap image registration. The System32 directory cache
+    has been moved from the resettable executive bump heap into the persistent file pool, and bounded
+    `[sec-init]` phase markers now bracket bootstrap image load, pinned DLL load, DLL registry
+    reservation, and handler setup so the next serialized proof identifies the exact remaining
+    service-image setup step.
+
+    AHCI/FAT load and pre-user-shell gate follow-up (2026-08-19): the serialized headless proof
+    `.tmp/run-headless-ahci-cluster-batch-20260820.log` confirms the latest low-level baseline under
+    live load: BOOTBOOT loads the initrd, the in-boot rust-micro specs reach `All specs passed!`,
+    generic hardware gates pass, and large FS-backed executable reads complete for `userinit.exe`,
+    `explorer.exe`, `svchost.exe`, and `rpcss.exe` through the bounded AHCI/FAT path. Real winlogon
+    api0 callbacks paint the logon dialog controls, SCM starts real service processes, and
+    noninteractive service processes attach to win32k through real thread callouts. The run is still
+    rejected as a desktop proof because it gates at winlogon's empty `GetMessage` steady state with
+    `services.exe` live and `userinit=0 explorer=0`; this is not a microkernel/BOOTBOOT failure and
+    not a reason to synthesize shell launch. The quiesce rule now defers the winlogon milestone gate
+    while no user shell exists and any non-winlogon top-level hosted process remains runnable. Review
+    adjustment: rerun one serialized desktop proof. If it still stops before `userinit.exe`, use the
+    new services/user-shell quiesce dump to fix the first real SCM/CM/service-database semantic.
+
+    Pre-user-shell liveness and snapshot batching retry (2026-08-20): the follow-up visible desktop
+    proof `.tmp/run-desktop-pre-user-shell-bulk-snapshot-20260820.log` was manually stopped after
+    the frontier became clear, so it is not an accepted desktop proof. It does confirm the
+    microkernel/BOOTBOOT side is healthy for this image shape: BOOTBOOT loads the 8,501,760-byte
+    initrd, the rootserver text is 15,958,016 bytes, in-boot rust-micro specs reach
+    `All specs passed!`, and storage/framebuffer/HPET/PCI/AHCI gates all pass. The old premature
+    services quiesce no longer fires while pre-user-shell work can still run; SCM dynamically admits
+    `eventlog.exe`, `svchost.exe`, `rpcss.exe`, and another `svchost.exe`, real SCM/EventLog/RPC
+    named-pipe traffic flows, and winlogon reaches genuine modal `WM_PAINT` dispatches through api0,
+    `NtUserBeginPaint`, and `NtUserEndPaint`. The new raw-snapshot bulk path is locally validated
+    and removes the sector-at-a-time snapshot writer as the visible stall. The remaining blocker is
+    later and NT-side: winlogon remains in its real modal logon UI with `userinit=0` and
+    `explorer=none` while service startup/RPC work continues; no `WlxActivateUserShell`,
+    `NtLoadKey`, dynamic `userinit.exe`, or dynamic `explorer.exe` launch occurs before the stop.
+    Review adjustment: keep the microkernel baseline green unless a later proof produces concrete
+    cap/scheduler evidence. Continue at the generic SCM/service-control/profile transition that
+    should let winlogon leave the logon dialog and activate the real user shell; do not add
+    service-name launch policy, synthetic shell signalling, or winlogon-specific quiesce success.

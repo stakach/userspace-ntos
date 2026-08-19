@@ -309,8 +309,7 @@ unsafe fn video_state_snapshot() -> VideoBridgeState {
 pub(crate) fn video_device_map_ready() -> bool {
     unsafe {
         let state = video_state_snapshot();
-        state.map_ready()
-            && video_io_route_ready()
+        state.map_ready() && video_io_route_ready()
     }
 }
 
@@ -631,12 +630,9 @@ pub(crate) unsafe fn video_device_io_control(
     } else {
         return 1;
     };
-    if let Some(information) = dispatch_video_port_owned_control(
-        ioctl as u32,
-        input,
-        output,
-        objects.device,
-    ) {
+    if let Some(information) =
+        dispatch_video_port_owned_control(ioctl as u32, input, output, objects.device)
+    {
         match information {
             Ok(information) if information <= u32::MAX as usize => {
                 set_ret(information as u32);
@@ -646,18 +642,20 @@ pub(crate) unsafe fn video_device_io_control(
         }
     }
     match state.route.backend {
-        VideoRouteBackend::HostedIoManager => match crate::driver_launch::device_control_on_io_handle(
-            state.route.file_handle,
-            ioctl as u32,
-            input,
-            output,
-        ) {
-            Ok(information) if information <= u32::MAX as u64 => {
-                set_ret(information as u32);
-                0
+        VideoRouteBackend::HostedIoManager => {
+            match crate::driver_launch::device_control_on_io_handle(
+                state.route.file_handle,
+                ioctl as u32,
+                input,
+                output,
+            ) {
+                Ok(information) if information <= u32::MAX as u64 => {
+                    set_ret(information as u32);
+                    0
+                }
+                _ => 1,
             }
-            _ => 1,
-        },
+        }
         VideoRouteBackend::Empty => 1,
     }
 }

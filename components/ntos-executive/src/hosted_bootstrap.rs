@@ -5,7 +5,10 @@
 //! reach back into the historical descriptor table.
 #![allow(clippy::all)]
 
-use crate::{register_hosted_process_runtime_for_image, HOSTED_PROCESS_IMAGE_CAP};
+use crate::{
+    hosted_process_runtime_for_pi, register_hosted_process_runtime_for_image,
+    HOSTED_PROCESS_IMAGE_CAP,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedBootstrapLoadSpec {
@@ -168,8 +171,10 @@ pub(crate) fn register_loaded_hosted_image(
 ) -> Result<(), nt_exe_image::HostedImageRegistrationError> {
     if loaded {
         catalog.register_ref(image)?;
-        register_hosted_process_runtime_for_image(image)
-            .expect("hosted process runtime layout must register once when image is loaded");
+        if hosted_process_runtime_for_pi(image.pi).is_none() {
+            register_hosted_process_runtime_for_image(image)
+                .expect("hosted process runtime layout must register once when image is loaded");
+        }
     }
     Ok(())
 }

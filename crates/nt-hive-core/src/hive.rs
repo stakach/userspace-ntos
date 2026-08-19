@@ -650,8 +650,13 @@ impl Hive {
     /// The relative path of a key cell within the hive (`\Sub\Key`).
     pub fn key_path(&self, id: CellId) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
+        let mut visited: Vec<CellId> = Vec::new();
         let mut cur = self.key(id)?;
         while let Some(p) = cur.parent {
+            if visited.iter().any(|seen| *seen == cur.id) {
+                return None;
+            }
+            visited.push(cur.id);
             parts.push(&cur.name);
             cur = self.key(p)?;
         }

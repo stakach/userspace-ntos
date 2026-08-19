@@ -98,7 +98,7 @@ pub(crate) unsafe fn storage_probe(
         let mut fs_miss = 0u32; // files that fell back to the flat ::NAME
         macro_rules! open_or_sys32 {
             ($leaf:expr, $short:expr) => {{
-                match open_sys32(&fs, $leaf) {
+                match open_sys32_uncached(&fs, $leaf) {
                     Some((c, s)) => {
                         fs_hits += 1;
                         Some((c, s, 0u8))
@@ -115,7 +115,7 @@ pub(crate) unsafe fn storage_probe(
         }
         macro_rules! open_or_path {
             ($path:expr, $short:expr) => {{
-                match fat_open_path(&fs, $path) {
+                match fat_open_path_uncached(&fs, $path) {
                     Some((c, s)) => {
                         fs_hits += 1;
                         Some((c, s, 0u8))
@@ -393,7 +393,7 @@ pub(crate) unsafe fn storage_probe(
         // Resolved BY PATH from \reactos\system32\ntdll.dll (verdict bit 0x100 = the by-path spec,
         // set ONLY on a genuine path resolution), falling back to the flat ::NTDLL.DLL. Bytes are
         // identical, so the loaded ntdll is unchanged.
-        let ntdll_ent = match open_sys32(&fs, b"ntdll.dll") {
+        let ntdll_ent = match open_sys32_uncached(&fs, b"ntdll.dll") {
             Some((c, s)) => {
                 fs_hits += 1;
                 verdict |= 0x100;
@@ -648,6 +648,8 @@ pub(crate) unsafe fn iopt_map(iopt_cap: u64, io_space_cap: u64, io_address: u64)
         inout("rdi") iopt_cap => _,
         inout("rsi") msginfo => reply,
         inout("r10") io_address => _, // mr0 = io_address (args.a2)
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -675,6 +677,8 @@ pub(crate) unsafe fn map_io(
         inout("rsi") msginfo => reply,
         inout("r10") rights => _,    // mr0 = rights (args.a2)
         inout("r8") io_address => _, // mr1 = io_address (args.a3)
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -700,6 +704,8 @@ pub(crate) unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) -> 
         inout("r8") last as u64 => _,
         inout("r9") dest_slot => _,
         inout("r15") 64u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -716,6 +722,8 @@ pub(crate) unsafe fn io_out16(ioport: u64, port: u16, value: u16) -> u64 {
         inout("rsi") (LBL_IOPORT_OUT16 << 12) | 2 => reply,
         inout("r10") port as u64 => _,
         inout("r8") value as u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -733,6 +741,8 @@ pub(crate) unsafe fn io_out32(ioport: u64, port: u16, value: u32) -> u64 {
         inout("rsi") (LBL_IOPORT_OUT32 << 12) | 2 => reply,
         inout("r10") port as u64 => _,
         inout("r8") value as u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -754,6 +764,8 @@ pub(crate) unsafe fn io_in16_r(ioport: u64, port: u16) -> (u16, u64) {
         inout("rdi") ioport => _,
         inout("rsi") ((LBL_IOPORT_IN16 << 12) | 1) => reply,
         inout("r10") port as u64 => value, // mr0 in = port; reply mr0 = value
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -775,6 +787,8 @@ pub(crate) unsafe fn io_in32_r(ioport: u64, port: u16) -> (u32, u64) {
         inout("rdi") ioport => _,
         inout("rsi") ((LBL_IOPORT_IN32 << 12) | 1) => reply,
         inout("r10") port as u64 => value, // mr0 in = port; reply mr0 = value
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),

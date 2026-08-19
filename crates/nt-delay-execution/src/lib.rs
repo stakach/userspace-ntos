@@ -26,12 +26,55 @@ pub fn ticks_to_100ns(ticks: u64, period_fs: u64) -> u64 {
     ((ticks as u128 * period_fs as u128) / 100_000_000u128).min(u64::MAX as u128) as u64
 }
 
+pub fn counter_epoch_offset(epoch_now_100ns: u64, counter_now_100ns: u64) -> i64 {
+    let delta = epoch_now_100ns as i128 - counter_now_100ns as i128;
+    if delta > i64::MAX as i128 {
+        i64::MAX
+    } else if delta < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        delta as i64
+    }
+}
+
+pub fn epoch_time_from_counter(counter_now_100ns: u64, offset_100ns: i64) -> u64 {
+    if offset_100ns >= 0 {
+        counter_now_100ns.saturating_add(offset_100ns as u64)
+    } else {
+        counter_now_100ns.saturating_sub(offset_100ns.unsigned_abs())
+    }
+}
+
+pub fn counter_time_from_epoch(epoch_time_100ns: u64, offset_100ns: i64) -> u64 {
+    if offset_100ns >= 0 {
+        epoch_time_100ns.saturating_sub(offset_100ns as u64)
+    } else {
+        epoch_time_100ns.saturating_add(offset_100ns.unsigned_abs())
+    }
+}
+
 pub fn hundred_ns_to_ticks_ceil(value: u64, period_fs: u64) -> u64 {
     if value == 0 || period_fs == 0 {
         return 0;
     }
     let numerator = value as u128 * 100_000_000u128;
     ((numerator + period_fs as u128 - 1) / period_fs as u128).min(u64::MAX as u128) as u64
+}
+
+pub fn timer_arm_target_ticks(
+    deadline_100ns: u64,
+    period_fs: u64,
+    now_ticks: u64,
+    min_delta_ticks: u64,
+) -> u64 {
+    let deadline_ticks = hundred_ns_to_ticks_ceil(deadline_100ns, period_fs);
+    deadline_ticks.max(now_ticks.saturating_add(min_delta_ticks.max(1)))
+}
+
+pub fn timer_min_delta_ticks(min_delta_100ns: u64, period_fs: u64, floor_ticks: u64) -> u64 {
+    hundred_ns_to_ticks_ceil(min_delta_100ns, period_fs)
+        .max(floor_ticks)
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +198,51 @@ mod tests {
         assert_eq!(ticks_to_100ns(10, period_fs), 1);
         assert_eq!(hundred_ns_to_ticks_ceil(1, period_fs), 10);
         assert_eq!(hundred_ns_to_ticks_ceil(2, period_fs), 20);
+    }
+
+    #[test]
+    fn counter_epoch_offset_preserves_preexisting_epoch() {
+        let offset = counter_epoch_offset(5_000, 4_250);
+        assert_eq!(offset, 750);
+        assert_eq!(epoch_time_from_counter(4_250, offset), 5_000);
+        assert_eq!(counter_time_from_epoch(5_000, offset), 4_250);
+    }
+
+    #[test]
+    fn counter_epoch_offset_can_shift_running_counter_back() {
+        let offset = counter_epoch_offset(2_000, 3_250);
+        assert_eq!(offset, -1_250);
+        assert_eq!(epoch_time_from_counter(3_250, offset), 2_000);
+        assert_eq!(counter_time_from_epoch(2_000, offset), 3_250);
+    }
+
+    #[test]
+    fn counter_epoch_conversion_saturates_at_bounds() {
+        assert_eq!(epoch_time_from_counter(u64::MAX - 1, 8), u64::MAX);
+        assert_eq!(epoch_time_from_counter(4, -8), 0);
+        assert_eq!(counter_time_from_epoch(4, 8), 0);
+        assert_eq!(counter_time_from_epoch(u64::MAX - 1, -8), u64::MAX);
+    }
+
+    #[test]
+    fn timer_arm_target_keeps_comparator_in_the_future() {
+        let period_fs = 10_000_000;
+        assert_eq!(timer_arm_target_ticks(200, period_fs, 1000, 32), 2000);
+        assert_eq!(timer_arm_target_ticks(101, period_fs, 1000, 32), 1032);
+        assert_eq!(timer_arm_target_ticks(90, period_fs, 1000, 32), 1032);
+        assert_eq!(
+            timer_arm_target_ticks(90, period_fs, u64::MAX - 5, 32),
+            u64::MAX
+        );
+        assert_eq!(timer_arm_target_ticks(90, period_fs, 1000, 0), 1001);
+    }
+
+    #[test]
+    fn timer_min_delta_uses_time_guard_with_tick_floor() {
+        let period_fs = 10_000_000;
+        assert_eq!(timer_min_delta_ticks(10_000, period_fs, 4096), 100_000);
+        assert_eq!(timer_min_delta_ticks(1, period_fs, 4096), 4096);
+        assert_eq!(timer_min_delta_ticks(0, period_fs, 0), 1);
     }
 
     #[test]

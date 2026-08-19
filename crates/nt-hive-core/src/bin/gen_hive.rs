@@ -13,7 +13,8 @@ use nt_config_manager::{SERVICE_BOOT_START, SERVICE_DEMAND_START};
 use nt_hive_core::reactos_network_ipv4_defaults_for_interface;
 use nt_hive_core::{
     encode_image, import_control_set_class_into_config_manager,
-    import_control_set_enum_into_config_manager, import_control_set_services_into_config_manager,
+    import_control_set_enum_into_config_manager, import_control_set_network_into_config_manager,
+    import_control_set_services_into_config_manager,
     seed_reactos_network_bindings_from_config_manager_into_target,
     seed_reactos_network_setup_into_target, CellId, Hive, HiveKind, ReactOsSetupSeedTarget,
     RegistryValueType, CURRENT_CONTROL_SET_TARGET,
@@ -336,6 +337,8 @@ fn import_generated_hive_config_manager(hive: &Hive) -> ConfigManager {
         import_control_set_services_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
     let _ = import_control_set_enum_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
     let _ = import_control_set_class_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
+    let _ =
+        import_control_set_network_into_config_manager(hive, &mut cm, CURRENT_CONTROL_SET_TARGET);
     cm
 }
 
@@ -1296,5 +1299,29 @@ mod tests {
                 utf16le_sz(E1000_INTERFACE_NAME).as_slice()
             ))
         );
+    }
+
+    #[test]
+    fn decoded_generated_hive_import_keeps_network_setup_idempotent() {
+        let bytes = encode_image(&build_hive());
+        let hive = decode_image(&bytes).expect("generated hive decodes");
+        let mut cm = import_generated_hive_config_manager(&hive);
+
+        assert_eq!(cm.devnode_count(), 3);
+        let stats = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
+        assert_eq!(stats, nt_hive_core::ReactOsNetworkSetupSeedStats::default());
+
+        let tcpip_linkage = cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Tcpip\Linkage")
+            .expect("TCPIP linkage");
+        assert_eq!(
+            cm.registry().query_multi_string(tcpip_linkage, "Bind"),
+            Some(vec![String::from(E1000_EXPORT_NAME)])
+        );
+        let e1000 = cm
+            .devnode(E1000_INSTANCE_ID)
+            .expect("generated E1000 devnode");
+        assert_eq!(e1000.service.as_deref(), Some("E1000"));
     }
 }

@@ -166,7 +166,11 @@ commented arms:
 
 - **winlogon SAS-window milestone** (`:3289`): park #8 quiesces once
   `WINLOGON_KEY_OPENED && LSA_RPC_SERVER_ACTIVE_SIGNALLED` (winlogon crossed msgina
-  GINA init AND lsass signalled its RPC-server-active event).
+  GINA init AND lsass signalled its RPC-server-active event), but only if no
+  pre-user-shell top-level hosted work remains runnable. Desktop proofs must not
+  terminate just because winlogon's queue reached its steady blocking
+  `GetMessage`; while `userinit.exe` has not spawned and SCM/service work can still
+  run, the gate is deferred to the next real progress or the 45s watchdog dump.
 - **winlogon WinMain event-wait** (`:3458`): winlogon's worker parked + its main
   parked on an event, **guarded by `LSA_RPC_SERVER_ACTIVE_SIGNALLED != 0`.** ★ This
   guard is the load-bearing paint-ordering invariant: winlogon `WaitForLsass`

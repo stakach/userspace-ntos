@@ -289,6 +289,11 @@ impl<'a> PeFile<'a> {
         exports::parse_exports(self.bytes, &self.headers, self.sections())
     }
 
+    /// Look up one named export without allocating the complete export list.
+    pub fn export_rva_by_name(&self, name: &str) -> Result<Option<u32>, PeError> {
+        exports::export_rva_by_name(self.bytes, &self.headers, self.sections(), name)
+    }
+
     /// Read a NUL-terminated ASCII string at `rva` (via the section table). Used by the loader to
     /// read forwarder strings (`"TARGETDLL.func"`) out of the export directory.
     pub fn cstr_at_rva(&self, rva: u32) -> Result<alloc::string::String, PeError> {

@@ -11,15 +11,124 @@ struct DirFindLfnScratch {
     lfn: [u8; 260],
 }
 
+#[repr(C)]
+struct FatSectorCacheScratch {
+    sector: u32,
+    valid: u32,
+    data: [u8; 512],
+}
+
 const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
-const _: () =
-    assert!(FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 <= 0x1000);
+const FAT32_FAT_CACHE_OFFSET: u64 =
+    (FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 + 7) & !7;
+const _: () = assert!(
+    FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
+);
+
+const SYSTEM32_CACHE_CAP: usize = 2048;
+const SYSTEM32_CACHE_NAME_CAP: usize = 96;
+
+#[derive(Clone, Copy)]
+struct System32CacheEntry {
+    name_len: u8,
+    attr: u8,
+    cluster: u32,
+    size: u32,
+    name: [u8; SYSTEM32_CACHE_NAME_CAP],
+}
+
+impl System32CacheEntry {
+    const EMPTY: Self = Self {
+        name_len: 0,
+        attr: 0,
+        cluster: 0,
+        size: 0,
+        name: [0; SYSTEM32_CACHE_NAME_CAP],
+    };
+}
+
+const SYSTEM32_CACHE_STATE_BASE: usize = crate::allocator::COMPONENT_LOCAL_WORD_BASE;
+const SYSTEM32_CACHE_STATE_PTR: usize = SYSTEM32_CACHE_STATE_BASE;
+const SYSTEM32_CACHE_STATE_COUNT: usize = SYSTEM32_CACHE_STATE_BASE + 8;
+const SYSTEM32_CACHE_STATE_READY: usize = SYSTEM32_CACHE_STATE_BASE + 16;
+const SYSTEM32_CACHE_STATE_OVERFLOW: usize = SYSTEM32_CACHE_STATE_BASE + 24;
+
+const _: () = assert!(4 <= crate::allocator::COMPONENT_LOCAL_WORDS);
+
+unsafe fn system32_cache_state_read(offset: usize) -> u64 {
+    core::ptr::read_volatile(offset as *const u64)
+}
+
+unsafe fn system32_cache_state_write(offset: usize, value: u64) {
+    core::ptr::write_volatile(offset as *mut u64, value);
+}
+
+unsafe fn system32_cache_entries_mut() -> Option<&'static mut [System32CacheEntry]> {
+    let ptr = system32_cache_state_read(SYSTEM32_CACHE_STATE_PTR) as *mut System32CacheEntry;
+    if !ptr.is_null() {
+        return Some(core::slice::from_raw_parts_mut(ptr, SYSTEM32_CACHE_CAP));
+    }
+
+    let bytes = core::mem::size_of::<System32CacheEntry>()
+        .checked_mul(SYSTEM32_CACHE_CAP)
+        .and_then(|bytes| u32::try_from(bytes).ok())?;
+    let allocated = pool_alloc(bytes)? as *mut System32CacheEntry;
+    system32_cache_state_write(SYSTEM32_CACHE_STATE_PTR, allocated as u64);
+    Some(core::slice::from_raw_parts_mut(
+        allocated,
+        SYSTEM32_CACHE_CAP,
+    ))
+}
+
+unsafe fn system32_cache_entries() -> Option<&'static [System32CacheEntry]> {
+    let ptr = system32_cache_state_read(SYSTEM32_CACHE_STATE_PTR) as *const System32CacheEntry;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(core::slice::from_raw_parts(ptr, SYSTEM32_CACHE_CAP))
+    }
+}
 
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
 pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
-    ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64);
-    (fs.dma_vaddr + 0x800) as *const u8
+    fat_read_sector_checked(fs, sector)
+        .unwrap_or((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
+}
+
+unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> {
+    let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64);
+    if status == 0xFF {
+        print_str(b"[fat-sector] read timeout sector=");
+        print_u64(sector as u64);
+        print_str(b"\n");
+        return None;
+    }
+    Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
+}
+
+unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Option<*const u8> {
+    let status = ahci_read_sectors(
+        fs.ahci_vaddr,
+        fs.dma_vaddr,
+        fs.dma_paddr,
+        sector as u64,
+        count,
+    );
+    if status == 0xFF {
+        print_str(b"[fat-sector] read timeout sector=");
+        print_u64(sector as u64);
+        print_str(b" count=");
+        print_u64(count as u64);
+        print_str(b"\n");
+        return None;
+    }
+    Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
+}
+
+unsafe fn fat_cache_invalidate(fs: &Fat32) {
+    let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
+    cache.valid = 0;
 }
 
 /// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
@@ -28,8 +137,35 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
     if fs.bps != 512 || data.len() != fs.bps as usize {
         return 0xff;
     }
-    core::ptr::copy_nonoverlapping(data.as_ptr(), (fs.dma_vaddr + 0x800) as *mut u8, data.len());
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
+        data.len(),
+    );
     ahci_write_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64)
+}
+
+#[allow(dead_code)]
+pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
+    if fs.bps != 512 || data.is_empty() || data.len() % fs.bps as usize != 0 {
+        return 0xff;
+    }
+    let sectors = (data.len() / fs.bps as usize) as u32;
+    if sectors == 0 || sectors > AHCI_MAX_SECTORS_PER_WRITE {
+        return 0xff;
+    }
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
+        data.len(),
+    );
+    ahci_write_sectors(
+        fs.ahci_vaddr,
+        fs.dma_vaddr,
+        fs.dma_paddr,
+        sector as u64,
+        sectors,
+    )
 }
 
 #[allow(dead_code)]
@@ -52,13 +188,27 @@ pub(crate) fn fat_cluster_sector(fs: &Fat32, cluster: u32) -> u32 {
     fs.data_start + (cluster - 2) * fs.spc
 }
 
+const FAT_EOC_MIN: u32 = 0x0FFF_FFF8;
+
 /// Follow the FAT: next cluster after `cluster` (>= 0x0FFF_FFF8 means end-of-chain).
 pub(crate) unsafe fn fat_next(fs: &Fat32, cluster: u32) -> u32 {
     let byte = cluster * 4;
     let sec = fs.fat_start + byte / fs.bps;
     let off = (byte % fs.bps) as u64;
-    let p = fat_read_sector(fs, sec);
-    (core::ptr::read_unaligned(p.add(off as usize) as *const u32)) & 0x0FFF_FFFF
+    let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
+    if cache.valid != 1 || cache.sector != sec {
+        let p = match fat_read_sector_checked(fs, sec) {
+            Some(p) => p,
+            None => return 0x0FFF_FFFF,
+        };
+        core::ptr::copy_nonoverlapping(p, cache.data.as_mut_ptr(), cache.data.len());
+        cache.sector = sec;
+        cache.valid = 1;
+    }
+    if off as usize + core::mem::size_of::<u32>() > cache.data.len() {
+        return 0x0FFF_FFFF;
+    }
+    (core::ptr::read_unaligned(cache.data.as_ptr().add(off as usize) as *const u32)) & 0x0FFF_FFFF
 }
 
 /// Visit native directory entries in stable FAT stream order. LFN fragments are decoded by the
@@ -66,15 +216,31 @@ pub(crate) unsafe fn fat_next(fs: &Fat32, cluster: u32) -> u32 {
 pub(crate) unsafe fn fat_visit_directory(
     fs: &Fat32,
     dir_cluster: u32,
-    mut visit: impl FnMut(nt_fs::DirectoryEntry) -> bool,
+    mut visit: impl FnMut(nt_fs::DirectoryEntry, u32) -> bool,
 ) {
     let mut decoder = nt_fs::FatDirectoryDecoder::new();
     let cluster_bytes = fs.bps.saturating_mul(fs.spc);
     let mut file_index = 0u32;
     let mut cluster = dir_cluster;
+    let max_clusters = if fs.spc == 0 {
+        0
+    } else {
+        (fs.total_sectors / fs.spc).min(4096)
+    };
+    let mut clusters_seen = 0u32;
     while cluster >= 2 && cluster < 0x0fff_fff8 {
+        if clusters_seen >= max_clusters {
+            print_str(b"[fat-dir] visitor chain overrun cluster=");
+            print_u64(dir_cluster as u64);
+            print_str(b"\n");
+            return;
+        }
+        clusters_seen += 1;
         for sector in 0..fs.spc {
-            let data = fat_read_sector(fs, fat_cluster_sector(fs, cluster) + sector);
+            let data = match fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector) {
+                Some(data) => data,
+                None => return,
+            };
             for index in 0..(fs.bps as usize / 32) {
                 let mut slot = [0u8; 32];
                 core::ptr::copy_nonoverlapping(data.add(index * 32), slot.as_mut_ptr(), slot.len());
@@ -82,7 +248,7 @@ pub(crate) unsafe fn fat_visit_directory(
                     nt_fs::FatDirectorySlot::End => return,
                     nt_fs::FatDirectorySlot::Skipped => {}
                     nt_fs::FatDirectorySlot::Entry(record) => {
-                        if !visit(record.entry) {
+                        if !visit(record.entry, record.first_cluster) {
                             return;
                         }
                     }
@@ -98,6 +264,160 @@ pub(crate) unsafe fn fat_visit_directory(
     }
 }
 
+fn component_has_separator(name: &[u8]) -> bool {
+    name.iter().any(|byte| *byte == b'\\' || *byte == b'/')
+}
+
+fn ascii_units_to_lower(units: &[u16], out: &mut [u8; SYSTEM32_CACHE_NAME_CAP]) -> Option<usize> {
+    if units.is_empty() || units.len() > out.len() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < units.len() {
+        let unit = units[i];
+        if unit > 0x7f || unit == b'\\' as u16 || unit == b'/' as u16 {
+            return None;
+        }
+        out[i] = (unit as u8).to_ascii_lowercase();
+        i += 1;
+    }
+    Some(units.len())
+}
+
+unsafe fn system32_cache_insert(
+    cache: &mut [System32CacheEntry],
+    name: &[u8],
+    cluster: u32,
+    size: u32,
+    attr: u8,
+    next: &mut usize,
+) {
+    if name.is_empty() || name.len() > SYSTEM32_CACHE_NAME_CAP {
+        return;
+    }
+    let mut existing = 0usize;
+    while existing < *next {
+        let entry = &cache[existing];
+        let len = entry.name_len as usize;
+        if len == name.len() && entry.name[..len] == *name {
+            return;
+        }
+        existing += 1;
+    }
+    if *next >= SYSTEM32_CACHE_CAP {
+        let overflow = system32_cache_state_read(SYSTEM32_CACHE_STATE_OVERFLOW);
+        system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, overflow.saturating_add(1));
+        return;
+    }
+    let entry = &mut cache[*next];
+    *entry = System32CacheEntry::EMPTY;
+    entry.name_len = name.len() as u8;
+    entry.attr = attr;
+    entry.cluster = cluster;
+    entry.size = size;
+    entry.name[..name.len()].copy_from_slice(name);
+    *next += 1;
+}
+
+unsafe fn system32_cache_build(fs: &Fat32) -> bool {
+    let Some(cache) = system32_cache_entries_mut() else {
+        return false;
+    };
+    let Some((reactos_cluster, _, reactos_attr)) = dir_find_lfn(fs, fs.root_cl, b"reactos") else {
+        return false;
+    };
+    if reactos_attr & 0x10 == 0 {
+        return false;
+    }
+    let Some((system32_cluster, _, system32_attr)) =
+        dir_find_lfn(fs, reactos_cluster, b"system32")
+    else {
+        return false;
+    };
+    if system32_attr & 0x10 == 0 {
+        return false;
+    }
+
+    for entry in cache.iter_mut() {
+        *entry = System32CacheEntry::EMPTY;
+    }
+    system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, 0);
+    let mut next = 0usize;
+    fat_visit_directory(fs, system32_cluster, |record, first_cluster| {
+        let attr = record.attributes as u8;
+        let size = record.end_of_file.min(u32::MAX as u64) as u32;
+        let mut name = [0u8; SYSTEM32_CACHE_NAME_CAP];
+        if let Some(len) = ascii_units_to_lower(record.name(), &mut name) {
+            system32_cache_insert(cache, &name[..len], first_cluster, size, attr, &mut next);
+        }
+        if !record.short_name().is_empty() {
+            let mut alias = [0u8; SYSTEM32_CACHE_NAME_CAP];
+            if let Some(len) = ascii_units_to_lower(record.short_name(), &mut alias) {
+                system32_cache_insert(cache, &alias[..len], first_cluster, size, attr, &mut next);
+            }
+        }
+        true
+    });
+    system32_cache_state_write(SYSTEM32_CACHE_STATE_COUNT, next as u64);
+    print_str(b"[fat-cache] system32 entries=");
+    print_u64(next as u64);
+    print_str(b" overflow=");
+    print_u64(system32_cache_state_read(SYSTEM32_CACHE_STATE_OVERFLOW));
+    print_str(b"\n");
+    true
+}
+
+unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8)> {
+    if leaf.is_empty()
+        || leaf.len() > SYSTEM32_CACHE_NAME_CAP
+        || component_has_separator(leaf)
+    {
+        return None;
+    }
+    if system32_cache_state_read(SYSTEM32_CACHE_STATE_READY) == 0 {
+        if !system32_cache_build(fs) {
+            return None;
+        }
+        system32_cache_state_write(SYSTEM32_CACHE_STATE_READY, 1);
+    }
+    let count = system32_cache_state_read(SYSTEM32_CACHE_STATE_COUNT).min(SYSTEM32_CACHE_CAP as u64)
+        as usize;
+    let cache = system32_cache_entries()?;
+    let mut wanted = [0u8; SYSTEM32_CACHE_NAME_CAP];
+    let mut i = 0usize;
+    while i < leaf.len() {
+        wanted[i] = leaf[i].to_ascii_lowercase();
+        i += 1;
+    }
+    let mut index = 0usize;
+    while index < count {
+        let entry = &cache[index];
+        let len = entry.name_len as usize;
+        if len == leaf.len() && entry.name[..len] == wanted[..leaf.len()] {
+            return Some((entry.cluster, entry.size, entry.attr));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
+    const PREFIX: &[u8] = b"reactos\\system32\\";
+    const ALT_PREFIX: &[u8] = b"reactos/system32/";
+    let leaf = if path.len() > PREFIX.len()
+        && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
+        &path[PREFIX.len()..]
+    } else if path.len() > ALT_PREFIX.len()
+        && path[..ALT_PREFIX.len()].eq_ignore_ascii_case(ALT_PREFIX)
+    {
+        &path[ALT_PREFIX.len()..]
+    } else {
+        return None;
+    };
+    (!component_has_separator(leaf)).then_some(leaf)
+}
+
 /// Scan directory `dir_cluster` (following its cluster chain) for the 8.3 name `name11`
 /// (11 bytes, space-padded). Returns (first_cluster, size_bytes, attr). LFN / deleted /
 /// volume-label / free entries are skipped. Extracts the entry before any further reads.
@@ -109,7 +429,7 @@ pub(crate) unsafe fn dir_find(
     let mut cl = dir_cluster;
     while cl >= 2 && cl < 0x0FFF_FFF8 {
         for s in 0..fs.spc {
-            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
+            let p = fat_read_sector_checked(fs, fat_cluster_sector(fs, cl) + s)?;
             for e in 0..(fs.bps as usize / 32) {
                 let ent = p.add(e * 32);
                 let first = *ent;
@@ -155,22 +475,105 @@ pub(crate) unsafe fn fat_read_file(
 ) -> u32 {
     let mut cl = first_cluster;
     let mut written = 0u32;
+    let cluster_bytes = fs.bps.saturating_mul(fs.spc);
+    let max_clusters = if cluster_bytes == 0 {
+        0
+    } else {
+        size.div_ceil(cluster_bytes).saturating_add(1)
+    };
+    let mut clusters_seen = 0u32;
     while cl >= 2 && cl < 0x0FFF_FFF8 && written < size {
-        for s in 0..fs.spc {
-            if written >= size {
+        if clusters_seen >= max_clusters {
+            print_str(b"[fat-read] cluster chain overrun first=");
+            print_u64(first_cluster as u64);
+            print_str(b" current=");
+            print_u64(cl as u64);
+            print_str(b" written=");
+            print_u64(written as u64);
+            print_str(b" size=");
+            print_u64(size as u64);
+            print_str(b"\n");
+            break;
+        }
+        if fs.spc == 1 {
+            let remaining_bytes = size - written;
+            let cluster_limit = remaining_bytes
+                .div_ceil(cluster_bytes)
+                .min(AHCI_MAX_SECTORS_PER_READ)
+                .max(1);
+            let mut run_clusters = 1u32;
+            let mut last_cluster = cl;
+            let mut next_after_run = fat_next(fs, last_cluster);
+            while run_clusters < cluster_limit
+                && next_after_run == last_cluster.wrapping_add(1)
+                && next_after_run < FAT_EOC_MIN
+            {
+                last_cluster = next_after_run;
+                run_clusters += 1;
+                next_after_run = fat_next(fs, last_cluster);
+            }
+            let Some(p) = fat_read_sectors_checked(fs, fat_cluster_sector(fs, cl), run_clusters)
+            else {
+                return written;
+            };
+            let bytes = (run_clusters * fs.bps).min(remaining_bytes);
+            core::ptr::copy_nonoverlapping(
+                p,
+                (dest_vaddr + written as u64) as *mut u8,
+                bytes as usize,
+            );
+            if run_clusters > 1 {
+                fat_cache_invalidate(fs);
+            }
+            written += bytes;
+            clusters_seen = clusters_seen.saturating_add(run_clusters);
+            if next_after_run == last_cluster {
+                print_str(b"[fat-read] self-referential cluster chain first=");
+                print_u64(first_cluster as u64);
+                print_str(b" cluster=");
+                print_u64(last_cluster as u64);
+                print_str(b"\n");
                 break;
             }
-            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
-            let n = core::cmp::min(fs.bps, size - written);
-            for i in 0..n as u64 {
-                core::ptr::write_volatile(
-                    (dest_vaddr + written as u64 + i) as *mut u8,
-                    *p.add(i as usize),
-                );
-            }
-            written += n;
+            cl = next_after_run;
+            continue;
         }
-        cl = fat_next(fs, cl);
+
+        clusters_seen += 1;
+        let mut s = 0u32;
+        while s < fs.spc && written < size {
+            let remaining_bytes = size - written;
+            let sectors = (fs.spc - s)
+                .min(remaining_bytes.div_ceil(fs.bps))
+                .min(AHCI_MAX_SECTORS_PER_READ)
+                .max(1);
+            let Some(p) =
+                fat_read_sectors_checked(fs, fat_cluster_sector(fs, cl) + s, sectors)
+            else {
+                return written;
+            };
+            let bytes = (sectors * fs.bps).min(remaining_bytes);
+            core::ptr::copy_nonoverlapping(
+                p,
+                (dest_vaddr + written as u64) as *mut u8,
+                bytes as usize,
+            );
+            if sectors > 1 {
+                fat_cache_invalidate(fs);
+            }
+            written += bytes;
+            s += sectors;
+        }
+        let next = fat_next(fs, cl);
+        if next == cl {
+            print_str(b"[fat-read] self-referential cluster chain first=");
+            print_u64(first_cluster as u64);
+            print_str(b" cluster=");
+            print_u64(cl as u64);
+            print_str(b"\n");
+            break;
+        }
+        cl = next;
     }
     written
 }
@@ -206,7 +609,11 @@ pub(crate) unsafe fn fat_read_file_range(
                 continue;
             }
             let start = within_cluster.saturating_sub(sector_start) as usize;
-            let data = fat_read_sector(fs, fat_cluster_sector(fs, cluster) + sector);
+            let Some(data) =
+                fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector)
+            else {
+                return written;
+            };
             let count = (fs.bps as usize - start).min(wanted - written);
             core::ptr::copy_nonoverlapping(
                 data.add(start),
@@ -269,9 +676,24 @@ pub(crate) unsafe fn dir_find_lfn(
     let mut hi_ord = 0usize;
     let mut have_lfn = false;
     let mut cl = dir_cluster;
+    let max_clusters = if fs.spc == 0 {
+        0
+    } else {
+        (fs.total_sectors / fs.spc).min(4096)
+    };
+    let mut clusters_seen = 0u32;
     while cl >= 2 && cl < 0x0FFF_FFF8 {
+        if clusters_seen >= max_clusters {
+            print_str(b"[fat-dir] directory chain overrun cluster=");
+            print_u64(dir_cluster as u64);
+            print_str(b" component=");
+            print_str(comp);
+            print_str(b"\n");
+            return None;
+        }
+        clusters_seen += 1;
         for s in 0..fs.spc {
-            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
+            let p = fat_read_sector_checked(fs, fat_cluster_sector(fs, cl) + s)?;
             for e in 0..(fs.bps as usize / 32) {
                 let ent = p.add(e * 32);
                 let first = *ent;
@@ -368,7 +790,16 @@ pub(crate) unsafe fn dir_find_lfn(
                 hi_ord = 0;
             }
         }
-        cl = fat_next(fs, cl);
+        let next = fat_next(fs, cl);
+        if next == cl {
+            print_str(b"[fat-dir] self-referential directory chain cluster=");
+            print_u64(dir_cluster as u64);
+            print_str(b" component=");
+            print_str(comp);
+            print_str(b"\n");
+            return None;
+        }
+        cl = next;
     }
     None
 }
@@ -413,7 +844,18 @@ fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
 /// — sufficient for the real ReactOS tree, whose names carry clean 8.3 aliases. Each non-final
 /// component must be a directory (FAT attr bit 0x10). This is the FS-backed-by-path primitive:
 /// the seam a full `\SystemRoot\system32\X` loader generalizes (see P7).
-pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32, u32, u8)> {
+unsafe fn fat_open_path_entry_inner(
+    fs: &Fat32,
+    path: &[u8],
+    use_system32_cache: bool,
+) -> Option<(u32, u32, u8)> {
+    if use_system32_cache {
+        if let Some(leaf) = system32_leaf_from_volume_path(path) {
+            if let Some(entry) = system32_cache_lookup(fs, leaf) {
+                return Some(entry);
+            }
+        }
+    }
     let mut cur = fs.root_cl;
     let mut start = 0usize;
     let mut i = 0usize;
@@ -439,16 +881,36 @@ pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32
     result
 }
 
+pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32, u32, u8)> {
+    fat_open_path_entry_inner(fs, path, true)
+}
+
+pub(crate) unsafe fn fat_open_path_entry_uncached(
+    fs: &Fat32,
+    path: &[u8],
+) -> Option<(u32, u32, u8)> {
+    fat_open_path_entry_inner(fs, path, false)
+}
+
+pub(crate) unsafe fn fat_open_path_uncached(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
+    let (cluster, size, attributes) = fat_open_path_entry_uncached(fs, path)?;
+    (attributes & 0x10 == 0).then_some((cluster, size))
+}
+
 pub(crate) unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
     let (cluster, size, attributes) = fat_open_path_entry(fs, path)?;
     (attributes & 0x10 == 0).then_some((cluster, size))
 }
 
-/// Open `\reactos\system32\<leaf>` from the volume (the common ReactOS binary location) via the
-/// LFN-aware path walk. Returns `(first_cluster, size)`. Builds the path in a stack buffer (the
-/// storage host has no allocator). `leaf` may itself contain `\` for a sub-dir (e.g.
-/// `b"drivers\\dxg.sys"`, `b"config\\system"`).
-pub(crate) unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
+unsafe fn open_sys32_path(fs: &Fat32, leaf: &[u8], use_system32_cache: bool) -> Option<(u32, u32)> {
+    if use_system32_cache {
+        if let Some(entry) = system32_cache_lookup(fs, leaf) {
+            if entry.2 & 0x10 == 0 {
+                return Some((entry.0, entry.1));
+            }
+            return None;
+        }
+    }
     let mut path = [0u8; 160];
     let mut n = 0usize;
     for &c in b"reactos\\system32\\" {
@@ -461,7 +923,28 @@ pub(crate) unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
         n += 1;
         i += 1;
     }
-    fat_open_path(fs, &path[..n])
+    if use_system32_cache {
+        fat_open_path(fs, &path[..n])
+    } else {
+        fat_open_path_uncached(fs, &path[..n])
+    }
+}
+
+/// Open `\reactos\system32\<leaf>` from the volume (the common ReactOS binary location) via the
+/// LFN-aware path walk. Returns `(first_cluster, size)`. Builds the path in a stack buffer (the
+/// storage host has no allocator). `leaf` may itself contain `\` for a sub-dir (e.g.
+/// `b"drivers\\dxg.sys"`, `b"config\\system"`).
+pub(crate) unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
+    open_sys32_path(fs, leaf, true)
+}
+
+/// Same path walk as [`open_sys32`], but without touching the executive's System32 cache.
+///
+/// The isolated storage host runs with the shared executive image mapped read-only and must never call
+/// rootserver services such as cap allocation or the file pool. It can still do the real FAT walk and
+/// copy bytes into its granted staging buffers.
+pub(crate) unsafe fn open_sys32_uncached(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
+    open_sys32_path(fs, leaf, false)
 }
 
 /// Does `\reactos\system32\<leaf>` exist on the executive's live FS? The REAL-FS existence
@@ -544,8 +1027,21 @@ pub(crate) unsafe fn load_dll_from_fs(
     path: &[u8],
     name: &[u8],
 ) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
+    print_str(b"[ntos-exec] FS-by-path begin ");
+    print_str(name);
+    print_str(b" path=");
+    print_str(path);
+    print_str(b"\n");
     if let Some(fs) = exec_fs() {
         if let Some((va, sz)) = load_file_to_pool(&fs, path) {
+            print_str(b"[ntos-exec] FS-by-path read ");
+            print_str(name);
+            print_str(b" bytes=");
+            print_u64(sz as u64);
+            print_str(b" @pool=0x");
+            print_hex((va >> 32) as u32);
+            print_hex(va as u32);
+            print_str(b"\n");
             let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
             if let Ok(pe) = nt_pe_loader::PeFile::parse(bytes) {
                 print_str(b"[ntos-exec] FS-by-path ");
@@ -561,7 +1057,15 @@ pub(crate) unsafe fn load_dll_from_fs(
             print_str(b"[ntos-exec] FS-by-path ");
             print_str(name);
             print_str(b": PARSE FAILED\n");
+        } else {
+            print_str(b"[ntos-exec] FS-by-path ");
+            print_str(name);
+            print_str(b": LOAD FAILED\n");
         }
+    } else {
+        print_str(b"[ntos-exec] FS-by-path ");
+        print_str(name);
+        print_str(b": NO FS\n");
     }
     (None, 0)
 }
@@ -893,14 +1397,25 @@ unsafe fn open_dll_read_result(
 /// Read `\reactos\system32\<leaf>` into a fresh pool buffer, returning `(va, size)`. Like
 /// `load_file_to_pool` but with the System32 prefix built in.
 unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), DemandLoadError> {
+    print_str(b"[diag-fat-load] open-sys32 ");
+    print_str(leaf);
+    print_str(b"\n");
     let (cluster, size) = open_sys32(fs, leaf).ok_or(DemandLoadError::FileMissing)?;
+    print_str(b"[diag-fat-load] read cluster=");
+    print_u64(cluster as u64);
+    print_str(b" size=");
+    print_u64(size as u64);
+    print_str(b"\n");
     open_cluster_read_result(fs, cluster, size)
 }
 
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
 /// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
-    let _ = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    if ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0) == 0xFF {
+        print_str(b"[fat-sector] read timeout sector=0\n");
+        return None;
+    }
     let bp = |o: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + o) as *const u8);
     let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
     let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
@@ -942,36 +1457,90 @@ pub(crate) static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POOL_INITED: AtomicU64 = AtomicU64::new(0);
 
 /// Reserve the pool's page tables in the executive's VSpace (once). Idempotent.
-pub(crate) unsafe fn pool_init() {
-    if POOL_INITED.swap(1, Ordering::Relaxed) != 0 {
-        return;
+pub(crate) unsafe fn pool_init() -> bool {
+    if POOL_INITED.load(Ordering::Relaxed) != 0 {
+        return true;
     }
     for p in 0..POOL_PTS {
         let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            POOL_VADDR + p * 0x20_0000,
-            CAP_INIT_THREAD_VSPACE,
-        );
+        let retype_error =
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        if retype_error != 0 {
+            print_str(b"[file-pool] page-table retype failed slot=0x");
+            print_hex((pt >> 32) as u32);
+            print_hex(pt as u32);
+            print_str(b" error=");
+            print_u64(retype_error);
+            print_str(b"\n");
+            return false;
+        }
+        let va = POOL_VADDR + p * 0x20_0000;
+        let map_error = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, va, CAP_INIT_THREAD_VSPACE);
+        if map_error != 0 {
+            print_str(b"[file-pool] page-table map failed slot=0x");
+            print_hex((pt >> 32) as u32);
+            print_hex(pt as u32);
+            print_str(b" va=0x");
+            print_hex((va >> 32) as u32);
+            print_hex(va as u32);
+            print_str(b" error=");
+            print_u64(map_error);
+            print_str(b"\n");
+            let _ = cnode_delete_recycle_r(pt);
+            return false;
+        }
     }
+    POOL_INITED.store(1, Ordering::Relaxed);
+    true
 }
 
 /// Allocate `nbytes` (page-rounded) of pool space, mapping fresh RW frames into the executive's
 /// VSpace. Returns the base VA, or None if the pool is exhausted. Bump-only (no free) — pool buffers
 /// live for the whole run, exactly like the fixed buffers they replace.
 pub(crate) unsafe fn pool_alloc(nbytes: u32) -> Option<u64> {
-    pool_init();
+    if !pool_init() {
+        return None;
+    }
     let pages = ((nbytes as u64) + 0xFFF) / 0x1000;
     let off = POOL_NEXT.fetch_add(pages * 0x1000, Ordering::Relaxed);
     if off + pages * 0x1000 > POOL_PTS * 0x20_0000 {
+        print_str(b"[file-pool] exhausted request=");
+        print_u64(nbytes as u64);
+        print_str(b" used=");
+        print_u64(off);
+        print_str(b" cap=");
+        print_u64(POOL_PTS * 0x20_0000);
+        print_str(b"\n");
         return None;
     }
     let base = POOL_VADDR + off;
     for i in 0..pages {
-        let f = alloc_frame();
-        let _ = page_map(f, base + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let (f, frame_error) = alloc_frame_r();
+        if frame_error != 0 || f == 0 {
+            print_str(b"[file-pool] frame retype failed va=0x");
+            let va = base + i * 0x1000;
+            print_hex((va >> 32) as u32);
+            print_hex(va as u32);
+            print_str(b" error=");
+            print_u64(frame_error);
+            print_str(b"\n");
+            return None;
+        }
+        let va = base + i * 0x1000;
+        let map_error = page_map_r(f, va, RW_NX, CAP_INIT_THREAD_VSPACE);
+        if map_error != 0 {
+            print_str(b"[file-pool] frame map failed frame=0x");
+            print_hex((f >> 32) as u32);
+            print_hex(f as u32);
+            print_str(b" va=0x");
+            print_hex((va >> 32) as u32);
+            print_hex(va as u32);
+            print_str(b" error=");
+            print_u64(map_error);
+            print_str(b"\n");
+            let _ = cnode_delete_recycle_r(f);
+            return None;
+        }
     }
     Some(base)
 }
@@ -981,12 +1550,31 @@ pub(crate) unsafe fn pool_alloc(nbytes: u32) -> Option<u64> {
 /// resident for the run so a PeFile parsed over them + the demand-fault router keep working. This is
 /// the single call the per-binary staging blocks collapse into: open path → bytes.
 pub(crate) unsafe fn load_file_to_pool(fs: &Fat32, path: &[u8]) -> Option<(u64, u32)> {
+    print_str(b"[fat-load] open begin path=");
+    print_str(path);
+    print_str(b"\n");
     let (cluster, size) = fat_open_path(fs, path)?;
+    print_str(b"[fat-load] open end cluster=");
+    print_u64(cluster as u64);
+    print_str(b" size=");
+    print_u64(size as u64);
+    print_str(b"\n");
     if size == 0 {
         return None;
     }
     let va = pool_alloc(size)?;
+    print_str(b"[fat-load] read begin size=");
+    print_u64(size as u64);
+    print_str(b" va=0x");
+    print_hex((va >> 32) as u32);
+    print_hex(va as u32);
+    print_str(b"\n");
     let read = fat_read_file(fs, cluster, size, va);
+    print_str(b"[fat-load] read end actual=");
+    print_u64(read as u64);
+    print_str(b" expected=");
+    print_u64(size as u64);
+    print_str(b"\n");
     if read < size {
         return None;
     }

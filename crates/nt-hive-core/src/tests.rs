@@ -38,6 +38,23 @@ fn hive_create_open_set_query() {
 }
 
 #[test]
+fn hive_key_path_rejects_cyclic_parent_chain() {
+    let mut h = Hive::new(HiveKind::System);
+    let parent = h.create_key(r"ControlSet001\Services\Loop");
+    let child = h.create_key(r"ControlSet001\Services\Loop\Child");
+    if let Some(Cell::Key(key)) = h
+        .cells
+        .get_mut(parent.0 as usize)
+        .and_then(|cell| cell.as_mut())
+    {
+        key.parent = Some(child);
+    }
+
+    assert_eq!(h.key_path(parent), None);
+    assert_eq!(h.key_path(child), None);
+}
+
+#[test]
 fn hive_class_metadata_roundtrips_in_image() {
     let mut h = Hive::new(HiveKind::Software);
     let key = h.create_key(r"Classes\Sample");
@@ -80,6 +97,7 @@ fn security_hive_lsa_policy_paths_roundtrip_in_image() {
 
     let image = encode_image(&hive);
     assert_eq!(encoded_image_len(&hive), Ok(image.len()));
+    assert_eq!(image_root_subkey_count_if_valid(&image), Ok(1));
     assert_eq!(
         image_value_len_if_valid(&image, r"Policy\PolAcDmS", ""),
         Ok(domain_sid.len())
@@ -111,6 +129,26 @@ fn security_hive_lsa_policy_paths_roundtrip_in_image() {
     assert_eq!(
         decoded.query_value(decoded_domain, ""),
         Some((RegistryValueType::Binary, domain_sid.as_slice()))
+    );
+}
+
+#[test]
+fn image_root_subkey_count_validates_without_materialising_hive() {
+    let root_only = Hive::new(HiveKind::Default);
+    let root_only_image = encode_image(&root_only);
+    assert_eq!(image_root_subkey_count_if_valid(&root_only_image), Ok(0));
+
+    let mut with_children = Hive::new(HiveKind::Default);
+    with_children.create_key(r"Control Panel\International");
+    with_children.create_key(r"Software\ReactOS");
+    let image = encode_image(&with_children);
+    assert_eq!(image_root_subkey_count_if_valid(&image), Ok(2));
+
+    let mut corrupted = image.clone();
+    corrupted[20] ^= 0x5a;
+    assert_eq!(
+        image_root_subkey_count_if_valid(&corrupted),
+        Err(HiveDecodeError::BadChecksum)
     );
 }
 
@@ -598,6 +636,43 @@ fn imports_control_set_services_into_config_manager() {
 }
 
 #[test]
+fn config_manager_import_skips_cyclic_hive_subtrees() {
+    let mut h = Hive::new(HiveKind::System);
+    let svc = h.create_key(r"ControlSet001\Services\Loop");
+    h.set_value(
+        svc,
+        "ImagePath",
+        RegistryValueType::ExpandSz,
+        utf16le_sz(r"system32\drivers\loop.sys"),
+    );
+    h.set_dword(svc, "Type", nt_config_manager::SERVICE_KERNEL_DRIVER);
+    h.set_dword(svc, "Start", nt_config_manager::SERVICE_SYSTEM_START);
+    h.set_dword(svc, "ErrorControl", 1);
+    let child = h.create_key(r"ControlSet001\Services\Loop\Child");
+    if let Some(Cell::Key(key)) = h
+        .cells
+        .get_mut(child.0 as usize)
+        .and_then(|cell| cell.as_mut())
+    {
+        key.subkeys.push(svc);
+    }
+
+    let mut cm = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_services_into_config_manager(&h, &mut cm, "ControlSet001"),
+        1
+    );
+    assert!(cm
+        .registry()
+        .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Loop\Child")
+        .is_some());
+    assert!(cm
+        .registry()
+        .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Loop\Child\Loop")
+        .is_none());
+}
+
+#[test]
 fn imports_service_group_order_for_service_database_order() {
     let mut h = Hive::new(HiveKind::System);
     let group_key = h.create_key(r"ControlSet001\Control\ServiceGroupOrder");
@@ -936,6 +1011,249 @@ fn manager_live_apply_can_share_value_payload_while_log_replays_bytes() {
     assert_eq!(booted_data[0], 0x31);
     assert_eq!(booted_data[booted_data.len() - 1], 0xd4);
     assert_eq!(booted.query_dword(booted_dest, "ReplayOnly"), Some(99));
+}
+
+#[test]
+fn manager_live_apply_replays_repeated_setup_style_mutations() {
+    let mut provider = MemoryHiveIoProvider::new();
+    let mut hive = Hive::new(HiveKind::System);
+
+    for (service, start, group) in [
+        ("Ndis", 0u32, "NDIS Wrapper"),
+        ("Tcpip", 1u32, "PNP_TDI"),
+        ("Afd", 1u32, "TDI"),
+    ] {
+        let path = alloc::format!(r"ControlSet001\Services\{}", service);
+        {
+            let mut manager = HiveManager::for_live_hive(provider, &hive);
+            manager
+                .mutate_with_live_apply(&mut hive, HiveLogOp::CreateKey { path: &path }, |hive| {
+                    hive.create_key(&path);
+                    true
+                })
+                .unwrap();
+            provider = manager.into_provider();
+        }
+
+        let key = hive.open_key(&path).expect("service key");
+        for (name, value) in [("Type", 1u32), ("Start", start), ("ErrorControl", 1u32)] {
+            let data = value.to_le_bytes();
+            let mut manager = HiveManager::for_live_hive(provider, &hive);
+            manager
+                .mutate_with_live_apply(
+                    &mut hive,
+                    HiveLogOp::SetValue {
+                        path: &path,
+                        name,
+                        value_type: RegistryValueType::Dword,
+                        data: &data,
+                    },
+                    |hive| hive.set_value(key, name, RegistryValueType::Dword, data.to_vec()),
+                )
+                .unwrap();
+            provider = manager.into_provider();
+        }
+
+        let image_path = alloc::format!(r"system32\drivers\{}.sys", service.to_ascii_lowercase());
+        for (name, value_type, value) in [
+            (
+                "ImagePath",
+                RegistryValueType::ExpandSz,
+                utf16le_sz(&image_path),
+            ),
+            ("Group", RegistryValueType::Sz, utf16le_sz(group)),
+        ] {
+            let mut manager = HiveManager::for_live_hive(provider, &hive);
+            manager
+                .mutate_with_live_apply(
+                    &mut hive,
+                    HiveLogOp::SetValue {
+                        path: &path,
+                        name,
+                        value_type,
+                        data: &value,
+                    },
+                    |hive| hive.set_value(key, name, value_type, value.clone()),
+                )
+                .unwrap();
+            provider = manager.into_provider();
+        }
+    }
+
+    assert!(provider.get_status().log_len > 0);
+    let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
+    let tcpip = booted
+        .open_key(r"ControlSet001\Services\Tcpip")
+        .expect("Tcpip key");
+    assert_eq!(booted.query_dword(tcpip, "Type"), Some(1));
+    assert_eq!(booted.query_dword(tcpip, "Start"), Some(1));
+    let (ty, data) = booted.query_value(tcpip, "Group").expect("Tcpip Group");
+    assert_eq!(ty, RegistryValueType::Sz);
+    assert_eq!(data, utf16le_sz("PNP_TDI"));
+}
+
+struct LiveApplySetupSeedTarget {
+    provider: Option<MemoryHiveIoProvider>,
+    hive: Hive,
+}
+
+impl LiveApplySetupSeedTarget {
+    fn new(kind: HiveKind) -> Self {
+        Self {
+            provider: Some(MemoryHiveIoProvider::new()),
+            hive: Hive::new(kind),
+        }
+    }
+
+    fn booted(self, kind: HiveKind) -> Hive {
+        HiveManager::new(self.provider.expect("provider"))
+            .boot(kind)
+            .expect("boot live-apply hive")
+    }
+
+    fn with_manager<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut HiveManager<MemoryHiveIoProvider>, &mut Hive) -> bool,
+    {
+        let provider = self.provider.take().expect("provider");
+        let mut manager = HiveManager::for_live_hive(provider, &self.hive);
+        let changed = f(&mut manager, &mut self.hive);
+        self.provider = Some(manager.into_provider());
+        changed
+    }
+
+    fn system_rel_path(path: &str) -> String {
+        let aliased = apply_ccs_alias(path);
+        let components: Vec<&str> = aliased
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .collect();
+        let start = if components.len() >= 3
+            && components[0].eq_ignore_ascii_case("Registry")
+            && components[1].eq_ignore_ascii_case("Machine")
+            && components[2].eq_ignore_ascii_case("System")
+        {
+            3
+        } else {
+            0
+        };
+        let mut out = String::new();
+        for component in components[start..].iter().copied() {
+            if !out.is_empty() {
+                out.push('\\');
+            }
+            out.push_str(component);
+        }
+        out
+    }
+}
+
+impl ReactOsSetupSeedTarget for LiveApplySetupSeedTarget {
+    fn create_key(&mut self, path: &str) -> bool {
+        let path = Self::system_rel_path(path);
+        self.with_manager(|manager, hive| {
+            manager
+                .mutate_with_live_apply(hive, HiveLogOp::CreateKey { path: &path }, |hive| {
+                    hive.create_key(&path);
+                    true
+                })
+                .is_ok()
+        })
+    }
+
+    fn set_value(
+        &mut self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> bool {
+        if self.value_matches(path, name, value_type, &data) {
+            return false;
+        }
+        let path = Self::system_rel_path(path);
+        self.with_manager(|manager, hive| {
+            let key = hive.create_key(&path);
+            let live_data = data.clone();
+            manager
+                .mutate_with_live_apply(
+                    hive,
+                    HiveLogOp::SetValue {
+                        path: &path,
+                        name,
+                        value_type,
+                        data: &data,
+                    },
+                    |hive| hive.set_value(key, name, value_type, live_data),
+                )
+                .is_ok()
+        })
+    }
+
+    fn has_value(&self, path: &str, name: &str) -> bool {
+        let path = Self::system_rel_path(path);
+        self.hive
+            .open_key(&path)
+            .and_then(|key| self.hive.query_value(key, name))
+            .is_some()
+    }
+
+    fn value_matches(
+        &self,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: &[u8],
+    ) -> bool {
+        let path = Self::system_rel_path(path);
+        self.hive
+            .open_key(&path)
+            .and_then(|key| self.hive.query_value(key, name))
+            .is_some_and(|(ty, existing)| ty == value_type && existing == data)
+    }
+}
+
+#[test]
+fn manager_live_apply_replays_reactos_print_setup_seed() {
+    let mut target = LiveApplySetupSeedTarget::new(HiveKind::System);
+
+    let stats = seed_reactos_print_setup_into_target(&mut target);
+    assert_eq!(
+        stats,
+        ReactOsPrintSetupSeedStats {
+            root_values: 6,
+            environment_values: 2,
+            print_processor_values: 2,
+            monitor_values: 1,
+        }
+    );
+
+    assert!(target
+        .hive
+        .open_key(r"ControlSet001\Control\Print\Environments\Windows x64")
+        .is_some());
+
+    let booted = target.booted(HiveKind::System);
+    let env = booted
+        .open_key(r"ControlSet001\Control\Print\Environments\Windows x64")
+        .expect("Windows x64 print environment");
+    let (ty, data) = booted.query_value(env, "Directory").expect("Directory");
+    assert_eq!(ty, RegistryValueType::Sz);
+    assert_eq!(data, utf16le_sz("x64"));
+
+    let processor = booted
+        .open_key(r"ControlSet001\Control\Print\Environments\Windows x64\Print Processors\winprint")
+        .expect("x64 winprint processor");
+    let (ty, data) = booted.query_value(processor, "Driver").expect("Driver");
+    assert_eq!(ty, RegistryValueType::Sz);
+    assert_eq!(data, utf16le_sz("winprint.dll"));
+
+    let monitor = booted
+        .open_key(r"ControlSet001\Control\Print\Monitors\Local Port")
+        .expect("local port monitor");
+    let (ty, data) = booted.query_value(monitor, "Driver").expect("Driver");
+    assert_eq!(ty, RegistryValueType::Sz);
+    assert_eq!(data, utf16le_sz("localmon.dll"));
 }
 
 #[test]

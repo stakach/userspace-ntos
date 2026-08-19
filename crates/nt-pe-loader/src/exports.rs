@@ -62,3 +62,49 @@ pub fn parse_exports(
     }
     Ok(out)
 }
+
+/// Look up one named export without materializing the full export table.
+///
+/// This is the path the kernel should use when it needs a handful of loader entry points from a
+/// large user-mode DLL. It walks the same AddressOfNames/AddressOfNameOrdinals/AddressOfFunctions
+/// tables as [`parse_exports`], but borrows each export name directly from the image.
+pub fn export_rva_by_name(
+    bytes: &[u8],
+    headers: &Headers,
+    sections: &[Section],
+    target: &str,
+) -> Result<Option<u32>, PeError> {
+    let dir = headers.data_directory(DIRECTORY_ENTRY_EXPORT);
+    if dir.virtual_address == 0 || dir.size == 0 {
+        return Ok(None);
+    }
+    let base = dir.virtual_address;
+    let number_of_functions = u32_at_rva(bytes, sections, base + 20)?;
+    let number_of_names = u32_at_rva(bytes, sections, base + 24)?;
+    let address_of_functions = u32_at_rva(bytes, sections, base + 28)?;
+    let address_of_names = u32_at_rva(bytes, sections, base + 32)?;
+    let address_of_name_ordinals = u32_at_rva(bytes, sections, base + 36)?;
+
+    if number_of_names > MAX_EXPORTS || number_of_functions > MAX_EXPORTS {
+        return Err(PeError::ImportTableInvalid);
+    }
+
+    let target = target.as_bytes();
+    for i in 0..number_of_names {
+        let name_rva = u32_at_rva(bytes, sections, address_of_names + i * 4)?;
+        let name = cstr_at_rva(bytes, sections, name_rva)?;
+        if name != target {
+            continue;
+        }
+        let func_index = u16_at_rva(bytes, sections, address_of_name_ordinals + i * 2)?;
+        if func_index as u32 >= number_of_functions {
+            return Err(PeError::ImportTableInvalid);
+        }
+        return Ok(Some(u32_at_rva(
+            bytes,
+            sections,
+            address_of_functions + func_index as u32 * 4,
+        )?));
+    }
+    Ok(None)
+}

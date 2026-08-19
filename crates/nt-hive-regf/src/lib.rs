@@ -25,12 +25,13 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_config_manager::{
-    ConfigManager, Registry, RegistryKeyId, RegistryValueType, CONTROL_CLASS_PATH, ENUM_PATH,
-    SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
+    ConfigManager, Registry, RegistryKeyId, RegistryValueType, CONTROL_CLASS_PATH,
+    CONTROL_NETWORK_PATH, ENUM_PATH, SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
 };
 use nt_hive_core::{CellId, Hive, HiveKind};
 
 const HBIN_BASE: usize = 0x1000;
+const CONFIG_IMPORT_MAX_DEPTH: usize = 256;
 
 /// A parsed, read-only `regf` hive borrowing its raw bytes (no copy — the hive image is large and
 /// mapped once). Keys are referred to by their hbin-relative cell offset (`KeyRef`).
@@ -968,6 +969,28 @@ pub fn import_control_set_class_into_config_manager(
     count
 }
 
+/// Import `ControlSetXXX\Control\Network` from a read-only REGF hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\Network`.
+pub fn import_control_set_network_into_config_manager(
+    hive: &RegfHive<'_>,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_path = String::from(control_set);
+    src_path.push_str("\\Control\\Network");
+    let Some(src_network) = hive.open_key(&src_path) else {
+        return 0;
+    };
+    let dst_network = cm.registry_mut().create_key(CONTROL_NETWORK_PATH);
+    let class_names = hive.subkeys_raw(src_network);
+    let count = class_names.len();
+    for (name, src_child) in class_names {
+        let dst_child = cm.registry_mut().create_subkey(dst_network, &name);
+        import_regf_key(hive, src_child, cm.registry_mut(), dst_child);
+    }
+    count
+}
+
 /// Import `ControlSetXXX\Control\ServiceGroupOrder` from a read-only REGF hive into
 /// `\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder`.
 pub fn import_control_set_service_group_order_into_config_manager(
@@ -987,16 +1010,38 @@ pub fn import_control_set_service_group_order_into_config_manager(
 }
 
 fn import_regf_key(hive: &RegfHive<'_>, src: KeyRef, dst: &mut Registry, dst_key: RegistryKeyId) {
+    let mut visited = Vec::new();
+    import_regf_key_inner(hive, src, dst, dst_key, 0, &mut visited);
+}
+
+fn import_regf_key_inner(
+    hive: &RegfHive<'_>,
+    src: KeyRef,
+    dst: &mut Registry,
+    dst_key: RegistryKeyId,
+    depth: usize,
+    visited: &mut Vec<KeyRef>,
+) {
+    if depth > CONFIG_IMPORT_MAX_DEPTH || visited.iter().any(|key| *key == src) {
+        return;
+    }
+    visited.push(src);
     let mut index = 0usize;
     while let Some((value_name, raw_type, data)) = hive.value_by_index(src, index) {
         let value_type = RegistryValueType::from_u32(raw_type).unwrap_or(RegistryValueType::Binary);
         let _ = dst.set_value(dst_key, &value_name, value_type, data);
         index += 1;
     }
-    for (child_name, src_child) in hive.subkeys_raw(src) {
-        let dst_child = dst.create_subkey(dst_key, &child_name);
-        import_regf_key(hive, src_child, dst, dst_child);
+    if depth < CONFIG_IMPORT_MAX_DEPTH {
+        for (child_name, src_child) in hive.subkeys_raw(src) {
+            if visited.iter().any(|key| *key == src_child) {
+                continue;
+            }
+            let dst_child = dst.create_subkey(dst_key, &child_name);
+            import_regf_key_inner(hive, src_child, dst, dst_child, depth + 1, visited);
+        }
     }
+    let _ = visited.pop();
 }
 
 /// Fold a path component for case-insensitive comparison.
@@ -1410,6 +1455,27 @@ mod tests {
             .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
             .and_then(|key| cm.registry().query_dword(key, "Answer"));
         assert_eq!(answer, Some(42));
+    }
+
+    #[test]
+    fn config_manager_import_skips_cyclic_regf_subtrees() {
+        let mut data = services_test_hive();
+        write_subkey_list(&mut data, 0x440, &[0x300, 0x240]);
+        let hive = RegfHive::new(&data).expect("valid test hive");
+
+        let mut cm = ConfigManager::new();
+        assert_eq!(
+            import_control_set_services_into_config_manager(&hive, &mut cm, "ControlSet001"),
+            1
+        );
+        assert!(cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Parameters")
+            .is_some());
+        assert!(cm
+            .registry()
+            .open_key(r"\Registry\Machine\System\CurrentControlSet\Services\Npfs\Npfs")
+            .is_none());
     }
 
     #[test]

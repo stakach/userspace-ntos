@@ -1913,11 +1913,18 @@ fn registry_key_handles_have_independent_process_local_lifetimes() {
     assert_eq!(pm.lookup_handle(second, second_a), Some(target));
     assert_eq!(pm.handle_access(first, first_a), Some(0x3));
     assert_eq!(pm.handle_access(first, first_b), Some(0x1));
+    assert_eq!(pm.handle_object_count(target), 3);
 
     pm.close_handle(first, first_a).unwrap();
     assert_eq!(pm.lookup_handle(first, first_a), None);
     assert_eq!(pm.lookup_handle(first, first_b), Some(target));
     assert_eq!(pm.lookup_handle(second, second_a), Some(target));
+    assert_eq!(pm.handle_object_count(target), 2);
+
+    pm.close_handle(first, first_b).unwrap();
+    assert_eq!(pm.handle_object_count(target), 1);
+    pm.close_handle(second, second_a).unwrap();
+    assert_eq!(pm.handle_object_count(target), 0);
 }
 
 #[test]

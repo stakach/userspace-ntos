@@ -7,7 +7,8 @@ use nt_config_store::codec::{crc32c, Reader, Writer};
 
 use crate::hive::{Cell, CellId, Hive, HiveKind, KeyCell, RegistryValueType, ValueCell};
 
-const IMAGE_MAGIC: [u8; 8] = *b"UNTHIVE1";
+pub const HIVE_IMAGE_MAGIC: [u8; 8] = *b"UNTHIVE1";
+const IMAGE_MAGIC: [u8; 8] = HIVE_IMAGE_MAGIC;
 const IMAGE_HEADER_LEN: usize = 8 + 2 + 2 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4; // 68
 const MIN_SCHEMA_VERSION: u16 = 1;
 const SCHEMA_VERSION: u16 = 2;
@@ -518,6 +519,92 @@ pub fn image_len_if_valid(bytes: &[u8]) -> Result<usize, HiveDecodeError> {
         return Err(HiveDecodeError::BadChecksum);
     }
     Ok(bytes.len())
+}
+
+/// Count root-key children in a valid core hive image without materialising a [`Hive`].
+///
+/// This is the content proof used by boot-time profile publication: it validates the image header,
+/// schema, payload bounds and CRCs, then scans the TLV payload in place. The scan is bounded by the
+/// payload length and does not allocate the registry arena.
+pub fn image_root_subkey_count_if_valid(bytes: &[u8]) -> Result<usize, HiveDecodeError> {
+    let mut r = Reader::new(bytes);
+    let magic = r.blob_fixed::<8>().ok_or(HiveDecodeError::Truncated)?;
+    if magic != IMAGE_MAGIC {
+        return Err(HiveDecodeError::BadMagic);
+    }
+    let header_len = r.u16().ok_or(HiveDecodeError::Truncated)? as usize;
+    if header_len != IMAGE_HEADER_LEN || bytes.len() < IMAGE_HEADER_LEN {
+        return Err(HiveDecodeError::Truncated);
+    }
+    let schema = r.u16().ok_or(HiveDecodeError::Truncated)?;
+    if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema) {
+        return Err(HiveDecodeError::UnsupportedSchema);
+    }
+    let _flags = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    let _kind = HiveKind::from_u32(r.u32().ok_or(HiveDecodeError::Truncated)?)
+        .ok_or(HiveDecodeError::UnsupportedSchema)?;
+    let _generation = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let _sequence = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let root_cell = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let _record_count = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    let payload_len64 = r.u64().ok_or(HiveDecodeError::Truncated)?;
+    if payload_len64 > usize::MAX as u64 {
+        return Err(HiveDecodeError::Truncated);
+    }
+    let payload_len = payload_len64 as usize;
+    let payload_crc = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    let header_crc = r.u32().ok_or(HiveDecodeError::Truncated)?;
+    if crc32c(&bytes[..IMAGE_HEADER_LEN - 4]) != header_crc {
+        return Err(HiveDecodeError::BadChecksum);
+    }
+    let image_len = IMAGE_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(HiveDecodeError::Truncated)?;
+    let payload = bytes
+        .get(IMAGE_HEADER_LEN..image_len)
+        .ok_or(HiveDecodeError::Truncated)?;
+    if crc32c(payload) != payload_crc {
+        return Err(HiveDecodeError::BadChecksum);
+    }
+
+    let mut pr = Reader::new(payload);
+    let mut saw_root = false;
+    let mut root_subkeys = 0usize;
+    while !pr.is_empty() {
+        match pr.u16().ok_or(HiveDecodeError::Truncated)? {
+            REC_KEY_CELL => {
+                let raw_id = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                let parent_raw = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                let _name = take_len_prefixed_slice(&mut pr)?;
+                let _flags = pr.u32().ok_or(HiveDecodeError::Truncated)?;
+                if pr.u8().ok_or(HiveDecodeError::Truncated)? != 0 {
+                    let _class_name = take_len_prefixed_slice(&mut pr)?;
+                }
+                if schema >= 2 && pr.u8().ok_or(HiveDecodeError::Truncated)? != 0 {
+                    let _security_descriptor = take_len_prefixed_slice(&mut pr)?;
+                }
+                let _last_write_sequence = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                if raw_id == root_cell {
+                    saw_root = true;
+                } else if parent_raw == root_cell {
+                    root_subkeys = root_subkeys.saturating_add(1);
+                }
+            }
+            REC_VALUE_CELL => {
+                let _raw_id = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                let _raw_parent_key = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+                let _name = take_len_prefixed_slice(&mut pr)?;
+                let _ty = pr.u32().ok_or(HiveDecodeError::Truncated)?;
+                let _data = take_len_prefixed_slice(&mut pr)?;
+                let _last_write_sequence = pr.u64().ok_or(HiveDecodeError::Truncated)?;
+            }
+            _ => return Err(HiveDecodeError::Truncated),
+        }
+    }
+    if !saw_root {
+        return Err(HiveDecodeError::Truncated);
+    }
+    Ok(root_subkeys)
 }
 
 fn take_len_prefixed_slice<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], HiveDecodeError> {

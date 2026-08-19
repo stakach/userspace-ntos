@@ -186,6 +186,24 @@ impl FileData {
             }
         }
     }
+
+    fn to_vec(&self, blobs: &[Vec<u8>]) -> Option<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes.clone()),
+            Self::Extents(_) => {
+                let len = self.len(blobs);
+                let mut out = Vec::new();
+                out.try_reserve_exact(len).ok()?;
+                out.resize(len, 0);
+                let read = self.read_into(blobs, 0, &mut out);
+                if read == len {
+                    Some(out)
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 struct Crc32c {
@@ -1942,6 +1960,16 @@ impl MemFs {
         }
     }
 
+    fn file_data_owned(&self, rel_path: &str) -> Option<Vec<u8>> {
+        let id = self.lookup(rel_path)?;
+        let node = self.node(id)?;
+        if node.is_dir {
+            None
+        } else {
+            node.data.to_vec(&self.blobs)
+        }
+    }
+
     fn file_data_folded_relative(&self, rel_path: &[u8]) -> Option<&[u8]> {
         let id = self.lookup_folded_relative(rel_path)?;
         let node = self.node(id)?;
@@ -1949,6 +1977,16 @@ impl MemFs {
             None
         } else {
             node.data.contiguous_slice(&self.blobs)
+        }
+    }
+
+    fn file_len(&self, rel_path: &str) -> Option<u64> {
+        let id = self.lookup(rel_path)?;
+        let node = self.node(id)?;
+        if node.is_dir {
+            None
+        } else {
+            Some(node.data.len(&self.blobs) as u64)
         }
     }
 
@@ -2029,6 +2067,91 @@ impl MemFs {
             data.resize(start + bytes.len(), 0);
         }
         data[start..start + bytes.len()].copy_from_slice(bytes);
+        bytes.len()
+    }
+
+    fn append_at_end(&mut self, id: u64, bytes: &[u8]) -> usize {
+        let Some(node) = self.node(id) else {
+            return 0;
+        };
+        if node.is_dir {
+            return 0;
+        }
+        if bytes.is_empty() {
+            return 0;
+        }
+        let mut appended = Vec::new();
+        if appended.try_reserve_exact(bytes.len()).is_err() {
+            return 0;
+        }
+        appended.extend_from_slice(bytes);
+
+        let data = {
+            let Some(node) = self.node_mut(id) else {
+                return 0;
+            };
+            core::mem::replace(&mut node.data, FileData::Extents(Vec::new()))
+        };
+
+        let mut extents = match data {
+            FileData::Extents(mut extents) => {
+                if extents.try_reserve_exact(1).is_err() {
+                    if let Some(node) = self.node_mut(id) {
+                        node.data = FileData::Extents(extents);
+                    }
+                    return 0;
+                }
+                extents
+            }
+            FileData::Bytes(existing) => {
+                let existing_len = existing.len();
+                let extent_count = usize::from(existing_len != 0) + 1;
+                let mut extents = Vec::new();
+                if extents.try_reserve_exact(extent_count).is_err() {
+                    if let Some(node) = self.node_mut(id) {
+                        node.data = FileData::Bytes(existing);
+                    }
+                    return 0;
+                }
+                if existing_len != 0 {
+                    if self.blobs.try_reserve_exact(1).is_err() {
+                        if let Some(node) = self.node_mut(id) {
+                            node.data = FileData::Bytes(existing);
+                        }
+                        return 0;
+                    }
+                    let blob = self.blobs.len();
+                    self.blobs.push(existing);
+                    extents.push(FileExtent {
+                        blob,
+                        offset: 0,
+                        len: existing_len,
+                    });
+                }
+                extents
+            }
+        };
+
+        if self.blobs.try_reserve_exact(1).is_err() {
+            if let Some(node) = self.node_mut(id) {
+                node.data = FileData::Extents(extents);
+            }
+            return 0;
+        }
+        let blob = self.blobs.len();
+        self.blobs.push(appended);
+        Self::push_extent_merged(
+            &mut extents,
+            FileExtent {
+                blob,
+                offset: 0,
+                len: bytes.len(),
+            },
+        );
+        let Some(node) = self.node_mut(id) else {
+            return 0;
+        };
+        node.data = FileData::Extents(extents);
         bytes.len()
     }
 
@@ -2539,6 +2662,56 @@ impl FileSystem {
         (STATUS_SUCCESS, n)
     }
 
+    /// Append bytes to the end of an open file without scanning unrelated immutable backing blobs.
+    pub fn zw_append_file(&mut self, handle: u64, data: &[u8]) -> (u32, usize) {
+        let Some(obj) = self.obj(handle) else {
+            return (STATUS_INVALID_HANDLE, 0);
+        };
+        let node_id = obj.node_id;
+        if self.volume.is_dir(node_id) {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
+        if data.is_empty() {
+            return (STATUS_SUCCESS, 0);
+        }
+        let n = self.volume.append_at_end(node_id, data);
+        if n == 0 {
+            return (STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        let end = self.volume.size(node_id);
+        self.obj_mut(handle).unwrap().current_offset = end;
+        (STATUS_SUCCESS, n)
+    }
+
+    /// Append bytes to a file named by NT path without allocating a transient `FILE_OBJECT`.
+    ///
+    /// This is still the same mounted-volume create/open and append operation as the Zw facade, but
+    /// it is intended for kernel-owned metadata streams such as hive journals where the caller
+    /// already has the path and does not need a handle cursor.
+    pub fn append_file_by_path(&mut self, path: &str, data: &[u8]) -> (u32, usize) {
+        if data.is_empty() {
+            return (STATUS_SUCCESS, 0);
+        }
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return (STATUS_OBJECT_PATH_NOT_FOUND, 0);
+        };
+        let (node_id, _) = match self
+            .volume
+            .create(&rel, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, 0)
+        {
+            Ok(result) => result,
+            Err(status) => return (status, 0),
+        };
+        if self.volume.is_dir(node_id) {
+            return (STATUS_FILE_IS_A_DIRECTORY, 0);
+        }
+        let written = self.volume.append_at_end(node_id, data);
+        if written != data.len() {
+            return (STATUS_INSUFFICIENT_RESOURCES, written);
+        }
+        (STATUS_SUCCESS, written)
+    }
+
     /// Replace the whole contents of an open file by taking ownership of `data`.
     ///
     /// This is an internal helper for checkpoint providers that already materialized a complete
@@ -2779,6 +2952,31 @@ impl FileSystem {
         self.volume.set_file_data(id, bytes)
     }
 
+    /// Create `path` as a FILE by taking ownership of `bytes`.
+    ///
+    /// This is for installed/kernel-owned provisioning paths that already built the complete image
+    /// buffer. On path/type failure the buffer is returned to the caller so it can be retained for a
+    /// later mount attempt instead of being silently dropped.
+    pub fn provision_file_owned(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), Vec<u8>> {
+        let Some(rel) = self.to_relative(&normalize_separators(path)) else {
+            return Err(bytes);
+        };
+        let Some((parent_path, leaf)) = MemFs::parent_and_leaf(&rel) else {
+            return Err(bytes);
+        };
+        let parent = self.volume.ensure_dir(parent_path);
+        let id = match self.volume.child(parent, leaf) {
+            Some(id) => id,
+            None => self.volume.create_child(parent, leaf, false),
+        };
+        if self.volume.is_dir(id) {
+            return Err(bytes);
+        }
+        let installed = self.volume.set_file_data_owned(id, bytes);
+        debug_assert!(installed);
+        Ok(())
+    }
+
     /// Create a file by folded volume-relative path, and create every missing directory above it.
     pub fn provision_file_relative(&mut self, relative: &[u8], bytes: &[u8]) -> bool {
         let Some((parent_path, leaf)) = MemFs::parent_and_leaf_bytes(relative) else {
@@ -2805,6 +3003,19 @@ impl FileSystem {
     pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
         let rel = self.to_relative(&normalize_separators(path))?;
         self.volume.file_data(&rel)
+    }
+
+    /// A file's bytes copied into an owned buffer. Unlike [`file_bytes`](Self::file_bytes), this
+    /// works for extent-backed append files whose contents are not stored as one contiguous slice.
+    pub fn file_bytes_owned(&self, path: &str) -> Option<Vec<u8>> {
+        let rel = self.to_relative(&normalize_separators(path))?;
+        self.volume.file_data_owned(&rel)
+    }
+
+    /// A file's logical byte length, including extent-backed append files.
+    pub fn file_len(&self, path: &str) -> Option<u64> {
+        let rel = self.to_relative(&normalize_separators(path))?;
+        self.volume.file_len(&rel)
     }
 
     /// A file's bytes by folded volume-relative path.

@@ -132,6 +132,16 @@ pub(crate) static NTUSER_DAT_PROVISIONED: AtomicU64 = AtomicU64::new(0);
 /// copying the raw `config\default` prototype would reintroduce the stale setup-state bug.
 static mut SETUP_DEFAULT_USER_NTUSER_IMAGE: Option<alloc::vec::Vec<u8>> = None;
 
+const REGF_HIVE_MAGIC: [u8; 4] = *b"regf";
+
+fn is_regf_hive_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&REGF_HIVE_MAGIC)
+}
+
+fn is_core_hive_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&nt_hive_core::HIVE_IMAGE_MAGIC)
+}
+
 /// Is `path` a REAL regf hive on this volume? Checked by CONTENT, not by existence: the bytes must
 /// parse through the same `nt-hive-regf` navigator the registry mounts a hive with, AND its root
 /// must really enumerate subkeys (a zero-filled or truncated file cannot fake that). Returns the
@@ -140,6 +150,9 @@ pub(crate) fn regf_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
     let Some(bytes) = fs.file_bytes(path) else {
         return 0;
     };
+    if !is_regf_hive_image(bytes) {
+        return 0;
+    }
     match RegfHive::new(bytes) {
         Some(hive) if !hive.subkeys(hive.root()).is_empty() => bytes.len(),
         _ => 0,
@@ -147,23 +160,28 @@ pub(crate) fn regf_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
 }
 
 fn hive_image_ok(bytes: &[u8]) -> bool {
-    if RegfHive::new(bytes).is_some_and(|hive| !hive.subkeys(hive.root()).is_empty()) {
-        return true;
+    if is_core_hive_image(bytes) {
+        return nt_hive_core::image_root_subkey_count_if_valid(bytes).is_ok_and(|subkeys| subkeys > 0);
     }
-    nt_hive_core::decode_image(bytes).is_ok_and(|hive| hive.subkey_count(hive.root()) > 0)
+    if is_regf_hive_image(bytes) {
+        return RegfHive::new(bytes).is_some_and(|hive| !hive.subkeys(hive.root()).is_empty());
+    }
+    false
 }
 
 /// Is `path` a mountable hive image on this volume? Accepts both real on-disk `regf` hives and this
 /// kernel's versioned mutable-hive checkpoints, matching `NtLoadKey`'s accepted source formats.
 pub(crate) fn hive_image_len_on(fs: &nt_fs::FileSystem, path: &str) -> usize {
-    let regf_len = regf_len_on(fs, path);
-    if regf_len != 0 {
-        return regf_len;
-    }
     let Some(bytes) = fs.file_bytes(path) else {
         return 0;
     };
-    nt_hive_core::image_len_if_valid(bytes).unwrap_or(0)
+    if is_core_hive_image(bytes) {
+        return nt_hive_core::image_len_if_valid(bytes).unwrap_or(0);
+    }
+    if is_regf_hive_image(bytes) {
+        return regf_len_on(fs, path);
+    }
+    0
 }
 
 /// Return the byte length of a value inside a hive image file on the writable volume.
@@ -179,13 +197,16 @@ pub(crate) fn hive_image_value_len_on(
     let Some(bytes) = fs.file_bytes(path) else {
         return 0;
     };
-    if let Some(regf) = RegfHive::new(bytes) {
+    if is_core_hive_image(bytes) {
+        return nt_hive_core::image_value_len_if_valid(bytes, key_path, value_name).unwrap_or(0);
+    }
+    if let Some(regf) = is_regf_hive_image(bytes).then(|| RegfHive::new(bytes)).flatten() {
         return regf
             .open_key(key_path)
             .and_then(|key| regf.value(key, value_name))
             .map_or(0, |(_, data)| data.len());
     }
-    nt_hive_core::image_value_len_if_valid(bytes, key_path, value_name).unwrap_or(0)
+    0
 }
 
 /// [`hive_image_len_on`] against the LIVE mounted volume (the gate specs' read-back).
@@ -226,11 +247,24 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
     }
     let len = image.len() as u64;
     if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
+        let mut image_slot = Some(image);
         let (already_current, provisioned) = {
-            let fs = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut().unwrap();
-            let already_current = fs.file_bytes(DEFAULT_USER_NTUSER_DAT) == Some(image.as_slice());
-            let provisioned =
-                already_current || fs.provision_file(DEFAULT_USER_NTUSER_DAT, image.as_slice());
+            let fs = (*core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
+                .as_mut()
+                .unwrap();
+            let current_image = image_slot.as_ref().map(|image| image.as_slice());
+            let already_current = fs.file_bytes(DEFAULT_USER_NTUSER_DAT) == current_image;
+            let provisioned = if already_current {
+                true
+            } else {
+                match fs.provision_file_owned(DEFAULT_USER_NTUSER_DAT, image_slot.take().unwrap()) {
+                    Ok(()) => true,
+                    Err(returned) => {
+                        image_slot = Some(returned);
+                        false
+                    }
+                }
+            };
             if provisioned {
                 refresh_live_profile_source_proofs(fs);
             }
@@ -243,7 +277,7 @@ pub(crate) unsafe fn set_default_user_ntuser_dat_image(image: alloc::vec::Vec<u8
             *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = None;
             NTUSER_DAT_PROVISIONED.store(len, Ordering::Relaxed);
         } else {
-            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(image);
+            *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = image_slot;
         }
         provisioned
     } else {
@@ -288,7 +322,9 @@ pub(crate) const COPIED_PROFILE_PROBE_FILE: &str =
 /// Single-threaded executive; borrows the mounted volume for the duration of the query.
 pub(crate) unsafe fn directory_exists_at(path: &str) -> bool {
     match writable_fs() {
-        Some(fs) => fs.query_attributes(path).is_some_and(|info| info.is_directory),
+        Some(fs) => fs
+            .query_attributes(path)
+            .is_some_and(|info| info.is_directory),
         None => false,
     }
 }
@@ -438,7 +474,8 @@ impl AhciSnapshotDevice {
     }
 
     fn absolute_lba(&self, lba: u64) -> Result<u32, nt_fs::SnapshotBlockStoreError> {
-        let relative = u32::try_from(lba).map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        let relative =
+            u32::try_from(lba).map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
         if relative >= self.sectors {
             return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
         }
@@ -492,26 +529,57 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
         lba: u64,
         data: &[u8],
     ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
-        if data.len() != self.sector_size() {
+        self.write_sectors(lba, data)
+    }
+
+    fn write_sectors(
+        &mut self,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        let sector_size = self.sector_size();
+        if sector_size == 0 || data.is_empty() || data.len() % sector_size != 0 {
             return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
         }
-        let absolute = self.absolute_lba(lba)?;
-        let tfd = unsafe { crate::fs_loader::fat_write_sector(&self.fat, absolute, data) };
-        if tfd & 0x89 == 0 {
-            let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n % 2048 == 0 {
+        let total_sectors = u64::try_from(data.len() / sector_size)
+            .map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        let end = lba
+            .checked_add(total_sectors)
+            .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
+        if end > self.sectors as u64 {
+            return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
+        }
+
+        let max_chunk = AHCI_MAX_SECTORS_PER_WRITE as usize;
+        let mut sector_index = 0usize;
+        while sector_index < total_sectors as usize {
+            let chunk_sectors = (total_sectors as usize - sector_index).min(max_chunk);
+            let relative_lba = lba + sector_index as u64;
+            let absolute = self.absolute_lba(relative_lba)?;
+            let byte_start = sector_index * sector_size;
+            let byte_end = byte_start + chunk_sectors * sector_size;
+            let tfd = unsafe {
+                crate::fs_loader::fat_write_sectors(&self.fat, absolute, &data[byte_start..byte_end])
+            };
+            if tfd & 0x89 != 0 {
+                return Err(nt_fs::SnapshotBlockStoreError::Io);
+            }
+            let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS
+                .fetch_add(chunk_sectors as u64, Ordering::Relaxed);
+            if n < 8 || (n / 2048) != ((n + chunk_sectors as u64) / 2048) {
                 print_str(b"[writable-fs-snapshot] write-sector #");
-                print_u64(n.saturating_add(1));
+                print_u64(n.saturating_add(chunk_sectors as u64));
                 print_str(b" rel-lba=");
-                print_u64(lba);
+                print_u64(relative_lba);
                 print_str(b" abs-lba=");
                 print_u64(absolute as u64);
+                print_str(b" count=");
+                print_u64(chunk_sectors as u64);
                 print_str(b"\n");
             }
-            Ok(())
-        } else {
-            Err(nt_fs::SnapshotBlockStoreError::Io)
+            sector_index += chunk_sectors;
         }
+        Ok(())
     }
 }
 
@@ -749,8 +817,8 @@ fn restored_profile_source_tree_stats(fs: &mut nt_fs::FileSystem) -> StagedTreeS
                 if offset + DIRECTORY_NAME_OFFSET > result.information {
                     break;
                 }
-                let next = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap())
-                    as usize;
+                let next =
+                    u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
                 let attributes = u32::from_le_bytes(
                     buffer[offset + FILE_ATTRIBUTES_OFFSET..offset + FILE_ATTRIBUTES_OFFSET + 4]
                         .try_into()
@@ -830,7 +898,8 @@ fn refresh_restored_config_proofs(fs: &nt_fs::FileSystem) {
 
 unsafe fn provision_missing_installed_sources(fs: &mut nt_fs::FileSystem) -> bool {
     let mut changed = false;
-    if PROVISION_DEFAULT_USER_PROFILE && !has_directory_relative(fs, PROFILES_VOLUME_ROOT_RELATIVE) {
+    if PROVISION_DEFAULT_USER_PROFILE && !has_directory_relative(fs, PROFILES_VOLUME_ROOT_RELATIVE)
+    {
         let before = fs.node_count();
         provision_staged_profiles(fs);
         changed |= fs.node_count() != before;
@@ -868,7 +937,9 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
             Ok(None) => (nt_fs::FileSystem::new(nt_fs::MemFs::new()), false),
             Err(status) => {
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-                print_str(b"[writable-fs-snapshot] refusing writable mount after restore status=0x");
+                print_str(
+                    b"[writable-fs-snapshot] refusing writable mount after restore status=0x",
+                );
                 print_hex(status);
                 print_str(b"\n");
                 return None;
@@ -931,13 +1002,25 @@ pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> 
     fs.file_bytes(path)
 }
 
-/// Borrow a mounted boot-hive journal sidecar without cloning it into the bump heap.
+/// Copy a mounted writable-volume file's full contents. This is for append-heavy internal files
+/// such as hive sidecar logs, which can be extent-backed instead of one contiguous slice.
 ///
 /// # Safety
-/// Single-threaded executive; callers must not mutate the writable volume while holding the slice.
-pub(crate) unsafe fn hive_log_bytes_if_mounted(image_path: &str) -> Option<&'static [u8]> {
+/// Single-threaded executive; borrows the mounted volume for the duration of the copy.
+pub(crate) unsafe fn file_bytes_owned_if_mounted(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref()?;
+    fs.file_bytes_owned(path)
+}
+
+/// Copy a mounted boot-hive journal sidecar, including extent-backed append files.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the copy.
+pub(crate) unsafe fn hive_log_bytes_owned_if_mounted(
+    image_path: &str,
+) -> Option<alloc::vec::Vec<u8>> {
     let log_path = alloc::format!("{}.LOG", image_path);
-    file_bytes_if_mounted(&log_path)
+    file_bytes_owned_if_mounted(&log_path)
 }
 
 /// Return the mounted hive sidecar-log length without cloning the log into the bump heap.
@@ -946,7 +1029,11 @@ pub(crate) unsafe fn hive_log_bytes_if_mounted(image_path: &str) -> Option<&'sta
 /// Single-threaded executive; callers must not mutate the writable volume while holding any
 /// separately borrowed slices.
 pub(crate) unsafe fn hive_log_len_if_mounted(image_path: &str) -> usize {
-    hive_log_bytes_if_mounted(image_path).map_or(0, |bytes| bytes.len())
+    let log_path = alloc::format!("{}.LOG", image_path);
+    (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
+        .as_ref()
+        .and_then(|fs| fs.file_len(&log_path))
+        .unwrap_or(0) as usize
 }
 
 /// Consume the one-shot dirty bit set by the lazy writable-volume mount/materialisation.
@@ -1171,34 +1258,11 @@ pub(crate) unsafe fn append_file(path: &str, data: &[u8]) -> u32 {
         let Some(fs) = writable_fs() else {
             break 'append nt_fs::STATUS_INVALID_HANDLE;
         };
-        let file = fs.zw_create_file(
-            path,
-            nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA | nt_fs::SYNCHRONIZE,
-            0,
-            0,
-            nt_fs::FILE_OPEN_IF,
-            nt_fs::FILE_NON_DIRECTORY_FILE,
-        );
-        if file.status != nt_fs::STATUS_SUCCESS {
-            break 'append file.status;
+        let (write_status, written) = fs.append_file_by_path(path, data);
+        if write_status == nt_fs::STATUS_SUCCESS && written != data.len() {
+            break 'append nt_fs::STATUS_INSUFFICIENT_RESOURCES;
         }
-        let end = match fs.zw_query_standard_information(file.handle) {
-            Some(info) => info.end_of_file,
-            None => {
-                let _ = fs.zw_close(file.handle);
-                break 'append nt_fs::STATUS_INVALID_HANDLE;
-            }
-        };
-        let (write_status, written) = fs.zw_write_file(file.handle, Some(end), data);
-        let flush_status = if write_status == nt_fs::STATUS_SUCCESS && written == data.len() {
-            fs.zw_flush_buffers_file(file.handle)
-        } else if write_status == nt_fs::STATUS_SUCCESS {
-            nt_fs::STATUS_INSUFFICIENT_RESOURCES
-        } else {
-            write_status
-        };
-        let _ = fs.zw_close(file.handle);
-        flush_status
+        write_status
     };
     if status == nt_fs::STATUS_SUCCESS {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
@@ -1384,7 +1448,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     fn read_primary_image(
         &mut self,
     ) -> Result<Option<alloc::vec::Vec<u8>>, nt_hive_core::HiveIoError> {
-        Ok(unsafe { file_bytes_if_mounted(&self.image_path).map(|bytes| bytes.to_vec()) })
+        Ok(unsafe { file_bytes_owned_if_mounted(&self.image_path) })
     }
 
     fn write_primary_image_atomic(
@@ -1402,11 +1466,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn read_log(&mut self) -> Result<alloc::vec::Vec<u8>, nt_hive_core::HiveIoError> {
-        Ok(unsafe {
-            file_bytes_if_mounted(&self.log_path)
-                .map(|bytes| bytes.to_vec())
-                .unwrap_or_default()
-        })
+        Ok(unsafe { file_bytes_owned_if_mounted(&self.log_path).unwrap_or_default() })
     }
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
@@ -1426,9 +1486,13 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn get_status(&self) -> nt_hive_core::HiveIoStatus {
-        let image_present =
-            unsafe { file_bytes_if_mounted(&self.image_path).is_some() };
-        let log_len = unsafe { file_bytes_if_mounted(&self.log_path).map_or(0, |bytes| bytes.len()) };
+        let image_present = unsafe { file_bytes_if_mounted(&self.image_path).is_some() };
+        let log_len = unsafe {
+            (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
+                .as_ref()
+                .and_then(|fs| fs.file_len(&self.log_path))
+                .unwrap_or(0) as usize
+        };
         nt_hive_core::HiveIoStatus {
             image_present,
             log_len,
@@ -1667,7 +1731,7 @@ unsafe fn provision_staged_tree(
         // Collect this directory's children first: `fat_visit_directory` and `dir_find_lfn` both
         // drive the sector cache, so the names are captured before any further reads.
         let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-        crate::fs_loader::fat_visit_directory(fat, cluster, |entry| {
+        crate::fs_loader::fat_visit_directory(fat, cluster, |entry, _first_cluster| {
             let mut name = alloc::string::String::new();
             for &unit in entry.name() {
                 if unit == 0 || unit > 0x7f {
@@ -1721,7 +1785,8 @@ unsafe fn provision_staged_tree(
 }
 
 unsafe fn staged_config_hive_ok(fat: &Fat32, root_cluster: u32, leaf: &[u8]) -> bool {
-    let Some((cluster, size, attr)) = crate::fs_loader::dir_find_lfn(fat, root_cluster, leaf) else {
+    let Some((cluster, size, attr)) = crate::fs_loader::dir_find_lfn(fat, root_cluster, leaf)
+    else {
         return false;
     };
     if attr & 0x10 != 0 || size as usize > MAX_STAGED_FILE {
@@ -1767,17 +1832,23 @@ unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
     // `.Default` checkpoint image. Do not copy raw `config\default`: that prototype lacks setup's
     // installed-user writes and is the bug this path replaces.
     if PROVISION_NTUSER_DAT {
-        let setup_image = (*core::ptr::addr_of!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).as_deref();
+        let setup_image = (*core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE)).take();
         match setup_image {
-            Some(hive) if hive_image_ok(hive) => {
-                if fs.provision_file(DEFAULT_USER_NTUSER_DAT, hive) {
+            Some(hive) if hive_image_ok(&hive) => {
+                let hive_len = hive.len();
+                match fs.provision_file_owned(DEFAULT_USER_NTUSER_DAT, hive) {
+                    Ok(()) => {
                     stats.files += 1;
-                    stats.bytes += hive.len() as u64;
-                    NTUSER_DAT_PROVISIONED.store(hive.len() as u64, Ordering::Relaxed);
-                    *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = None;
+                        stats.bytes += hive_len as u64;
+                        NTUSER_DAT_PROVISIONED.store(hive_len as u64, Ordering::Relaxed);
+                    }
+                    Err(returned) => {
+                        *core::ptr::addr_of_mut!(SETUP_DEFAULT_USER_NTUSER_IMAGE) = Some(returned);
+                    }
                 }
             }
-            _ => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),
+            Some(_) => print_str(b"[profile-source] setup HKU\\.DEFAULT image invalid -> no ntuser.dat\n"),
+            None => print_str(b"[profile-source] setup HKU\\.DEFAULT image absent -> no ntuser.dat\n"),
         }
         PROFILE_SOURCE_DIRS.store(stats.dirs, Ordering::Relaxed);
         PROFILE_SOURCE_FILES.store(stats.files, Ordering::Relaxed);

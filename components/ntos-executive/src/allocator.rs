@@ -57,7 +57,10 @@ pub const SERVICE_HEAP_FRAMES: u64 = 128;
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
 const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
-const DATA: usize = HEAP_BASE + 64; // allocations start past the counter
+/// Component-local metadata words available to modules that cannot use mutable image statics.
+pub const COMPONENT_LOCAL_WORD_BASE: usize = HEAP_BASE + 16;
+pub const COMPONENT_LOCAL_WORDS: usize = 6;
+const DATA: usize = HEAP_BASE + 64; // allocations start past allocator/local metadata
 const END: usize = HEAP_BASE + HEAP_SIZE;
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();

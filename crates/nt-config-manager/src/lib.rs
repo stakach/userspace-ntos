@@ -48,6 +48,8 @@ pub const ENUM_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Enum";
 pub const DEVICE_CLASSES_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\DeviceClasses";
 pub const CONTROL_CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
+pub const CONTROL_NETWORK_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Control\Network";
 pub const SERVICE_GROUP_ORDER_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder";
 pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";

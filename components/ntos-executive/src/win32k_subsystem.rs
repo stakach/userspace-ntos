@@ -629,9 +629,9 @@ const VIDEO_IOCTL_BYTES_RETURNED: u64 = 0x28;
 const VIDEO_IOCTL_IN_BUF: u64 = 0x100;
 const VIDEO_IOCTL_IN_CAP: usize = 0x1000;
 const VIDEO_IOCTL_OUT_BUF: u64 = VIDEO_IOCTL_IN_BUF + VIDEO_IOCTL_IN_CAP as u64;
-const VIDEO_IOCTL_OUT_CAP: usize =
-    WIN32K_VIDEO_IOCTL_BYTES - VIDEO_IOCTL_OUT_BUF as usize;
-const _: () = assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
+const VIDEO_IOCTL_OUT_CAP: usize = WIN32K_VIDEO_IOCTL_BYTES - VIDEO_IOCTL_OUT_BUF as usize;
+const _: () =
+    assert!(VIDEO_IOCTL_OUT_BUF as usize + VIDEO_IOCTL_OUT_CAP <= WIN32K_VIDEO_IOCTL_BYTES);
 static WIN32K_VIDEO_IOCTL_TRACE: AtomicU64 = AtomicU64::new(0);
 static WIN32K_VIDEO_IOCTL_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
 static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2975,8 +2975,7 @@ struct ServiceWinstaRecord {
 }
 
 unsafe fn service_winsta_record_ptr(base: u64, index: u64) -> *mut ServiceWinstaRecord {
-    (base + index * core::mem::size_of::<ServiceWinstaRecord>() as u64)
-        as *mut ServiceWinstaRecord
+    (base + index * core::mem::size_of::<ServiceWinstaRecord>() as u64) as *mut ServiceWinstaRecord
 }
 
 unsafe fn ensure_service_winsta_record_capacity(required: u64) -> bool {
@@ -3961,10 +3960,7 @@ unsafe fn write_thread_client_desktop_info(
             (pci + CLIENTINFO_PDESKINFO_OFF) as *mut u64,
             client_deskinfo,
         );
-        write_volatile(
-            (pci + CLIENTINFO_ULCLIENTDELTA_OFF) as *mut u64,
-            delta,
-        );
+        write_volatile((pci + CLIENTINFO_ULCLIENTDELTA_OFF) as *mut u64, delta);
         write_volatile(
             (pci + CLIENTINFO_PCLIENTTHREADINFO_OFF) as *mut u64,
             client_pcti,
@@ -4803,8 +4799,7 @@ use nt_kernel_exec::rtl_atom;
 const ATOM_ARENA_BYTES: u64 = 0x10000;
 const ATOM_ARENA_CAP: usize = (WIN32K_POOL_FRAMES * 0x1000 / ATOM_ARENA_BYTES) as usize;
 const ATOM_ARENA_WORDS: usize = (ATOM_ARENA_CAP + 63) / 64;
-static ATOM_ARENA_PTRS: [AtomicU64; ATOM_ARENA_CAP] =
-    [const { AtomicU64::new(0) }; ATOM_ARENA_CAP];
+static ATOM_ARENA_PTRS: [AtomicU64; ATOM_ARENA_CAP] = [const { AtomicU64::new(0) }; ATOM_ARENA_CAP];
 static ATOM_ARENA_IN_USE: [AtomicU64; ATOM_ARENA_WORDS] =
     [const { AtomicU64::new(0) }; ATOM_ARENA_WORDS];
 
@@ -7293,10 +7288,9 @@ fn lookup_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
 
 fn close_win32k_reg_handle(handle: u64) -> bool {
     let handles = win32k_reg_handles_mut();
-    if let Some(entry) = handles
-        .iter_mut()
-        .find(|entry| entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty))
-    {
+    if let Some(entry) = handles.iter_mut().find(|entry| {
+        entry.handle == handle && !matches!(entry.target, Win32kRegHandleTarget::Empty)
+    }) {
         *entry = Win32kRegHandle::EMPTY;
         true
     } else {
@@ -7717,7 +7711,9 @@ extern "win64" fn s_eng_device_io_control(
     out_len: u32,
     bytes_ret: *mut u32,
 ) -> u32 {
-    unsafe { request_video_device_io_control(hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret) }
+    unsafe {
+        request_video_device_io_control(hdev, ioctl, in_buf, in_len, out_buf, out_len, bytes_ret)
+    }
 }
 
 /// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`

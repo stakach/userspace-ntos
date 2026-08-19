@@ -95,8 +95,7 @@ static WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
     [const { AtomicU64::new(0) }; MAX_PI];
 static WIN32K_POOL_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
     [const { AtomicU64::new(0) }; MAX_PI];
-static GDI_USERVM_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
+static GDI_USERVM_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -1043,9 +1042,7 @@ unsafe fn remember_active_dispatch(request: &nt_user_callback::CallbackHeader) -
 
 fn staged_userconnect_u64(offset: u64) -> u64 {
     unsafe {
-        core::ptr::read_unaligned(
-            (win32k_subsystem::WIN32K_ARG_VADDR + offset) as *const u64,
-        )
+        core::ptr::read_unaligned((win32k_subsystem::WIN32K_ARG_VADDR + offset) as *const u64)
     }
 }
 
@@ -1065,9 +1062,7 @@ unsafe fn remember_active_dispatch_arg_snapshot(
     if context.ssn != win32k_subsystem::SSN_NT_USER_INITIALIZE {
         return true;
     }
-    let len = context
-        .args[2]
-        .min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+    let len = context.args[2].min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
     if len == 0 || len as usize > nt_user_callback::DISPATCH_ARG_SNAPSHOT_BYTES {
         return false;
     }
@@ -1118,7 +1113,9 @@ fn main_gui_callback_teb_alias(client: crate::spawn_hosts::UserCallbackClient) -
         return None;
     }
     match client.role {
-        Some(HostedThreadRole::Main) if client.top_badge != 0 && client.badge == client.top_badge => {
+        Some(HostedThreadRole::Main)
+            if client.top_badge != 0 && client.badge == client.top_badge =>
+        {
             let alias = crate::env_scratch_base_for_pi(pi);
             (alias != 0).then_some(alias)
         }
@@ -2047,6 +2044,8 @@ pub(crate) unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: b
         inout("r8") 20u64 => _,
         inout("r9") registers[0] => _,
         inout("r15") registers[1] => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -2081,6 +2080,8 @@ pub(crate) unsafe fn tcb_set_breakpoint(
         inout("r8") vaddr => _,
         inout("r9") breakpoint_type => _,
         inout("r15") size => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -2096,6 +2097,8 @@ pub(crate) unsafe fn tcb_get_breakpoint(tcb: u64, bp_num: u64) -> Option<TcbBrea
         inout("rdi") tcb => _,
         inout("rsi") (LBL_TCB_GET_BREAKPOINT << 12) | 1 => reply_info,
         inout("r10") bp_num => vaddr,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") breakpoint_type,
         lateout("r9") size,
         lateout("r15") access,
@@ -2122,6 +2125,8 @@ pub(crate) unsafe fn tcb_unset_breakpoint(tcb: u64, bp_num: u64) -> u64 {
         inout("rdi") tcb => _,
         inout("rsi") (LBL_TCB_UNSET_BREAKPOINT << 12) | 1 => reply_info,
         inout("r10") bp_num => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") _,
         lateout("r9") _,
         lateout("r15") _,
@@ -2541,6 +2546,8 @@ unsafe fn resume_suspended_user_callback_component(
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
         exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
+        root_image_rights: 3,
+        root_image_map_owner: crate::WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
         shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
         dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
         demand_cap: 8192,
@@ -2610,7 +2617,8 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         };
 
         cancelled_count += 1;
-        let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+        let previous_dispatch =
+            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
@@ -3278,13 +3286,7 @@ unsafe fn map_win32k_arena_prefix_into_client(
     }
 
     for p in (already_mapped + 511) / 512..(target_frames + 511) / 512 {
-        if !win32k_client_cap_bank_map_page_table(
-            pml4,
-            pi,
-            client_base + p * 0x20_0000,
-            label,
-            p,
-        ) {
+        if !win32k_client_cap_bank_map_page_table(pml4, pi, client_base + p * 0x20_0000, label, p) {
             return false;
         }
     }
@@ -3551,9 +3553,7 @@ pub(crate) struct Win32kClientCapBankReclaimStats {
     pub failures: u64,
 }
 
-pub(crate) unsafe fn release_win32k_client_cap_bank(
-    pi: usize,
-) -> Win32kClientCapBankReclaimStats {
+pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCapBankReclaimStats {
     if pi >= MAX_PI || pi >= u8::MAX as usize {
         return Win32kClientCapBankReclaimStats::default();
     }
@@ -3584,7 +3584,8 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(
         if WIN32K_CLIENT_CAP_BANK_OWNER[owner_slot].load(Ordering::Relaxed) != owner {
             continue;
         }
-        let Some((segment, segment_slot)) = win32k_client_cap_bank_slot_location(global_slot) else {
+        let Some((segment, segment_slot)) = win32k_client_cap_bank_slot_location(global_slot)
+        else {
             failures = failures.saturating_add(1);
             continue;
         };
@@ -4549,6 +4550,158 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
 /// to load) and win32k (W^X, to run). Reuses [`win32k_subsystem::load_driver_into`]. `dxgthk_base` names
 /// a prior-loaded dxgthk for import resolution (0 for a leaf). Returns (entry_rva, export_dir_rva,
 /// size_of_image). The reusable driver-loader mechanism is also used by display DLL hosting.
+#[inline(never)]
+unsafe fn load_one_driver_fail(stage: &[u8], subject: u64, error: u64) -> Option<(u32, u32, u32)> {
+    print_str(b"[win32k-svc] driver image load ");
+    print_str(stage);
+    print_str(b" failed subject=0x");
+    print_hex((subject >> 32) as u32);
+    print_hex(subject as u32);
+    print_str(b" error=");
+    print_u64(error);
+    print_str(b"\n");
+    None
+}
+
+unsafe fn release_driver_load_frame_run(base: u64, count: u64) {
+    let mut i = 0u64;
+    while i < count {
+        let _ = cnode_delete_recycle_r(base + i);
+        i += 1;
+    }
+}
+
+unsafe fn release_driver_load_map_caps(caps: &mut [u64; 256], count: u64) {
+    let mut i = 0u64;
+    while i < count.min(caps.len() as u64) {
+        let cap = caps[i as usize];
+        if cap != 0 {
+            let _ = cnode_delete_recycle_r(cap);
+            caps[i as usize] = 0;
+        }
+        i += 1;
+    }
+}
+
+unsafe fn alloc_driver_load_frame_run(frames: u64) -> Option<u64> {
+    let Some(base) = try_alloc_slot_run(frames) else {
+        print_str(b"[win32k-svc] driver image load frame-run slot allocation failed frames=");
+        print_u64(frames);
+        print_str(b"\n");
+        return None;
+    };
+    let mut i = 0u64;
+    while i < frames {
+        let slot = base + i;
+        let error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, slot);
+        if error != 0 {
+            let mut j = 0u64;
+            while j < i {
+                let _ = cnode_delete_recycle_r(base + j);
+                j += 1;
+            }
+            while j < frames {
+                recycle_deleted_root_slot(base + j);
+                j += 1;
+            }
+            let _ = load_one_driver_fail(b"frame-retype", slot, error);
+            return None;
+        }
+        i += 1;
+    }
+    Some(base)
+}
+
+#[derive(Clone, Copy)]
+struct DriverLoadPageTable {
+    pml4: u64,
+    base: u64,
+    cap: u64,
+}
+
+const DRIVER_LOAD_PAGE_TABLE_EMPTY: DriverLoadPageTable = DriverLoadPageTable {
+    pml4: 0,
+    base: 0,
+    cap: 0,
+};
+const DRIVER_LOAD_PT_RECORDS: usize = 32;
+const DRIVER_LOAD_PT_SPAN: u64 = 0x20_0000;
+static mut DRIVER_LOAD_PAGE_TABLES: [DriverLoadPageTable; DRIVER_LOAD_PT_RECORDS] =
+    [DRIVER_LOAD_PAGE_TABLE_EMPTY; DRIVER_LOAD_PT_RECORDS];
+
+#[inline]
+fn driver_load_pt_base(va: u64) -> u64 {
+    va & !(DRIVER_LOAD_PT_SPAN - 1)
+}
+
+unsafe fn driver_load_page_table_find(pml4: u64, base: u64) -> Option<u64> {
+    let records = &*core::ptr::addr_of!(DRIVER_LOAD_PAGE_TABLES);
+    for record in records {
+        if record.cap != 0 && record.pml4 == pml4 && record.base == base {
+            return Some(record.cap);
+        }
+    }
+    None
+}
+
+unsafe fn driver_load_page_table_insert(pml4: u64, base: u64, cap: u64) -> bool {
+    let records = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
+    for record in records {
+        if record.cap == 0 {
+            *record = DriverLoadPageTable { pml4, base, cap };
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn driver_load_page_table_remove(pml4: u64, base: u64, cap: u64) {
+    let records = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
+    for record in records {
+        if record.cap == cap && record.pml4 == pml4 && record.base == base {
+            *record = DRIVER_LOAD_PAGE_TABLE_EMPTY;
+            return;
+        }
+    }
+}
+
+unsafe fn ensure_driver_load_page_table(
+    pml4: u64,
+    va: u64,
+    stage_prefix: &[u8],
+) -> Option<(u64, bool)> {
+    let base = driver_load_pt_base(va);
+    if let Some(existing) = driver_load_page_table_find(pml4, base) {
+        return Some((existing, false));
+    }
+    let Some(pt) = try_alloc_slot() else {
+        return load_one_driver_fail(stage_prefix, base, 4).map(|_| (0, false));
+    };
+    let error = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    if error != 0 {
+        recycle_deleted_root_slot(pt);
+        return load_one_driver_fail(stage_prefix, pt, error).map(|_| (0, false));
+    }
+    let error = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, base, pml4);
+    if error != 0 {
+        let _ = cnode_delete_recycle_r(pt);
+        return load_one_driver_fail(stage_prefix, base, error).map(|_| (0, false));
+    }
+    if !driver_load_page_table_insert(pml4, base, pt) {
+        let _ = cnode_delete_recycle_r(pt);
+        return load_one_driver_fail(stage_prefix, base, 4).map(|_| (0, false));
+    }
+    Some((pt, true))
+}
+
+unsafe fn release_driver_load_page_table_if_new(pml4: u64, va: u64, cap: u64, is_new: bool) {
+    if is_new && cap != 0 {
+        let base = driver_load_pt_base(va);
+        driver_load_page_table_remove(pml4, base, cap);
+        let _ = cnode_delete_recycle_r(cap);
+    }
+}
+
 pub(crate) unsafe fn load_one_driver(
     src_va: u64,
     dst_va: u64,
@@ -4560,20 +4713,32 @@ pub(crate) unsafe fn load_one_driver(
         return None;
     }
     // Executive-side PT + frames (RW), to load into.
-    let ept = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ept);
-    let _ = paging_struct_map(ept, LBL_X86_PAGE_TABLE_MAP, dst_va, CAP_INIT_THREAD_VSPACE);
-    let base = alloc_frame();
-    for _ in 1..frames {
-        let _ = alloc_frame();
+    let (ept, ept_new) =
+        ensure_driver_load_page_table(CAP_INIT_THREAD_VSPACE, dst_va, b"exec-pt-map")?;
+    let base = alloc_driver_load_frame_run(frames)?;
+    static mut EXEC_MAP_CAPS: [u64; 256] = [0; 256];
+    let exec_map_caps = &mut *core::ptr::addr_of_mut!(EXEC_MAP_CAPS);
+    for cap in exec_map_caps.iter_mut() {
+        *cap = 0;
     }
     for i in 0..frames {
-        let _ = page_map(
-            copy_cap(base + i),
-            dst_va + i * 0x1000,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-        );
+        let (cap, copy_error) = copy_cap_r(base + i);
+        if copy_error != 0 {
+            release_driver_load_map_caps(exec_map_caps, i);
+            release_driver_load_frame_run(base, frames);
+            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+            return load_one_driver_fail(b"exec-frame-copy", base + i, copy_error);
+        }
+        let va = dst_va + i * 0x1000;
+        let map_error = page_map_r(cap, va, RW_NX, CAP_INIT_THREAD_VSPACE);
+        if map_error != 0 {
+            let _ = cnode_delete_recycle_r(cap);
+            release_driver_load_map_caps(exec_map_caps, i);
+            release_driver_load_frame_run(base, frames);
+            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+            return load_one_driver_fail(b"exec-frame-map", va, map_error);
+        }
+        exec_map_caps[i as usize] = cap;
     }
     // Parse + copy + reloc + resolve imports (writes via the executive's RW mapping). The per-frame
     // rights live in a `static` (ftfd.dll = 248 frames is too large for the bounded rootserver
@@ -4583,20 +4748,54 @@ pub(crate) unsafe fn load_one_driver(
     for r in rights.iter_mut() {
         *r = RW_NX;
     }
-    let res = win32k_subsystem::load_driver_into(
+    let Some(res) = win32k_subsystem::load_driver_into(
         src_va,
         dst_va,
         frames,
         &mut rights[..frames as usize],
         dxgthk_base,
-    )?;
+    ) else {
+        release_driver_load_map_caps(exec_map_caps, frames);
+        release_driver_load_frame_run(base, frames);
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return load_one_driver_fail(b"pe-load", dst_va, 0);
+    };
     // Map the SAME frames W^X into win32k's VSpace at the same VA (RX code / RW data).
-    let wpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
-    let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, dst_va, host_pml4);
+    let Some((wpt, wpt_new)) = ensure_driver_load_page_table(host_pml4, dst_va, b"host-pt-map")
+    else {
+        release_driver_load_map_caps(exec_map_caps, frames);
+        release_driver_load_frame_run(base, frames);
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return None;
+    };
+    static mut HOST_MAP_CAPS: [u64; 256] = [0; 256];
+    let host_map_caps = &mut *core::ptr::addr_of_mut!(HOST_MAP_CAPS);
+    for cap in host_map_caps.iter_mut() {
+        *cap = 0;
+    }
     for i in 0..frames {
         let r = rights[i as usize];
-        let _ = page_map(copy_cap(base + i), dst_va + i * 0x1000, r, host_pml4);
+        let (cap, copy_error) = copy_cap_r(base + i);
+        if copy_error != 0 {
+            release_driver_load_map_caps(host_map_caps, i);
+            release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
+            release_driver_load_map_caps(exec_map_caps, frames);
+            release_driver_load_frame_run(base, frames);
+            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+            return load_one_driver_fail(b"host-frame-copy", base + i, copy_error);
+        }
+        let va = dst_va + i * 0x1000;
+        let map_error = page_map_r(cap, va, r, host_pml4);
+        if map_error != 0 {
+            let _ = cnode_delete_recycle_r(cap);
+            release_driver_load_map_caps(host_map_caps, i);
+            release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
+            release_driver_load_map_caps(exec_map_caps, frames);
+            release_driver_load_frame_run(base, frames);
+            release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+            return load_one_driver_fail(b"host-frame-map", va, map_error);
+        }
+        host_map_caps[i as usize] = cap;
     }
     Some(res)
 }
@@ -5411,6 +5610,8 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         code_va: win32k_subsystem::WIN32K_CODE_VA,
         image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
         exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
+        root_image_rights: 3,
+        root_image_map_owner: crate::WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
         shared_va: sh,
         dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
         // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
@@ -5483,6 +5684,8 @@ pub(crate) unsafe fn tcb_read_rsp(tcb: u64) -> u64 {
         inout("rdx") SYS_CALL as u64 => _,
         inout("rdi") tcb => _,
         inout("rsi") 2u64 << 12 => _, // TCBReadRegisters, length 0
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r10") _,             // MR0 = rip
         lateout("r8") rsp,            // MR1 = rsp
         lateout("r9") _,              // MR2 = rax
@@ -5502,6 +5705,8 @@ pub(crate) unsafe fn tcb_read_rip(tcb: u64) -> u64 {
         inout("rdx") SYS_CALL as u64 => _,
         inout("rdi") tcb => _,
         inout("rsi") 2u64 << 12 => _, // TCBReadRegisters, length 0
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r10") rip,           // MR0 = rip
         lateout("r8") _,              // MR1 = rsp
         lateout("r9") _,              // MR2 = rax
@@ -5526,6 +5731,8 @@ pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
         inout("rsi") (2u64 << 12) | 20 => _, // TCBReadRegisters, msginfo.length=20 (label<<12 | len)
         inout("r10") 0u64 => r0,   // MR0 in / word 0 (rip) out
         inout("r8") 20u64 => r1,   // MR1 = count(20) in / word 1 (rsp) out
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r9") r2,          // word 2 (rflags)
         lateout("r15") r3,         // word 3 (rax)
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
@@ -5681,6 +5888,8 @@ pub(crate) unsafe fn tcb_read_debug_state(
         inout("rdi") tcb => _,
         inout("rsi") LBL_TCB_READ_DEBUG_STATE << 12 => _,
         inout("r10") reply_cap => r0,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") r1,
         lateout("r9") r2,
         lateout("r15") r3,

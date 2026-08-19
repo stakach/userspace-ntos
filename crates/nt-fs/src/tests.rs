@@ -68,6 +68,55 @@ impl SnapshotBlockDevice for MemoryBlockDevice {
     }
 }
 
+struct BulkCountingBlockDevice {
+    inner: MemoryBlockDevice,
+    bulk_writes: usize,
+    bulk_sectors: usize,
+}
+
+impl BulkCountingBlockDevice {
+    fn new(sector_size: usize, sectors: usize) -> Self {
+        Self {
+            inner: MemoryBlockDevice::new(sector_size, sectors),
+            bulk_writes: 0,
+            bulk_sectors: 0,
+        }
+    }
+}
+
+impl SnapshotBlockDevice for BulkCountingBlockDevice {
+    fn sector_size(&self) -> usize {
+        self.inner.sector_size()
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.inner.sector_count()
+    }
+
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.read_sector(lba, out)
+    }
+
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.write_sector(lba, data)
+    }
+
+    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        let sector_size = self.sector_size();
+        if sector_size == 0 || data.len() % sector_size != 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
+        self.bulk_writes += 1;
+        self.bulk_sectors += data.len() / sector_size;
+        let mut next_lba = lba;
+        for sector in data.chunks_exact(sector_size) {
+            self.inner.write_sector(next_lba, sector)?;
+            next_lba += 1;
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn query_information_encodes_standard_layout() {
     let metadata = QueryMetadata {
@@ -495,6 +544,19 @@ fn read_write_offset_and_eof() {
 }
 
 #[test]
+fn flush_buffers_file_validates_the_file_object() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let h = fs
+        .zw_create_file(r"\??\C:\Temp\f", FILE_WRITE_DATA, 0, 0, FILE_CREATE, 0)
+        .handle;
+    assert_eq!(fs.zw_write_file(h, None, b"pending").0, STATUS_SUCCESS);
+    assert_eq!(fs.zw_flush_buffers_file(h), STATUS_SUCCESS);
+    assert_eq!(fs.zw_query_standard_information(h).unwrap().end_of_file, 7);
+    fs.zw_close(h);
+    assert_eq!(fs.zw_flush_buffers_file(h), STATUS_INVALID_HANDLE);
+}
+
+#[test]
 fn read_file_into_uses_and_advances_file_position() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     let h = fs
@@ -899,6 +961,20 @@ fn snapshot_block_store_commits_latest_valid_slot() {
 }
 
 #[test]
+fn snapshot_block_store_streaming_writer_uses_bulk_sector_writes() {
+    let store = SnapshotBlockStore::new(0, 32);
+    let mut dev = BulkCountingBlockDevice::new(512, 32);
+    let payload = alloc::vec![0x5a; 4096 + 17];
+
+    assert_eq!(store.commit_next(&mut dev, &payload).unwrap(), 1);
+    assert!(dev.bulk_writes > 0);
+    assert!(dev.bulk_sectors >= 8);
+
+    let restored = store.read_latest(&mut dev).unwrap().unwrap();
+    assert_eq!(restored.payload, payload);
+}
+
+#[test]
 fn snapshot_block_store_keeps_previous_generation_when_update_write_fails() {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = MemoryBlockDevice::new(512, 16);
@@ -1107,6 +1183,46 @@ fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
     assert!(provider.get_status().image_present);
     provider.truncate_log().unwrap();
     assert_eq!(provider.get_status().log_len, 0);
+}
+
+#[test]
+fn append_file_extends_extent_sidecar_without_blob_search() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let large_profile_hive = alloc::vec![0x5a; 256 * 1024];
+    assert!(fs.provision_file_relative(b"profiles\\Default User\\ntuser.dat", &large_profile_hive));
+    assert!(fs.provision_directory_relative(b"reactos\\system32\\config"));
+    let blob_count_before = fs.unique_data_blobs();
+
+    let log = fs.zw_create_file(
+        r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG",
+        FILE_WRITE_DATA | FILE_APPEND_DATA | SYNCHRONIZE,
+        0,
+        0,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    assert_eq!(log.status, STATUS_SUCCESS);
+    assert_eq!(fs.zw_append_file(log.handle, b"abc"), (STATUS_SUCCESS, 3));
+    assert_eq!(fs.zw_append_file(log.handle, b"def"), (STATUS_SUCCESS, 3));
+    assert_eq!(
+        fs.append_file_by_path(r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG", b"ghi"),
+        (STATUS_SUCCESS, 3)
+    );
+    assert_eq!(
+        fs.file_len(r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG"),
+        Some(9)
+    );
+    assert_eq!(
+        fs.file_bytes_owned(r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG")
+            .as_deref(),
+        Some(&b"abcdefghi"[..])
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\ReactOS\System32\Config\SYSTEM.LOG"),
+        None
+    );
+    assert_eq!(fs.unique_data_blobs(), blob_count_before + 3);
+    fs.zw_close(log.handle);
 }
 
 #[test]
@@ -1831,6 +1947,37 @@ fn provisioned_file_is_a_real_enumerable_file() {
     }
     assert_eq!(names, [".", "..", "ntuser.dat"]);
     fs.zw_close(dir.handle);
+}
+
+#[test]
+fn owned_provisioning_installs_large_file_without_copying_into_blob_store() {
+    let mut fs = FileSystem::new(MemFs::new());
+    let mut hive_image = alloc::vec::Vec::new();
+    hive_image.resize(130_682, 0x5a);
+    hive_image[..4].copy_from_slice(b"UNTH");
+
+    assert!(fs
+        .provision_file_owned(
+            r"\??\C:\profiles\Default User\ntuser.dat",
+            hive_image.clone()
+        )
+        .is_ok());
+    assert_eq!(
+        fs.query_attributes(r"\??\C:\profiles\Default User\ntuser.dat")
+            .unwrap()
+            .end_of_file,
+        130_682
+    );
+    assert_eq!(
+        fs.file_bytes(r"\??\C:\profiles\Default User\ntuser.dat"),
+        Some(hive_image.as_slice())
+    );
+    assert_eq!(fs.unique_data_blobs(), 0);
+
+    let returned = fs
+        .provision_file_owned(r"\??\D:\outside.dat", hive_image)
+        .expect_err("unmounted volume returns owned buffer");
+    assert_eq!(returned.len(), 130_682);
 }
 
 /// Provisioning REPLACES an existing file's bytes exactly (no append, no stale tail), refuses a

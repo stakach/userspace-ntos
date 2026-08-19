@@ -9474,12 +9474,37 @@ fn fls_bitmap_header_ptr() -> *mut FlsBitmapHeader {
     core::ptr::addr_of_mut!(FLS_BITMAP_HEADER)
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn initialize_loader_critical_section(cs: *mut c_void) -> NtStatus {
+    // SAFETY: process-loader startup owns these process-local ntdll statics, and the process heap is
+    // already installed by LdrpInitialize before this helper is called.
+    unsafe { rtl_initialize_critical_section(cs) }
+}
+
 /// Publish process-wide loader/PEB locks before import processing and DLL attach.
 ///
 /// # Safety
 /// `peb` is the current process's writable PEB.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) {
+pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) -> NtStatus {
+    // ReactOS initializes these in LdrpInitializeProcess before storing their addresses in the PEB
+    // (ldrinit.c:2006 and ldrinit.c:2016). Do the same here instead of relying on the raw .data image
+    // bytes to remain the only source of truth after the first write-copy touch.
+    LDR_LOADER_LOCK_ACQUISITION_COUNT.store(0, Ordering::Release);
+    let mut status = unsafe { initialize_loader_critical_section(loader_lock_ptr()) };
+    if !nt_success(status) {
+        return status;
+    }
+    status = unsafe { initialize_loader_critical_section(fast_peb_lock_ptr()) };
+    if !nt_success(status) {
+        return status;
+    }
+    status = unsafe {
+        initialize_loader_critical_section(core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_LOCK).cast())
+    };
+    if !nt_success(status) {
+        return status;
+    }
     if peb != 0 {
         unsafe {
             core::ptr::write_unaligned((peb + 0x38) as *mut u64, fast_peb_lock_ptr() as u64);
@@ -9492,6 +9517,7 @@ pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) {
             core::ptr::write_unaligned((peb + 0x338) as *mut u64, fls_bitmap_header_ptr() as u64);
         }
     }
+    STATUS_SUCCESS
 }
 
 pub(crate) struct LoaderLockGuard(usize);

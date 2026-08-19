@@ -3,6 +3,11 @@ use nt_config_manager::{
     device_property, encode_sz, ConfigManager, DevPropKey, PropertyValue, RegistryValueType,
 };
 
+#[test]
+fn crc32c_matches_castagnoli_vector() {
+    assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+}
+
 /// Build the spec §21 fixture configuration.
 fn fixture() -> ConfigManager {
     let mut cm = ConfigManager::new();

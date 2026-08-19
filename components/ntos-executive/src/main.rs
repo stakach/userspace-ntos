@@ -72,7 +72,7 @@ mod driver_launch;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 const STATUS_IO_TIMEOUT: u32 = 0xC000_00B5;
 
@@ -465,8 +465,7 @@ pub const TP_WORKER_EXEC_BASE: u64 = 0x0000_0100_13A0_0000;
 pub const TP_WORKER_EXEC_STRIDE: u64 = 0x0004_0000;
 pub const TP_WORKER_ENV_SCRATCH_OFFSET: u64 = 0x0002_0000;
 pub const TP_WORKER_SLOT1_REGION_BASE: u64 = 0x0000_0100_13E0_0000;
-pub const TP_WORKER_SLOT0_REGION_BASE: u64 =
-    TP_WORKER_SLOT1_REGION_BASE - TP_WORKER_EXEC_STRIDE;
+pub const TP_WORKER_SLOT0_REGION_BASE: u64 = TP_WORKER_SLOT1_REGION_BASE - TP_WORKER_EXEC_STRIDE;
 pub const TP_WORKER_STACK_BASE: u64 = TP_WORKER_SLOT0_REGION_BASE;
 pub const TP_WORKER_STACK_FRAMES: u64 = 16;
 pub const TP_WORKER_STACK_TOP: u64 = TP_WORKER_STACK_BASE + TP_WORKER_STACK_FRAMES * 0x1000;
@@ -2090,7 +2089,8 @@ pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
-const _: () = assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
+const _: () =
+    assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 const ROOT_DMA_PROOF_INTERRUPT_STATUS_OFFSET: u64 = 0x08;
 const ROOT_DMA_PROOF_INTERRUPT_ACK_OFFSET: u64 = 0x0c;
@@ -2150,14 +2150,19 @@ const LBL_X86_IO_PAGE_TABLE_MAP: u64 = 49; // install a VT-d IO page table (buil
 const LBL_X86_PAGE_MAP_IO: u64 = 53; // map a frame at an IOVA in a device's IO space
 const OBJ_X86_IO_PAGE_TABLE: u64 = 13; // seL4_X86_IOPageTableObject
 const SLOT_IO_SPACE: u64 = 8; // seL4_CapIOSpace — the master IO-space cap in the root CNode
-const HOSTED_PCI_COMMON_BUFFER_IOVA: u64 = 0x1000;
-const HOSTED_PCI_COMMON_BUFFER_PAGES: u64 = 66;
-const HOSTED_PCI_COMMON_BUFFER_LEN: u64 = HOSTED_PCI_COMMON_BUFFER_PAGES * 0x1000;
-const _: () = assert!(HOSTED_PCI_COMMON_BUFFER_LEN <= 0x20_0000);
+                              // Per-device bus-master DMA aperture. Common buffers and transient map-register bounce mappings
+                              // share this IOMMU-confined window; IOVA 0 stays invalid, and the rest fits under one x86 IO
+                              // page-table span so every hosted PCI function can use the same per-domain address range.
+const HOSTED_PCI_DMA_WINDOW_IOVA: u64 = 0x1000;
+const HOSTED_PCI_DMA_WINDOW_PAGES: u64 = 68;
+const HOSTED_PCI_DMA_WINDOW_LEN: u64 = HOSTED_PCI_DMA_WINDOW_PAGES * 0x1000;
+const _: () = assert!(HOSTED_PCI_DMA_WINDOW_IOVA + HOSTED_PCI_DMA_WINDOW_LEN <= 0x20_0000);
+const HOSTED_BOOT_FRAMEBUFFER_EAGER_MMIO_PAGES: u64 = 32;
 /// Driver-host VSpace: where the executive maps the CM_RESOURCE_LIST + common-buffer
 /// descriptor (also mapped at the same vaddr in the host, aliasing the frame).
 pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
-const _: () = assert!(STORAGE_SHARED_END <= RESLIST_VADDR || RESLIST_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
+const _: () =
+    assert!(STORAGE_SHARED_END <= RESLIST_VADDR || RESLIST_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 const Q35_PCI_INTX_IOAPIC_ROUTE_MASK: u32 = 0x00FF_0000;
@@ -2266,6 +2271,7 @@ static ROOT_SLOT_RECYCLE_N: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_HW: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_REUSED: AtomicU64 = AtomicU64::new(0);
 static ROOT_SLOT_RECYCLE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static ROOT_SLOT_RECYCLE_CORRUPT: AtomicU64 = AtomicU64::new(0);
 static mut ROOT_SLOT_LIVE_BITS: [u64; ROOT_SLOT_LIVE_WORDS] = [0; ROOT_SLOT_LIVE_WORDS];
 static mut ROOT_SLOT_RETYPE_BYTES: [u32; ROOT_SLOT_TRACK_CAP] = [0; ROOT_SLOT_TRACK_CAP];
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
@@ -2320,20 +2326,20 @@ pub(crate) fn ensure_fsd_reply_slot(i: usize) -> u64 {
     unsafe {
         let slots = fsd_reply_slots_mut();
         while slots.len() <= i {
+            slots.push(0);
+        }
+        if slots[i] == 0 {
             let rf = alloc_slot();
             if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rf) != 0 || rf == 0 {
                 return 0;
             }
-            slots.push(rf);
+            slots[i] = rf;
         }
         slots[i]
     }
 }
 
 pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
-    if reply_cap == 0 {
-        return;
-    }
     unsafe {
         let slots = fsd_reply_slots_mut();
         while slots.len() <= i {
@@ -2769,7 +2775,10 @@ static WATCHDOG_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static WATCHDOG_MSGS: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_LAST_SEEN_MSGS: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static WATCHDOG_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Confirmed deadlock trips. Candidate trips are deliberately excluded so a long runnable user-mode
+/// stretch cannot turn a healthy boot red.
 pub(crate) static WATCHDOG_TRIPS: AtomicU64 = AtomicU64::new(0);
+/// 0 = clear, 1 = candidate silent-period trip, 2 = confirmed deadlock.
 pub(crate) static WATCHDOG_TRIPPED: AtomicU64 = AtomicU64::new(0);
 /// Ticks the watchdog re-armed itself from inside a NESTED component-pump receive (where the main
 /// service loop's `delay_timer_interrupt` cannot run to re-arm it).
@@ -2829,11 +2838,58 @@ pub(crate) unsafe fn watchdog_on_tick() {
     if messages != previous {
         return; // the executive is still receiving real work
     }
+    let _ = WATCHDOG_TRIPPED.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// Confirm a candidate watchdog trip after the service-owned hosted-thread census says no runnable
+/// hosted work remains.
+pub(crate) unsafe fn watchdog_confirm_trip() -> bool {
+    match WATCHDOG_TRIPPED.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => {}
+        Err(2) => return true,
+        Err(_) => return false,
+    }
+    let messages = WATCHDOG_MSGS.load(Ordering::Relaxed);
     let trip = WATCHDOG_TRIPS.fetch_add(1, Ordering::Relaxed);
-    WATCHDOG_TRIPPED.store(1, Ordering::Relaxed);
     if trip < 3 {
         watchdog_report(messages);
     }
+    true
+}
+
+/// Clear a candidate silent-period trip because hosted user-mode work is still runnable. Reset the
+/// comparison baseline so another two completely silent periods are required before the next
+/// candidate.
+pub(crate) fn watchdog_defer_runnable_silence() -> bool {
+    if WATCHDOG_TRIPPED
+        .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    WATCHDOG_LAST_SEEN_MSGS.store(WATCHDOG_MSGS.load(Ordering::Relaxed), Ordering::Relaxed);
+    true
+}
+
+/// Consume watchdog work that belongs to the timer delivery currently being serviced.
+///
+/// Bound notifications can interrupt nested receives before the main service loop is ready to run
+/// `delay_timer_interrupt`. If that gap lasts longer than another watchdog period, the receive-side
+/// `watchdog_on_tick` has already advanced one deadline, but the service-side interrupt still has to
+/// consume the now-overdue next one before it picks a new comparator.
+unsafe fn watchdog_take_timer_work(now_100ns: u64) -> u64 {
+    let mut ticks = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
+    if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.load(Ordering::Relaxed) == 0 {
+        return ticks;
+    }
+    let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+    if deadline != u64::MAX && now_100ns >= deadline {
+        unsafe {
+            watchdog_on_tick();
+        }
+        ticks = ticks.saturating_add(WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed));
+    }
+    ticks
 }
 
 /// What a deadlock now SAYS about itself, instead of a silent tail.
@@ -2929,20 +2985,23 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
     let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
     let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
     let target = if deadline == u64::MAX {
-        let step = nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
+        let step =
+            nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
         now.saturating_add(step)
     } else {
-        nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period)
-            .max(now.saturating_add(1))
+        let counter_deadline = hpet_counter_deadline_100ns(deadline);
+        nt_delay_execution::timer_arm_target_ticks(
+            counter_deadline,
+            period,
+            now,
+            delay_timer_min_arm_ticks(period),
+        )
     };
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
     config &= !HPET_TN_INT_ENB;
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    core::ptr::write_volatile(
-        (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
-        target,
-    );
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64, target);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     core::ptr::write_volatile(
         (HPET_VADDR + HPET_T0_CONFIG) as *mut u64,
@@ -2975,11 +3034,32 @@ pub(crate) unsafe fn delay_timer_nested_ack() {
 }
 
 const DELAY_TIMER_IRQ: u64 = 12;
+const DELAY_TIMER_MIN_ARM_100NS: u64 = 10_000;
+const DELAY_TIMER_MIN_ARM_FLOOR_TICKS: u64 = 4096;
+const DELAY_TIMER_SOURCE_DELAY_QUEUE: u64 = 1;
+const DELAY_TIMER_SOURCE_EVENT_WAIT: u64 = 2;
+const DELAY_TIMER_SOURCE_KEYED_WAIT: u64 = 3;
+const DELAY_TIMER_SOURCE_IO_COMPLETION: u64 = 4;
+const DELAY_TIMER_SOURCE_WATCHDOG: u64 = 5;
+const DELAY_TIMER_SOURCE_PIPE_NAME: u64 = 6;
+const DELAY_TIMER_SOURCE_USER_TIMER: u64 = 7;
+const DELAY_TIMER_SOURCE_KEYED_RELEASE: u64 = 8;
+const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
+
+fn delay_timer_min_arm_ticks(period_fs: u64) -> u64 {
+    nt_delay_execution::timer_min_delta_ticks(
+        DELAY_TIMER_MIN_ARM_100NS,
+        period_fs,
+        DELAY_TIMER_MIN_ARM_FLOOR_TICKS,
+    )
+}
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
+static HPET_MONOTONIC_OFFSET_100NS: AtomicI64 = AtomicI64::new(0);
+static HPET_MONOTONIC_READY: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_BADGED_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
@@ -2993,8 +3073,6 @@ static DELAY_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static DELAY_OTHER_BADGE_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static DELAY_TIMER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static DELAY_TIMER_REBIND_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static DELAY_TIMER_REARM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass signals LSA_RPC_SERVER_ACTIVE (its essential init is complete: the LSA RPC server is
 /// up). After this, an unrecoverable fault on lsass' MAIN thread (e.g. rpcrt4 NdrSimpleTypeUnmarshall
 /// dereferencing a bogus request buffer while servicing a self-directed RPC) is CONTAINED (the loop
@@ -4884,9 +4962,8 @@ unsafe fn nt_load_key_spec(passed: &mut u64) {
     let volatile_opened = USER_VOLATILE_ENV_OPENED.load(Ordering::Relaxed);
     let volatile_queried = USER_VOLATILE_ENV_QUERIED.load(Ordering::Relaxed);
     let volatile_value_count = USER_VOLATILE_ENV_QUERY_VALUE_COUNT.load(Ordering::Relaxed);
-    let persisted_profile_hive = crate::writable_fs::hive_image_len_at(
-        crate::writable_fs::COPIED_PROFILE_NTUSER_DAT,
-    ) as u64;
+    let persisted_profile_hive =
+        crate::writable_fs::hive_image_len_at(crate::writable_fs::COPIED_PROFILE_NTUSER_DAT) as u64;
     let checkpoint_backed = unloads >= 1
         && detached >= 1
         && checkpoints >= detached
@@ -5371,7 +5448,8 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     let copied_ntuser = hive_image_len_at(COPIED_PROFILE_NTUSER_DAT) as u64;
     let copied_this_boot =
         dirs >= 15 && files >= 1 && PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) >= 1;
-    let copied_from_restored_volume = restored && user_dir_exists && content_ok && copied_ntuser > 0;
+    let copied_from_restored_volume =
+        restored && user_dir_exists && content_ok && copied_ntuser > 0;
     print_str(b"[wl-profile-copy] CopyDirectory: subdirectories created=");
     print_u64(dirs);
     print_str(b" files copied=");
@@ -6013,8 +6091,7 @@ fn lsa_security_database_specs(passed: &mut u64) {
     let sid_head = LSA_ACCT_DOMAIN_SID_HEAD
         .load(Ordering::Relaxed)
         .to_le_bytes();
-    let sid_shape_ok =
-        sid_len == 24 && sid_head[0] == 1 && sid_head[1] == 4 && sid_head[7] == 5;
+    let sid_shape_ok = sid_len == 24 && sid_head[0] == 1 && sid_head[1] == 4 && sid_head[7] == 5;
     let restored = crate::writable_fs::snapshot_restore_seen();
     let policy_created_this_boot = LSA_POLICY_KEYS_CREATED.load(Ordering::Relaxed) >= 15;
     let policy_restored_from_hive =
@@ -6146,8 +6223,9 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let boot_checkpoint_failures = REG_FLUSH_KEY_BOOT_HIVE_FAILURES.load(Ordering::Relaxed);
     let active_name = ACTIVE_COMPUTER_NAME_KEY_CREATED.load(Ordering::Relaxed);
     let new_clients = LSA_RPC_NEW_CLIENT_REQUESTS.load(Ordering::Relaxed);
-    let restored_checkpoint =
-        crate::writable_fs::snapshot_restore_seen() && boot_checkpoints >= 1 && boot_checkpoint_bytes > 0;
+    let restored_checkpoint = crate::writable_fs::snapshot_restore_seen()
+        && boot_checkpoints >= 1
+        && boot_checkpoint_bytes > 0;
     print_str(b"[lsa-rpc] NtFlushKey calls=");
     print_u64(flushes);
     print_str(b" volatile=");
@@ -6435,10 +6513,11 @@ fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
-/// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
-/// large window of iterations with NO epoch bump AND no live process is still demand-faulting (only
-/// re-parks / a slow win32k live-lock churn remains), forward progress is impossible → QUIESCE (break
-/// → run the gate + qemu_exit). This is the robust termination backstop: cooperatively-parked
+/// signalled, a demand fault serviced into a runnable mapping/COW page, or the desktop paint. The
+/// service loop snapshots this at each iteration; if it runs a large window of iterations with NO
+/// epoch bump (only re-parks / a slow win32k live-lock churn remains), forward progress is
+/// impossible → QUIESCE (break → run the gate + qemu_exit). This is the robust termination backstop:
+/// cooperatively-parked
 /// processes (lsass listener wait / winlogon WaitForLsass) + a stuck client that keeps issuing
 /// syscalls (so it is neither crash- nor wait-parked) would otherwise block the loop's recv forever.
 /// Bumping it on real progress keeps a genuinely-advancing boot alive; a stall means the gate should
@@ -6458,10 +6537,6 @@ pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// per-slot window so late `\pipe\ntsvcs` accepts remain observable without changing behavior.
 pub(crate) static SCM_WORKER_SLOT_SSN_TRACE: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
-/// Generic per-process/per-slot TP worker trace. Dynamic services and drivers can create workers
-/// after global caps are exhausted; this keeps each hosted worker slot independently observable.
-pub(crate) static TP_WORKER_SLOT_SSN_TRACE: [AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT] =
-    [const { AtomicU64::new(0) }; MAX_PI * TP_WORKER_SLOT_COUNT];
 pub(crate) static TP_WORKER_SLOT_EVENT_TRACE: [AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; MAX_PI * TP_WORKER_SLOT_COUNT];
 /// LSA-RPC DIAG: per-SSN trace counter for lsass' `\pipe\lsarpc` rpcrt4 SERVER thread
@@ -6550,12 +6625,8 @@ pub(crate) static LSA_RPC_NEW_CLIENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// `...\Control\ComputerName\ActiveComputerName` key — the tail of the exact NtOpenKey/NtCreateKey/
 /// NtSetValueKey/**NtFlushKey** sequence that used to wall inside the rpcrt4 handoff.
 pub(crate) static ACTIVE_COMPUTER_NAME_KEY_CREATED: AtomicU64 = AtomicU64::new(0);
-/// Bounded per-SSN trace for lsass' generic thread-pool worker (rpcrt4's `RPCRT4_worker_thread`).
-pub(crate) static LSA_TP_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Total native syscalls serviced, for the `[ssn-heartbeat]` spin diagnostic.
 pub(crate) static NATIVE_SYSCALL_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
-/// Bounded per-SSN trace for the LSA per-connection worker (same shape as `[scm-worker-ssn]`).
-pub(crate) static LSA_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Native syscalls the LSA per-connection worker actually issued (unbounded) — the counter the gate
 /// asserts on: it can only be nonzero if a real per-connection worker thread RAN in lsass' VSpace.
 pub(crate) static LSA_WORKER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
@@ -6571,9 +6642,9 @@ pub(crate) static BADGE_EVENTS: [AtomicU64; BADGE_CENSUS_N] =
     [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
 pub(crate) static BADGE_TIME_100NS: [AtomicU64; BADGE_CENSUS_N] =
     [const { AtomicU64::new(0) }; BADGE_CENSUS_N];
-/// Per-SSN histogram for lsass (pi 4) — the whole process, all its badges. A BOUNDED unit of work
-/// shows a flat spread of distinct SSNs; a POLL / RETRY LIVELOCK shows one or two SSNs with counts
-/// in the thousands.
+/// Per-SSN histograms for hosted system processes — the whole process, all its badges. A bounded
+/// unit of work shows a flat spread of distinct SSNs; a poll/retry livelock shows one or two SSNs
+/// with counts in the thousands.
 ///
 /// ★ BATCH 58: the histogram covers BOTH service tables. The low 1024 buckets are the NATIVE SSN
 /// space (`ntdll`, `0x000..0x3FF`); the high 1024 are the **win32k SHADOW table** (`0x1000+`, which
@@ -6583,6 +6654,10 @@ pub(crate) static BADGE_TIME_100NS: [AtomicU64; BADGE_CENSUS_N] =
 pub(crate) const SSN_HIST_NATIVE: usize = 1024;
 pub(crate) const SSN_HIST_N: usize = 2048;
 pub(crate) static LSASS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Same histogram for the Service Control Manager (pi 3), which owns the post-LSA service/database
+/// frontier before `userinit.exe` and Explorer can be launched.
+pub(crate) static SERVICES_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
 /// Same histogram for winlogon (pi 2) — the process whose forward progress the paint depends on.
 pub(crate) static WINLOGON_SSN_HIST: [AtomicU64; SSN_HIST_N] =
@@ -6625,7 +6700,9 @@ pub(crate) fn census_slot(badge: u64) -> usize {
 pub(crate) static TIMER_TICKS_SEEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_SPURIOUS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_EARLY_STALE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TIMER_DUE_WORK_DRAINS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DELAY_TIMER_REARM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
 /// 1 = delay queue, 2 = event waiter, 3 = keyed waiter, 4 = io-completion waiter,
 /// 8 = keyed release waiter.
@@ -6643,7 +6720,7 @@ pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
 /// does NOT need diagnosing. A boot that blows the TCG budget (`RUNEXIT=124`) is killed before the
 /// gate runs, so it produced no census at all and every claim about "where the time went" was a
 /// guess. The service loop now dumps the same census every [`CENSUS_PERIOD_100NS`] of wall-clock,
-/// so a NON-quiescing boot still says who spent the seconds — and the successive dumps make a
+/// so a NON-quiescing boot still says who spent the seconds — and successive heartbeats make a
 /// runaway visible as a RATE, not just a total.
 pub(crate) const CENSUS_PERIOD_100NS: u64 = 30 * 10_000_000; // 30 s
 pub(crate) static CENSUS_PERIODIC_DUMPS: AtomicU64 = AtomicU64::new(0);
@@ -6686,7 +6763,7 @@ pub(crate) const GET_MESSAGE_EMPTY_QUEUE_GUARD: bool = true;
 pub(crate) static GET_MESSAGE_PREFLIGHT_PEEKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GET_MESSAGE_EMPTY_QUEUE_PARKS: AtomicU64 = AtomicU64::new(0);
 
-/// Record a win32k dispatch entry for the census, and tick the periodic dump from inside the
+/// Record a win32k dispatch entry for the census, and tick the periodic heartbeat from inside the
 /// nested pump. Called from the SSN >= 0x1000 arm of the service loop.
 pub(crate) fn w32_census_enter(ssn: u64) {
     let now = monotonic_time_100ns();
@@ -6724,6 +6801,103 @@ pub(crate) fn w32_census_enter(ssn: u64) {
     census_tick_static(now);
 }
 
+fn ssn_from_bucket(bucket: usize) -> u32 {
+    if bucket < SSN_HIST_NATIVE {
+        bucket as u32
+    } else {
+        0x1000 + (bucket - SSN_HIST_NATIVE) as u32
+    }
+}
+
+fn hot_ssn_bucket(hist: &[AtomicU64; SSN_HIST_N]) -> Option<(usize, u64)> {
+    let mut best = usize::MAX;
+    let mut best_n = 0u64;
+    for (bucket, cell) in hist.iter().enumerate() {
+        let n = cell.load(Ordering::Relaxed);
+        if n > best_n {
+            best_n = n;
+            best = bucket;
+        }
+    }
+    if best == usize::MAX {
+        None
+    } else {
+        Some((best, best_n))
+    }
+}
+
+fn print_hot_ssn_field(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
+    print_str(b" ");
+    print_str(who);
+    print_str(b"=");
+    if let Some((bucket, count)) = hot_ssn_bucket(hist) {
+        print_hex(ssn_from_bucket(bucket));
+        print_str(b"/");
+        print_u64(count);
+    } else {
+        print_str(b"none");
+    }
+}
+
+fn print_periodic_census_heartbeat(n: u64, now: u64) {
+    let mut total_events = 0u64;
+    let mut hot_badge = usize::MAX;
+    let mut hot_badge_events = 0u64;
+    let mut hot_badge_ms = 0u64;
+    for badge in 0..BADGE_CENSUS_N {
+        let events = BADGE_EVENTS[badge].load(Ordering::Relaxed);
+        total_events = total_events.saturating_add(events);
+        if events > hot_badge_events {
+            hot_badge = badge;
+            hot_badge_events = events;
+            hot_badge_ms = BADGE_TIME_100NS[badge].load(Ordering::Relaxed) / 10_000;
+        }
+    }
+
+    print_str(b"[census] periodic #");
+    print_u64(n);
+    print_str(b" t_ms=");
+    print_u64(now / 10_000);
+    print_str(b" events=");
+    print_u64(total_events);
+    print_str(b" hot-badge=");
+    if hot_badge == usize::MAX {
+        print_str(b"none");
+    } else {
+        print_u64(hot_badge as u64);
+        print_str(b"/");
+        print_u64(hot_badge_events);
+        print_str(b"/");
+        print_u64(hot_badge_ms);
+        print_str(b"ms");
+    }
+    print_str(b" faults=");
+    print_u64(DEMAND_FAULTS.load(Ordering::Relaxed));
+    print_str(b" heap=");
+    print_u64(allocator::mark() as u64);
+    print_str(b" timer=");
+    print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
+    print_str(b" pipe=");
+    print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
+    print_str(b" ssn-hot");
+    print_hot_ssn_field(b"services", unsafe {
+        &*core::ptr::addr_of!(SERVICES_SSN_HIST)
+    });
+    print_hot_ssn_field(b"winlogon", unsafe {
+        &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
+    });
+    print_hot_ssn_field(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
+    print_hot_ssn_field(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
+    print_hot_ssn_field(b"explorer", unsafe {
+        &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
+    });
+    print_str(b"\n");
+}
+
 /// Dump the census if the period has elapsed, using the shared static clock.
 pub(crate) fn census_tick_static(now: u64) {
     let last = CENSUS_LAST_DUMP.load(Ordering::Relaxed);
@@ -6732,20 +6906,7 @@ pub(crate) fn census_tick_static(now: u64) {
     }
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
-    print_str(b"[census] ---- periodic dump #");
-    print_u64(n);
-    print_str(b" ----\n");
-    print_census_badges();
-    print_census_counters(b"periodic");
-    print_ssn_hist(b"winlogon", unsafe {
-        &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
-    });
-    print_ssn_hist(b"csrss", unsafe { &*core::ptr::addr_of!(CSRSS_SSN_HIST) });
-    print_ssn_hist(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
-    print_ssn_hist(b"explorer", unsafe {
-        &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
-    });
-    print_w32_ssn_time();
+    print_periodic_census_heartbeat(n, now);
 }
 
 /// The 16 win32k SSNs that cost the most WALL-CLOCK (ms), plus the average per dispatch.
@@ -6854,8 +7015,7 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_pool_census(tag);
 }
 
-/// The per-badge table — factored out of [`print_progress_census`] so the periodic dump prints the
-/// identical thing.
+/// The per-badge table used by the final quiesce census.
 fn print_census_badges() {
     for badge in 0..BADGE_CENSUS_N {
         let events = BADGE_EVENTS[badge].load(Ordering::Relaxed);
@@ -6893,6 +7053,9 @@ pub(crate) fn print_progress_census() {
     print_str(b" last-past-source=");
     print_u64(TIMER_PAST_DEADLINE_SOURCE.load(Ordering::Relaxed));
     print_str(b" (1=delay 2=event 3=keyed 4=iocp 8=keyed-release)\n");
+    print_ssn_hist(b"services", unsafe {
+        &*core::ptr::addr_of!(SERVICES_SSN_HIST)
+    });
     print_ssn_hist(b"lsass", unsafe { &*core::ptr::addr_of!(LSASS_SSN_HIST) });
     print_ssn_hist(b"winlogon", unsafe {
         &*core::ptr::addr_of!(WINLOGON_SSN_HIST)
@@ -7103,6 +7266,22 @@ fn root_slot_index(slot: u64) -> Option<usize> {
     (index < ROOT_SLOT_TRACK_CAP).then_some(index)
 }
 
+fn root_slot_recycle_count() -> u64 {
+    let count = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+    let cap = ROOT_SLOT_RECYCLE_CAP as u64;
+    if count <= cap {
+        return count;
+    }
+    ROOT_SLOT_RECYCLE_CORRUPT.fetch_add(1, Ordering::Relaxed);
+    ROOT_SLOT_RECYCLE_N.store(cap, Ordering::Relaxed);
+    print_str(b"[cap] recycled-slot stack length clamped from ");
+    print_u64(count);
+    print_str(b" to ");
+    print_u64(cap);
+    print_str(b"\n");
+    cap
+}
+
 unsafe fn root_slot_mark_live(slot: u64) -> bool {
     let Some((word, bit)) = root_slot_bit(slot) else {
         return false;
@@ -7127,7 +7306,7 @@ unsafe fn root_slot_clear_live(slot: u64) -> bool {
 }
 
 unsafe fn root_slot_remove_recycled(slot: u64) -> bool {
-    let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+    let n = root_slot_recycle_count();
     let stack = core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE) as *mut u64;
     let mut i = 0;
     while i < n {
@@ -7186,7 +7365,7 @@ unsafe fn root_slot_take_retype_bytes(slot: u64) -> u64 {
 
 fn try_recycled_root_slot() -> Option<u64> {
     loop {
-        let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+        let n = root_slot_recycle_count();
         if n == 0 {
             return None;
         }
@@ -7210,7 +7389,7 @@ unsafe fn recycle_deleted_root_slot(slot: u64) {
         return;
     }
     let _ = root_slot_take_retype_bytes(slot);
-    let n = ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed);
+    let n = root_slot_recycle_count();
     if n >= ROOT_SLOT_RECYCLE_CAP as u64 {
         ROOT_SLOT_RECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -7228,7 +7407,7 @@ fn root_slot_available_count() -> u64 {
     let end = ROOT_CSPACE_END.load(Ordering::Relaxed);
     let bump = NEXT_SLOT.load(Ordering::Relaxed);
     let bump_free = end.saturating_sub(bump);
-    bump_free + ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed)
+    bump_free + root_slot_recycle_count()
 }
 
 // --- Shared executable-page cache (generic DLL loader) --------------------------------------------
@@ -7366,8 +7545,8 @@ pub(crate) unsafe fn csrss_frame_put_with_source(
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
-pub(crate) unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
-    let _ = csrss_frame_put_at_cap_source(pi, page, fr, alias, 0, 0);
+pub(crate) unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) -> bool {
+    csrss_frame_put_at_cap_source(pi, page, fr, alias, 0, 0)
 }
 unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
     csrss_frame_put_at_cap_source(pi, page, fr, alias, alias_cap, 0)
@@ -8085,8 +8264,7 @@ static IMAGE_MAP_CAP_BANK_RAW: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
 static IMAGE_MAP_CAP_BANK_CNODE: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
     [const { AtomicU64::new(0) }; IMAGE_MAP_CAP_BANK_SEGMENTS];
 static IMAGE_MAP_CAP_BANK_NEXT: AtomicU64 = AtomicU64::new(0);
-static IMAGE_MAP_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 static IMAGE_MAP_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
@@ -8135,7 +8313,12 @@ unsafe fn image_map_cap_bank_ensure_segment(segment: usize) -> Option<u64> {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return None;
     };
-    let mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, IMAGE_MAP_CAP_BANK_GUARD_BADGE);
+    let mint = cnode_mint_r(
+        CAP_INIT_THREAD_CNODE,
+        cnode,
+        raw,
+        IMAGE_MAP_CAP_BANK_GUARD_BADGE,
+    );
     if mint != 0 {
         recycle_deleted_root_slot(cnode);
         let _ = cnode_delete_recycle_r(raw);
@@ -8182,11 +8365,7 @@ unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImage
     Some(SharedImageMappingCap::Bank { cnode, slot })
 }
 
-unsafe fn image_map_cap_bank_take_root(
-    pi: u8,
-    cnode: u64,
-    slot: u16,
-) -> Result<u64, u64> {
+unsafe fn image_map_cap_bank_take_root(pi: u8, cnode: u64, slot: u16) -> Result<u64, u64> {
     let Some(root_cap) = try_alloc_slot() else {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return Err(4);
@@ -8773,6 +8952,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(ROOT_SLOT_RECYCLE_REUSED.load(Ordering::Relaxed));
     print_str(b" dropped=");
     print_u64(ROOT_SLOT_RECYCLE_DROPPED.load(Ordering::Relaxed));
+    print_str(b" corrupt=");
+    print_u64(ROOT_SLOT_RECYCLE_CORRUPT.load(Ordering::Relaxed));
     print_str(b" frame-reg=");
     print_u64(CSRSS_FRAME_HW.load(Ordering::Relaxed));
     print_str(b"/");
@@ -8906,6 +9087,8 @@ pub(crate) unsafe fn page_unmap_r(frame: u64) -> u64 {
         inout("r10") 0u64 => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -8956,6 +9139,8 @@ pub(crate) unsafe fn vspace_assign_asid(pml4: u64) -> u64 {
         inout("r10") pml4 => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -10771,9 +10956,29 @@ pub(crate) unsafe fn image_writecopy_cow_selftest(pi: usize, pml4: u64, scratch_
 }
 
 unsafe fn alloc_frame() -> u64 {
-    let s = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
-    s
+    let (slot, error) = alloc_frame_r();
+    if error == 0 && slot != 0 {
+        return slot;
+    }
+    print_str(b"[frame] allocation failed slot=0x");
+    print_hex((slot >> 32) as u32);
+    print_hex(slot as u32);
+    print_str(b" error=");
+    print_u64(error);
+    print_str(b" cspace-free=");
+    print_u64(root_slot_available_count());
+    print_str(b" untyped-free-KiB=");
+    print_u64(
+        UT_TOTAL_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed))
+            >> 10,
+    );
+    print_str(b"\n");
+    if slot != 0 {
+        recycle_deleted_root_slot(slot);
+    }
+    panic!("frame allocation failed");
 }
 
 unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
@@ -11579,6 +11784,8 @@ pub(crate) unsafe fn untyped_retype_r(
         inout("r10") obj => _,
         inout("r8") size_num => _,
         inout("r9") dest => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11602,6 +11809,8 @@ unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
         inout("r10") d => _,
         inout("r8") src => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11622,6 +11831,8 @@ unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
         inout("r10") dest => _,
         inout("r8") src => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11641,6 +11852,8 @@ pub(crate) unsafe fn cnode_copy_at_r(cnode: u64, dest: u64, src: u64) -> u64 {
         inout("r10") dest => _,
         inout("r8") src => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11656,6 +11869,8 @@ unsafe fn cnode_mint_r(cnode: u64, dest: u64, src: u64, badge: u64) -> u64 {
         inout("r10") dest => _,
         inout("r8") src => _,
         inout("r9") badge => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11676,6 +11891,8 @@ unsafe fn cnode_move_root_to_cnode_r(dest_cnode: u64, dest_index: u64, src_root_
         inout("r10") dest_index => _,
         inout("r8") src_root_slot => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11696,6 +11913,8 @@ unsafe fn cnode_move_cnode_to_root_r(dest_root_slot: u64, src_cnode: u64, src_in
         inout("r8") 64u64 => _,
         inout("r9") src_index => _,
         inout("r15") 64u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11715,6 +11934,8 @@ unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
         inout("r10") vaddr => _,
         inout("r8") rights => _,
         inout("r9") vspace => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11730,6 +11951,63 @@ pub(crate) unsafe fn paging_struct_map_r(paging: u64, label: u64, vaddr: u64, vs
         inout("r10") vaddr => _,
         inout("r8") vspace => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn tcb_set_priority_r(target: u64, prio: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_SET_PRIORITY << 12 => reply,
+        inout("r10") prio => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn tcb_set_gs_base_r(target: u64, base: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_SET_TLS_BASE << 12 => reply,
+        inout("r10") base => _,
+        inout("r8") 1u64 => _,
+        inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+unsafe fn tcb_set_hosted_syscalls_r(target: u64) -> u64 {
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_SET_HOSTED_SYSCALLS << 12 => reply,
+        inout("r10") 0u64 => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11747,6 +12025,8 @@ unsafe fn tcb_set_space_r(target: u64, fault_ep: u64, cnode: u64, vspace: u64) -
         inout("r10") fault_ep => _,
         inout("r8") cnode => _,
         inout("r9") vspace => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11764,6 +12044,8 @@ unsafe fn tcb_set_ipc_buffer_r(target: u64, vaddr: u64, frame: u64) -> u64 {
         inout("r10") vaddr => _,
         inout("r8") frame => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11781,6 +12063,25 @@ unsafe fn tcb_write_registers_r(target: u64, rip: u64, rsp: u64, arg0: u64) -> u
         inout("r10") rip => _,
         inout("r8") rsp => _,
         inout("r9") arg0 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+unsafe fn tcb_resume_r(target: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_RESUME << 12 => reply,
+        inout("r10") 0u64 => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -11943,7 +12244,10 @@ where
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let mmio_len = grant.assignment.mmio_len;
-        if mmio_len == 0 || mmio_len > window.mmio_pages * 0x1000 {
+        if mmio_len == 0
+            || mmio_len > window.mmio_pages * 0x1000
+            || window.mapped_mmio_len() == 0
+        {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         driver_launch::grant_hosted_device_resources(
@@ -11965,7 +12269,7 @@ where
             window.mmio_va,
             window.mmio_seed_va,
             window.mmio_frame_base,
-            window.mmio_pages,
+            window.mmio_map_pages,
             if grant.device.base_class() == nt_pnp::PCI_CLASS_DISPLAY {
                 win32k_subsystem::WIN32K_FB_VA
             } else {
@@ -12227,6 +12531,8 @@ unsafe fn tcb_suspend_r(tcb: u64) -> u64 {
         inout("r10") 0u64 => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12245,6 +12551,8 @@ unsafe fn cnode_delete_r(idx: u64) -> u64 {
         inout("r10") idx => _, // a2 = slot index under the root CNode
         inout("r8") 0u64 => _, // a3 = depth (ignored; msginfo length 0 → WORD_BITS)
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12261,6 +12569,8 @@ pub(crate) unsafe fn cnode_delete_in_cnode_r(cnode: u64, idx: u64) -> u64 {
         inout("r10") idx => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12289,6 +12599,8 @@ unsafe fn cnode_revoke_r(idx: u64) -> u64 {
         inout("r10") idx => _, // a2 = slot index under the root CNode
         inout("r8") 0u64 => _, // a3 = depth (ignored; msginfo length 0 → WORD_BITS)
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12309,6 +12621,8 @@ unsafe fn untyped_retype_from_r(untyped: u64, obj: u64, bits: u32, num: u32, des
         inout("r10") obj => _,
         inout("r8") size_num => _,
         inout("r9") dest => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12329,6 +12643,8 @@ unsafe fn sched_control_configure_r(sc: u64, budget: u64, period: u64) -> u64 {
         inout("r10") sc => _,
         inout("r8") budget => _,
         inout("r9") period => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12345,6 +12661,8 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
         inout("r10") tcb => _,
         inout("r8") 0u64 => _,
         inout("r9") 0u64 => _,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -12383,10 +12701,90 @@ unsafe fn attach_sched_context(tcb: u64) -> Result<u64, u64> {
 /// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to
 /// piggyback the image's 2 MiB PT; now that the working VAs moved high (out of the 64 MiB ELF
 /// reserve) it needs its own PT in every executive-image VSpace and in the executive's own.
-pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
+unsafe fn map_required_page_table(pml4: u64, base: u64, stage: &[u8]) {
     let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    if retype != 0 {
+        print_str(b"[paging] retype ");
+        print_str(stage);
+        print_str(b" failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" pt=0x");
+        print_hex((pt >> 32) as u32);
+        print_hex(pt as u32);
+        print_str(b" error=");
+        print_u64(retype);
+        print_str(b"\n");
+        panic!("required page-table retype failed");
+    }
+
+    let map = paging_struct_map_r(pt, LBL_X86_PAGE_TABLE_MAP, base, pml4);
+    if map != 0 {
+        let _ = cnode_delete_recycle_r(pt);
+        print_str(b"[paging] map ");
+        print_str(stage);
+        print_str(b" failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" error=");
+        print_u64(map);
+        print_str(b"\n");
+        panic!("required page-table map failed");
+    }
+}
+
+unsafe fn map_required_paging_struct(
+    pml4: u64,
+    object_type: u64,
+    map_label: u64,
+    base: u64,
+    stage: &[u8],
+) {
+    let cap = alloc_slot();
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, cap);
+    if retype != 0 {
+        print_str(b"[paging] retype ");
+        print_str(stage);
+        print_str(b" failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" cap=0x");
+        print_hex((cap >> 32) as u32);
+        print_hex(cap as u32);
+        print_str(b" type=");
+        print_u64(object_type);
+        print_str(b" error=");
+        print_u64(retype);
+        print_str(b"\n");
+        panic!("required paging-structure retype failed");
+    }
+
+    let map = paging_struct_map_r(cap, map_label, base, pml4);
+    if map != 0 {
+        let _ = cnode_delete_recycle_r(cap);
+        print_str(b"[paging] map ");
+        print_str(stage);
+        print_str(b" failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b" label=");
+        print_u64(map_label);
+        print_str(b" error=");
+        print_u64(map);
+        print_str(b"\n");
+        panic!("required paging-structure map failed");
+    }
+}
+
+pub(crate) unsafe fn map_cluster_pt(pml4: u64) {
+    map_required_page_table(pml4, WORK_CLUSTER_BASE, b"cluster-pt");
 }
 
 pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
@@ -12395,9 +12793,7 @@ pub(crate) unsafe fn map_tp_worker_target_lane_pts(pml4: u64) {
         (tp_worker_high_region_base(TP_WORKER_SLOT_COUNT - 1) + TP_WORKER_EXEC_STRIDE + 0x1f_ffff)
             & !0x1f_ffff;
     while base < end {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, base, pml4);
+        map_required_page_table(pml4, base, b"tp-worker-lane-pt");
         base += 0x20_0000;
     }
 }
@@ -12414,27 +12810,20 @@ unsafe fn map_heap_pt(pml4: u64) {
 unsafe fn map_heap_pts(pml4: u64, frames: u64) {
     let windows = frames.div_ceil(512).max(1);
     for window in 0..windows {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(
-            pt,
-            LBL_X86_PAGE_TABLE_MAP,
-            allocator::HEAP_BASE as u64 + window * 0x20_0000,
+        map_required_page_table(
             pml4,
+            allocator::HEAP_BASE as u64 + window * 0x20_0000,
+            b"heap-pt",
         );
     }
 }
 
 pub(crate) unsafe fn map_hosted_client_env_pt(pml4: u64) {
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, HOSTED_CLIENT_ENV_BASE, pml4);
+    map_required_page_table(pml4, HOSTED_CLIENT_ENV_BASE, b"hosted-client-env-pt");
 }
 
 unsafe fn map_user_alloc_pt(pml4: u64) {
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, USER_ALLOC_BASE, pml4);
+    map_required_page_table(pml4, USER_ALLOC_BASE, b"user-alloc-pt");
 }
 
 /// Build the standard executive-image paging skeleton in `pml4`: pdpt + pd for the image's 1 GiB
@@ -12442,19 +12831,25 @@ unsafe fn map_user_alloc_pt(pml4: u64) {
 /// relocated cluster PT. Callers then map the image frames + any region-specific buffer PTs. The
 /// pd is 1 GiB-granular, so it also covers the cluster / heap / buffer PTs (all < 512 MiB).
 pub(crate) unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    map_required_paging_struct(
+        pml4,
+        OBJ_X86_PDPT,
+        LBL_X86_PDPT_MAP,
+        IMAGE_BASE,
+        b"image-pdpt",
+    );
+    map_required_paging_struct(
+        pml4,
+        OBJ_X86_PAGE_DIRECTORY,
+        LBL_X86_PAGE_DIRECTORY_MAP,
+        IMAGE_BASE,
+        b"image-pd",
+    );
     // One PT per 2 MiB of image (512 4 KiB pages each). `.max(1)` keeps at least one even for a
     // trivially small image.
     let npt = ((img_count + 511) / 512).max(1);
     for k in 0..npt {
-        let pt = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE + k * 0x20_0000, pml4);
+        map_required_page_table(pml4, IMAGE_BASE + k * 0x20_0000, b"image-pt");
     }
     map_cluster_pt(pml4);
 }
@@ -12935,6 +13330,8 @@ unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
         "syscall",
         in("rdx") SYS_RECV as u64,
         inout("rdi") ep => badge,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rsi") msginfo,
         lateout("r10") mr0,
         lateout("r8") mr1,
@@ -12970,6 +13367,8 @@ unsafe fn reply_recv_full(
         inout("r8") r1 => mr1,
         inout("r9") r2 => mr2,
         inout("r15") r3 => mr3,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -13022,6 +13421,8 @@ unsafe fn reply_recv_badge(
             inout("r8") r1 => mr1,
             inout("r9") r2 => mr2,
             inout("r15") r3 => mr3,
+            in("r12") 0u64,
+            in("r13") 0u64,
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
@@ -13053,6 +13454,7 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
         lateout("r9") mr2,
         lateout("r15") mr3,
         in("r12") reply_cptr,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -13145,32 +13547,8 @@ unsafe fn reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3:
         inout("r8") r1 => _,
         inout("r9") r2 => _,
         inout("r15") r3 => _,
+        in("r12") 0u64,
         in("r13") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    reply >> 12
-}
-
-unsafe fn reply_on_handoff(
-    reply_cptr: u64,
-    msginfo: u64,
-    r0: u64,
-    r1: u64,
-    r2: u64,
-    r3: u64,
-) -> u64 {
-    let reply: u64;
-    core::arch::asm!(
-        "syscall",
-        inout("rdx") SYS_CALL as u64 => _,
-        inout("rdi") reply_cptr => _,
-        inout("rsi") msginfo => reply,
-        inout("r10") r0 => _,
-        inout("r8") r1 => _,
-        inout("r9") r2 => _,
-        inout("r15") r3 => _,
-        in("r13") SYS_REPLY_HANDOFF_MAGIC,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -13195,7 +13573,7 @@ pub(crate) static CLIENT_REPLY_BOUND: AtomicU64 = AtomicU64::new(0);
 /// would be parsed as an `InvocationLabel` by `decode_invocation` and rejected before reaching
 /// `decode_reply` (migration correction 1).
 unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
-    let label = reply_on_handoff(reply_cptr, msginfo, r0, r1, r2, r3);
+    let label = reply_on(reply_cptr, msginfo, r0, r1, r2, r3);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if label != 0 && CLIENT_REPLY_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
         print_str(b"[client-reply] UNBOUND reply object cptr=");
@@ -13208,14 +13586,53 @@ unsafe fn client_reply_on(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u
     }
 }
 
+#[inline]
+fn fallback_monotonic_time_100ns() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() / 10 }
+}
+
+#[inline]
+unsafe fn hpet_counter_time_100ns(period_fs: u64) -> u64 {
+    let ticks = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    nt_delay_execution::ticks_to_100ns(ticks, period_fs)
+}
+
+unsafe fn initialize_hpet_monotonic_epoch(period_fs: u64) {
+    if period_fs == 0 || HPET_MONOTONIC_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let fallback_now = fallback_monotonic_time_100ns();
+    let counter_now = hpet_counter_time_100ns(period_fs);
+    let offset = nt_delay_execution::counter_epoch_offset(fallback_now, counter_now);
+    HPET_MONOTONIC_OFFSET_100NS.store(offset, Ordering::Relaxed);
+    HPET_MONOTONIC_READY.store(true, Ordering::Release);
+    print_str(b"[hpet-clock] monotonic epoch fallback=");
+    print_u64(fallback_now);
+    print_str(b" counter=");
+    print_u64(counter_now);
+    print_str(b" offset=");
+    if offset < 0 {
+        print_str(b"-");
+        print_u64(offset.unsigned_abs());
+    } else {
+        print_u64(offset as u64);
+    }
+    print_str(b"\n");
+}
+
+#[inline]
+fn hpet_counter_deadline_100ns(deadline_100ns: u64) -> u64 {
+    let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
+    nt_delay_execution::counter_time_from_epoch(deadline_100ns, offset)
+}
+
 fn monotonic_time_100ns() -> u64 {
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
-    if period != 0 {
-        let ticks =
-            unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64) };
-        nt_delay_execution::ticks_to_100ns(ticks, period)
+    if period != 0 && HPET_MONOTONIC_READY.load(Ordering::Acquire) {
+        let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
+        unsafe { nt_delay_execution::epoch_time_from_counter(hpet_counter_time_100ns(period), offset) }
     } else {
-        unsafe { core::arch::x86_64::_rdtsc() / 10 }
+        fallback_monotonic_time_100ns()
     }
 }
 
@@ -13439,14 +13856,6 @@ unsafe fn delay_timer_init() -> bool {
                 0,
                 0,
             );
-            let n = DELAY_TIMER_REBIND_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 12 {
-                print_str(b"[delay-bind] rebind existing notification=0x");
-                print_hex_u64(notification);
-                print_str(b" root-bound=");
-                print_delay_root_bound_notification();
-                print_str(b"\n");
-            }
         }
         return true;
     }
@@ -13506,6 +13915,7 @@ unsafe fn delay_timer_init() -> bool {
     let config = HPET_TN_INT_TYPE_LEVEL | (pin << 9);
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
+    initialize_hpet_monotonic_epoch(period);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
     DELAY_TIMER_NOTIFICATION.store(notification, Ordering::Relaxed);
@@ -13519,39 +13929,14 @@ unsafe fn delay_timer_init() -> bool {
     print_u64(period);
     print_str(b" bound_badge=0x");
     print_hex_u64(DELAY_TIMER_BADGE);
-    print_str(b" root-bound=");
-    print_delay_root_bound_notification();
     print_str(b"\n");
     true
 }
 
-unsafe fn print_delay_root_bound_notification() {
-    let mut state = [0u64; win32k_glue::TCB_DEBUG_STATE_WORDS];
-    win32k_glue::tcb_read_debug_state(1, REPLY_MAIN_SLOT.load(Ordering::Relaxed), &mut state);
-    let bound = state[win32k_glue::TCB_DBG_BOUND_NOTIFICATION];
-    if bound == win32k_glue::TCB_DEBUG_NONE {
-        print_str(b"none");
-    } else {
-        print_u64(bound);
-    }
-    print_str(b" reply-bound=");
-    let reply_bound = state[win32k_glue::TCB_DBG_REPLY_BOUND_TCB];
-    if reply_bound == win32k_glue::TCB_DEBUG_NONE {
-        print_str(b"none");
-    } else {
-        print_u64(reply_bound);
-    }
-}
-
-unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
-    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    if handler == 0 {
-        return;
-    }
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+unsafe fn delay_timer_next_deadline(
+    queue: &nt_delay_execution::Queue<DELAY_WAITER_N>,
+) -> Option<(u64, u64)> {
+    let delay_deadline = queue.next_deadline();
     let event_deadline = (0..WAITER_N)
         .filter(|slot| WAITER_EVENT_IDX[*slot].load(Ordering::Relaxed) != u64::MAX)
         .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
@@ -13575,11 +13960,8 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         deadline => Some(deadline),
     };
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
-    // The deadman joins the same `min()` as every real waiter — it is a deadline like any other, so
-    // the arm/disarm path (and `exec_delay_timer_disarms`' invariants) are untouched by it.
     let deadman_deadline = watchdog_deadline();
-    let deadline = queue
-        .next_deadline()
+    let deadline = delay_deadline
         .into_iter()
         .chain(event_deadline)
         .chain(keyed_deadline)
@@ -13589,34 +13971,51 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .chain(user_timer_deadline)
         .chain(hosted_driver_deadline)
         .chain(deadman_deadline)
-        .min();
-    if let Some(deadline) = deadline {
+        .min()?;
+    let source = if delay_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_DELAY_QUEUE
+    } else if event_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_EVENT_WAIT
+    } else if keyed_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_KEYED_WAIT
+    } else if keyed_release_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_KEYED_RELEASE
+    } else if io_completion_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_IO_COMPLETION
+    } else if pipe_name_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_PIPE_NAME
+    } else if user_timer_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_USER_TIMER
+    } else if hosted_driver_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_HOSTED_DRIVER
+    } else {
+        DELAY_TIMER_SOURCE_WATCHDOG
+    };
+    Some((deadline, source))
+}
+
+unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if handler == 0 {
+        return;
+    }
+    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    config &= !HPET_TN_INT_ENB;
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    if let Some((deadline, source)) = delay_timer_next_deadline(queue) {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
-        let target = nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period);
+        let guard_ticks = delay_timer_min_arm_ticks(period);
         let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
-        // DIAGNOSTIC: a deadline that is ALREADY PAST is clamped to `now + 1`, so the comparator
-        // re-fires immediately. If the waiter holding it is not popped by any `*_wake_due`, that
-        // is a self-sustaining interrupt storm, not a timer. Attribute the source.
-        let source = if queue.next_deadline() == Some(deadline) {
-            1
-        } else if event_deadline == Some(deadline) {
-            2
-        } else if keyed_deadline == Some(deadline) {
-            3
-        } else if keyed_release_deadline == Some(deadline) {
-            8
-        } else if io_completion_deadline == Some(deadline) {
-            4
-        } else if pipe_name_deadline == Some(deadline) {
-            6
-        } else if user_timer_deadline == Some(deadline) {
-            7
-        } else if hosted_driver_deadline == Some(deadline) {
-            9
-        } else {
-            5 // the deadman
-        };
-        if target <= now {
+        let counter_deadline = hpet_counter_deadline_100ns(deadline);
+        let deadline_target =
+            nt_delay_execution::hundred_ns_to_ticks_ceil(counter_deadline, period);
+        let target =
+            nt_delay_execution::timer_arm_target_ticks(counter_deadline, period, now, guard_ticks);
+        // Keep the comparator safely ahead of the enable edge. For accounting, still record when
+        // the original deadline target has already passed; that means a wake path failed to drain
+        // its due waiter promptly and the guarded rearm is only preventing a lost one-shot.
+        if deadline_target <= now {
             TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
             TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
         }
@@ -13625,36 +14024,29 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         LAST_REARM_TARGET.store(target, Ordering::Relaxed);
         LAST_REARM_NOW.store(now, Ordering::Relaxed);
         LAST_REARM_ARMED.store(1, Ordering::Relaxed);
-        core::ptr::write_volatile(
-            (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
-            target.max(now.saturating_add(1)),
-        );
+        core::ptr::write_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64, target);
         core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+        if source == DELAY_TIMER_SOURCE_IO_COMPLETION {
+            let trace = DELAY_TIMER_REARM_TRACE_N.fetch_add(1, Ordering::Relaxed);
+            if trace < 16 {
+                let completion_waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
+                print_str(b"[delay-rearm] source=iocp deadline=");
+                print_u64(deadline);
+                print_str(b" now100=");
+                print_u64(monotonic_time_100ns());
+                print_str(b" hpet-now=0x");
+                print_hex_u64(now);
+                print_str(b" target=0x");
+                print_hex_u64(target);
+                print_str(b" waiters=");
+                print_u64(completion_waiters.len() as u64);
+                print_str(b"\n");
+            }
+        }
         // ARM. The comparator is written before the enable edge, with stale level status cleared on
         // both sides of the comparator write so an old assertion cannot storm as soon as we unmask.
         config |= HPET_TN_INT_ENB;
-        let trace = DELAY_TIMER_REARM_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace < 24 {
-            print_str(b"[delay-rearm] #");
-            print_u64(trace + 1);
-            print_str(b" src=");
-            print_u64(source);
-            print_str(b" deadline=");
-            print_u64(deadline);
-            print_str(b" now100=");
-            print_u64(monotonic_time_100ns());
-            print_str(b" hpet-now=0x");
-            print_hex_u64(now);
-            print_str(b" target=0x");
-            print_hex_u64(target.max(now.saturating_add(1)));
-            print_str(b" cfg=0x");
-            print_hex_u64(config);
-            print_str(b" delayq=");
-            print_u64(queue.len() as u64);
-            print_str(b" root-bound=");
-            print_delay_root_bound_notification();
-            print_str(b"\n");
-        }
+        core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     } else {
         // DISARM — nothing is waiting on time, so the timer must stop delivering entirely.
         // This used to clear `Tn_INT_TYPE_CNF` (bit 1) instead, leaving `Tn_INT_ENB` set with a
@@ -13665,8 +14057,16 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         // `exec_delay_timer_disarms` and `docs/transport-migration.md` §5.
         LAST_REARM_ARMED.store(0, Ordering::Relaxed);
         config &= !HPET_TN_INT_ENB;
+        core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     }
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+}
+
+unsafe fn delay_timer_rearm_and_drain_overdue(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
+) -> u64 {
+    delay_timer_rearm(queue);
+    delay_timer_drain_overdue_without_badge(queue, handler)
 }
 
 unsafe fn delay_park(
@@ -13703,7 +14103,11 @@ unsafe fn delay_park(
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     thread_wait_state_mark_badge_waiting(handler, badge);
-    delay_timer_rearm(queue);
+    let now = monotonic_time_100ns();
+    if deadline_100ns <= now {
+        let _ = delay_wake_due(handler, queue, now);
+    }
+    let _ = delay_timer_rearm_and_drain_overdue(queue, handler);
     true
 }
 
@@ -13714,6 +14118,7 @@ unsafe fn delay_wake_due(
 ) -> u64 {
     let mut woken = 0;
     while let Some(waiter) = queue.pop_due(now) {
+        DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);
@@ -13721,20 +14126,6 @@ unsafe fn delay_wake_due(
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
         woken += 1;
-        let wake_number = DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        if wake_number < 16 {
-            print_str(b"[delay] WAKE #");
-            print_u64(wake_number + 1);
-            print_str(b" tid=");
-            print_u64(waiter.thread_id);
-            print_str(b" badge=");
-            print_u64(waiter.badge);
-            print_str(b" deadline_100ns=");
-            print_u64(waiter.deadline_100ns);
-            print_str(b" now_100ns=");
-            print_u64(now);
-            print_str(b" status=STATUS_SUCCESS\n");
-        }
     }
     woken
 }
@@ -13810,6 +14201,45 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     } else {
         0
     }
+}
+
+unsafe fn delay_timer_drain_due_work(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
+    now_100ns: u64,
+) -> u64 {
+    let watchdog_tick = watchdog_take_timer_work(now_100ns);
+    delay_wake_due(handler, queue, now_100ns)
+        + wait_wake_due(handler, now_100ns)
+        + keyed_wait_wake_due(handler, now_100ns)
+        + keyed_release_wait_wake_due(handler, now_100ns)
+        + io_completion_wake_due(handler, now_100ns)
+        + pipe_name_wait_wake_due(handler, now_100ns)
+        + user_timer_wake_due(handler, now_100ns)
+        + driver_launch::hosted_driver_wait_wake_due(now_100ns)
+        + watchdog_tick
+}
+
+pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    handler: &mut ExecNtHandler,
+) -> u64 {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let Some((deadline, _source)) = delay_timer_next_deadline(queue) else {
+        return 0;
+    };
+    let now_100ns = monotonic_time_100ns();
+    if now_100ns < deadline {
+        return 0;
+    }
+    let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);
+    delay_timer_rearm(queue);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    delay_timer_ack_irq();
+    woken
 }
 
 fn delay_timer_delivery_is_stale(config: u64, counter: u64, comparator: u64) -> bool {
@@ -13939,18 +14369,8 @@ unsafe fn delay_timer_interrupt(
     // The comparator is programmed with hundred_ns_to_ticks_ceil().  When HPET delivers at that
     // tick, ticks_to_100ns() can still floor one quantum below the original deadline; use the armed
     // deadline as the minimum effective time for this non-stale delivery.
-    let now_100ns =
-        monotonic_time_100ns().max(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
-    let watchdog_tick = WATCHDOG_TICK_IS_OURS.swap(0, Ordering::Relaxed);
-    let woken = delay_wake_due(handler, queue, now_100ns)
-        + wait_wake_due(handler, now_100ns)
-        + keyed_wait_wake_due(handler, now_100ns)
-        + keyed_release_wait_wake_due(handler, now_100ns)
-        + io_completion_wake_due(handler, now_100ns)
-        + pipe_name_wait_wake_due(handler, now_100ns)
-        + user_timer_wake_due(handler, now_100ns)
-        + driver_launch::hosted_driver_wait_wake_due(now_100ns)
-        + watchdog_tick;
+    let now_100ns = monotonic_time_100ns().max(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
+    let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
         let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
@@ -13995,17 +14415,8 @@ unsafe fn delay_timer_interrupt(
 }
 
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
-    let completion_deadline =
-        unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
-    let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
-    let user_timer_deadline = USER_TIMER_NEXT_DEADLINE.load(Ordering::Relaxed);
-    let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
-        || queue.len() != 0
-        || completion_deadline.is_some()
-        || pipe_name_deadline.is_some()
-        || user_timer_deadline != u64::MAX
-        || hosted_driver_deadline.is_some()
+        || delay_timer_next_deadline(queue).is_some()
     {
         return;
     }
@@ -14381,8 +14792,14 @@ unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: 
             keyed_release_wait_clear_slot(slot);
             return false;
         }
-        set_reply_mr(15, KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
-        set_reply_mr(16, KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
+        set_reply_mr(
+            15,
+            KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed),
+        );
+        set_reply_mr(
+            16,
+            KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed),
+        );
         set_reply_mr(
             17,
             KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed),
@@ -14436,8 +14853,14 @@ unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> 
         }
         let cap = KEYED_RELEASE_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
         if cap != 0 {
-            set_reply_mr(15, KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
-            set_reply_mr(16, KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
+            set_reply_mr(
+                15,
+                KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed),
+            );
+            set_reply_mr(
+                16,
+                KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed),
+            );
             set_reply_mr(
                 17,
                 KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed),
@@ -15120,6 +15543,8 @@ unsafe fn ioapic_issue_irq_handler(
         in("r8") 64u64,      // mr1 = depth (init CNode: guard=0, so depth 64 resolves the slot)
         in("r9") 0u64,       // mr2 = ioapic id (ignored)
         in("r15") pin,       // mr3 = pin
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -15768,6 +16193,92 @@ fn system_hive_regf() -> Option<RegfHive<'static>> {
     RegfHive::new(bytes)
 }
 
+const SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH: usize = 32;
+
+fn system_hive_has_pnp_enum_devnodes() -> bool {
+    let Some(hive) = system_hive_regf() else {
+        return false;
+    };
+    let mut enum_path = alloc::string::String::from(nt_hive_core::CURRENT_CONTROL_SET_TARGET);
+    enum_path.push_str("\\Enum");
+    let Some(enum_key) = hive.open_key(&enum_path) else {
+        return false;
+    };
+    let mut visited = Vec::new();
+    system_hive_regf_key_has_pnp_devnode(&hive, enum_key, 0, &mut visited)
+}
+
+fn system_hive_regf_key_has_pnp_devnode(
+    hive: &RegfHive<'_>,
+    key: KeyRef,
+    depth: usize,
+    visited: &mut Vec<KeyRef>,
+) -> bool {
+    if depth > SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH || visited.iter().any(|seen| *seen == key) {
+        return false;
+    }
+    if hive.value_exists(key, "Service")
+        || hive.value_exists(key, "PdoName")
+        || hive.value_exists(key, "Driver")
+        || hive.value_exists(key, "HardwareID")
+        || hive.value_exists(key, "CompatibleIDs")
+    {
+        return true;
+    }
+    visited.push(key);
+    let found = if depth < SYSTEM_HIVE_PNP_ENUM_SCAN_MAX_DEPTH {
+        hive.subkeys_raw(key).into_iter().any(|(_, child)| {
+            !visited.iter().any(|seen| *seen == child)
+                && system_hive_regf_key_has_pnp_devnode(hive, child, depth + 1, visited)
+        })
+    } else {
+        false
+    };
+    let _ = visited.pop();
+    found
+}
+
+unsafe fn storage_config_hive_image_bytes() -> Option<&'static [u8]> {
+    let hive_size =
+        core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) as usize;
+    if hive_size == 0 || hive_size > STORAGE_HIVE_IMAGE_CAP {
+        return None;
+    }
+    Some(core::slice::from_raw_parts(
+        (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET) as *const u8,
+        hive_size,
+    ))
+}
+
+unsafe fn cached_config_hive_image_bytes() -> Option<&'static [u8]> {
+    (*core::ptr::addr_of!(CONFIG_HIVE_IMAGE_CACHE)).as_deref()
+}
+
+unsafe fn cache_config_hive_image_from_storage() -> bool {
+    let Some(bytes) = storage_config_hive_image_bytes() else {
+        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
+        return false;
+    };
+    if nt_hive_core::decode_image(bytes).is_err() {
+        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
+        return false;
+    }
+    let mut cached = Vec::new();
+    if cached.try_reserve_exact(bytes.len()).is_err() {
+        CONFIG_HIVE_IMAGE_CACHE_BYTES.store(0, Ordering::Relaxed);
+        return false;
+    }
+    cached.extend_from_slice(bytes);
+    let len = cached.len();
+    *core::ptr::addr_of_mut!(CONFIG_HIVE_IMAGE_CACHE) = Some(cached);
+    CONFIG_HIVE_IMAGE_CACHE_BYTES.store(len as u64, Ordering::Relaxed);
+    true
+}
+
+unsafe fn config_hive_image_bytes() -> Option<&'static [u8]> {
+    cached_config_hive_image_bytes().or_else(|| storage_config_hive_image_bytes())
+}
+
 struct ConfigHiveDriverLaunchSpec {
     service_name: alloc::string::String,
     driver_object_path: alloc::string::String,
@@ -16111,9 +16622,7 @@ impl InlineDriverLaunchPlan {
         let Some(end) = spec.devnode_start.checked_add(spec.devnode_count) else {
             return &[];
         };
-        self.devnodes
-            .get(spec.devnode_start..end)
-            .unwrap_or(&[])
+        self.devnodes.get(spec.devnode_start..end).unwrap_or(&[])
     }
 
     fn ids_for(&self, start: usize, count: usize) -> &[InlinePlanString] {
@@ -16123,17 +16632,11 @@ impl InlineDriverLaunchPlan {
         self.ids.get(start..end).unwrap_or(&[])
     }
 
-    fn hardware_ids_for(
-        &self,
-        devnode: &InlineDriverDevnodeSpec,
-    ) -> &[InlinePlanString] {
+    fn hardware_ids_for(&self, devnode: &InlineDriverDevnodeSpec) -> &[InlinePlanString] {
         self.ids_for(devnode.hardware_id_start, devnode.hardware_id_count)
     }
 
-    fn compatible_ids_for(
-        &self,
-        devnode: &InlineDriverDevnodeSpec,
-    ) -> &[InlinePlanString] {
+    fn compatible_ids_for(&self, devnode: &InlineDriverDevnodeSpec) -> &[InlinePlanString] {
         self.ids_for(devnode.compatible_id_start, devnode.compatible_id_count)
     }
 
@@ -16395,6 +16898,22 @@ impl HostedPciHardwareGrant {
     }
 }
 
+fn hosted_pci_eager_mmio_map_pages(
+    device: &nt_pnp::PciDevice,
+    grant: &HostedPciHardwareGrant,
+) -> u64 {
+    if device.base_class() == nt_pnp::PCI_CLASS_DISPLAY
+        && grant.mmio_phys == FB_PADDR.load(Ordering::Relaxed)
+    {
+        grant
+            .mmio_pages
+            .min(HOSTED_BOOT_FRAMEBUFFER_EAGER_MMIO_PAGES)
+            .max(1)
+    } else {
+        grant.mmio_pages
+    }
+}
+
 #[derive(Default)]
 struct HostedPciGrantDiscoveryReport {
     selected_devnodes: u64,
@@ -16533,9 +17052,9 @@ unsafe fn allocate_mapped_hosted_pci_dma_grant(
     device: &nt_pnp::PciDevice,
 ) -> (Option<HostedPciDmaGrant>, HostedPciDmaIommuMap) {
     let Some(grant) = allocate_hosted_pci_dma_grant(
-        HOSTED_PCI_COMMON_BUFFER_PAGES,
-        HOSTED_PCI_COMMON_BUFFER_IOVA,
-        HOSTED_PCI_COMMON_BUFFER_LEN,
+        HOSTED_PCI_DMA_WINDOW_PAGES,
+        HOSTED_PCI_DMA_WINDOW_IOVA,
+        HOSTED_PCI_DMA_WINDOW_LEN,
     ) else {
         return (None, HostedPciDmaIommuMap::failed());
     };
@@ -16701,22 +17220,23 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         || grant.dma_pages != 0
                         || grant.dma_logical != 0
                         || grant.dma_len != 0;
-                    let Some(mmio_bytes) = grant.mmio_pages.checked_mul(0x1000) else {
+                    let mmio_map_pages = hosted_pci_eager_mmio_map_pages(device, grant);
+                    let Some(mmio_map_bytes) = mmio_map_pages.checked_mul(0x1000) else {
                         report.pci_va_exhausted = true;
                         continue;
                     };
-                    let Some(mmio_va) = resource_vas.allocate_component_span(mmio_bytes) else {
+                    let Some(mmio_va) = resource_vas.allocate_component_span(mmio_map_bytes) else {
                         report.pci_va_exhausted = true;
                         continue;
                     };
-                    let Some(mmio_seed_va) = resource_vas.allocate_root_seed_span(mmio_bytes)
+                    let Some(mmio_seed_va) = resource_vas.allocate_root_seed_span(mmio_map_bytes)
                     else {
                         report.pci_va_exhausted = true;
                         continue;
                     };
                     if !map_hosted_pci_resource_root_alias(
                         grant.mmio_frame_base,
-                        grant.mmio_pages,
+                        mmio_map_pages,
                         mmio_seed_va,
                     ) {
                         report.missing_grants += 1;
@@ -16763,6 +17283,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         grant.mmio_phys,
                         grant.mmio_frame_base,
                         grant.mmio_pages,
+                        mmio_map_pages,
                         mmio_va,
                         mmio_seed_va,
                         grant.interrupt_vector,
@@ -16795,14 +17316,12 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                 {
                     continue;
                 }
-                let Some(mmio_va) =
-                    resource_vas.allocate_component_span(profile.mmio_len.max(1))
+                let Some(mmio_va) = resource_vas.allocate_component_span(profile.mmio_len.max(1))
                 else {
                     report.root_va_exhausted = true;
                     continue;
                 };
-                let Some(dma_va) = resource_vas.allocate_component_span(0x1000)
-                else {
+                let Some(dma_va) = resource_vas.allocate_component_span(0x1000) else {
                     report.root_va_exhausted = true;
                     continue;
                 };
@@ -17060,9 +17579,7 @@ fn count_inline_devnodes_from_records(
             let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
                 break;
             };
-            let Some(string_bytes) = shape
-                .string_bytes
-                .checked_add(devnode_shape.string_bytes)
+            let Some(string_bytes) = shape.string_bytes.checked_add(devnode_shape.string_bytes)
             else {
                 break;
             };
@@ -17087,9 +17604,7 @@ fn count_inline_devnodes(
             let Some(ids) = shape.ids.checked_add(devnode_shape.ids) else {
                 break;
             };
-            let Some(string_bytes) = shape
-                .string_bytes
-                .checked_add(devnode_shape.string_bytes)
+            let Some(string_bytes) = shape.string_bytes.checked_add(devnode_shape.string_bytes)
             else {
                 break;
             };
@@ -17201,17 +17716,7 @@ fn inline_driver_launch_spec_from_pnp_binding(
 }
 
 fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
-    let hive_size =
-        unsafe { core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32) } as usize;
-    if hive_size == 0 || hive_size > STORAGE_HIVE_IMAGE_CAP {
-        return None;
-    }
-    let hive_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (STORAGE_SHARED_VADDR + STORAGE_HIVE_IMAGE_OFFSET) as *const u8,
-            hive_size,
-        )
-    };
+    let hive_bytes = unsafe { config_hive_image_bytes()? };
     let hive = nt_hive_core::decode_image(hive_bytes).ok()?;
     let mut cm = nt_config_manager::ConfigManager::new();
     if nt_hive_core::import_control_set_services_into_config_manager(
@@ -17233,6 +17738,11 @@ fn config_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
         nt_hive_core::CURRENT_CONTROL_SET_TARGET,
     );
     let _ = nt_hive_core::import_control_set_class_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
+    let _ = nt_hive_core::import_control_set_network_into_config_manager(
         &hive,
         &mut cm,
         nt_hive_core::CURRENT_CONTROL_SET_TARGET,
@@ -17324,14 +17834,14 @@ fn count_config_hive_pnp_driver_launch_shape(start_type: u32) -> InlineDriverLau
     let mut shape = InlineDriverLaunchPlanShape::default();
     if let Some(cm) = config_hive_config_manager() {
         for binding in config_hive_pnp_driver_bindings_for_start(&cm, start_type) {
-            if let Some(header_string_bytes) = inline_driver_launch_spec_header_shape_from_service_metadata(
-                &binding.service,
-                start_type,
-            )
+            if let Some(header_string_bytes) =
+                inline_driver_launch_spec_header_shape_from_service_metadata(
+                    &binding.service,
+                    start_type,
+                )
             {
                 let devnodes = count_inline_devnodes_from_records(&cm, &binding.devnodes);
-                let Some(string_bytes) =
-                    header_string_bytes.checked_add(devnodes.string_bytes)
+                let Some(string_bytes) = header_string_bytes.checked_add(devnodes.string_bytes)
                 else {
                     break;
                 };
@@ -17379,12 +17889,9 @@ fn config_hive_pnp_driver_launch_plan_for_start(
             {
                 continue;
             }
-            if let Some(spec) = inline_driver_launch_spec_from_pnp_binding(
-                &cm,
-                binding,
-                start_type,
-                plan,
-            ) {
+            if let Some(spec) =
+                inline_driver_launch_spec_from_pnp_binding(&cm, binding, start_type, plan)
+            {
                 if !plan.push(spec) {
                     print_str(b"[driver-launch] ");
                     print_str(label);
@@ -17446,6 +17953,11 @@ fn system_hive_config_manager() -> Option<nt_config_manager::ConfigManager> {
     if counts.services == 0 {
         return None;
     }
+    let _ = nt_hive_regf::import_control_set_network_into_config_manager(
+        &hive,
+        &mut cm,
+        nt_hive_core::CURRENT_CONTROL_SET_TARGET,
+    );
     let _ = nt_hive_core::seed_reactos_network_setup_in_config_manager(&mut cm);
     Some(cm)
 }
@@ -17554,14 +18066,14 @@ fn count_system_hive_boot_driver_launch_shape() -> InlineDriverLaunchPlanShape {
             if !current_driver_host_can_boot_launch(&cm, &service) {
                 continue;
             }
-            if let Some(header_string_bytes) = inline_driver_launch_spec_header_shape_from_service_metadata(
-                &service,
-                SERVICE_SYSTEM_START,
-            )
+            if let Some(header_string_bytes) =
+                inline_driver_launch_spec_header_shape_from_service_metadata(
+                    &service,
+                    SERVICE_SYSTEM_START,
+                )
             {
                 let devnodes = count_inline_devnodes(&cm, &service.name);
-                let Some(string_bytes) =
-                    header_string_bytes.checked_add(devnodes.string_bytes)
+                let Some(string_bytes) = header_string_bytes.checked_add(devnodes.string_bytes)
                 else {
                     break;
                 };
@@ -17612,7 +18124,9 @@ fn system_hive_boot_driver_launch_plan() -> &'static InlineDriverLaunchPlan {
                 plan,
             ) {
                 if !plan.push(spec) {
-                    print_str(b"[driver-launch] system boot driver launch plan capacity raced specs=");
+                    print_str(
+                        b"[driver-launch] system boot driver launch plan capacity raced specs=",
+                    );
                     print_u64(required.specs as u64);
                     print_str(b" devnodes=");
                     print_u64(required.devnodes as u64);
@@ -17855,7 +18369,11 @@ fn registry_display_driver_leaf(installed_driver: &[u8]) -> Option<Vec<u8>> {
     if !registry_driver_leaf_is_safe(installed_driver) {
         return None;
     }
-    let suffix_len = if installed_driver.contains(&b'.') { 0 } else { 4 };
+    let suffix_len = if installed_driver.contains(&b'.') {
+        0
+    } else {
+        4
+    };
     let mut out = Vec::new();
     out.try_reserve_exact(installed_driver.len().checked_add(suffix_len)?)
         .ok()?;
@@ -18617,11 +19135,20 @@ pub(crate) struct RemoteThreadRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
     SmLoop,
-    Csr { slot: usize },
-    Winlogon { slot: usize },
+    Csr {
+        slot: usize,
+    },
+    Winlogon {
+        slot: usize,
+    },
     ServicesListener,
-    LsassListener { slot: usize },
-    TpWorker { pi: usize, slot: usize },
+    LsassListener {
+        slot: usize,
+    },
+    TpWorker {
+        pi: usize,
+        slot: usize,
+    },
     ThreadEx {
         pi: usize,
         slot: usize,
@@ -18638,6 +19165,60 @@ struct UserTimerRecord {
     apc_tid: u64,
     apc_routine: u64,
     apc_context: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingWaitTimeout {
+    specified: bool,
+    interval_100ns: i64,
+}
+
+impl PendingWaitTimeout {
+    const fn none() -> Self {
+        Self {
+            specified: false,
+            interval_100ns: 0,
+        }
+    }
+
+    const fn from_interval(interval_100ns: i64) -> Self {
+        Self {
+            specified: true,
+            interval_100ns,
+        }
+    }
+
+    fn is_none(self) -> bool {
+        !self.specified
+    }
+
+    fn due_now(self) -> Option<nt_delay_execution::Due> {
+        if self.specified {
+            Some(nt_delay_execution::due_time(
+                self.interval_100ns,
+                monotonic_time_100ns(),
+                nt_system_time_100ns(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn deadline_at_park(self) -> Option<u64> {
+        let now = monotonic_time_100ns();
+        if self.specified {
+            Some(match nt_delay_execution::due_time(
+                self.interval_100ns,
+                now,
+                nt_system_time_100ns(),
+            ) {
+                nt_delay_execution::Due::Immediate => now,
+                nt_delay_execution::Due::Monotonic100ns(deadline) => deadline,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 struct ExecNtHandler {
@@ -18675,8 +19256,9 @@ struct ExecNtHandler {
     /// selectors. Mounted-hive create/open handles use `mutable_key_handles` so later writes can
     /// land in this authority without path shadowing through `RegistryOverlay`.
     mutable_hives: MutableHiveSet,
-    /// Process handle targets in the mutable key range. Entries store stable hive/cell identity; a
-    /// dynamic hive unload clears entries for that hive so stale handles stop resolving.
+    /// Process handle targets in the mutable key range. Entries store stable hive/cell identity and
+    /// are released when the last process handle to that target closes; dynamic hive unload also
+    /// clears entries for that hive so stale handles stop resolving.
     mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
     /// Set when a mutable hive create/value write allocates new key/value arena state above the
     /// service-loop heap mark, or when the mutable key target table outgrows its reserved buffer.
@@ -18828,15 +19410,16 @@ struct ExecNtHandler {
     /// WaitObject) instead of replying, and wake it on the matching state transition. -1 = no park.
     /// Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
-    /// Monotonic 100ns deadline for the pending single-event park (`u64::MAX` = infinite).
-    wait_deadline_100ns: u64,
+    /// Raw NT timeout interval for the pending wait-object park. The loop converts it into a
+    /// monotonic deadline at the reply-cap park boundary, after any handler-side bookkeeping.
+    wait_timeout: PendingWaitTimeout,
     /// `NtWaitForKeyedEvent` asks the loop to park this syscall on an arbitrary user-mode key.
-    /// `u64::MAX` means no keyed-event park request; finite waits reuse the shared delay timer.
+    /// Finite waits reuse the shared delay timer.
     keyed_wait_key: u64,
-    keyed_wait_deadline_100ns: u64,
+    keyed_wait_timeout: PendingWaitTimeout,
     /// `NtReleaseKeyedEvent` uses the same rendezvous transport when no wait side is already parked.
     keyed_release_wait_key: u64,
-    keyed_release_wait_deadline_100ns: u64,
+    keyed_release_wait_timeout: PendingWaitTimeout,
     /// NtDelayExecution asks the service loop to park this syscall's reply until this signed
     /// 100ns interval becomes due. The handler validates/copies the user pointer; the loop owns
     /// deadline conversion and the HPET-backed reply-cap park.
@@ -18849,7 +19432,7 @@ struct ExecNtHandler {
     io_completion_key_out: u64,
     io_completion_apc_out: u64,
     io_completion_iosb_out: u64,
-    io_completion_deadline_100ns: u64,
+    io_completion_timeout: PendingWaitTimeout,
     /// Direct packet handoff selected by NtSetIoCompletion. The loop owns cross-process copyout and
     /// reply-cap wake, so the syscall handler only transfers this allocation-free pair.
     io_completion_wake: Option<(
@@ -18905,7 +19488,7 @@ struct ExecNtHandler {
     pipe_name_wait_hash: u64,
     pipe_name_wait_iosb_va: u64,
     pipe_name_wait_event_obj_idx: u64,
-    pipe_name_wait_deadline_100ns: u64,
+    pipe_name_wait_timeout: PendingWaitTimeout,
     pipe_name_wait_redrive: u64,
     /// BATCH 34 — set to the connected pipe's SERVER-end fid by a client pipe CONNECT
     /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe). The endpoint relation is decoded through
@@ -19019,12 +19602,12 @@ struct ExecNtHandler {
     /// directories a hosted process created SURVIVE the next per-syscall bump reset. Without it the
     /// volume would be handed back to the allocator the instant the syscall returned.
     writable_fs_dirty: bool,
-    /// Flush-like callers set this when user-visible success depends on the dirty writable volume
-    /// reaching its snapshot reserve before the current syscall reply is sent.
+    /// Explicit writable-volume durability callers set this when user-visible success depends on a
+    /// registry save/flush checkpoint reaching the snapshot reserve before the current syscall
+    /// reply is sent. Ordinary file `NtFlushBuffersFile` calls validate and flush their concrete
+    /// MemFs file object without forcing a whole-volume raw-reserve checkpoint in the hot syscall
+    /// path.
     writable_fs_commit_required: bool,
-    /// Optional caller IOSB for writable-volume `NtFlushBuffersFile`; updated if the post-dispatch
-    /// snapshot commit fails after the handler staged the optimistic in-memory flush result.
-    writable_fs_commit_iosb: u64,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
@@ -21255,7 +21838,10 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
     if t.resume {
         let _ = tcb_resume(tcb);
     }
-    HostedThreadSpawnResult::new(tcb, HostedThreadMechanismCaps::new(raw, cnode, sched_context))
+    HostedThreadSpawnResult::new(
+        tcb,
+        HostedThreadMechanismCaps::new(raw, cnode, sched_context),
+    )
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
@@ -21294,6 +21880,8 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SYSTEM hive the storage host read into HIVEBUF.
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+static mut CONFIG_HIVE_IMAGE_CACHE: Option<Vec<u8>> = None;
+pub(crate) static CONFIG_HIVE_IMAGE_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SECURITY / SAM hives the storage host read BY PATH
 /// off `\reactos\system32\config\{security,sam}` into SECHIVEBUF / SAMHIVEBUF.
 pub(crate) static SECHIVEBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -21837,6 +22425,7 @@ static WIN32K_DISP_BT_PT: AtomicU64 = AtomicU64::new(0);
 /// dispatch signal), so `win32k_dispatch` can drive its persistent service loop from anywhere.
 static WIN32K_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
+static WIN32K_ROOT_IMAGE_MAP_OWNER: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap cptr base of win32k's global USER heap arena (`heap_base`, WIN32K_HEAP_FRAMES
 /// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
 /// GUI client's VSpace (the gSharedInfo client-mapping).
@@ -22479,7 +23068,10 @@ struct DeviceFrameCapRun {
     pages: u64,
 }
 
-fn existing_boot_framebuffer_cap_run(paddr: u64, requested_pages: u64) -> Option<DeviceFrameCapRun> {
+fn existing_boot_framebuffer_cap_run(
+    paddr: u64,
+    requested_pages: u64,
+) -> Option<DeviceFrameCapRun> {
     if requested_pages == 0 || FB_PADDR.load(Ordering::Relaxed) != paddr {
         return None;
     }
@@ -22541,6 +23133,8 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
         inout("rdi") frame_cap => _,
         inout("rsi") (LBL_X86_PAGE_GET_ADDRESS << 12) => _,
         out("r10") paddr,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
@@ -22548,12 +23142,31 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
     paddr
 }
 
-/// Bring up AHCI port 0 and READ one 512-byte sector (`sector`) into the DMA frame at
-/// `dma_vaddr + 0x800` (paddr `dma_paddr + 0x800`) via ATA READ DMA EXT. All AHCI DMA
-/// structures live in one 4 KiB frame: Command List @0 (1 KiB-aligned), FIS Rx @0x400
-/// (256-aligned), Command Table @0x500 (128-aligned), data buffer @0x800. Returns the
-/// port Task File Data low byte after completion (0 = success; 0xFF = timeout). READ ONLY.
+pub(crate) const AHCI_DMA_DATA_OFFSET: u64 = 0x800;
+pub(crate) const AHCI_MAX_SECTORS_PER_READ: u32 = ((0x1000 - AHCI_DMA_DATA_OFFSET) / 512) as u32;
+pub(crate) const AHCI_MAX_SECTORS_PER_WRITE: u32 = AHCI_MAX_SECTORS_PER_READ;
+
+/// Bring up AHCI port 0 and READ one 512-byte sector (`sector`) into the DMA frame's data
+/// window via ATA READ DMA EXT. READ ONLY.
 unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sector: u64) -> u32 {
+    ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, sector, 1)
+}
+
+/// Bring up AHCI port 0 and READ `sector_count` 512-byte sectors into the DMA frame at
+/// `dma_vaddr + AHCI_DMA_DATA_OFFSET` (paddr `dma_paddr + AHCI_DMA_DATA_OFFSET`) via ATA READ DMA
+/// EXT. All AHCI DMA structures live in one 4 KiB frame: Command List @0 (1 KiB-aligned), FIS Rx
+/// @0x400 (256-aligned), Command Table @0x500 (128-aligned), data buffer @0x800. Returns the port
+/// Task File Data low byte after completion (0 = success; 0xFF = timeout/invalid count).
+unsafe fn ahci_read_sectors(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+    sector_count: u32,
+) -> u32 {
+    if sector_count == 0 || sector_count > AHCI_MAX_SECTORS_PER_READ {
+        return 0xFF;
+    }
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
@@ -22566,7 +23179,7 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
         if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
             break;
         }
-        yield_now();
+        core::hint::spin_loop();
     }
     // Zero the command list + FIS + command table region, then program the bases.
     for i in 0..(0x800u64 / 8) {
@@ -22575,10 +23188,10 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
     pw(0x00, dma_paddr as u32); // PxCLB  (command list @ +0)
     pw(0x04, (dma_paddr >> 32) as u32); // PxCLBU
     pw(0x08, (dma_paddr + 0x400) as u32); // PxFB (FIS rx @ +0x400)
-    pw(0x0C, (dma_paddr >> 32) as u32); // PxFBU
+    pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32); // PxFBU
                                         // Start FRE, then ST.
     pw(0x18, pr(0x18) | (1 << 4));
-    yield_now();
+    core::hint::spin_loop();
     pw(0x18, pr(0x18) | (1 << 0));
     pw(0x10, 0xFFFF_FFFF); // clear PxIS
 
@@ -22595,16 +23208,18 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
     cb(8, (sector >> 24) as u8); // LBA 31:24
     cb(9, (sector >> 32) as u8); // LBA 39:32
     cb(10, (sector >> 40) as u8); // LBA 47:40
-    core::ptr::write_volatile((ct + 12) as *mut u16, 1); // count = 1 sector
-                                                         // PRDT[0] @ ct + 0x80.
-    core::ptr::write_volatile((ct + 0x80) as *mut u32, (dma_paddr + 0x800) as u32); // DBA
-    core::ptr::write_volatile((ct + 0x84) as *mut u32, (dma_paddr >> 32) as u32); // DBAU
-    core::ptr::write_volatile((ct + 0x8C) as *mut u32, 511 | (1 << 31)); // DBC = 512 B | IOC
+    core::ptr::write_volatile((ct + 12) as *mut u16, sector_count as u16);
+    // PRDT[0] @ ct + 0x80.
+    let data_paddr = dma_paddr + AHCI_DMA_DATA_OFFSET;
+    core::ptr::write_volatile((ct + 0x80) as *mut u32, data_paddr as u32); // DBA
+    core::ptr::write_volatile((ct + 0x84) as *mut u32, (data_paddr >> 32) as u32); // DBAU
+    let bytes = sector_count * 512;
+    core::ptr::write_volatile((ct + 0x8C) as *mut u32, (bytes - 1) | (1 << 31)); // DBC | IOC
 
     // Command Header slot 0 @ dma+0. DW0 = CFL(5) | PRDTL(1)<<16; CTBA @ +8.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 16));
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32); // CTBA
-    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, (dma_paddr >> 32) as u32); // CTBAU
+    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, ((dma_paddr + 0x500) >> 32) as u32); // CTBAU
 
     // Issue command slot 0 (PxCI bit 0) + poll for completion.
     pw(0x38, 1);
@@ -22612,7 +23227,7 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
         if pr(0x38) & 1 == 0 {
             return pr(0x20) & 0xFF; // PxTFD low byte (0 = success)
         }
-        yield_now();
+        core::hint::spin_loop();
     }
     0xFF // timeout
 }
@@ -22623,6 +23238,24 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
 /// cleared here, so the caller must fill exactly one sector before issuing the write.
 #[allow(dead_code)]
 unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sector: u64) -> u32 {
+    ahci_write_sectors(ahci_vaddr, dma_vaddr, dma_paddr, sector, 1)
+}
+
+/// Bring up AHCI port 0 and WRITE `sector_count` 512-byte sectors from the DMA frame at
+/// `dma_vaddr + AHCI_DMA_DATA_OFFSET` (paddr `dma_paddr + AHCI_DMA_DATA_OFFSET`) via ATA WRITE DMA
+/// EXT. Returns the port Task File Data low byte after completion (0 = success; 0xFF =
+/// timeout/invalid count).
+#[allow(dead_code)]
+unsafe fn ahci_write_sectors(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    sector: u64,
+    sector_count: u32,
+) -> u32 {
+    if sector_count == 0 || sector_count > AHCI_MAX_SECTORS_PER_WRITE {
+        return 0xFF;
+    }
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
@@ -22633,7 +23266,7 @@ unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sec
         if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
             break;
         }
-        yield_now();
+        core::hint::spin_loop();
     }
     for i in 0..(0x800u64 / 8) {
         core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
@@ -22641,9 +23274,9 @@ unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sec
     pw(0x00, dma_paddr as u32);
     pw(0x04, (dma_paddr >> 32) as u32);
     pw(0x08, (dma_paddr + 0x400) as u32);
-    pw(0x0C, (dma_paddr >> 32) as u32);
+    pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32);
     pw(0x18, pr(0x18) | (1 << 4));
-    yield_now();
+    core::hint::spin_loop();
     pw(0x18, pr(0x18) | (1 << 0));
     pw(0x10, 0xFFFF_FFFF);
 
@@ -22659,42 +23292,44 @@ unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sec
     cb(8, (sector >> 24) as u8);
     cb(9, (sector >> 32) as u8);
     cb(10, (sector >> 40) as u8);
-    core::ptr::write_volatile((ct + 12) as *mut u16, 1);
-    core::ptr::write_volatile((ct + 0x80) as *mut u32, (dma_paddr + 0x800) as u32);
-    core::ptr::write_volatile((ct + 0x84) as *mut u32, (dma_paddr >> 32) as u32);
-    core::ptr::write_volatile((ct + 0x8C) as *mut u32, 511 | (1 << 31));
+    core::ptr::write_volatile((ct + 12) as *mut u16, sector_count as u16);
+    let data_paddr = dma_paddr + AHCI_DMA_DATA_OFFSET;
+    core::ptr::write_volatile((ct + 0x80) as *mut u32, data_paddr as u32);
+    core::ptr::write_volatile((ct + 0x84) as *mut u32, (data_paddr >> 32) as u32);
+    let bytes = sector_count * 512;
+    core::ptr::write_volatile((ct + 0x8C) as *mut u32, (bytes - 1) | (1 << 31));
 
     // Command Header slot 0: CFL(5) | W(1)<<6 | PRDTL(1)<<16.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 6) | (1u32 << 16));
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32);
-    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, (dma_paddr >> 32) as u32);
+    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, ((dma_paddr + 0x500) >> 32) as u32);
 
     pw(0x38, 1);
     for _ in 0..5_000_000u64 {
         if pr(0x38) & 1 == 0 {
             return pr(0x20) & 0xFF;
         }
-        yield_now();
+        core::hint::spin_loop();
     }
     0xFF
 }
 
 /// FAT32 filesystem geometry parsed from the volume's BPB (sector 0), plus the AHCI handles
-/// needed to read further sectors. All reads go through `ahci_read_sector` into the shared
-/// data buffer at `AHCI_DMA_VADDR + 0x800` — so a caller MUST consume one sector's bytes
-/// before triggering the next read.
+/// needed to read further sectors. Reads go through the AHCI DMA data window at
+/// `AHCI_DMA_VADDR + AHCI_DMA_DATA_OFFSET`; whole-file reads may consume a bounded contiguous
+/// sector run, while directory walkers still consume one sector before triggering the next read.
 #[derive(Clone, Copy)]
 struct Fat32 {
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     scratch_vaddr: u64,
-    bps: u32,        // bytes per sector
-    spc: u32,        // sectors per cluster
+    bps: u32,           // bytes per sector
+    spc: u32,           // sectors per cluster
     total_sectors: u32, // FAT-visible sector count from the BPB
-    fat_start: u32,  // first FAT sector
-    data_start: u32, // first data sector (cluster 2)
-    root_cl: u32,    // root directory cluster
+    fat_start: u32,     // first FAT sector
+    data_start: u32,    // first data sector (cluster 2)
+    root_cl: u32,       // root directory cluster
 }
 
 #[no_mangle]
@@ -23379,22 +24014,46 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let (mut si_verdict, mut si_faults) = (0u64, 0u64);
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
-        let si_fault_c = copy_cap(si_fault);
-        let smss_image = smss_bootstrap_image();
+        const SEC_IMAGE_SELFTEST_PI: usize = 20;
+        let sec_image_test_image = nt_exe_image::HostedProcessImageRef {
+            pi: SEC_IMAGE_SELFTEST_PI,
+            top_badge: nt_exe_image::dynamic_top_badge_for_pi(SEC_IMAGE_SELFTEST_PI)
+                .expect("SEC_IMAGE selftest must use a dynamic hosted-process identity"),
+            leaf: b"secimgtest.exe",
+            process_name: "secimgtest.exe",
+            role: nt_exe_image::HostedProcessRole::NonInteractiveService,
+            nt_image_path: b"\\SystemRoot\\System32\\secimgtest.exe",
+            command_line: b"secimgtest.exe",
+            image_root: nt_exe_image::HostedImageRoot::System32,
+            probe_fragment: b"secimgtest",
+        };
+        let si_fault_c = mint_badged(si_fault, sec_image_test_image.top_badge);
         reset_hosted_process_runtimes();
-        register_hosted_process_runtime_for_image(smss_image)
-            .expect("SMSS runtime layout must register before SEC_IMAGE demo spawn");
-        let spawn =
-            spawn_hosted_sec_image_for_image(smss_image, &pe, si_fault_c, None, false, 0, 0, 0);
+        register_hosted_process_runtime_for_image(sec_image_test_image)
+            .expect("SEC_IMAGE demo runtime layout must register before spawn");
+        let spawn = spawn_hosted_sec_image_for_image(
+            sec_image_test_image,
+            &pe,
+            si_fault_c,
+            None,
+            false,
+            false,
+            0,
+            0,
+            0,
+        );
+        let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
             let (v, f, _, _, _, _) = service_sec_image(
                 si_fault,
                 spawn.pml4,
                 spawn.main_tcb,
+                sec_image_test_image,
                 &pe,
                 BOOT_SEC_IMAGE_SCRATCH_BASE,
                 None,
             );
+            let _ = tcb_suspend_r(spawn.main_tcb);
             si_verdict = v;
             si_faults = f;
         } else {
@@ -23513,6 +24172,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             // Enable the HPET main counter (GEN_CONF bit 0).
             let gc = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
+            initialize_hpet_monotonic_epoch(HPET_PERIOD_FS.load(Ordering::Relaxed));
             core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, gc | 1);
 
             // Block on the RESULT notification. The executive is priority 255, so it
@@ -24457,6 +25117,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_cm_hive_answer_42", false, &mut passed);
                 }
             }
+            let cached_hive = cache_config_hive_image_from_storage();
+            print_str(b"[cm-hive-cache] generated SYSTEM hive cached=");
+            print_u64(cached_hive as u64);
+            print_str(b" bytes=");
+            print_u64(CONFIG_HIVE_IMAGE_CACHE_BYTES.load(Ordering::Relaxed));
+            print_str(b"\n");
         }
     }
 
@@ -24949,6 +25615,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let d = ComponentDescriptor {
                     entry: win32k_subsystem::win32k_subsystem_entry,
                     image_rights: Rights::Uniform(3), // RWX (trampolines + statics)
+                    lazy_image: true,
                     map_heap_pt: true,
                     // win32k's OWN stack at WIN32K_STACK_VADDR (NOT STACK_BASE — that VA must stay free
                     // for the per-client attach). Its own dedicated PT (128 KiB fits one PT).
@@ -24991,6 +25658,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 WIN32K_STACK_SLOT.store(sc.stack_frame_base, Ordering::Relaxed);
                 WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
                 WIN32K_TCB.store(sc.tcb, Ordering::Relaxed);
+                WIN32K_ROOT_IMAGE_MAP_OWNER.store(sc.map_cap_bank.owner as u64, Ordering::Relaxed);
                 sc.pml4
             };
 
@@ -25010,6 +25678,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 code_va,
                 image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
                 exec_code_va: code_va,
+                root_image_rights: 3,
+                root_image_map_owner: WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
                 shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
                 dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
                 demand_cap: 512,
@@ -25430,8 +26100,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 + hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.missing_memory_bar == 0
             && hosted_pci_grant_discovery.missing_interrupt == 0
-            && hosted_pci_grant_discovery.dma_grants
-                + hosted_pci_grant_discovery.dma_not_required
+            && hosted_pci_grant_discovery.dma_grants + hosted_pci_grant_discovery.dma_not_required
                 == hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.dma_failures == 0
             && hosted_pci_grant_discovery.claim_failures == 0,
@@ -26447,9 +27116,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 );
                             generic_pci_provider_export_completions =
                                 generic_pci_provider_export_completions.saturating_add(
-                                    provider_after
-                                        .provider_export_completions
-                                        .saturating_sub(provider_before.provider_export_completions),
+                                    provider_after.provider_export_completions.saturating_sub(
+                                        provider_before.provider_export_completions,
+                                    ),
                                 );
                             generic_pci_provider_export_rejections =
                                 generic_pci_provider_export_rejections.saturating_add(
@@ -26482,10 +27151,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_dma_adapter |= start_report.dma_adapter;
                         generic_hw_dma_common |= start_report.dma_common;
                         generic_hw_dma_packet_descriptors |= start_report.dma_packet_descriptors;
-                        generic_hw_dma_descriptor_common_count = generic_hw_dma_descriptor_common_count
-                            .saturating_add(start_report.dma_packet_descriptor_common_count);
-                        generic_hw_dma_descriptor_mapping_count = generic_hw_dma_descriptor_mapping_count
-                            .saturating_add(start_report.dma_packet_descriptor_mapping_count);
+                        generic_hw_dma_descriptor_common_count =
+                            generic_hw_dma_descriptor_common_count
+                                .saturating_add(start_report.dma_packet_descriptor_common_count);
+                        generic_hw_dma_descriptor_mapping_count =
+                            generic_hw_dma_descriptor_mapping_count
+                                .saturating_add(start_report.dma_packet_descriptor_mapping_count);
                         generic_hw_dma_descriptor_completed_mapping_count =
                             generic_hw_dma_descriptor_completed_mapping_count.saturating_add(
                                 start_report.dma_packet_descriptor_completed_mapping_count,
@@ -26839,12 +27510,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // LdrpInitialize's RVA from the loaded ntdll's export table (never hardcode — it drifts
                 // across builds) and pass it to the spawn trampoline so it calls OUR loader entry.
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
-                    let ntdll_exports = ntdll_pe.exports().unwrap_or_else(|_| Vec::new());
                     let ntdll_export_rva = |name: &str| -> u64 {
-                        ntdll_exports
-                            .iter()
-                            .find(|e| e.name == name)
-                            .map(|e| e.rva as u64)
+                        ntdll_pe
+                            .export_rva_by_name(name)
+                            .ok()
+                            .flatten()
+                            .map(u64::from)
                             .unwrap_or(0)
                     };
                     let smss_ldrp_rva = ntdll_export_rva("LdrpInitialize");
@@ -26885,10 +27556,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         si_fault_c,
                         Some((NTDLL_BASE, smss_ntdll_pe)),
                         true,
+                        false,
                         smss_ldrp_rva,
                         0,
                         0,
                     );
+                    print_str(b"[diag-smss] spawn returned pml4=0x");
+                    print_hex((spawn.pml4 >> 32) as u32);
+                    print_hex(spawn.pml4 as u32);
+                    print_str(b" tcb=0x");
+                    print_hex((spawn.main_tcb >> 32) as u32);
+                    print_hex(spawn.main_tcb as u32);
+                    print_str(b"\n");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. BATCH 22: smss now uses its own 64 MiB
@@ -26899,10 +27578,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // The demand-fault router fills ntdll's pages from THIS PE — pass OUR ntdll when
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).
+                    print_str(b"[diag-smss] entering service loop\n");
                     let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         spawn.pml4,
                         spawn.main_tcb,
+                        smss_image,
                         &pe,
                         SCRATCH_BASE,
                         Some((NTDLL_BASE, smss_ntdll_pe)),

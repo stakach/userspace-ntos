@@ -444,8 +444,9 @@ unsafe fn rd32(base: u64, off: u64) -> u32 {
 
 /// Force-fault every 4 KiB page in `[start, start+len)` into the current process's VSpace by reading
 /// one byte per page (volatile so the compiler can't elide it). Used before walking a dependency's
-/// export tables: the executive demand-fills hosted DLL pages PER PROCESS, and an untouched export
-/// array/name page reads back as zeros → a silent export-walk miss. Touching first fills them.
+/// export/import tables: the executive demand-fills hosted DLL pages PER PROCESS, and an untouched
+/// array/name page can be observed before the real SEC_IMAGE backing is resident in this VSpace.
+/// Touching first fills the page through the normal pager path.
 ///
 /// # Safety
 /// `[start, start+len)` must be a reserved/mappable range in this VSpace (a mapped PE image extent).
@@ -460,6 +461,18 @@ unsafe fn touch_range(start: u64, len: u64) {
             p += 0x1000;
         }
     }
+}
+
+/// Force-fault an image RVA range before an in-process PE table walk.
+///
+/// # Safety
+/// `base + rva..base + rva + len` must describe a mapped PE range.
+#[cfg(target_arch = "x86_64")]
+unsafe fn touch_rva_range(base: u64, rva: u32, len: u64) {
+    if rva == 0 || len == 0 {
+        return;
+    }
+    unsafe { touch_range(base + rva as u64, len) };
 }
 
 /// The `(virtual_address, size)` of data directory `idx` in a mapped PE at `base`.
@@ -730,18 +743,6 @@ unsafe fn attach_dfs(
                     return status;
                 }
             };
-        {
-            let mut mb = [0u8; 64];
-            let mut mn = 0usize;
-            for &c in b"DllMain base=0x" {
-                if mn < 64 {
-                    mb[mn] = c;
-                    mn += 1;
-                }
-            }
-            mn = crate::write_u64_hex(&mut mb, mn, base);
-            crate::dbg_print_bytes(mb.as_ptr(), mn);
-        }
         let tls_status = ensure_current_module_static_tls(base);
         if tls_status != 0 {
             (*table).mods[module_index].attaching = false;
@@ -1228,7 +1229,7 @@ unsafe fn name_eq(base: u64, name_rva: u32, want: &[u8]) -> bool {
         let p = (base + name_rva as u64) as *const u8;
         let mut i = 0usize;
         loop {
-            let c = core::ptr::read(p.add(i));
+            let c = core::ptr::read_volatile(p.add(i));
             if i >= want.len() {
                 return c == 0; // exact length match: next char must be the NUL
             }
@@ -1270,6 +1271,7 @@ unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
         // lazy per-process fill, not just this one symbol.
         touch_range(base + edir_rva as u64, edir_sz as u64);
         let ed = base + edir_rva as u64;
+        let number_of_functions = rd32(ed, 0x14);
         let number_of_names = rd32(ed, 0x18);
         let addr_of_functions = rd32(ed, 0x1c) as u64; // AddressOfFunctions RVA
         let addr_of_names = rd32(ed, 0x20) as u64; // AddressOfNames RVA
@@ -1278,6 +1280,9 @@ unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
             let name_rva = rd32(base, addr_of_names + i * 4);
             if name_eq(base, name_rva, want) {
                 let ordinal = rd16(base, addr_of_ordinals + i * 2) as u64;
+                if ordinal >= number_of_functions as u64 {
+                    return 0;
+                }
                 let func_rva = rd32(base, addr_of_functions + ordinal * 4);
                 return func_rva;
             }
@@ -1316,13 +1321,15 @@ pub unsafe fn snap_smss_imports(smss_base: u64, ntdll_base: u64) -> SnapResult {
     let mut out = SnapResult::default();
     // SAFETY: reading smss's mapped import directory + writing its mapped RW IAT per the contract.
     unsafe {
-        let (idir_rva, _sz) = data_directory(smss_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
+        let (idir_rva, idir_sz) = data_directory(smss_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
         if idir_rva == 0 {
             return out;
         }
+        touch_rva_range(smss_base, idir_rva, idir_sz as u64);
         // Walk the IMAGE_IMPORT_DESCRIPTOR array (20 bytes each), terminated by an all-zero entry.
         let mut desc = smss_base + idir_rva as u64;
         loop {
+            touch_range(desc, 20);
             let original_first_thunk = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
             let name_rva = rd32(desc, 12); // Name RVA
             let first_thunk = rd32(desc, 16); // FirstThunk (IAT) RVA
@@ -1340,6 +1347,8 @@ pub unsafe fn snap_smss_imports(smss_base: u64, ntdll_base: u64) -> SnapResult {
                 let mut ilt = smss_base + ilt_rva as u64;
                 let mut iat = smss_base + first_thunk as u64;
                 loop {
+                    touch_range(ilt, 8);
+                    touch_range(iat, 8);
                     let thunk = core::ptr::read_unaligned(ilt as *const u64);
                     if thunk == 0 {
                         break; // end of this descriptor's imports
@@ -1403,7 +1412,7 @@ unsafe fn read_cstr(base: u64, rva: u32, buf: &mut [u8]) -> usize {
         let p = (base + rva as u64) as *const u8;
         let mut i = 0usize;
         while i < buf.len() {
-            let c = core::ptr::read(p.add(i));
+            let c = core::ptr::read_volatile(p.add(i));
             if c == 0 {
                 break;
             }
@@ -2110,6 +2119,8 @@ unsafe fn snap_descriptor_against(
         let mut ilt = image_base + ilt_rva as u64;
         let mut iat = image_base + iat_rva as u64;
         loop {
+            touch_range(ilt, 8);
+            touch_range(iat, 8);
             let thunk = core::ptr::read_unaligned(ilt as *const u64);
             if thunk == 0 {
                 break;
@@ -2122,6 +2133,7 @@ unsafe fn snap_descriptor_against(
             let addr = if !by_ordinal {
                 // by name: IMAGE_IMPORT_BY_NAME RVA = thunk & 0x7fffffff; +2 skips the Hint.
                 let ibn_rva = (thunk & 0x7fff_ffff) as u32;
+                touch_rva_range(image_base, ibn_rva, 2);
                 let mut namebuf = [0u8; 96];
                 let nlen = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
                 resolve_export_addr(
@@ -2854,7 +2866,11 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     unsafe {
         let peb: u64;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
-        crate::exports::ldr_publish_process_locks(peb);
+        let status = crate::exports::ldr_publish_process_locks(peb);
+        if status != 0 {
+            crate::exports::rtl_raise_status(status);
+            core::hint::unreachable_unchecked();
+        }
     }
     let _loader_lock = match unsafe { crate::exports::acquire_loader_lock() } {
         Ok(guard) => guard,
@@ -3010,10 +3026,12 @@ unsafe fn snap_module(
     };
     // SAFETY: reading the mapped import directory + writing the mapped RW IAT per the contract.
     unsafe {
-        let (idir_rva, _sz) = data_directory(image_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
+        let (idir_rva, idir_sz) = data_directory(image_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
         if idir_rva != 0 {
+            touch_rva_range(image_base, idir_rva, idir_sz as u64);
             let mut desc = image_base + idir_rva as u64;
             loop {
+                touch_range(desc, 20);
                 let oft = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
                 let name_rva = rd32(desc, 12); // Name RVA
                 let ft = rd32(desc, 16); // FirstThunk (IAT) RVA
@@ -3407,7 +3425,6 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
 /// On-target; `LDR_STATE.ldr_va` + all `entry_vas[..count]` are in the reserved region.
 #[cfg(target_arch = "x86_64")]
 unsafe fn thread_ldr_lists() {
-    use nt_ntdll::loader::peb::circular_links;
     // SAFETY: single-threaded loader; the region VAs are mapped + reserved.
     unsafe {
         let st = &*core::ptr::addr_of!(LDR_STATE);
@@ -3422,20 +3439,29 @@ unsafe fn thread_ldr_lists() {
         ];
         for &(node_off, head_off) in &lists {
             let head_node_va = ldr_va + head_off;
-            // Build the ordered list of this list's node VAs.
-            let mut node_vas = [0u64; LDR_MAX_ENTRIES];
-            for i in 0..count {
-                node_vas[i] = st.entry_vas[i] + node_off;
+            if count == 0 {
+                core::ptr::write_unaligned(head_node_va as *mut u64, head_node_va);
+                core::ptr::write_unaligned((head_node_va + 8) as *mut u64, head_node_va);
+                continue;
             }
-            let (head, members) = circular_links(head_node_va, &node_vas[..count]);
-            // Head's list-head LIST_ENTRY.
-            core::ptr::write_unaligned((head_node_va) as *mut u64, head.flink);
-            core::ptr::write_unaligned((head_node_va + 8) as *mut u64, head.blink);
-            // Each member's LIST_ENTRY.
-            for (i, nl) in members.iter().enumerate() {
+            let first = st.entry_vas[0] + node_off;
+            let last = st.entry_vas[count - 1] + node_off;
+            core::ptr::write_unaligned(head_node_va as *mut u64, first);
+            core::ptr::write_unaligned((head_node_va + 8) as *mut u64, last);
+            for i in 0..count {
                 let node = st.entry_vas[i] + node_off;
-                core::ptr::write_unaligned(node as *mut u64, nl.flink);
-                core::ptr::write_unaligned((node + 8) as *mut u64, nl.blink);
+                let prev = if i == 0 {
+                    head_node_va
+                } else {
+                    st.entry_vas[i - 1] + node_off
+                };
+                let next = if i + 1 == count {
+                    head_node_va
+                } else {
+                    st.entry_vas[i + 1] + node_off
+                };
+                core::ptr::write_unaligned(node as *mut u64, next);
+                core::ptr::write_unaligned((node + 8) as *mut u64, prev);
             }
         }
     }
@@ -3532,28 +3558,6 @@ unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
                     return status;
                 }
             }
-        }
-
-        {
-            // Boot-log proof: "PebLdr va=0x.. n=N".
-            let st = &*core::ptr::addr_of!(LDR_STATE);
-            let mut mb = [0u8; 64];
-            let mut mn = 0usize;
-            for &c in b"PebLdr va=0x" {
-                if mn < 64 {
-                    mb[mn] = c;
-                    mn += 1;
-                }
-            }
-            mn = crate::write_u64_hex(&mut mb, mn, ldr_va);
-            for &c in b" n=" {
-                if mn < 64 {
-                    mb[mn] = c;
-                    mn += 1;
-                }
-            }
-            mn = crate::write_u32_dec(&mut mb, mn, st.count as u32);
-            crate::dbg_print_bytes(mb.as_ptr(), mn);
         }
         0
     }

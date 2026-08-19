@@ -103,6 +103,7 @@ pub(crate) struct HostedPnpPciResourceWindow {
     pub(crate) mmio_phys: u64,
     pub(crate) mmio_frame_base: u64,
     pub(crate) mmio_pages: u64,
+    pub(crate) mmio_map_pages: u64,
     pub(crate) mmio_va: u64,
     pub(crate) mmio_seed_va: u64,
     pub(crate) interrupt_vector: u32,
@@ -124,6 +125,7 @@ impl HostedPnpPciResourceWindow {
         mmio_phys: u64,
         mmio_frame_base: u64,
         mmio_pages: u64,
+        mmio_map_pages: u64,
         mmio_va: u64,
         mmio_seed_va: u64,
         interrupt_vector: u32,
@@ -135,7 +137,8 @@ impl HostedPnpPciResourceWindow {
         dma_logical: u64,
         dma_len: u64,
     ) -> Option<Self> {
-        if mmio_va == 0 || mmio_seed_va == 0 {
+        if mmio_va == 0 || mmio_seed_va == 0 || mmio_map_pages == 0 || mmio_map_pages > mmio_pages
+        {
             return None;
         }
         let has_dma = dma_frame_base != 0
@@ -162,6 +165,7 @@ impl HostedPnpPciResourceWindow {
             mmio_phys,
             mmio_frame_base,
             mmio_pages,
+            mmio_map_pages,
             mmio_va,
             mmio_seed_va,
             interrupt_vector,
@@ -181,6 +185,12 @@ impl HostedPnpPciResourceWindow {
 
     pub(crate) fn granted_mmio_len(&self) -> u32 {
         self.mmio_pages.saturating_mul(0x1000).min(u32::MAX as u64) as u32
+    }
+
+    pub(crate) fn mapped_mmio_len(&self) -> u32 {
+        self.mmio_map_pages
+            .saturating_mul(0x1000)
+            .min(u32::MAX as u64) as u32
     }
 
     pub(crate) fn dma_grant_valid(&self) -> bool {
@@ -382,7 +392,8 @@ pub(crate) unsafe fn start_inline_driver_service_devnodes(
 ) -> HostedPnpStartReport {
     let mut report = HostedPnpStartReport {
         driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
-            && (dc.add_device != 0 || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
+            && (dc.add_device != 0
+                || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
         ..HostedPnpStartReport::default()
     };
     let class_guid = if spec.class_guid_present {
@@ -428,7 +439,8 @@ pub(crate) unsafe fn start_owned_driver_service_devnodes(
 ) -> Result<HostedPnpStartReport, nt_status::NtStatus> {
     let mut report = HostedPnpStartReport {
         driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
-            && (dc.add_device != 0 || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
+            && (dc.add_device != 0
+                || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
         ..HostedPnpStartReport::default()
     };
     let class_guid = spec.class_guid.as_deref();
@@ -542,7 +554,12 @@ unsafe fn start_one_devnode<H, C>(
                 report,
             );
             if start_status_raw == 0 {
-                try_publish_hosted_video_route(device_id, service_name, devnode.instance_id, report);
+                try_publish_hosted_video_route(
+                    device_id,
+                    service_name,
+                    devnode.instance_id,
+                    report,
+                );
             }
         }
         Err(status) => {
@@ -941,20 +958,57 @@ fn print_hardware_evidence(
     start_status_raw: u32,
     evidence: driver_launch::HostedHardwareEvidence,
 ) {
-    print_str(match trace {
-        HostedPnpStartTrace::HardwareProof => b"[driver-launch] generic hardware evidence service=",
-        HostedPnpStartTrace::DemandStart => b"[driver-launch] demand hardware evidence service=",
-        HostedPnpStartTrace::BootService => b"[driver-launch] hardware evidence service=",
-    });
-    print_str(service_name.as_bytes());
-    print_str(b" devnode=");
-    print_str(instance_id.as_bytes());
+    if trace == HostedPnpStartTrace::HardwareProof {
+        print_str(b"[driver-launch] generic hardware evidence service=");
+        print_str(service_name.as_bytes());
+        print_str(b" devnode=");
+        print_str(instance_id.as_bytes());
+        print_str(b" start=");
+        print_hex(start_status_raw);
+        print_str(b" mmio=");
+        print_u64(evidence.mmio_mapped() as u64);
+        print_str(b" irq=");
+        print_u64(evidence.interrupt_connected() as u64);
+        print_str(b"/");
+        print_u64(evidence.interrupt_delivered() as u64);
+        print_str(b" dpc=");
+        print_u64(evidence.dpc_delivered() as u64);
+        print_str(b" dma=");
+        print_u64(evidence.dma_adapter_created() as u64);
+        print_str(b"/");
+        print_u64(evidence.dma_common_allocated() as u64);
+        print_str(b" desc=");
+        print_u64(evidence.dma_packet_descriptors_observed() as u64);
+        print_str(b" txrx=");
+        print_u64(evidence.dma_device_tx_completions);
+        print_str(b"/");
+        print_u64(evidence.dma_device_rx_completions);
+        print_str(b" io=");
+        print_u64(evidence.io_port_out32_serviced() as u64);
+        print_str(b" video=");
+        print_u64(evidence.video_initialized as u64);
+        print_str(b"/");
+        print_u64(evidence.video_find_adapter_calls);
+        print_str(b" root=");
+        print_u64(evidence.root_pdo_started as u64);
+        print_str(b"\n");
+        return;
+    }
+
+    print_hardware_evidence_prefix(trace, service_name, instance_id, b"bus");
     print_str(b" start=");
     print_hex(start_status_raw);
     print_str(b" mmio=");
     print_u64(evidence.mmio_mapped() as u64);
     print_str(b" mmio_len=");
     print_u64(evidence.resource_mmio_len);
+    print_str(b" mmio_map_len=");
+    print_u64(evidence.resource_mmio_map_len);
+    print_str(b" root_started=");
+    print_u64(evidence.root_pdo_started as u64);
+    print_str(b"\n");
+
+    print_hardware_evidence_prefix(trace, service_name, instance_id, b"irq");
     print_str(b" int=");
     print_u64(evidence.interrupt_connected() as u64);
     print_str(b" int_ctx=");
@@ -969,6 +1023,9 @@ fn print_hardware_evidence(
     print_u64(evidence.dpc_deliveries);
     print_str(b" dpc_drops=");
     print_u64(evidence.dpc_drops);
+    print_str(b"\n");
+
+    print_hardware_evidence_prefix(trace, service_name, instance_id, b"dma");
     print_str(b" dma_adapter=");
     print_u64(evidence.dma_adapter_created() as u64);
     print_str(b" dma_common=");
@@ -1007,6 +1064,9 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_device_interrupt_causes);
     print_str(b"/");
     print_u64(evidence.dma_device_model_failures);
+    print_str(b"\n");
+
+    print_hardware_evidence_prefix(trace, service_name, instance_id, b"io");
     print_str(b" io_out32=");
     print_u64(evidence.io_port_out32_serviced() as u64);
     print_str(b" io_out32_count=");
@@ -1039,8 +1099,9 @@ fn print_hardware_evidence(
     print_hex(evidence.io_port_last_in16_value as u32);
     print_str(b"/0x");
     print_hex(evidence.io_port_last_out16_value as u32);
-    print_str(b" root_started=");
-    print_u64(evidence.root_pdo_started as u64);
+    print_str(b"\n");
+
+    print_hardware_evidence_prefix(trace, service_name, instance_id, b"video");
     print_str(b" video_init=");
     print_u64(evidence.video_initialized as u64);
     print_str(b" video_find=");
@@ -1064,4 +1125,22 @@ fn print_hardware_evidence(
     print_str(b" video_reg_failures=");
     print_u64(evidence.video_registry_commit_failures);
     print_str(b"\n");
+}
+
+fn print_hardware_evidence_prefix(
+    trace: HostedPnpStartTrace,
+    service_name: &str,
+    instance_id: &str,
+    group: &[u8],
+) {
+    print_str(match trace {
+        HostedPnpStartTrace::HardwareProof => b"[driver-launch] generic hardware evidence service=",
+        HostedPnpStartTrace::DemandStart => b"[driver-launch] demand hardware evidence service=",
+        HostedPnpStartTrace::BootService => b"[driver-launch] hardware evidence service=",
+    });
+    print_str(service_name.as_bytes());
+    print_str(b" devnode=");
+    print_str(instance_id.as_bytes());
+    print_str(b" group=");
+    print_str(group);
 }

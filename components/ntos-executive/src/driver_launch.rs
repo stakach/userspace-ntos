@@ -28,19 +28,16 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
-use nt_dma_manager::{
-    DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
-};
+use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout};
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
     hosted_provider_has_export_marshal_policies, hosted_provider_internal_marshal_policy,
     ndis_miniport_characteristics_layout, ndis_protocol_characteristics_layout,
-    plan_hosted_driver_image,
-    plan_hosted_provider_import_binding, plan_hosted_provider_import_thunk,
-    HostedDriverImagePlanError, HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan,
-    HostedProviderDomainDescriptor, HostedProviderDomainError, HostedProviderDomainStatus,
-    HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
+    plan_hosted_driver_image, plan_hosted_provider_import_binding,
+    plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedProviderArgumentMarshal,
+    HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor, HostedProviderDomainError,
+    HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
@@ -67,10 +64,10 @@ use nt_io_manager::{
     DriverPeerId, FileId, InformationParameters, IoManager, IoParameters, IrpId, IrpProjection,
     MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmDriverObjectInit,
     WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
-    WDM_X64_DRIVER_EXTENSION_OFFSET,
-    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
-    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
-    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
+    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
+    WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
+    WDM_X64_IRP_SIZE,
 };
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
@@ -170,8 +167,7 @@ const _: () = assert!(FSD_WORKER_VADDR & (FSD_WORKER_STRIDE - 1) == 0);
 const _: () = assert!(FSD_WORKER_STRIDE & 0x1f_ffff == 0);
 const _: () = assert!(
     FSD_WORKER_BADGE_BASE
-        > crate::TP_WORKER_AUX_BADGE_BASE
-            + (crate::MAX_PI * crate::TP_WORKER_SLOT_COUNT) as u64
+        > crate::TP_WORKER_AUX_BADGE_BASE + (crate::MAX_PI * crate::TP_WORKER_SLOT_COUNT) as u64
 );
 const _: () = assert!(
     FSD_WORKER_SCRATCH_OFFSET + 0x1000 <= FSD_WORKER_STRIDE
@@ -188,8 +184,7 @@ const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
 const FSD_DATA_SE_EXPORTS_STRUCT_OFF: u64 = 0x500;
 const FSD_DATA_SE_SID_POOL_OFF: u64 =
     FSD_DATA_SE_EXPORTS_STRUCT_OFF + nt_security::se_exports::se_exports_offset::STRUCT_SIZE as u64;
-const FSD_DATA_MM_SYSTEM_RANGE_START_VA: u64 =
-    FSD_DATA_VADDR + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
+const FSD_DATA_MM_SYSTEM_RANGE_START_VA: u64 = FSD_DATA_VADDR + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA: u64 =
@@ -313,7 +308,7 @@ pub const SH_SYMLINK_LINK_BUF: u64 = 0x190; // out: UTF-16LE path capture
 pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
 pub const SH_RESOURCE_MMIO_PHYS: u64 = 0x3A0; // in: granted physical BAR base for MmMapIoSpace
-pub const SH_RESOURCE_MMIO_LEN: u64 = 0x3A8; // in: granted mapped BAR length
+pub const SH_RESOURCE_MMIO_LEN: u64 = 0x3A8; // in: granted physical BAR/resource length
 pub const SH_RESOURCE_MMIO_VA: u64 = 0x3B0; // in: component VA for the mapped BAR
 pub const SH_RESOURCE_INTERRUPT_VECTOR: u64 = 0x3B8; // in: granted interrupt vector/level (u32)
 pub const SH_RESOURCE_INTERRUPT_AFFINITY: u64 = 0x3C0; // in: granted interrupt affinity
@@ -354,6 +349,7 @@ pub const SH_RESOURCE_ADDRESS: u64 = 0x4D8; // in: DevicePropertyAddress value
 pub const SH_RESOURCE_PCI_VENDOR_DEVICE: u64 = 0x4E0; // in: PCI config dword 0x00
 pub const SH_RESOURCE_PCI_CLASS_REV: u64 = 0x4E8; // in: PCI config dword 0x08
 pub const SH_RESOURCE_PCI_IRQ: u64 = 0x4F0; // in: PCI interrupt line/pin bytes
+pub const SH_RESOURCE_MMIO_MAP_LEN: u64 = 0x4F8; // in: bytes actually mapped at SH_RESOURCE_MMIO_VA
 pub const SH_REGISTRY_IDENTITY_FLAGS: u64 = 0x500; // in: hosted registry identity flags
 pub const SH_REGISTRY_INSTANCE_LEN: u64 = 0x504; // in: ASCII bytes in instance path
 pub const SH_REGISTRY_DRIVER_KEY_LEN: u64 = 0x506; // in: ASCII bytes in class driver key
@@ -443,8 +439,7 @@ pub const SH_PROVIDER_EXPORT_MARSHAL_BASE: u64 =
 pub const SH_PROVIDER_EXPORT_MARSHAL_BYTES: u64 = 0x800;
 pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 =
     0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8 + SH_PROVIDER_EXPORT_MARSHAL_BYTES;
-pub const SH_WORK_QUEUE_BASE: u64 =
-    SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // in/out: queued Ex/Io work items
+pub const SH_WORK_QUEUE_BASE: u64 = SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // in/out: queued Ex/Io work items
 pub const SH_WORK_QUEUE_HEAD: u64 = SH_WORK_QUEUE_BASE;
 pub const SH_WORK_QUEUE_TAIL: u64 = SH_WORK_QUEUE_HEAD + 0x08;
 pub const SH_WORK_QUEUE_DROPS: u64 = SH_WORK_QUEUE_TAIL + 0x08;
@@ -457,13 +452,10 @@ pub const SH_WORK_QUEUE_ENTRY_ROUTINE: u64 = 0x10;
 pub const SH_WORK_QUEUE_ENTRY_ARG0: u64 = 0x18;
 pub const SH_WORK_QUEUE_ENTRY_ARG1: u64 = 0x20;
 pub const SH_WORK_QUEUE_CAPACITY: u64 = 256;
-pub const SH_WORK_QUEUE_ARENA_BYTES: u64 =
-    0x20 + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE;
-pub const SH_DPC_QUEUE_BASE: u64 =
-    SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: queued KDPC pointers
+pub const SH_WORK_QUEUE_ARENA_BYTES: u64 = 0x20 + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE;
+pub const SH_DPC_QUEUE_BASE: u64 = SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: queued KDPC pointers
 pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
-pub const SH_DPC_QUEUE_ARENA_BYTES: u64 =
-    ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
+pub const SH_DPC_QUEUE_ARENA_BYTES: u64 = ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
 pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 = SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
 pub const SH_DMA_ALLOC_RECORDS: u64 = SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
@@ -472,7 +464,9 @@ const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES <= SH_HANDOFF_ARENA_LIMIT);
 const _: () = assert!(SH_DPC_QUEUE_BASE > SH_SUPPORT_RECORDS);
 const _: () = assert!(SH_WORK_QUEUE_BASE >= SH_PROVIDER_EXPORT_MARSHAL_BASE);
-const _: () = assert!(SH_WORK_QUEUE_ENTRIES + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE <= SH_DPC_QUEUE_BASE);
+const _: () = assert!(
+    SH_WORK_QUEUE_ENTRIES + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE <= SH_DPC_QUEUE_BASE
+);
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
@@ -729,6 +723,13 @@ static HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(
 const HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_CAP: u64 = 16;
 static HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_CAP: u64 = 16;
+static HOSTED_DMA_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_DMA_SG_TRACE_CAP: u64 = 16;
+static HOSTED_RESOURCE_GRANT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_RESOURCE_GRANT_TRACE_CAP: u64 = 96;
+static HOSTED_RESOURCE_GRANT_DETAIL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_RESOURCE_GRANT_DETAIL_TRACE_CAP: u64 = 16;
+const SEL4_RETYPE_FAN_OUT_LIMIT: u64 = 256;
 
 #[inline]
 fn control_transfer_method(major: u64, code: u64) -> Option<u32> {
@@ -756,6 +757,129 @@ unsafe fn pool_alloc_zeroed(size: u64) -> u64 {
         zero(ptr, capacity);
     }
     ptr
+}
+
+unsafe fn alloc_driver_frame_run(instance: usize, name: &[u8], count: u64) -> Option<u64> {
+    let Some(base) = try_alloc_slot_run(count) else {
+        print_str(b"[driver-launch] frame run slot allocation failed inst=");
+        print_u64(instance as u64);
+        print_str(b" name=");
+        print_str(name);
+        print_str(b" count=");
+        print_u64(count);
+        print_str(b"\n");
+        return None;
+    };
+    let mut done = 0u64;
+    while done < count {
+        let remaining = count - done;
+        let batch = remaining.min(SEL4_RETYPE_FAN_OUT_LIMIT);
+        let slot = base + done;
+        let error = untyped_retype_r(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_4K_PAGE,
+            PAGING_BITS,
+            batch as u32,
+            slot,
+        );
+        if error != 0 {
+            print_str(b"[driver-launch] frame run retype failed inst=");
+            print_u64(instance as u64);
+            print_str(b" name=");
+            print_str(name);
+            print_str(b" index=");
+            print_u64(done);
+            print_str(b" batch=");
+            print_u64(batch);
+            print_str(b" label=");
+            print_u64(error);
+            print_str(b"\n");
+            let mut j = 0u64;
+            while j < done {
+                let _ = cnode_delete_recycle_r(base + j);
+                j += 1;
+            }
+            while j < count {
+                recycle_deleted_root_slot(base + j);
+                j += 1;
+            }
+            return None;
+        }
+        done += batch;
+    }
+    Some(base)
+}
+
+unsafe fn copy_driver_cap(instance: usize, name: &[u8], source: u64) -> Option<u64> {
+    let (cap, error) = copy_cap_r(source);
+    if error == 0 {
+        return Some(cap);
+    }
+    print_str(b"[driver-launch] cap copy failed inst=");
+    print_u64(instance as u64);
+    print_str(b" name=");
+    print_str(name);
+    print_str(b" source=0x");
+    print_hex64(source);
+    print_str(b" label=");
+    print_u64(error);
+    print_str(b"\n");
+    None
+}
+
+unsafe fn trace_hosted_resource_grant(stage: &[u8], device_id: u64, index: u64, total: u64) {
+    if HOSTED_RESOURCE_GRANT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_RESOURCE_GRANT_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[driver-launch] resource grant ");
+    print_str(stage);
+    print_str(b" device_id=");
+    print_u64(device_id);
+    if total != 0 {
+        print_str(b" index=");
+        print_u64(index);
+        print_str(b"/");
+        print_u64(total);
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_resource_grant_detail(
+    device_id: u64,
+    mmio_phys: u64,
+    mmio_len: u64,
+    mmio_frame_base: u64,
+    mmio_map_pages: u64,
+    mmio_va: u64,
+    dma_frame_base: u64,
+    dma_pages: u64,
+) {
+    if HOSTED_RESOURCE_GRANT_DETAIL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_RESOURCE_GRANT_DETAIL_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[driver-launch] resource grant detail device_id=");
+    print_u64(device_id);
+    print_str(b" mmio=0x");
+    print_hex64(mmio_phys);
+    print_str(b" len=");
+    print_u64(mmio_len);
+    print_str(b" frame-cap=");
+    print_u64(mmio_frame_base);
+    print_str(b" map-pages=");
+    print_u64(mmio_map_pages);
+    print_str(b" va=0x");
+    print_hex64(mmio_va);
+    if dma_pages != 0 {
+        print_str(b" dma-frame-cap=");
+        print_u64(dma_frame_base);
+        print_str(b" dma-pages=");
+        print_u64(dma_pages);
+    }
+    print_str(b"\n");
 }
 
 unsafe fn pool_copy_from_arg(dst: u64, len: u64) {
@@ -1060,9 +1184,8 @@ unsafe fn find_pending_irp_cancel_target(fid: u64) -> Option<PendingIrpCancelTar
         }
         let entry = read_volatile((node + 8) as *const PendingIrp);
         if entry.fid == fid && entry.irp != 0 {
-            let cancel_routine = read_unaligned(
-                (entry.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64,
-            );
+            let cancel_routine =
+                read_unaligned((entry.irp + WDM_X64_IRP_CANCEL_ROUTINE_OFFSET) as *const u64);
             if cancel_routine != 0 {
                 return Some(PendingIrpCancelTarget {
                     irp: entry.irp,
@@ -2417,7 +2540,8 @@ pub(crate) unsafe fn hosted_component_stack_qword(
 ) -> Option<u64> {
     let byte_offset = qword_index.checked_mul(8)?;
     let component_va = component_rsp.checked_add(byte_offset)?;
-    if component_va < FSD_STACK_VADDR || component_va.checked_add(8)? > FSD_STACK_VADDR + FSD_STACK_BYTES
+    if component_va < FSD_STACK_VADDR
+        || component_va.checked_add(8)? > FSD_STACK_VADDR + FSD_STACK_BYTES
     {
         return None;
     }
@@ -2500,10 +2624,7 @@ unsafe fn hosted_instance_pool_alloc(inst: DriverInstance, size: u64) -> Option<
 }
 
 unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
-    if inst.exec_pool_va == 0
-        || p < FSD_POOL_VADDR + POOL_DATA_OFF
-        || p >= component_pool_end()
-    {
+    if inst.exec_pool_va == 0 || p < FSD_POOL_VADDR + POOL_DATA_OFF || p >= component_pool_end() {
         return false;
     }
     let Some(p_exec) = inst.exec_pool_va.checked_add(p - FSD_POOL_VADDR) else {
@@ -2534,7 +2655,10 @@ unsafe fn hosted_instance_pool_free(inst: DriverInstance, p: u64) -> bool {
         cur = read_volatile((cur_exec - 8) as *const u64);
         steps += 1;
     }
-    write_volatile((p_exec - 8) as *mut u64, read_volatile(head_slot_exec as *const u64));
+    write_volatile(
+        (p_exec - 8) as *mut u64,
+        read_volatile(head_slot_exec as *const u64),
+    );
     write_volatile(head_slot_exec as *mut u64, p);
     true
 }
@@ -3706,9 +3830,8 @@ const HOSTED_REGISTRY_ARG_VALUE_OFF: u64 =
 const HOSTED_REGISTRY_ARG_DATA_OFF: u64 =
     HOSTED_REGISTRY_ARG_VALUE_OFF + HOSTED_REGISTRY_PATH_MAX as u64;
 const HOSTED_REGISTRY_ARG_DATA_CAP: u64 = HOSTED_REGISTRY_VALUE_SCRATCH_MAX as u64;
-const _: () = assert!(
-    HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_FRAMES * 0x1000
-);
+const _: () =
+    assert!(HOSTED_REGISTRY_ARG_DATA_OFF + HOSTED_REGISTRY_ARG_DATA_CAP <= FSD_ARG_FRAMES * 0x1000);
 const HOSTED_REGISTRY_OP_OPEN_RELATIVE_KEY: u64 = 1;
 const HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY: u64 = 2;
 const HOSTED_REGISTRY_OP_CLOSE: u64 = 3;
@@ -4487,7 +4610,10 @@ unsafe fn write_registry_arg_ascii<const N: usize>(
     write_volatile((FSD_ARG_VADDR + len_off) as *mut u32, value.len as u32);
     let mut i = 0usize;
     while i < value.len {
-        write_volatile((FSD_ARG_VADDR + buf_off + i as u64) as *mut u8, value.bytes[i]);
+        write_volatile(
+            (FSD_ARG_VADDR + buf_off + i as u64) as *mut u8,
+            value.bytes[i],
+        );
         i += 1;
     }
     true
@@ -4543,12 +4669,7 @@ unsafe fn write_registry_arg_data(data: u64, data_len: u32) -> i32 {
     STATUS_SUCCESS
 }
 
-unsafe fn hosted_registry_broker_call(
-    op: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> (i32, u64, u64) {
+unsafe fn hosted_registry_broker_call(op: u64, a1: u64, a2: u64, a3: u64) -> (i32, u64, u64) {
     let (_label, status, out1, out2, _) =
         call_on4((FSD_SERVICE_REGISTRY_LABEL << 12) | 4, op, a1, a2, a3);
     (status as u32 as i32, out1, out2)
@@ -4985,7 +5106,10 @@ extern "win64" fn s_rtl_create_unicode_string(dst: u64, src: u64) -> u8 {
         }
         copy_bytes_unchecked(buf, src, bytes);
         write_unaligned((buf + bytes) as *mut u16, 0);
-        write_unaligned((dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16, bytes as u16);
+        write_unaligned(
+            (dst + UNICODE_STRING_LENGTH_OFFSET) as *mut u16,
+            bytes as u16,
+        );
         write_unaligned(
             (dst + UNICODE_STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16,
             alloc_len as u16,
@@ -7101,14 +7225,20 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 
     unsafe {
         let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        let map_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
         let grant_va = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
-        if grant_phys == 0 || grant_len == 0 || grant_va == 0 || length == 0 || phys < grant_phys {
+        if grant_phys == 0 || grant_len == 0 || map_len == 0 || map_len > grant_len || grant_va == 0
+        {
+            return 0;
+        }
+        if !hosted_memory_range_granted(phys, length)
+            || !hosted_mapped_memory_range_granted(phys, length)
+            || phys < grant_phys
+            || length == 0
+        {
             return 0;
         }
         let offset = phys - grant_phys;
-        if offset > grant_len || length > grant_len - offset {
-            return 0;
-        }
         write_volatile(
             (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
             phys,
@@ -7126,8 +7256,15 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 
 extern "win64" fn s_mm_unmap_io_space(base: u64, _length: u64) {
     unsafe {
         let grant_va = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
-        let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
-        if grant_va != 0 && base >= grant_va && base < grant_va + grant_len {
+        let map_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
+        if grant_va != 0
+            && map_len != 0
+            && base >= grant_va
+            && grant_va
+                .checked_add(map_len)
+                .map(|end| base < end)
+                .unwrap_or(false)
+        {
             write_volatile(
                 (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
                 0,
@@ -7492,22 +7629,13 @@ unsafe fn clear_dma_allocation_records(sh: u64) {
 }
 
 unsafe fn clear_dma_allocation_record(record: u64) {
-    write_volatile(
-        (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
-        0,
-    );
+    write_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *mut u64, 0);
-    write_volatile(
-        (record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64,
-        0,
-    );
+    write_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64, 0);
     write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
-    write_volatile(
-        (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
-        0,
-    );
+    write_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64, 0);
 }
 
 unsafe fn dma_allocation_range_overlaps(
@@ -7617,14 +7745,12 @@ extern "win64" fn s_dma_allocate_common_buffer(
             if end > metadata.grant_len {
                 return 0;
             }
-            if let Some(next_offset) =
-                dma_allocation_range_overlaps(
-                    FSD_SHARED_VADDR,
-                    metadata.grant_logical,
-                    aligned,
-                    requested,
-                )
-            {
+            if let Some(next_offset) = dma_allocation_range_overlaps(
+                FSD_SHARED_VADDR,
+                metadata.grant_logical,
+                aligned,
+                requested,
+            ) {
                 offset = next_offset;
                 continue;
             }
@@ -7636,28 +7762,16 @@ extern "win64" fn s_dma_allocate_common_buffer(
         let logical = metadata.grant_logical + offset;
         // Common-buffer allocation does not promise zeroed memory, and provider-domain NDIS must
         // not dereference a VA that belongs to the dependent miniport VSpace.
-        write_volatile(
-            (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
-            logical,
-        );
-        write_volatile(
-            (record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64,
-            requested,
-        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64, logical);
+        write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, requested);
         write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, va);
         write_volatile(
             (record + SH_DMA_ALLOC_RECORD_KIND) as *mut u64,
             HOSTED_DMA_RECORD_KIND_COMMON,
         );
-        write_volatile(
-            (record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64,
-            0,
-        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_SOURCE_VA) as *mut u64, 0);
         write_volatile((record + SH_DMA_ALLOC_RECORD_FLAGS) as *mut u64, 0);
-        write_volatile(
-            (record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64,
-            0,
-        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *mut u64, 0);
         write_volatile(
             (FSD_SHARED_VADDR + SH_DMA_REQUESTED_LEN) as *mut u64,
             requested,
@@ -7769,6 +7883,82 @@ unsafe fn dma_mdl_transfer_window(mdl: u64, current_va: u64, requested: u64) -> 
     (length != 0).then_some((va, length))
 }
 
+unsafe fn trace_hosted_dma_sg(
+    phase: &[u8],
+    reason: &[u8],
+    status: i32,
+    adapter: u64,
+    mdl: u64,
+    current_va: u64,
+    length: u32,
+    sg_list: u64,
+    map_register: u64,
+    logical: u64,
+) {
+    if HOSTED_DMA_SG_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= HOSTED_DMA_SG_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-sg] ");
+    print_str(phase);
+    print_str(b" ");
+    print_str(reason);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" adapter=");
+    print_hex64(adapter);
+    print_str(b" mdl=");
+    print_hex64(mdl);
+    print_str(b" cur=");
+    print_hex64(current_va);
+    print_str(b" len=");
+    print_u64(length as u64);
+    print_str(b" sg=");
+    print_hex64(sg_list);
+    print_str(b" map=");
+    print_hex64(map_register);
+    print_str(b" logical=");
+    print_hex64(logical);
+    if let Some(metadata) = dma_adapter_metadata(adapter) {
+        print_str(b" grant=");
+        print_hex64(metadata.grant_va);
+        print_str(b"/");
+        print_u64(metadata.grant_len);
+        print_str(b"/");
+        print_hex64(metadata.grant_logical);
+        print_str(b" adapter-id=");
+        print_u64(metadata.adapter_id);
+    } else {
+        print_str(b" grant=invalid");
+    }
+    if mdl != 0 {
+        print_str(b" mdl.next/start/map/off/count=");
+        print_hex64(read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64));
+        print_str(b"/");
+        print_hex64(read_unaligned(
+            (mdl + nt_mdl::MDL_OFF_START_VA) as *const u64,
+        ));
+        print_str(b"/");
+        print_hex64(read_unaligned(
+            (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64,
+        ));
+        print_str(b"/");
+        print_u64(read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32) as u64);
+        print_str(b"/");
+        print_u64(read_unaligned((mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) as u64);
+    }
+    print_str(b" records=");
+    print_u64(read_volatile(
+        (FSD_SHARED_VADDR + SH_DMA_ALLOC_RECORD_COUNT) as *const u64,
+    ));
+    print_str(b"/");
+    print_u64(dma_allocation_record_capacity(FSD_SHARED_VADDR));
+    print_str(b" cursor=");
+    print_u64(read_volatile(
+        (FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *const u64,
+    ));
+    print_str(b"\n");
+}
+
 unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
     let mut offset = 0u64;
     while offset < len {
@@ -7820,22 +8010,70 @@ extern "win64" fn s_dma_map_transfer(
 ) -> i64 {
     unsafe {
         let Some(metadata) = dma_adapter_metadata(adapter) else {
+            trace_hosted_dma_sg(
+                b"map",
+                b"bad-adapter",
+                STATUS_INVALID_PARAMETER,
+                adapter,
+                mdl,
+                current_va,
+                0,
+                0,
+                map_register_base,
+                0,
+            );
             return 0;
         };
         if map_register_base == 0
             || read_unaligned(map_register_base as *const u64) != HOSTED_DMA_MAP_REGISTER_SIGNATURE
             || length.is_null()
         {
+            trace_hosted_dma_sg(
+                b"map",
+                b"bad-map-or-len",
+                STATUS_INVALID_PARAMETER,
+                adapter,
+                mdl,
+                current_va,
+                0,
+                0,
+                map_register_base,
+                0,
+            );
             return 0;
         }
         let requested = read_unaligned(length) as u64;
         let Some((source_va, mapped_len)) = dma_mdl_transfer_window(mdl, current_va, requested)
         else {
             write_unaligned(length, 0);
+            trace_hosted_dma_sg(
+                b"map",
+                b"mdl-window",
+                STATUS_INVALID_PARAMETER,
+                adapter,
+                mdl,
+                current_va,
+                requested as u32,
+                0,
+                map_register_base,
+                0,
+            );
             return 0;
         };
         let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
             write_unaligned(length, 0);
+            trace_hosted_dma_sg(
+                b"map",
+                b"no-record",
+                STATUS_INSUFFICIENT_RESOURCES,
+                adapter,
+                mdl,
+                current_va,
+                requested as u32,
+                0,
+                map_register_base,
+                0,
+            );
             return 0;
         };
 
@@ -7843,14 +8081,50 @@ extern "win64" fn s_dma_map_transfer(
         loop {
             let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
                 write_unaligned(length, 0);
+                trace_hosted_dma_sg(
+                    b"map",
+                    b"align-overflow",
+                    STATUS_INSUFFICIENT_RESOURCES,
+                    adapter,
+                    mdl,
+                    current_va,
+                    mapped_len as u32,
+                    0,
+                    map_register_base,
+                    0,
+                );
                 return 0;
             };
             let Some(end) = aligned.checked_add(mapped_len) else {
                 write_unaligned(length, 0);
+                trace_hosted_dma_sg(
+                    b"map",
+                    b"range-overflow",
+                    STATUS_INSUFFICIENT_RESOURCES,
+                    adapter,
+                    mdl,
+                    current_va,
+                    mapped_len as u32,
+                    0,
+                    map_register_base,
+                    0,
+                );
                 return 0;
             };
             if end > metadata.grant_len {
                 write_unaligned(length, 0);
+                trace_hosted_dma_sg(
+                    b"map",
+                    b"grant-full",
+                    STATUS_INSUFFICIENT_RESOURCES,
+                    adapter,
+                    mdl,
+                    current_va,
+                    mapped_len as u32,
+                    0,
+                    map_register_base,
+                    0,
+                );
                 return 0;
             }
             if let Some(next_offset) = dma_allocation_range_overlaps(
@@ -7873,10 +8147,7 @@ extern "win64" fn s_dma_map_transfer(
         } else {
             core::ptr::write_bytes(bounce_va as *mut u8, 0, mapped_len as usize);
         }
-        write_volatile(
-            (record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64,
-            logical,
-        );
+        write_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *mut u64, logical);
         write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, mapped_len);
         write_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *mut u64, bounce_va);
         write_volatile(
@@ -7914,6 +8185,18 @@ extern "win64" fn s_dma_map_transfer(
             write_volatile((FSD_SHARED_VADDR + SH_DMA_ALLOC_CURSOR) as *mut u64, end);
         }
         write_unaligned(length, mapped_len as u32);
+        trace_hosted_dma_sg(
+            b"map",
+            b"ok",
+            STATUS_SUCCESS,
+            adapter,
+            mdl,
+            current_va,
+            mapped_len as u32,
+            0,
+            map_register_base,
+            logical,
+        );
         logical as i64
     }
 }
@@ -7981,7 +8264,8 @@ extern "win64" fn s_dma_free_map_registers(
         while i < capacity {
             if let Some(record) = dma_allocation_record(FSD_SHARED_VADDR, i) {
                 let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-                let token = read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
+                let token =
+                    read_volatile((record + SH_DMA_ALLOC_RECORD_MAP_REGISTER) as *const u64);
                 if kind == HOSTED_DMA_RECORD_KIND_MAP_TRANSFER && token == map_register_base {
                     clear_dma_allocation_record(record);
                 }
@@ -8021,10 +8305,7 @@ unsafe fn dma_allocate_map_register_token(number_of_map_registers: u32) -> u64 {
     if map_register == 0 {
         return 0;
     }
-    write_unaligned(
-        map_register as *mut u64,
-        HOSTED_DMA_MAP_REGISTER_SIGNATURE,
-    );
+    write_unaligned(map_register as *mut u64, HOSTED_DMA_MAP_REGISTER_SIGNATURE);
     write_unaligned((map_register + 8) as *mut u32, number_of_map_registers);
     map_register
 }
@@ -8039,7 +8320,19 @@ unsafe fn dma_prepare_one_element_sg_list(
     list_owned: u8,
 ) -> i32 {
     if length == 0 || sg_list == 0 || dma_active_adapter_and_grant(adapter).is_none() {
-        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        trace_hosted_dma_sg(
+            b"prepare",
+            b"bad-input",
+            STATUS_INVALID_PARAMETER,
+            adapter,
+            mdl,
+            current_va,
+            length,
+            sg_list,
+            0,
+            0,
+        );
+        return STATUS_INVALID_PARAMETER;
     }
     let map_register = dma_allocate_map_register_token(1);
     let sg_context = pool_alloc_zeroed(HOSTED_SG_CONTEXT_SIZE);
@@ -8050,7 +8343,19 @@ unsafe fn dma_prepare_one_element_sg_list(
         if sg_context != 0 {
             pool_free(sg_context);
         }
-        return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        trace_hosted_dma_sg(
+            b"prepare",
+            b"alloc-failed",
+            STATUS_INSUFFICIENT_RESOURCES,
+            adapter,
+            mdl,
+            current_va,
+            length,
+            sg_list,
+            map_register,
+            0,
+        );
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
     let mut mapped_len = length;
     let logical = s_dma_map_transfer(
@@ -8064,7 +8369,19 @@ unsafe fn dma_prepare_one_element_sg_list(
     if logical == 0 || mapped_len == 0 {
         pool_free(sg_context);
         pool_free(map_register);
-        return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        trace_hosted_dma_sg(
+            b"prepare",
+            b"map-failed",
+            STATUS_INSUFFICIENT_RESOURCES,
+            adapter,
+            mdl,
+            current_va,
+            length,
+            sg_list,
+            map_register,
+            logical,
+        );
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     write_unaligned(sg_context as *mut u64, HOSTED_SG_CONTEXT_SIGNATURE);
@@ -8092,16 +8409,25 @@ unsafe fn dma_prepare_one_element_sg_list(
 
     write_unaligned(sg_list as *mut u32, 1);
     write_unaligned((sg_list + 8) as *mut u64, sg_context);
-    write_unaligned(
-        (sg_list + HOSTED_SG_ELEMENT_OFFSET) as *mut u64,
-        logical,
-    );
+    write_unaligned((sg_list + HOSTED_SG_ELEMENT_OFFSET) as *mut u64, logical);
     write_unaligned(
         (sg_list + HOSTED_SG_ELEMENT_OFFSET + 8) as *mut u32,
         mapped_len,
     );
     write_unaligned((sg_list + HOSTED_SG_ELEMENT_OFFSET + 16) as *mut u64, 0);
-    0
+    trace_hosted_dma_sg(
+        b"prepare",
+        b"ok",
+        STATUS_SUCCESS,
+        adapter,
+        mdl,
+        current_va,
+        mapped_len,
+        sg_list,
+        map_register,
+        logical,
+    );
+    STATUS_SUCCESS
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8116,12 +8442,37 @@ extern "win64" fn s_dma_get_scatter_gather_list(
     write_to_device: u8,
 ) -> i32 {
     unsafe {
-        if execution_routine == 0 || length == 0 || dma_active_adapter_and_grant(adapter).is_none() {
-            return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+        if execution_routine == 0 || length == 0 || dma_active_adapter_and_grant(adapter).is_none()
+        {
+            trace_hosted_dma_sg(
+                b"get",
+                b"bad-input",
+                STATUS_INVALID_PARAMETER,
+                adapter,
+                mdl,
+                current_va,
+                length,
+                0,
+                0,
+                0,
+            );
+            return STATUS_INVALID_PARAMETER;
         }
         let sg_list = pool_alloc_zeroed(HOSTED_SG_LIST_SIZE_ONE);
         if sg_list == 0 {
-            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+            trace_hosted_dma_sg(
+                b"get",
+                b"list-alloc-failed",
+                STATUS_INSUFFICIENT_RESOURCES,
+                adapter,
+                mdl,
+                current_va,
+                length,
+                0,
+                0,
+                0,
+            );
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
         let status = dma_prepare_one_element_sg_list(
             adapter,
@@ -8134,13 +8485,37 @@ extern "win64" fn s_dma_get_scatter_gather_list(
         );
         if status != 0 {
             pool_free(sg_list);
+            trace_hosted_dma_sg(
+                b"get",
+                b"prepare-failed",
+                status,
+                adapter,
+                mdl,
+                current_va,
+                length,
+                sg_list,
+                0,
+                0,
+            );
             return status;
         }
 
         let routine: extern "win64" fn(u64, u64, u64, u64) =
             core::mem::transmute(execution_routine as *const ());
         routine(device_object, 0, sg_list, context);
-        0
+        trace_hosted_dma_sg(
+            b"get",
+            b"routine-returned",
+            STATUS_SUCCESS,
+            adapter,
+            mdl,
+            current_va,
+            length,
+            sg_list,
+            0,
+            0,
+        );
+        STATUS_SUCCESS
     }
 }
 
@@ -8252,14 +8627,8 @@ extern "win64" fn s_dma_put_scatter_gather_list(
         } else {
             stored_write_to_device
         };
-        let _ = s_dma_flush_adapter_buffers(
-            adapter,
-            mdl,
-            map_register,
-            current_va,
-            length,
-            direction,
-        );
+        let _ =
+            s_dma_flush_adapter_buffers(adapter, mdl, map_register, current_va, length, direction);
         s_dma_free_map_registers(adapter, map_register, 1);
         pool_free(sg_context);
         if list_owned != 0 {
@@ -8696,17 +9065,15 @@ extern "win64" fn s_rtl_query_registry_values(
                 }
                 let value_name = wide_cstr_to_hosted_ascii::<HOSTED_REGISTRY_PATH_MAX>(name);
                 let mut value_found = false;
-                if let (Some(key_path), Some(value_name)) = (cm_registry_path.as_ref(), value_name) {
+                if let (Some(key_path), Some(value_name)) = (cm_registry_path.as_ref(), value_name)
+                {
                     let (status, value_type, data_len) =
                         broker_query_registry_path_value(key_path, &value_name);
                     match status {
                         STATUS_SUCCESS => {
                             let data = registry_arg_data_slice(data_len);
-                            let status = write_rtl_direct_registry_value(
-                                value_type,
-                                data,
-                                entry_context,
-                            );
+                            let status =
+                                write_rtl_direct_registry_value(value_type, data, entry_context);
                             if status < 0 {
                                 return status;
                             }
@@ -9142,7 +9509,10 @@ unsafe fn hosted_dispatcher_consume(object: u64) -> bool {
     false
 }
 
-unsafe fn hosted_dispatcher_wait_ready(objects: &[u64], wait_all: bool) -> Result<Option<u32>, i32> {
+unsafe fn hosted_dispatcher_wait_ready(
+    objects: &[u64],
+    wait_all: bool,
+) -> Result<Option<u32>, i32> {
     if objects.is_empty() || objects.len() > HOSTED_DRIVER_WAIT_OBJECT_MAX as usize {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -9233,7 +9603,8 @@ extern "win64" fn s_ke_wait_for_single_object(
     alertable: u8,
     timeout: u64,
 ) -> i32 {
-    let packed_wait = (wait_reason as u64) | ((wait_mode as u64) << 32) | ((alertable as u64) << 40);
+    let packed_wait =
+        (wait_reason as u64) | ((wait_mode as u64) << 32) | ((alertable as u64) << 40);
     let (timeout_code, timeout_arg) = unsafe { hosted_wait_timeout_payload(timeout) };
     let (_label, status, _, _, _) = unsafe {
         call_on4(
@@ -9436,14 +9807,8 @@ fn park_hosted_driver_wait(
 
 unsafe fn reply_hosted_driver_waiter(waiter: HostedDriverRawWaiter, status: i32) -> bool {
     let instance = waiter.instance;
-    let replied = crate::spawn_hosts::pump_reply_on(
-        waiter.reply_cap,
-        1,
-        status as u32 as u64,
-        0,
-        0,
-        0,
-    );
+    let replied =
+        crate::spawn_hosts::pump_reply_on(waiter.reply_cap, 1, status as u32 as u64, 0, 0, 0);
     let _ = hosted_driver_thread_table_mut(instance)
         .and_then(|table| table.set_ready(waiter.thread_handle).ok());
     if replied {
@@ -9643,7 +10008,11 @@ extern "win64" fn s_ke_initialize_timer(timer: u64) {
 }
 
 /// `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE, BOOLEAN, PLARGE_INTEGER)`.
-extern "win64" fn s_ke_delay_execution_thread(_wait_mode: u32, _alertable: u8, interval: u64) -> i32 {
+extern "win64" fn s_ke_delay_execution_thread(
+    _wait_mode: u32,
+    _alertable: u8,
+    interval: u64,
+) -> i32 {
     unsafe {
         if interval != 0 {
             let ticks = read_unaligned(interval as *const i64);
@@ -10019,11 +10388,7 @@ extern "win64" fn s_ex_initialize_npaged_lookaside_list(
 extern "win64" fn s_ex_delete_npaged_lookaside_list(la: u64) {
     if la != 0 {
         unsafe {
-            core::ptr::write_bytes(
-                la as *mut u8,
-                0,
-                nt_kernel_exec::general_lookaside::SIZE_OF,
-            );
+            core::ptr::write_bytes(la as *mut u8, 0, nt_kernel_exec::general_lookaside::SIZE_OF);
         }
     }
 }
@@ -10491,7 +10856,10 @@ extern "win64" fn s_rtl_absolute_to_self_relative_sd(
                 current as u32,
             );
         }
-        write_unaligned((self_relative_sd + SD_CONTROL_OFF) as *mut u16, control | SE_SELF_RELATIVE);
+        write_unaligned(
+            (self_relative_sd + SD_CONTROL_OFF) as *mut u16,
+            control | SE_SELF_RELATIVE,
+        );
         write_unaligned(buffer_length, total_len as u32);
     }
     STATUS_SUCCESS
@@ -10799,7 +11167,10 @@ unsafe fn write_key_value_partial_raw(
     }
     write_unaligned(key_value_information as *mut u32, 0);
     write_unaligned((key_value_information + 4) as *mut u32, value_type);
-    write_unaligned((key_value_information + 8) as *mut u32, data_bytes.len() as u32);
+    write_unaligned(
+        (key_value_information + 8) as *mut u32,
+        data_bytes.len() as u32,
+    );
     let data = key_value_information + 12;
     let mut i = 0usize;
     while i < data_bytes.len() {
@@ -11378,7 +11749,10 @@ const VBE_DISPI_INDEX_VIDEO_MEMORY_64K: u16 = 0x0A;
 const VIDEO_MEMORY_64K_UNIT: u64 = 64 * 1024;
 
 unsafe fn clear_shared_video_port_initialization() {
-    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION) as *mut u64, 0);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION) as *mut u64,
+        0,
+    );
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_FIND_ADAPTER) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO) as *mut u64, 0);
@@ -11387,10 +11761,22 @@ unsafe fn clear_shared_video_port_initialization() {
         (FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION_SIZE) as *mut u32,
         0,
     );
-    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *mut u32, 0);
-    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *mut u64, 0);
-    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_STATUS) as *mut u32, 0);
-    write_volatile((FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_AGAIN) as *mut u8, 0);
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *mut u32,
+        0,
+    );
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_CALLS) as *mut u64,
+        0,
+    );
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_STATUS) as *mut u32,
+        0,
+    );
+    write_volatile(
+        (FSD_SHARED_VADDR + SH_VIDEO_FIND_ADAPTER_AGAIN) as *mut u8,
+        0,
+    );
     write_volatile(
         (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
         0,
@@ -11414,10 +11800,7 @@ unsafe fn clear_shared_io_port_evidence_at(sh: u64) {
     write_volatile((sh + SH_RESOURCE_IO_PORT_IN16_DENIED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT16_DENIED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
-        0,
-    );
+    write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64, 0);
@@ -11494,6 +11877,12 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     range_within_grant(grant_start, grant_len, start, len)
 }
 
+unsafe fn hosted_mapped_memory_range_granted(start: u64, len: u64) -> bool {
+    let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
+    let map_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
+    range_within_grant(grant_start, map_len, start, len)
+}
+
 unsafe fn hosted_video_memory_caller_va(start: u64, len: u64) -> Option<u64> {
     let grant_start = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_PHYS) as *const u64);
     let grant_len = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
@@ -11528,8 +11917,8 @@ unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
 
 unsafe fn hosted_mmio_va_range_granted(start: u64, len: u64) -> bool {
     let grant_start = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_VA) as *const u64);
-    let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
-    grant_start != 0 && range_within_grant(grant_start, grant_len, start, len)
+    let map_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
+    grant_start != 0 && range_within_grant(grant_start, map_len, start, len)
 }
 
 unsafe fn bump_shared_io_counter(offset: u64) -> u64 {
@@ -11544,7 +11933,11 @@ unsafe fn hosted_port_cap_for_component_io(port: u64, width: u64) -> Option<u64>
         return None;
     }
     let cap = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64);
-    if cap == 0 { None } else { Some(cap) }
+    if cap == 0 {
+        None
+    } else {
+        Some(cap)
+    }
 }
 
 extern "win64" fn s_read_port_ushort(port: u64) -> u16 {
@@ -11619,7 +12012,11 @@ extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
             return 0;
         };
         let (value, status) = crate::io_in32_r(cap, port as u16);
-        if status == 0 { value } else { 0 }
+        if status == 0 {
+            value
+        } else {
+            0
+        }
     }
 }
 
@@ -11735,10 +12132,7 @@ extern "win64" fn s_video_port_get_access_ranges(
     slot: u64,
 ) -> u32 {
     unsafe {
-        if !hosted_resource_identity_active()
-            || access_ranges == 0
-            || num_access_ranges == 0
-        {
+        if !hosted_resource_identity_active() || access_ranges == 0 || num_access_ranges == 0 {
             return VP_ERROR_INVALID_PARAMETER;
         }
         if num_requested_resources != 0 || requested_resources != 0 {
@@ -11868,14 +12262,6 @@ extern "win64" fn s_video_port_map_memory(
         } else {
             match hosted_video_memory_caller_va(physical_address, requested_len as u64) {
                 Some(caller_va) => {
-                    write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64,
-                        physical_address,
-                    );
-                    write_volatile(
-                        (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
-                        requested_len as u64,
-                    );
                     caller_va
                 }
                 None => 0,
@@ -11935,9 +12321,8 @@ extern "win64" fn s_video_port_read_port_ushort(port: u64) -> u16 {
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *const u64);
         if cap != 0 && hosted_io_range_granted(port, 1) {
             if port == VBE_DISPI_IOPORT_DATA
-                && read_volatile(
-                    (FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64,
-                ) as u16
+                && read_volatile((FSD_SHARED_VADDR + SH_VIDEO_DISPI_SELECTED_INDEX) as *const u64)
+                    as u16
                     == VBE_DISPI_INDEX_VIDEO_MEMORY_64K
             {
                 if let Some(value) = hosted_video_memory_64k_units() {
@@ -12096,7 +12481,8 @@ unsafe fn stage_video_registry_parameter(
         return Err(VP_ERROR_MORE_DATA);
     }
     let capacity = (FSD_ARG_FRAMES * 0x1000) as usize;
-    let used = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_REGISTRY_SET_BYTES) as *const u64) as usize;
+    let used =
+        read_volatile((FSD_SHARED_VADDR + SH_VIDEO_REGISTRY_SET_BYTES) as *const u64) as usize;
     let record_len = align_up_u64(
         8u64.saturating_add(name.len as u64)
             .saturating_add(value_len as u64),
@@ -12267,7 +12653,10 @@ extern "win64" fn s_video_port_initialize(
                     (FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION_SIZE) as *mut u32,
                     data.hw_device_extension_size,
                 );
-                write_volatile((FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *mut u32, 1);
+                write_volatile(
+                    (FSD_SHARED_VADDR + SH_VIDEO_PORT_INITIALIZED) as *mut u32,
+                    1,
+                );
                 STATUS_SUCCESS
             }
             Err(error) => {
@@ -12336,7 +12725,10 @@ impl DriverImportResolution {
 }
 
 trait DriverImportResolver {
-    fn resolve_import(&mut self, request: DriverImportRequest<'_>) -> Option<DriverImportResolution>;
+    fn resolve_import(
+        &mut self,
+        request: DriverImportRequest<'_>,
+    ) -> Option<DriverImportResolution>;
 }
 
 struct HostedExecutableThunkWriter {
@@ -12863,7 +13255,7 @@ static HOSTED_PROVIDER_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 64;
+const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 16;
 const HOSTED_PROVIDER_CALLBACK_RECORD_CAP: usize = 256;
 static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
     HOSTED_PROVIDER_CALLBACK_RECORD_CAP] =
@@ -12879,7 +13271,7 @@ static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
-const HOSTED_PROVIDER_TRACE_CAP: u64 = 96;
+const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
 const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
     HOSTED_PROVIDER_POINTER_ALLOCATION_CAP] =
@@ -12904,14 +13296,13 @@ static HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new
 const HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP: usize = 128;
 static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: [HostedProviderMiniportInterruptShadow;
     HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP] =
-    [HostedProviderMiniportInterruptShadow::empty();
-        HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP];
+    [HostedProviderMiniportInterruptShadow::empty(); HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP];
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP: usize = 128;
-static mut HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS:
-    [HostedProviderNdisMiniportBlockMirror; HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP] =
+static mut HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS: [HostedProviderNdisMiniportBlockMirror;
+    HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP] =
     [HostedProviderNdisMiniportBlockMirror::empty();
         HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP];
 static HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -13061,6 +13452,21 @@ unsafe fn find_hosted_provider_singleton_by_cookie(
     None
 }
 
+unsafe fn clear_hosted_provider_singletons_for_instance(instance: usize) {
+    let singletons =
+        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
+    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let singleton = &mut *singletons.add(index);
+        if singleton.present && singleton.instance == instance {
+            *singleton = HostedProviderSingleton::empty();
+        }
+        index += 1;
+    }
+}
+
 unsafe fn register_hosted_provider_singleton(
     provider: HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
     instance: usize,
@@ -13176,9 +13582,8 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
                 evidence.private_dependencies_with_primary_provider = evidence
                     .private_dependencies_with_primary_provider
                     .saturating_add(summary.private_count);
-                evidence.unique_primary_provider_matches = evidence
-                    .unique_primary_provider_matches
-                    .saturating_add(1);
+                evidence.unique_primary_provider_matches =
+                    evidence.unique_primary_provider_matches.saturating_add(1);
                 if summary.first_private_instance != 0
                     && (evidence.first_private_dependency_with_primary_instance == 0
                         || summary.first_private_instance
@@ -13201,7 +13606,8 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
     evidence.singleton_overflows = HOSTED_PROVIDER_SINGLETON_OVERFLOWS.load(Ordering::Relaxed);
     evidence.singleton_conflicts = HOSTED_PROVIDER_SINGLETON_CONFLICTS.load(Ordering::Relaxed);
     evidence.provider_export_requests = HOSTED_PROVIDER_EXPORT_REQUESTS.load(Ordering::Relaxed);
-    evidence.provider_export_completions = HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_export_completions =
+        HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed);
     evidence.provider_export_rejections = HOSTED_PROVIDER_EXPORT_REJECTIONS.load(Ordering::Relaxed);
     evidence.provider_callback_requests = HOSTED_PROVIDER_CALLBACK_REQUESTS.load(Ordering::Relaxed);
     evidence.provider_callback_completions =
@@ -13228,16 +13634,15 @@ unsafe fn clear_support_image_records(shared_va: u64) {
     }
 }
 
-unsafe fn write_support_image_record(
-    shared_va: u64,
-    index: u32,
-    entry_rva: u64,
-) -> Option<()> {
+unsafe fn write_support_image_record(shared_va: u64, index: u32, entry_rva: u64) -> Option<()> {
     if index as u64 >= SH_SUPPORT_RECORD_CAPACITY {
         return None;
     }
     let record = shared_va + SH_SUPPORT_RECORDS + index as u64 * SH_SUPPORT_RECORD_SIZE;
-    write_volatile((record + SH_SUPPORT_RECORD_ENTRY_RVA) as *mut u64, entry_rva);
+    write_volatile(
+        (record + SH_SUPPORT_RECORD_ENTRY_RVA) as *mut u64,
+        entry_rva,
+    );
     write_volatile((record + SH_SUPPORT_RECORD_STATUS) as *mut i32, 0);
     write_volatile((record + SH_SUPPORT_RECORD_VERDICT) as *mut u32, 0);
     Some(())
@@ -13286,7 +13691,9 @@ fn print_hosted_provider_domain_error(error: HostedProviderDomainError) {
 
 fn print_hosted_provider_import_binding_error(error: HostedProviderImportBindingError) {
     match error {
-        HostedProviderImportBindingError::Domain(error) => print_hosted_provider_domain_error(error),
+        HostedProviderImportBindingError::Domain(error) => {
+            print_hosted_provider_domain_error(error)
+        }
         HostedProviderImportBindingError::Export(error) => match error {
             nt_hosted_runtime::HostedProviderExportCallError::Overflow => {
                 print_str(b"export-offset-overflow")
@@ -13346,9 +13753,7 @@ fn print_ndis_miniport_callback_name(offset: u64) {
         NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => print_str(b"TransferData"),
         NDIS_MINIPORT_RETURN_PACKET_CALLBACK_OFFSET_X64 => print_str(b"ReturnPacket"),
         NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64 => print_str(b"SendPackets"),
-        NDIS_MINIPORT_ALLOCATE_COMPLETE_CALLBACK_OFFSET_X64 => {
-            print_str(b"AllocateComplete")
-        }
+        NDIS_MINIPORT_ALLOCATE_COMPLETE_CALLBACK_OFFSET_X64 => print_str(b"AllocateComplete"),
         _ => print_str(b"unknown"),
     }
 }
@@ -13748,7 +14153,8 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(instance_index: usi
     };
     for route in routes.iter_mut() {
         if route.used
-            && (route.dependent_instance == instance_index || route.provider_instance == instance_index)
+            && (route.dependent_instance == instance_index
+                || route.provider_instance == instance_index)
         {
             clear_driver_object_extensions_for_driver_object(route.provider_driver_object);
             *route = HostedProviderDispatchRoute::empty();
@@ -13921,9 +14327,8 @@ unsafe fn complete_hosted_provider_miniport_registration(
     ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let add_device = read_unaligned(
-        (extension_exec + WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET) as *const u64,
-    );
+    let add_device =
+        read_unaligned((extension_exec + WDM_X64_DRIVER_EXTENSION_ADD_DEVICE_OFFSET) as *const u64);
     let Some(driver_exec) = component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
@@ -13933,8 +14338,7 @@ unsafe fn complete_hosted_provider_miniport_registration(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let pnp_dispatch = read_unaligned(
-        (driver_exec + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64 + IRP_MJ_PNP * 8)
-            as *const u64,
+        (driver_exec + WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64 + IRP_MJ_PNP * 8) as *const u64,
     );
     if add_device == 0 || pnp_dispatch == 0 {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
@@ -14063,9 +14467,8 @@ fn provider_shared_component_to_exec(
 }
 
 unsafe fn ndis_packet_shadow_len(packet_exec: u64) -> Option<u64> {
-    let oob_offset = read_unaligned(
-        (packet_exec + NDIS_PACKET_PRIVATE_OOB_OFFSET_X64) as *const u16,
-    ) as u64;
+    let oob_offset =
+        read_unaligned((packet_exec + NDIS_PACKET_PRIVATE_OOB_OFFSET_X64) as *const u16) as u64;
     if !(NDIS_PACKET_MIN_LEN_X64..=NDIS_PACKET_MAX_SHADOW_LEN_X64).contains(&oob_offset) {
         return None;
     }
@@ -14079,9 +14482,8 @@ unsafe fn ndis_packet_shadow_len(packet_exec: u64) -> Option<u64> {
 }
 
 unsafe fn ndis_packet_sg_info_cell_exec(packet_exec: u64, packet_bytes: u64) -> Option<u64> {
-    let oob_offset = read_unaligned(
-        (packet_exec + NDIS_PACKET_PRIVATE_OOB_OFFSET_X64) as *const u16,
-    ) as u64;
+    let oob_offset =
+        read_unaligned((packet_exec + NDIS_PACKET_PRIVATE_OOB_OFFSET_X64) as *const u16) as u64;
     let offset = oob_offset
         .checked_add(NDIS_PACKET_OOB_DATA_LEN_X64)?
         .checked_add(NDIS_PACKET_SCATTER_GATHER_INFO_INDEX_X64 * 8)?;
@@ -14167,8 +14569,7 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
         {
             record.dependent_sg_component_va = dependent_sg_component_va;
             record.provider_sg_component_va = provider_sg_component_va;
-            record.dependent_sg_component_owned_by_bridge =
-                dependent_sg_component_owned_by_bridge;
+            record.dependent_sg_component_owned_by_bridge = dependent_sg_component_owned_by_bridge;
             return true;
         }
         index += 1;
@@ -14962,14 +15363,20 @@ unsafe fn sync_ndis_buffer_shadow_to_provider(
         .provider_data_component_va
         .checked_add(offset)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(dependent_data_exec) =
-        component_to_exec_va_for_instance(dependent_instance, dependent_inst, dependent_data_va, bytes)
-    else {
+    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_data_va,
+        bytes,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(provider_data_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_data_va, bytes)
-    else {
+    let Some(provider_data_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_data_va,
+        bytes,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     copy_bytes(provider_data_exec, dependent_data_exec, bytes);
@@ -15008,9 +15415,12 @@ unsafe fn sync_ndis_buffer_shadow_to_dependent(
         .dependent_data_component_va
         .checked_add(offset)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(provider_data_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_data_va, bytes)
-    else {
+    let Some(provider_data_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_data_va,
+        bytes,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some(dependent_data_exec) = component_to_exec_va_for_instance(
@@ -15058,17 +15468,16 @@ unsafe fn sync_ndis_packet_buffers_to_dependent(
         return Ok(());
     }
 
-    let head_shadow =
-        find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
-            provider_instance,
-            dependent_instance,
-            provider_head,
-        )
-            .map(|(_, shadow)| shadow)
-            .ok_or_else(|| {
-                HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                STATUS_INVALID_PARAMETER
-            })?;
+    let head_shadow = find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
+        provider_instance,
+        dependent_instance,
+        provider_head,
+    )
+    .map(|(_, shadow)| shadow)
+    .ok_or_else(|| {
+        HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        STATUS_INVALID_PARAMETER
+    })?;
     let mut current = provider_head;
     let mut last_provider = 0u64;
     let mut last_dependent = 0u64;
@@ -15082,11 +15491,11 @@ unsafe fn sync_ndis_packet_buffers_to_dependent(
             dependent_instance,
             current,
         )
-                .map(|(_, shadow)| shadow)
-                .ok_or_else(|| {
-                    HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    STATUS_INVALID_PARAMETER
-                })?;
+        .map(|(_, shadow)| shadow)
+        .ok_or_else(|| {
+            HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            STATUS_INVALID_PARAMETER
+        })?;
         let Some(provider_mdl_exec) = component_to_exec_va_for_instance(
             provider_instance,
             provider_inst,
@@ -15105,12 +15514,11 @@ unsafe fn sync_ndis_packet_buffers_to_dependent(
                 dependent_instance,
                 provider_next,
             )
-                .map(|(_, shadow)| shadow.dependent_component_va)
-                .ok_or_else(|| {
-                    HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS
-                        .fetch_add(1, Ordering::Relaxed);
-                    STATUS_INVALID_PARAMETER
-                })?
+            .map(|(_, shadow)| shadow.dependent_component_va)
+            .ok_or_else(|| {
+                HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                STATUS_INVALID_PARAMETER
+            })?
         };
         sync_ndis_buffer_shadow_to_dependent(
             provider_instance,
@@ -15148,12 +15556,10 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
     provider_packet_exec: u64,
     dependent_packet_exec: u64,
 ) -> Result<(), i32> {
-    let provider_cell =
-        ndis_packet_sg_info_cell_exec(provider_packet_exec, shadow.bytes)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_cell =
-        ndis_packet_sg_info_cell_exec(dependent_packet_exec, shadow.bytes)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_cell = ndis_packet_sg_info_cell_exec(provider_packet_exec, shadow.bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_cell = ndis_packet_sg_info_cell_exec(dependent_packet_exec, shadow.bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
     let provider_sg = read_unaligned(provider_cell as *const u64);
     if provider_sg == 0 {
         write_unaligned(dependent_cell as *mut u64, 0);
@@ -15169,9 +15575,8 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
     let mut dependent_sg = shadow.dependent_sg_component_va;
     let allocated_new = dependent_sg == 0;
     if dependent_sg == 0 {
-        dependent_sg =
-            hosted_instance_pool_alloc(dependent_inst, HOSTED_SG_LIST_SIZE_ONE)
-                .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        dependent_sg = hosted_instance_pool_alloc(dependent_inst, HOSTED_SG_LIST_SIZE_ONE)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     }
     let Some(dependent_sg_exec) = component_to_exec_va_for_instance(
         dependent_instance,
@@ -15209,12 +15614,10 @@ unsafe fn sync_ndis_packet_sg_to_provider(
     provider_packet_exec: u64,
     dependent_packet_exec: u64,
 ) -> Result<(), i32> {
-    let provider_cell =
-        ndis_packet_sg_info_cell_exec(provider_packet_exec, shadow.bytes)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_cell =
-        ndis_packet_sg_info_cell_exec(dependent_packet_exec, shadow.bytes)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_cell = ndis_packet_sg_info_cell_exec(provider_packet_exec, shadow.bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dependent_cell = ndis_packet_sg_info_cell_exec(dependent_packet_exec, shadow.bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
     let dependent_sg = read_unaligned(dependent_cell as *const u64);
     let provider_sg = if dependent_sg == 0 {
         0
@@ -15684,7 +16087,10 @@ unsafe fn provider_marshal_output_ndis_first_buffer_va(
 
 unsafe fn write_provider_ndis_status(state: &ProviderMarshalState, status: i32) {
     if state.ndis_status_provider_exec_va != 0 {
-        write_unaligned(state.ndis_status_provider_exec_va as *mut u32, status as u32);
+        write_unaligned(
+            state.ndis_status_provider_exec_va as *mut u32,
+            status as u32,
+        );
     }
 }
 
@@ -15728,9 +16134,12 @@ unsafe fn complete_provider_ndis_packet_allocation(
         write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, 0);
         return;
     };
-    let Some(provider_packet_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_packet, packet_bytes)
-    else {
+    let Some(provider_packet_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_packet,
+        packet_bytes,
+    ) else {
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -15770,7 +16179,10 @@ unsafe fn complete_provider_ndis_packet_allocation(
         write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, 0);
         return;
     }
-    write_unaligned(state.ndis_packet_out_dependent_exec_va as *mut u64, dependent_packet);
+    write_unaligned(
+        state.ndis_packet_out_dependent_exec_va as *mut u64,
+        dependent_packet,
+    );
 }
 
 unsafe fn complete_provider_ndis_buffer_allocation(
@@ -15784,13 +16196,19 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         return;
     }
     if !provider_ndis_status_success(state) {
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
     }
     let provider_buffer = read_unaligned(state.ndis_buffer_out_provider_exec_va as *const u64);
     if provider_buffer == 0 || state.ndis_buffer_out_bytes == 0 {
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -15801,14 +16219,21 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         provider_buffer,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
     };
-    let Some(dependent_buffer) = hosted_instance_pool_alloc(dependent_inst, nt_mdl::MDL_SIZE as u64)
+    let Some(dependent_buffer) =
+        hosted_instance_pool_alloc(dependent_inst, nt_mdl::MDL_SIZE as u64)
     else {
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -15820,7 +16245,10 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         nt_mdl::MDL_SIZE as u64,
     ) else {
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -15852,12 +16280,18 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         dependent_data_component_owned_by_bridge: false,
     }) {
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
-        hosted_instance_pool_free(provider_inst, state.ndis_buffer_out_provider_data_component_va);
+        hosted_instance_pool_free(
+            provider_inst,
+            state.ndis_buffer_out_provider_data_component_va,
+        );
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
     }
-    write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, dependent_buffer);
+    write_unaligned(
+        state.ndis_buffer_out_dependent_exec_va as *mut u64,
+        dependent_buffer,
+    );
 }
 
 unsafe fn complete_provider_ndis_first_buffer_outputs(
@@ -15865,7 +16299,8 @@ unsafe fn complete_provider_ndis_first_buffer_outputs(
     provider_instance: usize,
     dependent_instance: usize,
 ) {
-    if state.ndis_first_buffer_provider_exec_va == 0 && state.ndis_first_buffer_va_provider_exec_va == 0
+    if state.ndis_first_buffer_provider_exec_va == 0
+        && state.ndis_first_buffer_va_provider_exec_va == 0
     {
         return;
     }
@@ -15884,9 +16319,14 @@ unsafe fn complete_provider_ndis_first_buffer_outputs(
         )
         .map(|(_, shadow)| shadow)
     };
-    let dependent_buffer = mapped.map(|shadow| shadow.dependent_component_va).unwrap_or(0);
+    let dependent_buffer = mapped
+        .map(|shadow| shadow.dependent_component_va)
+        .unwrap_or(0);
     if state.ndis_first_buffer_dependent_exec_va != 0 {
-        write_unaligned(state.ndis_first_buffer_dependent_exec_va as *mut u64, dependent_buffer);
+        write_unaligned(
+            state.ndis_first_buffer_dependent_exec_va as *mut u64,
+            dependent_buffer,
+        );
     }
     if state.ndis_first_buffer_va_dependent_exec_va != 0 {
         let provider_va = if state.ndis_first_buffer_va_provider_exec_va == 0 {
@@ -16170,8 +16610,7 @@ unsafe fn hosted_provider_miniport_interrupt_shadow(
             dependent_component_va,
         )?,
         None => {
-            HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS
-                .fetch_add(1, Ordering::Relaxed);
+            HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_PARAMETER);
         }
     };
@@ -16839,11 +17278,7 @@ unsafe fn ensure_hosted_provider_ndis_miniport_block_mirror(
         dependent_instance,
         provider_component_va,
     ) {
-        refresh_hosted_provider_ndis_miniport_block_mirror(
-            provider_inst,
-            dependent_inst,
-            mirror,
-        )?;
+        refresh_hosted_provider_ndis_miniport_block_mirror(provider_inst, dependent_inst, mirror)?;
         return Ok(mirror);
     }
     allocate_hosted_provider_ndis_miniport_block_mirror(
@@ -16884,7 +17319,8 @@ unsafe fn provider_marshal_emit_callback_thunk(
     callback_offset: u64,
     callback_kind: u8,
 ) -> Result<u64, i32> {
-    let Some((exec_va, run_va, thunk_index)) = allocate_instance_executable_thunk(provider_instance)
+    let Some((exec_va, run_va, thunk_index)) =
+        allocate_instance_executable_thunk(provider_instance)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -16907,7 +17343,8 @@ unsafe fn provider_marshal_emit_callback_thunk(
         exec_va as *mut u8,
         HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN as usize,
     );
-    encode_hosted_provider_callback_thunk(thunk, slot).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    encode_hosted_provider_callback_thunk(thunk, slot)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     Ok(thunk.thunk_va)
 }
 
@@ -16953,7 +17390,15 @@ fn provider_marshal_add_copyout(
     provider_exec_va: u64,
     bytes: u64,
 ) -> Option<()> {
-    provider_marshal_add_copyout_with_fixed(state, dependent_exec_va, provider_exec_va, bytes, 0, 0, 0)
+    provider_marshal_add_copyout_with_fixed(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        bytes,
+        0,
+        0,
+        0,
+    )
 }
 
 fn provider_marshal_add_copyout_with_fixed(
@@ -17080,7 +17525,12 @@ unsafe fn provider_marshal_input_buffer(
     let Some(dependent_exec_va) =
         provider_marshal_input_buffer_exec_va(dependent_index, dependent_inst, arg_value, bytes)
     else {
-        trace_provider_input_buffer_marshal_rejection(dependent_index, dependent_inst, arg_value, bytes);
+        trace_provider_input_buffer_marshal_rejection(
+            dependent_index,
+            dependent_inst,
+            arg_value,
+            bytes,
+        );
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
@@ -17133,8 +17583,8 @@ unsafe fn provider_marshal_input_buffer_exec_va(
     component_va: u64,
     bytes: u64,
 ) -> Option<u64> {
-    component_to_exec_va_for_instance(dependent_index, dependent_inst, component_va, bytes)
-        .or_else(|| {
+    component_to_exec_va_for_instance(dependent_index, dependent_inst, component_va, bytes).or_else(
+        || {
             let device_id = dependent_inst.device_id;
             if device_id == 0 {
                 return None;
@@ -17144,7 +17594,8 @@ unsafe fn provider_marshal_input_buffer_exec_va(
                 return None;
             }
             hosted_dma_alias_for_component_va(state, component_va, bytes)
-        })
+        },
+    )
 }
 
 fn provider_marshal_u32_arg(
@@ -17176,8 +17627,8 @@ unsafe fn provider_marshal_ansi_string(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let length = read_unaligned((desc_exec + ANSI_STRING_LENGTH_OFFSET) as *const u16) as u64;
-    let maximum = read_unaligned((desc_exec + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16)
-        as u64;
+    let maximum =
+        read_unaligned((desc_exec + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) as u64;
     let buffer = read_unaligned((desc_exec + ANSI_STRING_BUFFER_OFFSET) as *const u64);
     if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
         return Err(STATUS_INVALID_PARAMETER);
@@ -17360,10 +17811,12 @@ unsafe fn provider_marshal_mmio_mapping(
     let sh = dependent_inst.exec_shared_va;
     let grant_start = read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64);
     let grant_len = read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64);
+    let map_len = read_volatile((sh + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
     let grant_va = read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64);
     if length == 0
         || grant_va == 0
         || !range_within_grant(grant_start, grant_len, physical_address, length)
+        || !range_within_grant(grant_start, map_len, physical_address, length)
     {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -17594,9 +18047,12 @@ unsafe fn provider_marshal_ndis_request(
     if arg_value == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_request_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, NDIS_REQUEST_LEN_X64)
-    else {
+    let Some(dependent_request_exec) = component_to_exec_va_for_instance(
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        NDIS_REQUEST_LEN_X64,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let request_type =
@@ -17618,7 +18074,11 @@ unsafe fn provider_marshal_ndis_request(
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    copy_bytes(provider_request_exec, dependent_request_exec, NDIS_REQUEST_LEN_X64);
+    copy_bytes(
+        provider_request_exec,
+        dependent_request_exec,
+        NDIS_REQUEST_LEN_X64,
+    );
     provider_marshal_add_copyout(
         state,
         dependent_request_exec + NDIS_REQUEST_BYTES_DONE_OFFSET_X64,
@@ -17758,7 +18218,10 @@ unsafe fn provider_marshal_unicode_string(
         provider_buffer_va
     };
     write_unaligned(provider_desc_exec as *mut u16, length as u16);
-    write_unaligned((provider_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned(
+        (provider_desc_exec + 2) as *mut u16,
+        length.saturating_add(2) as u16,
+    );
     write_unaligned((provider_desc_exec + 8) as *mut u64, provider_buffer_va);
     Ok(provider_desc_va)
 }
@@ -17795,7 +18258,10 @@ unsafe fn provider_marshal_embedded_unicode_string_buffer(
         provider_buffer_va
     };
     write_unaligned(provider_desc_exec as *mut u16, length as u16);
-    write_unaligned((provider_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned(
+        (provider_desc_exec + 2) as *mut u16,
+        length.saturating_add(2) as u16,
+    );
     write_unaligned((provider_desc_exec + 8) as *mut u64, provider_buffer_va);
     Ok(())
 }
@@ -18033,7 +18499,8 @@ unsafe fn prepare_provider_export_marshal(
                     4,
                 )?;
                 state.ndis_status_provider_exec_va =
-                    provider_shared_component_to_exec(provider_shared, provider_arg, 4).unwrap_or(0);
+                    provider_shared_component_to_exec(provider_shared, provider_arg, 4)
+                        .unwrap_or(0);
                 provider_arg
             }
             HostedProviderArgumentMarshal::CallerOutHandle
@@ -18052,7 +18519,10 @@ unsafe fn prepare_provider_export_marshal(
                     bytes,
                 )?;
                 if policy.side_effect == HostedProviderExportSideEffect::NdisInitializeWrapper
-                    && matches!(policy.args[index], HostedProviderArgumentMarshal::CallerOutHandle)
+                    && matches!(
+                        policy.args[index],
+                        HostedProviderArgumentMarshal::CallerOutHandle
+                    )
                 {
                     state.ndis_initialize_wrapper_handle_exec_va =
                         provider_shared + (provider_arg - FSD_SHARED_VADDR);
@@ -18067,13 +18537,15 @@ unsafe fn prepare_provider_export_marshal(
                 arg,
                 4,
             )?,
-            HostedProviderArgumentMarshal::CallerInUnicodeString => provider_marshal_unicode_string(
-                &mut state,
-                dependent_index,
-                dependent_inst,
-                provider_shared,
-                arg,
-            )?,
+            HostedProviderArgumentMarshal::CallerInUnicodeString => {
+                provider_marshal_unicode_string(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                )?
+            }
             HostedProviderArgumentMarshal::CallerInAnsiString => provider_marshal_ansi_string(
                 &mut state,
                 dependent_index,
@@ -18165,13 +18637,15 @@ unsafe fn prepare_provider_export_marshal(
                 }
                 provider_packet
             }
-            HostedProviderArgumentMarshal::CallerOutNdisPacket => provider_marshal_output_ndis_packet(
-                &mut state,
-                dependent_index,
-                dependent_inst,
-                provider_shared,
-                arg,
-            )?,
+            HostedProviderArgumentMarshal::CallerOutNdisPacket => {
+                provider_marshal_output_ndis_packet(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                )?
+            }
             HostedProviderArgumentMarshal::CallerOutNdisBuffer {
                 virtual_address_arg,
                 length_arg,
@@ -18437,7 +18911,11 @@ unsafe fn complete_provider_export_marshal(
                 _ => {}
             }
         }
-        copy_bytes(copyout.dependent_exec_va, copyout.provider_exec_va, copyout.bytes);
+        copy_bytes(
+            copyout.dependent_exec_va,
+            copyout.provider_exec_va,
+            copyout.bytes,
+        );
         index += 1;
     }
     let mut free_index = 0usize;
@@ -18509,9 +18987,10 @@ unsafe fn complete_provider_export_side_effects(
     }
 }
 
-const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 13] = [
+const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 14] = [
     SH_RESOURCE_MMIO_PHYS,
     SH_RESOURCE_MMIO_LEN,
+    SH_RESOURCE_MMIO_MAP_LEN,
     SH_RESOURCE_MMIO_VA,
     SH_RESOURCE_INTERRUPT_VECTOR,
     SH_RESOURCE_INTERRUPT_AFFINITY,
@@ -18679,10 +19158,7 @@ unsafe fn project_provider_resource_state(
     Ok(())
 }
 
-fn provider_export_result_success(
-    policy: HostedProviderExportMarshalPolicy,
-    result: u64,
-) -> bool {
+fn provider_export_result_success(policy: HostedProviderExportMarshalPolicy, result: u64) -> bool {
     policy.result_semantics == HostedProviderExportResultSemantics::Void
         || result == STATUS_SUCCESS as u64
 }
@@ -18810,7 +19286,8 @@ unsafe fn trace_provider_resource_list_export(
     let Some((list_index, length_index)) = provider_policy_resource_list_args(policy) else {
         return;
     };
-    if length_index >= policy.argument_count as usize || list_index >= policy.argument_count as usize
+    if length_index >= policy.argument_count as usize
+        || list_index >= policy.argument_count as usize
     {
         return;
     }
@@ -18821,19 +19298,21 @@ unsafe fn trace_provider_resource_list_export(
 
     let status_index = provider_policy_status_arg(policy);
     let dependent_status = status_index
-        .and_then(|index| read_provider_arg_u32(dependent_index, dependent_inst, original_args[index]))
+        .and_then(|index| {
+            read_provider_arg_u32(dependent_index, dependent_inst, original_args[index])
+        })
         .unwrap_or(u32::MAX);
     let provider_status = status_index
-        .and_then(|index| read_provider_arg_u32(provider_index, provider_inst, marshalled_args[index]))
+        .and_then(|index| {
+            read_provider_arg_u32(provider_index, provider_inst, marshalled_args[index])
+        })
         .unwrap_or(u32::MAX);
-    let dependent_len = read_provider_arg_u32(
-        dependent_index,
-        dependent_inst,
-        original_args[length_index],
-    )
-    .unwrap_or(u32::MAX);
-    let provider_len = read_provider_arg_u32(provider_index, provider_inst, marshalled_args[length_index])
-        .unwrap_or(u32::MAX);
+    let dependent_len =
+        read_provider_arg_u32(dependent_index, dependent_inst, original_args[length_index])
+            .unwrap_or(u32::MAX);
+    let provider_len =
+        read_provider_arg_u32(provider_index, provider_inst, marshalled_args[length_index])
+            .unwrap_or(u32::MAX);
     let list_component_va = original_args[list_index];
     let (version, revision, count) = if list_component_va == 0 {
         (0xffffu16, 0xffffu16, u32::MAX)
@@ -18849,20 +19328,35 @@ unsafe fn trace_provider_resource_list_export(
         (0xffffu16, 0xffffu16, u32::MAX)
     };
     let desc0 = if count > 0 && count != u32::MAX {
-        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 0)
-            .unwrap_or(0xff)
+        read_provider_resource_descriptor_type(
+            dependent_index,
+            dependent_inst,
+            list_component_va,
+            0,
+        )
+        .unwrap_or(0xff)
     } else {
         0xff
     };
     let desc1 = if count > 1 && count != u32::MAX {
-        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 1)
-            .unwrap_or(0xff)
+        read_provider_resource_descriptor_type(
+            dependent_index,
+            dependent_inst,
+            list_component_va,
+            1,
+        )
+        .unwrap_or(0xff)
     } else {
         0xff
     };
     let desc2 = if count > 2 && count != u32::MAX {
-        read_provider_resource_descriptor_type(dependent_index, dependent_inst, list_component_va, 2)
-            .unwrap_or(0xff)
+        read_provider_resource_descriptor_type(
+            dependent_index,
+            dependent_inst,
+            list_component_va,
+            2,
+        )
+        .unwrap_or(0xff)
     } else {
         0xff
     };
@@ -18906,15 +19400,10 @@ pub(crate) unsafe fn service_hosted_provider_export(
     arg1: u64,
 ) -> u64 {
     HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let arg2 = read_volatile(
-        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG2) as *const u64,
-    );
-    let arg3 = read_volatile(
-        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
-    );
-    let caller_rsp = read_volatile(
-        (dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64,
-    );
+    let arg2 = read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG2) as *const u64);
+    let arg3 = read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
+    let caller_rsp =
+        read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64);
     let Some((_singleton_index, singleton)) =
         find_hosted_provider_singleton_by_cookie(provider_domain_cookie)
     else {
@@ -18939,7 +19428,8 @@ pub(crate) unsafe fn service_hosted_provider_export(
         }
         Err(_) => return hosted_provider_export_failure(STATUS_INVALID_PARAMETER),
     }
-    let Some((dependent_index, dependent_inst)) = instance_by_shared_va(dependent_channel.shared_va)
+    let Some((dependent_index, dependent_inst)) =
+        instance_by_shared_va(dependent_channel.shared_va)
     else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -18956,7 +19446,8 @@ pub(crate) unsafe fn service_hosted_provider_export(
     {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     }
-    let Some(exec_code_va) = ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
+    let Some(exec_code_va) =
+        ExecVaWindow::try_for_instance(singleton.instance).map(|win| win.code_va)
     else {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -19084,6 +19575,8 @@ pub(crate) unsafe fn service_hosted_provider_export(
         code_va: 0,
         image_frames: 0,
         exec_code_va,
+        root_image_rights: 3,
+        root_image_map_owner: provider_inst.map_cap_bank.owner,
         shared_va: provider_shared,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -19278,6 +19771,8 @@ unsafe fn dispatch_hosted_component_target(
         code_va: 0,
         image_frames: 0,
         exec_code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: shared,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -19450,10 +19945,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
             HOSTED_WORK_QUEUE_KIND_IO => [arg0, arg1, 0, 0],
             _ => continue,
         };
-        write_volatile(
-            (shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-            PASSIVE_LEVEL,
-        );
+        write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, PASSIVE_LEVEL);
         match dispatch_hosted_component_target(
             instance_index,
             inst,
@@ -19476,7 +19968,15 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 return Err(status);
             }
             Err(HostedComponentDispatchError::Wall(pr)) => {
-                trace_hosted_work_queue_wall(instance_index, kind, work_item, routine, arg0, arg1, pr);
+                trace_hosted_work_queue_wall(
+                    instance_index,
+                    kind,
+                    work_item,
+                    routine,
+                    arg0,
+                    arg1,
+                    pr,
+                );
                 write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                 return Err(STATUS_UNSUCCESSFUL);
             }
@@ -19501,7 +20001,11 @@ unsafe fn provider_callback_marshal_window(
 ) -> Result<(u64, u64), i32> {
     let cell_base = provider_marshal_align8(payload_bytes).ok_or(STATUS_INVALID_PARAMETER)?;
     let used = cell_base
-        .checked_add(trailing_cells.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?)
+        .checked_add(
+            trailing_cells
+                .checked_mul(8)
+                .ok_or(STATUS_INVALID_PARAMETER)?,
+        )
         .ok_or(STATUS_INVALID_PARAMETER)?;
     if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
@@ -19632,8 +20136,7 @@ unsafe fn service_ndis_query_set_callback(
         FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
     };
     let dependent_info_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_bytes0_component =
-        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
+    let dependent_bytes0_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
     let dependent_bytes1_component = dependent_bytes0_component + 8;
     let dependent_bytes0_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
     let dependent_bytes1_exec = dependent_bytes0_exec + 8;
@@ -19715,7 +20218,12 @@ unsafe fn service_ndis_isr_callback(
         record,
         dependent_inst,
         exec_code_va,
-        [dependent_recognized_component, dependent_queue_component, arg2, 0],
+        [
+            dependent_recognized_component,
+            dependent_queue_component,
+            arg2,
+            0,
+        ],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
     )?;
     copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
@@ -19757,13 +20265,11 @@ unsafe fn provider_callback_packet_shadow(
     record: HostedProviderCallbackRecord,
     provider_packet: u64,
 ) -> Result<HostedProviderNdisPacketShadow, i32> {
-    let Some((_index, shadow)) =
-        find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
-            provider_instance,
-            record.dependent_instance,
-            provider_packet,
-        )
-    else {
+    let Some((_index, shadow)) = find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
+        provider_instance,
+        record.dependent_instance,
+        provider_packet,
+    ) else {
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -19801,13 +20307,11 @@ unsafe fn service_ndis_send_callback(
         [arg0, shadow.dependent_component_va, arg2, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
     )?;
-    let Some((_index, refreshed)) =
-        find_hosted_provider_ndis_packet_shadow_by_dependent(
-            provider_instance,
-            record.dependent_instance,
-            shadow.dependent_component_va,
-        )
-    else {
+    let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
+        provider_instance,
+        record.dependent_instance,
+        shadow.dependent_component_va,
+    ) else {
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -19844,13 +20348,9 @@ unsafe fn service_ndis_send_packets_callback(
     }
     let bytes = count.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?;
     provider_callback_marshal_window(bytes, 0)?;
-    let provider_array_exec = component_to_exec_va_for_instance(
-        provider_instance,
-        provider_inst,
-        arg1,
-        bytes,
-    )
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    let provider_array_exec =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, bytes)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
     let dependent_shared = dependent_inst.exec_shared_va;
     let dependent_array_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
     let dependent_array_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
@@ -20030,9 +20530,12 @@ unsafe fn provider_callback_unicode_string_length(
     provider_inst: DriverInstance,
     provider_desc_component: u64,
 ) -> Result<u64, i32> {
-    let Some(provider_desc_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_desc_component, 16)
-    else {
+    let Some(provider_desc_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_desc_component,
+        16,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let length = read_unaligned(provider_desc_exec as *const u16) as u64;
@@ -20067,9 +20570,12 @@ unsafe fn provider_callback_copy_unicode_string(
     dependent_buffer_component: u64,
     dependent_buffer_exec: u64,
 ) -> Result<(), i32> {
-    let Some(provider_desc_exec) =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_desc_component, 16)
-    else {
+    let Some(provider_desc_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_desc_component,
+        16,
+    ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let length = read_unaligned(provider_desc_exec as *const u16) as u64;
@@ -20090,7 +20596,10 @@ unsafe fn provider_callback_copy_unicode_string(
         dependent_buffer_component
     };
     write_unaligned(dependent_desc_exec as *mut u16, length as u16);
-    write_unaligned((dependent_desc_exec + 2) as *mut u16, length.saturating_add(2) as u16);
+    write_unaligned(
+        (dependent_desc_exec + 2) as *mut u16,
+        length.saturating_add(2) as u16,
+    );
     write_unaligned((dependent_desc_exec + 8) as *mut u64, dependent_buffer);
     Ok(())
 }
@@ -20107,7 +20616,8 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
     arg3: u64,
     provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
 ) -> Result<u64, i32> {
-    let device_len = provider_callback_unicode_string_length(provider_instance, provider_inst, arg2)?;
+    let device_len =
+        provider_callback_unicode_string_length(provider_instance, provider_inst, arg2)?;
     let registry_len =
         provider_callback_unicode_string_length(provider_instance, provider_inst, arg3)?;
     let device_buffer_bytes = provider_callback_unicode_string_buffer_bytes(device_len)?;
@@ -20185,8 +20695,8 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
     .ok_or(STATUS_INVALID_PARAMETER)?;
     let provider_buffer = read_unaligned((provider_event_exec + 8) as *const u64);
     let provider_buffer_len = read_unaligned((provider_event_exec + 16) as *const u32) as u64;
-    let buffer_off = provider_marshal_align8(NDIS_NET_PNP_EVENT_LEN_X64)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let buffer_off =
+        provider_marshal_align8(NDIS_NET_PNP_EVENT_LEN_X64).ok_or(STATUS_INVALID_PARAMETER)?;
     let used = provider_marshal_align8(buffer_off + provider_buffer_len)
         .ok_or(STATUS_INVALID_PARAMETER)?;
     if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
@@ -20487,13 +20997,11 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
         [arg0, shadow.dependent_component_va, 0, 0],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
     )?;
-    let Some((_index, refreshed)) =
-        find_hosted_provider_ndis_packet_shadow_by_dependent(
-            provider_instance,
-            record.dependent_instance,
-            shadow.dependent_component_va,
-        )
-    else {
+    let Some((_index, refreshed)) = find_hosted_provider_ndis_packet_shadow_by_dependent(
+        provider_instance,
+        record.dependent_instance,
+        shadow.dependent_component_va,
+    ) else {
         HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -20516,9 +21024,7 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     arg2: u64,
 ) -> u64 {
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let arg3 = read_volatile(
-        (provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64,
-    );
+    let arg3 = read_volatile((provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
     let mut provider_stack = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     let mut stack_index = 0usize;
     while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
@@ -20528,7 +21034,8 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         );
         stack_index += 1;
     }
-    let Some((provider_instance, provider_inst)) = instance_by_shared_va(provider_channel.shared_va)
+    let Some((provider_instance, provider_inst)) =
+        instance_by_shared_va(provider_channel.shared_va)
     else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
@@ -20561,7 +21068,8 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     let dependent_shared = dependent_inst.exec_shared_va;
     let saved_dependent_irql =
         read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
-    let callback_irql = read_volatile((provider_channel.shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
+    let callback_irql =
+        read_volatile((provider_channel.shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
     write_volatile(
         (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
         callback_irql,
@@ -20586,18 +21094,20 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         } else {
             match record.callback_kind {
                 HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
-                    NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => service_ndis_initialize_callback(
-                        provider_instance,
-                        provider_inst,
-                        record,
-                        dependent_inst,
-                        exec_code_va,
-                        arg0,
-                        arg1,
-                        arg2,
-                        arg3,
-                        provider_stack,
-                    ),
+                    NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_initialize_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                        )
+                    }
                     NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => {
                         service_ndis_query_set_callback(
                             provider_instance,
@@ -20774,18 +21284,20 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                             arg3,
                         )
                     }
-                    NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => service_ndis_protocol_receive_callback(
-                        provider_instance,
-                        provider_inst,
-                        record,
-                        dependent_inst,
-                        exec_code_va,
-                        arg0,
-                        arg1,
-                        arg2,
-                        arg3,
-                        provider_stack,
-                    ),
+                    NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_receive_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                            provider_stack,
+                        )
+                    }
                     NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_complete_callback(
                             record,
@@ -20794,17 +21306,19 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                             arg0,
                         )
                     }
-                    NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => service_ndis_protocol_status_callback(
-                        provider_instance,
-                        provider_inst,
-                        record,
-                        dependent_inst,
-                        exec_code_va,
-                        arg0,
-                        arg1,
-                        arg2,
-                        arg3,
-                    ),
+                    NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => {
+                        service_ndis_protocol_status_callback(
+                            provider_instance,
+                            provider_inst,
+                            record,
+                            dependent_inst,
+                            exec_code_va,
+                            arg0,
+                            arg1,
+                            arg2,
+                            arg3,
+                        )
+                    }
                     NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_status_complete_callback(
                             record,
@@ -20869,9 +21383,7 @@ unsafe fn add_provider_domain_if_callable(
         print_str(b"\n");
         return None;
     }
-    match classify_hosted_provider_domain(Some(hosted_provider_domain_descriptor(
-        singleton,
-    ))) {
+    match classify_hosted_provider_domain(Some(hosted_provider_domain_descriptor(singleton))) {
         Ok(HostedProviderDomainStatus::Callable(_binding)) => {}
         Ok(HostedProviderDomainStatus::Absent | HostedProviderDomainStatus::MetadataOnly) => {
             return Some(false)
@@ -20935,13 +21447,22 @@ fn register_fsd_trampolines() {
     // SAFETY: single-threaded executive; the registry is only touched here + in fsd_export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(FSD_EXPORTS) };
     // pool (ExAllocatePool* → the FSD arena)
-    reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_tag as *const () as usize as u64);
+    reg.bind(
+        "ExAllocatePoolWithTag",
+        s_ex_alloc_pool_tag as *const () as usize as u64,
+    );
     reg.bind(
         "ExAllocatePoolWithQuotaTag",
         s_ex_alloc_pool_quota_tag as *const () as usize as u64,
     );
-    reg.bind("ExAllocatePool", s_ex_alloc_pool as *const () as usize as u64);
-    reg.bind("ExFreePoolWithTag", s_ex_free_pool_tag as *const () as usize as u64);
+    reg.bind(
+        "ExAllocatePool",
+        s_ex_alloc_pool as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExFreePoolWithTag",
+        s_ex_free_pool_tag as *const () as usize as u64,
+    );
     reg.bind("ExFreePool", s_ex_free_pool as *const () as usize as u64);
     // Rtl string init
     reg.bind(
@@ -20992,7 +21513,10 @@ fn register_fsd_trampolines() {
         "RtlUnicodeStringToAnsiString",
         s_rtl_unicode_string_to_ansi_string as *const () as usize as u64,
     );
-    reg.bind("RtlFreeAnsiString", s_rtl_free_ansi_string as *const () as usize as u64);
+    reg.bind(
+        "RtlFreeAnsiString",
+        s_rtl_free_ansi_string as *const () as usize as u64,
+    );
     reg.bind(
         "RtlCreateUnicodeString",
         s_rtl_create_unicode_string as *const () as usize as u64,
@@ -21005,14 +21529,23 @@ fn register_fsd_trampolines() {
         "RtlEqualUnicodeString",
         s_rtl_equal_unicode_string as *const () as usize as u64,
     );
-    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as *const () as usize as u64);
-    reg.bind("RtlInitString", s_rtl_init_ansi_string as *const () as usize as u64);
+    reg.bind(
+        "RtlInitAnsiString",
+        s_rtl_init_ansi_string as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlInitString",
+        s_rtl_init_ansi_string as *const () as usize as u64,
+    );
     reg.bind(
         "RtlQueryRegistryValues",
         s_rtl_query_registry_values as *const () as usize as u64,
     );
     // Io device/registration (control DEVICE_OBJECT + FS registration)
-    reg.bind("IoCreateDevice", s_io_create_device as *const () as usize as u64);
+    reg.bind(
+        "IoCreateDevice",
+        s_io_create_device as *const () as usize as u64,
+    );
     reg.bind(
         "IoDeleteDevice",
         s_io_delete_device as *const () as usize as u64,
@@ -21276,7 +21809,10 @@ fn register_fsd_trampolines() {
         "IoRegisterFileSystem",
         s_io_register_file_system as *const () as usize as u64,
     );
-    reg.bind("IoCompleteRequest", s_io_complete_request as *const () as usize as u64);
+    reg.bind(
+        "IoCompleteRequest",
+        s_io_complete_request as *const () as usize as u64,
+    );
     // npfs.sys's PE actually imports the fastcall alias `IofCompleteRequest` (the `IoCompleteRequest`
     // macro compiles to it). On x64 there is ONE calling convention, so `Irp`/`PriorityBoost` still
     // arrive in RCX/RDX — the same `extern "win64"` trampoline serves both. Without THIS binding the
@@ -21284,7 +21820,10 @@ fn register_fsd_trampolines() {
     // npfs's `NpCompleteDeferredIrps` "completed" the read IRP into a no-op, so the executive never
     // learned the read finished (never stashed the delivered bytes), and the re-drive fresh read hit
     // the drained queue and returned uninitialized pool (`d0 16 d0 16 …`). BATCH 38 root cause.
-    reg.bind("IofCompleteRequest", s_io_complete_request as *const () as usize as u64);
+    reg.bind(
+        "IofCompleteRequest",
+        s_io_complete_request as *const () as usize as u64,
+    );
     // Rtl Unicode prefix table (nt_kernel_exec::np_prefix) — the VCB name→FCB map
     reg.bind(
         "RtlInitializeUnicodePrefix",
@@ -21327,7 +21866,10 @@ fn register_fsd_trampolines() {
         "ExAcquireSharedWaitForExclusive",
         s_acquire_resource as *const () as usize as u64,
     );
-    reg.bind("ExReleaseResourceLite", s_release_resource as *const () as usize as u64);
+    reg.bind(
+        "ExReleaseResourceLite",
+        s_release_resource as *const () as usize as u64,
+    );
     reg.bind(
         "ExReleaseResourceForThreadLite",
         s_release_resource as *const () as usize as u64,
@@ -21345,7 +21887,10 @@ fn register_fsd_trampolines() {
         s_ex_is_resource_acquired_exclusive_lite as *const () as usize as u64,
     );
     reg.bind("ExDeleteResourceLite", s_zero as *const () as usize as u64);
-    reg.bind("ExQueryDepthSList", s_ex_query_depth_slist as *const () as usize as u64);
+    reg.bind(
+        "ExQueryDepthSList",
+        s_ex_query_depth_slist as *const () as usize as u64,
+    );
     reg.bind(
         "ExInitializePagedLookasideList",
         s_ex_initialize_paged_lookaside_list as *const () as usize as u64,
@@ -21361,9 +21906,15 @@ fn register_fsd_trampolines() {
     // The driver's OWN consistency bugchecks (npfs' `NpBugCheck`) — caught + reported + unwound,
     // never skipped. Previously an unresolved import resolved to a generic success no-op.
     if crate::KEBUGCHECK_BOUND {
-        reg.bind("KeBugCheckEx", s_ke_bug_check_ex as *const () as usize as u64);
+        reg.bind(
+            "KeBugCheckEx",
+            s_ke_bug_check_ex as *const () as usize as u64,
+        );
     }
-    reg.bind("__C_specific_handler", s_c_specific_handler as *const () as usize as u64);
+    reg.bind(
+        "__C_specific_handler",
+        s_c_specific_handler as *const () as usize as u64,
+    );
     // CRT / Rtl mem intrinsics (REAL — silent corruption otherwise)
     reg.bind("memcpy", s_memcpy as *const () as usize as u64);
     reg.bind("memmove", s_memmove as *const () as usize as u64);
@@ -21371,7 +21922,10 @@ fn register_fsd_trampolines() {
     reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
     reg.bind("memset", s_memset as *const () as usize as u64);
     reg.bind("RtlFillMemory", s_memset as *const () as usize as u64);
-    reg.bind("RtlCompareMemory", s_rtl_compare_memory as *const () as usize as u64);
+    reg.bind(
+        "RtlCompareMemory",
+        s_rtl_compare_memory as *const () as usize as u64,
+    );
     reg.bind("strlen", s_strlen as *const () as usize as u64);
     reg.bind("strcpy", s_strcpy as *const () as usize as u64);
     reg.bind("sprintf", s_sprintf as *const () as usize as u64);
@@ -21387,9 +21941,18 @@ fn register_fsd_trampolines() {
         "RtlInitializeBitMap",
         s_rtl_initialize_bitmap as *const () as usize as u64,
     );
-    reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as *const () as usize as u64);
-    reg.bind("RtlSetAllBits", s_rtl_set_all_bits as *const () as usize as u64);
-    reg.bind("RtlFindClearBits", s_rtl_find_clear_bits as *const () as usize as u64);
+    reg.bind(
+        "RtlClearAllBits",
+        s_rtl_clear_all_bits as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlSetAllBits",
+        s_rtl_set_all_bits as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlFindClearBits",
+        s_rtl_find_clear_bits as *const () as usize as u64,
+    );
     reg.bind(
         "RtlFindClearBitsAndSet",
         s_rtl_find_clear_bits_and_set as *const () as usize as u64,
@@ -21402,20 +21965,44 @@ fn register_fsd_trampolines() {
     reg.bind("RtlSetBit", s_rtl_set_bit as *const () as usize as u64);
     reg.bind("RtlClearBit", s_rtl_clear_bit as *const () as usize as u64);
     reg.bind("RtlSetBits", s_rtl_set_bits as *const () as usize as u64);
-    reg.bind("RtlClearBits", s_rtl_clear_bits as *const () as usize as u64);
-    reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as *const () as usize as u64);
+    reg.bind(
+        "RtlClearBits",
+        s_rtl_clear_bits as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlAreBitsClear",
+        s_rtl_are_bits_clear as *const () as usize as u64,
+    );
     reg.bind(
         "RtlCompareMemoryUlong",
         s_rtl_compare_memory as *const () as usize as u64,
     );
-    reg.bind("RtlCompareString", s_rtl_compare_string as *const () as usize as u64);
-    reg.bind("RtlUpcaseUnicodeChar", s_rtl_upcase_char as *const () as usize as u64);
+    reg.bind(
+        "RtlCompareString",
+        s_rtl_compare_string as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlUpcaseUnicodeChar",
+        s_rtl_upcase_char as *const () as usize as u64,
+    );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);
-    reg.bind("ZwEnumerateKey", s_zw_enumerate_key as *const () as usize as u64);
-    reg.bind("ZwQueryValueKey", s_zw_query_value_key as *const () as usize as u64);
-    reg.bind("ZwSetValueKey", s_zw_set_value_key as *const () as usize as u64);
-    reg.bind("ZwCreateFile", s_zw_create_file as *const () as usize as u64);
+    reg.bind(
+        "ZwEnumerateKey",
+        s_zw_enumerate_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwQueryValueKey",
+        s_zw_query_value_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwSetValueKey",
+        s_zw_set_value_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwCreateFile",
+        s_zw_create_file as *const () as usize as u64,
+    );
     reg.bind(
         "ZwQueryInformationFile",
         s_zw_query_information_file as *const () as usize as u64,
@@ -21449,7 +22036,10 @@ fn register_fsd_trampolines() {
         "ExpInterlockedPopEntrySList",
         s_exp_interlocked_pop_entry_slist as *const () as usize as u64,
     );
-    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as *const () as usize as u64);
+    reg.bind(
+        "ExQueueWorkItem",
+        s_ex_queue_work_item as *const () as usize as u64,
+    );
     // small-struct init (spinlock/event/timer/dpc/mutex/semaphore/ERESOURCE init)
     reg.bind(
         "ExInitializeResourceLite",
@@ -21512,16 +22102,31 @@ fn register_fsd_trampolines() {
         "KeWaitForMultipleObjects",
         s_ke_wait_for_multiple_objects as *const () as usize as u64,
     );
-    reg.bind("KeInitializeTimer", s_ke_initialize_timer as *const () as usize as u64);
-    reg.bind("KeInitializeTimerEx", s_ke_initialize_timer_ex as *const () as usize as u64);
-    reg.bind("KeCancelTimer", s_ke_cancel_timer as *const () as usize as u64);
+    reg.bind(
+        "KeInitializeTimer",
+        s_ke_initialize_timer as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInitializeTimerEx",
+        s_ke_initialize_timer_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeCancelTimer",
+        s_ke_cancel_timer as *const () as usize as u64,
+    );
     reg.bind("KeSetTimer", s_ke_set_timer as *const () as usize as u64);
-    reg.bind("KeSetTimerEx", s_ke_set_timer_ex as *const () as usize as u64);
+    reg.bind(
+        "KeSetTimerEx",
+        s_ke_set_timer_ex as *const () as usize as u64,
+    );
     reg.bind(
         "KeDelayExecutionThread",
         s_ke_delay_execution_thread as *const () as usize as u64,
     );
-    reg.bind("KeQuerySystemTime", s_ke_query_system_time as *const () as usize as u64);
+    reg.bind(
+        "KeQuerySystemTime",
+        s_ke_query_system_time as *const () as usize as u64,
+    );
     reg.bind(
         "KeStallExecutionProcessor",
         s_ke_stall_execution_processor as *const () as usize as u64,
@@ -21558,9 +22163,18 @@ fn register_fsd_trampolines() {
         "KeNumberProcessors",
         core::ptr::addr_of!(KE_NUMBER_PROCESSORS_VALUE) as usize as u64,
     );
-    reg.bind("ExInitializeFastMutex", s_init_small_struct as *const () as usize as u64);
-    reg.bind("KeInitializeMutex", s_init_small_struct as *const () as usize as u64);
-    reg.bind("KeReleaseMutex", s_ke_release_mutex as *const () as usize as u64);
+    reg.bind(
+        "ExInitializeFastMutex",
+        s_init_small_struct as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeInitializeMutex",
+        s_init_small_struct as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeReleaseMutex",
+        s_ke_release_mutex as *const () as usize as u64,
+    );
     reg.bind(
         "KeInitializeSemaphore",
         s_ke_initialize_semaphore as *const () as usize as u64,
@@ -21573,8 +22187,14 @@ fn register_fsd_trampolines() {
         "KeReleaseSemaphore",
         s_ke_release_semaphore as *const () as usize as u64,
     );
-    reg.bind("ProbeForRead", s_probe_for_read as *const () as usize as u64);
-    reg.bind("ProbeForWrite", s_probe_for_write as *const () as usize as u64);
+    reg.bind(
+        "ProbeForRead",
+        s_probe_for_read as *const () as usize as u64,
+    );
+    reg.bind(
+        "ProbeForWrite",
+        s_probe_for_write as *const () as usize as u64,
+    );
     // Se / Ob security helpers
     reg.bind(
         "IoGetFileObjectGenericMapping",
@@ -21584,8 +22204,14 @@ fn register_fsd_trampolines() {
         "RtlCreateSecurityDescriptor",
         s_rtl_create_security_descriptor as *const () as usize as u64,
     );
-    reg.bind("RtlLengthSid", s_rtl_length_sid as *const () as usize as u64);
-    reg.bind("RtlCreateAcl", s_rtl_create_acl as *const () as usize as u64);
+    reg.bind(
+        "RtlLengthSid",
+        s_rtl_length_sid as *const () as usize as u64,
+    );
+    reg.bind(
+        "RtlCreateAcl",
+        s_rtl_create_acl as *const () as usize as u64,
+    );
     reg.bind(
         "RtlAddAccessAllowedAce",
         s_rtl_add_access_allowed_ace as *const () as usize as u64,
@@ -21610,8 +22236,14 @@ fn register_fsd_trampolines() {
         "RtlAbsoluteToSelfRelativeSD",
         s_rtl_absolute_to_self_relative_sd as *const () as usize as u64,
     );
-    reg.bind("SeAssignSecurity", s_se_assign_security as *const () as usize as u64);
-    reg.bind("SeAccessCheck", s_se_access_check as *const () as usize as u64);
+    reg.bind(
+        "SeAssignSecurity",
+        s_se_assign_security as *const () as usize as u64,
+    );
+    reg.bind(
+        "SeAccessCheck",
+        s_se_access_check as *const () as usize as u64,
+    );
     reg.bind(
         "SeLockSubjectContext",
         s_se_lock_subject_context as *const () as usize as u64,
@@ -21624,8 +22256,14 @@ fn register_fsd_trampolines() {
         "SeOpenObjectAuditAlarm",
         s_se_open_object_audit_alarm as *const () as usize as u64,
     );
-    reg.bind("SeAppendPrivileges", s_se_append_privileges as *const () as usize as u64);
-    reg.bind("SeFreePrivileges", s_se_free_privileges as *const () as usize as u64);
+    reg.bind(
+        "SeAppendPrivileges",
+        s_se_append_privileges as *const () as usize as u64,
+    );
+    reg.bind(
+        "SeFreePrivileges",
+        s_se_free_privileges as *const () as usize as u64,
+    );
     reg.bind("SeTokenType", s_se_token_type as *const () as usize as u64);
     reg.bind(
         "SeCreateClientSecurity",
@@ -21643,7 +22281,10 @@ fn register_fsd_trampolines() {
         "SeSetSecurityDescriptorInfo",
         s_se_set_security_descriptor_info as *const () as usize as u64,
     );
-    reg.bind("ObLogSecurityDescriptor", s_ob_log_sd as *const () as usize as u64);
+    reg.bind(
+        "ObLogSecurityDescriptor",
+        s_ob_log_sd as *const () as usize as u64,
+    );
     reg.bind(
         "ObDereferenceSecurityDescriptor",
         s_ob_dereference_security_descriptor as *const () as usize as u64,
@@ -21660,18 +22301,27 @@ fn register_fsd_trampolines() {
         "ObSetSecurityObjectByPointer",
         s_ob_set_security_object_by_pointer as *const () as usize as u64,
     );
-    reg.bind("ObfReferenceObject", s_obf_reference_object as *const () as usize as u64);
+    reg.bind(
+        "ObfReferenceObject",
+        s_obf_reference_object as *const () as usize as u64,
+    );
     reg.bind(
         "ObfDereferenceObject",
         s_obf_dereference_object as *const () as usize as u64,
     );
     // Ps/Io current-object identity
-    reg.bind("PsGetCurrentProcess", s_current_process as *const () as usize as u64);
+    reg.bind(
+        "PsGetCurrentProcess",
+        s_current_process as *const () as usize as u64,
+    );
     reg.bind(
         "PsGetCurrentProcessId",
         s_ps_get_current_process_id as *const () as usize as u64,
     );
-    reg.bind("PsGetCurrentThread", s_current_process as *const () as usize as u64);
+    reg.bind(
+        "PsGetCurrentThread",
+        s_current_process as *const () as usize as u64,
+    );
     reg.bind(
         "PsGetCurrentThreadTeb",
         s_ps_get_current_thread_teb as *const () as usize as u64,
@@ -21684,15 +22334,27 @@ fn register_fsd_trampolines() {
         "PsTerminateSystemThread",
         s_ps_terminate_system_thread as *const () as usize as u64,
     );
-    reg.bind("KeGetCurrentThread", s_current_process as *const () as usize as u64);
-    reg.bind("IoGetRequestorProcess", s_current_process as *const () as usize as u64);
-    reg.bind("IoThreadToProcess", s_current_process as *const () as usize as u64);
+    reg.bind(
+        "KeGetCurrentThread",
+        s_current_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoGetRequestorProcess",
+        s_current_process as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoThreadToProcess",
+        s_current_process as *const () as usize as u64,
+    );
     reg.bind(
         "IoGetCurrentProcess",
         s_io_get_current_process as *const () as usize as u64,
     );
     // Debug print forwarders
-    reg.bind("vDbgPrintExWithPrefix", s_dbg_print as *const () as usize as u64);
+    reg.bind(
+        "vDbgPrintExWithPrefix",
+        s_dbg_print as *const () as usize as u64,
+    );
     reg.bind("vDbgPrintEx", s_dbg_print as *const () as usize as u64);
     reg.bind("DbgPrint", s_dbg_print as *const () as usize as u64);
     reg.bind("DbgPrintEx", s_dbg_print as *const () as usize as u64);
@@ -21716,7 +22378,10 @@ fn register_fsd_trampolines() {
         "HalGetInterruptVector",
         s_hal_get_interrupt_vector as *const () as usize as u64,
     );
-    reg.bind("HalGetBusData", s_hal_get_bus_data as *const () as usize as u64);
+    reg.bind(
+        "HalGetBusData",
+        s_hal_get_bus_data as *const () as usize as u64,
+    );
     reg.bind(
         "HalGetBusDataByOffset",
         s_hal_get_bus_data_by_offset as *const () as usize as u64,
@@ -21767,9 +22432,7 @@ fn lookup_videoprt_export(name: &str) -> Option<u64> {
         "VideoPortVerifyAccessRanges" => {
             Some(s_video_port_verify_access_ranges as *const () as usize as u64)
         }
-        "VideoPortGetDeviceBase" => {
-            Some(s_video_port_get_device_base as *const () as usize as u64)
-        }
+        "VideoPortGetDeviceBase" => Some(s_video_port_get_device_base as *const () as usize as u64),
         "VideoPortMapMemory" => Some(s_video_port_map_memory as *const () as usize as u64),
         "VideoPortUnmapMemory" => Some(s_video_port_unmap_memory as *const () as usize as u64),
         "VideoPortReadPortUshort" => {
@@ -21964,7 +22627,10 @@ struct HostedProviderImportResolver<'a> {
 }
 
 impl DriverImportResolver for HostedProviderImportResolver<'_> {
-    fn resolve_import(&mut self, request: DriverImportRequest<'_>) -> Option<DriverImportResolution> {
+    fn resolve_import(
+        &mut self,
+        request: DriverImportRequest<'_>,
+    ) -> Option<DriverImportResolution> {
         let _ = request.iat_slot_rva;
         if hosted_dependency_provider_dll(request.dll) {
             unsafe {
@@ -22068,7 +22734,10 @@ unsafe fn component_dispatch_video_add_device(drv: u64) -> (i32, u64) {
     let name_len = unit_count * 2;
     let mut unicode = [0u8; 16];
     write_unaligned(unicode.as_mut_ptr() as *mut u16, name_len as u16);
-    write_unaligned((unicode.as_mut_ptr() as u64 + 2) as *mut u16, name_len as u16);
+    write_unaligned(
+        (unicode.as_mut_ptr() as u64 + 2) as *mut u16,
+        name_len as u16,
+    );
     write_unaligned(
         (unicode.as_mut_ptr() as u64 + 8) as *mut u64,
         name_units.as_mut_ptr() as u64,
@@ -22111,8 +22780,7 @@ unsafe fn component_dispatch_video_initialize() -> (i32, u64) {
     };
     let init: extern "win64" fn(u64) -> u8 = core::mem::transmute(initialize as *const ());
     let ok = init(hw_extension);
-    let calls =
-        read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
+    let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
     write_volatile(
         (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
         calls.saturating_add(1),
@@ -22133,7 +22801,10 @@ unsafe fn component_dispatch_video_win32k_callbacks(inlen: u64, outlen: u64) -> 
         return (0xC000_000Du32 as i32, 0); // STATUS_INVALID_PARAMETER
     }
     if outlen < VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64 {
-        return (STATUS_BUFFER_TOO_SMALL, VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64);
+        return (
+            STATUS_BUFFER_TOO_SMALL,
+            VIDEO_WIN32K_CALLBACKS_SIZE_X64 as u64,
+        );
     }
     let phys_disp = read_unaligned(FSD_ARG_VADDR as *const u64);
     let callout = read_unaligned((FSD_ARG_VADDR + 8) as *const u64);
@@ -22474,9 +23145,8 @@ unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
         let find_adapter =
             read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_FIND_ADAPTER) as *const u64);
         let hw_context = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_CONTEXT) as *const u64);
-        let extension_size = read_volatile(
-            (FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION_SIZE) as *const u32,
-        );
+        let extension_size =
+            read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_DEVICE_EXTENSION_SIZE) as *const u32);
         if find_adapter == 0
             || extension_size == 0
             || read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64)
@@ -22588,6 +23258,8 @@ pub(crate) unsafe fn call_on4(
         "push r14",
         "push r15",
         "mov r15, rax",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
         "syscall",
         "mov rax, r15",
         "pop r15",
@@ -23425,6 +24097,13 @@ pub(crate) struct DriverComponent {
     /// Number of component image frames mapped at [`FSD_CODE_VA`] for this driver and its support
     /// provider images.
     pub image_frames: u64,
+    pub image_frame_base: u64,
+    pub pool_frame_base: u64,
+    pub data_frame_base: u64,
+    pub shared_frame_base: u64,
+    pub arg_frame_base: u64,
+    pub stack_frame_base: u64,
+    pub stack_frame_count: u64,
     /// Executive-side base of the executable thunk arena appended to this hosted image, if any.
     pub exec_thunk_va: u64,
     /// Component-side base of the executable thunk arena appended to this hosted image, if any.
@@ -23443,6 +24122,12 @@ pub(crate) struct DriverComponent {
     pub tcb: u64,
     /// The component host's CNode — dynamic PnP grants install hardware caps here.
     pub cnode: u64,
+    /// The unguarded root cap for the component CNode object.
+    pub raw_cnode: u64,
+    /// The scheduling context bound to the component TCB.
+    pub sched_context: u64,
+    /// Child-CNode bank that owns this component's mapped frame and paging caps.
+    pub map_cap_bank: crate::spawn_hosts::ComponentMapCapBank,
     /// The DEDICATED MCS reply object backing this component's `Call` dispatch transport.
     pub reply_cap: u64,
 }
@@ -23740,14 +24425,8 @@ unsafe fn collect_hosted_dependency_closure(
     }
     let mut idx = 0usize;
     while idx < nested.len() {
-        if collect_hosted_dependency_closure(
-            fs,
-            nested[idx],
-            visiting,
-            provider_domains,
-            plan,
-        )
-        .is_none()
+        if collect_hosted_dependency_closure(fs, nested[idx], visiting, provider_domains, plan)
+            .is_none()
         {
             let _ = visiting.pop();
             return None;
@@ -23844,10 +24523,10 @@ unsafe fn plan_hosted_images(
     private_lens.try_reserve_exact(dependencies.len()).ok()?;
     let mut idx = 0usize;
     while idx < dependencies.len() {
-        private_lens.push(raw_pe_size_of_image(
-            dependencies[idx].src_va,
-            dependencies[idx].src_size,
-        )? as u64);
+        private_lens
+            .push(
+                raw_pe_size_of_image(dependencies[idx].src_va, dependencies[idx].src_size)? as u64,
+            );
         idx += 1;
     }
     let layout = match plan_hosted_driver_image(
@@ -24622,12 +25301,13 @@ unsafe fn load_driver_reserved(
         image_frame_caps_vec.push(0);
         rights_vec.push(RW_NX);
     }
+    let image_frame_base = alloc_driver_frame_run(instance, b"image", img_frames)?;
     let mut i = 0u64;
     while i < img_frames {
         if image_frame_caps_vec[i as usize] == 0 {
-            image_frame_caps_vec[i as usize] = alloc_frame();
+            image_frame_caps_vec[i as usize] = image_frame_base + i;
         }
-        let cap = copy_cap(image_frame_caps_vec[i as usize]);
+        let cap = copy_driver_cap(instance, b"exec-image", image_frame_caps_vec[i as usize])?;
         map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
         i += 1;
     }
@@ -24659,10 +25339,7 @@ unsafe fn load_driver_reserved(
     }
     let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
     let rights = Box::leak(rights_vec.into_boxed_slice());
-    let pool_base = alloc_frame();
-    for _ in 1..FSD_POOL_FRAMES {
-        let _ = alloc_frame();
-    }
+    let pool_base = alloc_driver_frame_run(instance, b"pool", FSD_POOL_FRAMES)?;
     let pool_pts = pts_for(FSD_POOL_FRAMES);
     let mut pool_pt_index = 0u64;
     while pool_pt_index < pool_pts {
@@ -24672,35 +25349,26 @@ unsafe fn load_driver_reserved(
         pool_pt_index += 1;
     }
     for i in 0..FSD_POOL_FRAMES {
-        let cap = copy_cap(pool_base + i);
+        let cap = copy_driver_cap(instance, b"exec-pool", pool_base + i)?;
         map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)?;
     }
     // DATA + SHARED + ARG: caps + an aux PT in the executive VSpace.
-    let data_base = alloc_frame();
-    for _ in 1..FSD_DATA_FRAMES {
-        let _ = alloc_frame();
-    }
-    let shared_base = alloc_frame();
-    for _ in 1..FSD_SHARED_FRAMES {
-        let _ = alloc_frame();
-    }
-    let arg_base = alloc_frame();
-    for _ in 1..FSD_ARG_FRAMES {
-        let _ = alloc_frame();
-    }
+    let data_base = alloc_driver_frame_run(instance, b"data", FSD_DATA_FRAMES)?;
+    let shared_base = alloc_driver_frame_run(instance, b"shared", FSD_SHARED_FRAMES)?;
+    let arg_base = alloc_driver_frame_run(instance, b"arg", FSD_ARG_FRAMES)?;
     let apt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
     map_instance_exec_pt(instance, apt, win.aux_pt_va)?;
     for i in 0..FSD_DATA_FRAMES {
-        let cap = copy_cap(data_base + i);
+        let cap = copy_driver_cap(instance, b"exec-data", data_base + i)?;
         map_instance_exec_frame(instance, cap, win.data_va + i * 0x1000, RW_NX)?;
     }
     for i in 0..FSD_SHARED_FRAMES {
-        let cap = copy_cap(shared_base + i);
+        let cap = copy_driver_cap(instance, b"exec-shared", shared_base + i)?;
         map_instance_exec_frame(instance, cap, win.shared_va + i * 0x1000, RW_NX)?;
     }
     for i in 0..FSD_ARG_FRAMES {
-        let cap = copy_cap(arg_base + i);
+        let cap = copy_driver_cap(instance, b"exec-arg", arg_base + i)?;
         map_instance_exec_frame(instance, cap, win.arg_va + i * 0x1000, RW_NX)?;
     }
     initialize_hosted_driver_data_exports(win.data_va);
@@ -24762,7 +25430,10 @@ unsafe fn load_driver_reserved(
     let primary_entry_rva = planned_images
         .primary_offset
         .checked_add(entry_rva as u64)?;
-    write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, primary_entry_rva);
+    write_volatile(
+        (win.shared_va + SH_ENTRY_RVA) as *mut u64,
+        primary_entry_rva,
+    );
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
     write_volatile(
@@ -24799,11 +25470,18 @@ unsafe fn load_driver_reserved(
                     .map(|writer| writer.next_index())
                     .unwrap_or(0),
             )
-        };
+    };
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
-    let (pml4, tcb, cnode, stack_frame_base) = spawn_fsd_component(
+    print_str(b"[driver-launch] spawn-fsd begin inst=");
+    print_u64(instance as u64);
+    print_str(b" image-frames=");
+    print_u64(img_frames);
+    print_str(b" path=");
+    print_str(path);
+    print_str(b"\n");
+    let sc = spawn_fsd_component(
         image_frame_caps,
         pool_base,
         data_base,
@@ -24813,6 +25491,22 @@ unsafe fn load_driver_reserved(
         img_frames,
         &rights[..img_frames as usize],
     );
+    print_str(b"[driver-launch] spawn-fsd end inst=");
+    print_u64(instance as u64);
+    print_str(b" pml4=0x");
+    print_hex(sc.pml4 as u32);
+    print_str(b" tcb=0x");
+    print_hex(sc.tcb as u32);
+    print_str(b" map-caps=");
+    print_u64(sc.map_cap_bank.count);
+    print_str(b"\n");
+    let pml4 = sc.pml4;
+    let tcb = sc.tcb;
+    let cnode = sc.cnode;
+    let raw_cnode = sc.raw_cnode;
+    let sched_context = sc.sched_context;
+    let map_cap_bank = sc.map_cap_bank;
+    let stack_frame_base = sc.stack_frame_base;
     if unsafe { map_fsd_main_stack_exec_alias(instance, stack_frame_base, win.stack_va) }.is_none()
     {
         print_str(b"[driver-launch] stack alias map failed inst=");
@@ -24839,18 +25533,27 @@ unsafe fn load_driver_reserved(
             exec_stack_va: win.stack_va,
             exec_arg_va: win.arg_va,
             image_frames: img_frames,
+            image_frame_base,
+            pool_frame_base: pool_base,
+            data_frame_base: data_base,
+            shared_frame_base: shared_base,
+            arg_frame_base: arg_base,
+            stack_frame_base,
+            stack_frame_count: sc.stack_frame_count,
             exec_thunk_va,
             run_thunk_va,
             thunk_len,
             thunk_next,
             tcb,
             cnode,
+            raw_cnode,
+            sched_context,
+            map_cap_bank,
             reply_cap,
             used: true,
             ..EMPTY_INSTANCE
         },
     );
-
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
     //    signal (FSD_DISPATCH_LABEL). Faults report addresses in the COMPONENT's VSpace (image runs at
@@ -24863,6 +25566,8 @@ unsafe fn load_driver_reserved(
         code_va: run_va,
         image_frames: img_frames,
         exec_code_va: code_va,
+        root_image_rights: 3,
+        root_image_map_owner: map_cap_bank.owner,
         shared_va: win.shared_va,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 512,
@@ -24993,6 +25698,13 @@ unsafe fn load_driver_reserved(
         exec_stack_va: win.stack_va,
         exec_arg_va: win.arg_va,
         image_frames: img_frames,
+        image_frame_base,
+        pool_frame_base: pool_base,
+        data_frame_base: data_base,
+        shared_frame_base: shared_base,
+        arg_frame_base: arg_base,
+        stack_frame_base,
+        stack_frame_count: sc.stack_frame_count,
         exec_thunk_va,
         run_thunk_va,
         thunk_len,
@@ -25002,6 +25714,9 @@ unsafe fn load_driver_reserved(
         device_id: 0,
         tcb,
         cnode,
+        raw_cnode,
+        sched_context,
+        map_cap_bank,
         reply_cap: active_reply_cap,
     };
     let device_id = match register_io_device(driver_id, &dc) {
@@ -25044,7 +25759,7 @@ unsafe fn spawn_fsd_component(
     fault_ep: u64,
     image_frames: u64,
     rights: &[u64],
-) -> (u64, u64, u64, u64) {
+) -> crate::spawn_hosts::SpawnedComponent {
     // SAFETY: rights is heap-leaked by the loader for the component lifetime.
     let rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(rights);
     let regions = [
@@ -25100,6 +25815,7 @@ unsafe fn spawn_fsd_component(
     let d = ComponentDescriptor {
         entry: fsd_component_entry,
         image_rights: Rights::Uniform(3), // RWX (trampolines live in the shared executive image)
+        lazy_image: true,
         map_heap_pt: false,
         stack_base: FSD_STACK_VADDR,
         stack_frames: FSD_STACK_FRAMES,
@@ -25115,8 +25831,7 @@ unsafe fn spawn_fsd_component(
         gs_base: Some(FSD_KPCR_VA),
         caps: HostCaps::default(),
     };
-    let sc = spawn_component(&d);
-    (sc.pml4, sc.tcb, sc.cnode, sc.stack_frame_base)
+    spawn_component(&d)
 }
 
 const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
@@ -25131,9 +25846,11 @@ struct HostedPagingMapping {
     pml4: u64,
     level: u8,
     base: u64,
+    cap: u64,
 }
 
 static mut HOSTED_PAGING_MAPPINGS: Option<Vec<HostedPagingMapping>> = None;
+static mut HOSTED_RESOURCE_MAP_CAPS: Option<Vec<Vec<u64>>> = None;
 
 unsafe fn hosted_paging_mappings_mut() -> &'static mut Vec<HostedPagingMapping> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS);
@@ -25184,12 +25901,14 @@ unsafe fn ensure_hosted_paging_level(
         print_str(b" label=");
         print_u64(retype);
         print_str(b"\n");
+        recycle_deleted_root_slot(cap);
         return false;
     }
 
     let map = paging_struct_map_r(cap, map_label, base, pml4);
-    if map == SEL4_DELETE_FIRST {
+    let stored_cap = if map == SEL4_DELETE_FIRST {
         let _ = cnode_delete_recycle_r(cap);
+        0
     } else if map != 0 {
         print_str(b"[driver-launch] hosted paging ");
         print_str(name);
@@ -25199,11 +25918,73 @@ unsafe fn ensure_hosted_paging_level(
         print_str(b" label=");
         print_u64(map);
         print_str(b"\n");
+        let _ = cnode_delete_recycle_r(cap);
         return false;
-    }
+    } else {
+        cap
+    };
 
-    mappings.push(HostedPagingMapping { pml4, level, base });
+    mappings.push(HostedPagingMapping {
+        pml4,
+        level,
+        base,
+        cap: stored_cap,
+    });
     true
+}
+
+unsafe fn clear_hosted_paging_for_pml4(pml4: u64) -> u64 {
+    let Some(mappings) = (*core::ptr::addr_of_mut!(HOSTED_PAGING_MAPPINGS)).as_mut() else {
+        return 0;
+    };
+    let mut failures = 0u64;
+    let mut index = mappings.len();
+    while index != 0 {
+        index -= 1;
+        if mappings[index].pml4 == pml4 {
+            let mapping = mappings.remove(index);
+            if mapping.cap != 0 && cnode_delete_recycle_r(mapping.cap) != 0 {
+                failures += 1;
+            }
+        }
+    }
+    failures
+}
+
+unsafe fn hosted_resource_map_caps_mut() -> &'static mut Vec<Vec<u64>> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn record_hosted_resource_map_cap(instance: usize, cap: u64) {
+    if cap == 0 {
+        return;
+    }
+    let caps = hosted_resource_map_caps_mut();
+    while caps.len() <= instance {
+        caps.push(Vec::new());
+    }
+    caps[instance].push(cap);
+}
+
+unsafe fn clear_hosted_resource_map_caps_for_instance(instance: usize) -> u64 {
+    let Some(caps_by_instance) = (*core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS)).as_mut()
+    else {
+        return 0;
+    };
+    let Some(caps) = caps_by_instance.get_mut(instance) else {
+        return 0;
+    };
+    let mut failures = 0u64;
+    for cap in caps.drain(..).rev() {
+        if cap != 0 && cnode_delete_recycle_r(cap) != 0 {
+            failures += 1;
+        }
+    }
+    failures
 }
 
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
@@ -25907,6 +26688,7 @@ struct HostedRootPdoBinding {
 pub(crate) struct HostedHardwareEvidence {
     pub resource_mmio_phys: u64,
     pub resource_mmio_len: u64,
+    pub resource_mmio_map_len: u64,
     pub resource_io_port_len: u64,
     pub resource_io_port_cap: u64,
     pub resource_io_port_component_cap: u64,
@@ -26242,7 +27024,15 @@ unsafe fn revoke_hosted_device_resources(binding: HostedDeviceBinding) -> u64 {
 
 unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64) {
     let removed_io_port_cap = revoke_hosted_device_resources(binding);
-    if let Some((_, inst)) = instance_by_driver_id(binding.driver_id) {
+    if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
+        let failures = clear_hosted_resource_map_caps_for_instance(instance);
+        if failures != 0 {
+            print_str(b"[driver-launch] hosted resource map release failed inst=");
+            print_u64(instance as u64);
+            print_str(b" failures=");
+            print_u64(failures);
+            print_str(b"\n");
+        }
         if inst.cnode != 0 {
             let _ = crate::cnode_delete_in_cnode_r(inst.cnode, crate::CT_IO_PORT);
         }
@@ -26256,6 +27046,7 @@ unsafe fn clear_hosted_resource_projection(binding: HostedDeviceBinding, sh: u64
     }
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_MMIO_MAP_LEN) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
@@ -26496,6 +27287,7 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
         HostedHardwareEvidence {
             resource_mmio_phys: read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64),
             resource_mmio_len: read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64),
+            resource_mmio_map_len: read_volatile((sh + SH_RESOURCE_MMIO_MAP_LEN) as *const u64),
             resource_io_port_len: read_volatile((sh + SH_RESOURCE_IO_PORT_LEN) as *const u64),
             resource_io_port_cap: read_volatile((sh + SH_RESOURCE_IO_PORT_CAP) as *const u64),
             resource_io_port_component_cap: read_volatile(
@@ -26504,9 +27296,7 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             io_port_out32_faults: read_volatile(
                 (sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,
             ),
-            io_port_in16_calls: read_volatile(
-                (sh + SH_RESOURCE_IO_PORT_IN16_CALLS) as *const u64,
-            ),
+            io_port_in16_calls: read_volatile((sh + SH_RESOURCE_IO_PORT_IN16_CALLS) as *const u64),
             io_port_out16_calls: read_volatile(
                 (sh + SH_RESOURCE_IO_PORT_OUT16_CALLS) as *const u64,
             ),
@@ -26596,12 +27386,8 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             video_hw_initialize_calls: read_volatile(
                 (sh + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64,
             ),
-            video_hw_initialize_ok: read_volatile(
-                (sh + SH_VIDEO_HW_INITIALIZE_OK) as *const u8,
-            ),
-            video_hw_start_io_calls: read_volatile(
-                (sh + SH_VIDEO_HW_START_IO_CALLS) as *const u64,
-            ),
+            video_hw_initialize_ok: read_volatile((sh + SH_VIDEO_HW_INITIALIZE_OK) as *const u8),
+            video_hw_start_io_calls: read_volatile((sh + SH_VIDEO_HW_START_IO_CALLS) as *const u64),
             video_registry_set_calls: read_volatile(
                 (sh + SH_VIDEO_REGISTRY_SET_CALLS) as *const u64,
             ),
@@ -26646,9 +27432,7 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
         pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
         io_port_base: read_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *const u64),
-        dma_broker_va: previous_state
-            .map(|state| state.dma_broker_va)
-            .unwrap_or(0),
+        dma_broker_va: previous_state.map(|state| state.dma_broker_va).unwrap_or(0),
         dma_frame_base: previous_state
             .map(|state| state.dma_frame_base)
             .unwrap_or(0),
@@ -26714,8 +27498,18 @@ unsafe fn write_hosted_resource_state_projection(
     reset_dpc_queue: bool,
 ) {
     let evidence = state.evidence;
-    write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, evidence.resource_mmio_phys);
-    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, evidence.resource_mmio_len);
+    write_volatile(
+        (sh + SH_RESOURCE_MMIO_PHYS) as *mut u64,
+        evidence.resource_mmio_phys,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_MMIO_LEN) as *mut u64,
+        evidence.resource_mmio_len,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_MMIO_MAP_LEN) as *mut u64,
+        evidence.resource_mmio_map_len,
+    );
     write_volatile((sh + SH_RESOURCE_MMIO_VA) as *mut u64, state.mmio_va);
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
@@ -26740,7 +27534,10 @@ unsafe fn write_hosted_resource_state_projection(
         state.pci_class_rev,
     );
     write_volatile((sh + SH_RESOURCE_PCI_IRQ) as *mut u32, state.pci_irq);
-    write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, state.io_port_base);
+    write_volatile(
+        (sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64,
+        state.io_port_base,
+    );
     write_volatile(
         (sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64,
         evidence.resource_io_port_len,
@@ -26753,8 +27550,14 @@ unsafe fn write_hosted_resource_state_projection(
         (sh + SH_RESOURCE_IO_PORT_COMPONENT_CAP) as *mut u64,
         evidence.resource_io_port_component_cap,
     );
-    write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, state.video_memory_phys);
-    write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, state.video_memory_len);
+    write_volatile(
+        (sh + SH_VIDEO_MEMORY_PHYS) as *mut u64,
+        state.video_memory_phys,
+    );
+    write_volatile(
+        (sh + SH_VIDEO_MEMORY_LEN) as *mut u64,
+        state.video_memory_len,
+    );
     write_volatile(
         (sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64,
         state.video_memory_caller_va,
@@ -26779,7 +27582,10 @@ unsafe fn write_hosted_resource_state_projection(
         (sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
         evidence.interrupt_context,
     );
-    write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, evidence.interrupt_id);
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+        evidence.interrupt_id,
+    );
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
         evidence.interrupt_delivered_vector,
@@ -26796,17 +27602,35 @@ unsafe fn write_hosted_resource_state_projection(
         clear_dpc_queue_projection(sh);
     }
     write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, evidence.dpc_drops);
-    write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, evidence.dpc_deliveries);
+    write_volatile(
+        (sh + SH_DPC_DELIVERIES) as *mut u64,
+        evidence.dpc_deliveries,
+    );
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, evidence.dma_common_va);
-    write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, evidence.dma_common_len);
+    write_volatile(
+        (sh + SH_DMA_COMMON_LEN) as *mut u64,
+        evidence.dma_common_len,
+    );
     write_volatile(
         (sh + SH_DMA_COMMON_LOGICAL) as *mut u64,
         evidence.dma_common_logical,
     );
-    write_volatile((sh + SH_DMA_ADAPTER_ID) as *mut u64, evidence.dma_adapter_id);
-    write_volatile((sh + SH_DMA_ADAPTER_BLOB) as *mut u64, evidence.dma_adapter_blob);
-    write_volatile((sh + SH_DMA_REQUESTED_LEN) as *mut u64, evidence.dma_requested_len);
-    write_volatile((sh + SH_DMA_ALLOCATED_VA) as *mut u64, evidence.dma_allocated_va);
+    write_volatile(
+        (sh + SH_DMA_ADAPTER_ID) as *mut u64,
+        evidence.dma_adapter_id,
+    );
+    write_volatile(
+        (sh + SH_DMA_ADAPTER_BLOB) as *mut u64,
+        evidence.dma_adapter_blob,
+    );
+    write_volatile(
+        (sh + SH_DMA_REQUESTED_LEN) as *mut u64,
+        evidence.dma_requested_len,
+    );
+    write_volatile(
+        (sh + SH_DMA_ALLOCATED_VA) as *mut u64,
+        evidence.dma_allocated_va,
+    );
     write_volatile(
         (sh + SH_DMA_ALLOCATED_LOGICAL) as *mut u64,
         evidence.dma_allocated_logical,
@@ -26972,7 +27796,11 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     let state = states.iter().copied().find(|state| {
         state.instance == instance
             && state.evidence.resource_io_port_cap != 0
-            && io_port_in_range(port, state.io_port_base, state.evidence.resource_io_port_len)
+            && io_port_in_range(
+                port,
+                state.io_port_base,
+                state.evidence.resource_io_port_len,
+            )
     })?;
     copy_hosted_io_port_cap_to_instance(inst, state).ok()?;
     write_hosted_resource_state_projection(shared_va, state, false);
@@ -27073,7 +27901,9 @@ unsafe fn observe_hosted_dma_packet_descriptors(
             index += 1;
             continue;
         };
-        if logical_offset != va_offset || logical_offset > grant_len || len > grant_len - logical_offset
+        if logical_offset != va_offset
+            || logical_offset > grant_len
+            || len > grant_len - logical_offset
         {
             evidence.failures = evidence.failures.saturating_add(1);
             index += 1;
@@ -27123,9 +27953,9 @@ unsafe fn observe_hosted_dma_packet_descriptors(
                     evidence.completed = evidence
                         .completed
                         .saturating_add(observation.completed_descriptors);
-                    evidence.completed_common_buffers = evidence.completed_common_buffers.saturating_add(
-                        observation.completed_common_buffer_descriptors,
-                    );
+                    evidence.completed_common_buffers = evidence
+                        .completed_common_buffers
+                        .saturating_add(observation.completed_common_buffer_descriptors);
                     evidence.completed_transfer_mappings = evidence
                         .completed_transfer_mappings
                         .saturating_add(observation.completed_transfer_mapping_descriptors);
@@ -27265,9 +28095,7 @@ fn parse_ipv4_ascii_bytes(bytes: &[u8]) -> Option<[u8; 4]> {
             if digits == 3 {
                 return None;
             }
-            value = value
-                .checked_mul(10)?
-                .checked_add((byte - b'0') as u16)?;
+            value = value.checked_mul(10)?.checked_add((byte - b'0') as u16)?;
             if value > 255 {
                 return None;
             }
@@ -27364,25 +28192,17 @@ unsafe fn hosted_e1000_stimulus_config(
 }
 
 unsafe fn hosted_mmio_read_u32(state: HostedDeviceResourceState, offset: u64) -> Option<u32> {
-    if state.mmio_broker_va == 0
-        || offset.checked_add(4)? > state.evidence.resource_mmio_len
-    {
+    if state.mmio_broker_va == 0 || offset.checked_add(4)? > state.evidence.resource_mmio_map_len {
         return None;
     }
-    Some(read_volatile(
-        (state.mmio_broker_va + offset) as *const u32,
-    ))
+    Some(read_volatile((state.mmio_broker_va + offset) as *const u32))
 }
 
-unsafe fn hosted_mmio_write_u32(
-    state: HostedDeviceResourceState,
-    offset: u64,
-    value: u32,
-) -> bool {
+unsafe fn hosted_mmio_write_u32(state: HostedDeviceResourceState, offset: u64, value: u32) -> bool {
     let Some(end) = offset.checked_add(4) else {
         return false;
     };
-    if state.mmio_broker_va == 0 || end > state.evidence.resource_mmio_len {
+    if state.mmio_broker_va == 0 || end > state.evidence.resource_mmio_map_len {
         return false;
     }
     write_volatile((state.mmio_broker_va + offset) as *mut u32, value);
@@ -27500,8 +28320,7 @@ unsafe fn drive_hosted_e1000_tx_descriptors(
     ) else {
         return report;
     };
-    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64
-        || ring_len > usize::MAX as u64
+    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64 || ring_len > usize::MAX as u64
     {
         report.failures = report.failures.saturating_add(1);
         return report;
@@ -27572,8 +28391,7 @@ unsafe fn drive_hosted_e1000_rx_descriptor(
     ) else {
         return report;
     };
-    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64
-        || ring_len > usize::MAX as u64
+    if ring_len < HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride as u64 || ring_len > usize::MAX as u64
     {
         report.failures = report.failures.saturating_add(1);
         return report;
@@ -27723,7 +28541,8 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
         evidence.dma_descriptor_lengths = descriptors.lengths;
         evidence.dma_descriptor_completed = descriptors.completed;
         evidence.dma_descriptor_completed_common_buffers = descriptors.completed_common_buffers;
-        evidence.dma_descriptor_completed_transfer_mappings = descriptors.completed_transfer_mappings;
+        evidence.dma_descriptor_completed_transfer_mappings =
+            descriptors.completed_transfer_mappings;
         evidence.dma_descriptor_malformed = descriptors.malformed;
         evidence.dma_descriptor_observation_failures = descriptors.failures;
     }
@@ -27787,9 +28606,7 @@ fn nt_path_ascii(path: &NtPath) -> Option<Vec<u8>> {
 
 fn hosted_video_object_number_from_path(path: &[u8]) -> Option<u32> {
     let prefix = nt_video_miniport::VIDEO_DEVICE_PATH_PREFIX.as_bytes();
-    if path.len() <= prefix.len()
-        || !path[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
+    if path.len() <= prefix.len() || !path[..prefix.len()].eq_ignore_ascii_case(prefix) {
         return None;
     }
     let mut value = 0u32;
@@ -27797,9 +28614,7 @@ fn hosted_video_object_number_from_path(path: &[u8]) -> Option<u32> {
         if !digit.is_ascii_digit() {
             return None;
         }
-        value = value
-            .checked_mul(10)?
-            .checked_add((digit - b'0') as u32)?;
+        value = value.checked_mul(10)?.checked_add((digit - b'0') as u32)?;
     }
     Some(value)
 }
@@ -27814,12 +28629,22 @@ pub(crate) struct DriverInstance {
     pub exec_stack_va: u64,
     pub exec_arg_va: u64,
     pub image_frames: u64,
+    pub image_frame_base: u64,
+    pub pool_frame_base: u64,
+    pub data_frame_base: u64,
+    pub shared_frame_base: u64,
+    pub arg_frame_base: u64,
+    pub stack_frame_base: u64,
+    pub stack_frame_count: u64,
     pub exec_thunk_va: u64,
     pub run_thunk_va: u64,
     pub thunk_len: u64,
     pub thunk_next: u64,
     pub tcb: u64,
     pub cnode: u64,
+    pub raw_cnode: u64,
+    pub sched_context: u64,
+    pub map_cap_bank: crate::spawn_hosts::ComponentMapCapBank,
     pub reply_cap: u64,
     pub driver_id: u64,
     pub device_id: u64,
@@ -27839,12 +28664,22 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     exec_stack_va: 0,
     exec_arg_va: 0,
     image_frames: 0,
+    image_frame_base: 0,
+    pool_frame_base: 0,
+    data_frame_base: 0,
+    shared_frame_base: 0,
+    arg_frame_base: 0,
+    stack_frame_base: 0,
+    stack_frame_count: 0,
     exec_thunk_va: 0,
     run_thunk_va: 0,
     thunk_len: 0,
     thunk_next: 0,
     tcb: 0,
     cnode: 0,
+    raw_cnode: 0,
+    sched_context: 0,
+    map_cap_bank: crate::spawn_hosts::ComponentMapCapBank { owner: 0, count: 0 },
     reply_cap: 0,
     driver_id: 0,
     device_id: 0,
@@ -27922,8 +28757,7 @@ unsafe fn driver_instances() -> Option<&'static Vec<DriverInstance>> {
 }
 
 fn hosted_driver_thread_first_handle(instance: usize) -> u64 {
-    HOSTED_DRIVER_THREAD_HANDLE_BASE
-        .saturating_add(((instance as u64).saturating_add(1)) << 16)
+    HOSTED_DRIVER_THREAD_HANDLE_BASE.saturating_add(((instance as u64).saturating_add(1)) << 16)
 }
 
 unsafe fn hosted_driver_thread_tables_mut() -> &'static mut Vec<HostedDriverThreadTable> {
@@ -28032,11 +28866,7 @@ unsafe fn remove_hosted_driver_thread_runtime(
     Some(runtimes.remove(index))
 }
 
-fn rotate_hosted_driver_active_reply(
-    instance: usize,
-    expected_active: u64,
-    fresh: u64,
-) -> bool {
+fn rotate_hosted_driver_active_reply(instance: usize, expected_active: u64, fresh: u64) -> bool {
     if expected_active == 0 || fresh == 0 {
         return false;
     }
@@ -28058,7 +28888,8 @@ unsafe fn cancel_hosted_driver_waits_for_thread(instance: usize, thread_handle: 
     if let Some(waiters) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS)).as_mut() {
         let mut index = 0usize;
         while index < waiters.len() {
-            if waiters[index].instance == instance && waiters[index].thread_handle == thread_handle {
+            if waiters[index].instance == instance && waiters[index].thread_handle == thread_handle
+            {
                 let waiter = waiters.remove(index);
                 removed += 1;
                 removed_timed |= waiter.deadline_100ns.is_some();
@@ -28109,10 +28940,9 @@ fn clear_hosted_driver_threads_for_instance(instance: usize) {
         }
         if let Some(tables) = (*core::ptr::addr_of_mut!(HOSTED_DRIVER_THREAD_TABLES)).as_mut() {
             if instance < tables.len() {
-                tables[instance] =
-                    HostedDriverThreadTable::with_first_handle(hosted_driver_thread_first_handle(
-                        instance,
-                    ));
+                tables[instance] = HostedDriverThreadTable::with_first_handle(
+                    hosted_driver_thread_first_handle(instance),
+                );
             }
         }
     }
@@ -28244,9 +29074,46 @@ fn clear_instance_exec_mappings(instance: usize) {
         for cap in caps.drain(..) {
             if cap != 0 {
                 let _ = unsafe { page_unmap_r(cap) };
+                let _ = unsafe { cnode_delete_recycle_r(cap) };
             }
         }
     }
+}
+
+unsafe fn release_driver_frame_run(base: u64, count: u64) -> (u64, u64) {
+    if base == 0 || count == 0 {
+        return (0, 0);
+    }
+    let mut released = 0u64;
+    let mut failures = 0u64;
+    let mut index = count;
+    while index != 0 {
+        index -= 1;
+        let cap = base + index;
+        if cnode_delete_recycle_r(cap) == 0 {
+            released += 1;
+        } else {
+            failures += 1;
+        }
+    }
+    (released, failures)
+}
+
+unsafe fn release_driver_source_frame_runs(inst: DriverInstance) -> (u64, u64) {
+    let mut released = 0u64;
+    let mut failures = 0u64;
+    for (base, count) in [
+        (inst.image_frame_base, inst.image_frames),
+        (inst.pool_frame_base, FSD_POOL_FRAMES),
+        (inst.data_frame_base, FSD_DATA_FRAMES),
+        (inst.shared_frame_base, FSD_SHARED_FRAMES),
+        (inst.arg_frame_base, FSD_ARG_FRAMES),
+    ] {
+        let (run_released, run_failures) = release_driver_frame_run(base, count);
+        released += run_released;
+        failures += run_failures;
+    }
+    (released, failures)
 }
 
 unsafe fn ensure_instance_exec_pd(instance: usize, vaddr: u64) -> Option<()> {
@@ -28344,7 +29211,7 @@ unsafe fn map_fsd_main_stack_exec_alias(
 
     let mut i = 0u64;
     while i < FSD_STACK_FRAMES {
-        let cap = copy_cap(stack_frame_base + i);
+        let cap = copy_driver_cap(instance, b"exec-stack", stack_frame_base + i)?;
         map_instance_exec_frame(instance, cap, exec_stack_va + i * 0x1000, RW_NX)?;
         i += 1;
     }
@@ -28380,12 +29247,22 @@ fn register_instance(dc: &DriverComponent) {
         exec_stack_va: dc.exec_stack_va,
         exec_arg_va: dc.exec_arg_va,
         image_frames: dc.image_frames,
+        image_frame_base: dc.image_frame_base,
+        pool_frame_base: dc.pool_frame_base,
+        data_frame_base: dc.data_frame_base,
+        shared_frame_base: dc.shared_frame_base,
+        arg_frame_base: dc.arg_frame_base,
+        stack_frame_base: dc.stack_frame_base,
+        stack_frame_count: dc.stack_frame_count,
         exec_thunk_va: dc.exec_thunk_va,
         run_thunk_va: dc.run_thunk_va,
         thunk_len: dc.thunk_len,
         thunk_next: dc.thunk_next,
         tcb: dc.tcb,
         cnode: dc.cnode,
+        raw_cnode: dc.raw_cnode,
+        sched_context: dc.sched_context,
+        map_cap_bank: dc.map_cap_bank,
         reply_cap: dc.reply_cap,
         driver_id: dc.driver_id,
         device_id: dc.device_id,
@@ -28442,12 +29319,23 @@ pub(crate) struct HostedVideoRouteInfo {
 fn clear_instance(i: usize) {
     clear_hosted_driver_waits_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
+    unsafe {
+        let failures = clear_hosted_resource_map_caps_for_instance(i);
+        if failures != 0 {
+            print_str(b"[driver-launch] hosted resource map release failed inst=");
+            print_u64(i as u64);
+            print_str(b" failures=");
+            print_u64(failures);
+            print_str(b"\n");
+        }
+    }
     clear_hosted_device_bindings_for_instance(i);
     unsafe {
         clear_hosted_provider_ndis_shadows_for_instance(i);
         clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
         clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i);
         clear_hosted_provider_dispatch_routes_for_instance(i);
+        clear_hosted_provider_singletons_for_instance(i);
     }
     if let Some(inst) = instance(i) {
         unsafe {
@@ -28463,6 +29351,12 @@ fn clear_instance(i: usize) {
             }
         }
         clear_instance_exec_mappings(i);
+        let inst = t[i];
+        if inst.used {
+            unsafe {
+                release_driver_component_mechanism(i, inst);
+            }
+        }
         t[i] = EMPTY_INSTANCE;
     } else {
         clear_instance_exec_mappings(i);
@@ -28475,6 +29369,70 @@ fn register_instance_ready(i: usize, ready: bool) {
     let t = unsafe { driver_instances_mut() };
     if i < t.len() && t[i].used {
         t[i].ready = ready;
+    }
+}
+
+unsafe fn release_driver_component_mechanism(index: usize, inst: DriverInstance) {
+    let mut failures = 0u64;
+    if inst.tcb != 0 && tcb_suspend_r(inst.tcb) != 0 {
+        failures += 1;
+    }
+    let (stack_caps, stack_failures) =
+        release_driver_frame_run(inst.stack_frame_base, inst.stack_frame_count);
+    failures += stack_failures;
+    let release = crate::spawn_hosts::release_component_map_cap_bank(inst.map_cap_bank);
+    failures += release.failures;
+    failures += clear_hosted_paging_for_pml4(inst.pml4);
+    let (source_caps, source_failures) = release_driver_source_frame_runs(inst);
+    failures += source_failures;
+    if inst.cnode != 0 {
+        let _ = cnode_delete_in_cnode_r(inst.cnode, CT_IRQ_NTFN);
+        let _ = cnode_delete_in_cnode_r(inst.cnode, CT_RESULT_NTFN);
+        let _ = cnode_delete_in_cnode_r(inst.cnode, CT_IO_PORT);
+        if inst.fault_ep != 0 && cnode_delete_in_cnode_r(inst.cnode, CT_FAULT) != 0 {
+            failures += 1;
+        }
+        if inst.pml4 != 0 && cnode_delete_in_cnode_r(inst.cnode, CT_PML4) != 0 {
+            failures += 1;
+        }
+    }
+    if inst.reply_cap != 0 {
+        if cnode_delete_recycle_r(inst.reply_cap) != 0 {
+            failures += 1;
+        } else {
+            crate::replace_fsd_reply_slot(index, 0);
+        }
+    }
+    if inst.sched_context != 0 && cnode_delete_recycle_r(inst.sched_context) != 0 {
+        failures += 1;
+    }
+    if inst.tcb != 0 && cnode_delete_recycle_r(inst.tcb) != 0 {
+        failures += 1;
+    }
+    if inst.cnode != 0 && cnode_delete_recycle_r(inst.cnode) != 0 {
+        failures += 1;
+    }
+    if inst.raw_cnode != 0 && cnode_delete_recycle_r(inst.raw_cnode) != 0 {
+        failures += 1;
+    }
+    if inst.pml4 != 0 && cnode_delete_recycle_r(inst.pml4) != 0 {
+        failures += 1;
+    }
+    if inst.fault_ep != 0 && cnode_delete_recycle_r(inst.fault_ep) != 0 {
+        failures += 1;
+    }
+    if failures != 0 {
+        print_str(b"[driver-launch] component mechanism release failed inst=");
+        print_u64(index as u64);
+        print_str(b" bank-caps=");
+        print_u64(release.caps);
+        print_str(b" stack-caps=");
+        print_u64(stack_caps);
+        print_str(b" frame-caps=");
+        print_u64(source_caps);
+        print_str(b" failures=");
+        print_u64(failures);
+        print_str(b"\n");
     }
 }
 
@@ -28689,10 +29647,7 @@ pub(crate) fn service_hosted_driver_registry(
                 );
                 match crate::config_manager_enumerate_key(slot.path.as_str(), a2 as u32, data) {
                     Ok(n) => {
-                        write_volatile(
-                            (arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32,
-                            n as u32,
-                        );
+                        write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, n as u32);
                         (STATUS_SUCCESS, n as u64, 0)
                     }
                     Err(status) => (status, 0, 0),
@@ -28756,7 +29711,12 @@ pub(crate) fn service_hosted_driver_registry(
                     (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
                     a3 as usize,
                 );
-                match crate::config_manager_set_value(slot.path.as_str(), value_name.as_str(), a2 as u32, data) {
+                match crate::config_manager_set_value(
+                    slot.path.as_str(),
+                    value_name.as_str(),
+                    a2 as u32,
+                    data,
+                ) {
                     Ok(()) => (STATUS_SUCCESS, 0, 0),
                     Err(status) => (status, 0, 0),
                 }
@@ -28937,7 +29897,8 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
     let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
-    let Some(exec_object) = hosted_driver_wait_object_exec_va(instance, inst, runtime, object) else {
+    let Some(exec_object) = hosted_driver_wait_object_exec_va(instance, inst, runtime, object)
+    else {
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         if request <= 8 {
             print_str(b"[driver-wait] KeWaitForSingleObject unmapped object inst=");
@@ -28966,8 +29927,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                         Ok(deadline) => deadline,
                         Err(status) => {
                             if status == STATUS_TIMEOUT_I32 {
-                                HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS
-                                    .fetch_add(1, Ordering::Relaxed);
+                                HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                             }
@@ -29051,11 +30011,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
     let request = HOSTED_DRIVER_WAIT_MULTIPLE_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
     let wait_type = packed_wait as u32;
     let timeout_code = packed_wait >> 32;
-    if count == 0
-        || count > HOSTED_DRIVER_WAIT_OBJECT_MAX
-        || object_array == 0
-        || wait_type > 1
-    {
+    if count == 0 || count > HOSTED_DRIVER_WAIT_OBJECT_MAX || object_array == 0 || wait_type > 1 {
         HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     }
@@ -29147,8 +30103,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                                 HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS
                                     .fetch_add(1, Ordering::Relaxed);
                             } else {
-                                HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS
-                                    .fetch_add(1, Ordering::Relaxed);
+                                HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                             }
                             return HostedDriverWaitServiceResult::Reply(status);
                         }
@@ -29304,7 +30259,8 @@ pub(crate) fn service_hosted_driver_ke_release_semaphore(
         return STATUS_INVALID_PARAMETER;
     };
     let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
-    let Some(exec_semaphore) = hosted_driver_wait_object_exec_va(instance, inst, runtime, semaphore)
+    let Some(exec_semaphore) =
+        hosted_driver_wait_object_exec_va(instance, inst, runtime, semaphore)
     else {
         if request <= 8 {
             print_str(b"[driver-wait] KeReleaseSemaphore unmapped semaphore inst=");
@@ -29563,8 +30519,8 @@ pub(crate) fn service_hosted_driver_ps_terminate_system_thread(
     }
 
     let canceled_waits = unsafe { cancel_hosted_driver_waits_for_thread(instance, runtime.handle) };
-    let runtime = unsafe { remove_hosted_driver_thread_runtime(instance, runtime.handle) }
-        .unwrap_or(runtime);
+    let runtime =
+        unsafe { remove_hosted_driver_thread_runtime(instance, runtime.handle) }.unwrap_or(runtime);
     unsafe {
         delete_hosted_driver_thread_mechanism(
             runtime.tcb,
@@ -29635,6 +30591,8 @@ unsafe fn dispatch_driver_unload_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -29663,9 +30621,7 @@ struct AddDeviceDispatchResult {
     fdo_name: Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>>,
 }
 
-fn hosted_video_device_path(
-    number: u32,
-) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
+fn hosted_video_device_path(number: u32) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
     let mut path = HostedAscii::<HOSTED_EXPORT_NAME_MAX>::empty();
     if path.push_str(r"\Device\Video") && hosted_ascii_push_decimal_u32(&mut path, number) {
         Some(path)
@@ -29724,6 +30680,8 @@ unsafe fn dispatch_video_add_device_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -29792,6 +30750,8 @@ unsafe fn dispatch_provider_add_device_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(route.provider_instance)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: provider_inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -29865,6 +30825,8 @@ unsafe fn dispatch_add_device_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -29918,10 +30880,13 @@ where
         build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
     let registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
     publish_shared_registry_identity_at(inst.exec_shared_va, &registry_identity)?;
-    let provider_add_device_shared = hosted_provider_dispatch_route_for_instance(index)
-        .and_then(|route| instance(route.provider_instance).map(|provider| provider.exec_shared_va));
+    let provider_add_device_shared =
+        hosted_provider_dispatch_route_for_instance(index).and_then(|route| {
+            instance(route.provider_instance).map(|provider| provider.exec_shared_va)
+        });
     if let Some(provider_shared) = provider_add_device_shared {
-        if let Err(status) = publish_shared_registry_identity_at(provider_shared, &registry_identity)
+        if let Err(status) =
+            publish_shared_registry_identity_at(provider_shared, &registry_identity)
         {
             clear_shared_registry_identity_at(inst.exec_shared_va);
             release_hosted_registry_identity(registry_identity_id);
@@ -30055,9 +31020,9 @@ where
 
 /// Grant a hosted device driver access to the MMIO/interrupt resources selected for its devnode.
 ///
-/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: BAR frames are
-/// mapped into the isolated component VSpace, and the shared page records the only physical range
-/// and interrupt vector that `MmMapIoSpace`/`IoConnectInterrupt` may accept.
+/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: the full BAR
+/// range is granted in the shared page, while `mmio_map_pages` controls the bounded prefix eagerly
+/// mapped into the isolated component VSpace for direct `MmMapIoSpace` access.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn grant_hosted_device_resources(
     device_id: u64,
@@ -30069,7 +31034,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     mmio_va: u64,
     mmio_broker_va: u64,
     mmio_frame_base: u64,
-    mmio_pages: u64,
+    mmio_map_pages: u64,
     video_memory_caller_va: u64,
     interrupt_vector: u32,
     interrupt_latched: bool,
@@ -30086,7 +31051,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || mmio_va == 0
         || mmio_broker_va == 0
         || mmio_frame_base == 0
-        || mmio_pages == 0
+        || mmio_map_pages == 0
         || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -30116,15 +31081,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    if has_dma
-        && bus_identity.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS
-        && dma_broker_va == 0
+    if has_dma && bus_identity.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS && dma_broker_va == 0
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)
+    let (instance_index, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     if video_memory_caller_va != 0
         && (!hosted_instance_video_port_initialized(inst) || (video_memory_caller_va & 0xFFF) != 0)
@@ -30140,34 +31103,68 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         0
     };
     clear_hosted_resource_projection(binding, inst.exec_shared_va);
-    let mapped_len = mmio_len.min(mmio_pages.saturating_mul(0x1000));
-    for window in 0..mmio_pages.div_ceil(512).max(1) {
-        ensure_paging(mmio_va + window * 0x20_0000, inst.pml4);
+    trace_hosted_resource_grant(b"begin", device_id, 0, 0);
+    trace_hosted_resource_grant_detail(
+        device_id,
+        mmio_phys,
+        mmio_len,
+        mmio_frame_base,
+        mmio_map_pages,
+        mmio_va,
+        dma_frame_base,
+        dma_pages,
+    );
+    let mapped_len = mmio_len.min(mmio_map_pages.saturating_mul(0x1000));
+    if mapped_len == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    for window in 0..mmio_map_pages.div_ceil(512).max(1) {
+        if !ensure_paging(mmio_va + window * 0x20_0000, inst.pml4) {
+            print_str(b"[driver-launch] hosted MMIO paging failed device_id=");
+            print_u64(device_id);
+            print_str(b" window=");
+            print_u64(window);
+            print_str(b"/");
+            print_u64(mmio_map_pages.div_ceil(512).max(1));
+            print_str(b"\n");
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+    }
+    trace_hosted_resource_grant(b"mmio-paging", device_id, 0, mmio_map_pages);
     let mut page = 0u64;
-    while page < mmio_pages {
+    while page < mmio_map_pages {
+        if page == 0 || page % 128 == 0 {
+            trace_hosted_resource_grant(b"mmio-map", device_id, page, mmio_map_pages);
+        }
         let source_cap = mmio_frame_base + page;
         let (map_cap, copy_error) = copy_cap_r(source_cap);
-        let frame_cap = if copy_error == 0 {
-            map_cap
-        } else {
-            source_cap
-        };
-        let err = page_map_r(frame_cap, mmio_va + page * 0x1000, RW_NX, inst.pml4);
-        if err != 0 {
-            if copy_error == 0 {
-                let _ = cnode_delete_recycle_r(map_cap);
-            }
-            print_str(b"[driver-launch] hosted MMIO map failed label=");
-            print_u64(err);
-            print_str(b" copy=");
+        if copy_error != 0 {
+            clear_hosted_resource_map_caps_for_instance(instance_index);
+            print_str(b"[driver-launch] hosted MMIO cap copy failed label=");
             print_u64(copy_error);
             print_str(b" device_id=");
             print_u64(device_id);
             print_str(b" page=");
             print_u64(page);
             print_str(b"/");
-            print_u64(mmio_pages);
+            print_u64(mmio_map_pages);
+            print_str(b" frame_cap=");
+            print_u64(source_cap);
+            print_str(b"\n");
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        let err = page_map_r(map_cap, mmio_va + page * 0x1000, RW_NX, inst.pml4);
+        if err != 0 {
+            let _ = cnode_delete_recycle_r(map_cap);
+            clear_hosted_resource_map_caps_for_instance(instance_index);
+            print_str(b"[driver-launch] hosted MMIO map failed label=");
+            print_u64(err);
+            print_str(b" device_id=");
+            print_u64(device_id);
+            print_str(b" page=");
+            print_u64(page);
+            print_str(b"/");
+            print_u64(mmio_map_pages);
             print_str(b" va=0x");
             print_hex(((mmio_va + page * 0x1000) >> 32) as u32);
             print_hex((mmio_va + page * 0x1000) as u32);
@@ -30176,8 +31173,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             print_str(b"\n");
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
+        record_hosted_resource_map_cap(instance_index, map_cap);
         page += 1;
     }
+    trace_hosted_resource_grant(b"mmio-done", device_id, mmio_map_pages, mmio_map_pages);
 
     let mut mapped_dma_len = 0u64;
     let mut dma_adapter_id = 0u64;
@@ -30187,26 +31186,46 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         for window in 0..dma_pages.div_ceil(512).max(1) {
-            ensure_paging(dma_va + window * 0x20_0000, inst.pml4);
+            if !ensure_paging(dma_va + window * 0x20_0000, inst.pml4) {
+                print_str(b"[driver-launch] hosted DMA paging failed device_id=");
+                print_u64(device_id);
+                print_str(b" window=");
+                print_u64(window);
+                print_str(b"/");
+                print_u64(dma_pages.div_ceil(512).max(1));
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
         }
+        trace_hosted_resource_grant(b"dma-paging", device_id, 0, dma_pages);
         let mut dma_page = 0u64;
         while dma_page < dma_pages {
+            if dma_page == 0 || dma_page % 128 == 0 {
+                trace_hosted_resource_grant(b"dma-map", device_id, dma_page, dma_pages);
+            }
             let source_cap = dma_frame_base + dma_page;
             let (map_cap, copy_error) = copy_cap_r(source_cap);
-            let frame_cap = if copy_error == 0 {
-                map_cap
-            } else {
-                source_cap
-            };
-            let err = page_map_r(frame_cap, dma_va + dma_page * 0x1000, RW_NX, inst.pml4);
+            if copy_error != 0 {
+                clear_hosted_resource_map_caps_for_instance(instance_index);
+                print_str(b"[driver-launch] hosted DMA cap copy failed label=");
+                print_u64(copy_error);
+                print_str(b" device_id=");
+                print_u64(device_id);
+                print_str(b" page=");
+                print_u64(dma_page);
+                print_str(b"/");
+                print_u64(dma_pages);
+                print_str(b" frame_cap=");
+                print_u64(source_cap);
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
+            let err = page_map_r(map_cap, dma_va + dma_page * 0x1000, RW_NX, inst.pml4);
             if err != 0 {
-                if copy_error == 0 {
-                    let _ = cnode_delete_recycle_r(map_cap);
-                }
+                let _ = cnode_delete_recycle_r(map_cap);
+                clear_hosted_resource_map_caps_for_instance(instance_index);
                 print_str(b"[driver-launch] hosted DMA map failed label=");
                 print_u64(err);
-                print_str(b" copy=");
-                print_u64(copy_error);
                 print_str(b" device_id=");
                 print_u64(device_id);
                 print_str(b" page=");
@@ -30221,8 +31240,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 print_str(b"\n");
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
+            record_hosted_resource_map_cap(instance_index, map_cap);
             dma_page += 1;
         }
+        trace_hosted_resource_grant(b"dma-done", device_id, dma_pages, dma_pages);
         dma_adapter_id = hosted_dma_manager_mut().register_adapter(
             hosted_dma_owner(binding),
             true,
@@ -30230,6 +31251,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             true,
         );
     }
+    trace_hosted_resource_grant(b"rm-assign", device_id, 0, 0);
 
     let rm = hosted_resource_manager_mut();
     rm.assign_memory(
@@ -30237,7 +31259,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         mmio_resource_id,
         mmio_phys,
         mmio_va,
-        mapped_len,
+        mmio_len,
         nt_hal_abi::MM_NON_CACHED,
         nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
     );
@@ -30259,6 +31281,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     let mut io_port_cap = 0u64;
     let mut io_port_component_cap = 0u64;
     if io_port_len != 0 {
+        trace_hosted_resource_grant(b"ioport-begin", device_id, io_port_base, io_port_len as u64);
         let Some(cap) = try_alloc_slot() else {
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         };
@@ -30294,11 +31317,14 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         }
         io_port_cap = cap;
         io_port_component_cap = crate::CT_IO_PORT;
+        trace_hosted_resource_grant(b"ioport-done", device_id, io_port_base, io_port_len as u64);
     }
 
+    trace_hosted_resource_grant(b"shared-write", device_id, 0, 0);
     let sh = inst.exec_shared_va;
     write_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *mut u64, mmio_phys);
-    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mapped_len);
+    write_volatile((sh + SH_RESOURCE_MMIO_LEN) as *mut u64, mmio_len);
+    write_volatile((sh + SH_RESOURCE_MMIO_MAP_LEN) as *mut u64, mapped_len);
     write_volatile((sh + SH_RESOURCE_IO_PORT_BASE) as *mut u64, io_port_base);
     write_volatile(
         (sh + SH_RESOURCE_IO_PORT_LEN) as *mut u64,
@@ -30345,7 +31371,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
     if video_memory_caller_va != 0 {
         write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, mmio_phys);
-        write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, mapped_len);
+        write_volatile((sh + SH_VIDEO_MEMORY_LEN) as *mut u64, mmio_len);
         write_volatile(
             (sh + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64,
             video_memory_caller_va,
@@ -30383,6 +31409,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.mmio_broker_va = mmio_broker_va;
         state.dma_broker_va = dma_broker_va;
     }
+    trace_hosted_resource_grant(b"done", device_id, 0, 0);
     Ok(())
 }
 
@@ -30480,6 +31507,7 @@ unsafe fn record_hosted_resource_usage(
     let owner = hosted_resource_owner(binding);
     let grant_phys = read_volatile((sh + SH_RESOURCE_MMIO_PHYS) as *const u64);
     let grant_len = read_volatile((sh + SH_RESOURCE_MMIO_LEN) as *const u64);
+    let map_len = read_volatile((sh + SH_RESOURCE_MMIO_MAP_LEN) as *const u64);
     let grant_va = read_volatile((sh + SH_RESOURCE_MMIO_VA) as *const u64);
     let mapped_phys = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *const u64);
     let mapped_len = read_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *const u64);
@@ -30491,6 +31519,9 @@ unsafe fn record_hosted_resource_usage(
             .checked_sub(grant_phys)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if mapped_offset > grant_len || mapped_len > grant_len - mapped_offset {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if map_len == 0 || mapped_offset > map_len || mapped_len > map_len - mapped_offset {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let mapped = hosted_resource_manager_mut()
@@ -30585,6 +31616,8 @@ unsafe fn dispatch_video_find_adapter_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -30736,6 +31769,8 @@ unsafe fn dispatch_video_initialize_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -30795,10 +31830,7 @@ unsafe fn dispatch_video_start_io_for_instance(
         write_volatile((arg + i as u64) as *mut u8, 0);
     }
     write_volatile((sh + SH_DEVOBJ) as *mut u64, device_object);
-    write_volatile(
-        (sh + SH_REQ_MAJOR) as *mut u64,
-        FSD_DISPATCH_VIDEO_START_IO,
-    );
+    write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_VIDEO_START_IO);
     write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
     write_volatile((sh + SH_REQ_FSCTL) as *mut u64, ioctl);
     write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
@@ -30815,6 +31847,8 @@ unsafe fn dispatch_video_start_io_for_instance(
         exec_code_va: ExecVaWindow::try_for_instance(index)
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
             .code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -30864,9 +31898,8 @@ unsafe fn dispatch_video_irp_for_binding(
     let outcome = match major as u8 {
         major::IRP_MJ_CREATE => {
             let result = dispatch_video_initialize_for_instance(index, inst, device_object)?;
-            let initialize_calls = read_volatile(
-                (inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64,
-            );
+            let initialize_calls =
+                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
             let initialize_ok =
                 read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_OK) as *const u8);
             if result.0 != 0 || initialize_ok == 0 {
@@ -30929,7 +31962,8 @@ pub(crate) unsafe fn start_hosted_device(
     let video_find_adapter = read_volatile((sh + SH_VIDEO_HW_FIND_ADAPTER) as *const u64);
     let video_initialize = read_volatile((sh + SH_VIDEO_HW_INITIALIZE) as *const u64);
     let video_start_io = read_volatile((sh + SH_VIDEO_HW_START_IO) as *const u64);
-    if !video_initialized && (video_find_adapter != 0 || video_initialize != 0 || video_start_io != 0)
+    if !video_initialized
+        && (video_find_adapter != 0 || video_initialize != 0 || video_start_io != 0)
     {
         print_str(b"[driver-launch] hosted video callbacks without initialization device_id=");
         print_u64(device_id);
@@ -30942,12 +31976,13 @@ pub(crate) unsafe fn start_hosted_device(
         print_str(b"\n");
     }
     if video_initialized {
-        let root_status = hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, IRP_MN_START_DEVICE as u8);
-        write_volatile((sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64, IRP_MN_START_DEVICE);
+        let root_status =
+            hosted_root_bus_mut().dispatch_pnp(binding.pdo_object, IRP_MN_START_DEVICE as u8);
         write_volatile(
-            (sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32,
-            root_status,
+            (sh + SH_ROOT_PDO_FORWARDED_MINOR) as *mut u64,
+            IRP_MN_START_DEVICE,
         );
+        write_volatile((sh + SH_ROOT_PDO_FORWARDED_STATUS) as *mut i32, root_status);
         nt_status::NtStatus(root_status).to_result()?;
         let video_status = dispatch_video_find_adapter_for_instance(binding.instance, inst)?;
         let again = read_volatile((sh + SH_VIDEO_FIND_ADAPTER_AGAIN) as *const u8);
@@ -30957,7 +31992,9 @@ pub(crate) unsafe fn start_hosted_device(
             print_str(b" status=0x");
             print_hex(video_status);
             print_str(b" calls=");
-            print_u64(read_volatile((sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64));
+            print_u64(read_volatile(
+                (sh + SH_VIDEO_FIND_ADAPTER_CALLS) as *const u64,
+            ));
             print_str(b" again=");
             print_u64(again as u64);
             print_str(b"\n");
@@ -31443,6 +32480,8 @@ unsafe fn dispatch_irp_for_instance(
         code_va: 0,
         image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
         exec_code_va: ExecVaWindow::try_for_instance(dispatch_index)?.code_va,
+        root_image_rights: 3,
+        root_image_map_owner: d.map_cap_bank.owner,
         shared_va: sh,
         dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 256,
@@ -31601,10 +32640,7 @@ pub(crate) unsafe fn dispatch_irp_to_device_result(
     dispatch_external_irp_to_device_record_result(device_id, major, fsctl, file_id, in_data, out)
 }
 
-pub(crate) unsafe fn cancel_pending_file_irps(
-    device_id: u64,
-    file_id: u64,
-) -> Result<u64, u32> {
+pub(crate) unsafe fn cancel_pending_file_irps(device_id: u64, file_id: u64) -> Result<u64, u32> {
     let (instance, inst, device_object) = hosted_dispatch_instance_for_device_id(device_id)?;
     if !inst.ready || inst.driver_id == 0 || device_object == 0 {
         return Err(STATUS_DEVICE_NOT_READY as u32);
