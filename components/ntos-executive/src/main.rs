@@ -6668,6 +6668,56 @@ pub(crate) static SERVICES_SSN_HIST: [AtomicU64; SSN_HIST_N] =
 pub(crate) static EXEC_DISPATCH_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXEC_DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SLOW_DISPATCH_TRACED: AtomicU64 = AtomicU64::new(0);
+
+/// PER-CALL DISPATCH PROBE. Aggregate per-SSN totals cannot explain these stalls: the same handler
+/// runs thousands of times cheaply and then ONE call costs 20-160 s. A total hides that call; this
+/// records the segments of the CURRENT dispatch and is dumped only when that dispatch turns out to
+/// have been slow, so the pathological instance is the one that gets explained.
+pub(crate) const PROBE_SEGMENTS: usize = 12;
+pub(crate) static PROBE_TICKS: [AtomicU64; PROBE_SEGMENTS] =
+    [const { AtomicU64::new(0) }; PROBE_SEGMENTS];
+pub(crate) static PROBE_HITS: [AtomicU64; PROBE_SEGMENTS] =
+    [const { AtomicU64::new(0) }; PROBE_SEGMENTS];
+
+/// Clear the per-call probe at the start of a dispatch.
+pub(crate) fn probe_reset() {
+    for slot in 0..PROBE_SEGMENTS {
+        PROBE_TICKS[slot].store(0, Ordering::Relaxed);
+        PROBE_HITS[slot].store(0, Ordering::Relaxed);
+    }
+}
+
+/// Print the segments this dispatch spent time in.
+pub(crate) fn probe_dump() {
+    print_str(b" seg:");
+    for slot in 0..PROBE_SEGMENTS {
+        let hits = PROBE_HITS[slot].load(Ordering::Relaxed);
+        if hits == 0 {
+            continue;
+        }
+        print_str(b" #");
+        print_u64(slot as u64);
+        print_str(b"=");
+        print_u64(PROBE_TICKS[slot].load(Ordering::Relaxed) / 1_000_000);
+        print_str(b"ms/");
+        print_u64(hits);
+    }
+}
+
+/// Time `$body` into per-call probe segment `$slot`.
+#[macro_export]
+macro_rules! probe_seg {
+    ($slot:expr, $body:expr) => {{
+        let __probe_started = $crate::disk_census_ticks();
+        let __probe_result = $body;
+        $crate::PROBE_TICKS[$slot].fetch_add(
+            $crate::disk_census_ticks().wrapping_sub(__probe_started),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        $crate::PROBE_HITS[$slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        __probe_result
+    }};
+}
 /// How many times the ordered-services cache has been rebuilt (each rebuild walks every service
 /// key in the SYSTEM hive), so a slow dispatch can be tied to a rebuild storm.
 pub(crate) static SERVICES_ORDER_REBUILDS: AtomicU64 = AtomicU64::new(0);
@@ -6696,6 +6746,7 @@ pub(crate) fn record_native_dispatch_ticks(ssn: u64, ticks: u64) {
             print_u64(ticks / 1_000_000);
             print_str(b" services-order-rebuilds=");
             print_u64(SERVICES_ORDER_REBUILDS.load(Ordering::Relaxed));
+            probe_dump();
             print_str(b"\n");
         }
     }
@@ -6974,6 +7025,18 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
+    {
+        let (sw, st, mw, mt, outstanding) = driver_launch::hosted_driver_wait_census();
+        print_str(b" drvwait=");
+        print_u64(sw);
+        print_str(b"w/");
+        print_u64(st);
+        print_str(b"t+");
+        print_u64(mw);
+        print_u64(mt);
+        print_str(b"/");
+        print_u64(outstanding);
+    }
     print_str(b" exec-dispatch=");
     print_u64(EXEC_DISPATCH_CALLS.load(Ordering::Relaxed));
     print_str(b"/");

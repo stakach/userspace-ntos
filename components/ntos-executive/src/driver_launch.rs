@@ -9843,6 +9843,25 @@ fn record_hosted_driver_wait_timeout(api_multiple: bool) {
     }
 }
 
+/// Hosted-driver wait census: (single-woken, single-timeouts, multiple-woken, multiple-timeouts,
+/// waiters-outstanding). A driver that re-arms a wait the instant it times out shows up here as a
+/// timeout count climbing with no matching wake — the signature of an executive/component livelock
+/// rather than of real waiting.
+pub(crate) fn hosted_driver_wait_census() -> (u64, u64, u64, u64, u64) {
+    (
+        HOSTED_DRIVER_WAIT_SINGLE_WOKEN.load(Ordering::Relaxed),
+        HOSTED_DRIVER_WAIT_SINGLE_TIMEOUTS.load(Ordering::Relaxed),
+        HOSTED_DRIVER_WAIT_MULTIPLE_WOKEN.load(Ordering::Relaxed),
+        HOSTED_DRIVER_WAIT_MULTIPLE_TIMEOUTS.load(Ordering::Relaxed),
+        unsafe {
+            (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+                .as_ref()
+                .map(|waiters| waiters.len() as u64)
+                .unwrap_or(0)
+        },
+    )
+}
+
 pub(crate) fn hosted_driver_wait_next_deadline() -> Option<u64> {
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))

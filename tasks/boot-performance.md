@@ -132,3 +132,67 @@ comparator ahead of the enable edge.
 
 Both are genuine design debt and should be cleaned up when the disk path matters (persistent
 FAT32 write-through), but neither is a boot-time problem today.
+
+
+---
+
+# Round 2: what the stalls actually are
+
+## Measurement artifacts found (and what they invalidate)
+
+**QEMU RIP sampling of a round-robin-TCG guest is biased and must not be trusted for a
+profile.** All 4 vCPUs share one host thread; `info registers -a` reports each vCPU's *saved*
+state, and QEMU leaves a vCPU precisely at interrupt-delivery/return boundaries. So a
+non-currently-executing vCPU's RIP lands in ISR entry/exit code far more often than it belongs
+there. This produced a confident-looking "~85% of the running CPU is in interrupt handling" that
+is an artifact. The per-CPU RIP+RSP stability test IS still valid for one thing: proving CPUs 1-3
+are genuinely halted (RIP and RSP frozen for an entire 150 s window, distinct=1).
+
+**Run-to-run variance invalidates single-run A/B comparisons.** Whether a run happens to hit a
+stall dominates any aggregate. The "1 ms vs 10 ms vs 200 ms" table in Round 1 compared runs that
+differed mainly in whether a stall occurred, so it should NOT be read as a clean 33x attribution
+to the tick change. (The tick change is still well-motivated on its own terms — see below.)
+
+## Facts established with tools that are NOT biased
+
+- **The LAPIC tick is exactly what it should be.** `info lapic` during a hosted boot:
+  `LVTT vec 65, periodic, DCR=0x3 (divide by 16), initial_count = 626010`. QEMU's APIC bus is
+  1 GHz, so 626010 / (1e9/16) = **10.016 ms**. Calibration is correct and the timer is not
+  storming. At the old `LAPIC_TICK_MS = 1` this was ~1.0 ms, which is why lowering it is still
+  the right call — but its size must be re-measured with the variance controlled.
+- **There is no device-interrupt storm.** `info irq` deltas sampled every 20 s across a 480 s
+  boot: IRQ 0 fires 2278 times during PIT calibration and then stops; after that the only traffic
+  is IRQ 8 once per ~125 s. Every other 20 s window is empty.
+- **CPUs 1-3 are genuinely halted**, so `-smp 4` is not stealing the round-robin budget.
+- **The rootserver is not budget-throttled.** `rootserver.rs:863` gives it period 1_000_000 /
+  budget 1_000_000 — full budget, "effectively never runs out" by construction.
+- **The hosted-driver waiter livelock hypothesis is dead.** The new `drvwait=` census reads
+  `0w/0t+01/0` for the whole boot: zero timeouts, zero outstanding waiters.
+
+## The discrimination that matters
+
+`[slow-event]` measures loop-top to loop-top, so it includes **the hosted process running in user
+mode** until its next trap. `[slow-dispatch]` measures only `nt_dispatcher.dispatch`, i.e. the
+executive's own code. They are not the same thing, and conflating them sent this investigation
+sideways.
+
+In the latest build most of the big stalls are slow **events** with no matching slow **dispatch**:
+a run showed `[slow-event]` of 145 s (lsass, NtReadFile), 147 s (lsass, a fault), 14 s
+(`NtQueryDebugFilterState` — a syscall that does essentially nothing), against a single
+`[slow-dispatch]` of 11 s. A trivial syscall cannot cost 14 s of handler time; that 14 s is lsass
+executing its own code under TCG afterwards.
+
+So the residual splits into two very different problems, and the next round must size them
+separately rather than treating "the boot is slow" as one thing:
+
+1. **Guest-side**: hosted processes burning real TCG cycles in their own code. Only addressable by
+   doing less work in the guest (or faster emulation), not by executive algorithms.
+2. **Executive-side**: genuine multi-second dispatches. The per-call `probe_seg!` breakdown now
+   attached to `[slow-dispatch]` will name the segment for `NtCreateKey`; extend it to whichever
+   SSN the next capture implicates.
+
+## Method note for the next round
+
+Fix the variance before trusting any comparison: run each configuration N times and compare
+**time to a fixed early milestone** (before the first stall), or compare **exec-dispatch Mtick per
+dispatch on runs that recorded zero `[slow-event]`s**. A single run proves nothing here.

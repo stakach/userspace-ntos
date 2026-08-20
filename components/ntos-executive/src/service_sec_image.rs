@@ -8898,6 +8898,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = st;
                     handled = true;
                 } else {
+                    crate::probe_reset();
                     let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);

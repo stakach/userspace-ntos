@@ -21140,7 +21140,7 @@ impl ExecNtHandler {
                     }
                 };
                 let transient_mark = allocator::mark();
-                let name = self.read_registry_objattr_name(oa);
+                let name = crate::probe_seg!(0, self.read_registry_objattr_name(oa));
                 // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
                 let full: Option<alloc::string::String> = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut f = alloc::string::String::from(r"\Registry\Machine\");
@@ -21177,7 +21177,7 @@ impl ExecNtHandler {
                     Some(f) => f,
                     None => return 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 };
-                let canon = self.overlay_canon(&full);
+                let canon = crate::probe_seg!(1, self.overlay_canon(&full));
                 if canon == r"\" {
                     return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
                 }
@@ -21203,7 +21203,7 @@ impl ExecNtHandler {
                     .rsplit_once('\\')
                     .map(|(parent, _)| if parent.is_empty() { r"\" } else { parent })
                     .unwrap_or(r"\");
-                if !self.registry_path_exists(parent) {
+                if !crate::probe_seg!(2, self.registry_path_exists(parent)) {
                                         return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // Disposition/storage split: explicit overlay handles keep their overlay identity,
@@ -21214,18 +21214,21 @@ impl ExecNtHandler {
                 let create_options = nt_ulong_arg(args[5]);
                 let create_volatile = create_options & 0x1 != 0;
                 let root_is_overlay = root_target.and_then(overlay_key_idx).is_some();
-                let overlay_existing = if root_is_overlay {
+                let overlay_existing = crate::probe_seg!(3, if root_is_overlay {
                     self.overlay.find(&canon)
                 } else {
                     self.registry_overlay_index_for_canon_path(&canon)
-                };
-                let mutable_existing = self.mutable_hives.resolve_key(&full);
-                let base_existing =
+                });
+                let mutable_existing =
+                    crate::probe_seg!(4, self.mutable_hives.resolve_key(&full));
+                let base_existing = crate::probe_seg!(
+                    5,
                     if mutable_existing.is_none() && !self.mutable_hive_owns_path(&full) {
                         self.resolve_key(&full)
                     } else {
                         None
-                    };
+                    }
+                );
                 let existed = overlay_existing.is_some()
                     || mutable_existing.is_some()
                     || base_existing.is_some();
@@ -21294,11 +21297,11 @@ impl ExecNtHandler {
                     bump_progress();
                                         return 0;
                 }
-                let mutable_parent = if create_volatile || root_is_overlay {
+                let mutable_parent = crate::probe_seg!(6, if create_volatile || root_is_overlay {
                     None
                 } else {
                     self.mutable_hives.resolve_key(parent)
-                };
+                });
                 if let Some(mutable_parent) = mutable_parent {
                     let canon_len = canon.len();
                     let leaf = full.rsplit('\\').next().unwrap_or("");
@@ -21362,8 +21365,10 @@ impl ExecNtHandler {
                     } else {
                         None
                     };
-                    let mutable_key = match self.journal_create_mutable_subkey(mutable_parent, leaf)
-                    {
+                    let mutable_key = match crate::probe_seg!(
+                        7,
+                        self.journal_create_mutable_subkey(mutable_parent, leaf)
+                    ) {
                         Ok(key) => key,
                         Err(status) => return status,
                     };
@@ -21381,8 +21386,11 @@ impl ExecNtHandler {
                             return status;
                         }
                     }
-                    self.mark_mutable_hives_dirty_for_services_order_change(
-                        Self::registry_services_order_key_membership_may_change(canon),
+                    crate::probe_seg!(
+                        8,
+                        self.mark_mutable_hives_dirty_for_services_order_change(
+                            Self::registry_services_order_key_membership_may_change(canon),
+                        )
                     );
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
@@ -21415,8 +21423,10 @@ impl ExecNtHandler {
                             print_str(b" created mutable by winlogon\n");
                         }
                     }
-                    let status =
-                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0]);
+                    let status = crate::probe_seg!(
+                        9,
+                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                    );
                     if status != 0 {
                                                 return status;
                     }
