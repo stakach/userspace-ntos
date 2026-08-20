@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-19
+Last updated: 2026-08-21
 
 ## Objective
 
@@ -8492,3 +8492,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     cap/scheduler evidence. Continue at the generic SCM/service-control/profile transition that
     should let winlogon leave the logon dialog and activate the real user shell; do not add
     service-name launch policy, synthetic shell signalling, or winlogon-specific quiesce success.
+
+    Restored desktop proof after rust-micro IRQ/tick repair (2026-08-21): the slow-boot/login
+    stall was fixed in `rust-micro`, not by adding NT-side launch policy. The current submodule head
+    includes `e746507 kernel: mask the line that actually fired, by vector` and recent tick-period
+    scaling work; with that baseline the user-provided desktop run reaches the real ReactOS desktop
+    again. This closes the previous pre-user-shell/login-screen frontier: user shell activation,
+    `userinit.exe`, Explorer, and desktop paint are back in the live path. The active red edge has
+    moved later to post-desktop `kbswitch.exe`/win32k GDI traffic. The observed sequence is
+    `kbswitch.exe -> SSN 0x106c`, which maps to `NtGdiCreateBitmap`, returning `0x0605015e`, then
+    `kbswitch.exe -> SSN 0x10b5`, which maps to `NtGdiCreatePatternBrushInternal`, returning
+    `0x0610014c`, followed by repeated user page faults in the `tcb=86` client and a final `tcb=3`
+    `#GP` at `rip=0x100006828b6` with no installed fault handler. Review adjustment: the next
+    frontier is no longer SCM/profile/logon activation. Continue at the generic post-desktop GDI
+    client/object boundary: prove whether the bitmap and pattern-brush handles returned by isolated
+    win32k are valid for `kbswitch.exe`'s GDI shared table, whether the client-side GDI/user callback
+    path is executing through a stale or unmapped user pointer, and why the final system thread
+    reaches a no-handler `#GP`. Do not add kbswitch-specific success handling; fix the shared GDI
+    handle publication, client mapping, or fault-attribution mechanism that the run exposes.
