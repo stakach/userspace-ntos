@@ -332,3 +332,72 @@ Further micro-optimisation of executive handlers will not move the boot much. Th
 Nothing further — Round 4 was measurement. The fixes to date remain: the extent-wise
 `NtAllocateVirtualMemory` commit, the HPET stale-delivery drain/re-arm, the `extern-rootserver`
 tick period, and the one-time AHCI port bring-up.
+
+
+---
+
+# Round 5: SOLVED — an unmaskable IRQ storm in the kernel
+
+The suggestion to test whether this was a rust-micro problem was right, and there was a cheaper
+way to isolate it than swapping in seL4: **count retired instructions per address range with a
+QEMU TCG plugin** (`scratchpad/whoruns.c`, built against `/opt/homebrew/include/qemu-plugin.h`).
+Unlike RIP sampling it has no bias — attribution happens at translation time, and a halted CPU
+retires nothing.
+
+The very first run settled it. Over 239 seconds of a stall:
+
+| | retired instructions |
+| --- | --- |
+| kernel | **+40,383,973,458** (169M/s) |
+| ntos-executive | +16,027,357 |
+| hosted processes | **+0** |
+
+The guest was executing *nothing*. Every theory that blamed executive algorithms or guest code —
+including Round 4's — was wrong, and no userspace fix could ever have helped, because the
+executive never ran.
+
+Per-TB attribution named the loop: `irq12_entry` -> `irq_dispatch` -> `notification::signal` ->
+`swap_iretq_context_if_preempted` -> `bkl_acquire`. An interrupt storm.
+
+## Why the kernel could not stop it
+
+`irq_dispatch` masked the line only `if entry.level_triggered`, and only when a pin had been
+recorded by `X86IRQIssueIRQHandlerIOAPIC`. Three separate gaps, each measured:
+
+1. **Gating on the declared trigger mode.** The kernel cannot trust userspace's declaration to
+   predict whether the source is still asserting. Removing the gate was necessary but not
+   sufficient.
+2. **No pin recorded at all.** A handler issued through the plain `IRQControl_Get` path stores
+   nothing, so there was nothing to mask. A kernel diagnostic printed
+   `[irq-mask] irq=11 NO-PIN (cannot mask; storm reachable)` eight times inside one millisecond.
+3. **Guessing the identity-mapped GSI is wrong for PCI INTx.** On q35 those lines map to
+   GSI 16..23 while the device's legacy IRQ number is something like 11 — and `info irq` showed
+   the real traffic on **23**. Masking GSI 11 masks a line nothing uses. Measured: it did not help.
+
+## The fix
+
+Mask by **what actually fired**. The redirection table is the authority: `set_mask_for_vector`
+scans it and masks every entry programmed to deliver the CPU vector currently being handled; Ack
+unmasks the same way. No bookkeeping, a bounded 24-entry scan on the delivery path, and it
+restores seL4's contract of one delivery per Ack.
+
+## Result
+
+| | before | after |
+| --- | --- | --- |
+| hosted boot | **never finished within a 45-minute cap** | **completes in 92 s** (`RUNEXIT=3`) |
+| serial output in a 400 s window | 2,251 lines | 47,293 lines |
+| instruction split | kernel 97% / exec 0.8% | **exec 63% / kernel 34%** |
+| gate | (never reached) | 291/292 checks |
+
+Kernel spec suite still passes ("All specs passed!", including SMP and the MCS budget demo).
+
+The remaining `FAIL exec_winlogon_profile_directory_resolved` is the known profile/`ntuser.dat`
+frontier, not a regression — the gate simply reaches it now.
+
+## Method note
+
+Three measurement traps cost real time in this investigation, all recorded above: biased RIP
+sampling, single-run A/B against huge variance, and rdtsc brackets that contain preemption points.
+**Counting retired instructions had none of them.** For "where is the time going" on an emulated
+target, reach for the TCG plugin first.
