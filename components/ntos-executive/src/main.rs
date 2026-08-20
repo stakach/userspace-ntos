@@ -6669,6 +6669,49 @@ pub(crate) static EXEC_DISPATCH_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXEC_DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SLOW_DISPATCH_TRACED: AtomicU64 = AtomicU64::new(0);
 
+/// GUEST-vs-EXECUTIVE SPLIT. The badge census cannot separate "our code is slow" from "the hosted
+/// process is slow", and per-SSN dispatch totals are inflated by the win32k arms that run a NESTED
+/// pump (guest execution happens INSIDE the outer dispatch). The clean split is the blocking
+/// receive: while the executive sits in `SYS_RECV` it is doing nothing, so that time belongs to
+/// the guest. Everything else in the loop is ours. Both receive primitives feed these, so all
+/// call sites are covered from one place.
+pub(crate) static RECV_BLOCKED_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RECV_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// SERVICE-LOOP BODY CENSUS. `recv-blocked` + `exec-dispatch` accounted for only ~4 s of a 298 s
+/// boot, so nearly all of the wall-clock is in the loop body OUTSIDE the native dispatcher. These
+/// bracket the three things every iteration does unconditionally, so the remainder is attributable
+/// to the per-message arms (faults, win32k) rather than to fixed per-iteration overhead.
+pub(crate) static LOOP_KUSER_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOOP_DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOOP_QUIESCE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Breakdown of the per-iteration drain, which the loop census showed owning 144 s of a 422 s boot.
+pub(crate) static DRAIN_SCAN_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DRAIN_WORK_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DRAIN_REARM_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to nine wake paths; one of them owns
+/// the whole boot, so they are timed individually.
+pub(crate) const SUBDRAIN_N: usize = 9;
+pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
+    [const { AtomicU64::new(0) }; SUBDRAIN_N];
+pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
+    [const { AtomicU64::new(0) }; SUBDRAIN_N];
+
+/// Time one sub-drain into slot `$slot`, returning the number of waiters it woke.
+macro_rules! subdrain {
+    ($slot:expr, $body:expr) => {{
+        let __s = disk_census_ticks();
+        let __w: u64 = $body;
+        SUBDRAIN_TICKS[$slot]
+            .fetch_add(disk_census_ticks().wrapping_sub(__s), Ordering::Relaxed);
+        SUBDRAIN_WOKEN[$slot].fetch_add(__w, Ordering::Relaxed);
+        __w
+    }};
+}
+
 /// PER-CALL DISPATCH PROBE. Aggregate per-SSN totals cannot explain these stalls: the same handler
 /// runs thousands of times cheaply and then ONE call costs 20-160 s. A total hides that call; this
 /// records the segments of the CURRENT dispatch and is dumped only when that dispatch turns out to
@@ -7037,6 +7080,42 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         print_str(b"/");
         print_u64(outstanding);
     }
+    print_str(b" subdrain:");
+    for slot in 0..SUBDRAIN_N {
+        let ms = SUBDRAIN_TICKS[slot].load(Ordering::Relaxed) / 1_000_000;
+        if ms == 0 {
+            continue;
+        }
+        print_str(b" #");
+        print_u64(slot as u64);
+        print_str(b"=");
+        print_u64(ms);
+        print_str(b"ms/");
+        print_u64(SUBDRAIN_WOKEN[slot].load(Ordering::Relaxed));
+    }
+    print_str(b" drain=");
+    print_u64(DRAIN_CALLS.load(Ordering::Relaxed));
+    print_str(b"c/");
+    print_u64(DRAIN_DUE_HITS.load(Ordering::Relaxed));
+    print_str(b"due/");
+    print_u64(DRAIN_SCAN_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"s/");
+    print_u64(DRAIN_WORK_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"w/");
+    print_u64(DRAIN_REARM_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"r ms");
+    print_str(b" loop=");
+    print_u64(LOOP_KUSER_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"k/");
+    print_u64(LOOP_DRAIN_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"d/");
+    print_u64(LOOP_QUIESCE_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"q ms");
+    print_str(b" recv-blocked=");
+    print_u64(RECV_CALLS.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(RECV_BLOCKED_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"ms");
     print_str(b" exec-dispatch=");
     print_u64(EXEC_DISPATCH_CALLS.load(Ordering::Relaxed));
     print_str(b"/");
@@ -13605,6 +13684,7 @@ unsafe fn reply_recv_badge(
 /// faulting dispatch can't orphan an outer caller's pending reply. The kernel preserves the user's
 /// r12 across the syscall (it reads it, never writes it), so `in` is sufficient.
 unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let recv_started = disk_census_ticks();
     let badge: u64;
     let msginfo: u64;
     let mr0: u64;
@@ -13625,6 +13705,11 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    RECV_BLOCKED_TICKS.fetch_add(
+        disk_census_ticks().wrapping_sub(recv_started),
+        Ordering::Relaxed,
+    );
+    RECV_CALLS.fetch_add(1, Ordering::Relaxed);
     // ★ THE DEADMAN LIVES HERE for hosted-thread endpoint receives, not at the service-loop top, so
     // it also covers nested rendezvous receives. Executive-side SURT client waits mirror this same
     // HPET-badge handling in `RingChannel::wait_completion_timer_aware`.
@@ -13650,6 +13735,7 @@ unsafe fn client_reply_recv_badge(
     r2: u64,
     r3: u64,
 ) -> (u64, u64, u64, u64, u64, u64) {
+    let recv_started = disk_census_ticks();
     let badge: u64;
     let msginfo: u64;
     let mr0: u64;
@@ -13670,6 +13756,11 @@ unsafe fn client_reply_recv_badge(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    RECV_BLOCKED_TICKS.fetch_add(
+        disk_census_ticks().wrapping_sub(recv_started),
+        Ordering::Relaxed,
+    );
+    RECV_CALLS.fetch_add(1, Ordering::Relaxed);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if EXEC_DEADMAN_WATCHDOG {
         if badge == DELAY_TIMER_BADGE {
@@ -14375,15 +14466,15 @@ unsafe fn delay_timer_drain_due_work(
     handler: &mut ExecNtHandler,
     now_100ns: u64,
 ) -> u64 {
-    let watchdog_tick = watchdog_take_timer_work(now_100ns);
-    delay_wake_due(handler, queue, now_100ns)
-        + wait_wake_due(handler, now_100ns)
-        + keyed_wait_wake_due(handler, now_100ns)
-        + keyed_release_wait_wake_due(handler, now_100ns)
-        + io_completion_wake_due(handler, now_100ns)
-        + pipe_name_wait_wake_due(handler, now_100ns)
-        + user_timer_wake_due(handler, now_100ns)
-        + driver_launch::hosted_driver_wait_wake_due(now_100ns)
+    let watchdog_tick = subdrain!(8, watchdog_take_timer_work(now_100ns));
+    subdrain!(0, delay_wake_due(handler, queue, now_100ns))
+        + subdrain!(1, wait_wake_due(handler, now_100ns))
+        + subdrain!(2, keyed_wait_wake_due(handler, now_100ns))
+        + subdrain!(3, keyed_release_wait_wake_due(handler, now_100ns))
+        + subdrain!(4, io_completion_wake_due(handler, now_100ns))
+        + subdrain!(5, pipe_name_wait_wake_due(handler, now_100ns))
+        + subdrain!(6, user_timer_wake_due(handler, now_100ns))
+        + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
         + watchdog_tick
 }
 
@@ -14394,18 +14485,62 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 {
         return 0;
     }
-    let Some((deadline, _source)) = delay_timer_next_deadline(queue) else {
+    DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    let scan_started = disk_census_ticks();
+    let next = delay_timer_next_deadline(queue);
+    let now_100ns = monotonic_time_100ns();
+    DRAIN_SCAN_TICKS.fetch_add(
+        disk_census_ticks().wrapping_sub(scan_started),
+        Ordering::Relaxed,
+    );
+    let Some((deadline, _source)) = next else {
         return 0;
     };
-    let now_100ns = monotonic_time_100ns();
     if now_100ns < deadline {
         return 0;
     }
+    DRAIN_DUE_HITS.fetch_add(1, Ordering::Relaxed);
+    // Snapshot the per-sub-drain totals so a SLOW call can report its own deltas. Aggregates are
+    // useless here: this path runs a handful of times per boot and one call can cost a minute.
+    let mut before = [0u64; SUBDRAIN_N];
+    for slot in 0..SUBDRAIN_N {
+        before[slot] = SUBDRAIN_TICKS[slot].load(Ordering::Relaxed);
+    }
+    let work_started = disk_census_ticks();
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
+    let work_ticks = disk_census_ticks().wrapping_sub(work_started);
+    DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
+    if work_ticks > 1_000_000_000 {
+        print_str(b"[drain-slow] total_ms=");
+        print_u64(work_ticks / 1_000_000);
+        print_str(b" woken=");
+        print_u64(woken);
+        print_str(b" by-subdrain:");
+        for slot in 0..SUBDRAIN_N {
+            let ms = SUBDRAIN_TICKS[slot]
+                .load(Ordering::Relaxed)
+                .wrapping_sub(before[slot])
+                / 1_000_000;
+            if ms == 0 {
+                continue;
+            }
+            print_str(b" #");
+            print_u64(slot as u64);
+            print_str(b"=");
+            print_u64(ms);
+            print_str(b"ms");
+        }
+        print_str(b"\n");
+    }
     TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);
+    let rearm_started = disk_census_ticks();
     delay_timer_rearm(queue);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     delay_timer_ack_irq();
+    DRAIN_REARM_TICKS.fetch_add(
+        disk_census_ticks().wrapping_sub(rearm_started),
+        Ordering::Relaxed,
+    );
     woken
 }
 
@@ -23375,29 +23510,47 @@ unsafe fn ahci_read_sectors(
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
-    // Enable AHCI mode (GHC.AE bit 31).
-    let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
-    core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
-    // Stop the port: clear ST (bit 0) + FRE (bit 4); wait CR (bit 15) + FR (bit 14) clear.
-    pw(0x18, pr(0x18) & !((1 << 0) | (1 << 4)));
-    for _ in 0..1_000_000u64 {
-        if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
-            break;
+    // BRING THE PORT UP ONCE, not once per command.
+    //
+    // This used to stop the port (clear ST+FRE), spin until CR/FR cleared, zero 2 KiB of tables,
+    // reprogram PxCLB/PxFB and restart FRE+ST — for EVERY read, including a single 512-byte
+    // sector. Under TCG each of those register accesses is a trap into the device model, and
+    // restarting the command engine costs far more than the transfer itself; a whole-file read
+    // pays it thousands of times. The port state is the authority on whether that work is needed,
+    // so no static is required (this path is shared with the isolated storage host, whose image is
+    // mapped read-only and cannot write statics).
+    const PX_CMD_ST: u32 = 1 << 0;
+    const PX_CMD_FRE: u32 = 1 << 4;
+    let clb = (pr(0x00) as u64) | ((pr(0x04) as u64) << 32);
+    let fb = (pr(0x08) as u64) | ((pr(0x0C) as u64) << 32);
+    let running = clb == dma_paddr
+        && fb == dma_paddr + 0x400
+        && pr(0x18) & (PX_CMD_ST | PX_CMD_FRE) == (PX_CMD_ST | PX_CMD_FRE);
+    if !running {
+        // Enable AHCI mode (GHC.AE bit 31).
+        let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
+        core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
+        // Stop the port: clear ST (bit 0) + FRE (bit 4); wait CR (bit 15) + FR (bit 14) clear.
+        pw(0x18, pr(0x18) & !(PX_CMD_ST | PX_CMD_FRE));
+        for _ in 0..1_000_000u64 {
+            if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
         }
+        // Zero the command list + FIS + command table region, then program the bases.
+        for i in 0..(0x800u64 / 8) {
+            core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
+        }
+        pw(0x00, dma_paddr as u32); // PxCLB  (command list @ +0)
+        pw(0x04, (dma_paddr >> 32) as u32); // PxCLBU
+        pw(0x08, (dma_paddr + 0x400) as u32); // PxFB (FIS rx @ +0x400)
+        pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32); // PxFBU
+                                            // Start FRE, then ST.
+        pw(0x18, pr(0x18) | PX_CMD_FRE);
         core::hint::spin_loop();
+        pw(0x18, pr(0x18) | PX_CMD_ST);
     }
-    // Zero the command list + FIS + command table region, then program the bases.
-    for i in 0..(0x800u64 / 8) {
-        core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
-    }
-    pw(0x00, dma_paddr as u32); // PxCLB  (command list @ +0)
-    pw(0x04, (dma_paddr >> 32) as u32); // PxCLBU
-    pw(0x08, (dma_paddr + 0x400) as u32); // PxFB (FIS rx @ +0x400)
-    pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32); // PxFBU
-                                        // Start FRE, then ST.
-    pw(0x18, pr(0x18) | (1 << 4));
-    core::hint::spin_loop();
-    pw(0x18, pr(0x18) | (1 << 0));
     pw(0x10, 0xFFFF_FFFF); // clear PxIS
 
     // Command Table @ dma+0x500: H2D Register FIS (READ DMA EXT) + PRDT[0].
@@ -23464,25 +23617,35 @@ unsafe fn ahci_write_sectors(
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
-    let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
-    core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
-    pw(0x18, pr(0x18) & !((1 << 0) | (1 << 4)));
-    for _ in 0..1_000_000u64 {
-        if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
-            break;
+    // Same one-time bring-up as the read path — see the note in `ahci_read_sectors`.
+    const PX_CMD_ST: u32 = 1 << 0;
+    const PX_CMD_FRE: u32 = 1 << 4;
+    let clb = (pr(0x00) as u64) | ((pr(0x04) as u64) << 32);
+    let fb = (pr(0x08) as u64) | ((pr(0x0C) as u64) << 32);
+    let running = clb == dma_paddr
+        && fb == dma_paddr + 0x400
+        && pr(0x18) & (PX_CMD_ST | PX_CMD_FRE) == (PX_CMD_ST | PX_CMD_FRE);
+    if !running {
+        let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
+        core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
+        pw(0x18, pr(0x18) & !(PX_CMD_ST | PX_CMD_FRE));
+        for _ in 0..1_000_000u64 {
+            if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
         }
+        for i in 0..(0x800u64 / 8) {
+            core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
+        }
+        pw(0x00, dma_paddr as u32);
+        pw(0x04, (dma_paddr >> 32) as u32);
+        pw(0x08, (dma_paddr + 0x400) as u32);
+        pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32);
+        pw(0x18, pr(0x18) | PX_CMD_FRE);
         core::hint::spin_loop();
+        pw(0x18, pr(0x18) | PX_CMD_ST);
     }
-    for i in 0..(0x800u64 / 8) {
-        core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
-    }
-    pw(0x00, dma_paddr as u32);
-    pw(0x04, (dma_paddr >> 32) as u32);
-    pw(0x08, (dma_paddr + 0x400) as u32);
-    pw(0x0C, ((dma_paddr + 0x400) >> 32) as u32);
-    pw(0x18, pr(0x18) | (1 << 4));
-    core::hint::spin_loop();
-    pw(0x18, pr(0x18) | (1 << 0));
     pw(0x10, 0xFFFF_FFFF);
 
     let ct = dma_vaddr + 0x500;

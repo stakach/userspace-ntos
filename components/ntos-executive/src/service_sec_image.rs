@@ -5507,12 +5507,25 @@ pub(crate) unsafe fn service_sec_image(
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     loop {
         if ntdll.is_some() {
+            let started = crate::disk_census_ticks();
             publish_kuser_clocks();
+            crate::LOOP_KUSER_TICKS.fetch_add(
+                crate::disk_census_ticks().wrapping_sub(started),
+                Ordering::Relaxed,
+            );
         }
-        let overdue_timed_wakes = if badge == DELAY_TIMER_BADGE {
-            0
-        } else {
-            delay_timer_drain_overdue_without_badge(delay_queue, &mut nt_handler)
+        let overdue_timed_wakes = {
+            let started = crate::disk_census_ticks();
+            let drained = if badge == DELAY_TIMER_BADGE {
+                0
+            } else {
+                delay_timer_drain_overdue_without_badge(delay_queue, &mut nt_handler)
+            };
+            crate::LOOP_DRAIN_TICKS.fetch_add(
+                crate::disk_census_ticks().wrapping_sub(started),
+                Ordering::Relaxed,
+            );
+            drained
         };
         if overdue_timed_wakes != 0 {
             bump_progress();
@@ -5529,6 +5542,7 @@ pub(crate) unsafe fn service_sec_image(
         // Progress-stall accounting: reset the wall-clock window on any epoch bump (real forward
         // progress); quiesce if no progress for STALL_BUDGET_100NS.
         {
+            let quiesce_started = crate::disk_census_ticks();
             let ep = PROGRESS_EPOCH.load(Ordering::Relaxed);
             let now = monotonic_time_100ns();
             {
@@ -5555,6 +5569,10 @@ pub(crate) unsafe fn service_sec_image(
                 census_prev_mi = mi;
                 census_prev_m0 = m0;
                 census_prev_t = now;
+                crate::LOOP_QUIESCE_TICKS.fetch_add(
+                    crate::disk_census_ticks().wrapping_sub(quiesce_started),
+                    Ordering::Relaxed,
+                );
                 census_tick_static(now);
             }
             if ep != last_progress_epoch {

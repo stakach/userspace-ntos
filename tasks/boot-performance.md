@@ -196,3 +196,75 @@ separately rather than treating "the boot is slow" as one thing:
 Fix the variance before trusting any comparison: run each configuration N times and compare
 **time to a fixed early milestone** (before the first stall), or compare **exec-dispatch Mtick per
 dispatch on runs that recorded zero `[slow-event]`s**. A single run proves nothing here.
+
+
+---
+
+# Round 3: the accounting split, and the AHCI port fix
+
+## The split that finally localised it
+
+Added an unbiased three-way split of the service loop, all rdtsc-based:
+
+* `recv-blocked=` — time inside the blocking receive (both `recv_full_r12` and
+  `client_reply_recv_badge`, so every call site is covered from one place). While the executive
+  sits in `SYS_RECV` it is doing nothing, so that time belongs to the guest.
+* `exec-dispatch=` — time inside `nt_dispatcher.dispatch`, i.e. the executive's syscall handlers.
+* `loop=<kuser>k/<drain>d/<quiesce>q ms` — the three things every loop iteration does
+  unconditionally, so the remainder is attributable to the per-message arms.
+
+**Measured at 421.8 s of wall clock:**
+
+| where | cost |
+| --- | --- |
+| blocked in receive (guest running) | **1.65 s** |
+| inside `nt_dispatcher.dispatch` | **5.67 s** |
+| `publish_kuser_clocks` | 0.051 s |
+| quiesce/progress bookkeeping | 0.011 s |
+| **`delay_timer_drain_overdue_without_badge`** | **144.2 s** |
+
+So it is neither the guest nor the syscall handlers. Breaking the drain down further
+(`drain=<calls>c/<due>due/<scan>s/<work>w/<rearm>r`):
+
+* 13,650 calls, of which only **8** found anything due.
+* the per-iteration scan (`delay_timer_next_deadline` + one HPET read) totals **393 ms** — fine.
+* **`delay_timer_drain_due_work`: 143,752 ms across those 8 calls** — ~18 s per call, and the two
+  calls between the last two census dumps cost ~72 s each.
+
+`delay_timer_drain_due_work` fans out to nine wake paths (`delay_wake_due`, `wait_wake_due`,
+`keyed_wait_wake_due`, `keyed_release_wait_wake_due`, `io_completion_wake_due`,
+`pipe_name_wait_wake_due`, `user_timer_wake_due`, `hosted_driver_wait_wake_due`,
+`watchdog_take_timer_work`). Each is now timed individually (`subdrain:` in the census) and a
+`[drain-slow]` line dumps the per-call deltas whenever one call exceeds 1 s — aggregates are
+useless here, since the path runs a handful of times per boot and one call can cost a minute.
+**Capturing that attribution is the next step**; the runs since have diverged before reaching it.
+
+## Fixed: the AHCI port was re-initialised on EVERY command
+
+`ahci_read_sectors`/`ahci_write_sectors` stopped the port (clear ST+FRE), spun until CR/FR
+cleared, zeroed 2 KiB of tables, reprogrammed PxCLB/PxFB and restarted FRE+ST — for every read,
+including a single 512-byte sector. Under TCG each of those register accesses traps into the
+device model, and restarting the command engine costs far more than the transfer itself.
+
+Round 1 measured this path at 0.87 s and deprioritised it. That measurement was taken on a *fast*
+run: the per-command cost is not stable, and in a long boot the disk census reached
+`16237cmd/64562Mtick` — **64.5 s**, ~4 ms per command instead of ~56 µs.
+
+The port state is now the authority on whether bring-up is needed (compare PxCLB/PxFB against the
+DMA base and check ST|FRE), so no static is required — important because this path is shared with
+the isolated storage host, which cannot write statics.
+
+**Measured on the reproducible case** — reading the 1.4 MiB `explorer.exe`:
+
+| | before | after |
+| --- | --- | --- |
+| runs reaching the read | 2 of 2 | 3 of 3 |
+| read duration | **hung 390+ s** (never completed in the probe window) | **~57 ms** |
+
+## Still open
+
+- Attribute the 144 s to one of the nine sub-drains (`[drain-slow]` is armed and waiting for a run
+  that reaches it).
+- Other stall sites remain and move between runs: one boot stalled at `[sec-init] bootstrap-image
+  item=3 end`, another at smss's `[query-dir] call pi=0`. The same three-way split will localise
+  each of them the same way.
