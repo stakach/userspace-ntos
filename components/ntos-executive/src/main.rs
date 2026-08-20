@@ -6700,6 +6700,15 @@ pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 
+/// Inside `delay_wake_due`: the reply-send is not just bookkeeping. Sending on a reply cap makes
+/// the target runnable and the kernel may switch to it directly, so the syscall does not return
+/// until the executive is scheduled again — i.e. after the woken thread has run. Timing the send
+/// separately from the surrounding bookkeeping is what distinguishes "our wake path is slow" from
+/// "the thread we woke ran for a long time".
+pub(crate) static DELAY_WAKE_REPLY_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DELAY_WAKE_OTHER_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DELAY_WAKE_LAST_BADGE: AtomicU64 = AtomicU64::new(0);
+
 /// Time one sub-drain into slot `$slot`, returning the number of waiters it woke.
 macro_rules! subdrain {
     ($slot:expr, $body:expr) => {{
@@ -7080,6 +7089,12 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         print_str(b"/");
         print_u64(outstanding);
     }
+    print_str(b" delaywake=");
+    print_u64(DELAY_WAKE_REPLY_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"reply/");
+    print_u64(DELAY_WAKE_OTHER_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"other ms b=");
+    print_u64(DELAY_WAKE_LAST_BADGE.load(Ordering::Relaxed));
     print_str(b" subdrain:");
     for slot in 0..SUBDRAIN_N {
         let ms = SUBDRAIN_TICKS[slot].load(Ordering::Relaxed) / 1_000_000;
@@ -14376,13 +14391,25 @@ unsafe fn delay_wake_due(
 ) -> u64 {
     let mut woken = 0;
     while let Some(waiter) = queue.pop_due(now) {
+        let other_started = disk_census_ticks();
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        DELAY_WAKE_LAST_BADGE.store(waiter.badge, Ordering::Relaxed);
         set_reply_mr(15, waiter.resume_ip);
         set_reply_mr(16, waiter.resume_sp);
         set_reply_mr(17, waiter.resume_flags);
+        let reply_started = disk_census_ticks();
         client_reply_on(waiter.reply_cap, 18, 0, 0, 0, 0);
+        let reply_done = disk_census_ticks();
+        DELAY_WAKE_REPLY_TICKS
+            .fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
+        DELAY_WAKE_OTHER_TICKS.fetch_add(
+            disk_census_ticks()
+                .wrapping_sub(other_started)
+                .wrapping_sub(reply_done.wrapping_sub(reply_started)),
+            Ordering::Relaxed,
+        );
         woken += 1;
     }
     woken
@@ -14510,8 +14537,11 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     let work_ticks = disk_census_ticks().wrapping_sub(work_started);
     DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
-    if work_ticks > 1_000_000_000 {
-        print_str(b"[drain-slow] total_ms=");
+    // Print EVERY due drain, not just slow ones: the path fires only a handful of times per boot,
+    // so this is a few lines, and a run that diverges before the expensive one still reports the
+    // cheap ones — which is what tells us the shape.
+    {
+        print_str(b"[drain-due] total_ms=");
         print_u64(work_ticks / 1_000_000);
         print_str(b" woken=");
         print_u64(woken);
@@ -14530,6 +14560,12 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
             print_u64(ms);
             print_str(b"ms");
         }
+        print_str(b" delay-wake reply_ms=");
+        print_u64(DELAY_WAKE_REPLY_TICKS.load(Ordering::Relaxed) / 1_000_000);
+        print_str(b" other_ms=");
+        print_u64(DELAY_WAKE_OTHER_TICKS.load(Ordering::Relaxed) / 1_000_000);
+        print_str(b" badge=");
+        print_u64(DELAY_WAKE_LAST_BADGE.load(Ordering::Relaxed));
         print_str(b"\n");
     }
     TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);

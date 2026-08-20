@@ -268,3 +268,67 @@ the isolated storage host, which cannot write statics.
 - Other stall sites remain and move between runs: one boot stalled at `[sec-init] bootstrap-image
   item=3 end`, another at smss's `[query-dir] call pi=0`. The same three-way split will localise
   each of them the same way.
+
+
+---
+
+# Round 4: the 144 s is the GUEST, and here is the proof chain
+
+`[drain-due]` now prints on every due drain (a handful per boot), with per-call sub-drain deltas.
+Two independent runs captured the expensive one:
+
+```
+[drain-due] total_ms=158500 woken=1 by-subdrain: #0=158500ms
+[drain-due] total_ms=158931 woken=1 by-subdrain: #0=158931ms delay-wake reply_ms=0 other_ms=0 badge=20
+```
+
+So the whole cost is **sub-drain #0 = `delay_wake_due`**, waking exactly **one** waiter, on **badge
+20** (a services.exe worker thread).
+
+`delay_wake_due` is small enough to eliminate every part of it by measurement:
+
+```rust
+while let Some(waiter) = queue.pop_due(now) {      // <- all 158.9 s lands here
+    ...set_reply_mr x3...
+    client_reply_on(waiter.reply_cap, ...);        // reply_ms  = 0
+    release_reply_pool_cap(...);                   // other_ms = 0
+    thread_wait_state_clear_badge_ready(...);      //     "
+}
+```
+
+* `reply_ms = 0` — not the IPC.
+* `other_ms = 0` — not the bookkeeping.
+* What remains is `Queue::pop_due`, a linear scan with `min_by_key` over `DELAY_WAITER_N =
+  WAIT_REPLY_POOL_N - 1 = HOSTED_THREAD_RUNTIME_CAP` slots — a few hundred `Option<Waiter>`.
+  **A scan that size cannot take 159 seconds.**
+
+Therefore the executive is **not running** for that time: it is preempted inside `delay_wake_due`,
+immediately after `client_reply_on` made the badge-20 thread runnable, and that thread runs ~159 s
+of emulated code before trapping again. The time is charged to whatever instruction the executive
+happened to be on, which is why it lands in `pop_due`.
+
+**Conclusion: the dominant residual boot cost is hosted-process execution, not executive code.**
+The Round-3 accounting was right that it was neither `recv-blocked` nor `exec-dispatch`, but wrong
+to conclude it was therefore executive work — a preempted thread's off-CPU time looks like
+on-CPU time to an rdtsc bracket. That is the third measurement trap this investigation has hit,
+and the general lesson is the same each time: **rdtsc brackets measure elapsed time, not CPU time,
+so any bracket that can contain a preemption point is an upper bound, not an attribution.**
+
+## What this means for the remaining work
+
+Further micro-optimisation of executive handlers will not move the boot much. The levers are:
+
+1. **Find why badge 20 runs so long.** The strong suspicion is a poll/retry loop driven by waits
+   that TIME OUT instead of being signalled — the boot logs `[io-completion] TIMEOUT` and
+   `[pipe-name-wait] TIMEOUT` repeatedly, and a ReactOS service that gets a timeout typically
+   retries with a Sleep. Fixing the missing wake removes the spin, and with it the emulated work.
+   Start by dumping what badge 20's thread is doing (`tid`, its last SSN, and the wait it came
+   out of) at the moment `delay_wake_due` replies to it.
+2. **Confirm the preemption reading cheaply**: bracket `pop_due` itself. If it shows ~159 s while
+   the queue holds a handful of entries, off-CPU time is proven rather than inferred.
+
+## Fixed this round
+
+Nothing further — Round 4 was measurement. The fixes to date remain: the extent-wise
+`NtAllocateVirtualMemory` commit, the HPET stale-delivery drain/re-arm, the `extern-rootserver`
+tick period, and the one-time AHCI port bring-up.
