@@ -3034,6 +3034,15 @@ pub(crate) unsafe fn delay_timer_nested_ack() {
 }
 
 const DELAY_TIMER_IRQ: u64 = 12;
+/// Floor for how far ahead the HPET one-shot may be armed, in 100ns units (1 ms).
+///
+/// This is a FLOOR, not the value used — see `DELAY_TIMER_ROUND_TRIP_100NS`. Arming the comparator
+/// closer than the system can actually service the resulting interrupt is a self-sustaining storm:
+/// the comparator is already passed by the time the handler acks, the level-triggered line
+/// re-asserts immediately, and the executive never reaches userspace to make progress. Measured
+/// with a TCG instruction-count plugin during such a storm: the kernel retired 169M instructions
+/// per second in `irq12_entry` -> `irq_dispatch` -> `notification::signal` while the guest retired
+/// ZERO. 1 ms is far below one service round trip under emulation.
 const DELAY_TIMER_MIN_ARM_100NS: u64 = 10_000;
 const DELAY_TIMER_MIN_ARM_FLOOR_TICKS: u64 = 4096;
 const DELAY_TIMER_SOURCE_DELAY_QUEUE: u64 = 1;
@@ -3050,9 +3059,52 @@ const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
 const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
 
+/// ADAPTIVE minimum arm distance, in 100ns units.
+///
+/// A fixed 1 ms was an assumption about how fast the machine services a timer interrupt, and it is
+/// wrong under emulation. When the comparator is armed closer than one service cycle, it has
+/// already been passed by the time the handler acks; the level-triggered line re-asserts
+/// immediately and the one-shot becomes a self-sustaining storm in which the executive never
+/// reaches userspace. A TCG instruction-count plugin measured exactly that: 169M kernel
+/// instructions per second in `irq12_entry` -> `irq_dispatch` -> `notification::signal`, with the
+/// guest retiring ZERO instructions for minutes at a time.
+///
+/// Rather than guess a bigger constant, grow the guard on the storm's own signature — a delivery
+/// that wakes NOTHING means the comparator was already passed — and never shrink it, because
+/// shrinking re-enters the storm. Geometric growth converges in a handful of deliveries.
+static DELAY_TIMER_ARM_GUARD_100NS: AtomicU64 = AtomicU64::new(DELAY_TIMER_MIN_ARM_100NS);
+/// Ceiling for the adaptive guard (500 ms): beyond this the timer is too coarse to be useful, and
+/// a guard this large already means something other than arm distance is wrong.
+const DELAY_TIMER_ARM_GUARD_CAP_100NS: u64 = 5_000_000;
+/// How many times the guard has been grown — reported in the census as boot evidence.
+static DELAY_TIMER_ARM_GUARD_GROWTHS: AtomicU64 = AtomicU64::new(0);
+
+/// A delivery that woke nothing: the comparator was passed before the handler could ack. Back off.
+fn delay_timer_widen_arm_guard() {
+    let mut seen = DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed);
+    loop {
+        if seen >= DELAY_TIMER_ARM_GUARD_CAP_100NS {
+            return;
+        }
+        let wider = seen.saturating_mul(2).min(DELAY_TIMER_ARM_GUARD_CAP_100NS);
+        match DELAY_TIMER_ARM_GUARD_100NS.compare_exchange_weak(
+            seen,
+            wider,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                DELAY_TIMER_ARM_GUARD_GROWTHS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(observed) => seen = observed,
+        }
+    }
+}
+
 fn delay_timer_min_arm_ticks(period_fs: u64) -> u64 {
     nt_delay_execution::timer_min_delta_ticks(
-        DELAY_TIMER_MIN_ARM_100NS,
+        DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
         period_fs,
         DELAY_TIMER_MIN_ARM_FLOOR_TICKS,
     )
@@ -7089,6 +7141,10 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         print_str(b"/");
         print_u64(outstanding);
     }
+    print_str(b" armguard_us=");
+    print_u64(DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed) / 10);
+    print_str(b"/");
+    print_u64(DELAY_TIMER_ARM_GUARD_GROWTHS.load(Ordering::Relaxed));
     print_str(b" delaywake=");
     print_u64(DELAY_WAKE_REPLY_TICKS.load(Ordering::Relaxed) / 1_000_000);
     print_str(b"reply/");
@@ -14679,6 +14735,7 @@ unsafe fn delay_timer_interrupt(
     let cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
     if delay_timer_delivery_is_stale(cfg, counter, cmp) {
         TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+        delay_timer_widen_arm_guard();
         let n = TIMER_TICKS_EARLY_STALE.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             print_str(b"[timer-stale] #");
@@ -14727,6 +14784,7 @@ unsafe fn delay_timer_interrupt(
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 {
+        delay_timer_widen_arm_guard();
         let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
         if n < 10 || n % 400_000 == 0 {
             let counter = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
