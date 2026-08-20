@@ -6844,6 +6844,7 @@ impl ExecNtHandler {
     }
 
     fn rebuild_registry_services_order_cache(&mut self) -> bool {
+        crate::SERVICES_ORDER_REBUILDS.fetch_add(1, Ordering::Relaxed);
         let Some(services_key) =
             self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)
         else {
@@ -13912,41 +13913,85 @@ impl ExecNtHandler {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
         }
 
+        // Commit the plan EXTENT-WISE, not page-wise.
+        //
+        // `extent_at` is a linear scan of the whole fixed-capacity extent array, so consulting it
+        // once per page costs O(pages x capacity) for the WHOLE request — including the pages a
+        // request does not touch at all. A large `MEM_RESERVE` commits nothing, yet the page-at-a-
+        // time walk still paid two full scans per 4 KiB of reserved address space just to discover
+        // there was nothing to do; smss's big reservations spent TENS OF SECONDS here each.
+        //
+        // Both maps are extent-based, so `old`/`new` are constant across any run that crosses no
+        // extent boundary on either side. Advance a run at a time and do the per-page work only
+        // inside runs that actually became committed (or changed protection). Behaviour per page is
+        // identical — only the number of lookups changes.
+        let region_end = plan.base + plan.size;
         let mut page = plan.base;
         let mut changed_end = plan.base;
         let mut map_status = 0u32;
-        while page < plan.base + plan.size {
+        'commit: while page < region_end {
             let old = before.extent_at(page);
             let new = after.extent_at(page);
+            // Longest run starting at `page` over which BOTH lookups keep their current answer.
+            let mut run_end = region_end;
+            match new {
+                Some(extent) => run_end = run_end.min(extent.end()),
+                None => {
+                    if let Some(next) = after.next_extent_base_after(page) {
+                        run_end = run_end.min(next);
+                    }
+                }
+            }
+            match old {
+                Some(extent) => run_end = run_end.min(extent.end()),
+                None => {
+                    if let Some(next) = before.next_extent_base_after(page) {
+                        run_end = run_end.min(next);
+                    }
+                }
+            }
+            // A run must always advance, or a boundary exactly at `page` would spin forever.
+            let run_end = run_end.max(page + 0x1000).min(region_end);
             if new.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
             {
                 if old
                     .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
                 {
-                    if let Err(status) = vm_map_private_page(
-                        target_pi,
-                        page,
-                        new.unwrap().protection,
-                        target.pml4,
-                        target.scratch_base,
-                    ) {
-                        map_status = status;
-                        break;
+                    while page < run_end {
+                        if let Err(status) = vm_map_private_page(
+                            target_pi,
+                            page,
+                            new.unwrap().protection,
+                            target.pml4,
+                            target.scratch_base,
+                        ) {
+                            map_status = status;
+                            break 'commit;
+                        }
+                        page += 0x1000;
+                        changed_end = page;
                     }
+                    continue;
                 } else if old.unwrap().protection != new.unwrap().protection {
-                    if let Err(status) = vm_reprotect_private_page(
-                        target_pi,
-                        page,
-                        old.unwrap().protection,
-                        new.unwrap().protection,
-                        target.pml4,
-                    ) {
-                        map_status = status;
-                        break;
+                    while page < run_end {
+                        if let Err(status) = vm_reprotect_private_page(
+                            target_pi,
+                            page,
+                            old.unwrap().protection,
+                            new.unwrap().protection,
+                            target.pml4,
+                        ) {
+                            map_status = status;
+                            break 'commit;
+                        }
+                        page += 0x1000;
+                        changed_end = page;
                     }
+                    continue;
                 }
             }
-            page += 0x1000;
+            // Nothing to do across this whole run (reserved, unchanged, or outside any extent).
+            page = run_end;
             changed_end = page;
         }
         if map_status != 0 {

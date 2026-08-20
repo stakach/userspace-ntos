@@ -5492,6 +5492,14 @@ pub(crate) unsafe fn service_sec_image(
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
     let mut census_prev_badge = usize::MAX;
+    // SLOW-EVENT NAMING. The badge census says WHICH process burned the wall-clock but not WHICH
+    // request did it, and a single loop iteration can run for minutes with nothing else logged —
+    // a silent gap in the serial log with no way to attribute it. Remember the message identity
+    // that is being serviced so the next loop top can name any iteration that ran long.
+    let mut census_prev_mi = 0u64;
+    let mut census_prev_m0 = 0u64;
+    const SLOW_EVENT_100NS: u64 = 10_000_000; // 1 s
+    let mut slow_events_traced = 0u64;
     // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
     // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
@@ -5526,12 +5534,26 @@ pub(crate) unsafe fn service_sec_image(
             {
                 let slot = census_slot(badge);
                 if census_prev_badge != usize::MAX {
-                    BADGE_TIME_100NS[census_prev_badge]
-                        .fetch_add(now.wrapping_sub(census_prev_t), Ordering::Relaxed);
+                    let elapsed = now.wrapping_sub(census_prev_t);
+                    BADGE_TIME_100NS[census_prev_badge].fetch_add(elapsed, Ordering::Relaxed);
+                    if elapsed >= SLOW_EVENT_100NS && slow_events_traced < 64 {
+                        slow_events_traced += 1;
+                        print_str(b"[slow-event] badge=");
+                        print_u64(census_prev_badge as u64);
+                        print_str(b" label=0x");
+                        print_hex((census_prev_mi >> 12) as u32);
+                        print_str(b" m0=0x");
+                        print_hex(census_prev_m0 as u32);
+                        print_str(b" took_ms=");
+                        print_u64(elapsed / 10_000);
+                        print_str(b"\n");
+                    }
                 }
                 BADGE_EVENTS[slot].fetch_add(1, Ordering::Relaxed);
                 BADGE_LAST_T[slot].store(now, Ordering::Relaxed);
                 census_prev_badge = slot;
+                census_prev_mi = mi;
+                census_prev_m0 = m0;
                 census_prev_t = now;
                 census_tick_static(now);
             }
@@ -8876,8 +8898,13 @@ pub(crate) unsafe fn service_sec_image(
                     result = st;
                     handled = true;
                 } else {
+                    let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
+                    crate::record_native_dispatch_ticks(
+                        m0,
+                        crate::disk_census_ticks().wrapping_sub(dispatch_started),
+                    );
                     result = res.status as u64;
                     if pi == 3 && m0 == 161 {
                         let trace = SERVICES_NQIP_TRACE.fetch_add(1, Ordering::Relaxed);

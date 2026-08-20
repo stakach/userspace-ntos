@@ -6659,6 +6659,97 @@ pub(crate) static LSASS_SSN_HIST: [AtomicU64; SSN_HIST_N] =
 /// frontier before `userinit.exe` and Explorer can be launched.
 pub(crate) static SERVICES_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
+
+/// EXECUTIVE-TIME CENSUS. The badge census attributes the wall-clock between two loop tops to the
+/// badge serviced in between — which lumps together the executive's own handler work AND the
+/// hosted process running in user mode until its next trap. That is enough to name the guilty
+/// PROCESS but not the guilty SIDE. These counters bracket the native dispatch itself, so
+/// `exec-dispatch` vs the badge totals separates "our code is slow" from "the guest is spinning".
+pub(crate) static EXEC_DISPATCH_TICKS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXEC_DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SLOW_DISPATCH_TRACED: AtomicU64 = AtomicU64::new(0);
+/// How many times the ordered-services cache has been rebuilt (each rebuild walks every service
+/// key in the SYSTEM hive), so a slow dispatch can be tied to a rebuild storm.
+pub(crate) static SERVICES_ORDER_REBUILDS: AtomicU64 = AtomicU64::new(0);
+/// Per-SSN dispatch ticks, bucketed exactly like the SSN count histograms.
+pub(crate) static NATIVE_SSN_TICKS: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+/// Per-SSN dispatch counts, so the time dump reports a per-call cost, not just a total.
+pub(crate) static NATIVE_SSN_CALLS: [AtomicU64; SSN_HIST_N] =
+    [const { AtomicU64::new(0) }; SSN_HIST_N];
+
+/// Fold one completed native dispatch into the executive-time census.
+pub(crate) fn record_native_dispatch_ticks(ssn: u64, ticks: u64) {
+    EXEC_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    EXEC_DISPATCH_TICKS.fetch_add(ticks, Ordering::Relaxed);
+    // Name the INDIVIDUAL pathological dispatches. The per-SSN totals showed a handful of early
+    // registry calls carrying essentially all of the executive's time, so a total is no longer
+    // enough — the cost has to be attributed call by call.
+    if ticks > 1_000_000_000 {
+        let n = SLOW_DISPATCH_TRACED.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            print_str(b"[slow-dispatch] #");
+            print_u64(n);
+            print_str(b" ssn=0x");
+            print_hex(ssn as u32);
+            print_str(b" Mtick=");
+            print_u64(ticks / 1_000_000);
+            print_str(b" services-order-rebuilds=");
+            print_u64(SERVICES_ORDER_REBUILDS.load(Ordering::Relaxed));
+            print_str(b"\n");
+        }
+    }
+    if let Some(bucket) = ssn_hist_bucket(ssn) {
+        NATIVE_SSN_TICKS[bucket].fetch_add(ticks, Ordering::Relaxed);
+        NATIVE_SSN_CALLS[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Bucket an SSN the same way the SSN count histograms do (native low half, win32k high half).
+pub(crate) fn ssn_hist_bucket(ssn: u64) -> Option<usize> {
+    if ssn < SSN_HIST_NATIVE as u64 {
+        Some(ssn as usize)
+    } else if (0x1000..0x1000 + (SSN_HIST_N - SSN_HIST_NATIVE) as u64).contains(&ssn) {
+        Some(SSN_HIST_NATIVE + (ssn - 0x1000) as usize)
+    } else {
+        None
+    }
+}
+
+/// The native SSNs that cost the most EXECUTIVE time, printed at quiesce alongside the win32k
+/// equivalent (`print_w32_ssn_time`).
+pub(crate) fn print_native_ssn_time() {
+    let total = EXEC_DISPATCH_TICKS.load(Ordering::Relaxed);
+    let calls = EXEC_DISPATCH_CALLS.load(Ordering::Relaxed);
+    print_str(b"[census] native-time total_Mtick=");
+    print_u64(total / 1_000_000);
+    print_str(b" dispatches=");
+    print_u64(calls);
+    print_str(b" top_Mtick:");
+    let mut taken = [false; SSN_HIST_N];
+    for _ in 0..16 {
+        let mut best = usize::MAX;
+        let mut best_n = 0u64;
+        for (bucket, cell) in NATIVE_SSN_TICKS.iter().enumerate() {
+            let v = cell.load(Ordering::Relaxed);
+            if !taken[bucket] && v > best_n {
+                best_n = v;
+                best = bucket;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        print_str(b" ");
+        print_hex(ssn_from_bucket(best));
+        print_str(b"=");
+        print_u64(best_n / 1_000_000);
+        print_str(b"/");
+        print_u64(NATIVE_SSN_CALLS[best].load(Ordering::Relaxed));
+    }
+    print_str(b"\n");
+}
 /// Same histogram for winlogon (pi 2) — the process whose forward progress the paint depends on.
 pub(crate) static WINLOGON_SSN_HIST: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
@@ -6883,6 +6974,18 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
     print_str(b"/");
     print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
+    print_str(b" exec-dispatch=");
+    print_u64(EXEC_DISPATCH_CALLS.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(EXEC_DISPATCH_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"Mtick");
+    print_str(b" disk=");
+    print_u64(AHCI_CMDS.load(Ordering::Relaxed));
+    print_str(b"cmd/");
+    print_u64(AHCI_SECTORS.load(Ordering::Relaxed));
+    print_str(b"sec/");
+    print_u64(AHCI_TICKS.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"Mtick");
     print_str(b" ssn-hot");
     print_hot_ssn_field(b"services", unsafe {
         &*core::ptr::addr_of!(SERVICES_SSN_HIST)
@@ -6907,6 +7010,7 @@ pub(crate) fn census_tick_static(now: u64) {
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
+    print_native_ssn_time();
 }
 
 /// The 16 win32k SSNs that cost the most WALL-CLOCK (ms), plus the average per dispatch.
@@ -14361,6 +14465,22 @@ unsafe fn delay_timer_interrupt(
         }
         core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
         delay_timer_ack_irq();
+        // ★ A "stale" delivery must still DRAIN and RE-ARM. `counter < comparator` is not proof
+        // that this interrupt belongs to a previous arm: the counter is read a few instructions
+        // after entry, and QEMU's HPET can assert a tick or so before the read observes the match.
+        // Dropping such a delivery outright STRANDS the waiter it was armed for — it then sleeps
+        // until some unrelated timer happens to fire. Measured on a hosted boot: io-completion
+        // waiters woke ~84 SECONDS past their deadline, over and over, which is where most of the
+        // post-fix boot time went (`[io-completion] TIMEOUT … deadline=4830460920 now=5676701000`).
+        //
+        // Draining is idempotent — nothing due means nothing woken — and re-arming restores the
+        // one-shot for the earliest remaining deadline, so a genuinely stale edge costs one wasted
+        // scan instead of a lost wakeup. The storm protection is unchanged: a storming timer still
+        // wakes nothing, is still counted here, and the guarded rearm still keeps the comparator
+        // ahead of the enable edge.
+        let now_100ns = monotonic_time_100ns();
+        let _ = delay_timer_drain_due_work(queue, handler, now_100ns);
+        delay_timer_rearm(queue);
         return;
     }
     // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
@@ -23142,6 +23262,28 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
     paddr
 }
 
+/// DISK-I/O CENSUS. The AHCI path is the executive's hottest emulated device path — every PE
+/// image, hive and directory scan flows through it — and under TCG a port round-trip costs orders
+/// of magnitude more than the RAM work around it. These counters turn that into a MEASUREMENT.
+///
+/// They are only ever updated on the EXECUTIVE's mount (`Fat32::census`). The isolated storage
+/// host maps its image READ-ONLY, so a write to any static there faults with no handler and wedges
+/// the boot; `Fat32::census` is false on the mount that host builds by hand.
+pub(crate) static AHCI_CMDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static AHCI_SECTORS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static AHCI_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// A clock readable from any address space (no HPET mapping needed, unlike the census clock).
+#[inline(always)]
+pub(crate) fn disk_census_ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
 pub(crate) const AHCI_DMA_DATA_OFFSET: u64 = 0x800;
 pub(crate) const AHCI_MAX_SECTORS_PER_READ: u32 = ((0x1000 - AHCI_DMA_DATA_OFFSET) / 512) as u32;
 pub(crate) const AHCI_MAX_SECTORS_PER_WRITE: u32 = AHCI_MAX_SECTORS_PER_READ;
@@ -23320,6 +23462,9 @@ unsafe fn ahci_write_sectors(
 /// sector run, while directory walkers still consume one sector before triggering the next read.
 #[derive(Clone, Copy)]
 struct Fat32 {
+    /// Update the disk-I/O census on this mount. FALSE for the isolated storage host's mount:
+    /// its image is mapped read-only, so bumping a static there faults with no handler.
+    census: bool,
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,

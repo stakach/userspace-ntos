@@ -78,6 +78,9 @@ pub(crate) unsafe fn storage_probe(
     if bps == 512 && spc >= 1 && is_fat32 {
         verdict |= 2;
         let fs = Fat32 {
+            // The storage host's image is mapped read-only — the census statics are unwritable
+            // here, and a write would fault with no handler.
+            census: false,
             ahci_vaddr,
             dma_vaddr,
             dma_paddr,
