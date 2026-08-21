@@ -74,8 +74,9 @@ boots with two generated E1000 NICs, the extern rootserver discovers nine live d
 (architectural MMIO plus two E1000 BARs and the shifted AHCI BARs), both E1000 devnodes run
 AddDevice/StartDevice through the generic path, provider sharing reports `exports=91/91` with
 zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrome paints with
-`292/292` checks passing. With real TX traffic now accepted below, the remaining B3 packet frontier
-is live proof of packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`.
+`292/292` checks passing. With real E1000 TX/RX traffic now accepted below, the remaining generic
+B3 packet frontier is packet-array receive coverage for an NDIS5 miniport that actually reaches
+`MiniIndicateReceivePacket`; ReactOS e1000 correctly uses the legacy Ethernet receive path instead.
 Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
 send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
@@ -86,8 +87,9 @@ validation is green: `cargo fmt --all`, `cargo test -p nt-dma-manager`, executiv
 `.tmp/run-desktop-b3-tx-manager-kind-20260821.log` reaches Explorer shell chrome with `292/292`,
 keeps `pci_provider_exports=44/44` with zero rejections, and advances the real E1000 data-plane
 evidence to `dma_desc_common/map=128/1`, `dma_desc_done_map=1`, and `dma_dev_tx/rx=1/1`. The
-remaining B3 packet frontier is live packet-array receive proof through the internal NDIS receive
-indication route, not TX descriptor completion.
+same instrumented desktop proof below now accepts the legacy E1000 receive callback path. The
+remaining B3 packet frontier is separate live packet-array proof with a miniport that calls the
+internal NDIS receive indication helper.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -1649,9 +1651,11 @@ notification-package fallbacks.
   place and proven through the full desktop shell path. The provider-domain path now routes the
   observed NDIS open/bind/request/packet/buffer/send-completion surface through the shared
   `ndis.sys` runtime with typed packet/MDL shadows instead of private provider semantics.
-  Transfer-data/completion wiring and repeated-device scaling are proven at this frontier. Remaining
-  B3 work is true TCPIP-originated TX traffic through the real scatter/gather send route and live
-  packet-array receive proof with a miniport that reaches the internal NDIS helper.
+  Transfer-data/completion wiring and repeated-device scaling are proven at this frontier. Real
+  TCPIP-originated E1000 TX now reaches descriptor completion through the provider-domain
+  scatter/gather route, and E1000 RX uses ReactOS' legacy Ethernet receive indication path. Remaining
+  B3 packet-array work is coverage for a miniport that reaches the internal NDIS helper rather than
+  the e1000 legacy receive macro path.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -1660,9 +1664,8 @@ notification-package fallbacks.
   table. Provider-domain DMA adapters now retain the devnode-granted common-buffer window inside the
   component-local `DMA_ADAPTER`, so `NdisMInitializeScatterGatherDma` can publish real SG-capable
   NDIS state without later `NdisSend` calls depending on transient executive/shared projection
-  fields. The remaining B3 send work is below that boundary: ReactOS provider NDIS reaches the real
-  send path but still reports `STATUS_INSUFFICIENT_RESOURCES` before the E1000 miniport posts a TX
-  descriptor.
+  fields. That send-data-plane gap is now closed for the current E1000 frontier by the accepted B3 TX
+  checkpoints below.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -8311,8 +8314,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/run-desktop-b3-tx-manager-kind-20260821.log`, which reaches Explorer shell chrome with
     `292/292`, keeps `pci_provider_exports=44/44` with zero rejections, and proves real TX completion:
     `dma_desc_done_map=1`, `dma_dev_tx/rx=1/1`, and `dma_tx_candidates/map/done=1/1/2`. Review
-    adjustment: B3's remaining packet work is live packet-array receive indication through the
-    provider/internal NDIS route; true TCPIP-originated E1000 TX is no longer the blocker.
+    adjustment: true TCPIP-originated E1000 TX is no longer the blocker. Follow-up evidence work now
+    distinguishes the already-live ReactOS e1000 legacy receive path from packet-array receive, which
+    remains a generic NDIS5 coverage item for a miniport that calls `NdisMIndicateReceivePacket`.
+    Receive-evidence follow-up (2026-08-21): provider sharing now records durable per-path counters
+    for provider packet-array exports, protocol `Receive`, protocol
+    `ReceiveComplete`, and protocol `ReceivePacket` callback completions. The executive summary
+    prints these counters and gates the current e1000 data-plane proof with
+    `exec_provider_ndis_receive_indicated`, accepting either a clean legacy receive/receive-complete
+    pair or a clean packet receive callback. Local validation: `cargo fmt --all`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+    `.tmp/run-desktop-b3-receive-evidence-20260821.log`. That proof reaches Explorer shell chrome
+    with `293/293`, keeps `pci_provider_exports=44/44` with zero rejections, preserves real E1000
+    TX/RX evidence (`dma_desc_done_map=1`, `dma_dev_tx/rx=1/1`), and proves the current ReactOS e1000
+    receive route with `rx=1/1`, `rx-complete=1/1`, `rx-packet=0/0`, and
+    `PASS exec_provider_ndis_receive_indicated`. Review adjustment: E1000's NT5 data plane is now
+    accepted for this frontier. Packet-array receive remains a generic NDIS5 coverage target for a
+    miniport that calls `NdisMIndicateReceivePacket`; it should not be modeled as an e1000 blocker.
   - `[~]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

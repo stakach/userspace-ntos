@@ -12879,6 +12879,14 @@ pub(crate) struct HostedProviderSharingEvidence {
     pub provider_export_rejections: u64,
     pub provider_callback_requests: u64,
     pub provider_callback_completions: u64,
+    pub provider_packet_array_export_requests: u64,
+    pub provider_packet_array_export_completions: u64,
+    pub provider_protocol_receive_requests: u64,
+    pub provider_protocol_receive_completions: u64,
+    pub provider_protocol_receive_complete_requests: u64,
+    pub provider_protocol_receive_complete_completions: u64,
+    pub provider_protocol_receive_packet_requests: u64,
+    pub provider_protocol_receive_packet_completions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -13285,6 +13293,14 @@ static HOSTED_PROVIDER_CALLBACK_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
@@ -13633,6 +13649,22 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
     evidence.provider_callback_requests = HOSTED_PROVIDER_CALLBACK_REQUESTS.load(Ordering::Relaxed);
     evidence.provider_callback_completions =
         HOSTED_PROVIDER_CALLBACK_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_export_requests =
+        HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_export_completions =
+        HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_requests =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_completions =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_complete_requests =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_complete_completions =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_packet_requests =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_protocol_receive_packet_completions =
+        HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.load(Ordering::Relaxed);
     evidence
 }
 
@@ -14047,6 +14079,42 @@ unsafe fn trace_hosted_provider_callback_wall(
         }
     }
     print_str(b"\n");
+}
+
+fn record_provider_protocol_receive_request(record: HostedProviderCallbackRecord) {
+    if record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL {
+        return;
+    }
+    match record.callback_offset {
+        NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        }
+        NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        }
+        NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn record_provider_protocol_receive_completion(record: HostedProviderCallbackRecord) {
+    if record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL {
+        return;
+    }
+    match record.callback_offset {
+        NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 unsafe fn hosted_provider_callback_record_available() -> u64 {
@@ -19192,6 +19260,20 @@ fn provider_export_result_success(policy: HostedProviderExportMarshalPolicy, res
         || result == STATUS_SUCCESS as u64
 }
 
+fn provider_policy_uses_packet_array(policy: HostedProviderExportMarshalPolicy) -> bool {
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        if matches!(
+            policy.args[index],
+            HostedProviderArgumentMarshal::CallerInOutPacketArray { .. }
+        ) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 unsafe fn complete_provider_resource_mapping(
     policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
@@ -19465,6 +19547,10 @@ pub(crate) unsafe fn service_hosted_provider_export(
     }) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
+    let packet_array_export = provider_policy_uses_packet_array(policy);
+    if packet_array_export {
+        HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
     match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
         Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
         Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
@@ -19737,6 +19823,9 @@ pub(crate) unsafe fn service_hosted_provider_export(
         result,
     );
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    if packet_array_export {
+        HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    }
     trace_hosted_provider_export(
         b"done",
         &singleton.provider,
@@ -21120,6 +21209,7 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
+    record_provider_protocol_receive_request(record);
     let callback_args = [arg0, arg1, arg2, arg3];
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
@@ -21416,6 +21506,9 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         } else {
             result = Err(STATUS_DEVICE_NOT_READY);
         }
+    }
+    if result.is_ok() {
+        record_provider_protocol_receive_completion(record);
     }
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);

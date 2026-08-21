@@ -27841,6 +27841,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.provider_callback_completions);
         print_str(b"/");
         print_u64(provider_sharing.provider_callback_requests);
+        print_str(b" packet-array=");
+        print_u64(provider_sharing.provider_packet_array_export_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_packet_array_export_requests);
+        print_str(b" rx=");
+        print_u64(provider_sharing.provider_protocol_receive_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_protocol_receive_requests);
+        print_str(b" rx-complete=");
+        print_u64(provider_sharing.provider_protocol_receive_complete_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_protocol_receive_complete_requests);
+        print_str(b" rx-packet=");
+        print_u64(provider_sharing.provider_protocol_receive_packet_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_protocol_receive_packet_requests);
         print_str(b" singleton-overflows=");
         print_u64(provider_sharing.singleton_overflows);
         print_str(b" singleton-conflicts=");
@@ -27884,6 +27900,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && generic_pci_provider_export_requests != 0
             && generic_pci_provider_export_completions != 0
             && generic_pci_provider_export_rejections == 0,
+        &mut passed,
+    );
+    let provider_legacy_receive_ok = provider_sharing.provider_protocol_receive_requests != 0
+        && provider_sharing.provider_protocol_receive_requests
+            == provider_sharing.provider_protocol_receive_completions
+        && provider_sharing.provider_protocol_receive_complete_requests != 0
+        && provider_sharing.provider_protocol_receive_complete_requests
+            == provider_sharing.provider_protocol_receive_complete_completions;
+    let provider_packet_receive_ok = provider_sharing.provider_protocol_receive_packet_requests != 0
+        && provider_sharing.provider_protocol_receive_packet_requests
+            == provider_sharing.provider_protocol_receive_packet_completions;
+    check(
+        b"exec_provider_ndis_receive_indicated",
+        provider_legacy_receive_ok || provider_packet_receive_ok,
         &mut passed,
     );
     check(
