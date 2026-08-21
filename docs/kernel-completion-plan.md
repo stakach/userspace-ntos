@@ -638,10 +638,25 @@ shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobbered_by_win
 `exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
 reports `teb-tail-rows=24/24:24/24:24/24/14/0/0`, and commits writable profile state with
 `[writable-fs-snapshot] committed generation=5 bytes=822086`. Review adjustment: the remaining
-fixed `MAX_PI` rows are diagnostic summaries (`W32_TOTAL_DISPATCH`,
-`TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) plus process-manager admission tables.
-Audit diagnostic tables by whether they are still useful, and keep process admission policy separate
-from per-process mechanism storage.
+fixed `MAX_PI` rows at this checkpoint were diagnostic summaries (`W32_TOTAL_DISPATCH`,
+`TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) plus process-manager admission tables;
+the following win32k-dispatch slice closes the first diagnostic row.
+
+A4 diagnostic win32k dispatch row cleanup (2026-08-21): `W32_TOTAL_DISPATCH` no longer lives in a
+fixed `[AtomicU64; MAX_PI]` BSS array. The executive provisions vector-backed rows before the
+SEC_IMAGE workload, the win32k dispatch path records through `bump_w32_total_dispatch(pi)`, and the
+census prints the provisioned rows plus `w32-dispatch-rows=<len>/<cap>/<alloc-fail>/<miss>` so
+future row-allocation or admission mismatches are visible instead of indexing fixed storage. Local
+validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`.
+Serialized desktop proof `.tmp/run-desktop-w32-dispatch-rows-20260821.log` reaches genuine
+userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_teb_not_clobbered_by_win32k`, `exec_msgina_credential_keystrokes_delivered`, and
+`exec_explorer_shell_chrome_painted` green, reports `w32-dispatch-rows=24/24/0/0`, and commits
+writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822600`. Review
+adjustment: the remaining fixed `MAX_PI` rows in this cluster are `TP_WORKER_SLOT_EVENT_TRACE` and
+`FrameRegistryCensus.by_pi`; process-manager admission tables remain a separate policy boundary.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data

@@ -10561,7 +10561,7 @@ pub(crate) unsafe fn service_sec_image(
                 // loading code, faulting pages, running user callbacks, and painting. True stalls are
                 // handled by the wall-clock progress watchdog at the loop top.
                 {
-                    W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed);
+                    bump_w32_total_dispatch(pi);
                     // FORWARD-PROGRESS CENSUS: the win32k SHADOW table lands in the same per-process
                     // histogram as the native table (high half). Without this the census could see
                     // only the native syscalls, and every "the UI work grew" claim about a win32k

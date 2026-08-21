@@ -3589,10 +3589,58 @@ pub(crate) static WL_CPUEXC_DIAG_N: AtomicU64 = AtomicU64::new(0);
 /// Explorer and other real GUI clients can legitimately cross the old fixed bootstrap budgets while
 /// still loading code, filling pages, taking user callbacks, and painting. Liveness is therefore
 /// owned by the wall-clock progress-stall watchdog (`PROGRESS_EPOCH`), not by this counter.
-pub(crate) static W32_TOTAL_DISPATCH: [AtomicU64; MAX_PI] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; MAX_PI]
-};
+static mut W32_TOTAL_DISPATCH_ROWS: Vec<AtomicU64> = Vec::new();
+static W32_DISPATCH_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static W32_DISPATCH_ROW_MISSES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn reset_w32_dispatch_counter_rows(slots: usize) -> bool {
+    unsafe {
+        let rows = &mut *core::ptr::addr_of_mut!(W32_TOTAL_DISPATCH_ROWS);
+        rows.clear();
+        if rows.try_reserve(slots).is_err() {
+            W32_DISPATCH_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        while rows.len() < slots {
+            rows.push(AtomicU64::new(0));
+        }
+    }
+    true
+}
+
+unsafe fn w32_total_dispatch_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(W32_TOTAL_DISPATCH_ROWS)).get(pi)
+}
+
+pub(crate) fn bump_w32_total_dispatch(pi: usize) {
+    unsafe {
+        let Some(row) = w32_total_dispatch_row(pi) else {
+            W32_DISPATCH_ROW_MISSES.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        row.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn w32_total_dispatch_row_value(pi: usize) -> u64 {
+    unsafe {
+        w32_total_dispatch_row(pi)
+            .map(|row| row.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+fn w32_total_dispatch_row_stats() -> (usize, usize, u64, u64) {
+    unsafe {
+        let rows = &*core::ptr::addr_of!(W32_TOTAL_DISPATCH_ROWS);
+        (
+            rows.len(),
+            rows.capacity(),
+            W32_DISPATCH_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            W32_DISPATCH_ROW_MISSES.load(Ordering::Relaxed),
+        )
+    }
+}
 /// Compile-time gate for grind-era VERBOSE trace diagnostics (per-fault demand-map / throttled
 /// per-dispatch trace prints). OFF by default → clean serial; enable with `--features debug-trace`.
 /// NEVER gates milestone markers, spec PASS/FAIL, or the gate summary — only verbose trace noise.
@@ -7660,13 +7708,27 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_u64(PIPE_WAIT_PARKED_COUNT.load(Ordering::Relaxed));
     print_str(b" pipe-woken=");
     print_u64(PIPE_WAIT_WOKEN_COUNT.load(Ordering::Relaxed));
+    let (
+        w32_dispatch_rows,
+        w32_dispatch_cap,
+        w32_dispatch_alloc_fails,
+        w32_dispatch_misses,
+    ) = w32_total_dispatch_row_stats();
     print_str(b" w32-dispatch/pi=");
-    for pi in 0..MAX_PI {
+    for pi in 0..w32_dispatch_rows {
         if pi != 0 {
             print_str(b",");
         }
-        print_u64(W32_TOTAL_DISPATCH[pi].load(Ordering::Relaxed));
+        print_u64(w32_total_dispatch_row_value(pi));
     }
+    print_str(b" w32-dispatch-rows=");
+    print_u64(w32_dispatch_rows as u64);
+    print_str(b"/");
+    print_u64(w32_dispatch_cap as u64);
+    print_str(b"/");
+    print_u64(w32_dispatch_alloc_fails);
+    print_str(b"/");
+    print_u64(w32_dispatch_misses);
     print_str(b"\n[census] ");
     print_str(tag);
     print_str(b" overlay creates=");
@@ -25561,6 +25623,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // ntdll/smss will load: memory-efficient, only touched pages materialized.
     if !reset_process_vm_state(MAX_PI) {
         panic!("process VM state allocation failed");
+    }
+    if !reset_w32_dispatch_counter_rows(MAX_PI) {
+        panic!("win32k dispatch counter row allocation failed");
     }
     if !reset_image_map_cap_bank_process_rows(MAX_PI) {
         panic!("image map cap-bank process row allocation failed");
