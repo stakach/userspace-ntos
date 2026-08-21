@@ -8543,3 +8543,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reaches the login/userinit path, continue back to the post-desktop GDI frontier; if it stops
     earlier, inspect the first quiesce dump rather than reintroducing service-name or shell-specific
     fallbacks.
+
+    Restored desktop proof after idle-wait correction (2026-08-21): serialized
+    `QEMU_MEMORY=2G ./run.sh --desktop` in `.tmp/run-desktop-20260821-101352.log` reaches the
+    harness sentinel with `292/292` executive checks passing. This closes the previous
+    pre-user-shell idle-wait blocker and the post-desktop `kbswitch.exe`/GDI suspicion from the
+    restored rust-micro baseline: `exec_profile_ntuser_dat_present`, `exec_ntloadkey_serviced`,
+    `exec_winlogon_user_shell_activated`, `exec_userinit_process_spawned`,
+    `exec_gdi_user_batch_flushed`, and `exec_explorer_shell_chrome_painted` all pass. Explorer is
+    dynamically spawned from the real shell path, opens all three shell COM classes, receives
+    668 api0 redirects without callback failures, flushes 135 GDI batches for 184 records, and
+    paints the full 1024x768 framebuffer as non-background with at least 32 colors. The writable
+    overlay and profile hive path is also green: `NtLoadKey` mounts two hives, `NtUnloadKey`
+    detaches one, the copied `ntuser.dat` is a 130716-byte hive image, and the final pool census has
+    no untyped, image-bank, registry, ASID, or VM allocation failures. Review adjustment: the active
+    desktop/frontier cleanup is no longer shell launch, profile loading, or kbswitch GDI
+    publication. Continue the plan at B3's real network data-plane gap: true TCPIP-originated TX
+    through the provider-domain scatter/gather route and a live packet-array receive proof, without
+    adding driver-name, service-name, or packet-success fallbacks.
