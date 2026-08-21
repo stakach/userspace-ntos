@@ -4610,49 +4610,59 @@ struct DriverLoadPageTable {
     cap: u64,
 }
 
-const DRIVER_LOAD_PAGE_TABLE_EMPTY: DriverLoadPageTable = DriverLoadPageTable {
-    pml4: 0,
-    base: 0,
-    cap: 0,
-};
-const DRIVER_LOAD_PT_RECORDS: usize = 32;
 const DRIVER_LOAD_PT_SPAN: u64 = 0x20_0000;
-static mut DRIVER_LOAD_PAGE_TABLES: [DriverLoadPageTable; DRIVER_LOAD_PT_RECORDS] =
-    [DRIVER_LOAD_PAGE_TABLE_EMPTY; DRIVER_LOAD_PT_RECORDS];
+static mut DRIVER_LOAD_PAGE_TABLES: Option<Vec<DriverLoadPageTable>> = None;
 
 #[inline]
 fn driver_load_pt_base(va: u64) -> u64 {
     va & !(DRIVER_LOAD_PT_SPAN - 1)
 }
 
-unsafe fn driver_load_page_table_find(pml4: u64, base: u64) -> Option<u64> {
-    let records = &*core::ptr::addr_of!(DRIVER_LOAD_PAGE_TABLES);
-    for record in records {
-        if record.cap != 0 && record.pml4 == pml4 && record.base == base {
-            return Some(record.cap);
-        }
+unsafe fn driver_load_page_tables_mut() -> &'static mut Vec<DriverLoadPageTable> {
+    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
     }
-    None
+    slot.as_mut().unwrap()
+}
+
+unsafe fn driver_load_page_table_find(pml4: u64, base: u64) -> Option<u64> {
+    (&*core::ptr::addr_of!(DRIVER_LOAD_PAGE_TABLES))
+        .as_ref()
+        .and_then(|records| {
+            records
+                .iter()
+                .find(|record| record.pml4 == pml4 && record.base == base)
+                .map(|record| record.cap)
+        })
 }
 
 unsafe fn driver_load_page_table_insert(pml4: u64, base: u64, cap: u64) -> bool {
-    let records = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
-    for record in records {
-        if record.cap == 0 {
-            *record = DriverLoadPageTable { pml4, base, cap };
-            return true;
-        }
+    let records = driver_load_page_tables_mut();
+    if records.try_reserve(1).is_err() {
+        print_str(b"[driver-load] page-table record allocation failed pml4=0x");
+        print_hex((pml4 >> 32) as u32);
+        print_hex(pml4 as u32);
+        print_str(b" base=0x");
+        print_hex((base >> 32) as u32);
+        print_hex(base as u32);
+        print_str(b"\n");
+        return false;
     }
-    false
+    records.push(DriverLoadPageTable { pml4, base, cap });
+    true
 }
 
 unsafe fn driver_load_page_table_remove(pml4: u64, base: u64, cap: u64) {
-    let records = &mut *core::ptr::addr_of_mut!(DRIVER_LOAD_PAGE_TABLES);
-    for record in records {
+    let records = driver_load_page_tables_mut();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
         if record.cap == cap && record.pml4 == pml4 && record.base == base {
-            *record = DRIVER_LOAD_PAGE_TABLE_EMPTY;
+            records.swap_remove(i);
             return;
         }
+        i += 1;
     }
 }
 

@@ -297,6 +297,26 @@ reports `ucb-redirects=893 ucb-returns=893`, and shows no attach record allocati
 mapping cleanup failures. Review adjustment: win32k client attach capacity is closed for the current
 desktop frontier; continue auditing the remaining fixed runtime tables outside this attach cluster.
 
+A4/B3 driver-load page-table scaling cleanup (2026-08-21): the win32k/display driver load path no
+longer tracks mapped driver-image page tables in a 32-record static array. The registry now grows
+dynamically by `{pml4, base, cap}`, removes records on rollback with `swap_remove`, and treats
+failure to record a newly mapped page table as a hard driver-image load failure with an explicit
+`[driver-load]` diagnostic before recycling the cap. The headless credential route was tightened as
+part of the proof: the shared state machine now routes bounded blocking `GetMessage` calls while
+posted keystrokes are still pending, and the executive posts RETURN only after all username
+characters have been retrieved by the real modal queue. Local validation is green for
+`cargo fmt --all`, `cargo test -p nt-user-callback credential_injection -- --nocapture`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-headless-driver-load-pt-vec-cred-route-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing, keeps `exec_win32k_desktop_painted`,
+`exec_msgina_modal_paint_prefix`, `exec_winlogon_user_shell_activated`,
+`exec_userinit_process_spawned`, `exec_explorer_user_callbacks_redirected`,
+`exec_explorer_wndproc_installed_by_client`, and `exec_explorer_shell_chrome_painted` green, and
+shows the real IDD_LOGON queue delivered all 13 injected `WM_CHAR`s plus `VK_RETURN`. Review
+adjustment: driver-image page-table tracking capacity is closed; continue auditing remaining fixed
+runtime tables by subsystem ownership.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

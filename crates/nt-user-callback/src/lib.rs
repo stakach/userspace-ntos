@@ -667,17 +667,19 @@ impl CredentialInjectionSequence {
         self.text_readbacks = self.text_readbacks.saturating_add(1);
     }
 
-    /// Keystrokes are injected in two phases — the typed user name, then the RETURN key — each
-    /// released when the dialog's pump next reports its queue empty. A blocking `GetMessageW` may
-    /// be routed into win32k exactly ONCE per phase: right after a phase is posted the queue is
-    /// provably non-empty, so the call returns instead of blocking win32k (and the executive with
-    /// it). Every other blocking `GetMessage` means the queue drained and MUST be parked.
+    /// A blocking `GetMessageW` may be routed into win32k while an injected keystroke is still
+    /// pending delivery. This is bounded by the number of posted keystrokes, so the executive never
+    /// keeps routing an actually empty modal queue forever, but it also does not assume one routed
+    /// call drains the whole posted user name.
     pub const fn may_route_get_message(self) -> bool {
-        (self.routed_get_messages as usize) < self.posted_phases()
+        let pending_chars = self.retrieved_chars < self.posted_chars;
+        let pending_return = self.posted_return && !self.retrieved_return;
+        (pending_chars || pending_return)
+            && (self.routed_get_messages as usize) < self.posted_keystrokes()
     }
 
-    const fn posted_phases(self) -> usize {
-        (self.posted_chars as usize == LOGON_USERNAME.len()) as usize + self.posted_return as usize
+    const fn posted_keystrokes(self) -> usize {
+        self.posted_chars as usize + self.posted_return as usize
     }
 
     pub fn record_routed_get_message(&mut self) {
@@ -698,6 +700,10 @@ impl CredentialInjectionSequence {
 
     pub const fn retrieved_chars(self) -> u16 {
         self.retrieved_chars
+    }
+
+    pub const fn username_chars_delivered(self) -> bool {
+        self.retrieved_chars as usize == LOGON_USERNAME.len()
     }
 
     pub const fn retrieved_return(self) -> bool {
@@ -2513,28 +2519,55 @@ mod tests {
     }
 
     #[test]
-    fn credential_injection_routes_one_blocking_get_message_per_phase() {
+    fn credential_injection_routes_until_each_posted_keystroke_is_retrieved() {
         let mut injection = CredentialInjectionSequence::new();
         assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
         // Nothing queued yet -> routing a blocking GetMessage would block win32k.
         assert!(!injection.may_route_get_message());
         for index in 0..LOGON_USERNAME.len() - 1 {
             assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
-            assert!(!injection.may_route_get_message());
+            assert!(injection.may_route_get_message());
         }
         assert_eq!(
             injection.record_char_post(0x2008c, LOGON_USERNAME.len() - 1),
             Ok(())
         );
-        // Phase 1 (the typed user name) is queued -> exactly one blocking GetMessage may run.
+        // Route while posted characters are still pending. A single routed call often drains many
+        // nested modal messages, but it is not required to drain the whole user name.
+        for _ in 0..LOGON_USERNAME.len() - 1 {
+            assert!(injection.may_route_get_message());
+            injection.record_routed_get_message();
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        }
         assert!(injection.may_route_get_message());
         injection.record_routed_get_message();
+        assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert!(!injection.may_route_get_message());
+        assert!(injection.username_chars_delivered());
+        assert_eq!(injection.record_return_post(0x2008c), Ok(()));
+        assert!(injection.may_route_get_message());
+        injection.record_routed_get_message();
+        assert!(!injection.may_route_get_message());
+        assert!(injection.observe_retrieved(0x2008c, WM_KEYDOWN, VK_RETURN));
+        assert!(!injection.may_route_get_message());
+    }
+
+    #[test]
+    fn credential_injection_routing_is_bounded_if_delivery_stalls() {
+        let mut injection = CredentialInjectionSequence::new();
+        assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
+        for index in 0..LOGON_USERNAME.len() {
+            assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
+        }
+        for _ in 0..LOGON_USERNAME.len() {
+            assert!(injection.may_route_get_message());
+            injection.record_routed_get_message();
+        }
         assert!(!injection.may_route_get_message());
         for _ in 0..LOGON_USERNAME.len() {
             assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
         }
         assert!(!injection.may_route_get_message());
-        // Phase 2 (RETURN) buys exactly one more.
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
         assert!(injection.may_route_get_message());
         injection.record_routed_get_message();
