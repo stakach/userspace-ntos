@@ -8026,12 +8026,12 @@ impl ExecNtHandler {
         if runtime.pi >= MAX_PI || runtime.user_stack_allocation_base == 0 {
             return;
         }
-        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-            .add(runtime.pi);
+        let Some(vm_map) = process_vm_region_map_mut(runtime.pi) else {
+            return;
+        };
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = core::ptr::read(vm_map);
+        *before = *vm_map;
         *after = *before;
         let plan = match after.free(
             runtime.user_stack_allocation_base,
@@ -8067,7 +8067,7 @@ impl ExecNtHandler {
             }
             page += nt_address_space::PAGE_SIZE;
         }
-        core::ptr::write(vm_map, *after);
+        *vm_map = *after;
         USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -13913,13 +13913,13 @@ impl ExecNtHandler {
         if target.pml4 == 0 || target.scratch_base == 0 {
             return nt_process::STATUS_INVALID_HANDLE;
         }
-        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-            .add(target_pi);
+        let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
         // STATIC scratch, not stack — see the matching note in the free path.
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = core::ptr::read(vm_map);
+        *before = *vm_map;
         let plan = match allocate_private_vad_avoiding_fixed_authorities(
             before,
             after,
@@ -14049,7 +14049,7 @@ impl ExecNtHandler {
             }
             return map_status;
         }
-        core::ptr::write(vm_map, *after);
+        *vm_map = *after;
         let size_written = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
         let base_written = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
         if !created_vad && (!size_written || !base_written) {
@@ -14223,12 +14223,12 @@ impl ExecNtHandler {
             let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
             return 0;
         }
-        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-            .add(target_pi);
+        let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = core::ptr::read(vm_map);
+        *before = *vm_map;
         *after = *before;
         let plan = match after.protect(base, size, new_protection) {
             Ok(plan) => plan,
@@ -14282,7 +14282,7 @@ impl ExecNtHandler {
             }
             return map_status;
         }
-        core::ptr::write(vm_map, *after);
+        *vm_map = *after;
         let registry_slot = self.loop_ctx.and_then(|ctx| {
             (&*ctx.reg)
                 .dll_for_page(target_pi, plan.base)
@@ -14333,9 +14333,9 @@ impl ExecNtHandler {
             return Ok(info);
         }
 
-        let vm_map = &*((core::ptr::addr_of!(PROCESS_VM_REGIONS)
-            as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-            .add(target_pi));
+        let Some(vm_map) = process_vm_region_map(target_pi) else {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
         if vm_map.extent_at(page).is_some() {
             return vm_map.query_basic(page, USER_ADDRESS_LIMIT);
         }
@@ -14520,11 +14520,15 @@ impl ExecNtHandler {
         } else {
             (&(*ctx.pfilled)[target_pi], procs[target_pi].faults as usize)
         };
-        let target_vm = core::ptr::read(
-            (core::ptr::addr_of!(PROCESS_VM_REGIONS)
-                as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-                .add(target_pi),
-        );
+        let target_vm = match process_vm_region_map(target_pi) {
+            Some(map) => *map,
+            None => {
+                if count_ptr != 0 {
+                    let _ = self.xas_write_u64(count_ptr, 0);
+                }
+                return nt_process::STATUS_INVALID_HANDLE;
+            }
+        };
 
         let mut transferred = 0u64;
         let mut buffer = [0u8; 256];
@@ -14663,9 +14667,9 @@ impl ExecNtHandler {
         }) {
             return nt_process::STATUS_PROCESS_IS_TERMINATING;
         }
-        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-            .add(target_pi);
+        let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+            return nt_process::STATUS_INVALID_HANDLE;
+        };
         // ★ The before/after snapshots live in STATIC scratch, never on the stack. The executive's
         // rootserver stack floats immediately after its loaded image and is only a few pages; a
         // whole `VmRegionMap` is kilobytes, so taking two copies per call overflowed straight into
@@ -14674,7 +14678,7 @@ impl ExecNtHandler {
         // Single-threaded executive, and neither scratch outlives this call.
         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = core::ptr::read(vm_map);
+        *before = *vm_map;
         *after = *before;
         let plan = match after.free(base, size, free_type) {
             Ok(plan) => plan,
@@ -14692,7 +14696,7 @@ impl ExecNtHandler {
             }
             page += 0x1000;
         }
-        core::ptr::write(vm_map, *after);
+        *vm_map = *after;
         let _ = self.xas_write_u64(size_ptr, plan.size);
         let _ = self.xas_write_u64(base_ptr, plan.base);
         0
@@ -25384,12 +25388,12 @@ impl ExecNtHandler {
                         if writeback != 0 {
                             self.writable_fs_dirty = true;
                         }
-                        let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-                            as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-                            .add(target_pi);
+                        let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+                            return nt_process::STATUS_INVALID_HANDLE;
+                        };
                         let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
                         let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                        *before = core::ptr::read(vm_map);
+                        *before = *vm_map;
                         *after = *before;
                         let plan = match after.free(view.base, 0, nt_address_space::MEM_RELEASE) {
                             Ok(plan) => plan,
@@ -25408,7 +25412,7 @@ impl ExecNtHandler {
                             }
                             page += 0x1000;
                         }
-                        core::ptr::write(vm_map, *after);
+                        *vm_map = *after;
                         let _ = process_committed_mapping_unregister_range(
                             target_pi as u64,
                             view.base,
@@ -30124,12 +30128,12 @@ impl ExecNtHandler {
                     if target.pml4 == 0 || target.scratch_base == 0 {
                         return nt_process::STATUS_INVALID_HANDLE;
                     }
-                    let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-                        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-                        .add(target_pi);
+                    let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
                     let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
                     let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-                    *before = core::ptr::read(vm_map);
+                    *before = *vm_map;
                     let plan = match allocate_private_vad_avoiding_fixed_authorities(
                         before,
                         after,
@@ -30152,7 +30156,7 @@ impl ExecNtHandler {
                         plan.size,
                         section_offset,
                     ) {
-                        core::ptr::write(vm_map, *before);
+                        *vm_map = *before;
                         return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                     }
                     if !process_committed_mapping_register(
@@ -30164,10 +30168,10 @@ impl ExecNtHandler {
                         ),
                     ) {
                         let _ = generic_sections.unmap_view(target_pi, plan.base);
-                        core::ptr::write(vm_map, *before);
+                        *vm_map = *before;
                         return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                     }
-                    core::ptr::write(vm_map, *after);
+                    *vm_map = *after;
                     crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
                     if !csrss_out_write(
                         self.pi as u64,

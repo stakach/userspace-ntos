@@ -1374,8 +1374,10 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 /// remains meaningful instead of sitting exactly on its three-quarter ceiling.
 const VM_REGION_CAPACITY: usize = 96;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
-static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY>; MAX_PI] =
-    [const { nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT) }; MAX_PI];
+static PROCESS_VM_REGION_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut PROCESS_VM_REGIONS: alloc::vec::Vec<
+    nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+> = alloc::vec::Vec::new();
 /// Non-private committed mappings owned outside the private VAD allocator.
 ///
 /// This covers process-lifetime runtime pages plus mapped section/image views. Image views are
@@ -1383,23 +1385,82 @@ static mut PROCESS_VM_REGIONS: [nt_address_space::VmRegionMap<VM_REGION_CAPACITY
 /// ranges under one allocation base. Keep the table precharged for explorer's post-desktop DLL set
 /// without allocating in the syscall-reset window.
 const PROCESS_COMMITTED_MAPPING_CAPACITY: usize = 512;
-static mut PROCESS_COMMITTED_MAPPINGS: [nt_address_space::VmCommittedRangeTable<
-    PROCESS_COMMITTED_MAPPING_CAPACITY,
->; MAX_PI] = [const { nt_address_space::VmCommittedRangeTable::new() }; MAX_PI];
+static PROCESS_COMMITTED_MAPPING_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut PROCESS_COMMITTED_MAPPINGS: alloc::vec::Vec<
+    nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
+> = alloc::vec::Vec::new();
+
+pub(crate) unsafe fn reset_process_vm_region_maps(slots: usize) -> bool {
+    let maps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_REGIONS);
+    maps.clear();
+    if maps.try_reserve(slots).is_err() {
+        PROCESS_VM_REGION_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while maps.len() < slots {
+        maps.push(nt_address_space::VmRegionMap::new(
+            SMSS_ALLOC_VA,
+            PRIVATE_VM_LIMIT,
+        ));
+    }
+    true
+}
+
+pub(crate) unsafe fn process_vm_region_map_mut(
+    pi: usize,
+) -> Option<&'static mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>> {
+    (&mut *core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)).get_mut(pi)
+}
+
+pub(crate) unsafe fn process_vm_region_map(
+    pi: usize,
+) -> Option<&'static nt_address_space::VmRegionMap<VM_REGION_CAPACITY>> {
+    (&*core::ptr::addr_of!(PROCESS_VM_REGIONS)).get(pi)
+}
+
+pub(crate) unsafe fn process_vm_region_map_reset(pi: usize) {
+    if let Some(map) = process_vm_region_map_mut(pi) {
+        *map = nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+    }
+}
+
+pub(crate) unsafe fn reset_process_committed_mappings(slots: usize) -> bool {
+    let mappings = &mut *core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS);
+    mappings.clear();
+    if mappings.try_reserve(slots).is_err() {
+        PROCESS_COMMITTED_MAPPING_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while mappings.len() < slots {
+        mappings.push(nt_address_space::VmCommittedRangeTable::new());
+    }
+    true
+}
+
+unsafe fn process_committed_mapping_table_mut(
+    pi: usize,
+) -> Option<
+    &'static mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
+> {
+    (&mut *core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)).get_mut(pi)
+}
+
+unsafe fn process_committed_mapping_table(
+    pi: usize,
+) -> Option<&'static nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>> {
+    (&*core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)).get(pi)
+}
 
 pub(crate) unsafe fn process_committed_mapping_register(
     pi: u64,
     range: nt_address_space::VmCommittedRange,
 ) -> bool {
-    if pi as usize >= MAX_PI {
+    let Some(table) = process_committed_mapping_table_mut(pi as usize) else {
         return false;
-    }
-    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
-        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    match (*table).register(range) {
+    };
+    match table.register(range) {
         Ok(()) => {
-            note_high_water(&VM_COMMITTED_MAPPING_HW, (*table).range_count() as u64);
+            note_high_water(&VM_COMMITTED_MAPPING_HW, table.range_count() as u64);
             true
         }
         Err(status) => {
@@ -1422,39 +1483,26 @@ pub(crate) unsafe fn process_committed_mapping_register(
 }
 
 pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
-    if pi >= MAX_PI {
-        return;
+    if let Some(table) = process_committed_mapping_table_mut(pi) {
+        *table = nt_address_space::VmCommittedRangeTable::new();
     }
-    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
-        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi);
-    core::ptr::write(table, nt_address_space::VmCommittedRangeTable::new());
 }
 
 pub(crate) unsafe fn process_committed_mapping_snapshot(
     pi: u64,
 ) -> Option<nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>> {
-    if pi as usize >= MAX_PI {
-        return None;
-    }
-    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
-        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    Some(*table)
+    process_committed_mapping_table(pi as usize).copied()
 }
 
 pub(crate) unsafe fn process_committed_mapping_replace(
     pi: u64,
     replacement: nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>,
 ) -> bool {
-    if pi as usize >= MAX_PI {
+    let Some(table) = process_committed_mapping_table_mut(pi as usize) else {
         return false;
-    }
-    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
-        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
+    };
     *table = replacement;
-    note_high_water(&VM_COMMITTED_MAPPING_HW, (*table).range_count() as u64);
+    note_high_water(&VM_COMMITTED_MAPPING_HW, table.range_count() as u64);
     true
 }
 
@@ -1463,13 +1511,10 @@ pub(crate) unsafe fn process_committed_mapping_unregister_range(
     base: u64,
     size: u64,
 ) -> bool {
-    if pi as usize >= MAX_PI {
+    let Some(table) = process_committed_mapping_table_mut(pi as usize) else {
         return false;
-    }
-    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
-        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table)
+    };
+    table
         .unregister_range(base, size)
         .is_ok_and(|removed| removed != 0)
 }
@@ -1478,49 +1523,29 @@ pub(crate) unsafe fn process_committed_mapping_unregister_allocation(
     pi: u64,
     allocation_base: u64,
 ) -> bool {
-    if pi as usize >= MAX_PI {
+    let Some(table) = process_committed_mapping_table_mut(pi as usize) else {
         return false;
-    }
-    let table = (core::ptr::addr_of_mut!(PROCESS_COMMITTED_MAPPINGS)
-        as *mut nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table).unregister_allocation_base(allocation_base) != 0
+    };
+    table.unregister_allocation_base(allocation_base) != 0
 }
 
 pub(crate) unsafe fn process_committed_mapping_basic_information(
     pi: u64,
     page: u64,
 ) -> Option<nt_address_space::VmBasicInformation> {
-    if pi as usize >= MAX_PI {
-        return None;
-    }
-    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
-        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table).query_basic(page)
+    process_committed_mapping_table(pi as usize).and_then(|table| table.query_basic(page))
 }
 
 pub(crate) unsafe fn process_committed_image_allocation(
     pi: u64,
     page: u64,
 ) -> Option<nt_address_space::VmImageAllocation> {
-    if pi as usize >= MAX_PI {
-        return None;
-    }
-    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
-        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table).image_allocation_for_page(page)
+    process_committed_mapping_table(pi as usize)
+        .and_then(|table| table.image_allocation_for_page(page))
 }
 
 pub(crate) unsafe fn process_committed_mapping_next_base_after(pi: u64, page: u64) -> Option<u64> {
-    if pi as usize >= MAX_PI {
-        return None;
-    }
-    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
-        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table).next_base_after(page)
+    process_committed_mapping_table(pi as usize).and_then(|table| table.next_base_after(page))
 }
 
 pub(crate) unsafe fn process_committed_mapping_first_overlap(
@@ -1528,13 +1553,30 @@ pub(crate) unsafe fn process_committed_mapping_first_overlap(
     base: u64,
     size: u64,
 ) -> Option<nt_address_space::VmCommittedRange> {
-    if pi as usize >= MAX_PI {
-        return None;
+    process_committed_mapping_table(pi as usize)
+        .and_then(|table| table.first_overlap_range(base, size).ok().flatten())
+}
+
+fn process_vm_region_map_stats() -> (usize, usize, u64) {
+    unsafe {
+        let maps = &*core::ptr::addr_of!(PROCESS_VM_REGIONS);
+        (
+            maps.len(),
+            maps.capacity(),
+            PROCESS_VM_REGION_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
     }
-    let table = (core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS)
-        as *const nt_address_space::VmCommittedRangeTable<PROCESS_COMMITTED_MAPPING_CAPACITY>)
-        .add(pi as usize);
-    (*table).first_overlap_range(base, size).ok().flatten()
+}
+
+fn process_committed_mapping_stats() -> (usize, usize, u64) {
+    unsafe {
+        let mappings = &*core::ptr::addr_of!(PROCESS_COMMITTED_MAPPINGS);
+        (
+            mappings.len(),
+            mappings.capacity(),
+            PROCESS_COMMITTED_MAPPING_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
 }
 
 const GENERIC_SECTION_BACKING_NONE: u8 = 0;
@@ -1990,12 +2032,49 @@ pub(crate) static mut COMMITTED_MAP_AFTER: nt_address_space::VmCommittedRangeTab
     PROCESS_COMMITTED_MAPPING_CAPACITY,
 > = nt_address_space::VmCommittedRangeTable::new();
 const PRIVATE_VM_PT_COUNT: usize = ((PRIVATE_VM_LIMIT - SMSS_ALLOC_VA) / 0x20_0000) as usize;
-static mut PROCESS_VM_PT_CAPS: [[u64; PRIVATE_VM_PT_COUNT]; MAX_PI] =
-    [[0; PRIVATE_VM_PT_COUNT]; MAX_PI];
+static PROCESS_VM_PT_CAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> =
+    alloc::vec::Vec::new();
 const VM_FREE_FRAME_CAPACITY: usize = 4096;
 static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
 static mut VM_FREE_FRAME_N: usize = 0;
 static KUSER_PAGE_ALIAS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+
+pub(crate) unsafe fn reset_process_private_pt_caps(slots: usize) -> bool {
+    let caps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS);
+    caps.clear();
+    if caps.try_reserve(slots).is_err() {
+        PROCESS_VM_PT_CAP_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while caps.len() < slots {
+        caps.push([0; PRIVATE_VM_PT_COUNT]);
+    }
+    true
+}
+
+unsafe fn process_private_pt_caps_mut(
+    pi: usize,
+) -> Option<&'static mut [u64; PRIVATE_VM_PT_COUNT]> {
+    (&mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS)).get_mut(pi)
+}
+
+fn process_private_pt_cap_stats() -> (usize, usize, u64) {
+    unsafe {
+        let caps = &*core::ptr::addr_of!(PROCESS_VM_PT_CAPS);
+        (
+            caps.len(),
+            caps.capacity(),
+            PROCESS_VM_PT_CAP_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
+    reset_process_vm_region_maps(slots)
+        && reset_process_committed_mappings(slots)
+        && reset_process_private_pt_caps(slots)
+}
 
 unsafe fn kuser_page_alias_put(pi: u64, alias: u64) {
     let index = pi as usize;
@@ -8799,8 +8878,6 @@ unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
     let aliases = core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64;
     let source_caps = core::ptr::addr_of!(CSRSS_FRAME_SOURCE_CAP) as *const u64;
     let owns_frames = core::ptr::addr_of!(CSRSS_FRAME_OWNS_FRAME) as *const bool;
-    let vm_maps = core::ptr::addr_of!(PROCESS_VM_REGIONS)
-        as *const nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
 
     for index in 0..n {
         let pi = core::ptr::read(pis.add(index)) as usize;
@@ -8841,7 +8918,11 @@ unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
             continue;
         }
 
-        if let Some(extent) = (*vm_maps.add(pi)).extent_at(page) {
+        let Some(vm_map) = process_vm_region_map(pi) else {
+            census.unknown = census.unknown.saturating_add(1);
+            continue;
+        };
+        if let Some(extent) = vm_map.extent_at(page) {
             if extent.state == nt_address_space::VmExtentState::Committed {
                 census.vad_private = census.vad_private.saturating_add(1);
             } else {
@@ -9843,6 +9924,27 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(tp_win_cap as u64);
     print_str(b"/");
     print_u64(tp_win_fails);
+    let (vm_region_len, vm_region_cap, vm_region_fails) = process_vm_region_map_stats();
+    let (vm_commit_len, vm_commit_cap, vm_commit_fails) = process_committed_mapping_stats();
+    let (vm_pt_len, vm_pt_cap, vm_pt_fails) = process_private_pt_cap_stats();
+    print_str(b" process-vm=");
+    print_u64(vm_region_len as u64);
+    print_str(b"/");
+    print_u64(vm_region_cap as u64);
+    print_str(b"/");
+    print_u64(vm_region_fails);
+    print_str(b":");
+    print_u64(vm_commit_len as u64);
+    print_str(b"/");
+    print_u64(vm_commit_cap as u64);
+    print_str(b"/");
+    print_u64(vm_commit_fails);
+    print_str(b":");
+    print_u64(vm_pt_len as u64);
+    print_str(b"/");
+    print_u64(vm_pt_cap as u64);
+    print_str(b"/");
+    print_u64(vm_pt_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -11965,11 +12067,10 @@ unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
 }
 
 unsafe fn process_private_pt_caps_release(pi: usize) -> (u64, u64) {
-    if pi >= MAX_PI {
+    let Some(slots) = process_private_pt_caps_mut(pi) else {
         return (0, 0);
-    }
-    let caps = core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS) as *mut [u64; PRIVATE_VM_PT_COUNT];
-    let slots = (*caps.add(pi)).as_mut_ptr();
+    };
+    let slots = slots.as_mut_ptr();
     let mut released = 0u64;
     let mut failed = 0u64;
     for index in 0..PRIVATE_VM_PT_COUNT {
@@ -12021,8 +12122,8 @@ unsafe fn vm_ensure_private_pt(pi: usize, page: u64, pml4: u64) -> Result<(), u3
         .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
     let index = (offset / 0x20_0000) as usize;
-    let caps = core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS) as *mut [u64; PRIVATE_VM_PT_COUNT];
-    let slot = (*caps.add(pi)).as_mut_ptr().add(index);
+    let caps = process_private_pt_caps_mut(pi).ok_or(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+    let slot = caps.as_mut_ptr().add(index);
     if core::ptr::read(slot) != 0 {
         return Ok(());
     }
@@ -16231,12 +16332,7 @@ unsafe fn reclaim_final_process_vm(
     stats.dll_cache_evictions = dll_cache_evict_unreferenced_all();
     stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
     process_committed_mapping_reset(pi);
-    let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
-    core::ptr::write(
-        vm_maps.add(pi),
-        nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
-    );
+    process_vm_region_map_reset(pi);
     let (private_pts, private_pt_failures) = process_private_pt_caps_release(pi);
     stats.private_pts = private_pts;
     stats.private_pt_failures = private_pt_failures;
@@ -25140,6 +25236,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // .rdata (a second section, faulted in on its own access) and reports it — a real PE runs
     // with pages arriving only as touched, from their correct file offsets. This is how a real
     // ntdll/smss will load: memory-efficient, only touched pages materialized.
+    if !reset_process_vm_state(MAX_PI) {
+        panic!("process VM state allocation failed");
+    }
     print_str(b"[ntos-exec] P3: demand-loading a PE via SEC_IMAGE (pages fault in by RVA)\n");
     let sec_magic = 0x5EC1_1A6E_D15C_0DE5u64;
     let si_text = build_sec_image_text();

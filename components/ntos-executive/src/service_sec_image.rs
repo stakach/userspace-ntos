@@ -1584,12 +1584,12 @@ unsafe fn service_private_guard_page_fault(
     filled_pages: &[u64; 512],
     faults: usize,
 ) -> Result<bool, u32> {
-    let vm_map = (core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>)
-        .add(pi);
+    let Some(vm_map) = process_vm_region_map_mut(pi) else {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    };
     let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
     let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-    *before = core::ptr::read(vm_map);
+    *before = *vm_map;
     let Some(extent) = before.extent_at(page) else {
         return Ok(false);
     };
@@ -1612,7 +1612,7 @@ unsafe fn service_private_guard_page_fault(
         vm_map_private_page(pi, page, plan.new_protection, pml4, scratch_base)
     };
     map_result?;
-    core::ptr::write(vm_map, *after);
+    *vm_map = *after;
 
     let mut teb_write_ok = false;
     if nt_handler
@@ -5247,24 +5247,22 @@ pub(crate) unsafe fn service_sec_image(
     if !reset_hosted_tp_worker_window_resources(MAX_PI) {
         panic!("hosted TP worker window resource allocation failed");
     }
+    if !reset_process_vm_region_maps(MAX_PI) {
+        panic!("process VAD map allocation failed");
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
-    // pre-reserved process handle tables, SEC_IMAGE process scratch, and TP worker window resource
-    // slices) is allocated. Each smss syscall we service allocates transient Vec/String (copyin
-    // buffers, registry value info) on the no-free bump heap; without reclamation a few hundred
-    // registry syscalls exhaust the executive heap. Rewinding to this mark each iteration reclaims
-    // all per-syscall transients while leaving the persistent state below the mark intact.
+    // pre-reserved process handle tables, SEC_IMAGE process scratch, TP worker window resources,
+    // and private VAD rows) is allocated. Committed image/runtime mapping rows are intentionally
+    // preserved here: the SEC_IMAGE spawn path registered the primary image, ntdll, stack, and
+    // environment ranges before entering this loop. Each smss syscall we service allocates transient
+    // Vec/String (copyin buffers, registry value info) on the no-free bump heap; without reclamation
+    // a few hundred registry syscalls exhaust the executive heap. Rewinding to this mark each
+    // iteration reclaims all per-syscall transients while leaving the persistent state below the mark
+    // intact.
     // `mut` because durable runtime growth (CM overlays, hive mounts, DLL caches, object namespace)
     // must survive the per-syscall reset: after such a mutating syscall the loop advances this mark
     // past the new allocations.
     let mut heap_mark = allocator::mark();
-    let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
-        as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
-    for index in 0..MAX_PI {
-        core::ptr::write(
-            vm_maps.add(index),
-            nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT),
-        );
-    }
     VM_FREE_FRAME_N = 0;
     if live_service {
         let resume_error = tcb_resume_r(main_tcb);

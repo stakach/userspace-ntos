@@ -513,6 +513,26 @@ Review adjustment: continue the fixed-table audit at the heavier process VM stat
 committed mapping tables, and private page-table caps) before attempting to raise or remove the
 `MAX_PI` admission ceiling itself.
 
+A4/B3 process VM state scaling cleanup (2026-08-21): the remaining core process VM rows now use
+durable vector-backed stores instead of `[...; MAX_PI]` BSS arrays. `PROCESS_VM_REGIONS`,
+`PROCESS_COMMITTED_MAPPINGS`, and `PROCESS_VM_PT_CAPS` were moved behind checked helper contracts;
+syscall VAD transactions, generic-section map/unmap rollback, frame-registry census, private
+guard-fault handling, remote memory copy, and final process teardown now access rows through those
+helpers rather than pointer arithmetic over static arrays. The pre-service SEC_IMAGE diagnostic
+initializes all process VM backing before the first hosted image spawn, while the service loop resets
+only private VAD rows so it does not erase the committed image/ntdll/stack/environment ranges that
+the spawn path has just registered. The pool census reports the backing as
+`process-vm=<vad len/cap/fail>:<commit len/cap/fail>:<pt len/cap/fail>`. Local validation is green
+for `cargo fmt --all`, `cargo test -p nt-address-space`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof `.tmp/run-desktop-process-vm-state-vec-20260821.log`
+reaches genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing,
+keeps `exec_explorer_shell_chrome_painted` green, reports
+`process-vm=24/24/0:24/24/0:24/24/0`, and records zero VAD, committed-mapping, or private-PT backing
+allocation failures. Review adjustment: this closes the current SEC_IMAGE/fault scratch fixed-array
+cluster. Continue the fixed-runtime-table audit in the remaining process-index side tables such as
+KUSER aliases or frame/census summaries before changing the `MAX_PI` admission policy itself.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
