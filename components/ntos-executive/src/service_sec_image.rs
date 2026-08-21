@@ -1224,6 +1224,13 @@ fn pin_durable_heap_mark(heap_mark: &mut usize) {
     *heap_mark = (*heap_mark).max(allocator::mark());
 }
 
+#[inline]
+fn pin_wait_table_growth_if_dirty(heap_mark: &mut usize) {
+    if take_wait_table_growth_dirty() {
+        pin_durable_heap_mark(heap_mark);
+    }
+}
+
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
         return nt_fs::STATUS_SUCCESS;
@@ -5256,15 +5263,27 @@ pub(crate) unsafe fn service_sec_image(
     if !reset_process_vm_region_maps(MAX_PI) {
         panic!("process VAD map allocation failed");
     }
+    // Cooperative wait tables own durable state across syscall iterations. Allocate their backing
+    // storage before taking `heap_mark`; otherwise the loop's per-syscall heap rewind can reclaim a
+    // parked waiter's Vec storage while the reply cap is still live.
+    if !object_waiter_table_reset() {
+        panic!("object wait table allocation failed");
+    }
+    if !thread_wait_state_reset() {
+        panic!("thread wait parked-state allocation failed");
+    }
+    if !keyed_wait_tables_reset() {
+        panic!("keyed wait table allocation failed");
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved process handle tables, SEC_IMAGE process scratch, TP worker window resources,
-    // and private VAD rows) is allocated. Committed image/runtime mapping rows are intentionally
-    // preserved here: the SEC_IMAGE spawn path registered the primary image, ntdll, stack, and
-    // environment ranges before entering this loop. Each smss syscall we service allocates transient
-    // Vec/String (copyin buffers, registry value info) on the no-free bump heap; without reclamation
-    // a few hundred registry syscalls exhaust the executive heap. Rewinding to this mark each
-    // iteration reclaims all per-syscall transients while leaving the persistent state below the mark
-    // intact.
+    // private VAD rows, and cooperative wait tables) is allocated. Committed image/runtime mapping rows
+    // are intentionally preserved here: the SEC_IMAGE spawn path registered the primary image, ntdll,
+    // stack, and environment ranges before entering this loop. Each smss syscall we service allocates
+    // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
+    // reclamation a few hundred registry syscalls exhaust the executive heap. Rewinding to this mark
+    // each iteration reclaims all per-syscall transients while leaving the persistent state below the
+    // mark intact.
     // `mut` because durable runtime growth (CM overlays, hive mounts, DLL caches, object namespace)
     // must survive the per-syscall reset: after such a mutating syscall the loop advances this mark
     // past the new allocations.
@@ -5313,12 +5332,6 @@ pub(crate) unsafe fn service_sec_image(
     // the actual hosted thread badge; completion paths clear that badge when they resume the stolen
     // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
     // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
-    if !thread_wait_state_reset() {
-        panic!("thread wait parked-state allocation failed");
-    }
-    if !keyed_wait_tables_reset() {
-        panic!("keyed wait table allocation failed");
-    }
     let mut wait_parked: u64 = 0;
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
@@ -5476,6 +5489,7 @@ pub(crate) unsafe fn service_sec_image(
                 procs[$pi].ntfaults = ntfaults;
                 pfilled[$pi] = *filled_pages;
                 mark_wait_parked!($pi, $ip);
+                pin_wait_table_growth_if_dirty(&mut heap_mark);
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
                     recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = nb;
@@ -6799,6 +6813,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -8000,6 +8015,7 @@ pub(crate) unsafe fn service_sec_image(
             {
                 pin_durable_heap_mark(&mut heap_mark);
             }
+            pin_wait_table_growth_if_dirty(&mut heap_mark);
             if allocation_failed {
                 if image_protect_failed {
                     park_and_log!(pi, b"image-protect", m0, addr);
@@ -8535,6 +8551,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -8593,6 +8610,7 @@ pub(crate) unsafe fn service_sec_image(
                     if !delivered_waiting_client {
                         mark_wait_parked!(pi, m0);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -8671,6 +8689,7 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
+                        pin_wait_table_growth_if_dirty(&mut heap_mark);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -8713,6 +8732,7 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         mark_wait_parked!(pi, resume_ip);
+                        pin_wait_table_growth_if_dirty(&mut heap_mark);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                         badge = nb;
@@ -9405,6 +9425,7 @@ pub(crate) unsafe fn service_sec_image(
                 if take_object_namespace_growth_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                pin_wait_table_growth_if_dirty(&mut heap_mark);
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
                 // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
                 // contract as `overlay_dirty` — a mounted hive must outlive the syscall that
@@ -9461,6 +9482,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
+                pin_wait_table_growth_if_dirty(&mut heap_mark);
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
                 // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
                 // only ever prints `GetLastError()`, and several distinct NTSTATUSes collapse onto
@@ -9772,6 +9794,7 @@ pub(crate) unsafe fn service_sec_image(
                             if LSA_CLI_REPLY_CAP.load(Ordering::Relaxed) != 0 {
                                 mark_wait_parked!(pi, resume_ip);
                             }
+                            pin_wait_table_growth_if_dirty(&mut heap_mark);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                             badge = nb;
@@ -15153,6 +15176,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15206,6 +15230,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb;
@@ -15404,6 +15429,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15448,6 +15474,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15494,6 +15521,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
                     mi = received.1;
@@ -15566,6 +15594,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15613,6 +15642,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let received = recv_full_r12(fault_ep, new_reply);
                     badge = received.0;
@@ -15690,6 +15720,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -15745,6 +15776,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -15798,6 +15830,7 @@ pub(crate) unsafe fn service_sec_image(
                         wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -15850,6 +15883,7 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;
@@ -15895,6 +15929,7 @@ pub(crate) unsafe fn service_sec_image(
                     // so it counts toward the all-parked quiesce exactly like every other wait —
                     // the boot still reaches the gate if the debugger never continues.
                     mark_wait_parked!(pi, resume_ip);
+                    pin_wait_table_growth_if_dirty(&mut heap_mark);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb;

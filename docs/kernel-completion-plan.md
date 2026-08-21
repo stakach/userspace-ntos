@@ -617,9 +617,29 @@ Explorer shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobber
 `exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
 reports `keyed-wait=0/0/16/0/0:0/0/16/0/0`, and commits writable profile state with
 `[writable-fs-snapshot] committed generation=5 bytes=822600`. Review adjustment: keyed-event
-rendezvous capacity is no longer a fixed kernel cap. The main object-wait `WAIT_REPLY_POOL`/`WAITER_*`,
-IOCP, delay, and pipe-name waiters still remain explicit transport-capacity boundaries because they
-own real reply caps/resume records.
+rendezvous capacity is no longer a fixed kernel cap. The main object-wait reply-cap pool, IOCP,
+delay, and pipe-name waiters still remain explicit transport-capacity boundaries because they own
+real reply caps/resume records.
+
+A4/B3 object-wait waiter scaling cleanup (2026-08-22): `NtWaitForSingleObject` and
+`NtWaitForMultipleObjects` no longer use fixed `WAITER_N` parallel arrays for dispatcher wait
+records. The wait set, caller result indices, stolen reply cap, TID, deadline, syscall resume
+context, and pending wake selection now live together in a growable typed `ObjectWaiterTable`.
+Records reuse cleared rows, service-loop startup hard-fails if the initial reserve cannot be
+provisioned, and pool census reports
+`object-wait=<live>/<records>/<cap>/<alloc-fail>/<store-fail>`. The wait/keyed/thread wait tables
+are allocated before the service-loop heap rewind mark and publish a growth-dirty bit so future
+durable Vec growth is pinned before the next receive. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-object-waiters-vec-heapmark-20260822.log` reaches genuine userinit/Explorer launch
+and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_teb_not_clobbered_by_win32k`, `exec_msgina_credential_keystrokes_delivered`, and
+`exec_explorer_shell_chrome_painted` green, reports `object-wait=33/35/808/0/0`, and commits
+writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822086`. Review
+adjustment: the dispatcher waiter record store is no longer a fixed kernel cap. The real seL4
+reply-cap pool remains separate because it owns transport objects and needs its own capacity audit.
 
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of

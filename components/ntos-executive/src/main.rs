@@ -2727,6 +2727,7 @@ const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_
 const HOSTED_THREAD_WAIT_CAP: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_WAIT_CAP + 1;
 const WAIT_REPLY_POOL_USED_WORDS: usize = (WAIT_REPLY_POOL_N + 63) / 64;
+static WAIT_TABLE_GROWTH_DIRTY: AtomicBool = AtomicBool::new(false);
 /// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
 /// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
 /// (into a waiter slot) and installs a free spare as the new active.
@@ -2736,6 +2737,14 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
 /// by a parked waiter). Managed by wait_park / wait_wake_event.
 static WAIT_REPLY_POOL_USED: [AtomicU64; WAIT_REPLY_POOL_USED_WORDS] =
     [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_USED_WORDS];
+
+fn mark_wait_table_growth_dirty() {
+    WAIT_TABLE_GROWTH_DIRTY.store(true, Ordering::Relaxed);
+}
+
+fn take_wait_table_growth_dirty() -> bool {
+    WAIT_TABLE_GROWTH_DIRTY.swap(false, Ordering::Relaxed)
+}
 
 struct ThreadWaitParkTable {
     badges_plus_one: Vec<u64>,
@@ -2777,12 +2786,13 @@ impl ThreadWaitParkTable {
             *slot = encoded;
             return;
         }
-        if self.badges_plus_one.len() == self.badges_plus_one.capacity()
-            && self.badges_plus_one.try_reserve(1).is_err()
-        {
-            self.allocation_failures = self.allocation_failures.saturating_add(1);
-            self.store_failures = self.store_failures.saturating_add(1);
-            return;
+        if self.badges_plus_one.len() == self.badges_plus_one.capacity() {
+            if self.badges_plus_one.try_reserve(1).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                self.store_failures = self.store_failures.saturating_add(1);
+                return;
+            }
+            mark_wait_table_growth_dirty();
         }
         self.badges_plus_one.push(encoded);
     }
@@ -2882,44 +2892,201 @@ impl WaitObject {
     }
 }
 
-/// The waiter queue: each slot parks one blocked caller.
+/// The waiter queue: each record parks one blocked caller.
 ///
-/// A single-object wait (NtWaitForSingleObject) records ONE wait object in slot 0 of its set
+/// A single-object wait (NtWaitForSingleObject) records one wait object in slot 0 of its set
 /// (count 1); a multi-object wait (NtWaitForMultipleObjects) records up to `WAITER_MAX_EVENTS`
-/// typed wait objects + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == `WaitObject::FREE.raw()` means
-/// the slot is free (it doubles as event[0]).
-const WAITER_N: usize = HOSTED_THREAD_WAIT_CAP;
+/// typed wait objects + a `wait_all` flag. Object-wait records are heap-backed and grow with real
+/// parked wait demand. The stolen reply-cap pool remains a separate transport resource.
+const OBJECT_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 /// NT's architectural maximum for one multi-object wait.
 const WAITER_MAX_EVENTS: usize = 64;
-/// object[0] of each waiter's set (u64::MAX = free slot). Kept as the slot-free sentinel for backward
-/// compat with the single-object callers/spec.
-static WAITER_EVENT_IDX: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
-/// The FULL object set for a multi-object waiter (object[1..count]; object[0] is WAITER_EVENT_IDX).
-static WAITER_EVENTS: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
-    [const { [const { AtomicU64::new(u64::MAX) }; WAITER_MAX_EVENTS] }; WAITER_N];
-/// Original caller-array index for each compacted real wait object.
-static WAITER_RESULT_INDEX: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
-    [const { [const { AtomicU64::new(0) }; WAITER_MAX_EVENTS] }; WAITER_N];
+
+#[derive(Clone, Copy)]
+struct ObjectWaiterRecord {
+    objects: [WaitObject; WAITER_MAX_EVENTS],
+    result_indices: [u8; WAITER_MAX_EVENTS],
+    count: u8,
+    wait_all: bool,
+    reply_cap: u64,
+    tid: u64,
+    deadline: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+    pending_wake_index: u64,
+    pending_wake_object: WaitObject,
+}
+
+impl ObjectWaiterRecord {
+    const fn empty() -> Self {
+        Self {
+            objects: [WaitObject::FREE; WAITER_MAX_EVENTS],
+            result_indices: [0; WAITER_MAX_EVENTS],
+            count: 0,
+            wait_all: false,
+            reply_cap: 0,
+            tid: 0,
+            deadline: u64::MAX,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_flags: 0,
+            pending_wake_index: u64::MAX,
+            pending_wake_object: WaitObject::FREE,
+        }
+    }
+
+    fn is_live(self) -> bool {
+        self.count != 0 && self.reply_cap != 0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        objects: &[WaitObject],
+        result_indices: &[u8],
+        wait_all: bool,
+        reply_cap: u64,
+        tid: u64,
+        deadline: Option<u64>,
+        resume_ip: u64,
+        sp: u64,
+        flags: u64,
+    ) -> Self {
+        let mut record = Self::empty();
+        for (index, object) in objects.iter().copied().enumerate() {
+            record.objects[index] = object;
+            record.result_indices[index] = result_indices[index];
+        }
+        record.count = objects.len() as u8;
+        record.wait_all = wait_all;
+        record.reply_cap = reply_cap;
+        record.tid = tid;
+        record.deadline = deadline.unwrap_or(u64::MAX);
+        record.resume_ip = resume_ip;
+        record.resume_sp = sp;
+        record.resume_flags = flags;
+        record
+    }
+}
+
+struct ObjectWaiterTable {
+    entries: Vec<ObjectWaiterRecord>,
+    allocation_failures: u64,
+    store_failures: u64,
+}
+
+impl ObjectWaiterTable {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            allocation_failures: 0,
+            store_failures: 0,
+        }
+    }
+
+    fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.entries.clear();
+        if self.entries.capacity() < initial_reserve
+            && self.entries.try_reserve(initial_reserve).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
+    fn reserve_slot(&mut self) -> Option<usize> {
+        if let Some(index) = self.entries.iter().position(|entry| !entry.is_live()) {
+            return Some(index);
+        }
+        if self.entries.len() == self.entries.capacity() {
+            if self.entries.try_reserve(1).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                self.store_failures = self.store_failures.saturating_add(1);
+                return None;
+            }
+            mark_wait_table_growth_dirty();
+        }
+        let index = self.entries.len();
+        self.entries.push(ObjectWaiterRecord::empty());
+        Some(index)
+    }
+
+    fn park(&mut self, record: ObjectWaiterRecord) -> bool {
+        let Some(index) = self.reserve_slot() else {
+            return false;
+        };
+        self.entries[index] = record;
+        true
+    }
+
+    fn clear_slot(&mut self, slot: usize) {
+        if let Some(entry) = self.entries.get_mut(slot) {
+            *entry = ObjectWaiterRecord::empty();
+        }
+    }
+
+    fn record(&self, slot: usize) -> Option<ObjectWaiterRecord> {
+        self.entries
+            .get(slot)
+            .copied()
+            .filter(|entry| entry.is_live())
+    }
+
+    fn clear_pending_wakes(&mut self) {
+        for entry in self.entries.iter_mut().filter(|entry| entry.is_live()) {
+            entry.pending_wake_index = u64::MAX;
+            entry.pending_wake_object = WaitObject::FREE;
+        }
+    }
+
+    fn mark_pending_wake(&mut self, slot: usize, wake_index: u64, wake_object: WaitObject) {
+        if let Some(entry) = self.entries.get_mut(slot) {
+            if entry.is_live() {
+                entry.pending_wake_index = wake_index;
+                entry.pending_wake_object = wake_object;
+            }
+        }
+    }
+
+    fn pending_wake(&self, slot: usize) -> Option<(ObjectWaiterRecord, u64, WaitObject)> {
+        let entry = self.record(slot)?;
+        (entry.pending_wake_index != u64::MAX).then_some((
+            entry,
+            entry.pending_wake_index,
+            entry.pending_wake_object,
+        ))
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.is_live() && entry.deadline != u64::MAX)
+            .map(|entry| entry.deadline)
+            .min()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn stats(&self) -> (usize, usize, usize, u64, u64) {
+        (
+            self.entries.iter().filter(|entry| entry.is_live()).count(),
+            self.entries.len(),
+            self.entries.capacity(),
+            self.allocation_failures,
+            self.store_failures,
+        )
+    }
+}
+
+static mut OBJECT_WAITERS: ObjectWaiterTable = ObjectWaiterTable::new();
 /// Serialized service-loop work buffers, kept off the bounded rootserver stack.
 static mut PARK_WAIT_SET_WORK: [WaitObject; WAITER_MAX_EVENTS] =
     [WaitObject::FREE; WAITER_MAX_EVENTS];
 static mut PARK_WAIT_INDEX_WORK: [u8; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS];
-/// Number of events in this waiter's set (1 for a single-object wait).
-static WAITER_EVENT_COUNT: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-/// Wait mode: 0 = WaitAny (WAIT_TYPE WaitAnyObject — wake on the first signalled event, return its
-/// index as STATUS_WAIT_0+i), 1 = WaitAll (wake only when ALL events are signalled, return WAIT_0).
-static WAITER_WAIT_ALL: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-static WAITER_REPLY_CAP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-static WAITER_TID: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-/// Monotonic 100ns deadline (`u64::MAX` = infinite) for finite event waits.
-static WAITER_DEADLINE: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
-/// The parked waiter's syscall resume context (RCX/RSP/RFLAGS): a native-syscall (UnknownSyscall)
-/// fault is resumed by an apply_fault_reply that restores RCX←resume_ip, RSP←sp, RFLAGS←flags and
-/// RAX/r10←status. The service loop sets these in the IPC buffer at reply time, so we must snapshot
-/// them per-waiter at park and re-install them (set_reply_mr 15/16/17) before the wake send.
-static WAITER_RESUME_IP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-static WAITER_RESUME_SP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
-static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
 /// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2927,8 +3094,6 @@ static WAIT_WAKE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_PARK_INVALID_SET: AtomicU64 = AtomicU64::new(0);
 static WAIT_PARK_NO_WAITER_SLOT: AtomicU64 = AtomicU64::new(0);
 static WAIT_PARK_NO_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
-static mut WAIT_WAKE_INDEX_WORK: [u64; WAITER_N] = [u64::MAX; WAITER_N];
-static mut WAIT_WAKE_OBJECT_WORK: [u64; WAITER_N] = [WaitObject::FREE.raw(); WAITER_N];
 
 /// Blocking `NtRemoveIoCompletion` calls. One reply object remains active so the executive can
 /// continue receiving while every other reply cap is parked.
@@ -3010,10 +3175,13 @@ impl KeyedWaiterTable {
         if let Some(index) = self.entries.iter().position(|entry| !entry.is_live()) {
             return Some(index);
         }
-        if self.entries.len() == self.entries.capacity() && self.entries.try_reserve(1).is_err() {
-            self.allocation_failures = self.allocation_failures.saturating_add(1);
-            self.store_failures = self.store_failures.saturating_add(1);
-            return None;
+        if self.entries.len() == self.entries.capacity() {
+            if self.entries.try_reserve(1).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                self.store_failures = self.store_failures.saturating_add(1);
+                return None;
+            }
+            mark_wait_table_growth_dirty();
         }
         let index = self.entries.len();
         self.entries.push(KeyedWaiterRecord::empty());
@@ -3406,20 +3574,20 @@ unsafe fn watchdog_report(messages: u64) {
         win32k_subsystem::trace_win32k_request_context();
         win32k_glue::win32k_dispatch_backtrace();
     }
-    for slot in 0..WAITER_N {
-        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX {
+    for slot in 0..object_waiter_len() {
+        let Some(record) = object_waiter_record(slot) else {
             continue;
-        }
+        };
         print_str(b"[deadman] event-waiter tid=");
-        print_u64(WAITER_TID[slot].load(Ordering::Relaxed));
+        print_u64(record.tid);
         print_str(b" events=");
-        print_u64(WAITER_EVENT_COUNT[slot].load(Ordering::Relaxed));
+        print_u64(record.count as u64);
         print_str(b" wait-all=");
-        print_u64(WAITER_WAIT_ALL[slot].load(Ordering::Relaxed));
+        print_u64(record.wait_all as u64);
         print_str(b" deadline=");
-        print_u64(WAITER_DEADLINE[slot].load(Ordering::Relaxed));
+        print_u64(record.deadline);
         print_str(b" resume-ip=0x");
-        print_hex_u64(WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
+        print_hex_u64(record.resume_ip);
         print_str(b"\n");
     }
     for slot in 0..keyed_waiter_len() {
@@ -10424,6 +10592,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(hosted_thread_store_fails);
     let (
+        object_wait_live,
+        object_wait_records,
+        object_wait_cap,
+        object_wait_alloc_fails,
+        object_wait_store_fails,
+    ) = object_waiter_table_stats();
+    print_str(b" object-wait=");
+    print_u64(object_wait_live as u64);
+    print_str(b"/");
+    print_u64(object_wait_records as u64);
+    print_str(b"/");
+    print_u64(object_wait_cap as u64);
+    print_str(b"/");
+    print_u64(object_wait_alloc_fails);
+    print_str(b"/");
+    print_u64(object_wait_store_fails);
+    let (
         thread_wait_park_live,
         thread_wait_park_records,
         thread_wait_park_cap,
@@ -15663,11 +15848,7 @@ unsafe fn delay_timer_next_deadline(
     queue: &nt_delay_execution::Queue<DELAY_WAITER_N>,
 ) -> Option<(u64, u64)> {
     let delay_deadline = queue.next_deadline();
-    let event_deadline = (0..WAITER_N)
-        .filter(|slot| WAITER_EVENT_IDX[*slot].load(Ordering::Relaxed) != u64::MAX)
-        .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
-        .filter(|deadline| *deadline != u64::MAX)
-        .min();
+    let event_deadline = object_waiter_next_deadline();
     let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
     let keyed_release_deadline =
         unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline() };
@@ -16037,6 +16218,55 @@ unsafe fn delay_timer_ack_irq() {
     }
 }
 
+fn object_waiter_table_reset() -> bool {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).reset(OBJECT_WAITER_INITIAL_RESERVE)
+    }
+}
+
+fn object_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).stats() }
+}
+
+fn object_waiter_len() -> usize {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).len() }
+}
+
+fn object_waiter_record(slot: usize) -> Option<ObjectWaiterRecord> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).record(slot) }
+}
+
+fn object_waiter_next_deadline() -> Option<u64> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_deadline() }
+}
+
+fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).park(record) }
+}
+
+fn object_waiter_clear_slot(slot: usize) {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).clear_slot(slot);
+    }
+}
+
+fn object_waiter_clear_pending_wakes() {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS)).clear_pending_wakes();
+    }
+}
+
+fn object_waiter_mark_pending_wake(slot: usize, wake_index: u64, wake_object: WaitObject) {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS))
+            .mark_pending_wake(slot, wake_index, wake_object);
+    }
+}
+
+fn object_waiter_pending_wake(slot: usize) -> Option<(ObjectWaiterRecord, u64, WaitObject)> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).pending_wake(slot) }
+}
+
 fn thread_wait_state_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED))
@@ -16321,13 +16551,14 @@ unsafe fn wait_park(
 }
 
 unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
-    for slot in 0..WAITER_N {
-        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
-            || WAITER_TID[slot].load(Ordering::Relaxed) != tid
-        {
+    for slot in 0..object_waiter_len() {
+        let Some(record) = object_waiter_record(slot) else {
+            continue;
+        };
+        if record.tid != tid {
             continue;
         }
-        let cap = WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
             let deleted = cnode_delete_r(cap);
             let retyped = if deleted == 0 {
@@ -16339,11 +16570,7 @@ unsafe fn wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
                 release_reply_pool_cap(cap);
             }
         }
-        WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
-        WAITER_EVENT_COUNT[slot].store(0, Ordering::Relaxed);
-        WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
-        WAITER_TID[slot].store(0, Ordering::Relaxed);
-        WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
+        object_waiter_clear_slot(slot);
     }
     thread_wait_state_clear_tid(handler, tid);
 }
@@ -17071,18 +17298,6 @@ unsafe fn wait_park_multi(
         WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    // Find a free waiter slot.
-    let mut wslot = usize::MAX;
-    for i in 0..WAITER_N {
-        if WAITER_EVENT_IDX[i].load(Ordering::Relaxed) == u64::MAX {
-            wslot = i;
-            break;
-        }
-    }
-    if wslot == usize::MAX {
-        WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
     // The reply object bound to this caller is the active REPLY_MAIN.
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -17097,24 +17312,20 @@ unsafe fn wait_park_multi(
     };
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
-    for (k, &object) in objects.iter().enumerate() {
-        WAITER_EVENTS[wslot][k].store(object.raw(), Ordering::Relaxed);
-        WAITER_RESULT_INDEX[wslot][k].store(result_indices[k] as u64, Ordering::Relaxed);
+    if !object_waiter_park(ObjectWaiterRecord::new(
+        objects,
+        result_indices,
+        wait_all,
+        stolen,
+        tid,
+        deadline,
+        resume_ip,
+        sp,
+        flags,
+    )) {
+        WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
-    for k in objects.len()..WAITER_MAX_EVENTS {
-        WAITER_EVENTS[wslot][k].store(WaitObject::FREE.raw(), Ordering::Relaxed);
-    }
-    WAITER_EVENT_COUNT[wslot].store(objects.len() as u64, Ordering::Relaxed);
-    WAITER_WAIT_ALL[wslot].store(wait_all as u64, Ordering::Relaxed);
-    WAITER_REPLY_CAP[wslot].store(stolen, Ordering::Relaxed);
-    WAITER_TID[wslot].store(tid, Ordering::Relaxed);
-    WAITER_DEADLINE[wslot].store(deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
-    WAITER_RESUME_IP[wslot].store(resume_ip, Ordering::Relaxed);
-    WAITER_RESUME_SP[wslot].store(sp, Ordering::Relaxed);
-    WAITER_RESUME_FLAGS[wslot].store(flags, Ordering::Relaxed);
-    // WAITER_EVENT_IDX doubles as the slot-free sentinel: set it LAST (after the set) so a slot never
-    // looks "used but empty".
-    WAITER_EVENT_IDX[wslot].store(objects[0].raw(), Ordering::Relaxed);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -17133,62 +17344,45 @@ unsafe fn wait_wake_dispatcher_pulse(just_set: usize, handler: &mut ExecNtHandle
 }
 
 unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<usize>) -> u64 {
-    let wake_indices = &mut *core::ptr::addr_of_mut!(WAIT_WAKE_INDEX_WORK);
-    let wake_objects = &mut *core::ptr::addr_of_mut!(WAIT_WAKE_OBJECT_WORK);
-    for i in 0..WAITER_N {
-        wake_indices[i] = u64::MAX;
-        wake_objects[i] = WaitObject::FREE.raw();
-    }
-    for i in 0..WAITER_N {
-        let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
-        if slot_ev0 == u64::MAX {
-            continue; // free slot
-        }
-        let count = WAITER_EVENT_COUNT[i].load(Ordering::Relaxed) as usize;
-        if count == 0 {
+    object_waiter_clear_pending_wakes();
+    let waiter_count = object_waiter_len();
+    for i in 0..waiter_count {
+        let Some(record) = object_waiter_record(i) else {
             continue;
-        }
-        let wait_all = WAITER_WAIT_ALL[i].load(Ordering::Relaxed) != 0;
+        };
+        let count = record.count as usize;
         // Does this waiter's condition hold, and if WaitAny, which index fired?
         let mut wake = false;
         let mut wake_index = 0u64;
         let mut selected_slot = 0usize;
-        if wait_all {
+        if record.wait_all {
             // Check the whole set before consuming anything so an unsatisfied WaitAll never reserves
             // an auto-reset event or semaphore token.
             let mut all = true;
-            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let Some(object) =
-                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
-                else {
+                let object = record.objects[k];
+                if WaitObject::from_raw(object.raw()).is_none() {
                     all = false;
                     break;
                 };
-                if !handler.wait_object_ready_for(object, waiter_tid) {
+                if !handler.wait_object_ready_for(object, record.tid) {
                     all = false;
                     break;
                 }
             }
             wake = all;
             wake_index = 0; // WaitAll returns WAIT_OBJECT_0
-            if wake {
-                wake_objects[i] = WAITER_EVENTS[i][0].load(Ordering::Relaxed);
-            }
         } else {
             // WaitAny: the first (lowest-index) signalled event determines the return value.
-            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let Some(object) =
-                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
-                else {
+                let object = record.objects[k];
+                if WaitObject::from_raw(object.raw()).is_none() {
                     continue;
                 };
-                if handler.wait_object_ready_for(object, waiter_tid) {
+                if handler.wait_object_ready_for(object, record.tid) {
                     wake = true;
                     selected_slot = k;
-                    wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
-                    wake_objects[i] = object.raw();
+                    wake_index = record.result_indices[k] as u64;
                     break;
                 }
             }
@@ -17197,24 +17391,23 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
             continue;
         }
         // Consume the selected dispatcher transaction only after the condition is known to hold.
-        if wait_all {
-            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
+        let mut wake_object = record.objects[selected_slot.min(count.saturating_sub(1))];
+        if record.wait_all {
             for k in 0..count.min(WAITER_MAX_EVENTS) {
-                if let Some(object) =
-                    WaitObject::from_raw(WAITER_EVENTS[i][k].load(Ordering::Relaxed))
-                {
-                    handler.wait_object_consume_for(object, waiter_tid);
-                }
+                let object = record.objects[k];
+                if WaitObject::from_raw(object.raw()).is_none() {
+                    continue;
+                };
+                handler.wait_object_consume_for(object, record.tid);
             }
+            wake_object = record.objects[0];
         } else {
-            let waiter_tid = WAITER_TID[i].load(Ordering::Relaxed);
-            if let Some(object) =
-                WaitObject::from_raw(WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed))
-            {
-                handler.wait_object_consume_for(object, waiter_tid);
+            let object = record.objects[selected_slot];
+            if WaitObject::from_raw(object.raw()).is_some() {
+                handler.wait_object_consume_for(object, record.tid);
             }
         }
-        wake_indices[i] = wake_index;
+        object_waiter_mark_pending_wake(i, wake_index, wake_object);
     }
 
     if let Some(index) = pulse_event {
@@ -17222,83 +17415,74 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
     }
 
     let mut woken = 0u64;
-    for i in 0..WAITER_N {
-        let wake_index = wake_indices[i];
-        if wake_index == u64::MAX {
+    let waiter_count = object_waiter_len();
+    for i in 0..waiter_count {
+        let Some((record, wake_index, wake_object)) = object_waiter_pending_wake(i) else {
             continue;
-        }
-        let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
+        };
+        let cap = record.reply_cap;
         if cap != 0 {
             // Resume the parked wait with STATUS_WAIT_0 + index. The waiter blocked as a native syscall
             // (UnknownSyscall fault); apply_fault_reply restores RCX←resume_ip, RSP←sp, RFLAGS←flags
             // (IPC MR15/16/17) and RAX/r10←status. r10 (status) = wake_index = WAIT_OBJECT_0+index.
-            set_reply_mr(15, WAITER_RESUME_IP[i].load(Ordering::Relaxed));
-            set_reply_mr(16, WAITER_RESUME_SP[i].load(Ordering::Relaxed));
-            set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
+            set_reply_mr(15, record.resume_ip);
+            set_reply_mr(16, record.resume_sp);
+            set_reply_mr(17, record.resume_flags);
             client_reply_on(cap, 18, wake_index, 0, 0, 0);
             // Return this reply object to the pool (clear its used bit).
             release_reply_pool_cap(cap);
             let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace < 96 {
-                let tid = WAITER_TID[i].load(Ordering::Relaxed);
-                let object = WaitObject::from_raw(wake_objects[i]).unwrap_or(WaitObject::FREE);
                 print_str(b"[wait-wake] #");
                 print_u64(trace);
                 print_str(b" tid=");
-                print_u64(tid);
-                if let Some(badge) = handler.hosted_thread_badge_for_tid(tid) {
+                print_u64(record.tid);
+                if let Some(badge) = handler.hosted_thread_badge_for_tid(record.tid) {
                     print_str(b" badge=");
                     print_u64(badge);
                 }
                 print_str(b" object=");
-                print_str(object.describe());
+                print_str(wake_object.describe());
                 print_str(b"/");
-                print_u64(object.id());
+                print_u64(wake_object.id());
                 print_str(b" result=");
                 print_u64(wake_index);
                 print_str(b" count=");
-                print_u64(WAITER_EVENT_COUNT[i].load(Ordering::Relaxed));
+                print_u64(record.count as u64);
                 print_str(b" wait_all=");
-                print_u64(WAITER_WAIT_ALL[i].load(Ordering::Relaxed));
+                print_u64(record.wait_all as u64);
                 print_str(b"\n");
             }
-            thread_wait_state_clear_tid_ready(handler, WAITER_TID[i].load(Ordering::Relaxed));
+            thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
             WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         // Free the slot.
-        WAITER_EVENT_IDX[i].store(u64::MAX, Ordering::Relaxed);
-        WAITER_EVENT_COUNT[i].store(0, Ordering::Relaxed);
-        WAITER_REPLY_CAP[i].store(0, Ordering::Relaxed);
-        WAITER_TID[i].store(0, Ordering::Relaxed);
-        WAITER_DEADLINE[i].store(u64::MAX, Ordering::Relaxed);
+        object_waiter_clear_slot(i);
     }
     woken
 }
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
-    for slot in 0..WAITER_N {
-        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
-            || WAITER_DEADLINE[slot].load(Ordering::Relaxed) > now
-        {
+    for slot in 0..object_waiter_len() {
+        let Some(record) = object_waiter_record(slot) else {
+            continue;
+        };
+        if record.deadline > now {
             continue;
         }
-        let cap = WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(15, WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
-            set_reply_mr(16, WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
-            set_reply_mr(17, WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
+            set_reply_mr(15, record.resume_ip);
+            set_reply_mr(16, record.resume_sp);
+            set_reply_mr(17, record.resume_flags);
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid_ready(handler, WAITER_TID[slot].load(Ordering::Relaxed));
+            thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
         }
-        WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
-        WAITER_EVENT_COUNT[slot].store(0, Ordering::Relaxed);
-        WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
-        WAITER_TID[slot].store(0, Ordering::Relaxed);
-        WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
+        object_waiter_clear_slot(slot);
     }
     woken
 }
