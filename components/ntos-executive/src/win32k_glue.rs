@@ -397,42 +397,25 @@ pub(crate) struct Win32kPublishedContext {
     pub w32thread: u64,
 }
 
-impl Win32kPublishedContext {
-    const EMPTY: Self = Self {
-        pid: 0,
-        tid: 0,
-        eprocess: 0,
-        ethread: 0,
-        w32process: 0,
-        w32thread: 0,
-    };
-}
-
 #[derive(Clone, Copy)]
 struct SuspendedPublishedContext {
-    valid: u64,
     pi: u32,
     pid: u64,
     tid: u64,
     published: Win32kPublishedContext,
 }
 
-impl SuspendedPublishedContext {
-    const EMPTY: Self = Self {
-        valid: 0,
-        pi: 0,
-        pid: 0,
-        tid: 0,
-        published: Win32kPublishedContext::EMPTY,
-    };
-}
-
-const SUSPENDED_PUBLISHED_CONTEXT_CAP: usize = 16;
-static mut SUSPENDED_PUBLISHED_CONTEXTS: [SuspendedPublishedContext;
-    SUSPENDED_PUBLISHED_CONTEXT_CAP] =
-    [SuspendedPublishedContext::EMPTY; SUSPENDED_PUBLISHED_CONTEXT_CAP];
+static mut SUSPENDED_PUBLISHED_CONTEXTS: Option<Vec<SuspendedPublishedContext>> = None;
 static USER_CALLBACK_SUSPENDED_CONTEXT_CAPTURES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SUSPENDED_CONTEXT_DROPS: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn suspended_published_contexts_mut() -> &'static mut Vec<SuspendedPublishedContext> {
+    let slot = &mut *core::ptr::addr_of_mut!(SUSPENDED_PUBLISHED_CONTEXTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
 
 fn published_context_has_data(context: Win32kPublishedContext) -> bool {
     context.pid != 0
@@ -483,45 +466,32 @@ unsafe fn capture_suspended_published_win32k_context(
     }
     clear_published_win32k_context();
 
-    let slots =
-        core::ptr::addr_of_mut!(SUSPENDED_PUBLISHED_CONTEXTS) as *mut SuspendedPublishedContext;
-    let mut free = SUSPENDED_PUBLISHED_CONTEXT_CAP;
+    let contexts = suspended_published_contexts_mut();
     let mut i = 0usize;
-    while i < SUSPENDED_PUBLISHED_CONTEXT_CAP {
-        let slot = core::ptr::read(slots.add(i));
-        if slot.valid == 0 {
-            if free == SUSPENDED_PUBLISHED_CONTEXT_CAP {
-                free = i;
-            }
-        } else if slot.pi == client.pi
+    while i < contexts.len() {
+        let slot = contexts[i];
+        if slot.pi == client.pi
             && slot.pid == client.pid
             && (slot.tid == client.tid || slot.tid == 0 || client.tid == 0)
         {
-            free = i;
-            break;
+            contexts[i] = SuspendedPublishedContext {
+                pi: client.pi,
+                pid: client.pid,
+                tid: client.tid,
+                published,
+            };
+            USER_CALLBACK_SUSPENDED_CONTEXT_CAPTURES.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         i += 1;
     }
 
-    let target = if free < SUSPENDED_PUBLISHED_CONTEXT_CAP {
-        free
-    } else {
-        let n = USER_CALLBACK_SUSPENDED_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
-            print_str(b"[win32k-context] suspended publication table full -> oldest slot reused\n");
-        }
-        0
-    };
-    core::ptr::write(
-        slots.add(target),
-        SuspendedPublishedContext {
-            valid: 1,
-            pi: client.pi,
-            pid: client.pid,
-            tid: client.tid,
-            published,
-        },
-    );
+    contexts.push(SuspendedPublishedContext {
+        pi: client.pi,
+        pid: client.pid,
+        tid: client.tid,
+        published,
+    });
     USER_CALLBACK_SUSPENDED_CONTEXT_CAPTURES.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -530,20 +500,19 @@ pub(crate) unsafe fn take_suspended_published_win32k_context(
     pid: u64,
     tid: u64,
 ) -> Option<Win32kPublishedContext> {
-    let slots =
-        core::ptr::addr_of_mut!(SUSPENDED_PUBLISHED_CONTEXTS) as *mut SuspendedPublishedContext;
+    let contexts = suspended_published_contexts_mut();
     let mut i = 0usize;
-    while i < SUSPENDED_PUBLISHED_CONTEXT_CAP {
-        let slot = core::ptr::read(slots.add(i));
-        if slot.valid != 0
-            && slot.pi == pi
+    while i < contexts.len() {
+        let slot = contexts[i];
+        if slot.pi == pi
             && (pid == 0 || slot.pid == pid)
             && (tid == 0 || slot.tid == tid)
             && (pid == 0 || slot.published.pid == 0 || slot.published.pid == pid)
             && (tid == 0 || slot.published.tid == 0 || slot.published.tid == tid)
         {
-            core::ptr::write(slots.add(i), SuspendedPublishedContext::EMPTY);
-            return Some(slot.published);
+            let published = slot.published;
+            contexts.remove(i);
+            return Some(published);
         }
         i += 1;
     }
