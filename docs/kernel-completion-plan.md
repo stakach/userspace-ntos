@@ -104,6 +104,20 @@ the I/O-only DC21x4 packet model completes only the live `Adapter->CurrentRbd` d
 the ReactOS adapter state. This is an accepted correctness cleanup, not packet-array closure:
 `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0` remains the active B3 receive-indication
 frontier.
+Latest accepted B3 packet-array receive checkpoint (2026-08-21): the mixed E1000/DC21x4 proof now
+reaches ReactOS `dc21x4.sys` packet-array receive indication through the normal provider-domain NDIS
+path. CPU I/O-port faults feed the generic hosted-device I/O model for `NdisRawRead/WritePortUlong`,
+the DC21x4 model completes only the live `Adapter->CurrentRbd`, the generic interrupt/DPC path
+delivers the tulip RX interrupt, `MiniIndicateReceivePacket` calls TCPIP's real legacy
+`ProtocolReceive` fallback for a resources-status packet, and the provider callback bridge resolves
+the miniport DMA/common-buffer header/lookahead pointer through the existing NDIS buffer shadow
+instead of treating it as provider pool. The serialized proof
+`.tmp/run-headless-b3-dc21x4-packet-array-green-20260821.log` reaches Explorer shell chrome with
+`293/293`, keeps the modal-paint prefix green, shows DC21x4 `irq=1/1 dpc=1 ... pbrx=1/1/0`, and
+records provider sharing `packet-array=1/1 packet-array-rx=1/1 packet-array-rx-packet=0/0
+rx=2/2 rx-complete=1/1 rx-packet=0/0` with `PASS exec_provider_ndis_receive_indicated`. Review
+adjustment: this closes the current B3 packet-array receive frontier. The next B3 work should move to
+broader multi-driver/device scaling or later NDIS protocol surfaces, not packet-array scaffolding.
 Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
 send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
@@ -8356,7 +8370,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `PASS exec_provider_ndis_receive_indicated`. Review adjustment: E1000's NT5 data plane is now
     accepted for this frontier. Packet-array receive remains a generic NDIS5 coverage target for a
     miniport that calls `NdisMIndicateReceivePacket`; it should not be modeled as an e1000 blocker.
-  - `[~]` B3 packet-array miniport frontier (2026-08-21): packet-array receive is now separated from
+  - `[x]` B3 packet-array miniport frontier (2026-08-21): packet-array receive is now separated from
     the accepted E1000 frontier. ReactOS `dc21x4.sys` and `netkvm.sys` contain real
     `NdisMIndicateReceivePacket` callers; the current practical boot target is the staged
     `dc21x4.sys` with QEMU `tulip`, selected through generated registry/devnode metadata rather than
@@ -8515,6 +8529,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0`. Review adjustment: the next B3 slice is
     now specifically why the ReactOS DC21x4 receive DPC exits before `DcIndicateReceivePackets`, not
     ring selection or NDIS provider transport.
+    Packet-array receive closure `.tmp/run-headless-b3-dc21x4-packet-array-green-20260821.log`
+    completes that slice without adding a success fallback. The hosted CPU I/O-port fault path now
+    routes 32-bit port reads/writes through the generic hosted-device I/O model, so ReactOS
+    `NdisRawReadPortUlong`/`NdisRawWritePortUlong` sees the same CSR status/ack state that the
+    interrupt model owns. Provider sharing now records receive callbacks that occur inside a
+    packet-array export, and the provider `ProtocolReceive` bridge masks NT5 `UINT` sizes and resolves
+    header/lookahead pointers through NDIS buffer shadows when `MiniIndicateReceivePacket` hands TCPIP
+    a miniport DMA/common-buffer pointer rather than provider pool. The accepted mixed-NIC proof keeps
+    Explorer shell chrome green, restores `exec_msgina_modal_paint_prefix` by crediting
+    `DispatchMessage(WM_PAINT)` only after the real api0 callback continuation completes, and finishes
+    `293/293` with `packet-array=1/1`, `packet-array-rx=1/1`, `rx=2/2`,
+    `rx-complete=1/1`, and `PASS exec_provider_ndis_receive_indicated`. Local validation:
+    `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`,
+    `cargo test -p nt-user-callback dialog_modal -- --nocapture`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and the serialized mixed-NIC desktop proof above.
+    Review adjustment: the current packet-array frontier is closed. Continue B3 at broader repeated
+    driver/device scaling, additional NDIS protocol surfaces, or the next hardware class; do not
+    reintroduce packet-array scaffolding.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

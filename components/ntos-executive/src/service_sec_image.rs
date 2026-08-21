@@ -14536,7 +14536,12 @@ pub(crate) unsafe fn service_sec_image(
                     r
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
-                if dialog_modal_dispatch && !callback_suspended {
+                // `DispatchMessage` paint proof is authoritative only after the api0 callback
+                // continuation returns; the completed-dispatch hook samples that final MSG.
+                if dialog_modal_dispatch
+                    && !callback_suspended
+                    && m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
+                {
                     let staged_msg = msg_syscall && d_a0 == win32k_subsystem::WIN32K_ARG_VADDR;
                     let msg_ptr = if staged_msg {
                         win32k_subsystem::WIN32K_ARG_VADDR

@@ -27897,6 +27897,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.provider_packet_array_export_completions);
         print_str(b"/");
         print_u64(provider_sharing.provider_packet_array_export_requests);
+        print_str(b" packet-array-rx=");
+        print_u64(provider_sharing.provider_packet_array_protocol_receive_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_packet_array_protocol_receive_requests);
+        print_str(b" packet-array-rx-packet=");
+        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_completions);
+        print_str(b"/");
+        print_u64(provider_sharing.provider_packet_array_protocol_receive_packet_requests);
         print_str(b" rx=");
         print_u64(provider_sharing.provider_protocol_receive_completions);
         print_str(b"/");
@@ -27963,9 +27971,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let provider_packet_receive_ok = provider_sharing.provider_protocol_receive_packet_requests != 0
         && provider_sharing.provider_protocol_receive_packet_requests
             == provider_sharing.provider_protocol_receive_packet_completions;
+    let provider_packet_array_receive_ok =
+        provider_sharing.provider_packet_array_export_requests != 0
+            && provider_sharing.provider_packet_array_export_requests
+                == provider_sharing.provider_packet_array_export_completions
+            && ((provider_sharing.provider_packet_array_protocol_receive_packet_requests != 0
+                && provider_sharing.provider_packet_array_protocol_receive_packet_requests
+                    == provider_sharing
+                        .provider_packet_array_protocol_receive_packet_completions)
+                || (provider_sharing.provider_packet_array_protocol_receive_requests != 0
+                    && provider_sharing.provider_packet_array_protocol_receive_requests
+                        == provider_sharing.provider_packet_array_protocol_receive_completions));
     check(
         b"exec_provider_ndis_receive_indicated",
-        provider_legacy_receive_ok || provider_packet_receive_ok,
+        provider_legacy_receive_ok || provider_packet_receive_ok || provider_packet_array_receive_ok,
         &mut passed,
     );
     check(

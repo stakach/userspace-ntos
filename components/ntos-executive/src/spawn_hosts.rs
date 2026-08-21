@@ -2550,7 +2550,7 @@ unsafe fn pump_service_io_port_fault(
             }
         }
     } else if is_in {
-        let (value, io) = crate::io_in32_r(port_cap, port);
+        let (raw_value, io) = crate::io_in32_r(port_cap, port);
         if io != 0 {
             crate::print_str(b"[pump] IOPortIn32 failed label=");
             crate::print_u64(io);
@@ -2559,6 +2559,7 @@ unsafe fn pump_service_io_port_fault(
             crate::print_str(b"\n");
             return None;
         }
+        let value = crate::driver_launch::hosted_io_model_read_u32(port_u64, raw_value);
         regs[3] = (regs[3] & !0xFFFF_FFFFu64) | value as u64;
         if crate::win32k_glue::tcb_write_regs20(ch.tcb, &regs, false) != 0 {
             return None;
@@ -2574,6 +2575,7 @@ unsafe fn pump_service_io_port_fault(
             crate::print_str(b"\n");
             return None;
         }
+        crate::driver_launch::hosted_io_model_write_u32(port_u64, value);
 
         let local = core::ptr::read_volatile(
             (sh + crate::driver_launch::SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *const u64,

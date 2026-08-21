@@ -43,8 +43,10 @@ use nt_hosted_runtime::{
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
-    NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
-    DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
+    NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64,
+    DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64, DC21X4_ADAPTER_FLAGS_OFFSET_X64,
+    DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64,
+    DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
     HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
     NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
@@ -12212,7 +12214,7 @@ unsafe fn hosted_io_model_state_for_port_mut(
     })
 }
 
-unsafe fn hosted_io_model_read_u32(port: u64, value: u32) -> u32 {
+pub(crate) unsafe fn hosted_io_model_read_u32(port: u64, value: u32) -> u32 {
     let Some((state, offset)) = hosted_io_model_state_for_port_mut(port, 4) else {
         return value;
     };
@@ -12223,7 +12225,7 @@ unsafe fn hosted_io_model_read_u32(port: u64, value: u32) -> u32 {
     }
 }
 
-unsafe fn hosted_io_model_write_u32(port: u64, value: u32) {
+pub(crate) unsafe fn hosted_io_model_write_u32(port: u64, value: u32) {
     let Some((state, offset)) = hosted_io_model_state_for_port_mut(port, 4) else {
         return;
     };
@@ -13202,6 +13204,10 @@ pub(crate) struct HostedProviderSharingEvidence {
     pub provider_callback_completions: u64,
     pub provider_packet_array_export_requests: u64,
     pub provider_packet_array_export_completions: u64,
+    pub provider_packet_array_protocol_receive_requests: u64,
+    pub provider_packet_array_protocol_receive_completions: u64,
+    pub provider_packet_array_protocol_receive_packet_requests: u64,
+    pub provider_packet_array_protocol_receive_packet_completions: u64,
     pub provider_protocol_receive_requests: u64,
     pub provider_protocol_receive_completions: u64,
     pub provider_protocol_receive_complete_requests: u64,
@@ -13709,6 +13715,12 @@ static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS: AtomicU64 =
+    AtomicU64::new(0);
+static HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 =
+    AtomicU64::new(0);
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -14081,6 +14093,14 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.load(Ordering::Relaxed);
     evidence.provider_packet_array_export_completions =
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_protocol_receive_requests =
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_protocol_receive_completions =
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_protocol_receive_packet_requests =
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS.load(Ordering::Relaxed);
+    evidence.provider_packet_array_protocol_receive_packet_completions =
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.load(Ordering::Relaxed);
     evidence.provider_protocol_receive_requests =
         HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS.load(Ordering::Relaxed);
     evidence.provider_protocol_receive_completions =
@@ -15245,6 +15265,62 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
             && record.provider_component_va == provider_component_va
         {
             return Some((index, record));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn provider_receive_buffer_exec_va(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    if component_va == 0 || bytes == 0 {
+        return None;
+    }
+    if let Some(exec_va) =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, component_va, bytes)
+    {
+        return Some(exec_va);
+    }
+
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
+        as *const HostedProviderNdisBufferShadow;
+    let count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let shadow = *records.add(index);
+        if shadow.present && shadow.provider_instance == provider_instance {
+            if let Some(offset) = component_subrange_offset(
+                shadow.provider_data_component_va,
+                shadow.bytes,
+                component_va,
+                bytes,
+            ) {
+                let Some(owner_inst) = instance(shadow.dependent_instance) else {
+                    return None;
+                };
+                let owner_component_va = shadow.dependent_data_component_va.checked_add(offset)?;
+                return component_or_dma_common_to_exec_va(
+                    shadow.dependent_instance,
+                    owner_inst,
+                    owner_inst,
+                    owner_component_va,
+                    bytes,
+                )
+                .or_else(|| {
+                    component_or_dma_common_to_exec_va(
+                        provider_instance,
+                        provider_inst,
+                        owner_inst,
+                        component_va,
+                        bytes,
+                    )
+                });
+            }
         }
         index += 1;
     }
@@ -21323,6 +21399,21 @@ pub(crate) unsafe fn service_hosted_provider_export(
     if packet_array_export {
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
     }
+    let (
+        packet_array_protocol_receive_requests_before,
+        packet_array_protocol_receive_completions_before,
+        packet_array_protocol_receive_packet_requests_before,
+        packet_array_protocol_receive_packet_completions_before,
+    ) = if packet_array_export {
+        (
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS.load(Ordering::Relaxed),
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS.load(Ordering::Relaxed),
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS.load(Ordering::Relaxed),
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.load(Ordering::Relaxed),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
     match plan_hosted_provider_import_binding(Some(descriptor), provider_export_rva) {
         Ok(HostedProviderImportBinding::ProviderDomainCall(_plan)) => {}
         Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
@@ -21612,6 +21703,30 @@ pub(crate) unsafe fn service_hosted_provider_export(
     HOSTED_PROVIDER_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     if packet_array_export {
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_REQUESTS.fetch_add(
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_REQUESTS
+                .load(Ordering::Relaxed)
+                .saturating_sub(packet_array_protocol_receive_requests_before),
+            Ordering::Relaxed,
+        );
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_COMPLETIONS.fetch_add(
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETIONS
+                .load(Ordering::Relaxed)
+                .saturating_sub(packet_array_protocol_receive_completions_before),
+            Ordering::Relaxed,
+        );
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_REQUESTS.fetch_add(
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS
+                .load(Ordering::Relaxed)
+                .saturating_sub(packet_array_protocol_receive_packet_requests_before),
+            Ordering::Relaxed,
+        );
+        HOSTED_PROVIDER_PACKET_ARRAY_PROTOCOL_RECEIVE_PACKET_COMPLETIONS.fetch_add(
+            HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS
+                .load(Ordering::Relaxed)
+                .saturating_sub(packet_array_protocol_receive_packet_completions_before),
+            Ordering::Relaxed,
+        );
     }
     trace_hosted_provider_export(
         b"done",
@@ -22992,10 +23107,10 @@ unsafe fn service_ndis_protocol_receive_callback(
     arg3: u64,
     provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
 ) -> Result<u64, i32> {
-    let header_bytes = arg3;
+    let header_bytes = arg3 & u32::MAX as u64;
     let lookahead_component = provider_stack[0];
-    let lookahead_bytes = provider_stack[1];
-    let packet_bytes = provider_stack[2];
+    let lookahead_bytes = provider_stack[1] & u32::MAX as u64;
+    let packet_bytes = provider_stack[2] & u32::MAX as u64;
     let lookahead_off = provider_marshal_align8(header_bytes).ok_or(STATUS_INVALID_PARAMETER)?;
     let used = provider_marshal_align8(
         lookahead_off
@@ -23009,13 +23124,13 @@ unsafe fn service_ndis_protocol_receive_callback(
     let provider_header_exec = if header_bytes == 0 {
         0
     } else {
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, header_bytes)
+        provider_receive_buffer_exec_va(provider_instance, provider_inst, arg2, header_bytes)
             .ok_or(STATUS_INVALID_PARAMETER)?
     };
     let provider_lookahead_exec = if lookahead_bytes == 0 {
         0
     } else {
-        component_to_exec_va_for_instance(
+        provider_receive_buffer_exec_va(
             provider_instance,
             provider_inst,
             lookahead_component,
@@ -30557,6 +30672,8 @@ const DC_TRANSMIT_DESCRIPTORS: usize = 64;
 const DC_DESCRIPTOR_LEN: usize = 16;
 const HOSTED_DC21X4_RX_FRAME_LEN_WITH_CRC: u16 = 64;
 const HOSTED_DC21X4_RX_PAYLOAD_LEN: u16 = HOSTED_DC21X4_RX_FRAME_LEN_WITH_CRC - 4;
+const HOSTED_DC21X4_RX_TRACE_CAP: u64 = 8;
+static HOSTED_DC21X4_RX_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct HostedE1000StimulusConfig {
@@ -30975,6 +31092,88 @@ unsafe fn hosted_dc21x4_current_rbd_index(
     Some(index as usize)
 }
 
+unsafe fn hosted_dc21x4_adapter_u32(binding: HostedDeviceBinding, offset: u64) -> Option<u32> {
+    let adapter_context = hosted_dc21x4_adapter_context(binding)?;
+    let dependent_inst = instance(binding.instance)?;
+    let field_component = adapter_context.checked_add(offset)?;
+    let field_exec =
+        component_to_exec_va_for_instance(binding.instance, dependent_inst, field_component, 4)?;
+    Some(read_unaligned(field_exec as *const u32))
+}
+
+unsafe fn trace_hosted_dc21x4_rx_snapshot(
+    stage: &[u8],
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    sh: u64,
+) {
+    if !hosted_dc21x4_profile_matches(state) {
+        return;
+    }
+    if HOSTED_DC21X4_RX_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= HOSTED_DC21X4_RX_TRACE_CAP {
+        return;
+    }
+
+    let flags =
+        hosted_dc21x4_adapter_u32(binding, DC21X4_ADAPTER_FLAGS_OFFSET_X64).unwrap_or(0xffff_ffff);
+    let current_interrupt_mask =
+        hosted_dc21x4_adapter_u32(binding, DC21X4_ADAPTER_CURRENT_INTERRUPT_MASK_OFFSET_X64)
+            .unwrap_or(0xffff_ffff);
+    let interrupt_status =
+        hosted_dc21x4_adapter_u32(binding, DC21X4_ADAPTER_INTERRUPT_STATUS_OFFSET_X64)
+            .unwrap_or(0xffff_ffff);
+    let op_mode = hosted_io_read_u32(state, DC_CSR6_OP_MODE).unwrap_or(0xffff_ffff);
+    let ring_logical = hosted_io_read_u32(state, DC_CSR3_RX_RING_ADDRESS).unwrap_or(0) as u64;
+
+    print_str(b"[driver-launch] dc21x4 rx ");
+    print_str(stage);
+    print_str(b" device-id=");
+    print_u64(binding.device_id);
+    print_str(b" flags=0x");
+    print_hex(flags);
+    print_str(b" cur-mask=0x");
+    print_hex(current_interrupt_mask);
+    print_str(b" intr=0x");
+    print_hex(interrupt_status);
+    print_str(b" op=0x");
+    print_hex(op_mode);
+    print_str(b" ring=0x");
+    print_hex64(ring_logical);
+
+    let min_len = (DC_RECEIVE_BUFFERS_DEFAULT * DC_DESCRIPTOR_LEN) as u64;
+    if let Some((ring_component_va, ring_alias_va, available)) =
+        hosted_dma_common_record_alias_for_logical_base(sh, state, ring_logical, min_len)
+    {
+        let ring_len = available.min(min_len);
+        if ring_len >= DC_DESCRIPTOR_LEN as u64 && ring_len <= usize::MAX as u64 {
+            let descriptor_count =
+                (ring_len as usize / DC_DESCRIPTOR_LEN).min(DC_RECEIVE_BUFFERS_DEFAULT);
+            if let Some(index) =
+                hosted_dc21x4_current_rbd_index(binding, ring_component_va, descriptor_count)
+            {
+                let ring =
+                    core::slice::from_raw_parts(ring_alias_va as *const u8, ring_len as usize);
+                let base = index * DC_DESCRIPTOR_LEN;
+                let status = descriptor_read_u32(ring, base);
+                let control = descriptor_read_u32(ring, base + 4);
+                let address = descriptor_read_u32(ring, base + 8) as u64;
+                print_str(b" idx=");
+                print_u64(index as u64);
+                print_str(b" desc=0x");
+                print_hex(status);
+                print_str(b"/0x");
+                print_hex(control);
+                print_str(b"/0x");
+                print_hex64(address);
+                print_str(b"\n");
+                return;
+            }
+        }
+    }
+
+    print_str(b" idx=none\n");
+}
+
 unsafe fn complete_hosted_dc21x4_rx_descriptor(
     binding: HostedDeviceBinding,
     state: HostedDeviceResourceState,
@@ -31074,6 +31273,7 @@ unsafe fn drive_hosted_dc21x4_rx_descriptor(
         Ok(true) => {
             report.rx_completed = 1;
             report.interrupt_causes |= (DC_IRQ_RX_OK | DC_IRQ_NORMAL_SUMMARY) as u64;
+            trace_hosted_dc21x4_rx_snapshot(b"model-complete", binding, state, sh);
         }
         Ok(false) => {}
         Err(_) => {
@@ -35202,6 +35402,9 @@ unsafe fn dispatch_hosted_device_interrupt_once(
     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     nt_status::NtStatus(status).to_result()?;
     refresh_hosted_device_resource_state(binding, sh);
+    if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
+        trace_hosted_dc21x4_rx_snapshot(b"post-interrupt", binding, state, sh);
+    }
 
     Ok(HostedInterruptDelivery {
         interrupt_id: tokens.interrupt_id,
