@@ -2365,7 +2365,10 @@ unsafe fn pre_user_shell_frontier_pending(
         return false;
     }
 
-    let mut runnable_owners = live_top_badges(nt_handler) & !(crash_parked | wait_parked);
+    // Services may sit in normal finite NT waits while their idle worker loops poll IOCP/timeouts.
+    // Those waiters are live, but they are not runnable work that should defer the interactive
+    // login gate once the pre-user-shell path has otherwise gone idle.
+    let mut runnable_owners = runnable_top_badges(nt_handler) & !(crash_parked | wait_parked);
     if let Some(winlogon_badge) = hosted_top_badge_for_role(
         nt_handler,
         nt_exe_image::HostedProcessRole::InteractiveLogon,
@@ -2382,7 +2385,7 @@ unsafe fn pre_user_shell_frontier_pending(
     if n < 8 {
         print_str(b"[quiesce] ");
         print_str(reason);
-        print_str(b": deferring gate while pre-user-shell hosted work is live: owners=0x");
+        print_str(b": deferring gate while pre-user-shell hosted work is runnable: owners=0x");
         print_hex_u64(runnable_owners);
         print_str(b" services-events=");
         print_u64(SERVICES_NAMED_EVENTS.load(Ordering::Relaxed));
@@ -23286,6 +23289,34 @@ unsafe fn live_top_badges(nt_handler: &ExecNtHandler) -> u64 {
             if snapshot.live {
                 mask |= 1u64 << snapshot.owner;
             }
+        }
+    }
+    mask
+}
+
+/// Top-level process owners that currently have at least one Ready/Running hosted thread.
+#[inline]
+unsafe fn runnable_top_badges(nt_handler: &ExecNtHandler) -> u64 {
+    const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
+    let mut mask = 0u64;
+    for pi in 0..MAX_PI {
+        let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
+        if hosted_process_wait_snapshot(nt_handler, pi, &mut threads).is_none() {
+            continue;
+        }
+        let Some(owner) = nt_handler.hosted_process_top_badge(pi) else {
+            continue;
+        };
+        if owner >= 64 {
+            continue;
+        }
+        if threads.iter().any(|thread| {
+            matches!(
+                thread.state,
+                Some(nt_process::ThreadState::Ready) | Some(nt_process::ThreadState::Running)
+            )
+        }) {
+            mask |= 1u64 << owner;
         }
     }
     mask

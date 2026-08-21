@@ -8528,3 +8528,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun the serialized desktop
     proof from the restored rust-micro baseline. If `kbswitch.exe` still fails, first inspect bounded
     `[gdi-entry]` lines for bitmap/brush shared-table mismatches before adding any new mechanism.
+
+    Pre-user-shell idle-wait quiesce correction (2026-08-21): the serialized desktop rerun after the
+    writable-overlay lifetime fix did not reach the post-desktop `kbswitch.exe` frontier. It was
+    manually stopped after repeatedly cycling through empty IO completion removers for
+    `services.exe`, `lsass.exe`, `csrss.exe`, and a noninteractive auto-start service with
+    `userinit=0`. The important evidence is that `sc_autostartcomplete` had already been signalled,
+    the old MemFs `child_folded_bytes` `#GP` did not recur before the stop, and the pre-user-shell
+    quiesce deferral still printed `owners=0x20000145` because it treated live finite NT waits as
+    runnable hosted work. The pre-user-shell deferral now uses a Ready/Running owner mask instead of
+    the broader live-minus-parked mask, so idle service timeout/IOCP waits no longer block the
+    interactive login gate. This preserves the general quiesce rule elsewhere and does not synthesize
+    shell launch or service completion. Review adjustment: rerun one serialized desktop proof. If it
+    reaches the login/userinit path, continue back to the post-desktop GDI frontier; if it stops
+    earlier, inspect the first quiesce dump rather than reintroducing service-name or shell-specific
+    fallbacks.
