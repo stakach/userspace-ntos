@@ -130,6 +130,20 @@ x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
 for interrupt/timer/work-item/miniport mirrors and internal marshal policies, keeping failures
 fail-closed and service/provider identity registry-derived.
 
+B3 provider-runtime shadow scaling cleanup (2026-08-21): the remaining
+provider-domain runtime shadow/policy stores for miniport interrupt blocks, miniport timer blocks,
+NDIS work items, mirrored `NDIS_MINIPORT_BLOCK` state, and internal marshal policies now use
+growable vector-backed tables with reusable empty records instead of fixed executive arrays and
+overflow counters. Lookup, free, refresh, and fail-closed rejection paths still key records by real
+provider/dependent instances and provider RVAs. Local validation is green for `cargo fmt --all`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-b3-provider-runtime-vec-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing and keeps provider sharing alive with `exports=49/49`,
+`callbacks=24/25`, zero export rejections, and zero singleton overflow/conflict records. Review
+adjustment: provider callback records remain intentionally bounded by executable thunk slots for now;
+audit that table separately if future driver mixes exhaust callback-thunk identity.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
