@@ -103,7 +103,8 @@ static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
 static mut SERVICE_DLL_ARENA_PAGING_WORK: DllArenaPagingState = DllArenaPagingState::new();
-static mut SERVICE_PROCS_WORK: [ProcExec; MAX_PI] = [ProcExec::empty(); MAX_PI];
+static mut SERVICE_PROCS_WORK: alloc::vec::Vec<ProcExec> = alloc::vec::Vec::new();
+static SERVICE_PROCS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
     nt_exe_image::ImageTable::new();
 static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog<
@@ -726,8 +727,8 @@ unsafe fn drain_deferred_user_callback_returns(
     nt_handler: &mut ExecNtHandler,
     current_pi: usize,
     current_faults: usize,
-    procs: &mut [ProcExec; MAX_PI],
-    pfilled: &mut [[u64; 512]; MAX_PI],
+    procs: &mut [ProcExec],
+    pfilled: &mut [[u64; 512]],
     current_filled_pages: &mut [u64; 512],
 ) {
     while let Some(deferred) = take_deferred_user_callback_return_for_top() {
@@ -1170,6 +1171,31 @@ pub(crate) fn service_dll_arena_paging_stats() -> DllArenaPagingStats {
 
 fn take_service_dll_arena_paging_dirty() -> bool {
     unsafe { (&mut *core::ptr::addr_of_mut!(SERVICE_DLL_ARENA_PAGING_WORK)).take_dirty() }
+}
+
+#[inline(never)]
+unsafe fn reset_service_procs_work(slots: usize) -> Option<&'static mut [ProcExec]> {
+    let procs = &mut *core::ptr::addr_of_mut!(SERVICE_PROCS_WORK);
+    procs.clear();
+    if procs.try_reserve(slots).is_err() {
+        SERVICE_PROCS_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    while procs.len() < slots {
+        procs.push(ProcExec::empty());
+    }
+    Some(procs.as_mut_slice())
+}
+
+pub(crate) fn service_procs_work_stats() -> (usize, usize, u64) {
+    unsafe {
+        let procs = &*core::ptr::addr_of!(SERVICE_PROCS_WORK);
+        (
+            procs.len(),
+            procs.capacity(),
+            SERVICE_PROCS_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[inline(never)]
@@ -2408,8 +2434,8 @@ unsafe fn dump_shell_launch_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     if USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
         && USERINIT_SHELL_IMAGE_ATTEMPTS.load(Ordering::Relaxed) == 0
@@ -2516,8 +2542,8 @@ unsafe fn dump_lsa_readiness_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     if LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
         return;
@@ -2617,8 +2643,8 @@ unsafe fn dump_services_start_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     if SERVICES_SPAWNED.load(Ordering::Relaxed) == 0
         || USERINIT_SPAWNED.load(Ordering::Relaxed) != 0
@@ -2673,8 +2699,8 @@ unsafe fn dump_interactive_shell_frontier_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     dump_shell_launch_quiesce(nt_handler, loaded_images, reg, ntdll, procs, pfilled);
     let Some(pi) = interactive_shell_frontier_pi(nt_handler) else {
@@ -2814,7 +2840,7 @@ unsafe fn spawn_requested_hosted_exe(
     spec: HostedExeSpawn<'_>,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     fault_ep: u64,
-    procs: &mut [ProcExec; MAX_PI],
+    procs: &mut [ProcExec],
     nt_handler: &mut ExecNtHandler,
     exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
 ) -> Result<u64, u32> {
@@ -5178,16 +5204,6 @@ pub(crate) unsafe fn service_sec_image(
         }
         KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
     }
-    // Heap high-water mark taken AFTER all persistent state (the service table + the
-    // pre-reserved process handle tables) is allocated. Each smss syscall we service allocates
-    // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
-    // reclamation a few hundred registry syscalls exhaust the 128 KiB heap and the executive
-    // panics. Rewinding to this mark each iteration reclaims all per-syscall transients while
-    // leaving the persistent state (below the mark) intact.
-    // `mut` because the CM write overlay's runtime `String`/`Vec` growth (NtCreateKey/NtSetValueKey)
-    // must survive the per-syscall reset: after a mutating syscall the loop advances this mark past
-    // the overlay's new allocations (see the `overlay_dirty` consume below the dispatch).
-    let mut heap_mark = allocator::mark();
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
@@ -5210,10 +5226,7 @@ pub(crate) unsafe fn service_sec_image(
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
-    let procs = &mut *core::ptr::addr_of_mut!(SERVICE_PROCS_WORK);
-    for proc in procs.iter_mut() {
-        *proc = ProcExec::empty();
-    }
+    let procs = reset_service_procs_work(MAX_PI).expect("service process scratch allocation failed");
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler
             .pm_pid_for_pi(i)
@@ -5228,16 +5241,19 @@ pub(crate) unsafe fn service_sec_image(
     }
     procs[primary_pi].scratch_base = scratch_base;
     procs[primary_pi].img_end = img_end;
-    // Per-process demand-fill bookkeeping is kept in static storage rather than on the bounded
-    // rootserver stack (a local copy plus the loop's other arrays would risk the guard
-    // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
-    // run; zero it at entry so the demo call (ntdll=None) starts clean too.
-    let pfilled: &mut [[u64; 512]; MAX_PI] = &mut *core::ptr::addr_of_mut!(PFILLED);
-    for p in pfilled.iter_mut() {
-        for e in p.iter_mut() {
-            *e = 0;
-        }
-    }
+    // Per-process demand-fill bookkeeping is kept out of the bounded rootserver stack. It is now a
+    // heap-backed slice sized for the runtime process-index window instead of a fixed BSS matrix.
+    let pfilled = reset_pfilled_work(MAX_PI).expect("process fault scratch allocation failed");
+    // Heap high-water mark taken AFTER all persistent state (the service table + the
+    // pre-reserved process handle tables and SEC_IMAGE process scratch) is allocated. Each smss
+    // syscall we service allocates transient Vec/String (copyin buffers, registry value info) on the
+    // no-free bump heap; without reclamation a few hundred registry syscalls exhaust the executive
+    // heap. Rewinding to this mark each iteration reclaims all per-syscall transients while leaving
+    // the persistent state below the mark intact.
+    // `mut` because durable runtime growth (CM overlays, hive mounts, DLL caches, object namespace)
+    // must survive the per-syscall reset: after such a mutating syscall the loop advances this mark
+    // past the new allocations.
+    let mut heap_mark = allocator::mark();
     let vm_maps = core::ptr::addr_of_mut!(PROCESS_VM_REGIONS)
         as *mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>;
     for index in 0..MAX_PI {
@@ -5906,10 +5922,10 @@ pub(crate) unsafe fn service_sec_image(
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
             PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
         }
-        // LOUD overflow guard: `pi` still indexes the core process/fault scratch arrays
+        // LOUD overflow guard: `pi` still indexes the core process/fault scratch slices
         // (`procs` / `pfilled`, sized to MAX_PI). Dynamic hosted processes are admitted through the
         // catalog/runtime tables; if one ever exceeds this remaining executive ceiling this panics
-        // with a clear file:line instead of corrupting an adjacent array.
+        // with a clear file:line instead of indexing outside the admitted process window.
         assert!(
             pi < MAX_PI,
             "hosted process pi exceeds MAX_PI - raise the runtime ceiling"
@@ -19936,7 +19952,7 @@ pub(crate) unsafe fn service_sec_image(
 unsafe fn spawn_requested_multiplexed_thread(
     nt_handler: &mut ExecNtHandler,
     spec: HostedThreadSpawnSpec,
-    procs: &[ProcExec; MAX_PI],
+    procs: &[ProcExec],
     caller_sp: u64,
     fault_ep: u64,
 ) {
@@ -20038,8 +20054,8 @@ unsafe fn dump_interactive_logon_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     let Some(pi) = hosted_pi_for_role(
         nt_handler,
@@ -20065,8 +20081,8 @@ unsafe fn dump_hot_hosted_thread_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     let mut hot_badge = u64::MAX;
     let mut hot_time = 0u64;
@@ -20224,8 +20240,8 @@ unsafe fn dump_hosted_main_thread_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     let Some((tid, tcb, badge)) =
         nt_handler.hosted_thread_identity_for_role(pi, HostedThreadRole::Main)
@@ -20263,8 +20279,8 @@ unsafe fn dump_hosted_thread_quiesce(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) {
     let mut regs = [0u64; 20];
     crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -20447,8 +20463,8 @@ unsafe fn quiesce_copyin_process_bytes(
     pi: usize,
     va: u64,
     dst: &mut [u8],
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) -> bool {
     if pi >= MAX_PI {
         return false;
@@ -20472,8 +20488,8 @@ unsafe fn print_quiesce_iat_call_site(
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-    procs: &[ProcExec; MAX_PI],
-    pfilled: &[[u64; 512]; MAX_PI],
+    procs: &[ProcExec],
+    pfilled: &[[u64; 512]],
 ) -> bool {
     let Some(insn_address) = return_address.checked_sub(6) else {
         return false;
@@ -20593,7 +20609,7 @@ fn hosted_thread_suspended(nt_handler: &ExecNtHandler, tid: u64) -> bool {
 #[inline]
 fn live_process_context_for_role(
     nt_handler: &ExecNtHandler,
-    procs: &[ProcExec; MAX_PI],
+    procs: &[ProcExec],
     role: nt_exe_image::HostedProcessRole,
 ) -> Option<(usize, u64, u64)> {
     let pi = hosted_pi_for_role(nt_handler, role)?;
@@ -20606,7 +20622,7 @@ fn live_process_context_for_role(
 unsafe fn spawn_requested_local_thread(
     nt_handler: &mut ExecNtHandler,
     request: HostedThreadSpawnRequest,
-    procs: &[ProcExec; MAX_PI],
+    procs: &[ProcExec],
     current_pml4: u64,
     caller_sp: u64,
     fault_ep: u64,
@@ -21151,8 +21167,8 @@ unsafe fn gui_message_wait_was_replied(queue_event_body: u64, pi: u32, badge: u6
 unsafe fn gui_message_wait_redrive_event(
     nt_handler: &mut ExecNtHandler,
     event_body: u64,
-    pfilled: &[[u64; 512]; MAX_PI],
-    procs: &[ProcExec; MAX_PI],
+    pfilled: &[[u64; 512]],
+    procs: &[ProcExec],
 ) -> u64 {
     if event_body == 0 {
         return 0;
@@ -22299,8 +22315,8 @@ unsafe fn lsa_try_deliver_pending_request(nt_handler: &mut ExecNtHandler) -> boo
 unsafe fn lsa_complete_connect(
     nt_handler: &mut ExecNtHandler,
     outcome: u64,
-    pfilled: &mut [[u64; 512]; MAX_PI],
-    procs: &mut [ProcExec; MAX_PI],
+    pfilled: &mut [[u64; 512]],
+    procs: &mut [ProcExec],
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) -> bool {

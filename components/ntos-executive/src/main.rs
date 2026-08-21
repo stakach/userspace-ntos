@@ -7687,20 +7687,42 @@ static WL_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// NtQueryInformationThread(ThreadBasicInformation) — proves the NULL-deref is gone.
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 
-/// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
-/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass; MAX_PI rows for post-login growth).
-/// Kept off the bounded rootserver stack — this array as a local plus service_sec_image's other
-/// arrays would risk the guard page. In `.bss`, so growth to MAX_PI is free (no stack cost).
-/// Zeroed at service_sec_image entry; only that single loop touches it.
-static mut PFILLED: [[u64; 512]; MAX_PI] = [[0u64; 512]; MAX_PI];
-/// SERVICE 10 stack relief: the per-iteration `filled_pages` WORKING buffer (loaded from / saved to
-/// `PFILLED[pi]` around each dispatch) lives in a static, not on the rootserver stack. Adding a
-/// 5th hosted process pushed `service_sec_image`'s frame — its `[u64;256]` working array plus the
-/// ~20 DLL-PE locals — over the stack guard on the DEEP FS-walk call chain (fat_open_path →
-/// dir_find_lfn), corrupting that loop's cluster variable → an infinite FAT cluster-chain spin
-/// (100% CPU, no panic). Single-threaded executive → one active pi per iteration → one shared buffer
-/// is safe. Removing this 4 KiB from the frame keeps the boot within the 4-page stack (no kernel
-/// change → sel4test byte-identical).
+static PFILLED_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per admitted
+/// hosted process. Kept off the bounded rootserver stack, but no longer as a fixed BSS matrix:
+/// `service_sec_image` sizes this vector for the runtime process-index window before taking the
+/// service-loop heap mark.
+static mut PFILLED: alloc::vec::Vec<[u64; 512]> = alloc::vec::Vec::new();
+
+unsafe fn reset_pfilled_work(slots: usize) -> Option<&'static mut [[u64; 512]]> {
+    let pfilled = &mut *core::ptr::addr_of_mut!(PFILLED);
+    pfilled.clear();
+    if pfilled.try_reserve(slots).is_err() {
+        PFILLED_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    while pfilled.len() < slots {
+        pfilled.push([0u64; 512]);
+    }
+    Some(pfilled.as_mut_slice())
+}
+
+fn pfilled_work_stats() -> (usize, usize, u64) {
+    unsafe {
+        let pfilled = &*core::ptr::addr_of!(PFILLED);
+        (
+            pfilled.len(),
+            pfilled.capacity(),
+            PFILLED_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
+/// SERVICE 10 stack relief: the per-iteration `filled_pages` working buffer is copied to/from the
+/// current process's `PFILLED` row around each dispatch, but the loop itself only needs one active
+/// row at a time. Keeping this buffer out of the rootserver stack avoids the historical stack-guard
+/// overflow on the deep FAT walk path while the persistent per-process rows now live in a growable
+/// heap-backed slice.
 static mut FILLED_WORK: [u64; 512] = [0u64; 512];
 
 /// Persistent directory FILE_OBJECT state. `ExecNtHandler` is a local in
@@ -9774,6 +9796,21 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(dll_pe_store.growths);
     print_str(b"/");
     print_u64(dll_pe_store.allocation_failures);
+    let (proc_scratch_len, proc_scratch_cap, proc_scratch_fails) =
+        service_sec_image::service_procs_work_stats();
+    let (pfilled_len, pfilled_cap, pfilled_fails) = pfilled_work_stats();
+    print_str(b" proc-scratch=");
+    print_u64(proc_scratch_len as u64);
+    print_str(b"/");
+    print_u64(proc_scratch_cap as u64);
+    print_str(b"/");
+    print_u64(proc_scratch_fails);
+    print_str(b":");
+    print_u64(pfilled_len as u64);
+    print_str(b"/");
+    print_u64(pfilled_cap as u64);
+    print_str(b"/");
+    print_u64(pfilled_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -20067,8 +20104,8 @@ struct ExecLoopCtx {
     pml4: u64,
     /// Every hosted process's trusted mechanism state. Cross-process VM services select the target
     /// PML4/scratch through the access-checked target pid rather than the caller's active context.
-    procs: *mut [ProcExec; MAX_PI],
-    pfilled: *mut [[u64; 512]; MAX_PI],
+    procs: *mut [ProcExec],
+    pfilled: *mut [[u64; 512]],
     /// The named NLS section handle (\Nls\NlsSectionCP20127) NtOpenSection records so
     /// NtMapViewOfSection can back it. Points at the loop-local `nls_section_handle`.
     nls_section_handle: *mut u64,

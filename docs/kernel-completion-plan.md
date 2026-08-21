@@ -480,6 +480,22 @@ dll-pe=773/1024/11/0`, keeps `exec_explorer_shell_chrome_painted` green, and rec
 PE-store allocation failures. Review adjustment: the parsed-DLL metadata fixed capacity is closed;
 continue the fixed-table audit at the remaining SEC_IMAGE process/fault scratch state.
 
+A4/B3 SEC_IMAGE process/fault scratch scaling cleanup (2026-08-21): the core hosted-process scratch
+state no longer lives in `SERVICE_PROCS_WORK: [ProcExec; MAX_PI]`, and per-process demand-fill
+bookkeeping no longer lives in `PFILLED: [[u64; 512]; MAX_PI]`. Both are now heap-backed persistent
+slices allocated before the service-loop heap mark, with fallible reservation counters reported in
+the pool census as `proc-scratch=<procs-len>/<procs-cap>/<procs-fail>:<pfilled-len>/<pfilled-cap>/<pfilled-fail>`.
+Helper contracts now accept slices instead of fixed arrays, so future process-window growth does not
+require cascading type changes through SEC_IMAGE diagnostics, thread spawn, GUI wait redrive, or LSA
+completion paths. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof `.tmp/run-desktop-proc-scratch-vec-20260821.log`
+reaches genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing,
+reports `proc-scratch=24/24/0:24/24/0`, keeps `exec_explorer_shell_chrome_painted` green, and shows
+zero process/fault scratch allocation failures. Review adjustment: the static backing cap is closed;
+the remaining `MAX_PI` process-index admission ceiling is a separate process-manager capacity
+boundary and should be handled by admission/runtime policy rather than hidden BSS arrays.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
