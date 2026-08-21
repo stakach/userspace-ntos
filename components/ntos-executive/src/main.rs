@@ -3507,8 +3507,8 @@ pub(crate) unsafe fn winlogon_credential_injection_route(
             }
         }
         winlogon_credential_store(state);
-    } else if !state.is_injected() && state.username_chars_delivered() {
-        // ── PHASE 2: the typed characters have all been delivered; press RETURN so the REAL
+    } else if !state.is_injected() && state.username_ready_for_return() {
+        // ── PHASE 2: the real edit control has the user name; press RETURN so the REAL
         // IsDialogMessageW drives WM_COMMAND(IDOK) into LogonDialogProc.
         let username = state.username_hwnd();
         let post = win32k_glue::win32k_dispatch_wide(

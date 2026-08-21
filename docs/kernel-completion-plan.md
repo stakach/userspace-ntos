@@ -317,6 +317,25 @@ shows the real IDD_LOGON queue delivered all 13 injected `WM_CHAR`s plus `VK_RET
 adjustment: driver-image page-table tracking capacity is closed; continue auditing remaining fixed
 runtime tables by subsystem ownership.
 
+A4/B3 driver-load scratch scaling cleanup (2026-08-21): the same win32k/display driver loader no
+longer stages executive map caps, host map caps, or per-frame W^X rights in three fixed 256-entry
+static arrays. Each load now allocates exact-size scratch vectors from the requested frame count,
+reports scratch allocation failure as an explicit driver-image load failure, and releases a newly
+created executive page table if frame-run allocation fails after page-table setup. PE
+`SizeOfImage` probing no longer rejects drivers above 256 frames; the existing static-import VSpace
+reservation remains the range check for hosted win32k import placement. The credential route was
+kept real during proofing: RETURN may be posted after either all injected `WM_CHAR`s are observed
+from the real modal queue or the edit control renders the exact username through GDI, because both
+are live proofs that the real control owns the text. Local validation is green for `cargo fmt
+--all`, `cargo test -p nt-user-callback credential_injection -- --nocapture`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-headless-driver-load-scratch-vec-render-proof-20260821.log` reaches Explorer shell chrome
+with `293/293` checks passing, keeps the desktop/modal-paint/userinit/Explorer callback gates green,
+delivers all 13 username characters plus `VK_RETURN`, and emits no driver-load scratch or page-table
+allocation diagnostics. Review adjustment: the current driver-image loader scratch-size cap is
+closed; continue the fixed-runtime-table audit outside this loader cluster.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

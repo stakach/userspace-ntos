@@ -630,14 +630,15 @@ impl CredentialInjectionSequence {
     }
 
     /// Record the posted `WM_KEYDOWN`/`VK_RETURN` that drives the dialog to its decision. Valid
-    /// only once the whole user name has been typed AND every one of those characters has come
-    /// back out of the real queue — i.e. the real edit control has actually received them.
+    /// only once the whole user name has been typed and the real edit control has proven it received
+    /// the text, either by returning each posted `WM_CHAR` from the modal queue or by rendering the
+    /// exact user name through the real GDI text path.
     pub fn record_return_post(&mut self, hwnd: u64) -> Result<(), ValidationError> {
         if self.username_hwnd == 0
             || hwnd != self.username_hwnd
             || self.posted_return
             || self.posted_chars as usize != LOGON_USERNAME.len()
-            || self.retrieved_chars as usize != LOGON_USERNAME.len()
+            || !self.username_ready_for_return()
         {
             return Err(ValidationError::Sequence);
         }
@@ -704,6 +705,10 @@ impl CredentialInjectionSequence {
 
     pub const fn username_chars_delivered(self) -> bool {
         self.retrieved_chars as usize == LOGON_USERNAME.len()
+    }
+
+    pub const fn username_ready_for_return(self) -> bool {
+        self.username_chars_delivered() || self.text_readbacks != 0
     }
 
     pub const fn retrieved_return(self) -> bool {
@@ -2516,6 +2521,26 @@ mod tests {
         assert!(injection.observe_retrieved(0x2008c, WM_KEYDOWN, VK_RETURN));
         assert!(injection.keystrokes_delivered());
         assert_eq!(injection.retrieved_chars() as usize, LOGON_USERNAME.len());
+    }
+
+    #[test]
+    fn credential_injection_accepts_exact_rendered_username_before_return() {
+        let mut injection = CredentialInjectionSequence::new();
+        assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
+        for index in 0..LOGON_USERNAME.len() {
+            assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
+        }
+        for _ in 0..LOGON_USERNAME.len() - 1 {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        }
+        assert!(!injection.username_chars_delivered());
+        assert_eq!(
+            injection.record_return_post(0x2008c),
+            Err(ValidationError::Sequence)
+        );
+        injection.record_text_readback();
+        assert!(injection.username_ready_for_return());
+        assert_eq!(injection.record_return_post(0x2008c), Ok(()));
     }
 
     #[test]

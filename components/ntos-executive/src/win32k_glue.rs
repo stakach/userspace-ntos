@@ -4562,7 +4562,7 @@ unsafe fn release_driver_load_frame_run(base: u64, count: u64) {
     }
 }
 
-unsafe fn release_driver_load_map_caps(caps: &mut [u64; 256], count: u64) {
+unsafe fn release_driver_load_map_caps(caps: &mut [u64], count: u64) {
     let mut i = 0u64;
     while i < count.min(caps.len() as u64) {
         let cap = caps[i as usize];
@@ -4572,6 +4572,20 @@ unsafe fn release_driver_load_map_caps(caps: &mut [u64; 256], count: u64) {
         }
         i += 1;
     }
+}
+
+unsafe fn driver_load_scratch_records(frames: usize, fill: u64, stage: &[u8]) -> Option<Vec<u64>> {
+    let mut records = Vec::new();
+    if records.try_reserve_exact(frames).is_err() {
+        print_str(b"[win32k-svc] driver image load ");
+        print_str(stage);
+        print_str(b" scratch allocation failed frames=");
+        print_u64(frames as u64);
+        print_str(b"\n");
+        return None;
+    }
+    records.resize(frames, fill);
+    Some(records)
 }
 
 unsafe fn alloc_driver_load_frame_run(frames: u64) -> Option<u64> {
@@ -4710,22 +4724,37 @@ pub(crate) unsafe fn load_one_driver(
     host_pml4: u64,
     dxgthk_base: u64,
 ) -> Option<(u32, u32, u32)> {
-    if frames == 0 || frames as usize > 256 {
+    let Ok(frame_count) = usize::try_from(frames) else {
+        return load_one_driver_fail(b"frame-count", frames, 0);
+    };
+    if frame_count == 0 {
         return None;
     }
     // Executive-side PT + frames (RW), to load into.
     let (ept, ept_new) =
         ensure_driver_load_page_table(CAP_INIT_THREAD_VSPACE, dst_va, b"exec-pt-map")?;
-    let base = alloc_driver_load_frame_run(frames)?;
-    static mut EXEC_MAP_CAPS: [u64; 256] = [0; 256];
-    let exec_map_caps = &mut *core::ptr::addr_of_mut!(EXEC_MAP_CAPS);
-    for cap in exec_map_caps.iter_mut() {
-        *cap = 0;
-    }
+    let Some(mut exec_map_caps) = driver_load_scratch_records(frame_count, 0, b"exec-map-caps")
+    else {
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return None;
+    };
+    let Some(mut rights) = driver_load_scratch_records(frame_count, RW_NX, b"rights") else {
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return None;
+    };
+    let Some(mut host_map_caps) = driver_load_scratch_records(frame_count, 0, b"host-map-caps")
+    else {
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return None;
+    };
+    let Some(base) = alloc_driver_load_frame_run(frames) else {
+        release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
+        return None;
+    };
     for i in 0..frames {
         let (cap, copy_error) = copy_cap_r(base + i);
         if copy_error != 0 {
-            release_driver_load_map_caps(exec_map_caps, i);
+            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), i);
             release_driver_load_frame_run(base, frames);
             release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
             return load_one_driver_fail(b"exec-frame-copy", base + i, copy_error);
@@ -4734,29 +4763,24 @@ pub(crate) unsafe fn load_one_driver(
         let map_error = page_map_r(cap, va, RW_NX, CAP_INIT_THREAD_VSPACE);
         if map_error != 0 {
             let _ = cnode_delete_recycle_r(cap);
-            release_driver_load_map_caps(exec_map_caps, i);
+            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), i);
             release_driver_load_frame_run(base, frames);
             release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
             return load_one_driver_fail(b"exec-frame-map", va, map_error);
         }
         exec_map_caps[i as usize] = cap;
     }
-    // Parse + copy + reloc + resolve imports (writes via the executive's RW mapping). The per-frame
-    // rights live in a `static` (ftfd.dll = 248 frames is too large for the bounded rootserver
-    // stack). Single-threaded + sequential loads -> the shared static is safe.
-    static mut DRIVER_RIGHTS: [u64; 256] = [RW_NX; 256];
-    let rights = &mut *core::ptr::addr_of_mut!(DRIVER_RIGHTS);
-    for r in rights.iter_mut() {
-        *r = RW_NX;
-    }
+    // Parse + copy + reloc + resolve imports through the executive's RW mapping. The per-frame
+    // rights live in a heap vector because display/keyboard/helper drivers are not inherently capped
+    // at a particular image size.
     let Some(res) = win32k_subsystem::load_driver_into(
         src_va,
         dst_va,
         frames,
-        &mut rights[..frames as usize],
+        rights.as_mut_slice(),
         dxgthk_base,
     ) else {
-        release_driver_load_map_caps(exec_map_caps, frames);
+        release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
         release_driver_load_frame_run(base, frames);
         release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
         return load_one_driver_fail(b"pe-load", dst_va, 0);
@@ -4764,23 +4788,18 @@ pub(crate) unsafe fn load_one_driver(
     // Map the SAME frames W^X into win32k's VSpace at the same VA (RX code / RW data).
     let Some((wpt, wpt_new)) = ensure_driver_load_page_table(host_pml4, dst_va, b"host-pt-map")
     else {
-        release_driver_load_map_caps(exec_map_caps, frames);
+        release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
         release_driver_load_frame_run(base, frames);
         release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
         return None;
     };
-    static mut HOST_MAP_CAPS: [u64; 256] = [0; 256];
-    let host_map_caps = &mut *core::ptr::addr_of_mut!(HOST_MAP_CAPS);
-    for cap in host_map_caps.iter_mut() {
-        *cap = 0;
-    }
     for i in 0..frames {
         let r = rights[i as usize];
         let (cap, copy_error) = copy_cap_r(base + i);
         if copy_error != 0 {
-            release_driver_load_map_caps(host_map_caps, i);
+            release_driver_load_map_caps(host_map_caps.as_mut_slice(), i);
             release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
-            release_driver_load_map_caps(exec_map_caps, frames);
+            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
             release_driver_load_frame_run(base, frames);
             release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
             return load_one_driver_fail(b"host-frame-copy", base + i, copy_error);
@@ -4789,9 +4808,9 @@ pub(crate) unsafe fn load_one_driver(
         let map_error = page_map_r(cap, va, r, host_pml4);
         if map_error != 0 {
             let _ = cnode_delete_recycle_r(cap);
-            release_driver_load_map_caps(host_map_caps, i);
+            release_driver_load_map_caps(host_map_caps.as_mut_slice(), i);
             release_driver_load_page_table_if_new(host_pml4, dst_va, wpt, wpt_new);
-            release_driver_load_map_caps(exec_map_caps, frames);
+            release_driver_load_map_caps(exec_map_caps.as_mut_slice(), frames);
             release_driver_load_frame_run(base, frames);
             release_driver_load_page_table_if_new(CAP_INIT_THREAD_VSPACE, dst_va, ept, ept_new);
             return load_one_driver_fail(b"host-frame-map", va, map_error);
@@ -4814,7 +4833,7 @@ unsafe fn driver_image_frame_count(src_va: u64) -> Option<u64> {
         return None;
     }
     let frames = size_of_image.checked_add(0x0fff)? / 0x1000;
-    if frames == 0 || frames > 256 {
+    if frames == 0 {
         return None;
     }
     Some(frames)
