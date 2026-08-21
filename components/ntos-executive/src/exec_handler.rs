@@ -1010,11 +1010,9 @@ fn trace_tp_worker_event_transition(
     let Some((tp_pi, tp_slot)) = tp_worker_identity_from_badge(handler.current_badge) else {
         return;
     };
-    if tp_pi >= MAX_PI || tp_slot >= TP_WORKER_SLOT_COUNT {
+    let Some(n) = bump_tp_worker_slot_event_trace(tp_pi, tp_slot) else {
         return;
-    }
-    let trace_index = tp_pi * TP_WORKER_SLOT_COUNT + tp_slot;
-    let n = TP_WORKER_SLOT_EVENT_TRACE[trace_index].fetch_add(1, Ordering::Relaxed);
+    };
     if n >= 64 {
         return;
     }

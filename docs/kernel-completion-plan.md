@@ -656,7 +656,24 @@ userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing
 `exec_explorer_shell_chrome_painted` green, reports `w32-dispatch-rows=24/24/0/0`, and commits
 writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822600`. Review
 adjustment: the remaining fixed `MAX_PI` rows in this cluster are `TP_WORKER_SLOT_EVENT_TRACE` and
-`FrameRegistryCensus.by_pi`; process-manager admission tables remain a separate policy boundary.
+`FrameRegistryCensus.by_pi`; the following TP worker trace slice closes the first, and
+process-manager admission tables remain a separate policy boundary.
+
+A4 diagnostic TP worker trace row cleanup (2026-08-21): `TP_WORKER_SLOT_EVENT_TRACE` no longer uses a
+fixed `[AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT]` array. The executive provisions vector-backed
+`(pi, slot)` trace-throttle rows before the SEC_IMAGE workload, `trace_tp_worker_event_transition`
+records through `bump_tp_worker_slot_event_trace(pi, slot)`, and pool census now reports
+`tp-worker-event-rows=<len>/<cap>/<alloc-fail>/<miss>`. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-tp-worker-event-rows-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobbered_by_win32k`,
+`exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
+reports `tp-worker-event-rows=384/384/0/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822656`. Review adjustment: the remaining fixed
+diagnostic row in this cluster is `FrameRegistryCensus.by_pi`; keep process-manager admission policy
+as its own explicit boundary.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data

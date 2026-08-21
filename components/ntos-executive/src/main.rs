@@ -6998,8 +6998,63 @@ pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// per-slot window so late `\pipe\ntsvcs` accepts remain observable without changing behavior.
 pub(crate) static SCM_WORKER_SLOT_SSN_TRACE: [AtomicU64; TP_WORKER_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT];
-pub(crate) static TP_WORKER_SLOT_EVENT_TRACE: [AtomicU64; MAX_PI * TP_WORKER_SLOT_COUNT] =
-    [const { AtomicU64::new(0) }; MAX_PI * TP_WORKER_SLOT_COUNT];
+static mut TP_WORKER_SLOT_EVENT_TRACE_ROWS: Vec<AtomicU64> = Vec::new();
+static TP_WORKER_SLOT_EVENT_TRACE_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static TP_WORKER_SLOT_EVENT_TRACE_ROW_MISSES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn reset_tp_worker_slot_event_trace_rows(process_slots: usize) -> bool {
+    let Some(total_slots) = process_slots.checked_mul(TP_WORKER_SLOT_COUNT) else {
+        TP_WORKER_SLOT_EVENT_TRACE_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    unsafe {
+        let rows = &mut *core::ptr::addr_of_mut!(TP_WORKER_SLOT_EVENT_TRACE_ROWS);
+        rows.clear();
+        if rows.try_reserve(total_slots).is_err() {
+            TP_WORKER_SLOT_EVENT_TRACE_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        while rows.len() < total_slots {
+            rows.push(AtomicU64::new(0));
+        }
+    }
+    true
+}
+
+fn tp_worker_slot_event_trace_index(pi: usize, slot: usize) -> Option<usize> {
+    if slot >= TP_WORKER_SLOT_COUNT {
+        return None;
+    }
+    pi.checked_mul(TP_WORKER_SLOT_COUNT)
+        .and_then(|base| base.checked_add(slot))
+}
+
+unsafe fn tp_worker_slot_event_trace_row(pi: usize, slot: usize) -> Option<&'static AtomicU64> {
+    let index = tp_worker_slot_event_trace_index(pi, slot)?;
+    (&*core::ptr::addr_of!(TP_WORKER_SLOT_EVENT_TRACE_ROWS)).get(index)
+}
+
+pub(crate) fn bump_tp_worker_slot_event_trace(pi: usize, slot: usize) -> Option<u64> {
+    unsafe {
+        let Some(row) = tp_worker_slot_event_trace_row(pi, slot) else {
+            TP_WORKER_SLOT_EVENT_TRACE_ROW_MISSES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        Some(row.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+fn tp_worker_slot_event_trace_row_stats() -> (usize, usize, u64, u64) {
+    unsafe {
+        let rows = &*core::ptr::addr_of!(TP_WORKER_SLOT_EVENT_TRACE_ROWS);
+        (
+            rows.len(),
+            rows.capacity(),
+            TP_WORKER_SLOT_EVENT_TRACE_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            TP_WORKER_SLOT_EVENT_TRACE_ROW_MISSES.load(Ordering::Relaxed),
+        )
+    }
+}
 /// LSA-RPC DIAG: per-SSN trace counter for lsass' `\pipe\lsarpc` rpcrt4 SERVER thread
 /// (`RPCRT4_server_thread`, badge [`LSASS_LISTENER3_BADGE`]). Bounded; reveals exactly what the
 /// server thread does after `rpcrt4_protseq_np_wait_for_new_connection` returns from an accept
@@ -10143,6 +10198,16 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(tp_win_cap as u64);
     print_str(b"/");
     print_u64(tp_win_fails);
+    let (tp_trace_len, tp_trace_cap, tp_trace_fails, tp_trace_misses) =
+        tp_worker_slot_event_trace_row_stats();
+    print_str(b" tp-worker-event-rows=");
+    print_u64(tp_trace_len as u64);
+    print_str(b"/");
+    print_u64(tp_trace_cap as u64);
+    print_str(b"/");
+    print_u64(tp_trace_fails);
+    print_str(b"/");
+    print_u64(tp_trace_misses);
     let (vm_region_len, vm_region_cap, vm_region_fails) = process_vm_region_map_stats();
     let (vm_commit_len, vm_commit_cap, vm_commit_fails) = process_committed_mapping_stats();
     let (vm_pt_len, vm_pt_cap, vm_pt_fails) = process_private_pt_cap_stats();
@@ -25626,6 +25691,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
     if !reset_w32_dispatch_counter_rows(MAX_PI) {
         panic!("win32k dispatch counter row allocation failed");
+    }
+    if !reset_tp_worker_slot_event_trace_rows(MAX_PI) {
+        panic!("TP worker slot-event trace row allocation failed");
     }
     if !reset_image_map_cap_bank_process_rows(MAX_PI) {
         panic!("image map cap-bank process row allocation failed");
