@@ -781,31 +781,41 @@ pub struct PipeWaiter {
     pub is_write: bool,
 }
 
+const PIPE_TABLE_DEFAULT_INITIAL_RESERVE: usize = 16;
+
 /// Reset-safe table of parked pipe reads/writes.
 ///
-/// The const parameter is the first reservation size, not a hard NT limit. Real service startup can
-/// legitimately have many RPC servers and driver control pipes with pending reads at once, so the
-/// table grows on demand. Parking fails only if allocation for the next waiter record fails.
+/// The first reservation size is not a hard NT limit. Real service startup can legitimately have many
+/// RPC servers and driver control pipes with pending reads at once, so the table grows on demand.
+/// Parking fails only if allocation for the next waiter record fails.
 #[derive(Clone, Debug)]
-pub struct PipeWaiterTable<const N: usize> {
+pub struct PipeWaiterTable {
     slots: Vec<Option<PipeWaiter>>,
+    initial_reserve: usize,
 }
 
-impl<const N: usize> Default for PipeWaiterTable<N> {
+impl Default for PipeWaiterTable {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> PipeWaiterTable<N> {
+impl PipeWaiterTable {
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self::with_initial_reserve(PIPE_TABLE_DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            initial_reserve,
+        }
     }
 
     fn grow_reservation(&mut self) -> bool {
         if self.slots.len() == self.slots.capacity() {
             let reserve = if self.slots.capacity() == 0 {
-                N.max(1)
+                self.initial_reserve.max(1)
             } else {
                 1
             };
@@ -1552,23 +1562,31 @@ impl PipeNameWaiterTable {
 /// Reset-safe table of pending async server listens.
 ///
 /// ReactOS/NT does not impose a tiny global cap on `FSCTL_PIPE_LISTEN` IRPs: service startup can
-/// legitimately have many RPC servers listening before clients drain them. The const parameter is
-/// only the first reservation size; the table grows on demand and returns `None` only if the
+/// legitimately have many RPC servers listening before clients drain them. The first reservation
+/// size is just bootstrap storage; the table grows on demand and returns `None` only if the
 /// allocation for another listen record fails.
 #[derive(Clone, Debug)]
-pub struct AsyncListenTable<const N: usize> {
+pub struct AsyncListenTable {
     slots: Vec<Option<AsyncListen>>,
+    initial_reserve: usize,
 }
 
-impl<const N: usize> Default for AsyncListenTable<N> {
+impl Default for AsyncListenTable {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> AsyncListenTable<N> {
+impl AsyncListenTable {
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self::with_initial_reserve(PIPE_TABLE_DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            initial_reserve,
+        }
     }
 
     /// Whether `tid` currently owns any retained pending listen IRP.
@@ -1630,7 +1648,7 @@ impl<const N: usize> AsyncListenTable<N> {
         }
         if self.slots.len() == self.slots.capacity() {
             let reserve = if self.slots.capacity() == 0 {
-                N.max(1)
+                self.initial_reserve.max(1)
             } else {
                 1
             };
@@ -1764,7 +1782,7 @@ mod tests {
 
     #[test]
     fn pipe_waiter_park_on_empty_records_context() {
-        let mut t = PipeWaiterTable::<8>::new();
+        let mut t = PipeWaiterTable::new();
         assert!(t.is_empty());
         let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
         assert_eq!(t.len(), 1);
@@ -1782,7 +1800,7 @@ mod tests {
 
     #[test]
     fn asynchronous_pipe_waiter_does_not_own_a_reply_cap() {
-        let mut t = PipeWaiterTable::<1>::new();
+        let mut t = PipeWaiterTable::new();
         let mut waiter = wtr(0xAA, 3, 7);
         waiter.reply_cap = 0;
         waiter.apc_context = 0xDEAD;
@@ -1800,7 +1818,7 @@ mod tests {
         // The server listener parks reading server-fid; a peer write re-drives:
         // drain_all yields the parked read, and complete() frees it after the
         // executive fills the bytes + replies.
-        let mut t = PipeWaiterTable::<8>::new();
+        let mut t = PipeWaiterTable::new();
         let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
         let drained: std::vec::Vec<_> = t.drain_all().collect();
         assert_eq!(drained.len(), 1);
@@ -1819,7 +1837,7 @@ mod tests {
         // MSRPC is multi-round-trip: after the bind_ack reply the listener loops
         // back and re-parks on the SAME reading end for the request PDU. The slot
         // freed by the first completion must be re-usable.
-        let mut t = PipeWaiterTable::<4>::new();
+        let mut t = PipeWaiterTable::new();
         let s1 = t.park(wtr(0xAA, 3, 7)).unwrap();
         t.complete(s1).unwrap(); // bind read satisfied
         assert!(t.is_empty());
@@ -1835,7 +1853,7 @@ mod tests {
         // Both ends can be parked at once (server reading the request, client
         // reading the response), keyed by their own file-id; completing one does
         // not disturb the other.
-        let mut t = PipeWaiterTable::<8>::new();
+        let mut t = PipeWaiterTable::new();
         let server = t.park(wtr(0xAA, 3, 7)).unwrap(); // svc listener reads server end
         let client = t.park(wtr(0xBB, 2, 4)).unwrap(); // winlogon reads client end
         assert_eq!(t.len(), 2);
@@ -1855,9 +1873,9 @@ mod tests {
 
     #[test]
     fn pipe_waiter_grows_past_initial_reservation() {
-        // The const parameter is only the bootstrap reservation. More concurrent RPC/driver pipe
+        // The initial reservation is only bootstrap storage. More concurrent RPC/driver pipe
         // waiters grow the table instead of returning a synthetic out-of-resources status.
-        let mut t = PipeWaiterTable::<2>::new();
+        let mut t = PipeWaiterTable::with_initial_reserve(2);
         assert!(t.ensure_capacity());
         assert!(t.park(wtr(0xAA, 3, 7)).is_some());
         assert!(t.park(wtr(0xBB, 3, 8)).is_some());
@@ -1872,7 +1890,7 @@ mod tests {
 
     #[test]
     fn pipe_waiter_cancel_thread_frees_all_its_slots() {
-        let mut t = PipeWaiterTable::<8>::new();
+        let mut t = PipeWaiterTable::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap(); // same tid, 2nd end
         t.park(wtr(0xCC, 2, 4)).unwrap(); // different thread
@@ -1888,7 +1906,7 @@ mod tests {
 
     #[test]
     fn pipe_waiter_cancel_thread_callback_releases_every_waiter() {
-        let mut t = PipeWaiterTable::<8>::new();
+        let mut t = PipeWaiterTable::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap();
         t.park(wtr(0xCC, 2, 4)).unwrap();
@@ -1909,7 +1927,7 @@ mod tests {
 
     #[test]
     fn pipe_waiter_cancel_thread_file_only_removes_matching_file_object() {
-        let mut t = PipeWaiterTable::<4>::new();
+        let mut t = PipeWaiterTable::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap();
         t.park(wtr(0xAA, 3, 8)).unwrap();
@@ -2491,7 +2509,7 @@ mod tests {
 
     #[test]
     fn async_listen_arm_records_and_finds() {
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         assert!(t.is_empty());
         let slot = t.arm(al(0xE802D50, 42)).unwrap();
         assert_eq!(t.len(), 1);
@@ -2512,7 +2530,7 @@ mod tests {
         // The core Part-B edge modeled: a peer connect completes the server's pending listen; the
         // executive then signals `event_obj_idx` via its NtSetEvent wake path. complete() yields the
         // record (carrying the event to signal + the iosb to fill) exactly once, then the slot is free.
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xE802D50, 42)).unwrap();
         let done = t.complete(0xE802D50).expect("armed listen completes");
         assert_eq!(done.event_obj_idx, 42, "carries the event index to SIGNAL");
@@ -2531,7 +2549,7 @@ mod tests {
         // rpcrt4 re-posts FSCTL_PIPE_LISTEN with a fresh completion event after the previous connect
         // completed (successive clients). Re-arming the same server end REPLACES the record (no leak),
         // so the NEXT connect signals the NEW event, not a stale one.
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xE802D50, 42)).unwrap();
         t.arm(al(0xE802D50, 99)).unwrap(); // re-arm same server, new event
         assert_eq!(t.len(), 1, "re-arm does not leak a second slot");
@@ -2540,7 +2558,7 @@ mod tests {
 
     #[test]
     fn async_listen_cancel_thread_removes_owned_irps() {
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xA, 1)).unwrap();
         let mut other = al(0xB, 2);
         other.tid = 88;
@@ -2559,7 +2577,7 @@ mod tests {
 
     #[test]
     fn async_listen_drain_all_and_free() {
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         let s0 = t.arm(al(0xA, 1)).unwrap();
         let _s1 = t.arm(al(0xB, 2)).unwrap();
         let drained: std::vec::Vec<_> = t.drain_all().collect();
@@ -2572,7 +2590,7 @@ mod tests {
 
     #[test]
     fn async_listen_grows_past_initial_reservation() {
-        let mut t = AsyncListenTable::<2>::new();
+        let mut t = AsyncListenTable::with_initial_reserve(2);
         assert!(t.arm(al(1, 10)).is_some());
         assert!(t.arm(al(2, 20)).is_some());
         // Third DISTINCT server end grows the table. A real allocation failure would still return
@@ -2584,7 +2602,7 @@ mod tests {
 
     #[test]
     fn async_listen_cancel_thread_callback_releases_every_record() {
-        let mut t = AsyncListenTable::<2>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xA, 1)).unwrap();
         t.arm(al(0xB, 2)).unwrap();
         t.arm(al(0xC, 3)).unwrap();
@@ -2609,7 +2627,7 @@ mod tests {
 
     #[test]
     fn async_listen_cancel_thread_file_only_removes_matching_listen() {
-        let mut t = AsyncListenTable::<2>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xA, 1)).unwrap();
         t.arm(al(0xB, 2)).unwrap();
         let mut cancelled = std::vec::Vec::new();
@@ -2633,7 +2651,7 @@ mod tests {
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
         let samr: std::vec::Vec<u16> = "\\samr".encode_utf16().collect();
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
         t.arm(al_named(0xB, 2, &lsarpc)).unwrap();
         t.arm(al_named(0xC, 3, &samr)).unwrap();
@@ -2653,7 +2671,7 @@ mod tests {
     fn async_listen_armed_name_peeks_without_consuming() {
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
 
         assert!(t.armed_name(pipe_name_hash(&ntsvcs)));
@@ -2713,7 +2731,7 @@ mod tests {
         // The accept edge is the exact server fid returned by NPFS, so it can complete a listen even if
         // name metadata is unavailable. Name hashes are only the pre-open WaitNamedPipe probe surface.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al(0xA, 1)).unwrap(); // al() leaves name_hash == 0
         assert!(!t.armed_name(pipe_name_hash(&ntsvcs)));
         assert!(!t.armed_name(0));
@@ -2721,7 +2739,7 @@ mod tests {
         assert!(t.is_empty());
 
         let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
-        let mut t2 = AsyncListenTable::<8>::new();
+        let mut t2 = AsyncListenTable::new();
         t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
         assert!(!t2.armed_name(0));
         assert_eq!(t2.len(), 1);
@@ -2861,7 +2879,7 @@ mod tests {
     fn client_connect_before_listen_completes_late_armed_exact_server() {
         let control_pipe: std::vec::Vec<u16> = "\\net\\NtControlPipe0".encode_utf16().collect();
         let mut preconnected = PipePreconnectedServerTable::new();
-        let mut listens = AsyncListenTable::<2>::new();
+        let mut listens = AsyncListenTable::new();
 
         preconnected.remember(0x401).unwrap();
         preconnected.remember(0x403).unwrap();
@@ -2889,7 +2907,7 @@ mod tests {
         // Two instances of the SAME named pipe are not interchangeable once NPFS has accepted a client.
         // The executive must complete the server fid for the accepted CCB, even if that is not slot 0.
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = AsyncListenTable::<8>::new();
+        let mut t = AsyncListenTable::new();
         t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
         t.arm(al_named(0xB, 2, &ntsvcs)).unwrap();
         let accepted = t.complete(0xB).unwrap();
@@ -3021,7 +3039,7 @@ mod tests {
     fn pipe_waiter_cancel_thread_clears_parked_on_and_reopens_slot() {
         // cancel_thread_with must clear the parked_on() key AND free the slot for immediate re-park
         // after the caller has finalized the real pending IRP.
-        let mut t = PipeWaiterTable::<2>::new();
+        let mut t = PipeWaiterTable::with_initial_reserve(2);
         t.park(wtr(0xAA, 3, 7)).unwrap();
         t.park(wtr(0xBB, 3, 7)).unwrap();
         assert!(t.parked_on(0xAA));
@@ -3044,7 +3062,7 @@ mod tests {
         // which must be asked PER DIRECTION, or the write is refused with
         // STATUS_INSUFFICIENT_RESOURCES and the response is silently lost (the wall that stopped
         // `LsaOpenPolicy` from returning).
-        let mut t = PipeWaiterTable::<4>::new();
+        let mut t = PipeWaiterTable::new();
         let mut read = wtr(0xAA, 4, 26);
         read.is_write = false;
         t.park(read).unwrap();
@@ -3077,7 +3095,7 @@ mod tests {
     #[test]
     fn pipe_waiter_cancel_thread_no_match_is_noop() {
         // cancel_thread_with for a tid with no parked waiters frees nothing and disturbs nobody.
-        let mut t = PipeWaiterTable::<4>::new();
+        let mut t = PipeWaiterTable::new();
         t.park(wtr(0xAA, 3, 7)).unwrap();
         assert_eq!(t.cancel_thread_with(999, |_| {}), 0);
         assert_eq!(t.len(), 1);
@@ -3180,7 +3198,7 @@ mod tests {
     fn drain_all_order_is_stable_slot_order() {
         // The executive re-drives parked readers in a DETERMINISTIC order (slot order) so a peer write
         // re-issues reads reproducibly. Freeing a middle slot and re-parking reuses the low slot.
-        let mut t = PipeWaiterTable::<4>::new();
+        let mut t = PipeWaiterTable::new();
         let s0 = t.park(wtr(0xA0, 1, 1)).unwrap();
         let _s1 = t.park(wtr(0xA1, 1, 2)).unwrap();
         let _s2 = t.park(wtr(0xA2, 1, 3)).unwrap();

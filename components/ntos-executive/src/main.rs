@@ -3257,13 +3257,12 @@ static KEYED_RELEASE_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
 /// — and re-driven when the peer writes. The single-threaded executive owns all mutation.
 ///
-/// This starts with a small bootstrap reservation and grows like the async listen table. There is no
-/// tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and driver control
-/// paths can legitimately accumulate more parked reads/writes than the old 16-slot bring-up table.
+/// This starts with a small default bootstrap reservation and grows like the async listen table.
+/// There is no tiny global NT limit on pending named-pipe IRPs: service startup, RPC servers, and
+/// driver control paths can legitimately accumulate more parked reads/writes than the old 16-slot
+/// bring-up table.
 /// A refusal now means real allocation failure or reply-cap exhaustion, not "another service came up".
-const PIPE_WAITER_INITIAL_N: usize = 16;
-static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_INITIAL_N> =
-    nt_io_manager::PipeWaiterTable::new();
+static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable = nt_io_manager::PipeWaiterTable::new();
 /// Times a pipe read/write park was refused after a pending-capable IRP route wanted to retain it. A
 /// refusal is a functional degrade (the caller gets `STATUS_INSUFFICIENT_RESOURCES` for an I/O that
 /// should have completed later), so this must stay 0.
@@ -3279,10 +3278,9 @@ static PIPE_REDRIVE_RPC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// completion EVENT, then parks on `NtWaitForMultipleObjects([mgr_event, listen_event])` — it does NOT
 /// block on a pipe read. When the client (winlogon) connects/writes, the executive completes the
 /// pending listen + signals its event through the shared dispatcher wake path so the
-/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. The table starts with
-/// a small reservation and grows as real RPC/service listeners accumulate.
-const PIPE_ASYNC_LISTEN_INITIAL_N: usize = 16;
-static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_INITIAL_N> =
+/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. The table uses the
+/// pipe model's default bootstrap reservation and grows as real RPC/service listeners accumulate.
+static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable =
     nt_io_manager::AsyncListenTable::new();
 const PIPE_NAME_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable =

@@ -747,6 +747,20 @@ allocation/store failures. Review adjustment: GUI message waiter capacity is clo
 desktop frontier; continue the wait/runtime audit at any remaining pipe data waiter or subsystem
 tables that still own live reply/resume state.
 
+A4/B3 pipe waiter/listen table API cleanup (2026-08-22): the pipe data-plane parked read/write
+waiter table and async `FSCTL_PIPE_LISTEN` table no longer expose stale const-generic
+`PipeWaiterTable<N>` / `AsyncListenTable<N>` type identities or executive `*_INITIAL_N` aliases.
+Both stores were already growable; this cleanup makes the first reservation explicit data through
+`with_initial_reserve` for host tests and keeps `new()` as the default 16-row bootstrap reserve used
+by the executive. The active code now describes the actual mechanism: a growable pipe waiter/listen
+record store that fails only on real allocation failure or reply-cap exhaustion. Local validation is
+green for `cargo fmt --all`, `cargo test -p nt-io-manager`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Review adjustment: parked pipe data
+capacity no longer has an artificial table type or executive constant to remove; future pipe work
+should target real pipe completion semantics, cancellation, or diagnostics rather than fixed table
+identity.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before
