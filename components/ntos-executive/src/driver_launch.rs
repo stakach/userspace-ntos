@@ -43,10 +43,13 @@ use nt_hosted_runtime::{
     HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, NdisMiniportCharacteristicsLayoutError,
-    NdisProtocolCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
+    NdisProtocolCharacteristicsLayoutError, DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64,
+    DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64,
+    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64,
@@ -18206,6 +18209,31 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
     None
 }
 
+unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider_component(
+    provider_instance: usize,
+    provider_component_va: u64,
+) -> Option<HostedProviderNdisMiniportBlockMirror> {
+    if provider_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.provider_component_va == provider_component_va
+        {
+            return Some(record);
+        }
+        index += 1;
+    }
+    None
+}
+
 unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
     provider_instance: usize,
     dependent_instance: usize,
@@ -18226,6 +18254,24 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
             && record.dependent_instance == dependent_instance
             && record.dependent_component_va == dependent_component_va
         {
+            return Some(record);
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(
+    dependent_instance: usize,
+) -> Option<HostedProviderNdisMiniportBlockMirror> {
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present && record.dependent_instance == dependent_instance {
             return Some(record);
         }
         index += 1;
@@ -18353,6 +18399,13 @@ unsafe fn refresh_hosted_provider_ndis_miniport_block_mirror(
     provider_marshal_zero(
         dependent_exec,
         NDIS_MINIPORT_BLOCK_CALLBACK_PROJECTION_LEN_X64,
+    );
+    let miniport_adapter_context = read_unaligned(
+        (provider_exec + NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64) as *const u64,
+    );
+    write_unaligned(
+        (dependent_exec + NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64) as *mut u64,
+        miniport_adapter_context,
     );
     let eth_db =
         read_unaligned((provider_exec + NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64) as *const u64);
@@ -20609,6 +20662,26 @@ unsafe fn complete_provider_export_marshal(
     }
 }
 
+unsafe fn complete_hosted_provider_miniport_attributes(
+    provider_instance: usize,
+    provider_component_va: u64,
+) -> Result<(), i32> {
+    let Some(mirror) = hosted_provider_ndis_miniport_block_mirror_by_provider_component(
+        provider_instance,
+        provider_component_va,
+    ) else {
+        HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(provider_inst) = instance(provider_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(dependent_inst) = instance(mirror.dependent_instance) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    refresh_hosted_provider_ndis_miniport_block_mirror(provider_inst, dependent_inst, mirror)
+}
+
 unsafe fn complete_provider_export_side_effects(
     policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
@@ -20637,6 +20710,9 @@ unsafe fn complete_provider_export_side_effects(
                 return Ok(());
             }
             complete_hosted_provider_miniport_registration(provider_instance, args[0])
+        }
+        HostedProviderExportSideEffect::NdisMiniportAttributes => {
+            complete_hosted_provider_miniport_attributes(provider_instance, args[0])
         }
         HostedProviderExportSideEffect::NdisScatterGatherDmaInitialization => Ok(()),
         HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration => Ok(()),
@@ -30828,6 +30904,77 @@ unsafe fn write_hosted_e1000_rx_stimulus_frame(
     frame[38..42].copy_from_slice(&config.target_ip);
 }
 
+unsafe fn hosted_dc21x4_adapter_context(binding: HostedDeviceBinding) -> Option<u64> {
+    let mirror = hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(binding.instance)?;
+    let dependent_inst = instance(binding.instance)?;
+    let block_exec = component_to_exec_va_for_instance(
+        binding.instance,
+        dependent_inst,
+        mirror.dependent_component_va,
+        NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64 + 8,
+    )?;
+    let adapter_context = read_unaligned(
+        (block_exec + NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64) as *const u64,
+    );
+    if adapter_context == 0 {
+        return None;
+    }
+    let adapter_end = adapter_context.checked_add(DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64 + 8)?;
+    component_to_exec_va_for_instance(
+        binding.instance,
+        dependent_inst,
+        adapter_context,
+        adapter_end - adapter_context,
+    )?;
+    Some(adapter_context)
+}
+
+unsafe fn hosted_dc21x4_current_rbd_index(
+    binding: HostedDeviceBinding,
+    ring_component_va: u64,
+    descriptor_count: usize,
+) -> Option<usize> {
+    if descriptor_count == 0 {
+        return None;
+    }
+    let adapter_context = hosted_dc21x4_adapter_context(binding)?;
+    let dependent_inst = instance(binding.instance)?;
+    let fields_component = adapter_context.checked_add(DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64)?;
+    let fields_exec = component_to_exec_va_for_instance(
+        binding.instance,
+        dependent_inst,
+        fields_component,
+        DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64 - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64 + 8,
+    )?;
+    let current_rbd = read_unaligned(fields_exec as *const u64);
+    let head_rbd =
+        read_unaligned((fields_exec + DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64
+            - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64) as *const u64);
+    let tail_rbd =
+        read_unaligned((fields_exec + DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64
+            - DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64) as *const u64);
+    if current_rbd == 0 || head_rbd == 0 || tail_rbd == 0 || head_rbd != ring_component_va {
+        return None;
+    }
+    let ring_span = tail_rbd.checked_sub(head_rbd)?;
+    if ring_span % DC_DESCRIPTOR_LEN as u64 != 0 {
+        return None;
+    }
+    let live_descriptor_count = ring_span / DC_DESCRIPTOR_LEN as u64 + 1;
+    if live_descriptor_count == 0 || live_descriptor_count > descriptor_count as u64 {
+        return None;
+    }
+    let current_offset = current_rbd.checked_sub(head_rbd)?;
+    if current_offset % DC_DESCRIPTOR_LEN as u64 != 0 {
+        return None;
+    }
+    let index = current_offset / DC_DESCRIPTOR_LEN as u64;
+    if index >= live_descriptor_count || index > usize::MAX as u64 {
+        return None;
+    }
+    Some(index as usize)
+}
+
 unsafe fn complete_hosted_dc21x4_rx_descriptor(
     binding: HostedDeviceBinding,
     state: HostedDeviceResourceState,
@@ -30911,29 +31058,27 @@ unsafe fn drive_hosted_dc21x4_rx_descriptor(
         return report;
     };
     let ring = core::slice::from_raw_parts_mut(ring_alias_va as *mut u8, ring_len as usize);
-    let mut index = 0usize;
-    while index < descriptor_count {
-        match complete_hosted_dc21x4_rx_descriptor(
-            binding,
-            state,
-            ring_logical,
-            ring_component_va,
-            ring,
-            index,
-            stimulus_config,
-        ) {
-            Ok(true) => {
-                report.rx_completed = 1;
-                report.interrupt_causes |= (DC_IRQ_RX_OK | DC_IRQ_NORMAL_SUMMARY) as u64;
-                return report;
-            }
-            Ok(false) => {}
-            Err(_) => {
-                report.failures = report.failures.saturating_add(1);
-                return report;
-            }
+    let Some(index) = hosted_dc21x4_current_rbd_index(binding, ring_component_va, descriptor_count)
+    else {
+        return report;
+    };
+    match complete_hosted_dc21x4_rx_descriptor(
+        binding,
+        state,
+        ring_logical,
+        ring_component_va,
+        ring,
+        index,
+        stimulus_config,
+    ) {
+        Ok(true) => {
+            report.rx_completed = 1;
+            report.interrupt_causes |= (DC_IRQ_RX_OK | DC_IRQ_NORMAL_SUMMARY) as u64;
         }
-        index += 1;
+        Ok(false) => {}
+        Err(_) => {
+            report.failures = report.failures.saturating_add(1);
+        }
     }
     report
 }

@@ -21,6 +21,7 @@ pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
 pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
 pub const NDIS_MINIPORT_INTERRUPT_LEN_X64: u64 = 0x98;
 pub const NDIS_MINIPORT_TIMER_LEN_X64: u64 = 0xa0;
+pub const NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64: u64 = 0x18;
 pub const NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64: u64 = 0x20;
 pub const NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64: u64 = 0x190;
 pub const NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64: u64 = 0x1b0;
@@ -34,6 +35,9 @@ pub const NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2b8;
 pub const NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2c0;
 pub const NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2c8;
 pub const NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x2d0;
+pub const DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64: u64 = 0x118;
+pub const DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64: u64 = 0x120;
+pub const DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64: u64 = 0x128;
 pub const NDIS_PROTOCOL_CHARACTERISTICS_CALLBACK_CAP: usize = 19;
 pub const NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64: u64 = 0x58;
 pub const NDIS30_PROTOCOL_CHARACTERISTICS_LEN_X64: u64 = 0x68;
@@ -333,6 +337,7 @@ pub enum HostedProviderExportSideEffect {
     None,
     NdisInitializeWrapper,
     NdisMiniportRegistration,
+    NdisMiniportAttributes,
     NdisScatterGatherDmaInitialization,
     NdisMiniportInterruptDeregistration,
     NdisPacketFree,
@@ -586,9 +591,11 @@ pub fn hosted_provider_export_marshal_policy(
             ],
             HostedProviderExportSideEffect::NdisMiniportRegistration,
         ),
-        "NdisMSetAttributesEx" => {
-            void_export_policy(&[ProviderHandle, CallerContext, Scalar, Scalar, Scalar])
-        }
+        "NdisMSetAttributesEx" => export_policy_with_effect_and_result(
+            &[ProviderHandle, CallerContext, Scalar, Scalar, Scalar],
+            HostedProviderExportSideEffect::NdisMiniportAttributes,
+            HostedProviderExportResultSemantics::Void,
+        ),
         "NdisMRemoveMiniport" => export_policy(&[ProviderHandle]),
         "NdisMQueryAdapterResources" => void_export_policy(&[
             CallerOutStatus,
@@ -1379,6 +1386,12 @@ mod tests {
             HostedProviderExportSideEffect::NdisMiniportRegistration
         );
         assert_eq!(
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMSetAttributesEx")
+                .unwrap()
+                .side_effect,
+            HostedProviderExportSideEffect::NdisMiniportAttributes
+        );
+        assert_eq!(
             hosted_provider_export_marshal_policy("ndis.sys", "NdisMInitializeScatterGatherDma")
                 .unwrap()
                 .side_effect,
@@ -2082,6 +2095,10 @@ mod tests {
 
     #[test]
     fn ndis_miniport_block_callback_offsets_match_reactos_nt5_x64() {
+        assert_eq!(
+            NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
+            0x18
+        );
         assert_eq!(NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64, 0x20);
         assert_eq!(NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, 0x190);
         assert_eq!(
@@ -2107,6 +2124,13 @@ mod tests {
         assert_eq!(NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, 0x2c0);
         assert_eq!(NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64, 0x2c8);
         assert_eq!(NDIS_MINIPORT_BLOCK_SET_COMPLETE_HANDLER_OFFSET_X64, 0x2d0);
+    }
+
+    #[test]
+    fn dc21x4_adapter_rx_ring_offsets_match_reactos_nt5_x64() {
+        assert_eq!(DC21X4_ADAPTER_CURRENT_RBD_OFFSET_X64, 0x118);
+        assert_eq!(DC21X4_ADAPTER_HEAD_RBD_OFFSET_X64, 0x120);
+        assert_eq!(DC21X4_ADAPTER_TAIL_RBD_OFFSET_X64, 0x128);
     }
 
     #[test]

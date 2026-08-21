@@ -97,6 +97,13 @@ rx-packet=0/0`. This accepted slice uses no process names, driver names, or repe
 fallback loops. The remaining packet frontier is narrower: DC21x4 still does not reach live
 packet-array indication (`packet-array=0/0`), so next B3 work belongs in the miniport packet
 construction/receive indication path rather than transport/resource-state plumbing.
+Follow-up current-RBD cleanup `.tmp/run-headless-b3-dc21x4-current-rbd-20260821.log` keeps the same
+green desktop proof at `293/293` while removing the old anonymous DC21x4 RX ring scan: provider
+`NdisMSetAttributesEx` now refreshes the mirrored `NDIS_MINIPORT_BLOCK.MiniportAdapterContext`, and
+the I/O-only DC21x4 packet model completes only the live `Adapter->CurrentRbd` descriptor described by
+the ReactOS adapter state. This is an accepted correctness cleanup, not packet-array closure:
+`packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0` remains the active B3 receive-indication
+frontier.
 Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
 send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
@@ -8497,6 +8504,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0`. Review adjustment: B3's next target is
     no longer post-bind timing, provider resource copyback, or interrupt-mask state; it is the real
     DC21x4 packet-array path, where the current evidence is still `packet-array=0/0`.
+    Follow-up current-RBD cleanup `.tmp/run-headless-b3-dc21x4-current-rbd-20260821.log` keeps the
+    mixed-NIC desktop proof green with `293/293` after removing the anonymous DC21x4 RX descriptor
+    scan. The hosted-runtime layout tests now pin
+    `NDIS_MINIPORT_BLOCK.MiniportAdapterContext=0x18` and the ReactOS DC21x4 adapter RX ring pointers
+    `CurrentRbd=0x118`, `HeadRbd=0x120`, and `TailRbd=0x128`; the executive treats
+    `NdisMSetAttributesEx` as a real provider side effect and refreshes the mirrored miniport block
+    before the packet model reads `Adapter->CurrentRbd`. The proof still shows DC21x4 interrupt/DPC
+    delivery and `pbrx=1/1/0`, but provider sharing remains
+    `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0`. Review adjustment: the next B3 slice is
+    now specifically why the ReactOS DC21x4 receive DPC exits before `DcIndicateReceivePackets`, not
+    ring selection or NDIS provider transport.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created
