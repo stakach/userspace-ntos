@@ -5313,7 +5313,9 @@ pub(crate) unsafe fn service_sec_image(
     // the actual hosted thread badge; completion paths clear that badge when they resume the stolen
     // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
     // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
-    thread_wait_state_reset();
+    if !thread_wait_state_reset() {
+        panic!("thread wait parked-state allocation failed");
+    }
     let mut wait_parked: u64 = 0;
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,

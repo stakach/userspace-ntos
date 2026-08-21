@@ -2723,6 +2723,7 @@ pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
 const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
     MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
+const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const HOSTED_THREAD_WAIT_CAP: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_WAIT_CAP + 1;
 const WAIT_REPLY_POOL_USED_WORDS: usize = (WAIT_REPLY_POOL_N + 63) / 64;
@@ -2736,20 +2737,30 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
 static WAIT_REPLY_POOL_USED: [AtomicU64; WAIT_REPLY_POOL_USED_WORDS] =
     [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_USED_WORDS];
 
-#[derive(Clone, Copy)]
-struct ThreadWaitParkTable<const N: usize> {
-    badges_plus_one: [u64; N],
+struct ThreadWaitParkTable {
+    badges_plus_one: Vec<u64>,
+    allocation_failures: u64,
+    store_failures: u64,
 }
 
-impl<const N: usize> ThreadWaitParkTable<N> {
+impl ThreadWaitParkTable {
     const fn new() -> Self {
         Self {
-            badges_plus_one: [0; N],
+            badges_plus_one: Vec::new(),
+            allocation_failures: 0,
+            store_failures: 0,
         }
     }
 
-    fn reset(&mut self) {
-        self.badges_plus_one = [0; N];
+    fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.badges_plus_one.clear();
+        if self.badges_plus_one.capacity() < initial_reserve
+            && self.badges_plus_one.try_reserve(initial_reserve).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return false;
+        }
+        true
     }
 
     fn contains(&self, badge: u64) -> bool {
@@ -2764,7 +2775,16 @@ impl<const N: usize> ThreadWaitParkTable<N> {
         }
         if let Some(slot) = self.badges_plus_one.iter_mut().find(|slot| **slot == 0) {
             *slot = encoded;
+            return;
         }
+        if self.badges_plus_one.len() == self.badges_plus_one.capacity()
+            && self.badges_plus_one.try_reserve(1).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            self.store_failures = self.store_failures.saturating_add(1);
+            return;
+        }
+        self.badges_plus_one.push(encoded);
     }
 
     fn clear(&mut self, badge: u64) {
@@ -2778,10 +2798,19 @@ impl<const N: usize> ThreadWaitParkTable<N> {
             }
         }
     }
+
+    fn stats(&self) -> (usize, usize, usize, u64, u64) {
+        (
+            self.badges_plus_one.iter().filter(|badge| **badge != 0).count(),
+            self.badges_plus_one.len(),
+            self.badges_plus_one.capacity(),
+            self.allocation_failures,
+            self.store_failures,
+        )
+    }
 }
 
-static mut THREAD_WAIT_PARKED: ThreadWaitParkTable<HOSTED_THREAD_WAIT_CAP> =
-    ThreadWaitParkTable::new();
+static mut THREAD_WAIT_PARKED: ThreadWaitParkTable = ThreadWaitParkTable::new();
 /// Compact identity for an NT object that can satisfy a native wait.
 ///
 /// Dispatcher namespace objects keep their historical raw encoding (the obj_ns index), so existing
@@ -10301,6 +10330,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(hosted_thread_store_fails);
     let (
+        thread_wait_park_live,
+        thread_wait_park_records,
+        thread_wait_park_cap,
+        thread_wait_park_alloc_fails,
+        thread_wait_park_store_fails,
+    ) = thread_wait_state_stats();
+    print_str(b" thread-wait-park=");
+    print_u64(thread_wait_park_live as u64);
+    print_str(b"/");
+    print_u64(thread_wait_park_records as u64);
+    print_str(b"/");
+    print_u64(thread_wait_park_cap as u64);
+    print_str(b"/");
+    print_u64(thread_wait_park_alloc_fails);
+    print_str(b"/");
+    print_u64(thread_wait_park_store_fails);
+    let (
         hosted_loaded_entries_len,
         hosted_loaded_entries_cap,
         hosted_loaded_pes_len,
@@ -15875,9 +15921,10 @@ unsafe fn delay_timer_ack_irq() {
     }
 }
 
-fn thread_wait_state_reset() {
+fn thread_wait_state_reset() -> bool {
     unsafe {
-        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED)).reset();
+        (&mut *core::ptr::addr_of_mut!(THREAD_WAIT_PARKED))
+            .reset(HOSTED_THREAD_WAIT_INITIAL_RESERVE)
     }
 }
 
@@ -15951,6 +15998,10 @@ fn thread_wait_state_clear_tid_ready(handler: &mut ExecNtHandler, tid: u64) {
 
 fn thread_wait_state_badge_parked(badge: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).contains(badge) }
+}
+
+fn thread_wait_state_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe { (&*core::ptr::addr_of!(THREAD_WAIT_PARKED)).stats() }
 }
 
 unsafe fn delay_timer_interrupt(
