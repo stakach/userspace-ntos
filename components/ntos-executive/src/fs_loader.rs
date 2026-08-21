@@ -26,7 +26,6 @@ const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
 
-const SYSTEM32_CACHE_CAP: usize = 2048;
 const SYSTEM32_CACHE_NAME_CAP: usize = 96;
 
 #[derive(Clone, Copy)]
@@ -52,9 +51,10 @@ const SYSTEM32_CACHE_STATE_BASE: usize = crate::allocator::COMPONENT_LOCAL_WORD_
 const SYSTEM32_CACHE_STATE_PTR: usize = SYSTEM32_CACHE_STATE_BASE;
 const SYSTEM32_CACHE_STATE_COUNT: usize = SYSTEM32_CACHE_STATE_BASE + 8;
 const SYSTEM32_CACHE_STATE_READY: usize = SYSTEM32_CACHE_STATE_BASE + 16;
-const SYSTEM32_CACHE_STATE_OVERFLOW: usize = SYSTEM32_CACHE_STATE_BASE + 24;
+const SYSTEM32_CACHE_STATE_CAPACITY: usize = SYSTEM32_CACHE_STATE_BASE + 24;
+const SYSTEM32_CACHE_STATE_OVERFLOW: usize = SYSTEM32_CACHE_STATE_BASE + 32;
 
-const _: () = assert!(4 <= crate::allocator::COMPONENT_LOCAL_WORDS);
+const _: () = assert!(5 <= crate::allocator::COMPONENT_LOCAL_WORDS);
 
 unsafe fn system32_cache_state_read(offset: usize) -> u64 {
     core::ptr::read_volatile(offset as *const u64)
@@ -64,29 +64,30 @@ unsafe fn system32_cache_state_write(offset: usize, value: u64) {
     core::ptr::write_volatile(offset as *mut u64, value);
 }
 
-unsafe fn system32_cache_entries_mut() -> Option<&'static mut [System32CacheEntry]> {
+unsafe fn system32_cache_entries_mut(capacity: usize) -> Option<&'static mut [System32CacheEntry]> {
+    let capacity = capacity.max(1);
     let ptr = system32_cache_state_read(SYSTEM32_CACHE_STATE_PTR) as *mut System32CacheEntry;
-    if !ptr.is_null() {
-        return Some(core::slice::from_raw_parts_mut(ptr, SYSTEM32_CACHE_CAP));
+    let current_capacity = system32_cache_state_read(SYSTEM32_CACHE_STATE_CAPACITY) as usize;
+    if !ptr.is_null() && current_capacity >= capacity {
+        return Some(core::slice::from_raw_parts_mut(ptr, current_capacity));
     }
 
     let bytes = core::mem::size_of::<System32CacheEntry>()
-        .checked_mul(SYSTEM32_CACHE_CAP)
+        .checked_mul(capacity)
         .and_then(|bytes| u32::try_from(bytes).ok())?;
     let allocated = pool_alloc(bytes)? as *mut System32CacheEntry;
     system32_cache_state_write(SYSTEM32_CACHE_STATE_PTR, allocated as u64);
-    Some(core::slice::from_raw_parts_mut(
-        allocated,
-        SYSTEM32_CACHE_CAP,
-    ))
+    system32_cache_state_write(SYSTEM32_CACHE_STATE_CAPACITY, capacity as u64);
+    Some(core::slice::from_raw_parts_mut(allocated, capacity))
 }
 
 unsafe fn system32_cache_entries() -> Option<&'static [System32CacheEntry]> {
     let ptr = system32_cache_state_read(SYSTEM32_CACHE_STATE_PTR) as *const System32CacheEntry;
-    if ptr.is_null() {
+    let capacity = system32_cache_state_read(SYSTEM32_CACHE_STATE_CAPACITY) as usize;
+    if ptr.is_null() || capacity == 0 {
         None
     } else {
-        Some(core::slice::from_raw_parts(ptr, SYSTEM32_CACHE_CAP))
+        Some(core::slice::from_raw_parts(ptr, capacity))
     }
 }
 
@@ -319,7 +320,7 @@ unsafe fn system32_cache_insert(
         }
         existing += 1;
     }
-    if *next >= SYSTEM32_CACHE_CAP {
+    if *next >= cache.len() {
         let overflow = system32_cache_state_read(SYSTEM32_CACHE_STATE_OVERFLOW);
         system32_cache_state_write(SYSTEM32_CACHE_STATE_OVERFLOW, overflow.saturating_add(1));
         return;
@@ -334,10 +335,29 @@ unsafe fn system32_cache_insert(
     *next += 1;
 }
 
+fn system32_cache_count_name(units: &[u16], scratch: &mut [u8; SYSTEM32_CACHE_NAME_CAP]) -> usize {
+    if ascii_units_to_lower(units, scratch).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> usize {
+    let mut count = 0usize;
+    fat_visit_directory(fs, system32_cluster, |record, _first_cluster| {
+        let mut scratch = [0u8; SYSTEM32_CACHE_NAME_CAP];
+        count = count.saturating_add(system32_cache_count_name(record.name(), &mut scratch));
+        if !record.short_name().is_empty() {
+            count =
+                count.saturating_add(system32_cache_count_name(record.short_name(), &mut scratch));
+        }
+        true
+    });
+    count
+}
+
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some(cache) = system32_cache_entries_mut() else {
-        return false;
-    };
     let Some((reactos_cluster, _, reactos_attr)) = dir_find_lfn(fs, fs.root_cl, b"reactos") else {
         return false;
     };
@@ -353,6 +373,10 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
         return false;
     }
 
+    let needed = system32_cache_candidate_count(fs, system32_cluster);
+    let Some(cache) = system32_cache_entries_mut(needed) else {
+        return false;
+    };
     for entry in cache.iter_mut() {
         *entry = System32CacheEntry::EMPTY;
     }
@@ -376,6 +400,8 @@ unsafe fn system32_cache_build(fs: &Fat32) -> bool {
     system32_cache_state_write(SYSTEM32_CACHE_STATE_COUNT, next as u64);
     print_str(b"[fat-cache] system32 entries=");
     print_u64(next as u64);
+    print_str(b" capacity=");
+    print_u64(cache.len() as u64);
     print_str(b" overflow=");
     print_u64(system32_cache_state_read(SYSTEM32_CACHE_STATE_OVERFLOW));
     print_str(b"\n");
@@ -395,9 +421,8 @@ unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8
         }
         system32_cache_state_write(SYSTEM32_CACHE_STATE_READY, 1);
     }
-    let count = system32_cache_state_read(SYSTEM32_CACHE_STATE_COUNT).min(SYSTEM32_CACHE_CAP as u64)
-        as usize;
     let cache = system32_cache_entries()?;
+    let count = (system32_cache_state_read(SYSTEM32_CACHE_STATE_COUNT) as usize).min(cache.len());
     let mut wanted = [0u8; SYSTEM32_CACHE_NAME_CAP];
     let mut i = 0usize;
     while i < leaf.len() {

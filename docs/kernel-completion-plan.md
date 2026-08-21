@@ -211,6 +211,20 @@ checks passing, keeps `exec_dbgk_module_load_forwarded`, `exec_dbgk_module_unloa
 adjustment: continue the fixed-table audit outside module registry state; this removes the current
 SystemModuleInformation module-count ceiling.
 
+A4/B3 System32 loader-cache scaling cleanup (2026-08-21): the FAT `reactos\system32` lookup cache now
+sizes its pool-backed entry table from the live directory scan instead of allocating a fixed
+2048-entry table and dropping names after that cap. The first pass counts cacheable long and short
+names, the second pass keeps the existing duplicate rejection and lowercase ASCII leaf semantics,
+and lookups clamp against the recorded allocation capacity. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-system32-cache-sized-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing, emits `[fat-cache] system32 entries=773 capacity=773 overflow=0`, and preserves
+profile hive load plus dynamic userinit/Explorer launch. Review adjustment: the System32
+loader-cache entry-count cap is closed; remaining storage cleanup should target real read/DMA or
+writable-overlay mechanics rather than this cache.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
