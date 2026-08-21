@@ -9990,49 +9990,55 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
 
 /// Registered client TEB **tail** page VAs (the second page of every hosted thread's TEB). VAs
 /// repeat across VSpaces by design, so this is a small de-duplicated VA set, not a (pi, VA) table.
-const TEB_TAIL_PAGE_CAP: usize = 32;
-static mut TEB_TAIL_PAGE: [u64; TEB_TAIL_PAGE_CAP] = [0; TEB_TAIL_PAGE_CAP];
-static mut TEB_TAIL_PAGE_N: usize = 0;
+static mut TEB_TAIL_PAGES: Option<Vec<u64>> = None;
+
+unsafe fn teb_tail_pages_mut() -> &'static mut Vec<u64> {
+    let slot = &mut *core::ptr::addr_of_mut!(TEB_TAIL_PAGES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().expect("initialized above")
+}
+
 /// Record `page` as a client TEB tail page (called by BOTH spawn paths, next to the
 /// `csrss_frame_put` that makes it reachable from win32k at all).
-pub(crate) unsafe fn teb_tail_register(page: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_PAGE_N));
-    let pages = core::ptr::addr_of!(TEB_TAIL_PAGE) as *const u64;
-    for index in 0..n {
-        if core::ptr::read(pages.add(index)) == page {
-            return;
-        }
+pub(crate) unsafe fn teb_tail_register(page: u64) -> bool {
+    let pages = teb_tail_pages_mut();
+    if pages.iter().any(|entry| *entry == page) {
+        return true;
     }
-    if n < TEB_TAIL_PAGE_CAP {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(TEB_TAIL_PAGE) as *mut u64).add(n),
-            page,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(TEB_TAIL_PAGE_N), n + 1);
+    if pages.try_reserve(1).is_err() {
+        print_str(b"[teb-tail] page registry allocation failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+        return false;
     }
+    pages.push(page);
+    true
 }
 pub(crate) unsafe fn is_teb_tail_page(page: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_PAGE_N));
-    let pages = core::ptr::addr_of!(TEB_TAIL_PAGE) as *const u64;
-    for index in 0..n {
-        if core::ptr::read(pages.add(index)) == page {
-            return true;
-        }
-    }
-    false
+    (&*core::ptr::addr_of!(TEB_TAIL_PAGES))
+        .as_ref()
+        .is_some_and(|pages| pages.iter().any(|entry| *entry == page))
 }
 
 /// Copy-on-write shadows of client TEB tail pages, keyed by (pi, page). Each entry keeps a
 /// PERMANENT pair of executive aliases — the client's real frame and the shadow — so re-seeding a
 /// shadow is a plain 4 KiB copy with no further capability work.
-const TEB_TAIL_SHADOW_CAP: usize = 16;
 /// Executive alias window for those pairs: a free 2 MiB page-table slot between `NTDLLBUF`
 /// (`0x1440_0000` + 480 frames) and the file-buffer `POOL` (`0x1500_0000`).
 pub const TEB_TAIL_ALIAS_BASE: u64 = 0x0000_0100_1460_0000;
-static mut TEB_TAIL_SHADOW_PI: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
-static mut TEB_TAIL_SHADOW_PAGE: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
-static mut TEB_TAIL_SHADOW_FRAME: [u64; TEB_TAIL_SHADOW_CAP] = [0; TEB_TAIL_SHADOW_CAP];
-static mut TEB_TAIL_SHADOW_N: usize = 0;
+const TEB_TAIL_ALIAS_WINDOW_PAGES: usize = 512;
+
+#[derive(Clone, Copy)]
+struct TebTailShadowRecord {
+    pi: u64,
+    page: u64,
+    frame: u64,
+}
+
+static mut TEB_TAIL_SHADOW_RECORDS: Option<Vec<TebTailShadowRecord>> = None;
 static TEB_TAIL_ALIAS_PT: AtomicU64 = AtomicU64::new(0);
 /// win32k write faults on a protected tail page (each one is a scribble that DIDN'T happen).
 pub(crate) static W32_TEB_TAIL_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -10042,6 +10048,51 @@ pub(crate) static W32_TEB_TAIL_RESEEDS: AtomicU64 = AtomicU64::new(0);
 /// The first win32k image RVA measured storing into a client TEB tail — the evidence that names the
 /// writer instead of guessing at it.
 pub(crate) static W32_TEB_TAIL_FIRST_WRITER_RVA: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn teb_tail_shadows_mut() -> &'static mut Vec<TebTailShadowRecord> {
+    let slot = &mut *core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_RECORDS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().expect("initialized above")
+}
+
+unsafe fn teb_tail_shadow_index(pi: u64, page: u64) -> Option<usize> {
+    (&*core::ptr::addr_of!(TEB_TAIL_SHADOW_RECORDS))
+        .as_ref()?
+        .iter()
+        .position(|record| record.pi == pi && record.page == page)
+}
+
+fn teb_tail_shadow_capacity() -> usize {
+    TEB_TAIL_ALIAS_WINDOW_PAGES / 2
+}
+
+unsafe fn teb_tail_shadow_prepare_insert(pi: u64, page: u64) -> Option<usize> {
+    let shadows = teb_tail_shadows_mut();
+    let slot = shadows.len();
+    if slot >= teb_tail_shadow_capacity() {
+        print_str(b"[teb-shadow] alias window exhausted pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" records=");
+        print_u64(slot as u64);
+        print_str(b"\n");
+        return None;
+    }
+    if shadows.try_reserve(1).is_err() {
+        print_str(b"[teb-shadow] shadow record allocation failed pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+        return None;
+    }
+    Some(slot)
+}
 
 /// The private shadow frame for (`pi`, `page`), seeded from the client's LIVE tail page. Returns 0
 /// if the client frame is unknown or the executive is out of shadow slots (the caller then leaves
@@ -10059,21 +10110,11 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
             real_frame
         }
     };
-    let n = core::ptr::read(core::ptr::addr_of!(TEB_TAIL_SHADOW_N));
-    let pis = core::ptr::addr_of!(TEB_TAIL_SHADOW_PI) as *const u64;
-    let pages = core::ptr::addr_of!(TEB_TAIL_SHADOW_PAGE) as *const u64;
-    let frames = core::ptr::addr_of!(TEB_TAIL_SHADOW_FRAME) as *const u64;
-    let mut slot = usize::MAX;
-    for index in 0..n {
-        if core::ptr::read(pis.add(index)) == pi && core::ptr::read(pages.add(index)) == page {
-            slot = index;
-            break;
-        }
-    }
+    let mut slot = teb_tail_shadow_index(pi, page).unwrap_or(usize::MAX);
     if slot == usize::MAX {
-        if n >= TEB_TAIL_SHADOW_CAP {
+        let Some(new_slot) = teb_tail_shadow_prepare_insert(pi, page) else {
             return 0;
-        }
+        };
         if TEB_TAIL_ALIAS_PT.swap(1, Ordering::Relaxed) == 0 {
             let pt = alloc_slot();
             let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -10115,7 +10156,7 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
             print_str(b"\n");
             return 0;
         }
-        let real_alias = TEB_TAIL_ALIAS_BASE + (2 * n as u64) * 0x1000;
+        let real_alias = TEB_TAIL_ALIAS_BASE + (2 * new_slot as u64) * 0x1000;
         let shadow_alias = real_alias + 0x1000;
         let (real_copy, real_copy_error) = copy_cap_r(real_source);
         if real_copy_error != 0 {
@@ -10172,21 +10213,47 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
             print_str(b"\n");
             return 0;
         }
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_PI) as *mut u64).add(n),
-            pi,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_PAGE) as *mut u64).add(n),
-            page,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_FRAME) as *mut u64).add(n),
-            shadow,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_N), n + 1);
-        slot = n;
-        W32_TEB_TAIL_SHADOWS.fetch_add(1, Ordering::Relaxed);
+        let shadows = teb_tail_shadows_mut();
+        let mut created = false;
+        if shadows.len() != new_slot {
+            let _ = page_unmap_r(real_copy);
+            let _ = page_unmap_r(shadow_copy);
+            let _ = cnode_delete_recycle_r(real_copy);
+            let _ = cnode_delete_recycle_r(shadow_copy);
+            let _ = cnode_delete_recycle_r(shadow);
+            print_str(b"[teb-shadow] insertion order changed pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" expected=");
+            print_u64(new_slot as u64);
+            print_str(b" actual=");
+            print_u64(shadows.len() as u64);
+            print_str(b"\n");
+            return 0;
+        } else if let Some(existing) = shadows
+            .iter()
+            .position(|record| record.pi == pi && record.page == page)
+        {
+            let _ = page_unmap_r(real_copy);
+            let _ = page_unmap_r(shadow_copy);
+            let _ = cnode_delete_recycle_r(real_copy);
+            let _ = cnode_delete_recycle_r(shadow_copy);
+            let _ = cnode_delete_recycle_r(shadow);
+            slot = existing;
+        } else {
+            shadows.push(TebTailShadowRecord {
+                pi,
+                page,
+                frame: shadow,
+            });
+            slot = new_slot;
+            created = true;
+        }
+        if created {
+            W32_TEB_TAIL_SHADOWS.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         W32_TEB_TAIL_RESEEDS.fetch_add(1, Ordering::Relaxed);
     }
@@ -10203,7 +10270,11 @@ pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
         );
         offset += 8;
     }
-    core::ptr::read(frames.add(slot))
+    (&*core::ptr::addr_of!(TEB_TAIL_SHADOW_RECORDS))
+        .as_ref()
+        .and_then(|shadows| shadows.get(slot))
+        .map(|record| record.frame)
+        .unwrap_or(0)
 }
 
 // --- PRIVATE-VM UNMAP SELF-TEST (proves the ASID fix, by construction) --------------------------
@@ -22072,7 +22143,15 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> HostedThreadSpawnResult {
             print_str(b"\n");
         }
         // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
-        teb_tail_register(t.teb_va + 0x1000);
+        let tail_page = t.teb_va + 0x1000;
+        if !teb_tail_register(tail_page) {
+            print_str(b"[thread-life] failed to register protected TEB tail page pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            print_hex((tail_page >> 32) as u32);
+            print_hex(tail_page as u32);
+            print_str(b"\n");
+        }
     }
     // The private ACS page: written through its own scratch alias, then mapped at `acs_va` in the
     // target VSpace. Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a

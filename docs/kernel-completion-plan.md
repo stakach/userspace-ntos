@@ -385,6 +385,23 @@ matching FAIL marker exists. Review adjustment: executive paging seen-set capaci
 continue with remaining SEC_IMAGE/fault scratch arrays, TEB-tail shadow tables, or the larger GUI
 process/thread context registry.
 
+A4/B3 TEB-tail registry and shadow scaling cleanup (2026-08-21): protected client TEB tail page
+tracking now uses a vector-backed de-duplicated page set instead of a fixed 32-entry array, and
+copy-on-write TEB-tail shadow records now use vector-backed `{pi, page, frame}` records instead of
+fixed 16-entry parallel arrays. The shadow record count is still bounded by the real 2 MiB executive
+alias window at `TEB_TAIL_ALIAS_BASE`, which provides 256 real alias pairs; exhaustion or
+record-allocation failure now emits `[teb-tail]`/`[teb-shadow]` diagnostics instead of silently
+losing the protection/shadow state. TEB-tail registration callers now report the owning process/page
+if the protected-tail set cannot be extended. Local validation is green for `cargo fmt --all`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-teb-tail-registry-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing, keeps `exec_teb_not_clobbered_by_win32k`, `exec_win32k_desktop_painted`, and
+`exec_explorer_shell_chrome_painted` green, records `win32k ro-maps=246 store-faults=0
+gdi-write-windows=246 shadows=0`, and emits no TEB-tail allocation/alias/shadow diagnostics. Review
+adjustment: TEB-tail registry and COW shadow fixed-table caps are closed; continue with remaining
+SEC_IMAGE/fault scratch arrays or the larger GUI process/thread context registry.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

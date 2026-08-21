@@ -1061,7 +1061,14 @@ pub(crate) unsafe fn spawn_sec_image(
         // The tail page stays REACHABLE from win32k (it must be — win32k dereferences the caller's
         // TEB), but is mapped READ-ONLY there and copy-on-written on the first store. See
         // `W32_CLIENT_TEB_TAIL_PROTECTED`.
-        crate::teb_tail_register(SMSS_TEB_VA + 0x1000);
+        if !crate::teb_tail_register(SMSS_TEB_VA + 0x1000) {
+            crate::print_str(b"[spawn-sec-image] failed to register protected TEB tail page pi=");
+            crate::print_u64(pi as u64);
+            crate::print_str(b" page=0x");
+            crate::print_hex(((SMSS_TEB_VA + 0x1000) >> 32) as u32);
+            crate::print_hex((SMSS_TEB_VA + 0x1000) as u32);
+            crate::print_str(b"\n");
+        }
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = checked_spawn_page_map(
