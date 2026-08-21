@@ -5244,12 +5244,15 @@ pub(crate) unsafe fn service_sec_image(
     // Per-process demand-fill bookkeeping is kept out of the bounded rootserver stack. It is now a
     // heap-backed slice sized for the runtime process-index window instead of a fixed BSS matrix.
     let pfilled = reset_pfilled_work(MAX_PI).expect("process fault scratch allocation failed");
+    if !reset_hosted_tp_worker_window_resources(MAX_PI) {
+        panic!("hosted TP worker window resource allocation failed");
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
-    // pre-reserved process handle tables and SEC_IMAGE process scratch) is allocated. Each smss
-    // syscall we service allocates transient Vec/String (copyin buffers, registry value info) on the
-    // no-free bump heap; without reclamation a few hundred registry syscalls exhaust the executive
-    // heap. Rewinding to this mark each iteration reclaims all per-syscall transients while leaving
-    // the persistent state below the mark intact.
+    // pre-reserved process handle tables, SEC_IMAGE process scratch, and TP worker window resource
+    // slices) is allocated. Each smss syscall we service allocates transient Vec/String (copyin
+    // buffers, registry value info) on the no-free bump heap; without reclamation a few hundred
+    // registry syscalls exhaust the executive heap. Rewinding to this mark each iteration reclaims
+    // all per-syscall transients while leaving the persistent state below the mark intact.
     // `mut` because durable runtime growth (CM overlays, hive mounts, DLL caches, object namespace)
     // must survive the per-syscall reset: after such a mutating syscall the loop advances this mark
     // past the new allocations.

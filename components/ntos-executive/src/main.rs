@@ -640,9 +640,36 @@ impl HostedTpWorkerWindowResources {
     }
 }
 
-static mut HOSTED_TP_WORKER_WINDOW_RESOURCES: [[HostedTpWorkerWindowResources;
-    TP_WORKER_SLOT_COUNT]; MAX_PI] =
-    [[HostedTpWorkerWindowResources::empty(); TP_WORKER_SLOT_COUNT]; MAX_PI];
+static HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_TP_WORKER_WINDOW_RESOURCES: alloc::vec::Vec<
+    [HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT],
+> = alloc::vec::Vec::new();
+
+pub(crate) unsafe fn reset_hosted_tp_worker_window_resources(
+    slots: usize,
+) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
+    table.clear();
+    if table.try_reserve(slots).is_err() {
+        HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while table.len() < slots {
+        table.push([HostedTpWorkerWindowResources::empty(); TP_WORKER_SLOT_COUNT]);
+    }
+    true
+}
+
+fn hosted_tp_worker_window_resource_stats() -> (usize, usize, u64) {
+    unsafe {
+        let table = &*core::ptr::addr_of!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
+        (
+            table.len(),
+            table.capacity(),
+            HOSTED_TP_WORKER_WINDOW_RESOURCE_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
 
 fn hosted_tp_worker_slot_from_layout(
     pi: usize,
@@ -710,24 +737,22 @@ unsafe fn store_hosted_tp_worker_window_resources(
     slot: usize,
     resources: HostedTpWorkerWindowResources,
 ) {
-    if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
-        let table = core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES)
-            as *mut [[HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT]; MAX_PI];
-        (*table)[pi][slot] = resources;
+    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
+    if pi < table.len() && slot < TP_WORKER_SLOT_COUNT {
+        table[pi][slot] = resources;
     }
 }
 
 pub(crate) unsafe fn release_hosted_tp_worker_window_resources(pi: usize, slot: usize) {
-    if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
+    let table = &mut *core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES);
+    if pi >= table.len() || slot >= TP_WORKER_SLOT_COUNT {
         return;
     }
-    let table = core::ptr::addr_of_mut!(HOSTED_TP_WORKER_WINDOW_RESOURCES)
-        as *mut [[HostedTpWorkerWindowResources; TP_WORKER_SLOT_COUNT]; MAX_PI];
-    let resources = (*table)[pi][slot];
+    let resources = table[pi][slot];
     if !resources.live {
         return;
     }
-    (*table)[pi][slot] = HostedTpWorkerWindowResources::empty();
+    table[pi][slot] = HostedTpWorkerWindowResources::empty();
 
     for index in 0..TP_WORKER_STACK_FRAME_COUNT {
         let page = tp_worker_stack_base(slot) + index as u64 * 0x1000;
@@ -9811,6 +9836,13 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(pfilled_cap as u64);
     print_str(b"/");
     print_u64(pfilled_fails);
+    let (tp_win_len, tp_win_cap, tp_win_fails) = hosted_tp_worker_window_resource_stats();
+    print_str(b" tp-worker-win=");
+    print_u64(tp_win_len as u64);
+    print_str(b"/");
+    print_u64(tp_win_cap as u64);
+    print_str(b"/");
+    print_u64(tp_win_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -20598,21 +20630,21 @@ struct ExecNtHandler {
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
-    process_vspaces: [u64; MAX_PI],
+    process_vspaces: alloc::vec::Vec<u64>,
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
-    temporary_process_slots: [nt_process::ProcessId; MAX_PI],
+    temporary_process_slots: alloc::vec::Vec<nt_process::ProcessId>,
     /// Allocation-free hosted main/pool ETHREAD identities. Backed by BSS to keep handler
     /// construction independent of table size.
     thread_mechanisms: ExecThreadMechanisms,
     /// Runtime occupancy mask for the pre-created ETHREAD pool of each hosted process.
-    pool_used: [u64; MAX_PI],
+    pool_used: alloc::vec::Vec<u64>,
     /// Runtime suspended-on-create mask for claimed pool ETHREADs.
-    pool_suspended: [u64; MAX_PI],
+    pool_suspended: alloc::vec::Vec<u64>,
     /// Hosted worker stack/TEB VA windows consumed in each process VSpace. Thread teardown releases
     /// the mapped frames/caps and clears the slot, so a later ETHREAD can reuse the same mechanism
     /// lane with fresh stack/TEB/IPCBUF/trampoline frames.
-    tp_worker_window_used: [u64; MAX_PI],
+    tp_worker_window_used: alloc::vec::Vec<u64>,
     /// Executive-side seL4 mechanism runtime keyed by real NT TID. This is where live handler paths
     /// resolve TID -> TCB; the old TCB atomics are synchronized mirrors for global glue that has not
     /// been threaded through `ExecNtHandler` yet.

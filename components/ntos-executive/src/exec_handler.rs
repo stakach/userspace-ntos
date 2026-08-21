@@ -2409,6 +2409,28 @@ unsafe fn setup_locale_id_from_unattend() -> Option<u32> {
     parse_unattend_locale_id(&scratch[..read])
 }
 
+fn zeroed_process_slot_u64_vec() -> alloc::vec::Vec<u64> {
+    let mut slots = alloc::vec::Vec::new();
+    if slots.try_reserve_exact(MAX_PI).is_err() {
+        panic!("process slot u64 vector allocation failed");
+    }
+    while slots.len() < MAX_PI {
+        slots.push(0);
+    }
+    slots
+}
+
+fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId> {
+    let mut slots = alloc::vec::Vec::new();
+    if slots.try_reserve_exact(MAX_PI).is_err() {
+        panic!("temporary process slot vector allocation failed");
+    }
+    while slots.len() < MAX_PI {
+        slots.push(0);
+    }
+    slots
+}
+
 impl ExecNtHandler {
     #[inline(never)]
     pub(crate) unsafe fn initialize_in(
@@ -2704,12 +2726,15 @@ impl ExecNtHandler {
         write_field!(pm, pm);
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
-        write_field!(process_vspaces, [0; MAX_PI]);
-        write_field!(temporary_process_slots, [0; MAX_PI]);
+        write_field!(process_vspaces, zeroed_process_slot_u64_vec());
+        write_field!(
+            temporary_process_slots,
+            zeroed_temporary_process_slot_vec()
+        );
         write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
-        write_field!(pool_used, [0; MAX_PI]);
-        write_field!(pool_suspended, [0; MAX_PI]);
-        write_field!(tp_worker_window_used, [0; MAX_PI]);
+        write_field!(pool_used, zeroed_process_slot_u64_vec());
+        write_field!(pool_suspended, zeroed_process_slot_u64_vec());
+        write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
         write_field!(token_store, nt_security::TokenStore::with_capacity(64));

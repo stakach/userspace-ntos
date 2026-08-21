@@ -496,6 +496,23 @@ zero process/fault scratch allocation failures. Review adjustment: the static ba
 the remaining `MAX_PI` process-index admission ceiling is a separate process-manager capacity
 boundary and should be handled by admission/runtime policy rather than hidden BSS arrays.
 
+A4/B3 hosted process runtime-mask scaling cleanup (2026-08-21): the executive handler's per-pi
+runtime masks for hosted process VSpaces, temporary process slots, pool-thread occupancy,
+pool-thread suspended state, and TP worker window usage are now durable vectors initialized with the
+handler before the service-loop heap mark, rather than inline `[...; MAX_PI]` fields on
+`ExecNtHandler`. The TP worker stack/TEB/IPCBUF/trampoline resource grid also moved from
+`HOSTED_TP_WORKER_WINDOW_RESOURCES: [[...; TP_WORKER_SLOT_COUNT]; MAX_PI]` to a heap-backed
+persistent slice reset before the bump-reset mark. The pool census reports this backing as
+`tp-worker-win=<len>/<cap>/<fail>`. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof `.tmp/run-desktop-tp-worker-window-vec-20260821.log`
+reaches genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing,
+reports `proc-scratch=24/24/0:24/24/0 tp-worker-win=24/24/0`, keeps
+`exec_explorer_shell_chrome_painted` green, and records zero TP worker resource allocation failures.
+Review adjustment: continue the fixed-table audit at the heavier process VM state (`PROCESS_VM_REGIONS`,
+committed mapping tables, and private page-table caps) before attempting to raise or remove the
+`MAX_PI` admission ceiling itself.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
