@@ -28,6 +28,7 @@ const E1000_INSTANCE_ID: &str = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
 const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
 const E1000_INTERFACE_NAME: &str = "E1000_0000";
 const E1000_DRIVER_DESC: &str = "ReactOS Intel PRO/1000 Adapter";
+const DC21X4_DRIVER_DESC: &str = "Intel 21140-based PCI Ethernet Adapter";
 const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf";
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
@@ -48,9 +49,17 @@ struct GeneratedNetworkAdapter {
     driver_desc: &'static str,
 }
 
-const GENERATED_E1000_MAX_COUNT: usize = 29;
+const GENERATED_NETWORK_ADAPTER_MAX_COUNT: usize = 29;
 const GENERATED_E1000_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_8086&DEV_100E"];
 const GENERATED_E1000_COMPATIBLE_IDS: &[&str] = &[r"PCI\CC_020000", r"PCI\CC_0200"];
+const GENERATED_DC21X4_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_1011&DEV_0009"];
+const GENERATED_DC21X4_COMPATIBLE_IDS: &[&str] = &[r"PCI\CC_020000", r"PCI\CC_0200"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedNetworkAdapterKind {
+    E1000,
+    Dc21x4,
+}
 
 const GENERATED_SERVICE_GROUP_ORDER: &[&str] = &[
     "Video",
@@ -195,48 +204,138 @@ fn install_service_group_order(hive: &mut Hive) {
     );
 }
 
-fn generated_e1000_adapter(index: usize) -> GeneratedNetworkAdapter {
+fn generated_pci_request(adapter_index: usize) -> u8 {
     assert!(
-        index < GENERATED_E1000_MAX_COUNT,
-        "generated E1000 index exceeds one PCI bus"
+        adapter_index < GENERATED_NETWORK_ADAPTER_MAX_COUNT,
+        "generated NIC index exceeds one PCI bus"
     );
-    if index == 0 {
-        return GeneratedNetworkAdapter {
-            service_name: String::from("E1000"),
-            service_image_path: r"system32\drivers\e1000.sys",
-            driver_key: String::from(E1000_DRIVER_KEY),
-            instance_id: String::from(E1000_INSTANCE_ID),
-            pdo_name: String::from(r"\Device\NTPNP_PCI0001"),
-            hardware_ids: GENERATED_E1000_HARDWARE_IDS,
-            compatible_ids: GENERATED_E1000_COMPATIBLE_IDS,
-            export_name: String::from(E1000_EXPORT_NAME),
-            root_device: String::from(E1000_INTERFACE_NAME),
-            driver_desc: E1000_DRIVER_DESC,
-        };
-    }
+    let dev = 3 + adapter_index as u8;
+    dev << 3
+}
 
-    let dev = 3 + index as u8;
-    let request = dev << 3;
+fn generated_network_driver_key(class_index: usize) -> String {
+    format!(r"{}\{:04}", NET_CLASS_GUID, class_index)
+}
+
+fn generated_e1000_adapter(
+    class_index: usize,
+    model_index: usize,
+    adapter_index: usize,
+) -> GeneratedNetworkAdapter {
+    let request = generated_pci_request(adapter_index);
+    let driver_key = if class_index == 0 {
+        String::from(E1000_DRIVER_KEY)
+    } else {
+        generated_network_driver_key(class_index)
+    };
+    let instance_id = if adapter_index == 0 {
+        String::from(E1000_INSTANCE_ID)
+    } else {
+        format!(r"PCI\VEN_8086&DEV_100E\3&11583659&0&{:02X}", request)
+    };
+    let pdo_name = if adapter_index == 0 {
+        String::from(r"\Device\NTPNP_PCI0001")
+    } else {
+        format!(r"\Device\NTPNP_E1000_{:04}", model_index)
+    };
+    let export_name = if model_index == 0 {
+        String::from(E1000_EXPORT_NAME)
+    } else {
+        format!(r"\Device\E1000_{:04}", model_index)
+    };
+    let root_device = if model_index == 0 {
+        String::from(E1000_INTERFACE_NAME)
+    } else {
+        format!("E1000_{:04}", model_index)
+    };
     GeneratedNetworkAdapter {
         service_name: String::from("E1000"),
         service_image_path: r"system32\drivers\e1000.sys",
-        driver_key: format!(r"{}\{:04}", NET_CLASS_GUID, index),
-        instance_id: format!(r"PCI\VEN_8086&DEV_100E\3&11583659&0&{:02X}", request),
-        pdo_name: format!(r"\Device\NTPNP_E1000_{:04}", index),
+        driver_key,
+        instance_id,
+        pdo_name,
         hardware_ids: GENERATED_E1000_HARDWARE_IDS,
         compatible_ids: GENERATED_E1000_COMPATIBLE_IDS,
-        export_name: format!(r"\Device\E1000_{:04}", index),
-        root_device: format!("E1000_{:04}", index),
+        export_name,
+        root_device,
         driver_desc: E1000_DRIVER_DESC,
     }
 }
 
+fn generated_dc21x4_adapter(
+    class_index: usize,
+    model_index: usize,
+    adapter_index: usize,
+) -> GeneratedNetworkAdapter {
+    let request = generated_pci_request(adapter_index);
+    GeneratedNetworkAdapter {
+        service_name: String::from("dc21x4"),
+        service_image_path: r"system32\drivers\dc21x4.sys",
+        driver_key: generated_network_driver_key(class_index),
+        instance_id: format!(r"PCI\VEN_1011&DEV_0009\3&11583659&0&{:02X}", request),
+        pdo_name: format!(r"\Device\NTPNP_DC21X4_{:04}", model_index),
+        hardware_ids: GENERATED_DC21X4_HARDWARE_IDS,
+        compatible_ids: GENERATED_DC21X4_COMPATIBLE_IDS,
+        export_name: format!(r"\Device\DC21X4_{:04}", model_index),
+        root_device: format!("DC21X4_{:04}", model_index),
+        driver_desc: DC21X4_DRIVER_DESC,
+    }
+}
+
+fn generated_network_adapter(
+    kind: GeneratedNetworkAdapterKind,
+    class_index: usize,
+    model_index: usize,
+    adapter_index: usize,
+) -> GeneratedNetworkAdapter {
+    match kind {
+        GeneratedNetworkAdapterKind::E1000 => {
+            generated_e1000_adapter(class_index, model_index, adapter_index)
+        }
+        GeneratedNetworkAdapterKind::Dc21x4 => {
+            generated_dc21x4_adapter(class_index, model_index, adapter_index)
+        }
+    }
+}
+
+fn generated_network_adapters(
+    kinds: &[GeneratedNetworkAdapterKind],
+) -> Vec<GeneratedNetworkAdapter> {
+    assert!(
+        !kinds.is_empty() && kinds.len() <= GENERATED_NETWORK_ADAPTER_MAX_COUNT,
+        "NTOS_GENERATED_NETWORK_ADAPTERS must name 1..=29 NICs"
+    );
+
+    let mut e1000_count = 0usize;
+    let mut dc21x4_count = 0usize;
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(adapter_index, kind)| {
+            let model_index = match kind {
+                GeneratedNetworkAdapterKind::E1000 => {
+                    let index = e1000_count;
+                    e1000_count += 1;
+                    index
+                }
+                GeneratedNetworkAdapterKind::Dc21x4 => {
+                    let index = dc21x4_count;
+                    dc21x4_count += 1;
+                    index
+                }
+            };
+            generated_network_adapter(*kind, adapter_index, model_index, adapter_index)
+        })
+        .collect()
+}
+
 fn generated_e1000_adapters(count: usize) -> Vec<GeneratedNetworkAdapter> {
     assert!(
-        count > 0 && count <= GENERATED_E1000_MAX_COUNT,
+        count > 0 && count <= GENERATED_NETWORK_ADAPTER_MAX_COUNT,
         "NTOS_GENERATED_E1000_COUNT must be in 1..=29"
     );
-    (0..count).map(generated_e1000_adapter).collect()
+    let kinds = vec![GeneratedNetworkAdapterKind::E1000; count];
+    generated_network_adapters(&kinds)
 }
 
 fn generated_e1000_count_from_env() -> usize {
@@ -247,6 +346,48 @@ fn generated_e1000_count_from_env() -> usize {
         Err(std::env::VarError::NotPresent) => 1,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!("NTOS_GENERATED_E1000_COUNT must be valid UTF-8")
+        }
+    }
+}
+
+fn generated_network_adapter_kind_from_name(name: &str) -> Option<GeneratedNetworkAdapterKind> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "e1000" | "e1000.sys" => Some(GeneratedNetworkAdapterKind::E1000),
+        "dc21x4" | "dc21x4.sys" | "tulip" => Some(GeneratedNetworkAdapterKind::Dc21x4),
+        _ => None,
+    }
+}
+
+fn generated_network_adapter_kinds_from_spec(spec: &str) -> Vec<GeneratedNetworkAdapterKind> {
+    let mut kinds = Vec::new();
+    for raw in spec.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(kind) = generated_network_adapter_kind_from_name(name) else {
+            panic!("unsupported generated NIC '{name}'; supported: e1000, dc21x4");
+        };
+        kinds.push(kind);
+    }
+    assert!(
+        !kinds.is_empty() && kinds.len() <= GENERATED_NETWORK_ADAPTER_MAX_COUNT,
+        "NTOS_GENERATED_NETWORK_ADAPTERS must name 1..=29 NICs"
+    );
+    kinds
+}
+
+fn generated_network_adapters_from_env() -> Vec<GeneratedNetworkAdapter> {
+    match std::env::var("NTOS_GENERATED_NETWORK_ADAPTERS") {
+        Ok(value) => {
+            let kinds = generated_network_adapter_kinds_from_spec(&value);
+            generated_network_adapters(&kinds)
+        }
+        Err(std::env::VarError::NotPresent) => {
+            generated_e1000_adapters(generated_e1000_count_from_env())
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("NTOS_GENERATED_NETWORK_ADAPTERS must be valid UTF-8")
         }
     }
 }
@@ -774,7 +915,7 @@ fn install_display_miniport(hive: &mut Hive, install: &DisplayMiniportInstall) {
     hive.set_dword(device, "VgaCompatible", install.vga_compatible);
 }
 
-fn build_hive_with_e1000_count(e1000_count: usize) -> Hive {
+fn build_hive_with_network_adapters(network_adapters: Vec<GeneratedNetworkAdapter>) -> Hive {
     let mut hive = Hive::new(HiveKind::System);
     // A recognizable marker the executive reads back: ...\NtosTest\Answer = REG_DWORD 42.
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
@@ -834,7 +975,6 @@ fn build_hive_with_e1000_count(e1000_count: usize) -> Hive {
         encode_multi_sz(&[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"]),
     );
 
-    let network_adapters = generated_e1000_adapters(e1000_count);
     install_generated_network_adapters(&mut hive, &network_adapters);
     seed_generated_network_setup(&mut hive);
 
@@ -847,14 +987,14 @@ fn build_hive_with_e1000_count(e1000_count: usize) -> Hive {
 
 #[cfg(test)]
 fn build_hive() -> Hive {
-    build_hive_with_e1000_count(1)
+    build_hive_with_network_adapters(generated_e1000_adapters(1))
 }
 
 fn main() {
     let out = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "hive.dat".to_string());
-    let hive = build_hive_with_e1000_count(generated_e1000_count_from_env());
+    let hive = build_hive_with_network_adapters(generated_network_adapters_from_env());
     let bytes = encode_image(&hive);
     std::fs::write(&out, &bytes).expect("write hive image");
     eprintln!("gen_hive: wrote {} ({} bytes)", out, bytes.len());
@@ -977,6 +1117,124 @@ mod tests {
             Some((
                 RegistryValueType::Sz,
                 utf16le_sz(E1000_INTERFACE_NAME).as_slice()
+            ))
+        );
+    }
+
+    #[test]
+    fn generated_network_adapter_spec_accepts_packet_array_miniport_model() {
+        assert_eq!(
+            generated_network_adapter_kinds_from_spec("e1000, dc21x4, tulip"),
+            vec![
+                GeneratedNetworkAdapterKind::E1000,
+                GeneratedNetworkAdapterKind::Dc21x4,
+                GeneratedNetworkAdapterKind::Dc21x4,
+            ]
+        );
+    }
+
+    #[test]
+    fn generated_hive_can_declare_registry_selected_dc21x4_packet_array_driver() {
+        let adapters = generated_network_adapters(&[
+            GeneratedNetworkAdapterKind::E1000,
+            GeneratedNetworkAdapterKind::Dc21x4,
+        ]);
+        let mut hive = Hive::new(HiveKind::System);
+        install_service_group_order(&mut hive);
+        install_generated_network_adapters(&mut hive, &adapters);
+        seed_generated_network_setup(&mut hive);
+
+        let service = hive
+            .open_key(r"ControlSet001\Services\dc21x4")
+            .expect("dc21x4 service key");
+        assert_eq!(
+            hive.query_dword(service, "Type"),
+            Some(SERVICE_KERNEL_DRIVER)
+        );
+        assert_eq!(
+            hive.query_dword(service, "Start"),
+            Some(SERVICE_SYSTEM_START)
+        );
+        assert_eq!(
+            hive.query_value(service, "ImagePath"),
+            Some((
+                RegistryValueType::ExpandSz,
+                utf16le_sz(r"system32\drivers\dc21x4.sys").as_slice()
+            ))
+        );
+
+        let devnode = hive
+            .open_key(r"ControlSet001\Enum\PCI\VEN_1011&DEV_0009\3&11583659&0&20")
+            .expect("dc21x4 PCI devnode");
+        assert_eq!(
+            hive.query_value(devnode, "Service"),
+            Some((RegistryValueType::Sz, utf16le_sz("dc21x4").as_slice()))
+        );
+        assert_eq!(
+            hive.query_value(devnode, "Driver"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(r"{4D36E972-E325-11CE-BFC1-08002BE10318}\0001").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(devnode, "HardwareID"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[r"PCI\VEN_1011&DEV_0009"]).as_slice()
+            ))
+        );
+
+        let class_key = hive
+            .open_key(r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0001")
+            .expect("dc21x4 class key");
+        assert_eq!(
+            hive.query_value(class_key, "DriverDesc"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(DC21X4_DRIVER_DESC).as_slice()
+            ))
+        );
+        let linkage = hive
+            .open_key(
+                r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0001\Linkage",
+            )
+            .expect("dc21x4 linkage key");
+        assert_eq!(
+            hive.query_value(linkage, "Export"),
+            Some((
+                RegistryValueType::Sz,
+                utf16le_sz(r"\Device\DC21X4_0000").as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(linkage, "RootDevice"),
+            Some((RegistryValueType::Sz, utf16le_sz("DC21X4_0000").as_slice()))
+        );
+
+        let tcpip_linkage = hive
+            .open_key(r"ControlSet001\Services\Tcpip\Linkage")
+            .expect("Tcpip linkage");
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Bind"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[r"\Device\DC21X4_0000", E1000_EXPORT_NAME]).as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Export"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&[r"\Device\Tcpip_DC21X4_0000", r"\Device\Tcpip_E1000_0000"])
+                    .as_slice()
+            ))
+        );
+        assert_eq!(
+            hive.query_value(tcpip_linkage, "Route"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(&["DC21X4_0000", E1000_INTERFACE_NAME]).as_slice()
             ))
         );
     }

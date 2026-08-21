@@ -64,10 +64,12 @@ registry-derived receive stimulus are closed. The packet-array receive infrastru
 generic wiring through provider-internal NDIS miniport-block handlers and a clean serialized
 desktop regression proof. The generated-hive fallback no longer carries a separate hardcoded TCPIP
 binding path; it imports its own devnodes/classes into Config Manager and runs the same dynamic
-network setup seeder, with host coverage for two generated NIC bindings and an opt-in
-`NTOS_GENERATED_E1000_COUNT` build-tool knob for repeated-NIC proof images. Packet-array still
-needs a live-driver proof because the current ReactOS E1000 path uses classic Ethernet lookahead
-receive. Runtime PnP matching now parses the specific PCI instance location before generic
+network setup seeder, with host coverage for repeated E1000 bindings and mixed
+E1000/DC21x4 bindings. The build tool keeps the existing opt-in
+`NTOS_GENERATED_E1000_COUNT` knob for repeated-E1000 proof images and now also accepts
+`NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4` for a registry-selected packet-array miniport
+frontier. Packet-array still needs a live-driver proof because the current ReactOS E1000 path uses
+classic Ethernet lookahead receive. Runtime PnP matching now parses the specific PCI instance location before generic
 hardware IDs, so repeated identical NIC devnodes no longer collapse to the first enumerated
 function. Repeated-device runtime boot coverage is now accepted: `.tmp/run-headless-b3-two-e1000-after-ndis-shadow.log`
 boots with two generated E1000 NICs, the extern rootserver discovers nine live device untypeds
@@ -123,10 +125,9 @@ The serialized boot proof `.tmp/run-headless-b3-receive-indications-20260818-123
 projection as non-regressing in the full OS path: E1000 initializes through the provider `ndis.sys`,
 the miniport block mirror is published for provider instance 0/dependent instance 6, generic PCI
 provider-domain service/resource/DMA-descriptor gates pass, and Explorer shell chrome paints with
-`298/298` checks passing. That run does not yet show real receive-indication traffic, so the
-remaining B3 acceptance target is a genuine RX/TX data-plane stimulus that reaches TCPIP through
-the provider-domain route, including packet-array receive if ReactOS reaches the internal NDIS
-helper path.
+`298/298` checks passing. That run did not yet show real receive-indication traffic; later accepted
+TX/RX evidence below closes the E1000 data-plane target, leaving packet-array receive as the separate
+miniport frontier when a driver reaches the internal NDIS helper path.
 
 B3 win32k shared-map capacity slice (2026-08-18): the post-desktop CNode pressure was structural, not
 a BOOTBOOT/initrd-size problem. GUI client attach no longer projects a duplicate fixed GDI handle-table
@@ -8163,7 +8164,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `export-rejections=0`, `exec_generic_pci_provider_domain_serviced` PASS), passes
     `exec_dbgk_remote_breakin_reports_breakpoint`, reaches genuine userinit/explorer launch, and
     passes all desktop shell chrome gates with `298/298` executive checks.
-  - `[~]` B3 remaining NDIS data-plane and capacity work (2026-08-18): continue from the same
+  - `[x]` B3 E1000 NDIS data-plane and capacity work (2026-08-18): continue from the same
     dynamic provider-domain path. `MiniportTransferData`, `TransferDataComplete`, and exported
     Ethernet receive indication helpers now have local provider-domain wiring and a serialized
     full-OS boot proof: `.tmp/run-headless-b3-receive-indications-20260818-123659.log` reaches
@@ -8245,13 +8246,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     x86_64-unknown-none`, rust-micro
     `cargo +nightly check -Z build-std=core -Z unstable-options -Z json-target-spec --target
     triplets/mykernel-x86.json --release --features spec,extern-rootserver`, `git diff --check`,
-    and the serialized two-E1000 proof. Remaining proof is real TX packet traffic from the TCPIP
-    stack through the same dynamic provider-domain route and live packet-array receive with a
-    miniport that reaches the internal NDIS helper. Do not reintroduce private provider images,
-    protocol-specific fallbacks, or per-driver special cases. Current TX work factors hosted
-    interrupt delivery from E1000 packet modeling and adds a bounded TX-only redrive after the first
-    ISR/DPC/work-item drain; the redrive only completes descriptors posted by the real miniport and
-    then re-enters the normal interrupt path for real E1000/NDIS send completion.
+    and the serialized two-E1000 proof. Later 2026-08-21 TX/RX checkpoints below close the remaining
+    E1000 data-plane proof through the same dynamic provider-domain route. Live packet-array receive is
+    split into its own frontier because it requires a miniport that reaches the internal NDIS helper;
+    do not reintroduce private provider images, protocol-specific fallbacks, or per-driver special
+    cases.
   - `[x]` B3 win32k shared-map capacity cleanup (2026-08-18): the post-desktop failure was not a
     BOOTBOOT/initrd size limit. It was retained mapping-cap pressure from projecting the full
     16 MiB win32k USER heap, duplicate fixed GDI handle-table window, and full GDI user-attribute
@@ -8267,7 +8266,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     CSpace headroom (`slot-free=39051`).
     Review adjustment: B3 can continue at the real RX/TX traffic stimulus and packet-array receive
     projection path without carrying this shared-map capacity failure as an active blocker.
-  - `[~]` B3 provider-DMA adapter lifetime checkpoint (2026-08-18): the first repeated-NIC TX proof
+  - `[x]` B3 provider-DMA adapter lifetime checkpoint (2026-08-18): the first repeated-NIC TX proof
     regression came from treating the executive-owned hosted DMA manager as visible inside provider
     `ndis.sys`. The provider shim now copies the selected devnode grant VA, length, and logical base
     into the provider-local `DMA_ADAPTER` allocated by `IoGetDmaAdapter`, and
@@ -8332,7 +8331,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `PASS exec_provider_ndis_receive_indicated`. Review adjustment: E1000's NT5 data plane is now
     accepted for this frontier. Packet-array receive remains a generic NDIS5 coverage target for a
     miniport that calls `NdisMIndicateReceivePacket`; it should not be modeled as an e1000 blocker.
-  - `[~]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
+  - `[~]` B3 packet-array miniport frontier (2026-08-21): packet-array receive is now separated from
+    the accepted E1000 frontier. ReactOS `dc21x4.sys` and `netkvm.sys` contain real
+    `NdisMIndicateReceivePacket` callers; the current practical boot target is the staged
+    `dc21x4.sys` with QEMU `tulip`, selected through generated registry/devnode metadata rather than
+    a kernel launch shortcut. The generated fallback SYSTEM hive now has a typed NIC catalog with
+    E1000 and DC21x4 entries and accepts
+    `NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4`; TCPIP linkage/interface state still comes from the
+    Config Manager import plus shared ReactOS network setup seeder. Local validation:
+    `cargo fmt --all`, focused `cargo test -p nt-hive-core generated_network_adapter --
+    --nocapture`, focused `cargo test -p nt-hive-core
+    generated_hive_can_declare_registry_selected_dc21x4_packet_array_driver -- --nocapture`, and
+    `NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4 cargo run -q --release -p nt-hive-core --bin
+    gen_hive -- .tmp/generated-e1000-dc21x4-hive.dat` (12,684-byte output). Review adjustment: next
+    code should run a serialized boot with `-device tulip` and fix the first genuine DC21x4/NDIS
+    resource, interrupt, DMA, or packet-array projection gap observed; do not special-case
+    `dc21x4.sys` success.
+  - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created
     `\LsaAuthenticationPort` (`234/292`, no userinit/explorer). The rejected proof showed the new
@@ -8398,7 +8413,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exposes new kernel evidence. Review adjustment: rerun the serialized desktop proof from this
     cleaned baseline. An accepted result must reach genuine userinit/Explorer shell chrome without
     provider-domain rejects, cap-bank failures, or timer/deadman storms before returning to the
-    remaining B3 TX data-plane work.
+    remaining B3 provider-domain packet-array frontier.
     Delay wake/syscall ABI follow-up (2026-08-18): desktop proof
     `.tmp/run-desktop-b3-clean-micro-20260819-072657.log` reached the stricter microkernel baseline,
     dynamic LSASS listener setup, winlogon post-LSA registry reads, `msgina.dll` loading, and real
@@ -8620,7 +8635,6 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     overlay and profile hive path is also green: `NtLoadKey` mounts two hives, `NtUnloadKey`
     detaches one, the copied `ntuser.dat` is a 130716-byte hive image, and the final pool census has
     no untyped, image-bank, registry, ASID, or VM allocation failures. Review adjustment: the active
-    desktop/frontier cleanup is no longer shell launch, profile loading, or kbswitch GDI
-    publication. Continue the plan at B3's real network data-plane gap: true TCPIP-originated TX
-    through the provider-domain scatter/gather route and a live packet-array receive proof, without
-    adding driver-name, service-name, or packet-success fallbacks.
+    desktop/frontier cleanup is no longer shell launch, profile loading, kbswitch GDI publication, or
+    E1000 TX/RX. Continue the plan at B3's live packet-array receive proof with a miniport that reaches
+    the internal NDIS helper, without adding driver-name, service-name, or packet-success fallbacks.
