@@ -8407,6 +8407,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     adjustment: continue at generic PCI devnode-to-resource binding for registry-selected multi-NIC
     hardware, then rerun the serialized mixed-NIC boot with `-device tulip`; do not special-case
     `dc21x4.sys` success and do not add raw-pointer fallbacks.
+    The next slice corrects the generated DC21x4 hardware identity to QEMU's Intel 21143-compatible
+    `PCI\VEN_1011&DEV_0019`, teaches the pure PnP/resource crates to assign I/O-only PCI functions,
+    emits port-only and port+interrupt `CM_RESOURCE_LIST` layouts, and lets the executive grant a
+    hosted PCI device with port/interrupt/DMA resources and no MMIO window. The dynamic mixed-NIC
+    resource proof in `.tmp/run-headless-b3-dc21x4-desc-trace-20260821.log` reaches the desktop
+    gates (`293/293`) with E1000 still driving shell pixels, selects `dc21x4.sys`, assigns the tulip
+    function as port `0x6000` length `128` plus vector `10`, and shows the provider
+    `NdisMQueryAdapterResources` copyout as a real port descriptor followed by an interrupt
+    descriptor. `dc21x4.sys` still returns `STATUS_UNSUCCESSFUL` during `StartDevice` before CSR port
+    access (`io=0`), so the current review target is the real ReactOS
+    `NdisMRegisterIoPortRange`/`HalTranslateBusAddress` boundary. The executive now projects the
+    dynamic I/O-port cap into callable provider domains and has bounded generic traces for provider
+    I/O-port registration and HAL bus-address translation. The serialized proof
+    `.tmp/run-headless-b3-dc21x4-port-range-trace-20260821.log` reaches Explorer shell chrome with
+    `293/293`, confirms `NdisMRegisterIoPortRange` succeeds for tulip port `0x6000/128`, confirms
+    provider `HalTranslateBusAddress` returns I/O space with the projected provider port cap, and
+    keeps E1000 receive/desktop gates green. Review adjustment: `dc21x4.sys` now fails after port
+    registration and before CSR access, so continue at the next real ReactOS `StartDevice` edge:
+    dependent `NdisMGetDeviceProperty`/`IoGetDeviceProperty` location queries and the first
+    post-location configuration path.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

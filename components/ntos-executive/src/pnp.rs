@@ -21,8 +21,8 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus, PciDevice,
-    ResourceAssignment, RootBusResourceCatalog, RootBusResourceProfile,
+    assign_resources_with_granted_mmio, assign_root_bus_resources, assignment_to_cm_list,
+    enumerate_bus, PciDevice, ResourceAssignment, RootBusResourceCatalog, RootBusResourceProfile,
     ASSIGNMENT_CM_LIST_MAX_SIZE, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
@@ -97,18 +97,14 @@ pub(crate) fn build_devnode_pci_resource_grant(
     dma_len: u64,
     granted_mmio_len: u32,
 ) -> Option<DevnodePciResourceGrant> {
-    let mut assignment = assign_resources(
+    let assignment = assign_resources_with_granted_mmio(
         device,
         int_vector,
         int_latched,
         /*affinity=*/ 1,
         dma_len,
+        granted_mmio_len,
     )?;
-    let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
-    if mmio_len == 0 || mmio_len > u32::MAX as u64 {
-        return None;
-    }
-    assignment.mmio_len = mmio_len;
     let mut resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
     let n = assignment_to_cm_list(
         &mut resource_list,

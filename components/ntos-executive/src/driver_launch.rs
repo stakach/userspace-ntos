@@ -377,25 +377,25 @@ pub const SH_ACTIVE_IOSL: u64 = 0x6C8; // out: component VA of Tail.Overlay.Curr
 pub const SH_ACTIVE_DATA: u64 = 0x6D0; // out: component VA of request SystemBuffer/UserBuffer
 pub const SH_ACTIVE_DATA_CAP: u64 = 0x6D8; // out: bytes allocated for SH_ACTIVE_DATA
 pub const SH_ACTIVE_FILE_OBJECT: u64 = 0x6E0; // out: component VA of the IRP FILE_OBJECT, if any
-pub const SH_RESOURCE_IO_PORT_IN16_CALLS: u64 = 0x6E8; // out: VideoPortReadPortUshort calls
-pub const SH_RESOURCE_IO_PORT_OUT16_CALLS: u64 = 0x6F0; // out: VideoPortWritePortUshort calls
-pub const SH_RESOURCE_IO_PORT_IN16_FAILURES: u64 = 0x6F8; // out: failed inw invocations
-pub const SH_RESOURCE_IO_PORT_OUT16_FAILURES: u64 = 0x700; // out: failed outw invocations
-pub const SH_RESOURCE_IO_PORT_IN16_DENIED: u64 = 0x708; // out: inw outside assigned NT range
-pub const SH_RESOURCE_IO_PORT_OUT16_DENIED: u64 = 0x710; // out: outw outside assigned NT range
-pub const SH_RESOURCE_IO_PORT_LAST_IN16_STATUS: u64 = 0x718; // out: last inw invocation label
-pub const SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS: u64 = 0x720; // out: last outw invocation label
-pub const SH_RESOURCE_IO_PORT_LAST_IN16_PORT: u64 = 0x728; // out: last inw port number
-pub const SH_RESOURCE_IO_PORT_LAST_OUT16_PORT: u64 = 0x730; // out: last outw port number
-pub const SH_RESOURCE_IO_PORT_LAST_IN16_VALUE: u64 = 0x738; // out: last inw value
-pub const SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE: u64 = 0x740; // out: last outw value
+pub const SH_RESOURCE_IO_PORT_IN16_CALLS: u64 = 0x6E8; // out: port read calls
+pub const SH_RESOURCE_IO_PORT_OUT16_CALLS: u64 = 0x6F0; // out: port write calls
+pub const SH_RESOURCE_IO_PORT_IN16_FAILURES: u64 = 0x6F8; // out: failed port reads
+pub const SH_RESOURCE_IO_PORT_OUT16_FAILURES: u64 = 0x700; // out: failed port writes
+pub const SH_RESOURCE_IO_PORT_IN16_DENIED: u64 = 0x708; // out: reads outside assigned NT range
+pub const SH_RESOURCE_IO_PORT_OUT16_DENIED: u64 = 0x710; // out: writes outside assigned NT range
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_STATUS: u64 = 0x718; // out: last port read label
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS: u64 = 0x720; // out: last port write label
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_PORT: u64 = 0x728; // out: last port read number
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_PORT: u64 = 0x730; // out: last port write number
+pub const SH_RESOURCE_IO_PORT_LAST_IN16_VALUE: u64 = 0x738; // out: last port read value
+pub const SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE: u64 = 0x740; // out: last port write value
 pub const SH_RESOURCE_IO_PORT_COMPONENT_CAP: u64 = 0x748; // in: component-CNode IOPort cap slot
 pub const SH_VIDEO_MEMORY_PHYS: u64 = 0x750; // in: caller-visible video memory physical base
 pub const SH_VIDEO_MEMORY_LEN: u64 = 0x758; // in: caller-visible video memory bytes
 pub const SH_VIDEO_MEMORY_CALLER_VA: u64 = 0x760; // in: VA mapped in the EngDeviceIoControl caller
 pub const SH_VIDEO_MEMORY_MAPPED_VA: u64 = 0x768; // out: last VideoPortMapMemory caller VA
 pub const SH_RESOURCE_IO_PORT_CAP: u64 = 0x770; // in: executive root-CNode IOPort cap for the grant
-pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced inline out dx,eax faults
+pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced WRITE_PORT_ULONG calls
 pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
 pub const SH_DEVICE_INTERFACE_TARGET_LEN: u64 = 0x782; // out: target DeviceName bytes
 pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
@@ -729,6 +729,10 @@ static WDM_FORWARD_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const WDM_FORWARD_TRACE_CAP: u64 = 64;
 static PROVIDER_RESOURCE_LIST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_RESOURCE_LIST_TRACE_CAP: u64 = 16;
+static PROVIDER_IO_PORT_RANGE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const PROVIDER_IO_PORT_RANGE_TRACE_CAP: u64 = 16;
+static HOSTED_HAL_TRANSLATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
@@ -894,6 +898,56 @@ unsafe fn trace_hosted_resource_grant_detail(
         print_str(b" dma-pages=");
         print_u64(dma_pages);
     }
+    print_str(b"\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn trace_hosted_hal_translate_bus_address(
+    stage: &[u8],
+    interface_type: u32,
+    bus_number: u32,
+    expected_interface_type: u32,
+    expected_bus_number: u32,
+    bus_address: u64,
+    requested_space: u32,
+    translated_space: u32,
+    translated_address: u64,
+    mmio_base: u64,
+    mmio_len: u64,
+    port_base: u64,
+    port_len: u64,
+) {
+    if HOSTED_HAL_TRANSLATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_HAL_TRANSLATE_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[driver-launch] HalTranslateBusAddress ");
+    print_str(stage);
+    print_str(b" if=");
+    print_u64(interface_type as u64);
+    print_str(b"/");
+    print_u64(expected_interface_type as u64);
+    print_str(b" bus=");
+    print_u64(bus_number as u64);
+    print_str(b"/");
+    print_u64(expected_bus_number as u64);
+    print_str(b" addr=0x");
+    print_hex64(bus_address);
+    print_str(b" space=");
+    print_u64(requested_space as u64);
+    print_str(b"->");
+    print_u64(translated_space as u64);
+    print_str(b" translated=0x");
+    print_hex64(translated_address);
+    print_str(b" mmio=0x");
+    print_hex64(mmio_base);
+    print_str(b"/");
+    print_u64(mmio_len);
+    print_str(b" port=0x");
+    print_hex64(port_base);
+    print_str(b"/");
+    print_u64(port_len);
     print_str(b"\n");
 }
 
@@ -11554,31 +11608,61 @@ extern "win64" fn s_hal_translate_bus_address(
     translated_address: u64,
 ) -> u8 {
     unsafe {
-        if !hosted_resource_identity_active()
-            || interface_type
-                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
-            || bus_number
-                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
-        {
-            return 0;
-        }
+        let expected_interface_type =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
+        let expected_bus_number =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32);
         let grant_phys = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_PHYS) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_MMIO_LEN) as *const u64);
+        let port_base = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+        let port_len = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
         let requested_space = if address_space != 0 {
             read_unaligned(address_space as *const u32)
         } else {
             0
         };
+        if !hosted_resource_identity_active()
+            || interface_type != expected_interface_type
+            || bus_number != expected_bus_number
+        {
+            trace_hosted_hal_translate_bus_address(
+                b"reject-identity",
+                interface_type,
+                bus_number,
+                expected_interface_type,
+                expected_bus_number,
+                bus_address,
+                requested_space,
+                requested_space,
+                0,
+                grant_phys,
+                grant_len,
+                port_base,
+                port_len,
+            );
+            return 0;
+        }
         if requested_space != 0 {
-            let port_base =
-                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_BASE) as *const u64);
-            let port_len =
-                read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LEN) as *const u64);
             if port_base == 0
                 || port_len == 0
                 || bus_address < port_base
                 || bus_address >= port_base.saturating_add(port_len)
             {
+                trace_hosted_hal_translate_bus_address(
+                    b"reject-port",
+                    interface_type,
+                    bus_number,
+                    expected_interface_type,
+                    expected_bus_number,
+                    bus_address,
+                    requested_space,
+                    requested_space,
+                    0,
+                    grant_phys,
+                    grant_len,
+                    port_base,
+                    port_len,
+                );
                 return 0;
             }
             if address_space != 0 {
@@ -11587,6 +11671,21 @@ extern "win64" fn s_hal_translate_bus_address(
             if translated_address != 0 {
                 write_unaligned(translated_address as *mut u64, bus_address);
             }
+            trace_hosted_hal_translate_bus_address(
+                b"ok-port",
+                interface_type,
+                bus_number,
+                expected_interface_type,
+                expected_bus_number,
+                bus_address,
+                requested_space,
+                1,
+                bus_address,
+                grant_phys,
+                grant_len,
+                port_base,
+                port_len,
+            );
             return 1;
         }
         if grant_phys == 0
@@ -11594,6 +11693,21 @@ extern "win64" fn s_hal_translate_bus_address(
             || bus_address < grant_phys
             || bus_address >= grant_phys.saturating_add(grant_len)
         {
+            trace_hosted_hal_translate_bus_address(
+                b"reject-mmio",
+                interface_type,
+                bus_number,
+                expected_interface_type,
+                expected_bus_number,
+                bus_address,
+                requested_space,
+                requested_space,
+                0,
+                grant_phys,
+                grant_len,
+                port_base,
+                port_len,
+            );
             return 0;
         }
         if address_space != 0 {
@@ -11602,6 +11716,21 @@ extern "win64" fn s_hal_translate_bus_address(
         if translated_address != 0 {
             write_unaligned(translated_address as *mut u64, bus_address);
         }
+        trace_hosted_hal_translate_bus_address(
+            b"ok-mmio",
+            interface_type,
+            bus_number,
+            expected_interface_type,
+            expected_bus_number,
+            bus_address,
+            requested_space,
+            0,
+            bus_address,
+            grant_phys,
+            grant_len,
+            port_base,
+            port_len,
+        );
     }
     1
 }
@@ -12065,13 +12194,36 @@ extern "win64" fn s_write_port_ushort(port: u64, value: u16) {
 
 extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
     unsafe {
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            port,
+        );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                u64::MAX,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                0,
+            );
             return 0;
         };
         let (value, status) = crate::io_in32_r(cap, port as u16);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            status,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            value as u64,
+        );
         if status == 0 {
             value
         } else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_FAILURES);
             0
         }
     }
@@ -12079,11 +12231,32 @@ extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
 
 extern "win64" fn s_write_port_ulong(port: u64, value: u32) {
     unsafe {
+        bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            port,
+        );
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            value as u64,
+        );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                u64::MAX,
+            );
             return;
         };
-        if crate::io_out32(cap, port as u16, value) == 0 {
+        let status = crate::io_out32(cap, port as u16, value);
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            status,
+        );
+        if status == 0 {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT32_FAULTS);
+        } else {
+            bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_FAILURES);
         }
     }
 }
@@ -20211,23 +20384,6 @@ unsafe fn complete_provider_export_side_effects(
     }
 }
 
-const PROVIDER_RESOURCE_PROJECTION_OFFSETS: [u64; 14] = [
-    SH_RESOURCE_MMIO_PHYS,
-    SH_RESOURCE_MMIO_LEN,
-    SH_RESOURCE_MMIO_MAP_LEN,
-    SH_RESOURCE_MMIO_VA,
-    SH_RESOURCE_INTERRUPT_VECTOR,
-    SH_RESOURCE_INTERRUPT_AFFINITY,
-    SH_RESOURCE_INTERFACE_TYPE,
-    SH_RESOURCE_BUS_NUMBER,
-    SH_RESOURCE_ADDRESS,
-    SH_RESOURCE_PCI_VENDOR_DEVICE,
-    SH_RESOURCE_PCI_CLASS_REV,
-    SH_RESOURCE_PCI_IRQ,
-    SH_RESOURCE_IO_PORT_BASE,
-    SH_RESOURCE_IO_PORT_LEN,
-];
-
 const PROVIDER_MMIO_MAPPING_STATE_OFFSETS: [u64; 2] =
     [SH_RESOURCE_MMIO_MAPPED_PHYS, SH_RESOURCE_MMIO_MAPPED_LEN];
 
@@ -20364,18 +20520,18 @@ unsafe fn project_provider_dma_state(
 }
 
 unsafe fn project_provider_resource_state(
+    binding: HostedDeviceBinding,
     dependent_shared: u64,
+    provider_inst: DriverInstance,
     provider_shared: u64,
 ) -> Result<(), i32> {
-    let mut index = 0usize;
-    while index < PROVIDER_RESOURCE_PROJECTION_OFFSETS.len() {
-        let offset = PROVIDER_RESOURCE_PROJECTION_OFFSETS[index];
-        write_volatile(
-            (provider_shared + offset) as *mut u64,
-            read_volatile((dependent_shared + offset) as *const u64),
-        );
-        index += 1;
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .unwrap_or_else(|| read_hosted_device_resource_state_from_shared(binding, dependent_shared));
+    if state.driver_id != binding.driver_id || state.instance != binding.instance {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
+    copy_hosted_io_port_cap_to_instance(provider_inst, state).map_err(|status| status.raw())?;
+    write_hosted_resource_state_projection(provider_shared, state, false);
     copy_provider_mmio_mapping_state(provider_shared, dependent_shared);
     copy_provider_interrupt_state(provider_shared, dependent_shared);
     project_provider_dma_state(dependent_shared, provider_shared)?;
@@ -20493,6 +20649,23 @@ fn provider_policy_resource_list_args(
     None
 }
 
+fn provider_policy_io_port_range_args(
+    policy: HostedProviderExportMarshalPolicy,
+) -> Option<(usize, usize, usize)> {
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        if let HostedProviderArgumentMarshal::CallerOutIoPortRange {
+            initial_port_arg,
+            length_arg,
+        } = policy.args[index]
+        {
+            return Some((index, initial_port_arg as usize, length_arg as usize));
+        }
+        index += 1;
+    }
+    None
+}
+
 fn provider_policy_status_arg(policy: HostedProviderExportMarshalPolicy) -> Option<usize> {
     let mut index = 0usize;
     while index < policy.argument_count as usize {
@@ -20513,15 +20686,77 @@ unsafe fn read_provider_arg_u32(
         .map(|exec_va| read_unaligned(exec_va as *const u32))
 }
 
-unsafe fn read_provider_resource_descriptor_type(
+unsafe fn read_provider_arg_u64(
+    instance_index: usize,
+    inst: DriverInstance,
+    component_va: u64,
+) -> Option<u64> {
+    component_to_exec_va_for_instance(instance_index, inst, component_va, 8)
+        .map(|exec_va| read_unaligned(exec_va as *const u64))
+}
+
+#[derive(Clone, Copy)]
+struct ProviderResourceDescriptorTrace {
+    kind: u8,
+    share: u8,
+    flags: u16,
+    field0: u64,
+    field1: u32,
+    field2: u64,
+}
+
+unsafe fn read_provider_resource_descriptor_trace(
     instance_index: usize,
     inst: DriverInstance,
     list_component_va: u64,
     descriptor_index: u32,
-) -> Option<u8> {
+) -> Option<ProviderResourceDescriptorTrace> {
     let offset = 8u64.checked_add((descriptor_index as u64).checked_mul(20)?)?;
-    component_to_exec_va_for_instance(instance_index, inst, list_component_va + offset, 1)
-        .map(|exec_va| read_unaligned(exec_va as *const u8))
+    let exec_va =
+        component_to_exec_va_for_instance(instance_index, inst, list_component_va + offset, 20)?;
+    let kind = read_unaligned(exec_va as *const u8);
+    let share = read_unaligned((exec_va + 1) as *const u8);
+    let flags = read_unaligned((exec_va + 2) as *const u16);
+    let (field0, field1, field2) = match kind {
+        2 => (
+            read_unaligned((exec_va + 4) as *const u32) as u64,
+            read_unaligned((exec_va + 8) as *const u32),
+            read_unaligned((exec_va + 12) as *const u64),
+        ),
+        _ => (
+            read_unaligned((exec_va + 4) as *const u64),
+            read_unaligned((exec_va + 12) as *const u32),
+            0,
+        ),
+    };
+    Some(ProviderResourceDescriptorTrace {
+        kind,
+        share,
+        flags,
+        field0,
+        field1,
+        field2,
+    })
+}
+
+fn print_provider_resource_descriptor_trace(desc: Option<ProviderResourceDescriptorTrace>) {
+    if let Some(desc) = desc {
+        print_u64(desc.kind as u64);
+        print_str(b"/");
+        print_u64(desc.share as u64);
+        print_str(b"/0x");
+        print_hex(desc.flags as u32);
+        print_str(b"/0x");
+        print_hex((desc.field0 >> 32) as u32);
+        print_hex(desc.field0 as u32);
+        print_str(b"/");
+        print_u64(desc.field1 as u64);
+        print_str(b"/0x");
+        print_hex((desc.field2 >> 32) as u32);
+        print_hex(desc.field2 as u32);
+    } else {
+        print_str(b"none");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20581,37 +20816,34 @@ unsafe fn trace_provider_resource_list_export(
         (0xffffu16, 0xffffu16, u32::MAX)
     };
     let desc0 = if count > 0 && count != u32::MAX {
-        read_provider_resource_descriptor_type(
+        read_provider_resource_descriptor_trace(
             dependent_index,
             dependent_inst,
             list_component_va,
             0,
         )
-        .unwrap_or(0xff)
     } else {
-        0xff
+        None
     };
     let desc1 = if count > 1 && count != u32::MAX {
-        read_provider_resource_descriptor_type(
+        read_provider_resource_descriptor_trace(
             dependent_index,
             dependent_inst,
             list_component_va,
             1,
         )
-        .unwrap_or(0xff)
     } else {
-        0xff
+        None
     };
     let desc2 = if count > 2 && count != u32::MAX {
-        read_provider_resource_descriptor_type(
+        read_provider_resource_descriptor_trace(
             dependent_index,
             dependent_inst,
             list_component_va,
             2,
         )
-        .unwrap_or(0xff)
     } else {
-        0xff
+        None
     };
 
     print_str(b"[driver-import] provider resource-list export rva=0x");
@@ -20636,12 +20868,83 @@ unsafe fn trace_provider_resource_list_export(
     print_u64(revision as u64);
     print_str(b"/");
     print_u64(count as u64);
-    print_str(b" types=");
-    print_u64(desc0 as u64);
-    print_str(b",");
-    print_u64(desc1 as u64);
-    print_str(b",");
-    print_u64(desc2 as u64);
+    print_str(b" desc0=");
+    print_provider_resource_descriptor_trace(desc0);
+    print_str(b" desc1=");
+    print_provider_resource_descriptor_trace(desc1);
+    print_str(b" desc2=");
+    print_provider_resource_descriptor_trace(desc2);
+    print_str(b"\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn trace_provider_io_port_range_export(
+    policy: HostedProviderExportMarshalPolicy,
+    provider_export_rva: u64,
+    provider_index: usize,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    original_args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshalled_args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    result: u64,
+) {
+    let Some((out_index, initial_index, length_index)) = provider_policy_io_port_range_args(policy)
+    else {
+        return;
+    };
+    if out_index >= policy.argument_count as usize
+        || initial_index >= policy.argument_count as usize
+        || length_index >= policy.argument_count as usize
+    {
+        return;
+    }
+    let trace = PROVIDER_IO_PORT_RANGE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= PROVIDER_IO_PORT_RANGE_TRACE_CAP {
+        return;
+    }
+
+    let requested_start = original_args[initial_index] & u32::MAX as u64;
+    let requested_len = original_args[length_index] & u32::MAX as u64;
+    let dependent_out = read_provider_arg_u64(dependent_index, dependent_inst, original_args[out_index])
+        .unwrap_or(u64::MAX);
+    let provider_out = read_provider_arg_u64(provider_index, provider_inst, marshalled_args[out_index])
+        .unwrap_or(u64::MAX);
+    let dependent_sh = dependent_inst.exec_shared_va;
+    let provider_sh = provider_inst.exec_shared_va;
+    let dependent_grant_start =
+        read_volatile((dependent_sh + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+    let dependent_grant_len = read_volatile((dependent_sh + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    let provider_grant_start =
+        read_volatile((provider_sh + SH_RESOURCE_IO_PORT_BASE) as *const u64);
+    let provider_grant_len = read_volatile((provider_sh + SH_RESOURCE_IO_PORT_LEN) as *const u64);
+    let provider_port_cap = read_volatile((provider_sh + SH_RESOURCE_IO_PORT_CAP) as *const u64);
+
+    print_str(b"[driver-import] provider io-port export rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" result=0x");
+    print_hex((result >> 32) as u32);
+    print_hex(result as u32);
+    print_str(b" success=");
+    print_u64(provider_export_result_success(policy, result) as u64);
+    print_str(b" request=0x");
+    print_hex64(requested_start);
+    print_str(b"/");
+    print_u64(requested_len);
+    print_str(b" out dep/prov=0x");
+    print_hex64(dependent_out);
+    print_str(b"/0x");
+    print_hex64(provider_out);
+    print_str(b" grant dep=0x");
+    print_hex64(dependent_grant_start);
+    print_str(b"/");
+    print_u64(dependent_grant_len);
+    print_str(b" prov=0x");
+    print_hex64(provider_grant_start);
+    print_str(b"/");
+    print_u64(provider_grant_len);
+    print_str(b" prov-cap=");
+    print_u64(provider_port_cap);
     print_str(b"\n");
 }
 
@@ -20766,10 +21069,13 @@ pub(crate) unsafe fn service_hosted_provider_export(
         }
     };
 
-    if dependent_binding.is_some() {
-        if let Err(status) =
-            project_provider_resource_state(dependent_channel.shared_va, provider_shared)
-        {
+    if let Some(binding) = dependent_binding {
+        if let Err(status) = project_provider_resource_state(
+            binding,
+            dependent_channel.shared_va,
+            provider_inst,
+            provider_shared,
+        ) {
             trace_hosted_provider_export_rejection(
                 &singleton.provider,
                 provider_domain_cookie,
@@ -20922,6 +21228,17 @@ pub(crate) unsafe fn service_hosted_provider_export(
     );
     complete_provider_export_marshal(policy, &marshal_state, result);
     trace_provider_resource_list_export(
+        policy,
+        provider_export_rva,
+        singleton.instance,
+        provider_inst,
+        dependent_index,
+        dependent_inst,
+        &original_args,
+        &args,
+        result,
+    );
+    trace_provider_io_port_range_export(
         policy,
         provider_export_rva,
         singleton.instance,
@@ -32609,11 +32926,13 @@ where
     Ok(device_id.raw())
 }
 
-/// Grant a hosted device driver access to the MMIO/interrupt resources selected for its devnode.
+/// Grant a hosted device driver access to the MMIO/port/interrupt resources selected for its
+/// devnode.
 ///
-/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: the full BAR
-/// range is granted in the shared page, while `mmio_map_pages` controls the bounded prefix eagerly
-/// mapped into the isolated component VSpace for direct `MmMapIoSpace` access.
+/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: memory BARs are
+/// granted in the shared page, while `mmio_map_pages` controls the bounded prefix eagerly mapped
+/// into the isolated component VSpace for direct `MmMapIoSpace` access. I/O-only PCI devices pass
+/// zero for the MMIO fields and still receive their port cap, interrupt resource, and DMA window.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn grant_hosted_device_resources(
     device_id: u64,
@@ -32637,17 +32956,29 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     dma_logical: u64,
     dma_len: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    if mmio_phys == 0
-        || mmio_len == 0
-        || mmio_va == 0
-        || mmio_broker_va == 0
-        || mmio_frame_base == 0
-        || mmio_map_pages == 0
-        || interrupt_affinity > u32::MAX as u64
+    let has_mmio = mmio_phys != 0
+        || mmio_len != 0
+        || mmio_va != 0
+        || mmio_broker_va != 0
+        || mmio_frame_base != 0
+        || mmio_map_pages != 0;
+    if interrupt_affinity > u32::MAX as u64 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if has_mmio
+        && (mmio_phys == 0
+            || mmio_len == 0
+            || mmio_va == 0
+            || mmio_broker_va == 0
+            || mmio_frame_base == 0
+            || mmio_map_pages == 0)
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     if (io_port_base == 0) != (io_port_len == 0) {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if !has_mmio && io_port_len == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let io_port_last = if io_port_len != 0 {
@@ -32681,13 +33012,18 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     let (instance_index, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     if video_memory_caller_va != 0
-        && (!hosted_instance_video_port_initialized(inst) || (video_memory_caller_va & 0xFFF) != 0)
+        && (!has_mmio
+            || !hosted_instance_video_port_initialized(inst)
+            || (video_memory_caller_va & 0xFFF) != 0)
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let owner = hosted_resource_owner(binding);
-    let mmio_resource_id =
-        hosted_mmio_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let mmio_resource_id = if has_mmio {
+        hosted_mmio_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
+    } else {
+        0
+    };
     let interrupt_resource_id = if interrupt_vector != 0 {
         hosted_interrupt_resource_id(device_id).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
     } else {
@@ -32705,69 +33041,74 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         dma_frame_base,
         dma_pages,
     );
-    let mapped_len = mmio_len.min(mmio_map_pages.saturating_mul(0x1000));
-    if mapped_len == 0 {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    for window in 0..mmio_map_pages.div_ceil(512).max(1) {
-        if !ensure_paging(mmio_va + window * 0x20_0000, inst.pml4) {
-            print_str(b"[driver-launch] hosted MMIO paging failed device_id=");
-            print_u64(device_id);
-            print_str(b" window=");
-            print_u64(window);
-            print_str(b"/");
-            print_u64(mmio_map_pages.div_ceil(512).max(1));
-            print_str(b"\n");
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    let mapped_len = if has_mmio {
+        let len = mmio_len.min(mmio_map_pages.saturating_mul(0x1000));
+        if len == 0 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
-    }
-    trace_hosted_resource_grant(b"mmio-paging", device_id, 0, mmio_map_pages);
-    let mut page = 0u64;
-    while page < mmio_map_pages {
-        if page == 0 || page % 128 == 0 {
-            trace_hosted_resource_grant(b"mmio-map", device_id, page, mmio_map_pages);
+        for window in 0..mmio_map_pages.div_ceil(512).max(1) {
+            if !ensure_paging(mmio_va + window * 0x20_0000, inst.pml4) {
+                print_str(b"[driver-launch] hosted MMIO paging failed device_id=");
+                print_u64(device_id);
+                print_str(b" window=");
+                print_u64(window);
+                print_str(b"/");
+                print_u64(mmio_map_pages.div_ceil(512).max(1));
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
         }
-        let source_cap = mmio_frame_base + page;
-        let (map_cap, copy_error) = copy_cap_r(source_cap);
-        if copy_error != 0 {
-            clear_hosted_resource_map_caps_for_instance(instance_index);
-            print_str(b"[driver-launch] hosted MMIO cap copy failed label=");
-            print_u64(copy_error);
-            print_str(b" device_id=");
-            print_u64(device_id);
-            print_str(b" page=");
-            print_u64(page);
-            print_str(b"/");
-            print_u64(mmio_map_pages);
-            print_str(b" frame_cap=");
-            print_u64(source_cap);
-            print_str(b"\n");
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        trace_hosted_resource_grant(b"mmio-paging", device_id, 0, mmio_map_pages);
+        let mut page = 0u64;
+        while page < mmio_map_pages {
+            if page == 0 || page % 128 == 0 {
+                trace_hosted_resource_grant(b"mmio-map", device_id, page, mmio_map_pages);
+            }
+            let source_cap = mmio_frame_base + page;
+            let (map_cap, copy_error) = copy_cap_r(source_cap);
+            if copy_error != 0 {
+                clear_hosted_resource_map_caps_for_instance(instance_index);
+                print_str(b"[driver-launch] hosted MMIO cap copy failed label=");
+                print_u64(copy_error);
+                print_str(b" device_id=");
+                print_u64(device_id);
+                print_str(b" page=");
+                print_u64(page);
+                print_str(b"/");
+                print_u64(mmio_map_pages);
+                print_str(b" frame-cap=");
+                print_u64(source_cap);
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
+            let err = page_map_r(map_cap, mmio_va + page * 0x1000, RW_NX, inst.pml4);
+            if err != 0 {
+                let _ = cnode_delete_recycle_r(map_cap);
+                clear_hosted_resource_map_caps_for_instance(instance_index);
+                print_str(b"[driver-launch] hosted MMIO map failed label=");
+                print_u64(err);
+                print_str(b" device_id=");
+                print_u64(device_id);
+                print_str(b" page=");
+                print_u64(page);
+                print_str(b"/");
+                print_u64(mmio_map_pages);
+                print_str(b" va=0x");
+                print_hex(((mmio_va + page * 0x1000) >> 32) as u32);
+                print_hex((mmio_va + page * 0x1000) as u32);
+                print_str(b" frame-cap=");
+                print_u64(source_cap);
+                print_str(b"\n");
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
+            record_hosted_resource_map_cap(instance_index, map_cap);
+            page += 1;
         }
-        let err = page_map_r(map_cap, mmio_va + page * 0x1000, RW_NX, inst.pml4);
-        if err != 0 {
-            let _ = cnode_delete_recycle_r(map_cap);
-            clear_hosted_resource_map_caps_for_instance(instance_index);
-            print_str(b"[driver-launch] hosted MMIO map failed label=");
-            print_u64(err);
-            print_str(b" device_id=");
-            print_u64(device_id);
-            print_str(b" page=");
-            print_u64(page);
-            print_str(b"/");
-            print_u64(mmio_map_pages);
-            print_str(b" va=0x");
-            print_hex(((mmio_va + page * 0x1000) >> 32) as u32);
-            print_hex((mmio_va + page * 0x1000) as u32);
-            print_str(b" frame_cap=");
-            print_u64(source_cap);
-            print_str(b"\n");
-            return Err(nt_status::NtStatus::UNSUCCESSFUL);
-        }
-        record_hosted_resource_map_cap(instance_index, map_cap);
-        page += 1;
-    }
-    trace_hosted_resource_grant(b"mmio-done", device_id, mmio_map_pages, mmio_map_pages);
+        trace_hosted_resource_grant(b"mmio-done", device_id, mmio_map_pages, mmio_map_pages);
+        len
+    } else {
+        0
+    };
 
     let mut mapped_dma_len = 0u64;
     let mut dma_adapter_id = 0u64;
@@ -32845,15 +33186,17 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     trace_hosted_resource_grant(b"rm-assign", device_id, 0, 0);
 
     let rm = hosted_resource_manager_mut();
-    rm.assign_memory(
-        owner,
-        mmio_resource_id,
-        mmio_phys,
-        mmio_va,
-        mmio_len,
-        nt_hal_abi::MM_NON_CACHED,
-        nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
-    );
+    if has_mmio {
+        rm.assign_memory(
+            owner,
+            mmio_resource_id,
+            mmio_phys,
+            mmio_va,
+            mmio_len,
+            nt_hal_abi::MM_NON_CACHED,
+            nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
+        );
+    }
     if interrupt_vector != 0 {
         rm.assign_interrupt(
             owner,

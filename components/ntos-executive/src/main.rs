@@ -12554,17 +12554,22 @@ where
         ) else {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         };
-        if grant.assignment.mmio_phys != window.mmio_phys
-            || window.mmio_frame_base == 0
-            || !window.dma_grant_valid()
+        let has_mmio = grant.assignment.mmio_len != 0;
+        if has_mmio
+            && (grant.assignment.mmio_phys != window.mmio_phys || window.mmio_frame_base == 0)
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let mmio_len = grant.assignment.mmio_len;
-        if mmio_len == 0
-            || mmio_len > window.mmio_pages * 0x1000
-            || window.mapped_mmio_len() == 0
+        if !has_mmio
+            && (window.mmio_phys != 0 || window.mmio_frame_base != 0 || window.mmio_pages != 0)
         {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if !window.dma_grant_valid() {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let mmio_len = grant.assignment.mmio_len;
+        if has_mmio && (mmio_len > window.mmio_pages * 0x1000 || window.mapped_mmio_len() == 0) {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         driver_launch::grant_hosted_device_resources(
@@ -12587,7 +12592,7 @@ where
             window.mmio_seed_va,
             window.mmio_frame_base,
             window.mmio_map_pages,
-            if grant.device.base_class() == nt_pnp::PCI_CLASS_DISPLAY {
+            if has_mmio && grant.device.base_class() == nt_pnp::PCI_CLASS_DISPLAY {
                 win32k_subsystem::WIN32K_FB_VA
             } else {
                 0
@@ -17268,8 +17273,15 @@ impl HostedPciHardwareGrant {
         interrupt_latched: bool,
         dma: Option<HostedPciDmaGrant>,
     ) -> Option<Self> {
-        let mem_bar = device.first_memory_bar()?;
-        if mmio_frame_base == 0 || mmio_pages == 0 || mem_bar.size == 0 {
+        let mem_bar = device.first_memory_bar();
+        let has_granted_mmio = mmio_frame_base != 0 || mmio_pages != 0;
+        if (mmio_frame_base == 0) != (mmio_pages == 0) {
+            return None;
+        }
+        if has_granted_mmio && mem_bar.is_none() {
+            return None;
+        }
+        if !has_granted_mmio && device.first_io_bar().is_none() {
             return None;
         }
         let (dma_frame_base, dma_pages, dma_logical, dma_len) = match dma {
@@ -17277,11 +17289,16 @@ impl HostedPciHardwareGrant {
             Some(_) => return None,
             None => (0, 0, 0, 0),
         };
+        let (mmio_phys, mmio_pages) = if has_granted_mmio {
+            (mem_bar.unwrap().base, mmio_pages)
+        } else {
+            (0, 0)
+        };
         Some(Self {
             bus: device.bus,
             dev: device.dev,
             func: device.func,
-            mmio_phys: mem_bar.base,
+            mmio_phys,
             mmio_frame_base,
             mmio_pages,
             interrupt_vector,
@@ -17335,6 +17352,7 @@ struct HostedPciGrantDiscoveryReport {
     dma_not_required: u64,
     dma_failures: u64,
     missing_memory_bar: u64,
+    mmio_port_fallbacks: u64,
     missing_interrupt: u64,
     claim_failures: u64,
 }
@@ -17509,17 +17527,29 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.existing_grants += 1;
                     continue;
                 }
-                let Some(mem_bar) = device.first_memory_bar() else {
+                let mem_bar = device.first_memory_bar();
+                if mem_bar.is_none() && device.first_io_bar().is_none() {
                     report.missing_memory_bar += 1;
                     continue;
-                };
+                }
                 let interrupt_vector = hosted_pci_interrupt_vector(device).unwrap_or(0);
-                let mmio_pages = mem_bar.size.div_ceil(0x1000).max(1);
-                let Some(mmio_run) = existing_boot_framebuffer_cap_run(mem_bar.base, mmio_pages)
-                    .or_else(|| claim_device_frame_caps(bi, mem_bar.base, mmio_pages))
-                else {
-                    report.claim_failures += 1;
-                    continue;
+                let mmio_run = if let Some(mem_bar) = mem_bar {
+                    let mmio_pages = mem_bar.size.div_ceil(0x1000).max(1);
+                    match existing_boot_framebuffer_cap_run(mem_bar.base, mmio_pages)
+                        .or_else(|| claim_device_frame_caps(bi, mem_bar.base, mmio_pages))
+                    {
+                        Some(mmio_run) => Some(mmio_run),
+                        None if device.first_io_bar().is_some() => {
+                            report.mmio_port_fallbacks += 1;
+                            None
+                        }
+                        None => {
+                            report.claim_failures += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
                 };
                 if hosted_pci_driver_needs_dma(device) {
                     let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
@@ -17527,8 +17557,8 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                         report.dma_grants += 1;
                         let Some(grant) = HostedPciHardwareGrant::for_device(
                             device,
-                            mmio_run.base,
-                            mmio_run.pages,
+                            mmio_run.map(|run| run.base).unwrap_or(0),
+                            mmio_run.map(|run| run.pages).unwrap_or(0),
                             interrupt_vector,
                             false,
                             Some(dma),
@@ -17559,8 +17589,8 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.dma_not_required += 1;
                     let Some(grant) = HostedPciHardwareGrant::for_device(
                         device,
-                        mmio_run.base,
-                        mmio_run.pages,
+                        mmio_run.map(|run| run.base).unwrap_or(0),
+                        mmio_run.map(|run| run.pages).unwrap_or(0),
                         interrupt_vector,
                         false,
                         None,
@@ -17617,14 +17647,23 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         report.missing_grants += 1;
                         continue;
                     };
-                    let Some(mem_bar) = device.first_memory_bar() else {
+                    let mem_bar = device.first_memory_bar();
+                    let has_mmio = grant.mmio_phys != 0
+                        || grant.mmio_frame_base != 0
+                        || grant.mmio_pages != 0;
+                    if has_mmio
+                        && (mem_bar.is_none()
+                            || grant.mmio_phys != mem_bar.unwrap().base
+                            || grant.mmio_frame_base == 0)
+                    {
                         report.missing_grants += 1;
                         continue;
-                    };
-                    if grant.mmio_phys != mem_bar.base
-                        || grant.mmio_frame_base == 0
-                        || !grant.dma_grant_valid()
-                    {
+                    }
+                    if !has_mmio && device.first_io_bar().is_none() {
+                        report.missing_grants += 1;
+                        continue;
+                    }
+                    if !grant.dma_grant_valid() {
                         report.missing_grants += 1;
                         continue;
                     }
@@ -17632,28 +17671,39 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         || grant.dma_pages != 0
                         || grant.dma_logical != 0
                         || grant.dma_len != 0;
-                    let mmio_map_pages = hosted_pci_eager_mmio_map_pages(device, grant);
-                    let Some(mmio_map_bytes) = mmio_map_pages.checked_mul(0x1000) else {
-                        report.pci_va_exhausted = true;
-                        continue;
+                    let mmio_map_pages = if has_mmio {
+                        hosted_pci_eager_mmio_map_pages(device, grant)
+                    } else {
+                        0
                     };
-                    let Some(mmio_va) = resource_vas.allocate_component_span(mmio_map_bytes) else {
-                        report.pci_va_exhausted = true;
-                        continue;
+                    let (mmio_va, mmio_seed_va) = if has_mmio {
+                        let Some(mmio_map_bytes) = mmio_map_pages.checked_mul(0x1000) else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        let Some(mmio_va) = resource_vas.allocate_component_span(mmio_map_bytes)
+                        else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        let Some(mmio_seed_va) =
+                            resource_vas.allocate_root_seed_span(mmio_map_bytes)
+                        else {
+                            report.pci_va_exhausted = true;
+                            continue;
+                        };
+                        if !map_hosted_pci_resource_root_alias(
+                            grant.mmio_frame_base,
+                            mmio_map_pages,
+                            mmio_seed_va,
+                        ) {
+                            report.missing_grants += 1;
+                            continue;
+                        }
+                        (mmio_va, mmio_seed_va)
+                    } else {
+                        (0, 0)
                     };
-                    let Some(mmio_seed_va) = resource_vas.allocate_root_seed_span(mmio_map_bytes)
-                    else {
-                        report.pci_va_exhausted = true;
-                        continue;
-                    };
-                    if !map_hosted_pci_resource_root_alias(
-                        grant.mmio_frame_base,
-                        mmio_map_pages,
-                        mmio_seed_va,
-                    ) {
-                        report.missing_grants += 1;
-                        continue;
-                    }
                     let dma_va = if needs_dma {
                         let Some(dma_bytes) = grant.dma_pages.checked_mul(0x1000) else {
                             report.pci_va_exhausted = true;
@@ -26553,6 +26603,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_grant_discovery.dma_failures);
     print_str(b" missing-mmio=");
     print_u64(hosted_pci_grant_discovery.missing_memory_bar);
+    print_str(b" mmio-port-fallbacks=");
+    print_u64(hosted_pci_grant_discovery.mmio_port_fallbacks);
     print_str(b" missing-int=");
     print_u64(hosted_pci_grant_discovery.missing_interrupt);
     print_str(b" claim-failures=");

@@ -137,7 +137,20 @@ impl HostedPnpPciResourceWindow {
         dma_logical: u64,
         dma_len: u64,
     ) -> Option<Self> {
-        if mmio_va == 0 || mmio_seed_va == 0 || mmio_map_pages == 0 || mmio_map_pages > mmio_pages
+        let has_mmio = mmio_phys != 0
+            || mmio_frame_base != 0
+            || mmio_pages != 0
+            || mmio_map_pages != 0
+            || mmio_va != 0
+            || mmio_seed_va != 0;
+        if has_mmio
+            && (mmio_phys == 0
+                || mmio_frame_base == 0
+                || mmio_pages == 0
+                || mmio_map_pages == 0
+                || mmio_va == 0
+                || mmio_seed_va == 0
+                || mmio_map_pages > mmio_pages)
         {
             return None;
         }

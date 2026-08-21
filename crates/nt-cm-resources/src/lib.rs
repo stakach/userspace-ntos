@@ -18,7 +18,8 @@
 //! ```
 //!
 //! A PCI device with both MMIO and port-space BARs uses the same header with three descriptors
-//! (total 80 bytes): Memory @20, Port @40, Interrupt @60.
+//! (total 80 bytes): Memory @20, Port @40, Interrupt @60. I/O-only PCI devices omit the memory
+//! descriptor and keep the same 20-byte descriptor stride.
 
 #![no_std]
 
@@ -62,6 +63,10 @@ pub const MEMORY_PORT_LIST_SIZE: usize = 60;
 pub const MEMORY_INTERRUPT_LIST_SIZE: usize = 60;
 /// Total encoded size of a one-memory + one-port + one-interrupt `CM_RESOURCE_LIST`.
 pub const MEMORY_PORT_INTERRUPT_LIST_SIZE: usize = 80;
+/// Total encoded size of a one-port `CM_RESOURCE_LIST`.
+pub const PORT_LIST_SIZE: usize = 40;
+/// Total encoded size of a one-port + one-interrupt `CM_RESOURCE_LIST`.
+pub const PORT_INTERRUPT_LIST_SIZE: usize = 60;
 
 fn w32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -193,6 +198,26 @@ pub fn build_memory_port_interrupt_list(
     Some(MEMORY_PORT_INTERRUPT_LIST_SIZE)
 }
 
+/// Encode a `CM_RESOURCE_LIST` with a single I/O-port descriptor into `buf`.
+pub fn build_port_list(buf: &mut [u8], bus_number: u32, port: PortDescriptor) -> Option<usize> {
+    build_list_header(buf, PORT_LIST_SIZE, bus_number, 1)?;
+    write_port_descriptor(buf, 20, port);
+    Some(PORT_LIST_SIZE)
+}
+
+/// Encode a `CM_RESOURCE_LIST` with port + interrupt descriptors into `buf`.
+pub fn build_port_interrupt_list(
+    buf: &mut [u8],
+    bus_number: u32,
+    port: PortDescriptor,
+    int: InterruptDescriptor,
+) -> Option<usize> {
+    build_list_header(buf, PORT_INTERRUPT_LIST_SIZE, bus_number, 2)?;
+    write_port_descriptor(buf, 20, port);
+    write_interrupt_descriptor(buf, 40, int);
+    Some(PORT_INTERRUPT_LIST_SIZE)
+}
+
 /// Decode `(memory, interrupt)` from an encoded list — the same field reads a
 /// WDK-compiled driver performs. Returns `None` if the layout is malformed or the
 /// expected descriptors are missing.
@@ -283,6 +308,46 @@ pub fn decode_memory_port_interrupt_list(
         }
     }
     Some((mem?, port?, int?))
+}
+
+/// Decode `(port, interrupt)` from an encoded list. Returns `None` if the layout is malformed or
+/// either descriptor is absent.
+pub fn decode_port_interrupt_list(buf: &[u8]) -> Option<(PortDescriptor, InterruptDescriptor)> {
+    if buf.len() < PORT_INTERRUPT_LIST_SIZE {
+        return None;
+    }
+    let r32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    let r16 = |o: usize| u16::from_le_bytes(buf[o..o + 2].try_into().unwrap());
+    let r64 = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    if r32(0) != 1 || r32(16) != 2 {
+        return None;
+    }
+    let mut port = None;
+    let mut int = None;
+    for k in 0..2 {
+        let d = 20 + k * PARTIAL_DESCRIPTOR_SIZE;
+        match buf[d] {
+            CM_RESOURCE_TYPE_PORT => {
+                port = Some(PortDescriptor {
+                    start: r64(d + 4),
+                    length: r32(d + 12),
+                    flags: r16(d + 2),
+                    share: buf[d + 1],
+                })
+            }
+            CM_RESOURCE_TYPE_INTERRUPT => {
+                int = Some(InterruptDescriptor {
+                    level: r32(d + 4),
+                    vector: r32(d + 8),
+                    affinity: r64(d + 12),
+                    flags: r16(d + 2),
+                    share: buf[d + 1],
+                })
+            }
+            _ => {}
+        }
+    }
+    Some((port?, int?))
 }
 
 #[cfg(test)]
@@ -414,6 +479,40 @@ mod tests {
     }
 
     #[test]
+    fn encodes_port_interrupt_without_memory() {
+        let mut buf = [0u8; PORT_INTERRUPT_LIST_SIZE];
+        let n = build_port_interrupt_list(
+            &mut buf,
+            0,
+            PortDescriptor {
+                start: 0x6000,
+                length: 0x80,
+                flags: CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+            InterruptDescriptor {
+                level: 10,
+                vector: 10,
+                affinity: 1,
+                flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+        )
+        .unwrap();
+        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 2);
+        assert_eq!(buf[20], CM_RESOURCE_TYPE_PORT);
+        assert_eq!(buf[40], CM_RESOURCE_TYPE_INTERRUPT);
+
+        let (port, int) = decode_port_interrupt_list(&buf).unwrap();
+        assert_eq!(port.start, 0x6000);
+        assert_eq!(port.length, 0x80);
+        assert_eq!(port.flags, CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR);
+        assert_eq!(int.vector, 10);
+        assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
+    }
+
+    #[test]
     fn field_offsets_match_wdk() {
         let mut buf = [0u8; 60];
         build_memory_interrupt_list(
@@ -503,5 +602,24 @@ mod tests {
         )
         .is_none());
         assert!(decode_memory_port_interrupt_list(&small).is_none());
+        assert!(build_port_interrupt_list(
+            &mut small,
+            0,
+            PortDescriptor {
+                start: 0,
+                length: 0,
+                flags: 0,
+                share: 0
+            },
+            InterruptDescriptor {
+                level: 0,
+                vector: 0,
+                affinity: 0,
+                flags: 0,
+                share: 0
+            },
+        )
+        .is_none());
+        assert!(decode_port_interrupt_list(&small).is_none());
     }
 }

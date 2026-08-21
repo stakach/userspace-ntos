@@ -28,7 +28,7 @@ const E1000_INSTANCE_ID: &str = r"PCI\VEN_8086&DEV_100E\3&11583659&0&18";
 const E1000_EXPORT_NAME: &str = r"\Device\E1000_0000";
 const E1000_INTERFACE_NAME: &str = "E1000_0000";
 const E1000_DRIVER_DESC: &str = "ReactOS Intel PRO/1000 Adapter";
-const DC21X4_DRIVER_DESC: &str = "Intel 21140-based PCI Ethernet Adapter";
+const DC21X4_DRIVER_DESC: &str = "Intel 21143-based PCI Ethernet Adapter";
 const BOCHS_INF_RELATIVE_PATH: &str = "rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf";
 const BOCHS_INSTANCE_ID: &str = r"PCI\VEN_1234&DEV_1111\3&11583659&0&08";
 const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
@@ -52,7 +52,7 @@ struct GeneratedNetworkAdapter {
 const GENERATED_NETWORK_ADAPTER_MAX_COUNT: usize = 29;
 const GENERATED_E1000_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_8086&DEV_100E"];
 const GENERATED_E1000_COMPATIBLE_IDS: &[&str] = &[r"PCI\CC_020000", r"PCI\CC_0200"];
-const GENERATED_DC21X4_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_1011&DEV_0009"];
+const GENERATED_DC21X4_HARDWARE_IDS: &[&str] = &[r"PCI\VEN_1011&DEV_0019"];
 const GENERATED_DC21X4_COMPATIBLE_IDS: &[&str] = &[r"PCI\CC_020000", r"PCI\CC_0200"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,7 +272,7 @@ fn generated_dc21x4_adapter(
         service_name: String::from("dc21x4"),
         service_image_path: r"system32\drivers\dc21x4.sys",
         driver_key: generated_network_driver_key(class_index),
-        instance_id: format!(r"PCI\VEN_1011&DEV_0009\3&11583659&0&{:02X}", request),
+        instance_id: format!(r"PCI\VEN_1011&DEV_0019\3&11583659&0&{:02X}", request),
         pdo_name: format!(r"\Device\NTPNP_DC21X4_{:04}", model_index),
         hardware_ids: GENERATED_DC21X4_HARDWARE_IDS,
         compatible_ids: GENERATED_DC21X4_COMPATIBLE_IDS,
@@ -1164,7 +1164,7 @@ mod tests {
         );
 
         let devnode = hive
-            .open_key(r"ControlSet001\Enum\PCI\VEN_1011&DEV_0009\3&11583659&0&20")
+            .open_key(r"ControlSet001\Enum\PCI\VEN_1011&DEV_0019\3&11583659&0&20")
             .expect("dc21x4 PCI devnode");
         assert_eq!(
             hive.query_value(devnode, "Service"),
@@ -1181,7 +1181,7 @@ mod tests {
             hive.query_value(devnode, "HardwareID"),
             Some((
                 RegistryValueType::MultiSz,
-                encode_multi_sz(&[r"PCI\VEN_1011&DEV_0009"]).as_slice()
+                encode_multi_sz(&[r"PCI\VEN_1011&DEV_0019"]).as_slice()
             ))
         );
 

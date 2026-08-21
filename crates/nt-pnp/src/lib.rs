@@ -33,6 +33,7 @@ pub use nt_cm_resources::{
     CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_BAR,
     CM_RESOURCE_PORT_IO, CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, MEMORY_INTERRUPT_LIST_SIZE,
     MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE,
+    PORT_INTERRUPT_LIST_SIZE, PORT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
@@ -79,6 +80,11 @@ impl Bar {
     pub fn is_present(&self) -> bool {
         self.size != 0
     }
+
+    /// Whether this BAR is both implemented and assigned a usable base address.
+    pub fn is_assigned(&self) -> bool {
+        self.is_present() && self.base != 0
+    }
 }
 
 /// One enumerated PCI function.
@@ -105,14 +111,14 @@ impl PciDevice {
         (self.class >> 16) as u8
     }
 
-    /// The first *present memory* BAR — the device's primary MMIO register file (a NIC's BAR0).
+    /// The first assigned memory BAR — the device's primary MMIO register file (a NIC's BAR0).
     pub fn first_memory_bar(&self) -> Option<&Bar> {
-        self.bars.iter().find(|b| !b.is_io && b.is_present())
+        self.bars.iter().find(|b| !b.is_io && b.is_assigned())
     }
 
-    /// The first *present I/O-space* BAR.
+    /// The first assigned I/O-space BAR.
     pub fn first_io_bar(&self) -> Option<&Bar> {
-        self.bars.iter().find(|b| b.is_io && b.is_present())
+        self.bars.iter().find(|b| b.is_io && b.is_assigned())
     }
 }
 
@@ -461,14 +467,15 @@ where
     None
 }
 
-/// The resource assignment PnP produces for a device: which MMIO window + interrupt (+ optional
+/// The resource assignment PnP produces for a device: which memory/port BARs + interrupt (+ optional
 /// DMA common-buffer) the driver is granted. This is the abstract grant the executive turns into
 /// minted caps; [`assignment_to_cm_list`] encodes it as the `CM_RESOURCE_LIST` the driver reads.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResourceAssignment {
-    /// The device MMIO physical base (the BAR base).
+    /// The device MMIO physical base (the BAR base), or zero for I/O-only PCI functions.
     pub mmio_phys: u64,
-    /// The MMIO window length (rounded up to whole pages by the broker when minting frame caps).
+    /// The MMIO window length (rounded up to whole pages by the broker when minting frame caps), or
+    /// zero for I/O-only PCI functions.
     pub mmio_len: u64,
     /// The device I/O port base, if the PCI function exposes a port BAR.
     pub io_port_base: u64,
@@ -657,7 +664,8 @@ fn legacy_pci_io_port_range(device: &PciDevice) -> Option<(u64, u32, u16)> {
 /// Assign resources to a device bound to `class`, from its enumerated BARs, optional legacy port
 /// resources, and optional IRQ. `int_vector` is the translated interrupt vector the executive has
 /// arranged for this device; `0` means the bus assigned no interrupt. `dma_len` is the common-buffer
-/// size the driver needs (`0` for none). Returns `None` if the device exposes no memory BAR.
+/// size the driver needs (`0` for none). Returns `None` if the device exposes no memory or port
+/// resource.
 pub fn assign_resources(
     device: &PciDevice,
     int_vector: u32,
@@ -665,7 +673,7 @@ pub fn assign_resources(
     int_affinity: u64,
     dma_len: u64,
 ) -> Option<ResourceAssignment> {
-    let mem_bar = device.first_memory_bar()?;
+    let mem_bar = device.first_memory_bar();
     let (io_port_base, io_port_len, io_port_flags) = match device.first_io_bar() {
         Some(port_bar) => {
             if port_bar.size > u32::MAX as u64 {
@@ -679,9 +687,13 @@ pub fn assign_resources(
         }
         None => legacy_pci_io_port_range(device).unwrap_or((0, 0, 0)),
     };
+    if mem_bar.is_none() && io_port_len == 0 {
+        return None;
+    }
+    let (mmio_phys, mmio_len) = mem_bar.map(|bar| (bar.base, bar.size)).unwrap_or((0, 0));
     Some(ResourceAssignment {
-        mmio_phys: mem_bar.base,
-        mmio_len: mem_bar.size,
+        mmio_phys,
+        mmio_len,
         io_port_base,
         io_port_len,
         io_port_flags,
@@ -692,14 +704,45 @@ pub fn assign_resources(
     })
 }
 
+/// Assign resources, then constrain the memory descriptor to the MMIO span the executive can
+/// actually grant. If the memory BAR cannot be granted but an I/O BAR is available, the returned
+/// assignment falls back to port resources only. Drivers such as dc21x4 accept either a memory or
+/// port CSR window, and NT's resource arbiter can choose the translated resource set it starts.
+pub fn assign_resources_with_granted_mmio(
+    device: &PciDevice,
+    int_vector: u32,
+    int_latched: bool,
+    int_affinity: u64,
+    dma_len: u64,
+    granted_mmio_len: u32,
+) -> Option<ResourceAssignment> {
+    let mut assignment = assign_resources(device, int_vector, int_latched, int_affinity, dma_len)?;
+    if assignment.mmio_len != 0 {
+        if granted_mmio_len == 0 {
+            if assignment.io_port_len == 0 {
+                return None;
+            }
+            assignment.mmio_phys = 0;
+            assignment.mmio_len = 0;
+        } else {
+            let mmio_len = assignment.mmio_len.min(granted_mmio_len as u64);
+            if mmio_len == 0 || mmio_len > u32::MAX as u64 {
+                return None;
+            }
+            assignment.mmio_len = mmio_len;
+        }
+    }
+    Some(assignment)
+}
+
 /// The largest `CM_RESOURCE_LIST` this crate currently emits for one device.
 pub const ASSIGNMENT_CM_LIST_MAX_SIZE: usize = MEMORY_PORT_INTERRUPT_LIST_SIZE;
 
 /// Encode a [`ResourceAssignment`] as the `CM_RESOURCE_LIST` a WDK driver reads at
-/// `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start`; callers should pass the
-/// translated physical address for real WDM drivers that call `MmMapIoSpace`. The list contains
-/// exactly the assigned memory, optional port, and optional interrupt descriptors. Returns the byte
-/// length written.
+/// `IRP_MN_START_DEVICE`. `memory_start` is written into `u.Memory.Start` when the assignment has a
+/// memory resource; callers should pass the translated physical address for real WDM drivers that
+/// call `MmMapIoSpace`. The list contains exactly the assigned memory/port and optional interrupt
+/// descriptors. Returns the byte length written.
 pub fn assignment_to_cm_list(
     buf: &mut [u8],
     bus_number: u32,
@@ -707,12 +750,12 @@ pub fn assignment_to_cm_list(
     memory_start: u64,
     mmio_len: u32,
 ) -> Option<usize> {
-    let mem = MemoryDescriptor {
+    let mem = (assign.mmio_len != 0 && mmio_len != 0).then_some(MemoryDescriptor {
         start: memory_start,
         length: mmio_len,
         flags: CM_RESOURCE_MEMORY_READ_WRITE,
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-    };
+    });
     let port = (assign.io_port_len != 0).then_some(PortDescriptor {
         start: assign.io_port_base,
         length: assign.io_port_len,
@@ -730,15 +773,22 @@ pub fn assignment_to_cm_list(
         },
         share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
     });
-    match (port, int) {
-        (Some(port), Some(int)) => {
+    match (mem, port, int) {
+        (Some(mem), Some(port), Some(int)) => {
             nt_cm_resources::build_memory_port_interrupt_list(buf, bus_number, mem, port, int)
         }
-        (Some(port), None) => nt_cm_resources::build_memory_port_list(buf, bus_number, mem, port),
-        (None, Some(int)) => {
+        (Some(mem), Some(port), None) => {
+            nt_cm_resources::build_memory_port_list(buf, bus_number, mem, port)
+        }
+        (Some(mem), None, Some(int)) => {
             nt_cm_resources::build_memory_interrupt_list(buf, bus_number, mem, int)
         }
-        (None, None) => nt_cm_resources::build_memory_list(buf, bus_number, mem),
+        (Some(mem), None, None) => nt_cm_resources::build_memory_list(buf, bus_number, mem),
+        (None, Some(port), Some(int)) => {
+            nt_cm_resources::build_port_interrupt_list(buf, bus_number, port, int)
+        }
+        (None, Some(port), None) => nt_cm_resources::build_port_list(buf, bus_number, port),
+        (None, None, _) => None,
     }
 }
 
@@ -1111,6 +1161,77 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_io_bar_when_mmio_cannot_be_granted() {
+        let m = nic_mock();
+        let dev =
+            enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
+        assert!(dev.first_memory_bar().is_some());
+        assert!(dev.first_io_bar().is_some());
+
+        let assign = assign_resources_with_granted_mmio(&dev, 11, false, 1, 0x1000, 0).unwrap();
+        assert_eq!(assign.mmio_phys, 0);
+        assert_eq!(assign.mmio_len, 0);
+        assert_eq!(assign.io_port_base, 0xC000);
+        assert_eq!(assign.io_port_len, 0x40);
+
+        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let n = assignment_to_cm_list(&mut buf, 0, &assign, 0, 0).unwrap();
+        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
+        let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
+        assert_eq!(port.start, 0xC000);
+        assert_eq!(port.length, 0x40);
+        assert_eq!(int.vector, 11);
+    }
+
+    #[test]
+    fn assigns_io_only_pci_resources_and_builds_cm_list() {
+        let regs = vec![
+            ((4, 0, PCI_CFG_VENDOR_DEVICE), 0x0019_1011),
+            ((4, 0, PCI_CFG_CLASS_REV), 0x0200_0000),
+            ((4, 0, PCI_CFG_BAR0), 0x6001),
+            ((4, 0, PCI_CFG_BAR0 + 4), 0),
+            ((4, 0, PCI_CFG_INTERRUPT), 0x0000_010A),
+        ];
+        let m = MockConfig {
+            regs: RefCell::new(regs),
+            bar_masks: vec![
+                ((4, 0, PCI_CFG_BAR0), 0xFFFF_FF81),
+                ((4, 0, PCI_CFG_BAR0 + 4), 0xFFFE_0000),
+            ],
+        };
+        let dev =
+            enumerate_function(0, 4, 0, |o| m.read(4, 0, o), |o, v| m.write(4, 0, o, v)).unwrap();
+        assert!(dev.bars.iter().any(|bar| !bar.is_io
+            && bar.is_present()
+            && !bar.is_assigned()
+            && bar.size == 0x2_0000));
+        assert!(dev.first_memory_bar().is_none());
+        let assign = assign_resources(&dev, 10, false, 1, 0x1000).unwrap();
+        assert_eq!(assign.mmio_phys, 0);
+        assert_eq!(assign.mmio_len, 0);
+        assert_eq!(assign.io_port_base, 0x6000);
+        assert_eq!(assign.io_port_len, 0x80);
+        assert_eq!(
+            assign.io_port_flags,
+            CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR
+        );
+        assert_eq!(assign.int_vector, 10);
+        assert!(!assign.int_latched);
+        assert_eq!(assign.dma_len, 0x1000);
+
+        let mut buf = [0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
+        let n = assignment_to_cm_list(&mut buf, 0, &assign, 0, 0).unwrap();
+        assert_eq!(n, PORT_INTERRUPT_LIST_SIZE);
+        let (port, int) = nt_cm_resources::decode_port_interrupt_list(&buf).unwrap();
+        assert_eq!(port.start, 0x6000);
+        assert_eq!(port.length, 0x80);
+        assert_eq!(port.flags, CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_BAR);
+        assert_eq!(int.vector, 10);
+        assert_eq!(int.flags, CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
+        assert_eq!(int.affinity, 1);
+    }
+
+    #[test]
     fn bochs_display_gets_legacy_dispi_ports_without_interrupt() {
         let regs = vec![
             ((1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_1234),
@@ -1262,21 +1383,21 @@ mod tests {
     }
 
     #[test]
-    fn assign_none_without_memory_bar() {
-        // A device with only an I/O BAR has no MMIO window to grant.
+    fn assign_none_without_any_bar() {
+        // A device with no memory or I/O BAR has no device resource to grant.
         let regs = vec![
             ((5, 0, PCI_CFG_VENDOR_DEVICE), 0xBEEF_1234),
             ((5, 0, PCI_CFG_CLASS_REV), 0x0200_0000),
-            ((5, 0, PCI_CFG_BAR0), 0xC001), // I/O BAR (bit0 set)
             ((5, 0, PCI_CFG_INTERRUPT), 0x0000_0105),
         ];
         let m = MockConfig {
             regs: RefCell::new(regs),
-            bar_masks: vec![((5, 0, PCI_CFG_BAR0), 0xFFFF_FF01)], // 256-byte I/O BAR
+            bar_masks: vec![],
         };
         let dev =
             enumerate_function(0, 5, 0, |o| m.read(5, 0, o), |o, v| m.write(5, 0, o, v)).unwrap();
         assert!(dev.first_memory_bar().is_none());
+        assert!(dev.first_io_bar().is_none());
         assert!(assign_resources(&dev, 5, true, 1, 0).is_none());
     }
 }
