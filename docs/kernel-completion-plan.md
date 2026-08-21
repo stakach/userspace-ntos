@@ -186,6 +186,18 @@ checks passing and keeps `exec_lsa_rpc_handoff_reaches_new_client`, `exec_lsa_wo
 `[fsd-pipe-rpc-ctx]` observations. Review adjustment: continue auditing the remaining fixed runtime
 tables by subsystem ownership rather than collecting them under the provider-domain cleanup.
 
+A4/B3 NPFS prefix table scaling cleanup (2026-08-21): the hosted NPFS Unicode prefix table now grows
+in a vector instead of a fixed 64-entry executive array. Initialization clears the live table,
+removal leaves reusable empty slots, insert still rejects duplicate case-insensitive names, and table
+capacity no longer fabricates a false insert result. Local validation is green for `cargo fmt --all`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-prefix-table-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing and keeps `exec_writable_overlay_mounted`, `exec_lsarpc_deadlock_guarded`,
+`exec_profile_ntuser_dat_present`, and `exec_winlogon_user_shell_activated` green. Review
+adjustment: continue auditing remaining fixed runtime tables by ownership; NPFS prefix capacity is
+closed for the current hosted FSD frontier.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

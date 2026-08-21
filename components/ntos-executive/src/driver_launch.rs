@@ -8993,17 +8993,33 @@ struct PrefixSlot {
     used: bool,
 }
 
-const PREFIX_CAP: usize = 64;
+impl PrefixSlot {
+    const fn empty() -> Self {
+        Self {
+            entry: 0,
+            name_va: 0,
+            name_len: 0,
+            used: false,
+        }
+    }
+}
 
-/// The single VCB prefix table (npfs is a singleton driver). Lives in the executive image `.bss`
-/// (shared into the component). Populated by `s_rtl_insert_unicode_prefix`, queried by
-/// `s_rtl_find_unicode_prefix`. Reset by `s_rtl_init_unicode_prefix`.
-static mut PREFIX_TABLE: [PrefixSlot; PREFIX_CAP] = [PrefixSlot {
-    entry: 0,
-    name_va: 0,
-    name_len: 0,
-    used: false,
-}; PREFIX_CAP];
+/// The single VCB prefix table (npfs is a singleton driver). Populated by
+/// `s_rtl_insert_unicode_prefix`, queried by `s_rtl_find_unicode_prefix`, and reset by
+/// `s_rtl_init_unicode_prefix`.
+static mut PREFIX_TABLE: Option<Vec<PrefixSlot>> = None;
+
+unsafe fn prefix_table_mut() -> &'static mut Vec<PrefixSlot> {
+    let slot = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn prefix_table() -> Option<&'static Vec<PrefixSlot>> {
+    (&*core::ptr::addr_of!(PREFIX_TABLE)).as_ref()
+}
 
 /// Copy a UNICODE_STRING.Buffer (UTF-16) into a fixed scratch for comparison. Returns the length in
 /// u16 units (capped at the scratch size). Pipe names are short (`\ntsvcs` = 7).
@@ -9025,14 +9041,8 @@ extern "win64" fn s_rtl_init_unicode_prefix(tbl: u64) {
             write_unaligned((tbl + 8) as *mut u64, 0);
             write_unaligned((tbl + 16) as *mut u32, 0);
         }
-        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
-        for s in table.iter_mut() {
-            *s = PrefixSlot {
-                entry: 0,
-                name_va: 0,
-                name_len: 0,
-                used: false,
-            };
+        if let Some(table) = (*core::ptr::addr_of_mut!(PREFIX_TABLE)).as_mut() {
+            table.clear();
         }
     }
 }
@@ -9047,7 +9057,7 @@ extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64
     unsafe {
         let name_len = read_unaligned(prefix as *const u16); // UNICODE_STRING.Length
         let name_va = read_unaligned((prefix + 8) as *const u64); // UNICODE_STRING.Buffer
-        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+        let table = prefix_table_mut();
         // dedup: an identical (case-insensitive) name already present → FALSE (the FSD bug-checks on
         // this, meaning it never re-creates the same pipe; our create arm rejects duplicates first).
         let mut new: [u16; 128] = [0; 128];
@@ -9076,8 +9086,14 @@ extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64
                 return 1;
             }
         }
+        table.push(PrefixSlot {
+            entry,
+            name_va,
+            name_len,
+            used: true,
+        });
+        1
     }
-    0 // table full
 }
 
 /// `PUNICODE_PREFIX_TABLE_ENTRY RtlFindUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_STRING FullName,
@@ -9092,7 +9108,9 @@ extern "win64" fn s_rtl_find_unicode_prefix(_tbl: u64, full: u64, _ci: u64) -> u
         let full_va = read_unaligned((full + 8) as *const u64);
         let mut fbuf: [u16; 256] = [0; 256];
         let fn_ = read_ustr16(full_va, full_len, &mut fbuf);
-        let table = &*core::ptr::addr_of!(PREFIX_TABLE);
+        let Some(table) = prefix_table() else {
+            return 0;
+        };
         let mut best_entry = 0u64;
         let mut best_len = 0usize; // matched name length in u16 units
                                    // Compare against each used slot; keep the longest component-prefix.
@@ -9145,15 +9163,10 @@ extern "win64" fn s_rtl_remove_unicode_prefix(_tbl: u64, entry: u64) {
         return;
     }
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+        let table = prefix_table_mut();
         for slot in table.iter_mut() {
             if slot.used && slot.entry == entry {
-                *slot = PrefixSlot {
-                    entry: 0,
-                    name_va: 0,
-                    name_len: 0,
-                    used: false,
-                };
+                *slot = PrefixSlot::empty();
                 return;
             }
         }
