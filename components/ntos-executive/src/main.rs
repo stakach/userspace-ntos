@@ -10010,6 +10010,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(hosted_spawned_cap as u64);
     print_str(b"/");
     print_u64(hosted_spawned_fails);
+    let (
+        hosted_loaded_entries_len,
+        hosted_loaded_entries_cap,
+        hosted_loaded_pes_len,
+        hosted_loaded_pes_cap,
+        hosted_loaded_fails,
+    ) = service_sec_image::service_hosted_loaded_images_stats();
+    print_str(b" hosted-loaded=");
+    print_u64(hosted_loaded_entries_len as u64);
+    print_str(b"/");
+    print_u64(hosted_loaded_entries_cap as u64);
+    print_str(b":");
+    print_u64(hosted_loaded_pes_len as u64);
+    print_str(b"/");
+    print_u64(hosted_loaded_pes_cap as u64);
+    print_str(b"/");
+    print_u64(hosted_loaded_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);

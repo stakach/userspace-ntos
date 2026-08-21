@@ -1146,9 +1146,11 @@ unsafe fn reset_service_exe_image_catalog_work(
 
 #[inline(never)]
 unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoadedImageTable {
-    let slot = core::ptr::addr_of_mut!(SERVICE_HOSTED_LOADED_IMAGES_WORK);
-    core::ptr::write(slot, HostedLoadedImageTable::new());
-    &mut *slot
+    let table = &mut *core::ptr::addr_of_mut!(SERVICE_HOSTED_LOADED_IMAGES_WORK);
+    if !table.reset(MAX_PI) {
+        panic!("hosted loaded image table allocation failed");
+    }
+    table
 }
 
 #[inline(never)]
@@ -1167,6 +1169,10 @@ unsafe fn reset_service_dll_arena_paging_work() -> &'static mut DllArenaPagingSt
 
 pub(crate) fn service_dll_arena_paging_stats() -> DllArenaPagingStats {
     unsafe { (&*core::ptr::addr_of!(SERVICE_DLL_ARENA_PAGING_WORK)).stats() }
+}
+
+pub(crate) fn service_hosted_loaded_images_stats() -> (usize, usize, usize, usize, u64) {
+    unsafe { (&*core::ptr::addr_of!(SERVICE_HOSTED_LOADED_IMAGES_WORK)).store_stats() }
 }
 
 fn take_service_dll_arena_paging_dirty() -> bool {

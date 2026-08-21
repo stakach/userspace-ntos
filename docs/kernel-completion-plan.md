@@ -564,6 +564,24 @@ green, and reports `hosted-runtime=24/24/0:24/24/0`. Review adjustment: hosted p
 registration backing is closed; remaining process-index arrays are now mostly diagnostic counters,
 cap-bank summaries, or explicit admission geometry and should be audited by owner before conversion.
 
+A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
+hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
+`[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before
+bootstrap image registration, duplicate/invalid process indices keep the same checked failure
+contract, and the admission limit remains `MAX_PI` until process-manager policy is deliberately
+expanded. The pool census reports `hosted-loaded=<entry len/cap>:<pe len/cap/fail>`. Local
+validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-hosted-loaded-vec-rerun-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_explorer_shell_chrome_painted`
+green, and reports `hosted-loaded=24/24:24/24/0`. A prior non-accepted attempt reached Explorer
+traffic but faulted during the quiesce writable snapshot commit before the sentinel; it did not
+repeat on the accepted proof and should be treated as a D2 snapshot robustness edge if it reappears.
+Review adjustment: hosted executable PE metadata no longer has a fixed per-process backing table.
+Remaining `MAX_PI` arrays are mostly diagnostic counters/cap-bank summaries; audit those by owner
+instead of converting every counter mechanically.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

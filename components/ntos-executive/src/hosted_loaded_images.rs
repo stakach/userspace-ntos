@@ -5,6 +5,8 @@
 //! bootstrap-specific image locals.
 #![allow(clippy::all)]
 
+use alloc::vec::Vec;
+
 use crate::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,16 +35,32 @@ impl HostedLoadedImage {
 }
 
 pub(crate) struct HostedLoadedImageTable {
-    entries: [Option<HostedLoadedImage>; MAX_PI],
-    pes: [Option<nt_pe_loader::PeFile<'static>>; MAX_PI],
+    entries: Vec<Option<HostedLoadedImage>>,
+    pes: Vec<Option<nt_pe_loader::PeFile<'static>>>,
 }
 
 impl HostedLoadedImageTable {
     pub(crate) const fn new() -> Self {
         Self {
-            entries: [None; MAX_PI],
-            pes: [const { None }; MAX_PI],
+            entries: Vec::new(),
+            pes: Vec::new(),
         }
+    }
+
+    pub(crate) fn reset(&mut self, slots: usize) -> bool {
+        self.entries.clear();
+        self.pes.clear();
+        if self.entries.try_reserve(slots).is_err() || self.pes.try_reserve(slots).is_err() {
+            HOSTED_LOADED_IMAGE_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        while self.entries.len() < slots {
+            self.entries.push(None);
+        }
+        while self.pes.len() < slots {
+            self.pes.push(None);
+        }
+        true
     }
 
     pub(crate) fn register_if_loaded(
@@ -54,7 +72,7 @@ impl HostedLoadedImageTable {
         if pe.is_none() {
             return Ok(());
         }
-        if image.pi >= MAX_PI {
+        if image.pi >= MAX_PI || image.pi >= self.entries.len() || image.pi >= self.pes.len() {
             return Err(HostedLoadedImageRegistrationError::InvalidPi);
         }
         let Some(leaf) = nt_exe_image::canonical_exe_leaf(image.leaf) else {
@@ -122,4 +140,16 @@ impl HostedLoadedImageTable {
         let pe = self.pes.get(hosted.pi)?.as_ref()?;
         Some((pe, entry.pool_va()))
     }
+
+    pub(crate) fn store_stats(&self) -> (usize, usize, usize, usize, u64) {
+        (
+            self.entries.len(),
+            self.entries.capacity(),
+            self.pes.len(),
+            self.pes.capacity(),
+            HOSTED_LOADED_IMAGE_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
 }
+
+static HOSTED_LOADED_IMAGE_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
