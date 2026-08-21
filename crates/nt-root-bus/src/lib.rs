@@ -108,6 +108,23 @@ pub struct Pdo {
     pub started: bool,
 }
 
+/// Invalid identity material for a root-bus PDO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootBusPdoError {
+    /// The caller did not supply a PDO object identity.
+    ZeroObjectId,
+    /// `BusQueryDeviceID` would be empty.
+    EmptyDeviceId,
+    /// `BusQueryInstanceID` would be empty.
+    EmptyInstanceId,
+    /// `BusQueryHardwareIDs` would be an empty `REG_MULTI_SZ`.
+    EmptyHardwareIds,
+    /// One hardware-ID entry is empty.
+    EmptyHardwareId,
+    /// One compatible-ID entry is empty.
+    EmptyCompatibleId,
+}
+
 /// `NTSTATUS` the PDO's PnP dispatch returns.
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
@@ -139,6 +156,73 @@ impl RootBus {
     /// A root bus with no children yet.
     pub fn new() -> Self {
         Self { pdos: Vec::new() }
+    }
+
+    /// Validate the identity a real PnP root PDO will publish through `IRP_MN_QUERY_ID`.
+    pub fn validate_pdo_identity<H, C>(
+        object_id: u64,
+        device_id: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+        instance_id: &str,
+    ) -> Result<(), RootBusPdoError>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
+        if object_id == 0 {
+            return Err(RootBusPdoError::ZeroObjectId);
+        }
+        if device_id.is_empty() {
+            return Err(RootBusPdoError::EmptyDeviceId);
+        }
+        if instance_id.is_empty() {
+            return Err(RootBusPdoError::EmptyInstanceId);
+        }
+        if hardware_ids.is_empty() {
+            return Err(RootBusPdoError::EmptyHardwareIds);
+        }
+        for id in hardware_ids {
+            if id.as_ref().is_empty() {
+                return Err(RootBusPdoError::EmptyHardwareId);
+            }
+        }
+        for id in compatible_ids {
+            if id.as_ref().is_empty() {
+                return Err(RootBusPdoError::EmptyCompatibleId);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checked variant for real PnP publication. Proof components can still use `create_pdo`
+    /// directly when constructing intentionally minimal fixtures.
+    pub fn try_create_pdo<H, C>(
+        &mut self,
+        object_id: u64,
+        device_id: &str,
+        hardware_ids: &[H],
+        compatible_ids: &[C],
+        instance_id: &str,
+    ) -> Result<u64, RootBusPdoError>
+    where
+        H: AsRef<str>,
+        C: AsRef<str>,
+    {
+        Self::validate_pdo_identity(
+            object_id,
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+        )?;
+        Ok(self.create_pdo(
+            object_id,
+            device_id,
+            hardware_ids,
+            compatible_ids,
+            instance_id,
+        ))
     }
 
     /// Enumerate a child: create a PDO with the given identity + default capabilities. Returns the
@@ -382,5 +466,52 @@ mod tests {
             split_enum_instance_path("LEGACY_DEVICE"),
             ("LEGACY_DEVICE", "")
         );
+    }
+
+    #[test]
+    fn checked_pdo_rejects_incomplete_registry_identity() {
+        let empty: [&str; 0] = [];
+        let mut b = RootBus::new();
+
+        assert_eq!(
+            b.try_create_pdo(0, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Err(RootBusPdoError::ZeroObjectId)
+        );
+        assert_eq!(
+            b.try_create_pdo(0x1000, "", &[r"ROOT\A"], &empty, "0001"),
+            Err(RootBusPdoError::EmptyDeviceId)
+        );
+        assert_eq!(
+            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, ""),
+            Err(RootBusPdoError::EmptyInstanceId)
+        );
+        assert_eq!(
+            b.try_create_pdo(0x1000, r"ROOT\A", &empty, &empty, "0001"),
+            Err(RootBusPdoError::EmptyHardwareIds)
+        );
+        assert_eq!(
+            b.try_create_pdo(0x1000, r"ROOT\A", &[""], &empty, "0001"),
+            Err(RootBusPdoError::EmptyHardwareId)
+        );
+        assert_eq!(
+            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &[""], "0001"),
+            Err(RootBusPdoError::EmptyCompatibleId)
+        );
+
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn checked_pdo_publishes_registry_identity_without_synthesis() {
+        let mut b = RootBus::new();
+        let empty: [&str; 0] = [];
+        assert_eq!(
+            b.try_create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &empty, "0001"),
+            Ok(0x1000)
+        );
+        assert_eq!(b.len(), 1);
+        let pdo = b.pdo(0x1000).unwrap();
+        assert_eq!(pdo.hardware_ids, alloc::vec![String::from(r"ROOT\A")]);
+        assert!(pdo.compatible_ids.is_empty());
     }
 }

@@ -40,54 +40,40 @@ invariants from the real workload. The latest ntdll loader-list cleanup also rem
 `PEB_LDR_DATA.EntryInProgress` dependency from `RtlPcToFileHeader`, which unblocked the dynamic
 `userinit.exe` to `explorer.exe` shell path without adding kernel launch policy.
 
-Current B3 provider-domain packet slice (2026-08-18): the shared-provider direction is now a real
+Current B3 provider-domain packet slice (2026-08-21): the shared-provider direction is now a real
 provider-owned export and callback transport, not image-only sharing. Observed NDIS open, bind,
-request, packet, buffer, send-completion, work-item, and receive paths now cross from TCPIP/E1000
-into the provider `ndis.sys` runtime through typed marshal policy. Packet and MDL shadows are keyed
-by provider and dependent instances, miniport send callbacks receive dependent-domain
-packet/MDL/scatter-gather views, provider packet state is synchronized back after in/out
-completions, and `NdisMSendComplete` re-enters provider NDIS before dispatching TCPIP's real
-`SendComplete`. The sparse LiveCD setup now provisions deterministic static TCPIP interface config
+request, packet, buffer, send-completion, work-item, legacy receive, and packet-array receive paths
+cross from TCPIP/E1000/DC21x4 into the provider `ndis.sys` runtime through typed marshal policy.
+Packet and MDL shadows are keyed by provider and dependent instances, miniport send callbacks
+receive dependent-domain packet/MDL/scatter-gather views, provider packet state is synchronized back
+after in/out completions, and `NdisMSendComplete` re-enters provider NDIS before dispatching TCPIP's
+real `SendComplete`. The sparse LiveCD setup provisions deterministic static TCPIP interface config
 for discovered NIC identities while preserving explicit registry config, and the E1000 receive
 stimulus derives its sender/target IPv4 tuple from the live Config Manager TCPIP interface key. The
-hosted-driver `MmSystemRangeStart` data export now matches the hosted FSD system range so ReactOS
-TCPIP accepts hosted pool pointers during queued reconfiguration. The clean serialized desktop
-proof `.tmp/run-desktop-20260818-160505.log` reaches `298/298`, keeps
-`pci_provider_exports=43/43` with zero provider rejections or callback/work walls, passes
-`exec_lsa_worker_route`, and reaches genuine Explorer shell chrome with full-framebuffer
-non-background pixels. Validation for this slice: `cargo fmt --all`,
-`cargo test -p nt-hive-core -- --nocapture`, executive `cargo check --manifest-path
-components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, serialized
-`QEMU_MEMORY=2G ./run.sh --desktop`, and `git diff --check`. Review adjustment: descriptor
-discovery, provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure, and
-registry-derived receive stimulus are closed. The packet-array receive infrastructure now has
-generic wiring through provider-internal NDIS miniport-block handlers and a clean serialized
-desktop regression proof. The generated-hive fallback no longer carries a separate hardcoded TCPIP
-binding path; it imports its own devnodes/classes into Config Manager and runs the same dynamic
-network setup seeder, with host coverage for repeated E1000 bindings and mixed
-E1000/DC21x4 bindings. The build tool keeps the existing opt-in
-`NTOS_GENERATED_E1000_COUNT` knob for repeated-E1000 proof images and now also accepts
-`NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4` for a registry-selected packet-array miniport
-frontier. Packet-array still needs a live-driver proof because the current ReactOS E1000 path uses
-classic Ethernet lookahead receive. Runtime PnP matching now parses the specific PCI instance location before generic
-hardware IDs, so repeated identical NIC devnodes no longer collapse to the first enumerated
-function. Repeated-device runtime boot coverage is now accepted: `.tmp/run-headless-b3-two-e1000-after-ndis-shadow.log`
-boots with two generated E1000 NICs, the extern rootserver discovers nine live device untypeds
-(architectural MMIO plus two E1000 BARs and the shifted AHCI BARs), both E1000 devnodes run
-AddDevice/StartDevice through the generic path, provider sharing reports `exports=91/91` with
-zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrome paints with
-`292/292` checks passing. With real E1000 TX/RX traffic now accepted below, the remaining generic
-B3 packet frontier is packet-array receive coverage for an NDIS5 miniport that actually reaches
-`MiniIndicateReceivePacket`; ReactOS e1000 correctly uses the legacy Ethernet receive path instead.
-Latest accepted DC21x4 checkpoint (2026-08-21): the generated mixed-NIC path now gets QEMU tulip
-through `dc21x4.sys` StartDevice and into real interrupt/DPC delivery using the dynamic PCI resource
-grant. The I/O-only hosted-device path models DC21x4 CSR status/ack semantics, completes one owned RX
-descriptor through validated common-buffer DMA aliases, and raises the tulip interrupt through the
-generic hosted-device dispatcher. Provider protocol `BindAdapter` completion now dynamically matches
-the provider-domain `DeviceName` against mirrored NDIS miniport blocks by
-`NDIS_MINIPORT_BLOCK.MiniportName`, arms one bounded receive interrupt for the matched
-resource-backed devnode, and lets the ordinary generic interrupt path consume that pending receive
-after the hosted device is fully ready instead of re-entering the miniport from StartDevice unwind.
+hosted-driver `MmSystemRangeStart` data export matches the hosted FSD system range so ReactOS TCPIP
+accepts hosted pool pointers during queued reconfiguration. Runtime PnP matching parses the
+specific PCI instance location before generic hardware IDs, so repeated identical NIC devnodes no
+longer collapse to the first enumerated function.
+
+Repeated-device and packet-array runtime boot coverage are now accepted. `.tmp/run-headless-b3-two-e1000-after-ndis-shadow.log`
+boots with two generated E1000 NICs; both devnodes run AddDevice/StartDevice through the generic
+path, provider sharing reports `exports=91/91` with zero export rejections, and Explorer shell
+chrome paints with `292/292` checks passing. `.tmp/run-headless-b3-dc21x4-packet-array-green-20260821.log`
+boots a mixed E1000/DC21x4 registry-selected image, drives QEMU tulip through `dc21x4.sys`
+StartDevice, generic interrupt/DPC delivery, validated common-buffer DMA aliases, and the provider
+`MiniIndicateReceivePacket` bridge, then reaches Explorer chrome with `293/293` checks passing and
+provider sharing `packet-array=1/1 packet-array-rx=1/1`. Review adjustment: descriptor discovery,
+provider-domain NDIS bring-up, packet/MDL send-completion, queued TCPIP reconfigure,
+registry-derived receive stimulus, repeated E1000 runtime selection, and packet-array receive are
+closed. Continue B3 at broader repeated driver/device scaling, additional NDIS protocol surfaces,
+and strict registry-derived device identity publication; do not reintroduce driver-name,
+service-name, or packet-success fallbacks.
+Strict root-PDO identity cleanup (2026-08-21): real executive PnP registration now validates the
+registry-derived device ID, instance ID, and hardware-ID list before creating the I/O Manager PDO,
+then publishes that exact identity through the root-bus checked constructor. The old
+executive-side hardware-ID synthesis from the instance path is removed. Serialized proof
+`.tmp/run-headless-root-pdo-identity-20260821-155718.log` reaches genuine userinit/Explorer launch
+and Explorer shell chrome with `293/293` checks passing.
 Serialized mixed-NIC proof `.tmp/run-headless-b3-postbind-rx-late-inject-20260821.log` reaches
 Explorer shell chrome with `293/293`, keeps `exec_win32k_desktop_painted` and
 `exec_explorer_shell_chrome_painted` green, and shows the DC21x4 post-bind interrupt delivered through
@@ -1693,9 +1679,11 @@ notification-package fallbacks.
   `ndis.sys` runtime with typed packet/MDL shadows instead of private provider semantics.
   Transfer-data/completion wiring and repeated-device scaling are proven at this frontier. Real
   TCPIP-originated E1000 TX now reaches descriptor completion through the provider-domain
-  scatter/gather route, and E1000 RX uses ReactOS' legacy Ethernet receive indication path. Remaining
-  B3 packet-array work is coverage for a miniport that reaches the internal NDIS helper rather than
-  the e1000 legacy receive macro path.
+  scatter/gather route, E1000 RX uses ReactOS' legacy Ethernet receive indication path, and the
+  mixed E1000/DC21x4 proof now drives the provider-domain packet-array receive bridge through a
+  miniport that reaches the internal NDIS helper. The current B3 packet-array frontier is closed;
+  B3 remains open for broader repeated driver/device scaling, additional NDIS protocol surfaces, and
+  removal of any remaining synthetic device-identity publication.
   Root-bus proof resource
   profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
   static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
@@ -1705,7 +1693,11 @@ notification-package fallbacks.
   component-local `DMA_ADAPTER`, so `NdisMInitializeScatterGatherDma` can publish real SG-capable
   NDIS state without later `NdisSend` calls depending on transient executive/shared projection
   fields. That send-data-plane gap is now closed for the current E1000 frontier by the accepted B3 TX
-  checkpoints below.
+  checkpoints below. Registry-selected root PDO publication now validates that the imported devnode
+  carries real device, instance, and hardware IDs before the executive creates the I/O Manager PDO;
+  the old executive-side hardware-ID synthesis from the instance path has been removed. The
+  serialized proof `.tmp/run-headless-root-pdo-identity-20260821-155718.log` reaches userinit,
+  Explorer, and shell chrome with `293/293` checks passing.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 
@@ -8837,5 +8829,6 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     detaches one, the copied `ntuser.dat` is a 130716-byte hive image, and the final pool census has
     no untyped, image-bank, registry, ASID, or VM allocation failures. Review adjustment: the active
     desktop/frontier cleanup is no longer shell launch, profile loading, kbswitch GDI publication, or
-    E1000 TX/RX. Continue the plan at B3's live packet-array receive proof with a miniport that reaches
-    the internal NDIS helper, without adding driver-name, service-name, or packet-success fallbacks.
+    E1000 TX/RX. The later DC21x4 proof closed B3's packet-array receive target; continue with
+    repeated driver/device scaling, additional NDIS protocol surfaces, and packaging/ownership
+    cleanup without adding driver-name, service-name, or packet-success fallbacks.

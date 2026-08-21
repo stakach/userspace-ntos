@@ -29525,6 +29525,19 @@ fn register_hosted_root_pdo_binding(
     Ok(())
 }
 
+fn hosted_root_pdo_identity_status(error: nt_root_bus::RootBusPdoError) -> nt_status::NtStatus {
+    match error {
+        nt_root_bus::RootBusPdoError::ZeroObjectId
+        | nt_root_bus::RootBusPdoError::EmptyDeviceId
+        | nt_root_bus::RootBusPdoError::EmptyInstanceId
+        | nt_root_bus::RootBusPdoError::EmptyHardwareIds
+        | nt_root_bus::RootBusPdoError::EmptyHardwareId
+        | nt_root_bus::RootBusPdoError::EmptyCompatibleId => {
+            nt_status::NtStatus::INVALID_PARAMETER
+        }
+    }
+}
+
 unsafe fn register_hosted_root_pdo<H, C>(
     pdo_object: u64,
     instance_path: &str,
@@ -29535,9 +29548,15 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
-    if pdo_object == 0 {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
+    let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
+    nt_root_bus::RootBus::validate_pdo_identity(
+        pdo_object,
+        device_id,
+        hardware_ids,
+        compatible_ids,
+        instance_id,
+    )
+    .map_err(hosted_root_pdo_identity_status)?;
     if let Some(device_id) = hosted_root_pdo_device_id(pdo_object) {
         return Ok(device_id);
     }
@@ -29554,26 +29573,15 @@ where
         let _ = io_manager_mut().destroy_device(pdo_device_id);
         return Err(status);
     }
-    let (device_id, instance_id) = nt_root_bus::split_enum_instance_path(instance_path);
-    let fallback_hardware = [device_id];
-    let bus = hosted_root_bus_mut();
-    if hardware_ids.is_empty() {
-        bus.create_pdo(
-            pdo_object,
-            device_id,
-            &fallback_hardware[..],
-            compatible_ids,
-            instance_id,
-        );
-    } else {
-        bus.create_pdo(
+    hosted_root_bus_mut()
+        .try_create_pdo(
             pdo_object,
             device_id,
             hardware_ids,
             compatible_ids,
             instance_id,
-        );
-    }
+        )
+        .map_err(hosted_root_pdo_identity_status)?;
     Ok(pdo_device_id.raw())
 }
 
