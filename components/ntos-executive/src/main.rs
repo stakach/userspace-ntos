@@ -9987,6 +9987,35 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(w32_row_fails);
     let (
+        teb_frame_rows,
+        teb_frame_cap,
+        teb_live_rows,
+        teb_live_cap,
+        teb_watch_rows,
+        teb_watch_cap,
+        teb_live_count,
+        teb_row_alloc_fails,
+        teb_row_misses,
+    ) = teb_tail_row_stats();
+    print_str(b" teb-tail-rows=");
+    print_u64(teb_frame_rows as u64);
+    print_str(b"/");
+    print_u64(teb_frame_cap as u64);
+    print_str(b":");
+    print_u64(teb_live_rows as u64);
+    print_str(b"/");
+    print_u64(teb_live_cap as u64);
+    print_str(b":");
+    print_u64(teb_watch_rows as u64);
+    print_str(b"/");
+    print_u64(teb_watch_cap as u64);
+    print_str(b"/");
+    print_u64(teb_live_count);
+    print_str(b"/");
+    print_u64(teb_row_alloc_fails);
+    print_str(b"/");
+    print_u64(teb_row_misses);
+    let (
         w32_ctx_proc_len,
         w32_ctx_proc_cap,
         w32_ctx_proc_growths,
@@ -10467,7 +10496,11 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
 /// `TEB_TAIL_REPAIRS` is asserted zero by `exec_teb_tail_protected_from_win32k`.
 pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
     let env_scratch = env_scratch_base_for_pi(pi);
-    if env_scratch == 0 || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
+    let Some(live_row) = teb_tail_alias_live_row(pi) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    if env_scratch == 0 || live_row.load(Ordering::Relaxed) == 0 {
         return;
     }
     const STATIC_UNICODE_STRING: u64 = 0x258; // TEB+0x1258, i.e. offset 0x258 of the 2nd TEB page
@@ -10566,7 +10599,9 @@ pub(crate) unsafe fn teb_tail_canary_intact(teb2_alias: u64) -> bool {
 /// a write anyone makes through it lands in this TEB, which is exactly the shape a "win32k scribbled
 /// the TEB" symptom takes when win32k never actually touched the TEB's own VA.
 pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
-    let frame = TEB2_FRAME_CAP[pi].load(Ordering::Relaxed);
+    let frame = teb2_frame_cap_row(pi)
+        .map(|row| row.load(Ordering::Relaxed))
+        .unwrap_or(0);
     print_str(b"[teb-watch] alias scan pi=");
     print_u64(pi as u64);
     print_str(b" teb2-frame-cap=0x");
@@ -10616,12 +10651,14 @@ pub(crate) static W32_TEB_TAIL_RO_MAPS: AtomicU64 = AtomicU64::new(0);
 /// Each process' MAIN-thread TEB tail frame cap, so a transition report can ask the decisive
 /// question: is this frame ALIASED — registered/cached under some OTHER key, so that a write win32k
 /// or a demand fill makes elsewhere lands in this TEB?
-pub(crate) static TEB2_FRAME_CAP: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static mut TEB2_FRAME_CAP_ROWS: Vec<AtomicU64> = Vec::new();
 /// Bit `pi` set once `spawn_sec_image` has actually MAPPED that process' `scr + 0x5000` TEB-tail
 /// alias. Reading the alias before then is a #PF in the executive itself (measured).
-pub(crate) static TEB_TAIL_ALIAS_LIVE: AtomicU64 = AtomicU64::new(0);
+static mut TEB_TAIL_ALIAS_LIVE_ROWS: Vec<AtomicU64> = Vec::new();
 /// Per-pi "the tail was intact last time we looked" bit, so only the TRANSITION is reported.
-static TEB_WATCH_GOOD: [AtomicU64; MAX_PI] = [const { AtomicU64::new(1) }; MAX_PI];
+static mut TEB_WATCH_GOOD_ROWS: Vec<AtomicU64> = Vec::new();
+static TEB_TAIL_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static TEB_TAIL_ROW_MISSES: AtomicU64 = AtomicU64::new(0);
 static TEB_WATCH_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// Last observed value of winlogon's `TEB.ReservedForNtRpc` (TEB+0x1698) + a bounded report budget.
 pub(crate) static WL_NTRPC_SLOT: AtomicU64 = AtomicU64::new(0);
@@ -10633,22 +10670,126 @@ static TEB_WATCH_LAST_TAG: AtomicU64 = AtomicU64::new(u64::MAX);
 static TEB_WATCH_LAST_AUX: AtomicU64 = AtomicU64::new(0);
 static TEB_WATCH_LAST_AUX2: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn publish_process_teb_tail_alias(pi: usize, teb2_frame_cap: u64) {
-    if pi >= MAX_PI || pi >= 64 {
-        return;
+unsafe fn reset_teb_tail_atomic_process_rows(
+    rows: &mut Vec<AtomicU64>,
+    slots: usize,
+    value: u64,
+) -> bool {
+    rows.clear();
+    if rows.try_reserve(slots).is_err() {
+        TEB_TAIL_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
-    TEB2_FRAME_CAP[pi].store(teb2_frame_cap, Ordering::Relaxed);
-    TEB_WATCH_GOOD[pi].store(1, Ordering::Relaxed);
-    TEB_TAIL_ALIAS_LIVE.fetch_or(1u64 << pi, Ordering::Relaxed);
+    while rows.len() < slots {
+        rows.push(AtomicU64::new(value));
+    }
+    for row in rows.iter() {
+        row.store(value, Ordering::Relaxed);
+    }
+    true
+}
+
+pub(crate) fn reset_teb_tail_process_rows(slots: usize) -> bool {
+    unsafe {
+        let frame_rows = reset_teb_tail_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(TEB2_FRAME_CAP_ROWS),
+            slots,
+            0,
+        );
+        let live_rows = reset_teb_tail_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(TEB_TAIL_ALIAS_LIVE_ROWS),
+            slots,
+            0,
+        );
+        let watch_rows = reset_teb_tail_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(TEB_WATCH_GOOD_ROWS),
+            slots,
+            1,
+        );
+        frame_rows && live_rows && watch_rows
+    }
+}
+
+unsafe fn teb2_frame_cap_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(TEB2_FRAME_CAP_ROWS)).get(pi)
+}
+
+unsafe fn teb_tail_alias_live_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(TEB_TAIL_ALIAS_LIVE_ROWS)).get(pi)
+}
+
+unsafe fn teb_watch_good_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(TEB_WATCH_GOOD_ROWS)).get(pi)
+}
+
+fn note_teb_tail_row_miss() {
+    TEB_TAIL_ROW_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn teb_tail_alias_live_for_pi(pi: usize) -> bool {
+    unsafe {
+        teb_tail_alias_live_row(pi)
+            .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
+    }
+}
+
+fn teb_tail_row_stats() -> (usize, usize, usize, usize, usize, usize, u64, u64, u64) {
+    unsafe {
+        let frame_rows = &*core::ptr::addr_of!(TEB2_FRAME_CAP_ROWS);
+        let live_rows = &*core::ptr::addr_of!(TEB_TAIL_ALIAS_LIVE_ROWS);
+        let watch_rows = &*core::ptr::addr_of!(TEB_WATCH_GOOD_ROWS);
+        let live_count = live_rows
+            .iter()
+            .filter(|row| row.load(Ordering::Relaxed) != 0)
+            .count() as u64;
+        (
+            frame_rows.len(),
+            frame_rows.capacity(),
+            live_rows.len(),
+            live_rows.capacity(),
+            watch_rows.len(),
+            watch_rows.capacity(),
+            live_count,
+            TEB_TAIL_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            TEB_TAIL_ROW_MISSES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) fn publish_process_teb_tail_alias(pi: usize, teb2_frame_cap: u64) {
+    let Some(frame_row) = (unsafe { teb2_frame_cap_row(pi) }) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    let Some(live_row) = (unsafe { teb_tail_alias_live_row(pi) }) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    let Some(watch_row) = (unsafe { teb_watch_good_row(pi) }) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    frame_row.store(teb2_frame_cap, Ordering::Relaxed);
+    watch_row.store(1, Ordering::Relaxed);
+    live_row.store(1, Ordering::Relaxed);
 }
 
 pub(crate) fn revoke_process_teb_tail_alias(pi: usize) {
-    if pi >= MAX_PI || pi >= 64 {
+    let Some(frame_row) = (unsafe { teb2_frame_cap_row(pi) }) else {
+        note_teb_tail_row_miss();
         return;
-    }
-    TEB_TAIL_ALIAS_LIVE.fetch_and(!(1u64 << pi), Ordering::Relaxed);
-    TEB2_FRAME_CAP[pi].store(0, Ordering::Relaxed);
-    TEB_WATCH_GOOD[pi].store(1, Ordering::Relaxed);
+    };
+    let Some(live_row) = (unsafe { teb_tail_alias_live_row(pi) }) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    let Some(watch_row) = (unsafe { teb_watch_good_row(pi) }) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    live_row.store(0, Ordering::Relaxed);
+    frame_row.store(0, Ordering::Relaxed);
+    watch_row.store(1, Ordering::Relaxed);
     if pi == 2 {
         WL_NTRPC_SLOT.store(0, Ordering::Relaxed);
         WL_NTRPC_LAST_TAG.store(u64::MAX, Ordering::Relaxed);
@@ -10661,9 +10802,17 @@ pub(crate) fn revoke_process_teb_tail_alias(pi: usize) {
 /// dispatch, 2 = after one) — the measurement that says whether a win32k dispatch is the writer at
 /// all, rather than assuming it from the fact that the value looks like USER data.
 pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
-    if pi >= MAX_PI || TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << pi) == 0 {
+    let Some(live_row) = teb_tail_alias_live_row(pi) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    if live_row.load(Ordering::Relaxed) == 0 {
         return;
     }
+    let Some(watch_row) = teb_watch_good_row(pi) else {
+        note_teb_tail_row_miss();
+        return;
+    };
     let env_scratch = env_scratch_base_for_pi(pi);
     if env_scratch == 0 {
         return;
@@ -10711,7 +10860,7 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
     let max = core::ptr::read_volatile((tail + 2) as *const u16);
     let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
     let good = max == 522 && buffer == SMSS_TEB_VA + 0x1268;
-    let was_good = TEB_WATCH_GOOD[pi].swap(good as u64, Ordering::Relaxed) != 0;
+    let was_good = watch_row.swap(good as u64, Ordering::Relaxed) != 0;
     if good || !was_good {
         TEB_WATCH_LAST_TAG.store(tag, Ordering::Relaxed);
         TEB_WATCH_LAST_AUX.store(aux, Ordering::Relaxed);
@@ -25415,6 +25564,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
     if !reset_image_map_cap_bank_process_rows(MAX_PI) {
         panic!("image map cap-bank process row allocation failed");
+    }
+    if !reset_teb_tail_process_rows(MAX_PI) {
+        panic!("TEB-tail process row allocation failed");
     }
     if !win32k_glue::reset_win32k_client_process_rows(MAX_PI) {
         panic!("win32k client process row allocation failed");

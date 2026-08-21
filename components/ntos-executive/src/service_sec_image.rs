@@ -6203,7 +6203,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // The live TEB tail through the executive's persistent alias: TEB+0x1698 is
                 // `ReservedForNtRpc`, rpcrt4's per-thread `threaddata` cache.
-                if crate::TEB_TAIL_ALIAS_LIVE.load(Ordering::Relaxed) & (1u64 << 2) != 0 {
+                if crate::teb_tail_alias_live_for_pi(2) {
                     print_str(b"[cs-diag] live TEB+0x1680..0x16b0:");
                     let mut off = 0u64;
                     while off < 0x30 {

@@ -619,9 +619,29 @@ reports `posted-chars=13 retrieved-chars=13 return posted/retrieved=1/1 gdi-read
 `image-bank-rows=24/24/0`, and commits writable profile state with
 `[writable-fs-snapshot] committed generation=5 bytes=822086`. Review adjustment:
 shared-image cap-bank per-process live-count rows no longer have fixed backing storage. The
-remaining fixed `MAX_PI` users are diagnostic row summaries (`W32_TOTAL_DISPATCH`,
-`TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) or remaining live TEB-tail rows
-(`TEB2_FRAME_CAP`, `TEB_WATCH_GOOD`) and should be audited next.
+remaining fixed `MAX_PI` users at this checkpoint were diagnostic row summaries
+(`W32_TOTAL_DISPATCH`, `TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) plus the live
+TEB-tail rows (`TEB2_FRAME_CAP`, `TEB_WATCH_GOOD`); the following TEB-tail slice closes the latter.
+
+A4/B3 TEB-tail process-row scaling cleanup (2026-08-21): the live TEB-tail alias watch state no
+longer uses the remaining `[AtomicU64; MAX_PI]` arrays or the old 64-bit live mask. The executive now
+provisions vector-backed process rows for TEB-tail frame caps, live state, and watch-good
+transitions before the SEC_IMAGE workload, and publish/revoke/watch paths fail closed with a
+separate row-miss counter if rows are not present. The TEB-tail diagnostics now use
+`teb_tail_alias_live_for_pi()` instead of reading a global bitmask directly, and the pool census
+reports `teb-tail-rows=<frame len/cap>:<live len/cap>:<watch len/cap>/<live>/<alloc-fail>/<miss>`.
+Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-teb-tail-rows-row-miss-20260821.log` reaches genuine userinit/Explorer launch and Explorer
+shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobbered_by_win32k`,
+`exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
+reports `teb-tail-rows=24/24:24/24:24/24/14/0/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822086`. Review adjustment: the remaining
+fixed `MAX_PI` rows are diagnostic summaries (`W32_TOTAL_DISPATCH`,
+`TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) plus process-manager admission tables.
+Audit diagnostic tables by whether they are still useful, and keep process admission policy separate
+from per-process mechanism storage.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
