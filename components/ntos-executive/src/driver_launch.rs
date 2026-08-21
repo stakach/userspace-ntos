@@ -13131,17 +13131,6 @@ struct HostedProviderSummary {
 }
 
 impl HostedProviderSummary {
-    const fn empty() -> Self {
-        Self {
-            provider: HostedAscii::empty(),
-            primary_count: 0,
-            primary_image_bytes: 0,
-            private_count: 0,
-            private_image_bytes: 0,
-            first_private_instance: 0,
-        }
-    }
-
     fn present(&self) -> bool {
         self.primary_count != 0 || self.private_count != 0
     }
@@ -13657,15 +13646,8 @@ impl HostedProviderPointerAllocation {
 }
 
 static mut HOSTED_DEP_IMAGES: Option<Vec<LoadedDependencyImage>> = None;
-const HOSTED_PROVIDER_SUMMARY_CAP: usize = 128;
-static mut HOSTED_PROVIDER_SUMMARIES: [HostedProviderSummary; HOSTED_PROVIDER_SUMMARY_CAP] =
-    [HostedProviderSummary::empty(); HOSTED_PROVIDER_SUMMARY_CAP];
-static HOSTED_PROVIDER_SUMMARY_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_LOAD_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
-const HOSTED_PROVIDER_SINGLETON_CAP: usize = 16;
-static mut HOSTED_PROVIDER_SINGLETONS: [HostedProviderSingleton; HOSTED_PROVIDER_SINGLETON_CAP] =
-    [HostedProviderSingleton::empty(); HOSTED_PROVIDER_SINGLETON_CAP];
-static HOSTED_PROVIDER_SINGLETON_COUNT: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_SUMMARIES: Option<Vec<HostedProviderSummary>> = None;
+static mut HOSTED_PROVIDER_SINGLETONS: Option<Vec<HostedProviderSingleton>> = None;
 static HOSTED_PROVIDER_DOMAIN_BINDINGS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_SINGLETON_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_SINGLETON_CONFLICTS: AtomicU64 = AtomicU64::new(0);
@@ -13739,6 +13721,30 @@ unsafe fn clear_hosted_dependency_images() {
     if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
         images.clear();
     }
+}
+
+unsafe fn hosted_provider_summaries_mut() -> &'static mut Vec<HostedProviderSummary> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_SUMMARIES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_summaries() -> Option<&'static Vec<HostedProviderSummary>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_SUMMARIES)).as_ref()
+}
+
+unsafe fn hosted_provider_singletons_mut() -> &'static mut Vec<HostedProviderSingleton> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_singletons() -> Option<&'static Vec<HostedProviderSingleton>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETONS)).as_ref()
 }
 
 unsafe fn hosted_provider_callback_records_mut(
@@ -13892,13 +13898,8 @@ unsafe fn record_hosted_provider_load(
     instance: usize,
     image_len: u32,
 ) {
-    let summaries =
-        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SUMMARIES) as *mut HostedProviderSummary;
-    let count = HOSTED_PROVIDER_SUMMARY_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let summary = &mut *summaries.add(index);
+    let summaries = hosted_provider_summaries_mut();
+    for summary in summaries.iter_mut() {
         if summary.present() && hosted_ascii_eq_ignore_case(&summary.provider, &provider) {
             match role {
                 HostedProviderLoadRole::PrimaryService => {
@@ -13917,14 +13918,9 @@ unsafe fn record_hosted_provider_load(
             }
             return;
         }
-        index += 1;
     }
-    if count >= HOSTED_PROVIDER_SUMMARY_CAP {
-        HOSTED_PROVIDER_LOAD_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let summary = &mut *summaries.add(count);
-    *summary = HostedProviderSummary {
+
+    let mut summary = HostedProviderSummary {
         provider,
         primary_count: 0,
         primary_image_bytes: 0,
@@ -13932,7 +13928,6 @@ unsafe fn record_hosted_provider_load(
         private_image_bytes: 0,
         first_private_instance: 0,
     };
-    HOSTED_PROVIDER_SUMMARY_COUNT.store((count + 1) as u64, Ordering::Relaxed);
     match role {
         HostedProviderLoadRole::PrimaryService => {
             summary.primary_count = 1;
@@ -13944,26 +13939,17 @@ unsafe fn record_hosted_provider_load(
             summary.first_private_instance = (instance as u64).saturating_add(1);
         }
     }
-}
-
-unsafe fn hosted_provider_singleton_at(index: usize) -> HostedProviderSingleton {
-    let singletons =
-        core::ptr::addr_of!(HOSTED_PROVIDER_SINGLETONS) as *const HostedProviderSingleton;
-    *singletons.add(index)
+    summaries.push(summary);
 }
 
 unsafe fn find_hosted_provider_singleton(
     provider: &HostedAscii<HOSTED_DEP_PROVIDER_MAX>,
 ) -> Option<(usize, HostedProviderSingleton)> {
-    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let singleton = hosted_provider_singleton_at(index);
+    let singletons = hosted_provider_singletons()?;
+    for (index, singleton) in singletons.iter().copied().enumerate() {
         if singleton.present && hosted_ascii_eq_ignore_case(&singleton.provider, provider) {
             return Some((index, singleton));
         }
-        index += 1;
     }
     None
 }
@@ -13974,31 +13960,21 @@ unsafe fn find_hosted_provider_singleton_by_cookie(
     if provider_domain_cookie == 0 {
         return None;
     }
-    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let singleton = hosted_provider_singleton_at(index);
+    let singletons = hosted_provider_singletons()?;
+    for (index, singleton) in singletons.iter().copied().enumerate() {
         if singleton.present && singleton.provider_domain_cookie == provider_domain_cookie {
             return Some((index, singleton));
         }
-        index += 1;
     }
     None
 }
 
 unsafe fn clear_hosted_provider_singletons_for_instance(instance: usize) {
-    let singletons =
-        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
-    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_SINGLETON_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let singleton = &mut *singletons.add(index);
+    let singletons = hosted_provider_singletons_mut();
+    for singleton in singletons.iter_mut() {
         if singleton.present && singleton.instance == instance {
             *singleton = HostedProviderSingleton::empty();
         }
-        index += 1;
     }
 }
 
@@ -14040,24 +14016,20 @@ unsafe fn register_hosted_provider_singleton(
         return false;
     }
 
-    let count = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed) as usize;
-    if count >= HOSTED_PROVIDER_SINGLETON_CAP {
+    let singletons = hosted_provider_singletons_mut();
+    let Some(provider_domain_cookie) = (singletons.len() as u64).checked_add(1) else {
         HOSTED_PROVIDER_SINGLETON_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[driver-launch] provider singleton table exhausted before ");
+        print_str(b"[driver-launch] provider singleton cookie exhausted before ");
         print_str(provider.as_bytes());
         print_str(b"\n");
         return false;
-    }
-
-    let singletons =
-        core::ptr::addr_of_mut!(HOSTED_PROVIDER_SINGLETONS) as *mut HostedProviderSingleton;
-    let provider_domain_cookie = (count as u64).saturating_add(1);
+    };
     let export_call_gate = if hosted_provider_has_export_marshal_policies(provider.as_str()) {
         hosted_provider_export_gate_va()
     } else {
         0
     };
-    *singletons.add(count) = HostedProviderSingleton {
+    singletons.push(HostedProviderSingleton {
         present: true,
         provider,
         instance,
@@ -14070,8 +14042,7 @@ unsafe fn register_hosted_provider_singleton(
         pool_frames,
         export_call_gate,
         provider_domain_cookie,
-    };
-    HOSTED_PROVIDER_SINGLETON_COUNT.store((count + 1) as u64, Ordering::Relaxed);
+    });
     print_str(b"[driver-launch] provider singleton published ");
     print_str(provider.as_bytes());
     print_str(b" frames=");
@@ -14090,16 +14061,10 @@ unsafe fn register_hosted_provider_singleton(
 }
 
 pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidence {
-    let count = HOSTED_PROVIDER_SUMMARY_COUNT.load(Ordering::Relaxed) as usize;
     let mut evidence = HostedProviderSharingEvidence::default();
-    if count != 0 {
-        let bounded_count = count.min(HOSTED_PROVIDER_SUMMARY_CAP);
-        let summaries = unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::addr_of!(HOSTED_PROVIDER_SUMMARIES) as *const HostedProviderSummary,
-                bounded_count,
-            )
-        };
+    unsafe {
+        let summaries = hosted_provider_summaries();
+        if let Some(summaries) = summaries {
         for summary in summaries {
             evidence.primary_services = evidence
                 .primary_services
@@ -14134,9 +14099,11 @@ pub(crate) fn hosted_provider_sharing_evidence() -> HostedProviderSharingEvidenc
                     .saturating_add(summary.private_count);
             }
         }
+        }
+        if let Some(singletons) = hosted_provider_singletons() {
+            evidence.singleton_providers = singletons.iter().filter(|record| record.present).count() as u64;
+        }
     }
-    evidence.overflowed_load_records = HOSTED_PROVIDER_LOAD_OVERFLOWS.load(Ordering::Relaxed);
-    evidence.singleton_providers = HOSTED_PROVIDER_SINGLETON_COUNT.load(Ordering::Relaxed);
     evidence.provider_domain_bindings = HOSTED_PROVIDER_DOMAIN_BINDINGS.load(Ordering::Relaxed);
     evidence.singleton_overflows = HOSTED_PROVIDER_SINGLETON_OVERFLOWS.load(Ordering::Relaxed);
     evidence.singleton_conflicts = HOSTED_PROVIDER_SINGLETON_CONFLICTS.load(Ordering::Relaxed);

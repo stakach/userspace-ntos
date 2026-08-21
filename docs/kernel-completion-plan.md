@@ -158,6 +158,20 @@ adjustment: the remaining provider singleton and summary tables are diagnostic/p
 rather than per-callback runtime transport capacity; audit them separately if the provider mix grows
 past today's NDIS stack.
 
+B3 provider-publication table scaling cleanup (2026-08-21): provider load
+summaries and provider singleton publication records now grow in vectors instead of fixed 128/16-entry
+executive arrays. Provider-domain cookies remain stable as `vector index + 1`; cleared singleton
+slots stay in place so old cookies are not accidentally reused, while new providers append new
+publication records. Local validation is green for `cargo fmt --all` and executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+plus `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-b3-provider-publication-vec-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing and keeps provider sharing alive with `exports=49/49`,
+`callbacks=24/25`, `singletons=9` live present providers, zero export rejections, and zero singleton
+overflow/conflict records. Review adjustment: this removes the remaining fixed provider-domain
+publication/summary caps from the current NDIS provider path; remaining B3 static state should now be
+audited outside the provider-domain transport cluster.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
