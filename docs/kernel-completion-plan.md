@@ -76,6 +76,16 @@ AddDevice/StartDevice through the generic path, provider sharing reports `export
 zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrome paints with
 `292/292` checks passing. The remaining B3 packet frontier is true TX traffic from the real stack
 and live proof of packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`.
+Latest B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
+validated provider DMA allocation records back into the bound miniport devnode after real miniport
+send callbacks, and hardware-bound packet completion exports request DMA copyback so SG-map release
+stays in the same validated record model. Serialized desktop proof
+`.tmp/run-desktop-b3-provider-dma-send-copyback-20260821.log` remains fully green with `292/292` and
+Explorer shell chrome painted. The proof advances the B3 evidence from no transfer mapping to a real
+TX-ring map-transfer observation (`dma_desc_common/map=128/1`) while preserving E1000 RX
+(`dma_dev_tx/rx=0/1`) and zero provider rejections. The active gap is now descriptor completion over
+the real E1000 tail/head window: the packet is mapped and a TX descriptor is visible, but the hosted
+packet model has not yet completed it as device TX.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -8269,6 +8279,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `0xc000009a` before any TX descriptor is posted (`dma_desc_common/map=256/0`,
     `dma_dev_tx/rx=0/2`), so the next slice must diagnose and fix the generic packet/MDL SG
     marshalling path rather than adding E1000-specific behavior.
+    Provider DMA send-copyback follow-up (2026-08-21): the provider-domain send path now treats
+    SG map-transfer records as part of the bound hardware devnode state, not as private provider
+    state. `NdisSend` and `NdisSendPackets` copy validated provider DMA records back into the
+    dependent miniport after real send callbacks, replay those records through the hosted DMA
+    manager, and refresh the device resource projection. Hardware-bound in/out packet exports also
+    request DMA copyback so completion-time `PutScatterGatherList` updates are imported through the
+    same fail-closed record validator. Local validation is green: `cargo fmt --all`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Serialized desktop validation
+    `.tmp/run-desktop-b3-provider-dma-send-copyback-20260821.log` reaches Explorer shell chrome with
+    `292/292`, keeps `pci_provider_exports=44/44` with zero rejections, and changes E1000 evidence
+    from no transfer-map descriptor to `dma_desc_common/map=128/1`. Remaining B3 TX work has moved
+    below SG creation: the TX descriptor is visible in the ring, but `dma_dev_tx/rx` is still `0/1`,
+    so the next slice should inspect and fix the real E1000 `TDH`/`TDT` completion window without
+    adding send-success or packet-specific fallbacks.
   - `[~]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

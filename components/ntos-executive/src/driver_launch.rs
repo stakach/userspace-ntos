@@ -18640,6 +18640,11 @@ unsafe fn prepare_provider_export_marshal(
                 let free_on_success =
                     policy.side_effect == HostedProviderExportSideEffect::NdisPacketFree;
                 state.ndis_packet_free_on_success = free_on_success;
+                if !free_on_success
+                    && hosted_resource_binding_by_device_id(dependent_inst.device_id).is_some()
+                {
+                    state.dma_state_copyback = true;
+                }
                 let provider_packet = provider_marshal_ndis_packet(
                     &mut state,
                     provider_instance,
@@ -18886,6 +18891,9 @@ unsafe fn prepare_provider_export_marshal(
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
                 };
+                if hosted_resource_binding_by_device_id(dependent_inst.device_id).is_some() {
+                    state.dma_state_copyback = true;
+                }
                 provider_marshal_ndis_packet_array(
                     &mut state,
                     provider_instance,
@@ -19242,6 +19250,21 @@ unsafe fn complete_provider_dma_state(
             print_str(b"\n");
         }
     }
+}
+
+unsafe fn copy_provider_dma_state_to_bound_dependent(
+    binding: HostedDeviceBinding,
+    dependent_shared: u64,
+    provider_shared: u64,
+) -> Result<(), i32> {
+    if !provider_dma_allocation_records_valid(provider_shared) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    copy_provider_dma_projection_fields(dependent_shared, provider_shared);
+    copy_provider_dma_allocation_records(dependent_shared, provider_shared);
+    replay_hosted_dma_allocation_records(binding, dependent_shared).map_err(|status| status.raw())?;
+    refresh_hosted_device_resource_state(binding, dependent_shared);
+    Ok(())
 }
 
 fn provider_policy_resource_list_args(
@@ -20342,6 +20365,13 @@ unsafe fn service_ndis_send_callback(
         refreshed,
         true,
     )?;
+    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_inst.device_id) {
+        copy_provider_dma_state_to_bound_dependent(
+            binding,
+            dependent_inst.exec_shared_va,
+            provider_inst.exec_shared_va,
+        )?;
+    }
     Ok(result)
 }
 
@@ -20429,6 +20459,13 @@ unsafe fn service_ndis_send_packets_callback(
             )?;
         }
         index += 1;
+    }
+    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_inst.device_id) {
+        copy_provider_dma_state_to_bound_dependent(
+            binding,
+            dependent_inst.exec_shared_va,
+            provider_inst.exec_shared_va,
+        )?;
     }
     Ok(result)
 }
