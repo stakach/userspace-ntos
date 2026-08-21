@@ -172,6 +172,20 @@ overflow/conflict records. Review adjustment: this removes the remaining fixed p
 publication/summary caps from the current NDIS provider path; remaining B3 static state should now be
 audited outside the provider-domain transport cluster.
 
+A4/B3 DCE/RPC diagnostic table scaling cleanup (2026-08-21): the named-pipe
+DCE/RPC read-reassembly and context-flow diagnostic stores now grow in vectors instead of fixed
+16/256-entry executive arrays. Fragmented read capture still reuses cleared slots for completed
+PDUs, but it appends for additional concurrent pipe/FID fragments instead of rotating over live
+diagnostic state; context UUID flow records append instead of dropping observations after the old
+fixed table fills. Local validation is green for `cargo fmt --all` and executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+plus `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-dcerpc-diagnostic-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing and keeps `exec_lsa_rpc_handoff_reaches_new_client`, `exec_lsa_worker_route`, and
+`exec_lsarpc_deadlock_guarded` green while emitting vector-backed `[fsd-pipe-rpc-read]` and
+`[fsd-pipe-rpc-ctx]` observations. Review adjustment: continue auditing the remaining fixed runtime
+tables by subsystem ownership rather than collecting them under the provider-domain cleanup.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

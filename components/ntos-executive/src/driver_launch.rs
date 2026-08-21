@@ -716,11 +716,9 @@ static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 static mut PIPE_TRANSCEIVE_TRACE_COUNT: u32 = 0;
 const PIPE_RW_TRACE_CAP: u32 = 768;
 const PIPE_TRANSCEIVE_TRACE_CAP: u32 = 384;
-const DCERPC_READ_REASSEMBLY_CAP: usize = 16;
 const DCERPC_READ_REASSEMBLY_BYTES: usize = 512;
 const DCERPC_READ_REASSEMBLY_TRACE_CAP: u32 = 160;
 const DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_CAP: u32 = 192;
-const DCERPC_CONTEXT_FLOW_CAP: usize = 256;
 const DCERPC_CONTEXT_FLOW_CREATE_TRACE_CAP: u32 = 64;
 const DCERPC_CONTEXT_FLOW_USE_TRACE_CAP: u32 = 96;
 const DCERPC_CONTEXT_FLOW_MISS_TRACE_CAP: u32 = 96;
@@ -1881,17 +1879,33 @@ const EMPTY_DCERPC_CONTEXT_FLOW: DceRpcContextFlow = DceRpcContextFlow {
     request_count: 0,
 };
 
-static mut DCERPC_READ_REASSEMBLY: [DceRpcReadAssembly; DCERPC_READ_REASSEMBLY_CAP] =
-    [EMPTY_DCERPC_READ_ASSEMBLY; DCERPC_READ_REASSEMBLY_CAP];
-static mut DCERPC_READ_REASSEMBLY_CURSOR: usize = 0;
+static mut DCERPC_READ_REASSEMBLY: Option<Vec<DceRpcReadAssembly>> = None;
 static mut DCERPC_READ_REASSEMBLY_TRACE_COUNT: u32 = 0;
 static mut DCERPC_READ_REASSEMBLY_CONTEXT_TRACE_COUNT: u32 = 0;
-static mut DCERPC_CONTEXT_FLOW: [DceRpcContextFlow; DCERPC_CONTEXT_FLOW_CAP] =
-    [EMPTY_DCERPC_CONTEXT_FLOW; DCERPC_CONTEXT_FLOW_CAP];
-static mut DCERPC_CONTEXT_FLOW_DROPS: u32 = 0;
+static mut DCERPC_CONTEXT_FLOW: Option<Vec<DceRpcContextFlow>> = None;
 static mut DCERPC_CONTEXT_FLOW_CREATE_TRACE_COUNT: u32 = 0;
 static mut DCERPC_CONTEXT_FLOW_USE_TRACE_COUNT: u32 = 0;
 static mut DCERPC_CONTEXT_FLOW_MISS_TRACE_COUNT: u32 = 0;
+
+unsafe fn dcerpc_read_reassembly_table_mut() -> &'static mut Vec<DceRpcReadAssembly> {
+    let slot = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn dcerpc_context_flow_table_mut() -> &'static mut Vec<DceRpcContextFlow> {
+    let slot = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn dcerpc_context_flow_table() -> Option<&'static Vec<DceRpcContextFlow>> {
+    (&*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW)).as_ref()
+}
 
 impl PipeCcbView {
     fn has_queued_state(&self) -> bool {
@@ -2049,7 +2063,7 @@ unsafe fn trace_dcerpc_read_reassembly(
 }
 
 unsafe fn dcerpc_read_reassembly_active_slot(fid: u64) -> Option<usize> {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let table = dcerpc_read_reassembly_table_mut();
     for (index, entry) in table.iter().enumerate() {
         if entry.fid == fid && entry.frag_len >= 16 && entry.len < entry.frag_len {
             return Some(index);
@@ -2059,20 +2073,19 @@ unsafe fn dcerpc_read_reassembly_active_slot(fid: u64) -> Option<usize> {
 }
 
 unsafe fn dcerpc_read_reassembly_new_slot(fid: u64) -> usize {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let table = dcerpc_read_reassembly_table_mut();
     for (index, entry) in table.iter().enumerate() {
         if entry.fid == 0 || entry.fid == fid {
             return index;
         }
     }
-    let index = DCERPC_READ_REASSEMBLY_CURSOR % DCERPC_READ_REASSEMBLY_CAP;
-    DCERPC_READ_REASSEMBLY_CURSOR =
-        (DCERPC_READ_REASSEMBLY_CURSOR + 1) % DCERPC_READ_REASSEMBLY_CAP;
+    let index = table.len();
+    table.push(EMPTY_DCERPC_READ_ASSEMBLY);
     index
 }
 
 unsafe fn dcerpc_read_reassembly_start(index: usize, fid: u64, frag_len: u16) {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let table = dcerpc_read_reassembly_table_mut();
     table[index] = DceRpcReadAssembly {
         fid,
         frag_len,
@@ -2082,7 +2095,7 @@ unsafe fn dcerpc_read_reassembly_start(index: usize, fid: u64, frag_len: u16) {
 }
 
 unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u64) -> bool {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let table = dcerpc_read_reassembly_table_mut();
     let entry = &mut table[index];
     let target_len = core::cmp::min(entry.frag_len as usize, DCERPC_READ_REASSEMBLY_BYTES);
     let have = entry.len as usize;
@@ -2098,7 +2111,7 @@ unsafe fn dcerpc_read_reassembly_append(index: usize, payload: u64, chunk_len: u
 }
 
 unsafe fn dcerpc_read_reassembly_emit(index: usize, status: u32, info: u64) {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
+    let table = dcerpc_read_reassembly_table_mut();
     let entry = table[index];
     let view = dcerpc_pdu_view(entry.buf.as_ptr() as u64, entry.len as u64);
     let Some(view) = view else {
@@ -2142,9 +2155,10 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
     for context in pdu.context_handles.iter().flatten() {
         let existing_index = dcerpc_context_flow_find(context.uuid);
         let seen_response = existing_index
-            .map(|index| {
-                let table = &*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW);
-                table[index].response_count != 0
+            .and_then(|index| {
+                dcerpc_context_flow_table()
+                    .and_then(|table| table.get(index))
+                    .map(|entry| entry.response_count != 0)
             })
             .unwrap_or(false);
         let Some(index) = existing_index.or_else(|| dcerpc_context_flow_alloc(context.uuid)) else {
@@ -2157,7 +2171,7 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
             continue;
         };
 
-        let table = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
+        let table = dcerpc_context_flow_table_mut();
         let entry = &mut table[index];
         match pdu.ptype {
             0 => {
@@ -2218,7 +2232,7 @@ unsafe fn dcerpc_trace_context_flow(fid: u64, pdu: DceRpcPduView) {
 }
 
 unsafe fn dcerpc_context_flow_find(uuid: [u8; 16]) -> Option<usize> {
-    let table = &*core::ptr::addr_of!(DCERPC_CONTEXT_FLOW);
+    let table = dcerpc_context_flow_table()?;
     for (index, entry) in table.iter().enumerate() {
         if (entry.response_count != 0 || entry.request_count != 0) && entry.uuid == uuid {
             return Some(index);
@@ -2228,7 +2242,7 @@ unsafe fn dcerpc_context_flow_find(uuid: [u8; 16]) -> Option<usize> {
 }
 
 unsafe fn dcerpc_context_flow_alloc(uuid: [u8; 16]) -> Option<usize> {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_CONTEXT_FLOW);
+    let table = dcerpc_context_flow_table_mut();
     for (index, entry) in table.iter_mut().enumerate() {
         if entry.response_count == 0 && entry.request_count == 0 {
             *entry = DceRpcContextFlow {
@@ -2238,8 +2252,12 @@ unsafe fn dcerpc_context_flow_alloc(uuid: [u8; 16]) -> Option<usize> {
             return Some(index);
         }
     }
-    DCERPC_CONTEXT_FLOW_DROPS = DCERPC_CONTEXT_FLOW_DROPS.saturating_add(1);
-    None
+    let index = table.len();
+    table.push(DceRpcContextFlow {
+        uuid,
+        ..EMPTY_DCERPC_CONTEXT_FLOW
+    });
+    Some(index)
 }
 
 unsafe fn dcerpc_print_context_flow(
@@ -2294,16 +2312,13 @@ unsafe fn dcerpc_print_context_flow(
             print_u64(entry.first_request_op as u64);
         }
     }
-    if DCERPC_CONTEXT_FLOW_DROPS != 0 {
-        print_str(b" drops=");
-        print_u64(DCERPC_CONTEXT_FLOW_DROPS as u64);
-    }
     print_str(b"\n");
 }
 
 unsafe fn dcerpc_read_reassembly_clear(index: usize) {
-    let table = &mut *core::ptr::addr_of_mut!(DCERPC_READ_REASSEMBLY);
-    table[index] = EMPTY_DCERPC_READ_ASSEMBLY;
+    if let Some(entry) = dcerpc_read_reassembly_table_mut().get_mut(index) {
+        *entry = EMPTY_DCERPC_READ_ASSEMBLY;
+    }
 }
 
 unsafe fn dcerpc_context_handles(
