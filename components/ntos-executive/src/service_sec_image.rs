@@ -5531,7 +5531,9 @@ pub(crate) unsafe fn service_sec_image(
             drained
         };
         if overdue_timed_wakes != 0 {
-            bump_progress();
+            // Timer drains are scheduler bookkeeping, not forward progress by themselves. The
+            // resumed waiter will bump PROGRESS_EPOCH if it performs real load/fill/event/paint
+            // work; counting the wake itself can keep the boot alive forever on timeout churn.
             if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
                 if watchdog_defer_if_hosted_work_can_run(b"overdue-timer") {
                     wait_parked = wait_parked_owner_mask(&nt_handler);

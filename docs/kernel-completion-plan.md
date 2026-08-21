@@ -7981,7 +7981,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     quiesce snapshot around the no-readiness frontier, then rerun so the next proof identifies the
     exact running thread and call site instead of relying on a partial census. Closed by the LSASS
     readiness visibility and later shell-launch proofs below.
-  - `[~]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural
+  - `[x]` Boot packaging design note: hitting BOOTBOOT's 16 MiB boot-image limit is a structural
     smell, not a resource problem to solve by inflating the monolithic image. The preferred direction
     is a small rust-micro seL4/rootserver boot image loaded directly by BOOTBOOT, plus an
     initrd/folder manifest that carries the NT personality set as separate artifacts: executive,
@@ -7997,7 +7997,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `8460800 bytes`, and staged Rust ntdll `1797120 bytes`, so the image is still below the 16 MiB
     kernel wall but has little headroom. The preferred split remains BOOTBOOT loading only the
     rust-micro seL4/rootserver image, with NT personalities/services/drivers carried as manifest
-    entries in initrd/folder storage.
+    entries in initrd/folder storage. Cleanup slice (2026-08-21): inspection showed that
+    `boot/rootserver` already comes from the BOOTBOOT initrd instead of being compiled into the
+    kernel. The remaining avoidable coupling was build-mode ownership: `build_kernel.sh` still forced
+    the internal `spec` feature into hosted desktop images. The hosted `extern-rootserver` build now
+    defaults to a lean non-spec kernel while preserving explicit kernel-spec runs through the default
+    standalone build, an explicit `spec` feature, or `KERNEL_SPECS=1`. Follow-up validation
+    (2026-08-21): `./rust-micro/scripts/build_kernel.sh extern-rootserver` reports
+    `kernel features: extern-rootserver`, BOOTBOOT loads the root task from the initrd
+    (`Initrd loaded ... 8206848 bytes`), the microkernel text image remains below the limit at
+    `15572992 bytes`, and serialized `.tmp/run-lean-extern-rootserver-20260821.log` reaches genuine
+    userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing. The default
+    standalone build still reports `kernel features: spec`. Follow-up top-level validation
+    `.tmp/run-headless-lean-hosted-top-quiesce-20260821.log` proves the normal `./run.sh` hosted
+    desktop path also reaches Explorer shell chrome with `293/293` checks passing. The service-loop
+    progress watchdog no longer counts overdue timer/IO-completion drain bookkeeping as real
+    forward progress; the resumed thread must perform demand-load, page-fill, event, or paint work
+    to reset the wall-clock quiesce window. Review adjustment: this closes the current
+    BOOTBOOT-size/build-mode coupling and the follow-on top-level gate drift; keep moving toward an
+    explicit manifest for the remaining NT personality artifacts rather than growing the
+    BOOTBOOT-visible payload.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
