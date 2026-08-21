@@ -3799,47 +3799,48 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
 // keyed by a level-tagged aligned index. Hosted client VAs can overlap win32k's high PML4 slot, so
 // the sparse pager treats `DeleteFirst` while mapping a paging structure as "that level already
 // exists" and only records levels whose map was observed to succeed or already be present.
-pub(crate) static mut W32_CLIENT_SEEN: [u64; 8192] = [0; 8192];
-pub(crate) static mut W32_CLIENT_SEEN_N: usize = 0;
+static mut W32_CLIENT_SEEN: Option<Vec<u64>> = None;
 const SEL4_FAILED_LOOKUP: u64 = 6;
 const SEL4_DELETE_FIRST: u64 = 8;
 static W32_PAGING_REPAIR_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static W32_PAGING_REPAIR_SUCCESSES: AtomicU64 = AtomicU64::new(0);
-pub(crate) unsafe fn w32_seen(key: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
-    let a = core::ptr::addr_of!(W32_CLIENT_SEEN) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(a.add(i)) == key {
-            return true;
-        }
+
+unsafe fn w32_client_seen_mut() -> &'static mut Vec<u64> {
+    let slot = &mut *core::ptr::addr_of_mut!(W32_CLIENT_SEEN);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
     }
-    false
+    slot.as_mut().unwrap()
 }
+
+pub(crate) unsafe fn w32_seen(key: u64) -> bool {
+    (&*core::ptr::addr_of!(W32_CLIENT_SEEN))
+        .as_ref()
+        .is_some_and(|entries| entries.iter().any(|entry| *entry == key))
+}
+
 pub(crate) unsafe fn w32_mark(key: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
-    if n < 8192 {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(W32_CLIENT_SEEN) as *mut u64).add(n),
-            key,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n + 1);
+    let entries = w32_client_seen_mut();
+    if entries.iter().any(|entry| *entry == key) {
+        return;
     }
+    if entries.try_reserve(1).is_err() {
+        print_str(b"[w32paging] seen-set allocation failed key=0x");
+        print_hex((key >> 32) as u32);
+        print_hex(key as u32);
+        print_str(b"\n");
+        return;
+    }
+    entries.push(key);
 }
 
 unsafe fn w32_forget(key: u64) -> bool {
-    let mut n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
-    let entries = core::ptr::addr_of_mut!(W32_CLIENT_SEEN) as *mut u64;
+    let entries = w32_client_seen_mut();
     let mut i = 0usize;
     let mut removed = false;
-    while i < n {
-        if core::ptr::read(entries.add(i)) == key {
-            let last = n - 1;
-            if i != last {
-                core::ptr::write(entries.add(i), core::ptr::read(entries.add(last)));
-            }
-            core::ptr::write(entries.add(last), 0);
-            n = last;
-            core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n);
+    while i < entries.len() {
+        if entries[i] == key {
+            entries.swap_remove(i);
             removed = true;
         } else {
             i += 1;

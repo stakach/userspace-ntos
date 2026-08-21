@@ -267,6 +267,20 @@ reports `ucb-redirects=893 ucb-returns=893`, and completes the quiesce writable-
 Review adjustment: this removes another fixed callback-context capacity limit; continue the
 remaining runtime-table audit by subsystem ownership.
 
+A4/B3 win32k paging seen-set scaling cleanup (2026-08-21): win32k's client paging hierarchy seen set
+now grows in a vector instead of silently stopping at an 8192-entry static array. The set still
+records level-tagged PDPT/PD/PT keys, rejects duplicates, and forgets stale hierarchy keys before
+repair. Allocation failure now emits an explicit `[w32paging]` diagnostic rather than pretending the
+key was recorded. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-w32-seen-vec-20260821.log` reaches Explorer shell chrome with `293/293` checks
+passing, keeps `exec_win32k_desktop_painted`, `exec_msgina_modal_paint_prefix`,
+`exec_explorer_user_callbacks_redirected`, and `exec_explorer_wndproc_installed_by_client` green,
+reports `ucb-redirects=906 ucb-returns=906`, and shows no `[w32paging]` allocation failures. Review
+adjustment: continue the win32k attach-table cleanup separately because attach records own live
+mapped caps and need fail-closed record insertion.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
