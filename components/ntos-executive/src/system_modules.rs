@@ -3,14 +3,31 @@
 //! The table is populated by actual image load paths. It is intentionally not a name oracle:
 //! enumeration reports modules that were registered after a PE was loaded and mapped.
 
+use alloc::vec::Vec;
 use nt_syscall::system_information::{SystemModuleEntry, RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE};
 
-pub(crate) const SYSTEM_MODULE_REGISTRY_CAP: usize = 64;
+static mut SYSTEM_MODULES: Option<Vec<SystemModuleEntry>> = None;
+static mut SYSTEM_MODULE_SNAPSHOT_WORK: Option<Vec<SystemModuleEntry>> = None;
 
-static mut SYSTEM_MODULES: [SystemModuleEntry; SYSTEM_MODULE_REGISTRY_CAP] =
-    [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
-static mut SYSTEM_MODULE_SNAPSHOT_WORK: [SystemModuleEntry; SYSTEM_MODULE_REGISTRY_CAP] =
-    [SystemModuleEntry::EMPTY; SYSTEM_MODULE_REGISTRY_CAP];
+unsafe fn system_modules_mut() -> &'static mut Vec<SystemModuleEntry> {
+    let slot = &mut *core::ptr::addr_of_mut!(SYSTEM_MODULES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn system_modules() -> Option<&'static Vec<SystemModuleEntry>> {
+    (&*core::ptr::addr_of!(SYSTEM_MODULES)).as_ref()
+}
+
+unsafe fn system_module_snapshot_work_mut() -> &'static mut Vec<SystemModuleEntry> {
+    let slot = &mut *core::ptr::addr_of_mut!(SYSTEM_MODULE_SNAPSHOT_WORK);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
 
 pub(crate) fn register_system_module(path: &[u8], image_base: u64, image_size: u32) -> bool {
     register_system_module_ex(path, image_base, image_base, image_size, 0, 1)
@@ -32,7 +49,7 @@ pub(crate) fn register_system_module_ex(
     };
 
     unsafe {
-        let modules = &mut *core::ptr::addr_of_mut!(SYSTEM_MODULES);
+        let modules = system_modules_mut();
         let mut empty = None;
         for index in 0..modules.len() {
             let existing = &modules[index];
@@ -55,8 +72,12 @@ pub(crate) fn register_system_module_ex(
             }
         }
 
-        let Some(index) = empty else {
-            return false;
+        let index = match empty {
+            Some(index) => index,
+            None => {
+                modules.push(SystemModuleEntry::EMPTY);
+                modules.len() - 1
+            }
         };
         write_system_module_entry(
             &mut modules[index],
@@ -72,27 +93,23 @@ pub(crate) fn register_system_module_ex(
     }
 }
 
-pub(crate) fn snapshot_system_modules(out: &mut [SystemModuleEntry]) -> usize {
-    let modules = unsafe { &*core::ptr::addr_of!(SYSTEM_MODULES) };
-    let mut count = 0usize;
-    for module in modules {
-        if module.full_path_name_len == 0 {
-            continue;
-        }
-        if count >= out.len() {
-            break;
-        }
-        out[count] = *module;
-        out[count].load_order_index = count.min(u16::MAX as usize) as u16;
-        count += 1;
-    }
-    count
-}
-
 pub(crate) fn system_module_snapshot_scratch() -> (&'static [SystemModuleEntry], usize) {
-    let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM_MODULE_SNAPSHOT_WORK) };
-    let count = snapshot_system_modules(snapshot);
-    (&snapshot[..count], count)
+    unsafe {
+        let snapshot = system_module_snapshot_work_mut();
+        snapshot.clear();
+        if let Some(modules) = system_modules() {
+            for module in modules {
+                if module.full_path_name_len == 0 {
+                    continue;
+                }
+                let mut entry = *module;
+                entry.load_order_index = snapshot.len().min(u16::MAX as usize) as u16;
+                snapshot.push(entry);
+            }
+        }
+        let count = snapshot.len();
+        (&snapshot[..count], count)
+    }
 }
 
 fn write_system_module_entry(

@@ -198,6 +198,19 @@ checks passing and keeps `exec_writable_overlay_mounted`, `exec_lsarpc_deadlock_
 adjustment: continue auditing remaining fixed runtime tables by ownership; NPFS prefix capacity is
 closed for the current hosted FSD frontier.
 
+A4/B3 system-module registry scaling cleanup (2026-08-21): the live `SystemModuleInformation`
+registry now stores loaded module records and query snapshot scratch in vectors instead of fixed
+64-entry executive arrays. Registration still rejects invalid image facts, canonicalizes the same
+`\SystemRoot` paths, updates duplicate module records in place, and reports the query snapshot
+through the existing NT encoder. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-system-modules-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing, keeps `exec_dbgk_module_load_forwarded`, `exec_dbgk_module_unload_forwarded`, and
+`exec_dbgk_attach_posts_fake_modules` green, and preserves dynamic userinit/Explorer launch. Review
+adjustment: continue the fixed-table audit outside module registry state; this removes the current
+SystemModuleInformation module-count ceiling.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
