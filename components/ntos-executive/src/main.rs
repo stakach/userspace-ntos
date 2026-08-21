@@ -1995,9 +1995,6 @@ pub const DLL_ARENA_END: u64 = 0x0000_0000_9800_0000;
 pub const DLL_ARENA_PT_COUNT: usize =
     ((DLL_ARENA_END - DLL_ARENA_START) / nt_dll_registry::PAGE_TABLE_SPAN) as usize;
 pub const DLL_ARENA_PT_WORDS: usize = (DLL_ARENA_PT_COUNT + 63) / 64;
-/// Heap-backed metadata capacity. The staged System32 corpus contains 449 DLLs totaling only
-/// 111 MiB after 64 KiB alignment, so 512 entries cover it while the bounded arena guards VA use.
-pub const DLL_REG_COUNT: usize = 512;
 const _: () = assert!(DLL_ARENA_END == win32k_subsystem::CSRSS_W32_SHARED_VA);
 const _: () = assert!(DLL_ARENA_PT_COUNT == 192);
 const _: () = assert!(DLL_ARENA_PT_WORDS * 64 >= DLL_ARENA_PT_COUNT);
@@ -2013,6 +2010,97 @@ pub(crate) struct DllArenaPagingStats {
     pub capacity: usize,
     pub growths: u64,
     pub allocation_failures: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DllPeStoreStats {
+    pub records: usize,
+    pub capacity: usize,
+    pub growths: u64,
+    pub allocation_failures: u64,
+}
+
+pub(crate) struct DllPeStore {
+    entries: Vec<Option<nt_pe_loader::PeFile<'static>>>,
+    dirty: bool,
+    growths: u64,
+    allocation_failures: u64,
+}
+
+impl DllPeStore {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            dirty: false,
+            growths: 0,
+            allocation_failures: 0,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.entries.clear();
+        self.dirty = false;
+        self.growths = 0;
+        self.allocation_failures = 0;
+    }
+
+    pub(crate) fn ensure_slot(&mut self, slot: usize) -> Result<bool, ()> {
+        if slot < self.entries.len() {
+            return Ok(false);
+        }
+        let Some(target_len) = slot.checked_add(1) else {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(());
+        };
+        let old_capacity = self.entries.capacity();
+        let needed = target_len - self.entries.len();
+        if self.entries.try_reserve(needed).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(());
+        }
+        if self.entries.capacity() != old_capacity {
+            self.growths = self.growths.saturating_add(1);
+        }
+        while self.entries.len() <= slot {
+            self.entries.push(None);
+        }
+        self.dirty = true;
+        Ok(true)
+    }
+
+    pub(crate) fn set(
+        &mut self,
+        slot: usize,
+        pe: Option<nt_pe_loader::PeFile<'static>>,
+    ) -> Result<(), ()> {
+        self.ensure_slot(slot)?;
+        self.entries[slot] = pe;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Option<nt_pe_loader::PeFile<'static>>] {
+        &self.entries
+    }
+
+    pub(crate) fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        let dirty = self.dirty;
+        self.dirty = false;
+        dirty
+    }
+
+    pub(crate) fn stats(&self) -> DllPeStoreStats {
+        DllPeStoreStats {
+            records: self.entries.len(),
+            capacity: self.entries.capacity(),
+            growths: self.growths,
+            allocation_failures: self.allocation_failures,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -9677,6 +9765,15 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(dll_paging.growths);
     print_str(b"/");
     print_u64(dll_paging.allocation_failures);
+    let dll_pe_store = service_sec_image::service_dll_pe_store_stats();
+    print_str(b" dll-pe=");
+    print_u64(dll_pe_store.records as u64);
+    print_str(b"/");
+    print_u64(dll_pe_store.capacity as u64);
+    print_str(b"/");
+    print_u64(dll_pe_store.growths);
+    print_str(b"/");
+    print_u64(dll_pe_store.allocation_failures);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -20003,15 +20100,10 @@ struct ExecLoopCtx {
     img_end: u64,
     nt_base: u64,
     nt_end: u64,
-    /// The loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
-    /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
-    dll_pes: *const &'static Option<nt_pe_loader::PeFile<'static>>,
-    dll_pes_len: usize,
-    /// The mutable backing store for `dll_pes` — the demand-load path (`fs_loader::demand_load_dll`,
-    /// called on a `reg.resolve_name` MISS in NtOpenFile) writes a freshly-parsed `PeFile` into a
-    /// reserved slot here; `dll_pes[slot]` (a ref AT the slot) then observes it. Raw mut ptr to the
-    /// pre-sized heap store allocated below the bump-reset mark.
-    dll_pe_store: *mut Option<nt_pe_loader::PeFile<'static>>,
+    /// The mutable backing store for loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client
+    /// stack). The demand-load path writes freshly parsed PEs here, and `dll_pes()` derives a live
+    /// slice from the current vector so runtime slot growth cannot leave a stale reference table.
+    dll_pe_store: *mut DllPeStore,
     /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
@@ -20028,8 +20120,8 @@ struct ExecLoopCtx {
 }
 
 impl ExecLoopCtx {
-    unsafe fn dll_pes(&self) -> &'static [&'static Option<nt_pe_loader::PeFile<'static>>] {
-        core::slice::from_raw_parts(self.dll_pes, self.dll_pes_len)
+    unsafe fn dll_pes(&self) -> &'static [Option<nt_pe_loader::PeFile<'static>>] {
+        (&*self.dll_pe_store).as_slice()
     }
 }
 

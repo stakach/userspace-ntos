@@ -157,11 +157,7 @@ fn trace_stack_growth_reply(
     print_str(b"\n");
 }
 
-static mut SERVICE_DLL_PE_STORE_WORK: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
-    [const { None }; DLL_REG_COUNT];
-static SERVICE_DLL_PE_NONE: Option<nt_pe_loader::PeFile<'static>> = None;
-static mut SERVICE_DLL_PE_REFS_WORK: [&'static Option<nt_pe_loader::PeFile<'static>>;
-    DLL_REG_COUNT] = [&SERVICE_DLL_PE_NONE; DLL_REG_COUNT];
+static mut SERVICE_DLL_PE_STORE_WORK: DllPeStore = DllPeStore::new();
 
 const WIN32K_MSG_BYTES: usize = 48;
 const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
@@ -1177,24 +1173,18 @@ fn take_service_dll_arena_paging_dirty() -> bool {
 }
 
 #[inline(never)]
-unsafe fn reset_service_dll_pe_store_work(
-) -> &'static mut [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] {
+unsafe fn reset_service_dll_pe_store_work() -> &'static mut DllPeStore {
     let store = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PE_STORE_WORK);
-    for slot in store.iter_mut() {
-        *slot = None;
-    }
+    store.reset();
     store
 }
 
-#[inline(never)]
-unsafe fn reset_service_dll_pe_refs_work(
-    store: &'static [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
-) -> &'static [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] {
-    let refs = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PE_REFS_WORK);
-    for (i, slot) in refs.iter_mut().enumerate() {
-        *slot = &store[i];
-    }
-    refs
+pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
+    unsafe { (&*core::ptr::addr_of!(SERVICE_DLL_PE_STORE_WORK)).stats() }
+}
+
+fn take_service_dll_pe_store_dirty() -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(SERVICE_DLL_PE_STORE_WORK)).take_dirty() }
 }
 
 #[inline]
@@ -5076,13 +5066,13 @@ pub(crate) unsafe fn service_sec_image(
     //       byte-identical shared text, loader never relocates it). Demand-load assigns slots in
     //       loader-request order, which can't guarantee csrsrv lands at slot 0, so this ONE entry is a
     //       documented pin (DLL_PIN_COUNT). No other DLL cares about its base (all get relocated).
-    //   (2) RESERVE the remaining metadata slots empty (per-pi handle stores pre-allocated below
-    //       the heap_mark → the on-demand `activate` at syscall time needs NO heap growth, surviving
-    //       the per-syscall bump-heap reset). `dll_pe_store` is pre-sized below the mark and `PeFile`
-    //       stores section metadata inline, so an on-demand `dll_pe_store[slot] = Some(pe)` is likewise
-    //       reset-safe. The pool bytes live in the cap-mapped POOL arena (atomic POOL_NEXT).
+    //   (2) RESERVE empty metadata slots from the live System32 cache size (per-pi handle stores and
+    //       PE-store slots allocated below the heap_mark). Demand-load can still append a checked
+    //       slot later; the service loop pins the heap mark when that happens. The pool bytes live in
+    //       the cap-mapped POOL arena (atomic POOL_NEXT).
     // Adding a new DLL (userinit/explorer/shell32/…) now needs NO edit here — it demand-loads into a
-    // free reserved slot. NO maintained DLL list remains (only the 1-entry csrsrv base pin).
+    // data-derived or dynamically appended slot. NO maintained DLL list remains (only the 1-entry
+    // csrsrv base pin plus forwarder-only `_vista` pins).
     // csrsrv (base pin) + the three `_vista` forwarder DLLs (loaded via LdrpSnapThunk's forwarder
     // path, which the NtOpenFile-based demand-load hook can't catch — see DLL_PIN_COUNT). ws2help is
     // demand-loadable (ws2_32 loads it as a normal import, not a forwarder), so it's NOT pinned.
@@ -5092,12 +5082,10 @@ pub(crate) unsafe fn service_sec_image(
         (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
         (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
     ];
-    // Static parsed-PE storage (lives for the whole loop without charging the executive bump heap).
-    // `dll_pes[i]` holds `&dll_pe_store[i]` — a stable ref into this array — so the erased slice
-    // handed to the
-    // handler stays valid when a demand-load later writes `dll_pe_store[slot] = Some(pe)` (the ref
-    // points AT the slot, so it observes the new value). Only the LIVE run (ntdll present) mounts the
-    // pool/FS + demand-loads; the demo SEC_IMAGE call leaves every slot None.
+    // Parsed-PE storage lives for the whole service loop. `ExecLoopCtx::dll_pes()` derives a slice
+    // from this vector each dispatch, so demand-load slot growth cannot leave a stale parallel ref
+    // table behind. Only the LIVE run (ntdll present) mounts the pool/FS + demand-loads; the demo
+    // SEC_IMAGE call leaves every slot None.
     let dll_pe_store = reset_service_dll_pe_store_work();
     let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
     if live_service {
@@ -5114,38 +5102,59 @@ pub(crate) unsafe fn service_sec_image(
                 .as_ref()
                 .map(|p| (image_extent(p), p.entry_point_rva()))
                 .unwrap_or((0, 0));
-            reg.register(stem, sz, ent);
+            let slot = reg.register(stem, sz, ent);
             if let Some(ref p) = pe {
-                let base = reg.base(i);
+                let base = reg.base(slot);
                 apply_relocations_to_buf(p, va, base);
                 let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
                 core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
             }
-            dll_pe_store[i] = pe;
+            if dll_pe_store.set(slot, pe).is_err() {
+                print_str(b"[sec-init] dll-pe-store pin allocation failed slot=");
+                print_u64(slot as u64);
+                print_str(b"\n");
+            }
         }
         print_str(b"[sec-init] pinned-dll-load end\n");
     }
-    // (2) Reserve remaining metadata slots. VA is consumed only when a real image activates one.
+    // (2) Reserve empty metadata slots from the live System32 cache. VA is consumed only when a real
+    // image activates one; this is a performance/persistence reserve, not a hard ceiling.
+    let dll_slot_reserve = if live_service {
+        match exec_fs().and_then(|fs| system32_cache_slot_reserve_hint(&fs)) {
+            Some(count) => count.max(DLL_PIN_COUNT),
+            None => DLL_PIN_COUNT,
+        }
+    } else {
+        0
+    };
     if live_service {
         print_str(b"[sec-init] dll-reserve begin\n");
+        print_str(b"[sec-init] dll-reserve target=");
+        print_u64(dll_slot_reserve as u64);
+        print_str(b"\n");
     }
-    for _ in DLL_PIN_COUNT..DLL_REG_COUNT {
-        reg.reserve();
+    while live_service && reg.len() < dll_slot_reserve {
+        match reg.try_reserve_slot() {
+            Ok(slot) => {
+                if dll_pe_store.ensure_slot(slot).is_err() {
+                    print_str(b"[sec-init] dll-pe-store reserve allocation failed slot=");
+                    print_u64(slot as u64);
+                    print_str(b"\n");
+                    break;
+                }
+            }
+            Err(_) => {
+                print_str(b"[sec-init] dll-registry reserve allocation failed len=");
+                print_u64(reg.len() as u64);
+                print_str(b"\n");
+                break;
+            }
+        }
     }
+    dll_pe_store.clear_dirty();
     if live_service {
         print_str(b"[sec-init] dll-reserve end\n");
     }
-    // Raw mut ptr to the PE store for the on-demand fill (the handler activates a reserved slot then
-    // writes its parsed PE here via this ptr; `dll_pes[slot]` — a ref AT the slot — observes it).
-    // Taken BEFORE `dll_pes` borrows the array immutably (a raw ptr holds no borrow). The demand-load
-    // writes through this ptr are single-threaded + never alias a live `dll_pes[i]` read (the router
-    // reads a slot only after it's mapped, which is after it's written).
-    let dll_pe_store_ptr = dll_pe_store.as_mut_ptr();
-    let dll_pes: &'static [&'static Option<nt_pe_loader::PeFile<'static>>] =
-        &reset_service_dll_pe_refs_work(
-            &*(dll_pe_store.as_ptr()
-                as *const [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT]),
-        )[..];
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -7248,7 +7257,7 @@ pub(crate) unsafe fn service_sec_image(
                     // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from
                     // that DLL's parsed PE. The committed view table resolves ownership; the
                     // registry maps the allocation base to the parsed PE bytes.
-                    dll_pes[i].as_ref().unwrap()
+                    dll_pe_store.as_slice()[i].as_ref().unwrap()
                 } else {
                     print_str(b"[vmf-image-owner] no PE for committed image allocation pi=");
                     print_u64(pi as u64);
@@ -7959,6 +7968,7 @@ pub(crate) unsafe fn service_sec_image(
             if take_shared_image_mapping_dirty()
                 || take_dll_cache_dirty()
                 || take_service_dll_arena_paging_dirty()
+                || take_service_dll_pe_store_dirty()
             {
                 pin_durable_heap_mark(&mut heap_mark);
             }
@@ -8923,11 +8933,7 @@ pub(crate) unsafe fn service_sec_image(
                     img_end,
                     nt_base,
                     nt_end,
-                    dll_pes: dll_pes.as_ptr()
-                        as *const &'static Option<nt_pe_loader::PeFile<'static>>,
-                    dll_pes_len: dll_pes.len(),
-                    dll_pe_store: dll_pe_store_ptr as *mut ()
-                        as *mut Option<nt_pe_loader::PeFile<'static>>,
+                    dll_pe_store: dll_pe_store as *mut DllPeStore,
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     generic_sections: generic_sections as *mut GenericSectionTable,
@@ -9030,7 +9036,7 @@ pub(crate) unsafe fn service_sec_image(
                                 nt_end,
                                 ntdll.map(|(_, p)| p),
                                 &reg,
-                                &dll_pes,
+                                dll_pe_store.as_slice(),
                                 &mut nt_handler,
                             );
                             if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) == 0 {
@@ -9065,7 +9071,7 @@ pub(crate) unsafe fn service_sec_image(
                                 nt_end,
                                 ntdll.map(|(_, p)| p),
                                 &reg,
-                                &dll_pes,
+                                dll_pe_store.as_slice(),
                             ) {
                                 result = 0xC000_0001;
                             } else {
@@ -9423,6 +9429,7 @@ pub(crate) unsafe fn service_sec_image(
                 if take_shared_image_mapping_dirty()
                     || take_dll_cache_dirty()
                     || take_service_dll_arena_paging_dirty()
+                    || take_service_dll_pe_store_dirty()
                 {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
@@ -9655,7 +9662,7 @@ pub(crate) unsafe fn service_sec_image(
                             pfilled,
                             procs,
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                         );
                         bump_progress();
                     }
@@ -9779,7 +9786,7 @@ pub(crate) unsafe fn service_sec_image(
                             .expect("CSRSS PE must be registered before SM rendezvous"),
                         procs[csrss_pi].img_end,
                         &reg,
-                        &dll_pes,
+                        dll_pe_store.as_slice(),
                         &mut nt_handler,
                     );
                     if client_handle != 0 {
@@ -9836,7 +9843,7 @@ pub(crate) unsafe fn service_sec_image(
                             .expect("CSRSS PE must be registered before SM API rendezvous"),
                         procs[csrss_pi].img_end,
                         &reg,
-                        &dll_pes,
+                        dll_pe_store.as_slice(),
                         &mut nt_handler,
                     );
                     if completed {
@@ -9883,7 +9890,7 @@ pub(crate) unsafe fn service_sec_image(
                                 nt_end,
                                 ntdll.map(|(_, p)| p),
                                 &reg,
-                                &dll_pes,
+                                dll_pe_store.as_slice(),
                                 &mut nt_handler,
                             )
                         });
@@ -9933,7 +9940,7 @@ pub(crate) unsafe fn service_sec_image(
                             nt_end,
                             ntdll.map(|(_, p)| p),
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                             &mut nt_handler,
                         );
                         if client_handle == 0 {
@@ -9968,7 +9975,7 @@ pub(crate) unsafe fn service_sec_image(
                                     &mut faults,
                                     scratch_base,
                                     &reg,
-                                    &dll_pes,
+                                    dll_pe_store.as_slice(),
                                     pml4,
                                 );
                             }
@@ -11153,7 +11160,7 @@ pub(crate) unsafe fn service_sec_image(
                                         bytes,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                                     core::ptr::write_bytes(
@@ -11277,7 +11284,7 @@ pub(crate) unsafe fn service_sec_image(
                                     cj_header as usize,
                                     scratch_base,
                                     &reg,
-                                    &dll_pes,
+                                    dll_pe_store.as_slice(),
                                 );
                                 let header_out = core::slice::from_raw_parts_mut(
                                     staged_bmi as *mut u8,
@@ -11345,7 +11352,7 @@ pub(crate) unsafe fn service_sec_image(
                                         staged_bmi_bytes as usize,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let bmi_out = core::slice::from_raw_parts_mut(
                                         staged_bmi as *mut u8,
@@ -11515,7 +11522,7 @@ pub(crate) unsafe fn service_sec_image(
                                         cj_max_bits as usize,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let bits_out = core::slice::from_raw_parts_mut(
                                         staged_bits as *mut u8,
@@ -11545,7 +11552,7 @@ pub(crate) unsafe fn service_sec_image(
                                             cj_max_info as usize,
                                             scratch_base,
                                             &reg,
-                                            &dll_pes,
+                                            dll_pe_store.as_slice(),
                                         );
                                         let bmi_out = core::slice::from_raw_parts_mut(
                                             staged_pbmi as *mut u8,
@@ -11725,7 +11732,7 @@ pub(crate) unsafe fn service_sec_image(
                                         cj_max_bits as usize,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let bits_out = core::slice::from_raw_parts_mut(
                                         staged_bits as *mut u8,
@@ -11752,7 +11759,7 @@ pub(crate) unsafe fn service_sec_image(
                                         cj_max_info as usize,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let bmi_out = core::slice::from_raw_parts_mut(
                                         staged_pbmi as *mut u8,
@@ -11913,7 +11920,7 @@ pub(crate) unsafe fn service_sec_image(
                                             16,
                                             scratch_base,
                                             &reg,
-                                            &dll_pes,
+                                            dll_pe_store.as_slice(),
                                         );
                                         img_spawn::client_copyin_mapped(
                                             pi as u64,
@@ -11934,7 +11941,7 @@ pub(crate) unsafe fn service_sec_image(
                                             dx_bytes as usize,
                                             scratch_base,
                                             &reg,
-                                            &dll_pes,
+                                            dll_pe_store.as_slice(),
                                         );
                                         img_spawn::client_copyin_mapped(
                                             pi as u64,
@@ -11955,7 +11962,7 @@ pub(crate) unsafe fn service_sec_image(
                                             string_bytes as usize,
                                             scratch_base,
                                             &reg,
-                                            &dll_pes,
+                                            dll_pe_store.as_slice(),
                                         );
                                         img_spawn::client_copyin_mapped(
                                             pi as u64,
@@ -12032,7 +12039,7 @@ pub(crate) unsafe fn service_sec_image(
                             WIN32K_RECT_STAGE_BYTES,
                             scratch_base,
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                         );
                         let input = core::slice::from_raw_parts_mut(
                             arg as *mut u8,
@@ -12138,7 +12145,7 @@ pub(crate) unsafe fn service_sec_image(
                             WIN32K_PAINTSTRUCT_STAGE_BYTES,
                             scratch_base,
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                         );
                         let input = core::slice::from_raw_parts_mut(
                             arg as *mut u8,
@@ -12519,7 +12526,7 @@ pub(crate) unsafe fn service_sec_image(
                                             string_bytes,
                                             scratch_base,
                                             &reg,
-                                            &dll_pes,
+                                            dll_pe_store.as_slice(),
                                         );
                                         img_spawn::client_copyin_mapped(
                                             pi as u64,
@@ -12643,7 +12650,7 @@ pub(crate) unsafe fn service_sec_image(
                                         input_bytes,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let input = core::slice::from_raw_parts_mut(
                                         staged_pwc as *mut u8,
@@ -12813,7 +12820,7 @@ pub(crate) unsafe fn service_sec_image(
                                         string_bytes,
                                         scratch_base,
                                         &reg,
-                                        &dll_pes,
+                                        dll_pe_store.as_slice(),
                                     );
                                     let input = core::slice::from_raw_parts_mut(
                                         staged_string as *mut u8,
@@ -13023,7 +13030,7 @@ pub(crate) unsafe fn service_sec_image(
                         &mut faults,
                         filled_pages,
                         &reg,
-                        &dll_pes,
+                        dll_pe_store.as_slice(),
                     );
                     prefill_client_large_string_pages(
                         pi as u64,
@@ -13032,7 +13039,7 @@ pub(crate) unsafe fn service_sec_image(
                         &mut faults,
                         filled_pages,
                         &reg,
-                        &dll_pes,
+                        dll_pe_store.as_slice(),
                     );
                     prefill_client_large_string_pages(
                         pi as u64,
@@ -13041,7 +13048,7 @@ pub(crate) unsafe fn service_sec_image(
                         &mut faults,
                         filled_pages,
                         &reg,
-                        &dll_pes,
+                        dll_pe_store.as_slice(),
                     );
                     let original_a1 = d_a1;
                     let original_a2 = d_a2;
@@ -13087,7 +13094,7 @@ pub(crate) unsafe fn service_sec_image(
                             &mut faults,
                             filled_pages,
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                         );
                         match try_capture_client_string_arg(
                             pi as u64,
@@ -13957,7 +13964,7 @@ pub(crate) unsafe fn service_sec_image(
                             &mut faults,
                             filled_pages,
                             &reg,
-                            &dll_pes,
+                            dll_pe_store.as_slice(),
                         );
                     }
                     crate::teb_tail_watch(pi, 1, m0, 0);
@@ -22295,7 +22302,7 @@ unsafe fn lsa_complete_connect(
     pfilled: &mut [[u64; 512]; MAX_PI],
     procs: &mut [ProcExec; MAX_PI],
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) -> bool {
     let cap = LSA_CLI_REPLY_CAP.load(Ordering::Relaxed);
     if cap == 0 || LSA_CLI_KIND.load(Ordering::Relaxed) != 1 {
@@ -23000,7 +23007,7 @@ unsafe fn ensure_client_copyin_dll_page(
     page: u64,
     scratch_base: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) -> bool {
     if csrss_frame_get(pi, page) != 0 || client_copyin_frame_get(pi, page) != 0 {
         return true;
@@ -23011,7 +23018,7 @@ unsafe fn ensure_client_copyin_dll_page(
     let Some(slot) = dll_pes.get(i) else {
         return false;
     };
-    let Some(tpe) = (*slot).as_ref() else {
+    let Some(tpe) = slot.as_ref() else {
         return false;
     };
     // Reserve the high end of each process scratch window for bounded copy-in prefetches. Demand
@@ -23044,7 +23051,7 @@ unsafe fn prefill_client_copyin_dll_range_pages(
     len: usize,
     scratch_base: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) {
     if len == 0 {
         return;
@@ -23070,7 +23077,7 @@ unsafe fn prefill_client_large_string_pages(
     faults: &mut u64,
     filled_pages: &mut [u64; 512],
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) {
     let mut raw = [0u8; 16];
     if !img_spawn::client_copyin_mapped(

@@ -464,6 +464,22 @@ adjustment: the DLL arena PD/PT fixed-table cap is closed. The remaining SEC_IMA
 now the deeper core process/fault scratch (`procs` / `pfilled`) rather than the DLL arena mapping
 state.
 
+A4/B3 DLL PE store and registry reserve scaling cleanup (2026-08-21): the SEC_IMAGE DLL metadata path
+no longer keeps parsed PE state in a fixed 512-entry static array or a parallel static reference
+table. The service loop now owns a growable `DllPeStore`; `ExecLoopCtx::dll_pes()` derives a live
+slice from it on demand, and runtime demand-load growth marks the durable heap pin before the next
+bump-heap reset. `nt-dll-registry` now exposes fallible empty-slot reservation, the initial metadata
+reserve is sized from the live System32 loader cache, and a later demand-load can append a checked
+registry/store slot instead of failing because a boot-time reserve was too small. Local validation is
+green for `cargo fmt --all`, `cargo test -p nt-dll-registry`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-dll-pe-store-dirty-rerun-20260821.log` reaches genuine userinit/Explorer launch
+and Explorer shell chrome with `293/293` checks passing, reports `dll-paging=13/16/3/0
+dll-pe=773/1024/11/0`, keeps `exec_explorer_shell_chrome_painted` green, and records zero DLL
+PE-store allocation failures. Review adjustment: the parsed-DLL metadata fixed capacity is closed;
+continue the fixed-table audit at the remaining SEC_IMAGE process/fault scratch state.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

@@ -1945,7 +1945,7 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
     faults: &mut u64,
     scratch_base: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     pml4: u64,
 ) -> bool {
     if src.is_empty() {
@@ -2047,7 +2047,7 @@ pub(crate) unsafe fn csrss_out_write(
     faults: &mut u64,
     scratch_base: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     pml4: u64,
 ) -> bool {
     if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, &val.to_le_bytes()) {

@@ -16541,7 +16541,7 @@ impl ExecNtHandler {
         let reg = &*ctx.reg;
         let dll_pes = ctx.dll_pes();
         let (index, rva) = reg.dll_for_page(self.pi, page)?;
-        let pe = dll_pes.get(index).and_then(|slot| (*slot).as_ref())?;
+        let pe = dll_pes.get(index).and_then(|slot| slot.as_ref())?;
         Some(image_rva_protection(pe, rva))
     }
 
@@ -20123,11 +20123,11 @@ impl ExecNtHandler {
         if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
             let load = {
                 let _alloc_scope = crate::allocator::enter_scope(b"demand-load-dll");
-                demand_load_dll_result(reg, ctx.dll_pe_store, DLL_REG_COUNT, &nb[..nlen])
+                demand_load_dll_result(reg, &mut *ctx.dll_pe_store, &nb[..nlen])
             };
             match load {
-                Ok(slot) => {
-                    dll_i = Some(slot);
+                Ok(result) => {
+                    dll_i = Some(result.slot);
                 }
                 Err(err) => {
                     if !self.current_process_is_winlogon()
@@ -20139,11 +20139,9 @@ impl ExecNtHandler {
                         print_str(b" reason=");
                         print_str(err.tag());
                         match err {
-                            DemandLoadError::StoreTooSmall { slot, store_len } => {
+                            DemandLoadError::StoreAllocationFailed { slot } => {
                                 print_str(b" slot=");
                                 print_u64(slot as u64);
-                                print_str(b" store_len=");
-                                print_u64(store_len as u64);
                             }
                             DemandLoadError::PoolExhausted { size } => {
                                 print_str(b" size=");
@@ -20162,7 +20160,7 @@ impl ExecNtHandler {
                             DemandLoadError::UnsupportedImageName
                             | DemandLoadError::SxsProbe
                             | DemandLoadError::DeniedDiverter
-                            | DemandLoadError::NoReservedSlot
+                            | DemandLoadError::RegistrySlotAllocationFailed
                             | DemandLoadError::NoMountedFs
                             | DemandLoadError::FileMissing
                             | DemandLoadError::EmptyFile

@@ -441,6 +441,18 @@ unsafe fn system32_cache_lookup(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32, u8
     None
 }
 
+pub(crate) unsafe fn system32_cache_slot_reserve_hint(fs: &Fat32) -> Option<usize> {
+    if system32_cache_state_read(SYSTEM32_CACHE_STATE_READY) == 0 {
+        if !system32_cache_build(fs) {
+            return None;
+        }
+        system32_cache_state_write(SYSTEM32_CACHE_STATE_READY, 1);
+    }
+    let count = system32_cache_state_read(SYSTEM32_CACHE_STATE_COUNT) as usize;
+    let capacity = system32_cache_state_read(SYSTEM32_CACHE_STATE_CAPACITY) as usize;
+    Some(count.min(capacity))
+}
+
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
     const PREFIX: &[u8] = b"reactos\\system32\\";
     const ALT_PREFIX: &[u8] = b"reactos/system32/";
@@ -1185,8 +1197,8 @@ pub(crate) enum DemandLoadError {
     UnsupportedImageName,
     SxsProbe,
     DeniedDiverter,
-    NoReservedSlot,
-    StoreTooSmall { slot: usize, store_len: usize },
+    RegistrySlotAllocationFailed,
+    StoreAllocationFailed { slot: usize },
     NoMountedFs,
     FileMissing,
     EmptyFile,
@@ -1202,8 +1214,8 @@ impl DemandLoadError {
             DemandLoadError::UnsupportedImageName => b"unsupported-name",
             DemandLoadError::SxsProbe => b"sxs-probe",
             DemandLoadError::DeniedDiverter => b"denied-diverter",
-            DemandLoadError::NoReservedSlot => b"no-reserved-slot",
-            DemandLoadError::StoreTooSmall { .. } => b"store-too-small",
+            DemandLoadError::RegistrySlotAllocationFailed => b"registry-slot-allocation-failed",
+            DemandLoadError::StoreAllocationFailed { .. } => b"store-allocation-failed",
             DemandLoadError::NoMountedFs => b"no-mounted-fs",
             DemandLoadError::FileMissing => b"file-missing",
             DemandLoadError::EmptyFile => b"empty-file",
@@ -1215,30 +1227,35 @@ impl DemandLoadError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DemandLoadResult {
+    pub slot: usize,
+}
+
 /// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
 /// the mounted ReactOS volume (or the default `\reactos\system32` search for bare dependency
 /// names), load its bytes into the (reset-safe, cap-mapped) pool, claim a
-/// pre-reserved registry slot, activate it (stem + geometry, assigning a compact collision-free base),
+/// registry/store slot, activate it (stem + geometry, assigning a compact collision-free base),
 /// relocate the pool bytes to that base + patch its ImageBase, store the parsed `PeFile` into the
-/// caller's `dll_pe_store` slot, and return the slot index. The demand-fault router + the
+/// caller's `dll_pe_store`, and return the slot index. The demand-fault router + the
 /// NtOpenFile→NtCreateSection→NtMapViewOfSection flow then treat it exactly like a boot-registered
-/// DLL (no code-path difference — it operates on the `PeFile` slice + the registry).
+/// DLL (no code-path difference — it operates on the PE store slice + the registry).
 ///
 /// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
-/// survives the per-syscall reset). `dll_pe_store` is pre-sized before the service-loop heap mark, and
-/// `PeFile` keeps section metadata inline, so assigning `Some(pe)` does not allocate. The registry
-/// slot was also reserved before the mark; `activate` only writes inline metadata. Transient path,
-/// import, and relocation vectors from this syscall are reclaimed by the normal per-syscall rewind.
+/// survives the per-syscall reset). The service loop pre-reserves slots from the live System32 cache
+/// before the heap mark, and a miss beyond that reserve grows the registry + PE store through checked
+/// vector admission. The service loop pins the durable heap mark when that store reports growth.
+/// Transient path, import, and relocation vectors from this syscall are reclaimed by the normal
+/// per-syscall rewind.
 ///
 /// # Safety
-/// `store` must point at a live `[Option<PeFile>; N]` whose slots outlive the service loop; `reg`
-/// must be the live registry. Single-threaded executive; no aliasing.
+/// `store` and `reg` must be the live loop-owned DLL metadata stores. Single-threaded executive; no
+/// aliasing.
 pub(crate) unsafe fn demand_load_dll_result(
     reg: &mut nt_dll_registry::Registry,
-    store: *mut Option<nt_pe_loader::PeFile<'static>>,
-    store_len: usize,
+    store: &mut DllPeStore,
     folded_name: &[u8],
-) -> Result<usize, DemandLoadError> {
+) -> Result<DemandLoadResult, DemandLoadError> {
     let (leaf, stem) = split_dll_leaf(folded_name).ok_or(DemandLoadError::UnsupportedImageName)?;
     // Reject SxS/actctx probes (the registry's own rule) so we never demand-load a manifest as a DLL.
     if nt_dll_registry::Registry::is_sxs_probe(folded_name) {
@@ -1258,11 +1275,22 @@ pub(crate) unsafe fn demand_load_dll_result(
     if stem == b"apphelp" {
         return Err(DemandLoadError::DeniedDiverter);
     }
-    let slot = reg.first_free().ok_or(DemandLoadError::NoReservedSlot)?;
-    if slot >= store_len {
-        // registry has a reserved slot but the parallel PE store doesn't — capacity bug
-        return Err(DemandLoadError::StoreTooSmall { slot, store_len });
-    }
+    let slot = if let Some(slot) = reg.first_free() {
+        if store.ensure_slot(slot).is_err() {
+            return Err(DemandLoadError::StoreAllocationFailed { slot });
+        }
+        slot
+    } else {
+        let slot = reg.len();
+        if store.ensure_slot(slot).is_err() {
+            return Err(DemandLoadError::StoreAllocationFailed { slot });
+        }
+        let reserved = reg
+            .try_reserve_slot()
+            .map_err(|_| DemandLoadError::RegistrySlotAllocationFailed)?;
+        debug_assert_eq!(reserved, slot);
+        reserved
+    };
     let fs = exec_fs().ok_or(DemandLoadError::NoMountedFs)?;
     let (va, sz) = open_dll_read_result(&fs, folded_name, leaf)?;
     let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
@@ -1278,7 +1306,9 @@ pub(crate) unsafe fn demand_load_dll_result(
     apply_relocations_to_buf(&pe, va, base);
     let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
     core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
-    *store.add(slot) = Some(pe);
+    store
+        .set(slot, Some(pe))
+        .map_err(|_| DemandLoadError::StoreAllocationFailed { slot })?;
     crate::bump_progress(); // (B) a NEW DLL loaded = unambiguous forward progress (resets stall)
                             // samsrv.dll — lsass' SAM server. lsasrv/lsass resolve it at runtime; nothing in the executive
                             // names it, so a genuine by-path demand-load is the ONLY way it can appear. Recorded for the
@@ -1295,7 +1325,7 @@ pub(crate) unsafe fn demand_load_dll_result(
     print_str(b" base 0x");
     print_hex(base as u32);
     print_str(b"\n");
-    Ok(slot)
+    Ok(DemandLoadResult { slot })
 }
 
 fn is_rooted_or_device_path(name: &[u8]) -> bool {

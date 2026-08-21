@@ -120,6 +120,11 @@ pub struct Registry {
     next_base: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveError {
+    InsufficientResources,
+}
+
 impl Registry {
     /// Pack activated images into `[arena_start, arena_end)` at Windows' 64 KiB granularity.
     pub fn new(arena_start: u64, arena_end: u64) -> Self {
@@ -151,11 +156,23 @@ impl Registry {
     /// `heap_mark`) makes the `dlls` Vec growth + the per-pi handle-store allocations PERSISTENT, so a
     /// later on-demand `activate` needs NO heap growth here — only inline metadata writes and a
     /// checked compact-arena bump. See the module docs + `PI_RESERVE`.
-    pub fn reserve(&mut self) -> usize {
+    pub fn try_reserve_slot(&mut self) -> Result<usize, ReserveError> {
         // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots (see [`PI_RESERVE`]).
         let mut file_handle = Vec::new();
         let mut section_handle = Vec::new();
         let mut mapped_by_pi = Vec::new();
+        file_handle
+            .try_reserve_exact(PI_RESERVE)
+            .map_err(|_| ReserveError::InsufficientResources)?;
+        section_handle
+            .try_reserve_exact(PI_RESERVE)
+            .map_err(|_| ReserveError::InsufficientResources)?;
+        mapped_by_pi
+            .try_reserve_exact(PI_RESERVE)
+            .map_err(|_| ReserveError::InsufficientResources)?;
+        self.dlls
+            .try_reserve(1)
+            .map_err(|_| ReserveError::InsufficientResources)?;
         file_handle.resize(PI_RESERVE, 0);
         section_handle.resize(PI_RESERVE, 0);
         mapped_by_pi.resize(PI_RESERVE, 0);
@@ -169,7 +186,12 @@ impl Registry {
             section_handle,
             mapped_by_pi,
         });
-        self.dlls.len() - 1
+        Ok(self.dlls.len() - 1)
+    }
+
+    pub fn reserve(&mut self) -> usize {
+        self.try_reserve_slot()
+            .expect("DLL registry slot allocation failed")
     }
 
     /// Activate a reserved slot and assign a compact stable base. Returns false without claiming the

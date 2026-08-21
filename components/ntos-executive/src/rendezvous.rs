@@ -779,7 +779,7 @@ pub(crate) unsafe fn sm_rendezvous(
     csrss_pe: &nt_pe_loader::PeFile,
     csrss_img_end: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
     const SSN_SET_INFO_THREAD: u64 = 238;
@@ -1179,7 +1179,7 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     csrss_pe: &nt_pe_loader::PeFile,
     csrss_img_end: u64,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
     const SSN_QUERY_INFO_PROCESS: u64 = 161;
@@ -1524,7 +1524,7 @@ pub(crate) unsafe fn csr_api_request_rendezvous(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
     const CSR_API_MSG_MAX: usize = 0x178;
@@ -2254,7 +2254,7 @@ pub(crate) unsafe fn csr_sb_startup(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) -> bool {
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
@@ -3253,7 +3253,7 @@ pub(crate) unsafe fn csr_fill_page(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     fill_idx: &mut u64,
 ) -> bool {
     let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
@@ -3306,7 +3306,7 @@ unsafe fn csr_sb_accept_connection(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &ExecNtHandler,
 ) -> u64 {
     const SSN_REPLY_WAIT_RECV: u64 = 203;
@@ -3459,7 +3459,7 @@ unsafe fn csr_sb_api_request_rendezvous(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
     const SSN_SET_INFO_PROCESS: u64 = 237;
@@ -3847,7 +3847,7 @@ pub(crate) unsafe fn csr_rendezvous(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    dll_pes: &[Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
     const SSN_SET_EVENT: u64 = 228;
