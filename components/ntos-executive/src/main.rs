@@ -10638,6 +10638,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(delay_wait_store_fails);
     let (
+        gui_message_wait_live,
+        gui_message_wait_records,
+        gui_message_wait_cap,
+        gui_message_wait_alloc_fails,
+        gui_message_wait_store_fails,
+    ) = service_sec_image::gui_message_waiter_stats();
+    print_str(b" gui-msg-wait=");
+    print_u64(gui_message_wait_live as u64);
+    print_str(b"/");
+    print_u64(gui_message_wait_records as u64);
+    print_str(b"/");
+    print_u64(gui_message_wait_cap as u64);
+    print_str(b"/");
+    print_u64(gui_message_wait_alloc_fails);
+    print_str(b"/");
+    print_u64(gui_message_wait_store_fails);
+    let (
         object_wait_live,
         object_wait_records,
         object_wait_cap,

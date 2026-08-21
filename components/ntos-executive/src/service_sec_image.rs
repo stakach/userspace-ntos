@@ -231,7 +231,7 @@ const CURSORDATA_AJIFRATE_OFF: usize = 0x78;
 const CURSORF_ACON: u32 = 0x0008;
 const CURSORDATA_ACON_LIMIT: u32 = 1000;
 const DEFERRED_CALLBACK_RETURN_N: usize = nt_user_callback::MAX_CONTINUATION_DEPTH;
-const GUI_MESSAGE_WAITER_N: usize = 16;
+const GUI_MESSAGE_WAITER_INITIAL_RESERVE: usize = 16;
 static CSR_API_TAIL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CSR_API_TAIL_REPLY_TRACE: AtomicU64 = AtomicU64::new(0);
 
@@ -272,8 +272,9 @@ impl GuiMessageWaiter {
     };
 }
 
-static mut GUI_MESSAGE_WAITERS: [GuiMessageWaiter; GUI_MESSAGE_WAITER_N] =
-    [GuiMessageWaiter::EMPTY; GUI_MESSAGE_WAITER_N];
+static mut GUI_MESSAGE_WAITERS: alloc::vec::Vec<GuiMessageWaiter> = alloc::vec::Vec::new();
+static GUI_MESSAGE_WAITER_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static GUI_MESSAGE_WAITER_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct SyscallReplyContext {
@@ -511,6 +512,66 @@ unsafe fn reset_deferred_user_callback_returns() {
     let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
     for index in 0..DEFERRED_CALLBACK_RETURN_N {
         table[index] = DeferredCallbackReturn::EMPTY;
+    }
+}
+
+#[inline(never)]
+unsafe fn reset_gui_message_waiters() -> bool {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    waiters.clear();
+    if waiters.capacity() < GUI_MESSAGE_WAITER_INITIAL_RESERVE {
+        let reserve = GUI_MESSAGE_WAITER_INITIAL_RESERVE - waiters.capacity();
+        if waiters.try_reserve(reserve).is_err() {
+            GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn gui_message_waiter_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
+        (
+            waiters.iter().filter(|waiter| waiter.used).count(),
+            waiters.len(),
+            waiters.capacity(),
+            GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            GUI_MESSAGE_WAITER_STORE_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+unsafe fn gui_message_waiter_alloc_slot() -> Option<usize> {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    if let Some(slot) = waiters.iter().position(|waiter| !waiter.used) {
+        return Some(slot);
+    }
+    let old_capacity = waiters.capacity();
+    if waiters.len() == waiters.capacity() && waiters.try_reserve(1).is_err() {
+        GUI_MESSAGE_WAITER_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        GUI_MESSAGE_WAITER_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if waiters.capacity() != old_capacity {
+        mark_wait_table_growth_dirty();
+    }
+    waiters.push(GuiMessageWaiter::EMPTY);
+    Some(waiters.len() - 1)
+}
+
+unsafe fn gui_message_waiter_record(slot: usize) -> Option<GuiMessageWaiter> {
+    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
+        .get(slot)
+        .copied()
+}
+
+unsafe fn gui_message_waiter_clear_slot(slot: usize, reply_cap: u64) {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    if let Some(waiter) = waiters.get_mut(slot) {
+        if waiter.used && waiter.reply_cap == reply_cap {
+            *waiter = GuiMessageWaiter::EMPTY;
+        }
     }
 }
 
@@ -5301,9 +5362,12 @@ pub(crate) unsafe fn service_sec_image(
     if !keyed_wait_tables_reset() {
         panic!("keyed wait table allocation failed");
     }
+    if !reset_gui_message_waiters() {
+        panic!("GUI message waiter table allocation failed");
+    }
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved process handle tables, SEC_IMAGE process scratch, TP worker window resources,
-    // private VAD rows, and cooperative wait tables) is allocated. Committed image/runtime mapping rows
+    // private VAD rows, and cooperative/message wait tables) is allocated. Committed image/runtime mapping rows
     // are intentionally preserved here: the SEC_IMAGE spawn path registered the primary image, ntdll,
     // stack, and environment ranges before entering this loop. Each smss syscall we service allocates
     // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
@@ -21183,8 +21247,7 @@ unsafe fn gui_message_wait_park(
     if queue_event_body == 0 || msg_ptr == 0 {
         return false;
     }
-    let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(slot) = (0..GUI_MESSAGE_WAITER_N).find(|&index| !table[index].used) else {
+    let Some(slot) = gui_message_waiter_alloc_slot() else {
         return false;
     };
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -21194,22 +21257,25 @@ unsafe fn gui_message_wait_park(
     let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
-    table[slot] = GuiMessageWaiter {
-        used: true,
-        pi,
-        badge,
-        tid,
-        queue_event_body,
-        msg_ptr,
-        hwnd_filter,
-        filter_min,
-        filter_max,
-        caller_sp,
-        reply_cap: stolen,
-        resume_ip,
-        resume_sp: sp,
-        resume_flags: flags,
-    };
+    {
+        let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+        table[slot] = GuiMessageWaiter {
+            used: true,
+            pi,
+            badge,
+            tid,
+            queue_event_body,
+            msg_ptr,
+            hwnd_filter,
+            filter_min,
+            filter_max,
+            caller_sp,
+            reply_cap: stolen,
+            resume_ip,
+            resume_sp: sp,
+            resume_flags: flags,
+        };
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
@@ -21231,8 +21297,7 @@ unsafe fn gui_message_wait_park(
 
 unsafe fn gui_message_wait_was_replied(queue_event_body: u64, pi: u32, badge: u64) -> bool {
     let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
-    !(0..GUI_MESSAGE_WAITER_N).any(|slot| {
-        let waiter = table[slot];
+    !table.iter().any(|waiter| {
         waiter.used
             && waiter.queue_event_body == queue_event_body
             && waiter.pi == pi
@@ -21266,10 +21331,10 @@ unsafe fn gui_message_wait_redrive_event(
     let saved_ctx = nt_handler.loop_ctx.take();
     let mut woken = 0u64;
 
-    for slot in 0..GUI_MESSAGE_WAITER_N {
-        let waiter = {
-            let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
-            table[slot]
+    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
+    for slot in 0..waiter_count {
+        let Some(waiter) = gui_message_waiter_record(slot) else {
+            continue;
         };
         if !waiter.used || waiter.queue_event_body != event_body {
             continue;
@@ -21417,12 +21482,7 @@ unsafe fn gui_message_wait_redrive_event(
         client_reply_on(waiter.reply_cap, 18, status, 0, 0, 0);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
-        {
-            let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-            if table[slot].used && table[slot].reply_cap == waiter.reply_cap {
-                table[slot] = GuiMessageWaiter::EMPTY;
-            }
-        }
+        gui_message_waiter_clear_slot(slot, waiter.reply_cap);
         woken += 1;
         let n = GUI_MESSAGE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
         if n < 32 {

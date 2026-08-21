@@ -725,8 +725,27 @@ genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks
 and `exec_explorer_shell_chrome_painted` green, reports `reply-pool=52/53/53/809/0/0/0/0`, and
 commits writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822628`.
 Review adjustment: the main hosted-user reply-cap transport capacity is no longer a fixed boot-time
-pool. Remaining wait-related cleanup should move to other explicit owner tables such as GUI message
-waiters or parked pipe data waiters, or to post-desktop GDI/client-object correctness.
+pool. Remaining wait-related cleanup should move to other explicit owner tables such as parked pipe
+data waiters, or to post-desktop GDI/client-object correctness.
+
+A4/B3 GUI message waiter scaling cleanup (2026-08-22): the SEC_IMAGE service loop's parked
+`GetMessage` queue-event waiters no longer use the fixed 16-entry `GUI_MESSAGE_WAITERS` table.
+The waiter store now grows in a vector, reuses cleared rows, pre-reserves durable storage before the
+service-loop heap rewind mark, and marks later growth through the shared wait-table dirty bit.
+Parking still fails closed before stealing the active reply cap if a waiter row cannot be stored;
+redrive snapshots waiter records before dispatching win32k so nested callback/message activity does
+not hold a vector borrow across re-entrant user-mode work. Pool census reports
+`gui-msg-wait=<live>/<records>/<cap>/<alloc-fail>/<store-fail>`. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-gui-message-waiters-vec-20260822.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_win32k_blocking_getmessage_guarded`,
+`exec_explorer_user_callbacks_redirected`, `exec_explorer_wndproc_installed_by_client`, and
+`exec_explorer_shell_chrome_painted` green, and reports `gui-msg-wait=3/3/16/0/0` with zero waiter
+allocation/store failures. Review adjustment: GUI message waiter capacity is closed for the current
+desktop frontier; continue the wait/runtime audit at any remaining pipe data waiter or subsystem
+tables that still own live reply/resume state.
 
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
