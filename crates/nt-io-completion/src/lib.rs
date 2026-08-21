@@ -1,6 +1,10 @@
-//! Allocation-free NT I/O completion-port objects and packet queues.
+//! NT I/O completion-port objects and packet queues.
 
 #![no_std]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
@@ -380,20 +384,35 @@ pub struct CompletionWaiter {
     sequence: u64,
 }
 
-/// Allocation-free wait table shared by completion ports. Per-port release is LIFO, matching NT
-/// KQUEUE scheduling; deadline and cancellation scans retain deterministic park order.
-pub struct CompletionWaiterTable<const WAITERS: usize> {
-    slots: [Option<CompletionWaiter>; WAITERS],
+/// Wait table shared by completion ports. Per-port release is LIFO, matching NT KQUEUE scheduling;
+/// deadline and cancellation scans retain deterministic park order. Storage grows with real parked
+/// waiter demand and reuses cleared rows so the crate does not impose an IOCP waiter ceiling.
+pub struct CompletionWaiterTable {
+    slots: Vec<Option<CompletionWaiter>>,
     next_sequence: u64,
+    allocation_failures: u64,
+    store_failures: u64,
 }
 
-impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
+impl CompletionWaiterTable {
     pub const fn new() -> Self {
-        assert!(WAITERS > 0);
         Self {
-            slots: [None; WAITERS],
+            slots: Vec::new(),
             next_sequence: 0,
+            allocation_failures: 0,
+            store_failures: 0,
         }
+    }
+
+    pub fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.slots.clear();
+        if self.slots.capacity() < initial_reserve
+            && self.slots.try_reserve(initial_reserve).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return false;
+        }
+        true
     }
 
     pub fn insert(&mut self, mut waiter: CompletionWaiter) -> Result<(), u32> {
@@ -406,14 +425,21 @@ impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let index = if let Some(index) = self.slots.iter().position(|slot| slot.is_none()) {
+            index
+        } else {
+            if self.slots.len() == self.slots.capacity() && self.slots.try_reserve(1).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                self.store_failures = self.store_failures.saturating_add(1);
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            let index = self.slots.len();
+            self.slots.push(None);
+            index
+        };
         waiter.sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        *slot = Some(waiter);
+        self.slots[index] = Some(waiter);
         Ok(())
     }
 
@@ -473,6 +499,22 @@ impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
         self.len() == 0
     }
 
+    pub fn records(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    pub fn allocation_failures(&self) -> u64 {
+        self.allocation_failures
+    }
+
+    pub fn store_failures(&self) -> u64 {
+        self.store_failures
+    }
+
     fn pop_oldest_matching(
         &mut self,
         predicate: impl Fn(&CompletionWaiter) -> bool,
@@ -489,7 +531,7 @@ impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
     }
 }
 
-impl<const WAITERS: usize> Default for CompletionWaiterTable<WAITERS> {
+impl Default for CompletionWaiterTable {
     fn default() -> Self {
         Self::new()
     }
@@ -1154,7 +1196,7 @@ mod tests {
 
     #[test]
     fn completion_packets_are_fifo_but_waiters_are_lifo_per_port() {
-        let mut waiters = CompletionWaiterTable::<4>::new();
+        let mut waiters = CompletionWaiterTable::new();
         waiters.insert(waiter(1, 10, INFINITE_DEADLINE)).unwrap();
         waiters.insert(waiter(2, 20, INFINITE_DEADLINE)).unwrap();
         waiters.insert(waiter(1, 30, INFINITE_DEADLINE)).unwrap();
@@ -1166,8 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn completion_waiter_capacity_and_reply_identity_are_enforced() {
-        let mut waiters = CompletionWaiterTable::<2>::new();
+    fn completion_waiter_reply_identity_and_dynamic_growth_are_enforced() {
+        let mut waiters = CompletionWaiterTable::new();
         assert_eq!(
             waiters.insert(waiter(1, 0, INFINITE_DEADLINE)),
             Err(STATUS_INVALID_PARAMETER)
@@ -1178,15 +1220,17 @@ mod tests {
             Err(STATUS_INVALID_PARAMETER)
         );
         waiters.insert(waiter(2, 2, INFINITE_DEADLINE)).unwrap();
-        assert_eq!(
-            waiters.insert(waiter(3, 3, INFINITE_DEADLINE)),
-            Err(STATUS_INSUFFICIENT_RESOURCES)
-        );
+        waiters.insert(waiter(3, 3, INFINITE_DEADLINE)).unwrap();
+        assert_eq!(waiters.len(), 3);
+        assert!(waiters.records() >= 3);
+        assert!(waiters.capacity() >= waiters.records());
+        assert_eq!(waiters.allocation_failures(), 0);
+        assert_eq!(waiters.store_failures(), 0);
     }
 
     #[test]
     fn completion_waiter_deadlines_are_ordered_and_infinite_is_ignored() {
-        let mut waiters = CompletionWaiterTable::<5>::new();
+        let mut waiters = CompletionWaiterTable::new();
         waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
         waiters.insert(waiter(1, 2, 200)).unwrap();
         waiters.insert(waiter(2, 3, 100)).unwrap();
@@ -1203,7 +1247,7 @@ mod tests {
 
     #[test]
     fn completion_waiters_cancel_by_thread_without_disturbing_others() {
-        let mut waiters = CompletionWaiterTable::<4>::new();
+        let mut waiters = CompletionWaiterTable::new();
         waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
         let mut second = waiter(1, 2, INFINITE_DEADLINE);
         second.thread_id = 101;
@@ -1217,7 +1261,7 @@ mod tests {
 
     #[test]
     fn completion_waiters_cancel_by_process_without_disturbing_others() {
-        let mut waiters = CompletionWaiterTable::<4>::new();
+        let mut waiters = CompletionWaiterTable::new();
         let mut first = waiter(1, 1, INFINITE_DEADLINE);
         first.process_index = 2;
         waiters.insert(first).unwrap();

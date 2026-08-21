@@ -5269,6 +5269,9 @@ pub(crate) unsafe fn service_sec_image(
     if !object_waiter_table_reset() {
         panic!("object wait table allocation failed");
     }
+    if !io_completion_waiter_table_reset() {
+        panic!("IO completion wait table allocation failed");
+    }
     if !thread_wait_state_reset() {
         panic!("thread wait parked-state allocation failed");
     }
@@ -9443,8 +9446,11 @@ pub(crate) unsafe fn service_sec_image(
                 // reset. Exactly the `overlay_dirty` contract, for the file system instead of the
                 // registry; bounded (the profile tree is a handful of nodes) and only on the
                 // iterations that actually touched the volume.
-                let writable_fs_touched =
-                    nt_handler.writable_fs_dirty || crate::writable_fs::take_mount_dirty();
+                let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
+                let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
+                let writable_fs_touched = nt_handler.writable_fs_dirty
+                    || writable_fs_mount_dirty
+                    || writable_fs_runtime_dirty;
                 if writable_fs_touched {
                     let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
                     nt_handler.writable_fs_dirty = false;
@@ -21464,9 +21470,14 @@ unsafe fn io_completion_park(
     waiter.apc_context_out = apc_context_out;
     waiter.io_status_block_out = io_status_block_out;
     waiter.deadline_100ns = deadline_100ns;
-    if unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter) }.is_err() {
+    let waiters = unsafe { &mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS) };
+    let old_capacity = waiters.capacity();
+    if waiters.insert(waiter).is_err() {
         let _ = nt_handler.io_completion_ports.release(port_id);
         return false;
+    }
+    if waiters.capacity() != old_capacity {
+        mark_wait_table_growth_dirty();
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);

@@ -363,6 +363,7 @@ pub(crate) static CONFIG_SOURCE_SOFTWARE_HIVE_OK: AtomicU64 = AtomicU64::new(0);
 /// created lazily so a boot that never writes pays nothing).
 static mut EXEC_WRITABLE_FS: Option<nt_fs::FileSystem> = None;
 static WRITABLE_FS_MOUNT_DIRTY: AtomicBool = AtomicBool::new(false);
+static WRITABLE_FS_RUNTIME_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_DIRTY: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 static WRITABLE_FS_SNAPSHOT_RESTORE_PROBED: AtomicBool = AtomicBool::new(false);
@@ -583,7 +584,12 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
     }
 }
 
+fn mark_runtime_dirty() {
+    WRITABLE_FS_RUNTIME_DIRTY.store(true, Ordering::Release);
+}
+
 fn mark_snapshot_dirty() {
+    mark_runtime_dirty();
     WRITABLE_FS_SNAPSHOT_DIRTY.store(true, Ordering::Release);
 }
 
@@ -670,6 +676,7 @@ unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) {
     let provisioned = provision_missing_installed_sources(&mut fs);
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     *slot = Some(fs);
+    mark_runtime_dirty();
     WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
     if provisioned || !restored {
         mark_snapshot_dirty();
@@ -1041,6 +1048,11 @@ pub(crate) fn take_mount_dirty() -> bool {
     WRITABLE_FS_MOUNT_DIRTY.swap(false, Ordering::AcqRel)
 }
 
+/// Consume the one-shot dirty bit set by durable mounted-volume runtime changes.
+pub(crate) fn take_runtime_dirty() -> bool {
+    WRITABLE_FS_RUNTIME_DIRTY.swap(false, Ordering::AcqRel)
+}
+
 /// Classify an NT object name: `Some(volume-relative path)` when it belongs to the writable volume,
 /// `None` when the read-only namespace still owns it.
 pub(crate) fn writable_path(name: &[u16]) -> Option<alloc::vec::Vec<u8>> {
@@ -1093,6 +1105,7 @@ pub(crate) unsafe fn create(
         options,
     );
     if result.status == nt_fs::STATUS_SUCCESS {
+        mark_runtime_dirty();
         if create_information_changes_volume(result.information) {
             mark_snapshot_dirty();
         }
@@ -1163,6 +1176,7 @@ pub(crate) unsafe fn open_existing_relative_if_mounted(
         options,
     );
     if result.status == nt_fs::STATUS_SUCCESS {
+        mark_runtime_dirty();
         OVERLAY_OPENS.fetch_add(1, Ordering::Relaxed);
         (
             result.status,
@@ -1298,6 +1312,7 @@ pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
         if file.status != nt_fs::STATUS_SUCCESS {
             break 'truncate file.status;
         }
+        mark_runtime_dirty();
         let old_len = fs
             .zw_query_standard_information(file.handle)
             .map_or(0, |info| info.end_of_file);
@@ -1375,6 +1390,7 @@ pub(crate) unsafe fn write_file_atomic_owned(path: &str, bytes: alloc::vec::Vec<
         if create.status != nt_fs::STATUS_SUCCESS {
             break 'replace create.status;
         }
+        mark_runtime_dirty();
 
         let write_status = fs.replace_file_data_owned(create.handle, bytes);
         if write_status != nt_fs::STATUS_SUCCESS {
@@ -1654,7 +1670,10 @@ pub(crate) unsafe fn retain(file_id: u64) -> Result<(), u32> {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     };
     match fs.zw_retain(file_id) {
-        nt_fs::STATUS_SUCCESS => Ok(()),
+        nt_fs::STATUS_SUCCESS => {
+            mark_runtime_dirty();
+            Ok(())
+        }
         status => Err(status),
     }
 }

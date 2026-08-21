@@ -617,9 +617,9 @@ Explorer shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobber
 `exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
 reports `keyed-wait=0/0/16/0/0:0/0/16/0/0`, and commits writable profile state with
 `[writable-fs-snapshot] committed generation=5 bytes=822600`. Review adjustment: keyed-event
-rendezvous capacity is no longer a fixed kernel cap. The main object-wait reply-cap pool, IOCP,
-delay, and pipe-name waiters still remain explicit transport-capacity boundaries because they own
-real reply caps/resume records.
+rendezvous capacity is no longer a fixed kernel cap. The main object-wait reply-cap pool, delay, and
+pipe-name waiters still remain explicit transport-capacity boundaries because they own real reply
+caps/resume records.
 
 A4/B3 object-wait waiter scaling cleanup (2026-08-22): `NtWaitForSingleObject` and
 `NtWaitForMultipleObjects` no longer use fixed `WAITER_N` parallel arrays for dispatcher wait
@@ -640,6 +640,29 @@ and Explorer shell chrome with `293/293` checks passing, keeps
 writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822086`. Review
 adjustment: the dispatcher waiter record store is no longer a fixed kernel cap. The real seL4
 reply-cap pool remains separate because it owns transport objects and needs its own capacity audit.
+
+A4/B3 IO completion waiter scaling cleanup (2026-08-22): `NtRemoveIoCompletion` waiters no longer
+use a fixed const-generic slot array sized from `WAIT_REPLY_POOL_N - 1`. `nt-io-completion` now owns
+a growable vector-backed `CompletionWaiterTable` that preserves LIFO per-port release, oldest
+thread/process cancellation, and deadline ordering while reusing cleared records. The executive
+pre-reserves this durable table before the service-loop heap rewind mark, pins later growth through
+the same wait-table dirty bit as other wait records, and reports
+`iocp-wait=<live>/<records>/<cap>/<alloc-fail>/<store-fail>` in pool census. The proof run also
+exposed a real writable-FS durability hole: open/replacement paths could grow the mounted
+`FileSystem`/`FILE_OBJECT` runtime state without a module-owned heap-pin signal. `writable_fs` now
+publishes a runtime dirty bit alongside snapshot/mount dirty so the service loop pins durable MemFs
+and handle-table growth before the next bump-heap reset. Local validation is green for
+`cargo fmt --all`, `cargo test -p nt-io-completion`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-iocp-waiters-writable-runtime-dirty-20260822.log` reaches genuine
+userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_teb_not_clobbered_by_win32k`, `exec_msgina_credential_keystrokes_delivered`,
+`exec_profile_ntuser_dat_present`, and `exec_explorer_shell_chrome_painted` green, reports
+`iocp-wait=4/4/808/0/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822086`. Review adjustment: IOCP parked-remover
+record capacity is closed. The remaining finite wait capacity is the real seL4 reply-cap pool plus
+the still-audited delay and pipe-name waiters.
 
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of

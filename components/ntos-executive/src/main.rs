@@ -3097,8 +3097,8 @@ static WAIT_PARK_NO_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Blocking `NtRemoveIoCompletion` calls. One reply object remains active so the executive can
 /// continue receiving while every other reply cap is parked.
-const IO_COMPLETION_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
-static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable<IO_COMPLETION_WAITER_N> =
+const IO_COMPLETION_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
+static mut IO_COMPLETION_WAITERS: nt_io_completion::CompletionWaiterTable =
     nt_io_completion::CompletionWaiterTable::new();
 static IO_COMPLETION_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -10609,6 +10609,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(object_wait_store_fails);
     let (
+        io_completion_wait_live,
+        io_completion_wait_records,
+        io_completion_wait_cap,
+        io_completion_wait_alloc_fails,
+        io_completion_wait_store_fails,
+    ) = io_completion_waiter_table_stats();
+    print_str(b" iocp-wait=");
+    print_u64(io_completion_wait_live as u64);
+    print_str(b"/");
+    print_u64(io_completion_wait_records as u64);
+    print_str(b"/");
+    print_u64(io_completion_wait_cap as u64);
+    print_str(b"/");
+    print_u64(io_completion_wait_alloc_fails);
+    print_str(b"/");
+    print_u64(io_completion_wait_store_fails);
+    let (
         thread_wait_park_live,
         thread_wait_park_records,
         thread_wait_park_cap,
@@ -16265,6 +16282,26 @@ fn object_waiter_mark_pending_wake(slot: usize, wake_index: u64, wake_object: Wa
 
 fn object_waiter_pending_wake(slot: usize) -> Option<(ObjectWaiterRecord, u64, WaitObject)> {
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).pending_wake(slot) }
+}
+
+fn io_completion_waiter_table_reset() -> bool {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+            .reset(IO_COMPLETION_WAITER_INITIAL_RESERVE)
+    }
+}
+
+fn io_completion_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
+        (
+            waiters.len(),
+            waiters.records(),
+            waiters.capacity(),
+            waiters.allocation_failures(),
+            waiters.store_failures(),
+        )
+    }
 }
 
 fn thread_wait_state_reset() -> bool {
