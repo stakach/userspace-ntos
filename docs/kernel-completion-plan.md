@@ -8427,6 +8427,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registration and before CSR access, so continue at the next real ReactOS `StartDevice` edge:
     dependent `NdisMGetDeviceProperty`/`IoGetDeviceProperty` location queries and the first
     post-location configuration path.
+    The next slice closes that edge without adding a raw pointer path. Provider
+    `NdisMGetDeviceProperty` now rewrites PDO/FDO/next-device outputs to the dependent devnode
+    objects, `IoGetDeviceProperty` serves bus/address properties from the active resource grant, and
+    NDIS buffer shadows can now be backed by validated DMA common-buffer subranges. This lets
+    ReactOS `dc21x4.sys` call `NdisAllocateBuffer` over receive buffers returned by
+    `NdisMAllocateSharedMemory` while preserving the common-buffer VA/logical-address identity
+    instead of copying the receive memory into unrelated pool storage. Local validation:
+    `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Accepted mixed-NIC proof
+    `.tmp/run-headless-b3-dc21x4-ndis-buffer-dma-20260821.log` boots with
+    `NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4` plus QEMU `tulip`, shows no
+    provider-export reject at `ndis.sys!NdisAllocateBuffer`, returns
+    `StartDevice status=0x00000000` for the generated DC21x4 PCI devnode, passes
+    `exec_generic_pci_provider_domain_serviced`, keeps Explorer shell chrome green, and finishes
+    `293/293`. Review adjustment: the packet-array frontier has moved past DC21x4 provider
+    initialization. Continue at the first real packet-array data-plane proof: interrupt/DPC activity
+    for the tulip function, receive descriptor ownership, and a live
+    `NdisMIndicateReceivePacket`/protocol receive-complete path.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

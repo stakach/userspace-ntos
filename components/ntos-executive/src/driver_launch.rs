@@ -731,6 +731,8 @@ static PROVIDER_RESOURCE_LIST_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_RESOURCE_LIST_TRACE_CAP: u64 = 16;
 static PROVIDER_IO_PORT_RANGE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_IO_PORT_RANGE_TRACE_CAP: u64 = 16;
+static PROVIDER_DEVICE_PROPERTY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const PROVIDER_DEVICE_PROPERTY_TRACE_CAP: u64 = 24;
 static HOSTED_HAL_TRANSLATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -742,6 +744,8 @@ static HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(
 const HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_CAP: u64 = 16;
 static HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_BUFFER_MARSHAL_TRACE_CAP: u64 = 16;
+static HOSTED_IO_DEVICE_PROPERTY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_IO_DEVICE_PROPERTY_TRACE_CAP: u64 = 32;
 static HOSTED_DMA_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_TRACE_CAP: u64 = 16;
 static HOSTED_RESOURCE_GRANT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -5933,6 +5937,7 @@ unsafe fn hosted_resource_identity_active() -> bool {
 unsafe fn hosted_pdo_known(pdo: u64) -> bool {
     pdo != 0
         && (hosted_device_binding_by_pdo_object(pdo).is_some()
+            || hosted_root_pdo_device_id(pdo).is_some()
             || read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64) == pdo)
 }
 
@@ -5975,6 +5980,31 @@ unsafe fn hosted_device_object_known(device_object: u64) -> bool {
             || read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64) == device_object)
 }
 
+unsafe fn trace_io_get_device_property(
+    pdo: u64,
+    property: u32,
+    buffer_len: u32,
+    status: i32,
+    value: u32,
+) {
+    if HOSTED_IO_DEVICE_PROPERTY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_IO_DEVICE_PROPERTY_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[driver-launch] IoGetDeviceProperty pdo=0x");
+    print_hex64(pdo);
+    print_str(b" prop=");
+    print_u64(property as u64);
+    print_str(b" len=");
+    print_u64(buffer_len as u64);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" value=0x");
+    print_hex(value);
+    print_str(b"\n");
+}
+
 /// `NTSTATUS IoGetDeviceProperty(PDEVICE_OBJECT, DEVICE_REGISTRY_PROPERTY, ULONG, PVOID, PULONG)`.
 extern "win64" fn s_io_get_device_property(
     pdo: u64,
@@ -5984,10 +6014,18 @@ extern "win64" fn s_io_get_device_property(
     result_len: u64,
 ) -> i32 {
     unsafe {
-        if !hosted_pdo_known(pdo) {
+        let resource_identity_active = hosted_resource_identity_active();
+        let resource_property = matches!(
+            property,
+            DEVICE_PROPERTY_LEGACY_BUS_TYPE
+                | DEVICE_PROPERTY_BUS_NUMBER
+                | DEVICE_PROPERTY_ADDRESS
+        );
+        if !hosted_pdo_known(pdo) && !(resource_identity_active && resource_property) {
             if result_len != 0 {
                 write_unaligned(result_len as *mut u32, 0);
             }
+            trace_io_get_device_property(pdo, property, buffer_len, STATUS_INVALID_PARAMETER, 0);
             return STATUS_INVALID_PARAMETER;
         }
         if property == DEVICE_PROPERTY_DRIVER_KEY_NAME {
@@ -5995,32 +6033,51 @@ extern "win64" fn s_io_get_device_property(
                 if result_len != 0 {
                     write_unaligned(result_len as *mut u32, 0);
                 }
+                trace_io_get_device_property(
+                    pdo,
+                    property,
+                    buffer_len,
+                    STATUS_OBJECT_NAME_NOT_FOUND,
+                    0,
+                );
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             };
             if !identity.has_driver_key() {
                 if result_len != 0 {
                     write_unaligned(result_len as *mut u32, 0);
                 }
+                trace_io_get_device_property(
+                    pdo,
+                    property,
+                    buffer_len,
+                    STATUS_OBJECT_NAME_NOT_FOUND,
+                    0,
+                );
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
-            return write_ascii_sz_property_utf16(
+            let status = write_ascii_sz_property_utf16(
                 buffer_len,
                 buffer,
                 result_len,
                 &identity.driver_key_name,
             );
+            trace_io_get_device_property(pdo, property, buffer_len, status, 0);
+            return status;
         }
-        if !hosted_resource_identity_active() {
+        if !resource_identity_active {
             if result_len != 0 {
                 write_unaligned(result_len as *mut u32, 0);
             }
+            trace_io_get_device_property(pdo, property, buffer_len, STATUS_NOT_SUPPORTED, 0);
             return STATUS_NOT_SUPPORTED;
         }
         match property {
             DEVICE_PROPERTY_LEGACY_BUS_TYPE => {
                 let value =
                     read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
-                write_u32_property(buffer_len, buffer, result_len, value)
+                let status = write_u32_property(buffer_len, buffer, result_len, value);
+                trace_io_get_device_property(pdo, property, buffer_len, status, value);
+                status
             }
             DEVICE_PROPERTY_BUS_NUMBER | DEVICE_PROPERTY_ADDRESS => {
                 let value = if property == DEVICE_PROPERTY_BUS_NUMBER {
@@ -6028,9 +6085,14 @@ extern "win64" fn s_io_get_device_property(
                 } else {
                     read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_ADDRESS) as *const u32)
                 };
-                write_u32_property(buffer_len, buffer, result_len, value)
+                let status = write_u32_property(buffer_len, buffer, result_len, value);
+                trace_io_get_device_property(pdo, property, buffer_len, status, value);
+                status
             }
-            _ => STATUS_NOT_SUPPORTED,
+            _ => {
+                trace_io_get_device_property(pdo, property, buffer_len, STATUS_NOT_SUPPORTED, 0);
+                STATUS_NOT_SUPPORTED
+            }
         }
     }
 }
@@ -13223,6 +13285,7 @@ struct ProviderMarshalState {
     ndis_buffer_out_dependent_data_component_va: u64,
     ndis_buffer_out_provider_data_component_va: u64,
     ndis_buffer_out_bytes: u64,
+    ndis_buffer_out_provider_data_owned_by_bridge: bool,
     ndis_first_buffer_dependent_exec_va: u64,
     ndis_first_buffer_provider_exec_va: u64,
     ndis_first_buffer_va_dependent_exec_va: u64,
@@ -13289,6 +13352,7 @@ impl ProviderMarshalState {
             ndis_buffer_out_dependent_data_component_va: 0,
             ndis_buffer_out_provider_data_component_va: 0,
             ndis_buffer_out_bytes: 0,
+            ndis_buffer_out_provider_data_owned_by_bridge: false,
             ndis_first_buffer_dependent_exec_va: 0,
             ndis_first_buffer_provider_exec_va: 0,
             ndis_first_buffer_va_dependent_exec_va: 0,
@@ -15362,12 +15426,18 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(provider_data_exec) = component_to_exec_va_for_instance(
+    let provider_data_exec = component_to_exec_va_for_instance(
         provider_instance,
         provider_inst,
         provider_data_component_va,
         bytes,
-    ) else {
+    );
+    let dma_data_exec = if provider_data_exec.is_none() {
+        dma_common_subrange_exec_va(dependent_inst, provider_data_component_va, bytes)
+    } else {
+        None
+    };
+    let Some(provider_data_exec) = provider_data_exec.or(dma_data_exec) else {
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -15376,10 +15446,15 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    let Some(dependent_data_component_va) = hosted_instance_pool_alloc(dependent_inst, bytes)
-    else {
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    let (dependent_data_component_va, dependent_data_owned_by_bridge) = if dma_data_exec.is_some() {
+        (provider_data_component_va, false)
+    } else {
+        let Some(dependent_data_component_va) = hosted_instance_pool_alloc(dependent_inst, bytes)
+        else {
+            hosted_instance_pool_free(dependent_inst, dependent_component_va);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        (dependent_data_component_va, true)
     };
     let Some(dependent_mdl_exec) = component_to_exec_va_for_instance(
         dependent_instance,
@@ -15387,23 +15462,27 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         dependent_component_va,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
+        if dependent_data_owned_by_bridge {
+            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
+        }
         hosted_instance_pool_free(dependent_inst, dependent_component_va);
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
-        dependent_instance,
-        dependent_inst,
-        dependent_data_component_va,
-        bytes,
-    ) else {
-        hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
-        hosted_instance_pool_free(dependent_inst, dependent_component_va);
-        HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    copy_bytes(dependent_data_exec, provider_data_exec, bytes);
+    if dependent_data_owned_by_bridge {
+        let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+            dependent_instance,
+            dependent_inst,
+            dependent_data_component_va,
+            bytes,
+        ) else {
+            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
+            hosted_instance_pool_free(dependent_inst, dependent_component_va);
+            HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        copy_bytes(dependent_data_exec, provider_data_exec, bytes);
+    }
     write_ndis_mdl(dependent_mdl_exec, dependent_data_component_va, bytes, 0);
     let shadow = HostedProviderNdisBufferShadow {
         present: true,
@@ -15417,10 +15496,12 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         provider_component_owned_by_bridge: false,
         provider_data_component_owned_by_bridge: false,
         dependent_component_owned_by_bridge: true,
-        dependent_data_component_owned_by_bridge: true,
+        dependent_data_component_owned_by_bridge: dependent_data_owned_by_bridge,
     };
     if !register_hosted_provider_ndis_buffer_shadow(shadow) {
-        hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
+        if dependent_data_owned_by_bridge {
+            hosted_instance_pool_free(dependent_inst, dependent_data_component_va);
+        }
         hosted_instance_pool_free(dependent_inst, dependent_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -15459,12 +15540,18 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+    let dependent_data_exec = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
         dependent_data_component_va,
         bytes,
-    ) else {
+    );
+    let dma_data_exec = if dependent_data_exec.is_none() {
+        dma_common_subrange_exec_va(dependent_inst, dependent_data_component_va, bytes)
+    } else {
+        None
+    };
+    let Some(dependent_data_exec) = dependent_data_exec.or(dma_data_exec) else {
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -15473,9 +15560,15 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
-    let Some(provider_data_component_va) = hosted_instance_pool_alloc(provider_inst, bytes) else {
-        hosted_instance_pool_free(provider_inst, provider_component_va);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    let (provider_data_component_va, provider_data_owned_by_bridge) = if dma_data_exec.is_some() {
+        (dependent_data_component_va, false)
+    } else {
+        let Some(provider_data_component_va) = hosted_instance_pool_alloc(provider_inst, bytes)
+        else {
+            hosted_instance_pool_free(provider_inst, provider_component_va);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        };
+        (provider_data_component_va, true)
     };
     let Some(provider_mdl_exec) = component_to_exec_va_for_instance(
         provider_instance,
@@ -15483,23 +15576,27 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         provider_component_va,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        if provider_data_owned_by_bridge {
+            hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        }
         hosted_instance_pool_free(provider_inst, provider_component_va);
         HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(provider_data_exec) = component_to_exec_va_for_instance(
-        provider_instance,
-        provider_inst,
-        provider_data_component_va,
-        bytes,
-    ) else {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
-        hosted_instance_pool_free(provider_inst, provider_component_va);
-        HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    copy_bytes(provider_data_exec, dependent_data_exec, bytes);
+    if provider_data_owned_by_bridge {
+        let Some(provider_data_exec) = component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            provider_data_component_va,
+            bytes,
+        ) else {
+            hosted_instance_pool_free(provider_inst, provider_data_component_va);
+            hosted_instance_pool_free(provider_inst, provider_component_va);
+            HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        copy_bytes(provider_data_exec, dependent_data_exec, bytes);
+    }
     write_ndis_mdl(provider_mdl_exec, provider_data_component_va, bytes, 0);
     let shadow = HostedProviderNdisBufferShadow {
         present: true,
@@ -15511,12 +15608,14 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         provider_data_component_va,
         bytes,
         provider_component_owned_by_bridge: true,
-        provider_data_component_owned_by_bridge: true,
+        provider_data_component_owned_by_bridge: provider_data_owned_by_bridge,
         dependent_component_owned_by_bridge: false,
         dependent_data_component_owned_by_bridge: false,
     };
     if !register_hosted_provider_ndis_buffer_shadow(shadow) {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        if provider_data_owned_by_bridge {
+            hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        }
         hosted_instance_pool_free(provider_inst, provider_component_va);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -15776,17 +15875,19 @@ unsafe fn sync_ndis_buffer_shadow_to_provider(
         .provider_data_component_va
         .checked_add(offset)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+    let Some(dependent_data_exec) = component_or_dma_common_to_exec_va(
         dependent_instance,
+        dependent_inst,
         dependent_inst,
         dependent_data_va,
         bytes,
     ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(provider_data_exec) = component_to_exec_va_for_instance(
+    let Some(provider_data_exec) = component_or_dma_common_to_exec_va(
         provider_instance,
         provider_inst,
+        dependent_inst,
         provider_data_va,
         bytes,
     ) else {
@@ -15828,16 +15929,18 @@ unsafe fn sync_ndis_buffer_shadow_to_dependent(
         .dependent_data_component_va
         .checked_add(offset)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(provider_data_exec) = component_to_exec_va_for_instance(
+    let Some(provider_data_exec) = component_or_dma_common_to_exec_va(
         provider_instance,
         provider_inst,
+        dependent_inst,
         provider_data_va,
         bytes,
     ) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+    let Some(dependent_data_exec) = component_or_dma_common_to_exec_va(
         dependent_instance,
+        dependent_inst,
         dependent_inst,
         dependent_data_va,
         bytes,
@@ -16413,37 +16516,56 @@ unsafe fn provider_marshal_output_ndis_buffer(
     if dependent_data_component_va == 0 || bytes == 0 || bytes > u32::MAX as u64 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_data_exec) = component_to_exec_va_for_instance(
+    let dependent_data_exec = component_to_exec_va_for_instance(
         dependent_instance,
         dependent_inst,
         dependent_data_component_va,
         bytes,
-    ) else {
+    );
+    let dma_data_exec = if dependent_data_exec.is_none() {
+        dma_common_subrange_exec_va(dependent_inst, dependent_data_component_va, bytes)
+    } else {
+        None
+    };
+    let (provider_data_component_va, provider_data_owned_by_bridge) = if let Some(data_exec) =
+        dependent_data_exec.or(dma_data_exec)
+    {
+        if dma_data_exec.is_some() {
+            (dependent_data_component_va, false)
+        } else {
+            let Some(provider_data_component_va) = hosted_instance_pool_alloc(provider_inst, bytes)
+            else {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            };
+            let Some(provider_data_exec) = component_to_exec_va_for_instance(
+                provider_instance,
+                provider_inst,
+                provider_data_component_va,
+                bytes,
+            ) else {
+                hosted_instance_pool_free(provider_inst, provider_data_component_va);
+                return Err(STATUS_INVALID_PARAMETER);
+            };
+            copy_bytes(provider_data_exec, data_exec, bytes);
+            (provider_data_component_va, true)
+        }
+    } else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(provider_data_component_va) = hosted_instance_pool_alloc(provider_inst, bytes) else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let Some(provider_data_exec) = component_to_exec_va_for_instance(
-        provider_instance,
-        provider_inst,
-        provider_data_component_va,
-        bytes,
-    ) else {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
-        return Err(STATUS_INVALID_PARAMETER);
-    };
-    copy_bytes(provider_data_exec, dependent_data_exec, bytes);
     let Some(dependent_out_exec) =
         component_to_exec_va_for_instance(dependent_instance, dependent_inst, out_arg_value, 8)
     else {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        if provider_data_owned_by_bridge {
+            hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        }
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_out_component_va, provider_out_exec)) =
         provider_marshal_alloc(state, provider_shared, 8)
     else {
-        hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        if provider_data_owned_by_bridge {
+            hosted_instance_pool_free(provider_inst, provider_data_component_va);
+        }
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     state.ndis_buffer_out_dependent_exec_va = dependent_out_exec;
@@ -16451,6 +16573,7 @@ unsafe fn provider_marshal_output_ndis_buffer(
     state.ndis_buffer_out_dependent_data_component_va = dependent_data_component_va;
     state.ndis_buffer_out_provider_data_component_va = provider_data_component_va;
     state.ndis_buffer_out_bytes = bytes;
+    state.ndis_buffer_out_provider_data_owned_by_bridge = provider_data_owned_by_bridge;
     Ok(provider_out_component_va)
 }
 
@@ -16605,22 +16728,32 @@ unsafe fn complete_provider_ndis_device_properties(
     while index < state.ndis_device_property_output_count {
         let output = state.ndis_device_property_outputs[index];
         let provider_value = read_unaligned(output.provider_exec_va as *const u64);
-        let value = if provider_value == 0 {
-            0
-        } else {
-            match output.kind {
-                NDIS_DEVICE_PROPERTY_PDO => binding.map(|slot| slot.pdo_object).unwrap_or(0),
-                NDIS_DEVICE_PROPERTY_FDO => binding
-                    .map(|slot| slot.device_object)
-                    .filter(|value| *value != 0)
-                    .unwrap_or(dependent_inst.device_object),
-                NDIS_DEVICE_PROPERTY_NEXT => binding.map(|slot| slot.pdo_object).unwrap_or(0),
-                NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES
-                | NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES => 0,
-                _ => 0,
-            }
+        let value = match output.kind {
+            NDIS_DEVICE_PROPERTY_PDO => binding.map(|slot| slot.pdo_object).unwrap_or(0),
+            NDIS_DEVICE_PROPERTY_FDO => binding
+                .map(|slot| slot.device_object)
+                .filter(|value| *value != 0)
+                .unwrap_or(dependent_inst.device_object),
+            NDIS_DEVICE_PROPERTY_NEXT => binding.map(|slot| slot.pdo_object).unwrap_or(0),
+            NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES
+            | NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES => 0,
+            _ => 0,
         };
         write_unaligned(output.dependent_exec_va as *mut u64, value);
+        let trace = PROVIDER_DEVICE_PROPERTY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace < PROVIDER_DEVICE_PROPERTY_TRACE_CAP {
+            print_str(b"[driver-import] provider device-property kind=");
+            print_u64(output.kind as u64);
+            print_str(b" provider=0x");
+            print_hex64(provider_value);
+            print_str(b" dependent=0x");
+            print_hex64(value);
+            print_str(b" binding=");
+            print_u64(binding.is_some() as u64);
+            print_str(b" dep-dev=0x");
+            print_hex64(dependent_inst.device_object);
+            print_str(b"\n");
+        }
         index += 1;
     }
 }
@@ -16884,19 +17017,23 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         return;
     }
     if !provider_ndis_status_success(state) {
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
     }
     let provider_buffer = read_unaligned(state.ndis_buffer_out_provider_exec_va as *const u64);
     if provider_buffer == 0 || state.ndis_buffer_out_bytes == 0 {
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -16907,10 +17044,12 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         provider_buffer,
         nt_mdl::MDL_SIZE as u64,
     ) else {
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -16918,10 +17057,12 @@ unsafe fn complete_provider_ndis_buffer_allocation(
     let Some(dependent_buffer) =
         hosted_instance_pool_alloc(dependent_inst, nt_mdl::MDL_SIZE as u64)
     else {
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -16933,10 +17074,12 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         nt_mdl::MDL_SIZE as u64,
     ) else {
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -16963,15 +17106,17 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         provider_data_component_va: state.ndis_buffer_out_provider_data_component_va,
         bytes: state.ndis_buffer_out_bytes,
         provider_component_owned_by_bridge: true,
-        provider_data_component_owned_by_bridge: true,
+        provider_data_component_owned_by_bridge: state.ndis_buffer_out_provider_data_owned_by_bridge,
         dependent_component_owned_by_bridge: true,
         dependent_data_component_owned_by_bridge: false,
     }) {
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
-        hosted_instance_pool_free(
-            provider_inst,
-            state.ndis_buffer_out_provider_data_component_va,
-        );
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
         write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
         write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
         return;
@@ -19130,6 +19275,74 @@ unsafe fn dma_common_allocation_record_matches(
         index += 1;
     }
     false
+}
+
+unsafe fn dma_common_allocation_record_covers(
+    sh: u64,
+    component_va: u64,
+    length: u64,
+) -> Option<u64> {
+    if component_va == 0 || length == 0 {
+        return None;
+    }
+    let grant_va = read_volatile((sh + SH_DMA_COMMON_VA) as *const u64);
+    let grant_logical = read_volatile((sh + SH_DMA_COMMON_LOGICAL) as *const u64);
+    if grant_va == 0 || grant_logical == 0 {
+        return None;
+    }
+    let capacity = dma_allocation_record_capacity(sh);
+    let count = read_volatile((sh + SH_DMA_ALLOC_RECORD_COUNT) as *const u64);
+    if capacity == 0 || count > capacity {
+        return None;
+    }
+    let mut index = 0u64;
+    while index < count {
+        let record = dma_allocation_record(sh, index)?;
+        let record_logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let record_len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        let record_va = read_volatile((record + SH_DMA_ALLOC_RECORD_VA) as *const u64);
+        let record_kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        if record_kind == HOSTED_DMA_RECORD_KIND_COMMON && record_logical != 0 && record_va != 0 {
+            let logical_offset = record_logical.checked_sub(grant_logical)?;
+            let va_offset = record_va.checked_sub(grant_va)?;
+            if logical_offset == va_offset {
+                if let Some(offset) =
+                    component_subrange_offset(record_va, record_len, component_va, length)
+                {
+                    let logical = record_logical.checked_add(offset)?;
+                    if dma_common_pointer_in_grant(sh, component_va, logical, length) {
+                        return Some(logical);
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn dma_common_subrange_exec_va(
+    inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    if inst.device_id == 0 {
+        return None;
+    }
+    let state = hosted_device_resource_state_by_device_id(inst.device_id)?;
+    dma_common_allocation_record_covers(inst.exec_shared_va, component_va, bytes)?;
+    hosted_dma_alias_for_component_va(state, component_va, bytes)
+}
+
+unsafe fn component_or_dma_common_to_exec_va(
+    instance: usize,
+    inst: DriverInstance,
+    dma_owner_inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    component_to_exec_va_for_instance(instance, inst, component_va, bytes)
+        .or_else(|| dma_common_subrange_exec_va(dma_owner_inst, component_va, bytes))
 }
 
 unsafe fn provider_marshal_output_dma_common_buffer(
@@ -31412,6 +31625,7 @@ fn instance_for_pump_channel(
 unsafe fn hosted_pdo_known_at(sh: u64, pdo: u64) -> bool {
     pdo != 0
         && (hosted_device_binding_by_pdo_object(pdo).is_some()
+            || hosted_root_pdo_device_id(pdo).is_some()
             || read_volatile((sh + SH_REQ_FILEID) as *const u64) == pdo)
 }
 
