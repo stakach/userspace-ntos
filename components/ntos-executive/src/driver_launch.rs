@@ -22646,7 +22646,7 @@ unsafe fn trace_deferred_post_bind_rx_interrupt(
     binding: HostedDeviceBinding,
     status: Result<HostedInterruptDelivery, nt_status::NtStatus>,
 ) {
-    print_str(b"[provider-ndis] post-bind rx drain device-id=");
+    print_str(b"[provider-ndis] post-bind rx inject device-id=");
     print_u64(binding.device_id);
     match status {
         Ok(delivery) => {
@@ -22686,27 +22686,6 @@ unsafe fn arm_post_bind_receive_interrupt_for_device_name(
         print_u64(binding.device_id);
         print_str(b"\n");
     }
-}
-
-unsafe fn drain_hosted_post_bind_receive_interrupt(binding: HostedDeviceBinding, sh: u64) {
-    if !take_hosted_post_bind_rx_pending(binding.device_id) {
-        return;
-    }
-    if !mark_hosted_post_bind_rx_attempt(binding.device_id) {
-        return;
-    }
-    let status = match publish_hosted_interrupt_connection_from_shared(binding, sh) {
-        Ok(()) => {
-            refresh_hosted_device_resource_state(binding, sh);
-            inject_hosted_device_interrupt(binding.device_id)
-        }
-        Err(status) => Err(status),
-    };
-    match &status {
-        Ok(delivery) => record_hosted_post_bind_rx_result(binding.device_id, Some(*delivery)),
-        Err(_) => record_hosted_post_bind_rx_result(binding.device_id, None),
-    }
-    trace_deferred_post_bind_rx_interrupt(binding, status);
 }
 
 unsafe fn service_ndis_protocol_bind_adapter_callback(
@@ -35008,7 +34987,6 @@ pub(crate) unsafe fn start_hosted_device(
         video_port_status(video_status)?;
         apply_hosted_device_interface_state(sh)?;
         refresh_hosted_device_resource_state(binding, sh);
-        drain_hosted_post_bind_receive_interrupt(binding, sh);
         return Ok(());
     }
     let mut out = [];
@@ -35035,7 +35013,6 @@ pub(crate) unsafe fn start_hosted_device(
         nt_status::NtStatus(root_status).to_result()?;
     }
     refresh_hosted_device_resource_state(binding, sh);
-    drain_hosted_post_bind_receive_interrupt(binding, sh);
     Ok(())
 }
 
@@ -35093,28 +35070,43 @@ pub(crate) unsafe fn inject_hosted_device_interrupt(
 ) -> Result<HostedInterruptDelivery, nt_status::NtStatus> {
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (_, inst) = instance_by_driver_id(binding.driver_id)
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if !inst.ready {
-        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+    let post_bind_rx = if take_hosted_post_bind_rx_pending(device_id) {
+        mark_hosted_post_bind_rx_attempt(device_id)
+    } else {
+        false
+    };
+    let status = (|| -> Result<HostedInterruptDelivery, nt_status::NtStatus> {
+        let (_, inst) = instance_by_driver_id(binding.driver_id)
+            .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if !inst.ready {
+            return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+        }
+
+        let sh = inst.exec_shared_va;
+        let state = restore_hosted_device_resource_state(binding, sh, true)?;
+        let mut packet_model_report = drive_hosted_device_packet_model(binding, state, sh)?;
+        let mut delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
+
+        let state = restore_hosted_device_resource_state(binding, sh, false)?;
+        let tx_report = drive_hosted_device_tx_packet_model(binding, state, sh)?;
+        let redrive_needed = tx_report.interrupt_causes != 0;
+        packet_model_report.merge(tx_report);
+        if redrive_needed {
+            let tx_delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
+            delivery.claimed |= tx_delivery.claimed;
+        }
+        record_hosted_dma_packet_model_report(device_id, packet_model_report);
+
+        Ok(delivery)
+    })();
+    if post_bind_rx {
+        match &status {
+            Ok(delivery) => record_hosted_post_bind_rx_result(device_id, Some(*delivery)),
+            Err(_) => record_hosted_post_bind_rx_result(device_id, None),
+        }
+        trace_deferred_post_bind_rx_interrupt(binding, status);
     }
-
-    let sh = inst.exec_shared_va;
-    let state = restore_hosted_device_resource_state(binding, sh, true)?;
-    let mut packet_model_report = drive_hosted_device_packet_model(binding, state, sh)?;
-    let mut delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
-
-    let state = restore_hosted_device_resource_state(binding, sh, false)?;
-    let tx_report = drive_hosted_device_tx_packet_model(binding, state, sh)?;
-    let redrive_needed = tx_report.interrupt_causes != 0;
-    packet_model_report.merge(tx_report);
-    if redrive_needed {
-        let tx_delivery = dispatch_hosted_device_interrupt_once(binding, sh)?;
-        delivery.claimed |= tx_delivery.claimed;
-    }
-    record_hosted_dma_packet_model_report(device_id, packet_model_report);
-
-    Ok(delivery)
+    status
 }
 
 /// Route SCM/native driver stop through the live hosted driver's real `DriverUnload`, then remove

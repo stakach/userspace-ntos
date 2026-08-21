@@ -86,15 +86,17 @@ descriptor through validated common-buffer DMA aliases, and raises the tulip int
 generic hosted-device dispatcher. Provider protocol `BindAdapter` completion now dynamically matches
 the provider-domain `DeviceName` against mirrored NDIS miniport blocks by
 `NDIS_MINIPORT_BLOCK.MiniportName`, arms one bounded receive interrupt for the matched
-resource-backed devnode, and drains it after StartDevice refresh rather than re-entering the miniport
-while the shared request page is still unwinding. Serialized mixed-NIC proof
-`.tmp/run-headless-b3-postbind-rx-deferred-20260821.log` reaches Explorer shell chrome with
-`292/293`, keeps `exec_win32k_desktop_painted` and `exec_explorer_shell_chrome_painted` green, and
-shows both NICs with real post-bind receive attempts/deliveries/failures as `pbrx=1/1/0`. This
-accepted slice uses no process names, driver names, or repeated RX redrive fallback loops. The
-remaining packet frontier is narrower: DC21x4 still does not reach live packet-array indication
-(`packet-array=0/0 rx=1/2 rx-complete=2/2 rx-packet=0/0`), so next B3 work belongs in the miniport
-packet construction/receive indication path rather than transport/resource-state plumbing.
+resource-backed devnode, and lets the ordinary generic interrupt path consume that pending receive
+after the hosted device is fully ready instead of re-entering the miniport from StartDevice unwind.
+Serialized mixed-NIC proof `.tmp/run-headless-b3-postbind-rx-late-inject-20260821.log` reaches
+Explorer shell chrome with `293/293`, keeps `exec_win32k_desktop_painted` and
+`exec_explorer_shell_chrome_painted` green, and shows the DC21x4 post-bind interrupt delivered through
+the canonical dispatcher with `generic hardware interrupt delivery service=dc21x4 ... claimed=1`,
+`txrx=0/1 pbrx=1/1/0`, and provider sharing `packet-array=0/0 rx=1/1 rx-complete=1/1
+rx-packet=0/0`. This accepted slice uses no process names, driver names, or repeated RX redrive
+fallback loops. The remaining packet frontier is narrower: DC21x4 still does not reach live
+packet-array indication (`packet-array=0/0`), so next B3 work belongs in the miniport packet
+construction/receive indication path rather than transport/resource-state plumbing.
 Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
 send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
@@ -8484,15 +8486,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     live and regressed the existing provider receive gate. Keep RX stimulus bounded to the proof
     interrupt until the next slice proves why ReactOS `dc21x4.sys` is not reaching the
     `NdisMIndicateReceivePacket` helper.
-    Follow-up serialized proof `.tmp/run-headless-b3-postbind-rx-deferred-20260821.log` accepts the
-    clean dynamic slice: provider `BindAdapter` now matches the protocol `DeviceName` to the mirrored
-    provider-domain `NDIS_MINIPORT_BLOCK.MiniportName`, arms exactly one resource-backed receive
-    interrupt, publishes the interrupt connection idempotently from the shared resource state, and
-    drains the interrupt only after StartDevice state refresh. The run reaches Explorer shell chrome
-    with `292/293`, shows DC21x4 and E1000 both at `pbrx=1/1/0`, and avoids the previous immediate
-    re-entry corruption. Review adjustment: B3's next target is no longer post-bind timing or provider
-    resource copyback; it is the real DC21x4 packet-array path, where the current evidence is still
-    `packet-array=0/0 rx=1/2 rx-complete=2/2 rx-packet=0/0`.
+    Follow-up serialized proof `.tmp/run-headless-b3-postbind-rx-late-inject-20260821.log` accepts
+    the clean dynamic slice: provider `BindAdapter` now matches the protocol `DeviceName` to the
+    mirrored provider-domain `NDIS_MINIPORT_BLOCK.MiniportName`, arms exactly one resource-backed
+    receive interrupt, publishes the interrupt connection idempotently from the shared resource state,
+    and lets the normal hosted-device interrupt path consume the pending receive after StartDevice has
+    fully unwound. The run reaches Explorer shell chrome with `293/293`, shows DC21x4 at
+    `generic hardware interrupt delivery service=dc21x4 ... claimed=1`,
+    `irq=1/1 dpc=1 txrx=0/1 pbrx=1/1/0`, and provider sharing
+    `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0`. Review adjustment: B3's next target is
+    no longer post-bind timing, provider resource copyback, or interrupt-mask state; it is the real
+    DC21x4 packet-array path, where the current evidence is still `packet-array=0/0`.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created
