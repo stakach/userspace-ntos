@@ -2724,19 +2724,22 @@ pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
 const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
     MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
 const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
-const HOSTED_THREAD_WAIT_CAP: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
-const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_WAIT_CAP + 1;
-const WAIT_REPLY_POOL_USED_WORDS: usize = (WAIT_REPLY_POOL_N + 63) / 64;
+const WAIT_REPLY_POOL_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE + 1;
 static WAIT_TABLE_GROWTH_DIRTY: AtomicBool = AtomicBool::new(false);
-/// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
-/// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
-/// (into a waiter slot) and installs a free spare as the new active.
-static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
-    [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_N];
-/// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
-/// by a parked waiter). Managed by wait_park / wait_wake_event.
-static WAIT_REPLY_POOL_USED: [AtomicU64; WAIT_REPLY_POOL_USED_WORDS] =
-    [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_USED_WORDS];
+
+#[derive(Clone, Copy)]
+struct WaitReplyPoolRecord {
+    cap: u64,
+    used: bool,
+}
+
+/// Growable pool of MCS Reply objects. Index 0 is the active `REPLY_MAIN` object; later rows are
+/// spare or stolen reply caps held by parked waiters. Spare Reply objects are retyped lazily.
+static mut WAIT_REPLY_POOL: Vec<WaitReplyPoolRecord> = Vec::new();
+static WAIT_REPLY_POOL_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WAIT_REPLY_POOL_SLOT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WAIT_REPLY_POOL_RETYPE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WAIT_REPLY_POOL_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn mark_wait_table_growth_dirty() {
     WAIT_TABLE_GROWTH_DIRTY.store(true, Ordering::Relaxed);
@@ -10592,6 +10595,32 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(hosted_thread_store_fails);
     let (
+        reply_pool_used,
+        reply_pool_live,
+        reply_pool_records,
+        reply_pool_cap,
+        reply_pool_alloc_fails,
+        reply_pool_slot_fails,
+        reply_pool_retype_fails,
+        reply_pool_store_fails,
+    ) = wait_reply_pool_stats();
+    print_str(b" reply-pool=");
+    print_u64(reply_pool_used);
+    print_str(b"/");
+    print_u64(reply_pool_live);
+    print_str(b"/");
+    print_u64(reply_pool_records);
+    print_str(b"/");
+    print_u64(reply_pool_cap);
+    print_str(b"/");
+    print_u64(reply_pool_alloc_fails);
+    print_str(b"/");
+    print_u64(reply_pool_slot_fails);
+    print_str(b"/");
+    print_u64(reply_pool_retype_fails);
+    print_str(b"/");
+    print_u64(reply_pool_store_fails);
+    let (
         delay_wait_live,
         delay_wait_records,
         delay_wait_cap,
@@ -15619,71 +15648,189 @@ fn print_hex_u64(value: u64) {
     print_hex(value as u32);
 }
 
-fn wait_reply_pool_bit(index: usize) -> Option<(usize, u64)> {
-    if index >= WAIT_REPLY_POOL_N {
+unsafe fn wait_reply_pool_mut() -> &'static mut Vec<WaitReplyPoolRecord> {
+    &mut *core::ptr::addr_of_mut!(WAIT_REPLY_POOL)
+}
+
+unsafe fn wait_reply_pool_ref() -> &'static Vec<WaitReplyPoolRecord> {
+    &*core::ptr::addr_of!(WAIT_REPLY_POOL)
+}
+
+fn wait_reply_pool_initialize(active_reply_cap: u64, initial_reserve: usize) -> bool {
+    if active_reply_cap == 0 {
+        WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    unsafe {
+        let pool = wait_reply_pool_mut();
+        pool.clear();
+        if pool.capacity() < initial_reserve {
+            let additional = initial_reserve - pool.capacity();
+            if pool.try_reserve_exact(additional).is_err() {
+                WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        pool.push(WaitReplyPoolRecord {
+            cap: active_reply_cap,
+            used: true,
+        });
+    }
+    true
+}
+
+fn wait_reply_pool_insert_cap(cap: u64, used: bool) -> Option<usize> {
+    if cap == 0 {
+        WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    Some((index / 64, 1u64 << (index % 64)))
+    unsafe {
+        let pool = wait_reply_pool_mut();
+        if let Some(index) = pool.iter().position(|record| record.cap == 0) {
+            pool[index] = WaitReplyPoolRecord { cap, used };
+            return Some(index);
+        }
+        let old_capacity = pool.capacity();
+        if pool.len() == pool.capacity() && pool.try_reserve(1).is_err() {
+            WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if pool.capacity() != old_capacity {
+            mark_wait_table_growth_dirty();
+        }
+        pool.push(WaitReplyPoolRecord { cap, used });
+        Some(pool.len() - 1)
+    }
 }
 
-fn wait_reply_pool_index_used(index: usize) -> bool {
-    let Some((word, bit)) = wait_reply_pool_bit(index) else {
-        return false;
+fn wait_reply_pool_allocate_spare() -> Option<(usize, u64)> {
+    let cap = match try_alloc_slot() {
+        Some(cap) => cap,
+        None => {
+            WAIT_REPLY_POOL_SLOT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     };
-    WAIT_REPLY_POOL_USED[word].load(Ordering::Relaxed) & bit != 0
-}
-
-fn wait_reply_pool_mark_used(index: usize) {
-    if let Some((word, bit)) = wait_reply_pool_bit(index) {
-        WAIT_REPLY_POOL_USED[word].fetch_or(bit, Ordering::Relaxed);
+    let retype = unsafe { untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) };
+    if retype != 0 {
+        WAIT_REPLY_POOL_RETYPE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            recycle_deleted_root_slot(cap);
+        }
+        return None;
     }
-}
-
-fn wait_reply_pool_mark_free(index: usize) {
-    if let Some((word, bit)) = wait_reply_pool_bit(index) {
-        WAIT_REPLY_POOL_USED[word].fetch_and(!bit, Ordering::Relaxed);
-    }
-}
-
-fn wait_reply_pool_reset_used() {
-    for word in 0..WAIT_REPLY_POOL_USED_WORDS {
-        WAIT_REPLY_POOL_USED[word].store(0, Ordering::Relaxed);
+    match wait_reply_pool_insert_cap(cap, false) {
+        Some(index) => Some((index, cap)),
+        None => {
+            let _ = unsafe { cnode_delete_recycle_r(cap) };
+            None
+        }
     }
 }
 
 fn wait_reply_pool_find_free() -> Option<(usize, u64)> {
-    (0..WAIT_REPLY_POOL_N).find_map(|index| {
-        let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
-        (!wait_reply_pool_index_used(index) && cap != 0).then_some((index, cap))
-    })
+    unsafe {
+        let pool = wait_reply_pool_ref();
+        if let Some((index, record)) = pool
+            .iter()
+            .enumerate()
+            .find(|(_, record)| record.cap != 0 && !record.used)
+        {
+            return Some((index, record.cap));
+        }
+    }
+    wait_reply_pool_allocate_spare()
 }
 
 fn wait_reply_pool_has_free() -> bool {
+    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     wait_reply_pool_find_free().is_some()
 }
 
+fn wait_reply_pool_find_cap(cap: u64) -> Option<usize> {
+    if cap == 0 {
+        return None;
+    }
+    unsafe {
+        wait_reply_pool_ref()
+            .iter()
+            .position(|record| record.cap == cap)
+    }
+}
+
+fn wait_reply_pool_mark_used(index: usize) {
+    unsafe {
+        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
+            if record.cap != 0 {
+                record.used = true;
+            }
+        }
+    }
+}
+
+fn wait_reply_pool_mark_free(index: usize) {
+    unsafe {
+        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
+            record.used = false;
+        }
+    }
+}
+
+fn wait_reply_pool_clear_cap(index: usize) {
+    unsafe {
+        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
+            record.cap = 0;
+            record.used = false;
+        }
+    }
+}
+
 fn wait_reply_pool_used_count() -> u64 {
-    (0..WAIT_REPLY_POOL_USED_WORDS)
-        .map(|word| {
-            WAIT_REPLY_POOL_USED[word]
-                .load(Ordering::Relaxed)
-                .count_ones() as u64
-        })
-        .sum()
+    unsafe {
+        wait_reply_pool_ref()
+            .iter()
+            .filter(|record| record.cap != 0 && record.used)
+            .count() as u64
+    }
 }
 
 fn wait_reply_pool_live_count() -> u64 {
-    (0..WAIT_REPLY_POOL_N)
-        .filter(|index| WAIT_REPLY_POOL[*index].load(Ordering::Relaxed) != 0)
-        .count() as u64
+    unsafe {
+        wait_reply_pool_ref()
+            .iter()
+            .filter(|record| record.cap != 0)
+            .count() as u64
+    }
+}
+
+fn wait_reply_pool_record_count() -> u64 {
+    unsafe { wait_reply_pool_ref().len() as u64 }
+}
+
+fn wait_reply_pool_capacity() -> u64 {
+    unsafe { wait_reply_pool_ref().capacity() as u64 }
+}
+
+fn wait_reply_pool_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        wait_reply_pool_used_count(),
+        wait_reply_pool_live_count(),
+        wait_reply_pool_record_count(),
+        wait_reply_pool_capacity(),
+        WAIT_REPLY_POOL_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        WAIT_REPLY_POOL_SLOT_FAILURES.load(Ordering::Relaxed),
+        WAIT_REPLY_POOL_RETYPE_FAILURES.load(Ordering::Relaxed),
+        WAIT_REPLY_POOL_STORE_FAILURES.load(Ordering::Relaxed),
+    )
 }
 
 fn release_reply_pool_cap(cap: u64) {
-    for index in 0..WAIT_REPLY_POOL_N {
-        if WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == cap {
-            wait_reply_pool_mark_free(index);
-            break;
-        }
+    if let Some(index) = wait_reply_pool_find_cap(cap) {
+        wait_reply_pool_mark_free(index);
     }
 }
 
@@ -17071,8 +17218,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
     if active == 0 {
         return false;
     }
-    let active_index = (0..WAIT_REPLY_POOL_N)
-        .find(|&index| WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == active);
+    let active_index = wait_reply_pool_find_cap(active);
     let fresh = wait_reply_pool_find_free();
     let (active_index, fresh_index, fresh) = match (active_index, fresh) {
         (Some(active_index), Some((fresh_index, fresh))) => (active_index, fresh_index, fresh),
@@ -17092,7 +17238,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, active);
     if retype != 0 {
-        WAIT_REPLY_POOL[active_index].store(0, Ordering::Relaxed);
+        wait_reply_pool_clear_cap(active_index);
     }
     print_str(b"[thread-term] reply-drop cap=0x");
     print_hex(active as u32);
@@ -25613,26 +25759,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if e_rm == 0 {
         REPLY_MAIN_SLOT.store(rm, Ordering::Relaxed);
     }
-    // Checkpoint B: retype the reply-object POOL. pool[0] IS the REPLY_MAIN object (the loop's active
-    // recv reply cap); pool[1..] are spares the loop rotates in when it steals pool[active] to hold a
-    // parked waiter's Call. All are OBJ_REPLY (size_bits 0).
-    if e_rm == 0 {
-        WAIT_REPLY_POOL[0].store(rm, Ordering::Relaxed);
-        for i in 1..WAIT_REPLY_POOL_N {
-            let rp = alloc_slot();
-            let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rp);
-            if e == 0 {
-                WAIT_REPLY_POOL[i].store(rp, Ordering::Relaxed);
-            }
-        }
-        wait_reply_pool_reset_used();
-        wait_reply_pool_mark_used(0); // pool[0] is the active REPLY_MAIN
-        print_str(b"[reply-pool] live=");
-        print_u64(wait_reply_pool_live_count());
-        print_str(b" capacity=");
-        print_u64(WAIT_REPLY_POOL_N as u64);
-        print_str(b"\n");
-    }
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
     }
@@ -25698,6 +25824,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
+    if e_rm == 0 {
+        if !wait_reply_pool_initialize(rm, WAIT_REPLY_POOL_INITIAL_RESERVE) {
+            print_str(b"[reply-pool] initialize failed\n");
+            park();
+        }
+        let (used, live, records, capacity, alloc_fails, slot_fails, retype_fails, store_fails) =
+            wait_reply_pool_stats();
+        print_str(b"[reply-pool] used/live/records/cap/fails=");
+        print_u64(used);
+        print_str(b"/");
+        print_u64(live);
+        print_str(b"/");
+        print_u64(records);
+        print_str(b"/");
+        print_u64(capacity);
+        print_str(b"/");
+        print_u64(alloc_fails);
+        print_str(b"/");
+        print_u64(slot_fails);
+        print_str(b"/");
+        print_u64(retype_fails);
+        print_str(b"/");
+        print_u64(store_fails);
+        print_str(b"\n");
+    }
 
     // Object Manager: stand it up as an isolated service + drive it as the front-end.
     let c: &'static mut ObjectClient<ObChan<'static>> =

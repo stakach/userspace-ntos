@@ -705,6 +705,29 @@ delay waiter record capacity is closed. The remaining finite wait capacity is th
 reply-cap pool because it owns live kernel reply objects and resume slots; treat that as a transport
 capacity redesign, not as a bookkeeping vectorization.
 
+A4/B3 reply-cap pool scaling cleanup (2026-08-22): the executive's main hosted-user MCS Reply object
+pool no longer pre-retypes a fixed `WAIT_REPLY_POOL_N` array and parallel used bitmap before the
+heap exists. The root service now records reply-cap ownership in a growable vector of typed
+`{cap, used}` rows, initializes row 0 as the active `REPLY_MAIN` after `map_own_heap()`, reserves the
+current hosted-thread admission window as durable metadata, and lazily retypes spare Reply objects
+only when a real park/preflight needs one. The waiter commit protocol remains unchanged: a park
+records the waiter first, marks the selected fresh reply cap used, then rotates `REPLY_MAIN`; wake,
+cancel, abandon, and thread-termination paths release or delete/retype the exact stolen cap. Pool
+census now reports
+`reply-pool=<used>/<live>/<records>/<cap>/<alloc-fail>/<slot-fail>/<retype-fail>/<store-fail>`, and
+deferred-callback refusal diagnostics use the same live stats instead of a compile-time cap.
+Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+the serialized desktop proof `.tmp/run-desktop-reply-pool-vec-20260822.log`. The proof reaches
+genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_wait_reply_cap_park_wake`, `exec_client_reply_bound`, `exec_delay_execution_park_wake`,
+`exec_delay_execution_multiplex`, `exec_gdi_user_batch_flushed`, `exec_profile_ntuser_dat_present`,
+and `exec_explorer_shell_chrome_painted` green, reports `reply-pool=52/53/53/809/0/0/0/0`, and
+commits writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822628`.
+Review adjustment: the main hosted-user reply-cap transport capacity is no longer a fixed boot-time
+pool. Remaining wait-related cleanup should move to other explicit owner tables such as GUI message
+waiters or parked pipe data waiters, or to post-desktop GDI/client-object correctness.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before

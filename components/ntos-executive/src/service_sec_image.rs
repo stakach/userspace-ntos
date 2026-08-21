@@ -537,10 +537,16 @@ fn trace_deferred_user_callback_return_refusal(reason: &[u8]) {
         print_u64(active_depth as u64);
         print_str(b" continuation-depth=");
         print_u64(continuation_depth as u64);
-        print_str(b" reply-used=");
-        print_u64(wait_reply_pool_used_count());
+        let (reply_used, reply_live, reply_records, reply_cap, _, _, _, _) =
+            wait_reply_pool_stats();
         print_str(b" reply-pool=");
-        print_u64(WAIT_REPLY_POOL_N as u64);
+        print_u64(reply_used);
+        print_str(b"/");
+        print_u64(reply_live);
+        print_str(b"/");
+        print_u64(reply_records);
+        print_str(b"/");
+        print_u64(reply_cap);
         print_str(b" active-reply=0x");
         print_hex_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
         print_str(b"\n");
