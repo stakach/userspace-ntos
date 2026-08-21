@@ -3,7 +3,7 @@
 #![allow(clippy::all)]
 use crate::*;
 
-const SEC_IMAGE_FAULT_CAP: u64 = 15000;
+pub(crate) const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_STEADY_PAGES: u64 = 16;
 const SEC_IMAGE_PREFETCH_SOFT_PAGES: u64 = 8;
 const SEC_IMAGE_PREFETCH_LOW_PAGES: u64 = 1;
@@ -22986,22 +22986,28 @@ unsafe fn ensure_client_copyin_dll_page(
     let Some(tpe) = (*slot).as_ref() else {
         return false;
     };
-    let prefetch_index =
-        core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N)).min(CLIENT_COPYIN_FRAME_CAP);
-    if prefetch_index == CLIENT_COPYIN_FRAME_CAP {
-        return false;
-    }
     // Reserve the high end of each process scratch window for bounded copy-in prefetches. Demand
     // fills are capped below this range, so every prefetched page keeps a distinct live alias.
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - (prefetch_index as u64 + 3) * 0x1000;
+    let Some(alias) = client_copyin_frame_prepare_insert(pi, page, scratch_base) else {
+        return false;
+    };
     let (frame, fe) = alloc_frame_r();
-    let se = page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
-    if fe != 0 || se != 0 {
+    if fe != 0 {
+        let _ = cnode_delete_r(frame);
+        return false;
+    }
+    if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+        let _ = cnode_delete_r(frame);
         return false;
     }
     let _ = fill_image_page(tpe, rva, alias);
-    client_copyin_frame_put(pi, page, frame, alias);
-    true
+    if client_copyin_frame_put(pi, page, frame, alias) {
+        true
+    } else {
+        let _ = page_unmap(frame);
+        let _ = cnode_delete_r(frame);
+        false
+    }
 }
 
 unsafe fn prefill_client_copyin_dll_range_pages(

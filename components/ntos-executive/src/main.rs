@@ -9025,67 +9025,112 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
     removed
 }
 
-const CLIENT_COPYIN_FRAME_CAP: usize = 256;
-static mut CLIENT_COPYIN_FRAME_PI: [u8; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
-static mut CLIENT_COPYIN_FRAME_VA: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
-static mut CLIENT_COPYIN_FRAME_FR: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
-static mut CLIENT_COPYIN_FRAME_ALIAS: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
-static mut CLIENT_COPYIN_FRAME_N: usize = 0;
+#[derive(Clone, Copy)]
+struct ClientCopyinFrameRecord {
+    pi: u64,
+    page: u64,
+    frame: u64,
+    alias: u64,
+}
 
-unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64, alias: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N));
-    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
-    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            return;
+static mut CLIENT_COPYIN_FRAMES: Option<Vec<ClientCopyinFrameRecord>> = None;
+const CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES: usize = 3;
+
+fn client_copyin_frames_mut() -> &'static mut Vec<ClientCopyinFrameRecord> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAMES);
+        if slot.is_none() {
+            *slot = Some(Vec::new());
         }
+        slot.as_mut().expect("initialized above")
     }
-    if n < CLIENT_COPYIN_FRAME_CAP {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_PI) as *mut u8).add(n),
-            pi as u8,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_VA) as *mut u64).add(n),
-            page,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_FR) as *mut u64).add(n),
-            fr,
-        );
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_ALIAS) as *mut u64).add(n),
-            alias,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_N), n + 1);
+}
+
+fn client_copyin_frames() -> Option<&'static Vec<ClientCopyinFrameRecord>> {
+    unsafe { (&*core::ptr::addr_of!(CLIENT_COPYIN_FRAMES)).as_ref() }
+}
+
+unsafe fn client_copyin_frame_find(pi: u64, page: u64) -> Option<ClientCopyinFrameRecord> {
+    client_copyin_frames()?
+        .iter()
+        .copied()
+        .find(|record| record.pi == pi && record.page == page)
+}
+
+unsafe fn client_copyin_frame_alias_for_index(index: usize, scratch_base: u64) -> Option<u64> {
+    let window_pages = (DEMAND_SCRATCH_WINDOW / 0x1000) as usize;
+    let low_guard_pages = service_sec_image::SEC_IMAGE_FAULT_CAP as usize;
+    let reserved_pages = low_guard_pages.checked_add(CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES)?;
+    let capacity = window_pages.checked_sub(reserved_pages)?;
+    if index >= capacity {
+        return None;
     }
+    let page_from_top = index.checked_add(CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES)?;
+    let offset = (page_from_top as u64).checked_mul(0x1000)?;
+    scratch_base.checked_add(DEMAND_SCRATCH_WINDOW.checked_sub(offset)?)
+}
+
+unsafe fn client_copyin_frame_prepare_insert(pi: u64, page: u64, scratch_base: u64) -> Option<u64> {
+    if client_copyin_frame_find(pi, page).is_some() {
+        return None;
+    }
+    let frames = client_copyin_frames_mut();
+    let count = frames.len();
+    let Some(alias) = client_copyin_frame_alias_for_index(count, scratch_base) else {
+        print_str(b"[client-copyin] ERROR: scratch alias capacity exhausted pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" records=");
+        print_u64(count as u64);
+        print_str(b"\n");
+        return None;
+    };
+    if frames.try_reserve(1).is_err() {
+        print_str(b"[client-copyin] ERROR: frame record allocation failed pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+        return None;
+    }
+    Some(alias)
+}
+
+unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64, alias: u64) -> bool {
+    if client_copyin_frame_find(pi, page).is_some() {
+        return false;
+    }
+    let frames = client_copyin_frames_mut();
+    if frames.try_reserve(1).is_err() {
+        print_str(b"[client-copyin] ERROR: frame record allocation failed pi=");
+        print_u64(pi);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b"\n");
+        return false;
+    }
+    frames.push(ClientCopyinFrameRecord {
+        pi,
+        page,
+        frame: fr,
+        alias,
+    });
+    true
 }
 
 unsafe fn client_copyin_frame_get(pi: u64, page: u64) -> u64 {
-    let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N));
-    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
-    let frs = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_FR) as *const u64;
-    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            return core::ptr::read(frs.add(i));
-        }
-    }
-    0
+    client_copyin_frame_find(pi, page)
+        .map(|record| record.frame)
+        .unwrap_or(0)
 }
 unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
-    let n =
-        core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N)).min(CLIENT_COPYIN_FRAME_CAP);
-    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
-    let aliases = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_ALIAS) as *const u64;
-    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            return core::ptr::read(aliases.add(i));
-        }
-    }
-    0
+    client_copyin_frame_find(pi, page)
+        .map(|record| record.alias)
+        .unwrap_or(0)
 }
 // --- POOL CENSUS (batch 59) ------------------------------------------------------------------
 // A fixed-capacity resource that silently returns "no" is this codebase's recurring wall (the bump

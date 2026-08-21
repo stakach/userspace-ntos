@@ -352,6 +352,22 @@ allocation diagnostics. Review adjustment: atom-table arena count is closed for 
 frontier; continue the runtime-table audit with the larger GUI process/thread context registry or a
 smaller ownership-local table if that registry needs preparatory refactoring.
 
+A4/B3 client-copyin frame registry scaling cleanup (2026-08-21): the executive SEC_IMAGE copy-in
+prefetch registry now uses vector-backed `{pi, page, frame, alias}` records instead of four fixed
+256-entry arrays. Prefetch alias allocation is bounded by the real 64 MiB demand scratch window,
+reserving the low `SEC_IMAGE_FAULT_CAP` demand-fill pages and the top temporary-copy pages, so
+exhaustion is reported as explicit `[client-copyin]` diagnostics rather than silently dropping a
+record. The prefetch path reserves the record before allocating a frame and tears the frame down if
+allocation, mapping, or final insertion fails. Local validation is green for `cargo fmt --all`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-client-copyin-frame-vec-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing, keeps `exec_sec_image_demand_loaded`, `exec_sec_image_two_sections`,
+`exec_userinit_process_spawned`, and `exec_explorer_shell_chrome_painted` green, and emits no
+`[client-copyin]` allocation or alias-capacity diagnostics. Review adjustment: the client-copyin
+prefetch table cap is closed; continue with remaining SEC_IMAGE/fault scratch fixed arrays or the
+larger GUI process/thread context registry.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
