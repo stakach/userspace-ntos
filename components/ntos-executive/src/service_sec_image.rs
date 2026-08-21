@@ -5272,6 +5272,9 @@ pub(crate) unsafe fn service_sec_image(
     if !io_completion_waiter_table_reset() {
         panic!("IO completion wait table allocation failed");
     }
+    if !pipe_name_waiter_table_reset() {
+        panic!("pipe-name wait table allocation failed");
+    }
     if !thread_wait_state_reset() {
         panic!("thread wait parked-state allocation failed");
     }
@@ -22677,6 +22680,7 @@ unsafe fn pipe_name_wait_park(
         return false;
     };
     let table = &mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS);
+    let old_capacity = table.capacity();
     let parked = table.arm(nt_io_manager::PipeNameWaiter {
         root_handle,
         name_hash,
@@ -22693,6 +22697,9 @@ unsafe fn pipe_name_wait_park(
     });
     if parked.is_none() {
         return false;
+    }
+    if table.capacity() != old_capacity {
+        mark_wait_table_growth_dirty();
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);

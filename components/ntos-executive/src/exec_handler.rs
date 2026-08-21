@@ -22384,10 +22384,15 @@ impl ExecNtHandler {
                                             let waiters = &mut *core::ptr::addr_of_mut!(
                                                 crate::PIPE_NAME_WAITERS
                                             );
+                                            let old_capacity = waiters.capacity();
+                                            let wait_capacity = waiters.ensure_capacity();
+                                            if wait_capacity && waiters.capacity() != old_capacity {
+                                                crate::mark_wait_table_growth_dirty();
+                                            }
                                             let reply_capacity =
                                                 REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
                                                     && wait_reply_pool_has_free();
-                                            if !waiters.ensure_capacity() || !reply_capacity {
+                                            if !wait_capacity || !reply_capacity {
                                                 status =
                                                     nt_io_completion::STATUS_INSUFFICIENT_RESOURCES
                                                         as u64;

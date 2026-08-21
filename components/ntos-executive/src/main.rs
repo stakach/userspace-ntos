@@ -3281,8 +3281,8 @@ static PIPE_REDRIVE_RPC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const PIPE_ASYNC_LISTEN_INITIAL_N: usize = 16;
 static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_INITIAL_N> =
     nt_io_manager::AsyncListenTable::new();
-const PIPE_NAME_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
-static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable<PIPE_NAME_WAITER_N> =
+const PIPE_NAME_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
+static mut PIPE_NAME_WAITERS: nt_io_manager::PipeNameWaiterTable =
     nt_io_manager::PipeNameWaiterTable::new();
 /// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
 static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -10626,6 +10626,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(io_completion_wait_store_fails);
     let (
+        pipe_name_wait_live,
+        pipe_name_wait_records,
+        pipe_name_wait_cap,
+        pipe_name_wait_alloc_fails,
+        pipe_name_wait_store_fails,
+    ) = pipe_name_waiter_table_stats();
+    print_str(b" pipe-name-wait=");
+    print_u64(pipe_name_wait_live as u64);
+    print_str(b"/");
+    print_u64(pipe_name_wait_records as u64);
+    print_str(b"/");
+    print_u64(pipe_name_wait_cap as u64);
+    print_str(b"/");
+    print_u64(pipe_name_wait_alloc_fails);
+    print_str(b"/");
+    print_u64(pipe_name_wait_store_fails);
+    let (
         thread_wait_park_live,
         thread_wait_park_records,
         thread_wait_park_cap,
@@ -16294,6 +16311,26 @@ fn io_completion_waiter_table_reset() -> bool {
 fn io_completion_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
     unsafe {
         let waiters = &*core::ptr::addr_of!(IO_COMPLETION_WAITERS);
+        (
+            waiters.len(),
+            waiters.records(),
+            waiters.capacity(),
+            waiters.allocation_failures(),
+            waiters.store_failures(),
+        )
+    }
+}
+
+fn pipe_name_waiter_table_reset() -> bool {
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(PIPE_NAME_WAITERS))
+            .reset(PIPE_NAME_WAITER_INITIAL_RESERVE)
+    }
+}
+
+fn pipe_name_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe {
+        let waiters = &*core::ptr::addr_of!(PIPE_NAME_WAITERS);
         (
             waiters.len(),
             waiters.records(),

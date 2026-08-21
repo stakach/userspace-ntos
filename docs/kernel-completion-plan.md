@@ -664,6 +664,26 @@ userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing
 record capacity is closed. The remaining finite wait capacity is the real seL4 reply-cap pool plus
 the still-audited delay and pipe-name waiters.
 
+A4/B3 pipe-name waiter scaling cleanup (2026-08-22): root `FSCTL_PIPE_WAIT` waiter bookkeeping no
+longer exposes a const-generic table identity sized from `WAIT_REPLY_POOL_N - 1`. `nt-io-manager`
+now owns a non-generic growable `PipeNameWaiterTable` with explicit reset, live/record/capacity
+stats, and allocation/store failure counters. The executive pre-reserves the durable root-wait queue
+before the service-loop heap rewind mark, marks later successful growth through the shared
+wait-table dirty bit, and reports
+`pipe-name-wait=<live>/<records>/<cap>/<alloc-fail>/<store-fail>` in pool census. Local validation is
+green for `cargo fmt --all`, `cargo test -p nt-io-manager pipe_name_waiter -- --nocapture`,
+`cargo test -p nt-io-manager`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-pipe-name-waiters-vec-20260822.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps
+`exec_teb_not_clobbered_by_win32k`, `exec_msgina_credential_keystrokes_delivered`,
+`exec_profile_ntuser_dat_present`, and `exec_explorer_shell_chrome_painted` green, reports
+`pipe-name-wait=0/0/808/0/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822142`. Review adjustment: root NPFS wait
+bookkeeping capacity is closed. The remaining finite wait capacity is the real seL4 reply-cap pool
+plus the still-audited delay wait queue.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before

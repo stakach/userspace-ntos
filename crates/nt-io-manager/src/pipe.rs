@@ -1362,33 +1362,47 @@ pub struct PipeNameWaiter {
 
 /// Reset-safe wait queue for root `FSCTL_PIPE_WAIT` requests.
 ///
-/// The const parameter is the initial reservation size, not a semantic limit. Native NPFS keeps a
-/// VCB wait queue; service waves can have many named-pipe root waits outstanding at once, so this
-/// table grows on demand and refuses only when it cannot allocate another waiter record.
+/// Native NPFS keeps a VCB wait queue; service waves can have many named-pipe root waits
+/// outstanding at once, so this table grows on demand and refuses only when it cannot allocate
+/// another waiter record.
 #[derive(Clone, Debug)]
-pub struct PipeNameWaiterTable<const N: usize> {
+pub struct PipeNameWaiterTable {
     slots: Vec<Option<PipeNameWaiter>>,
+    allocation_failures: u64,
+    store_failures: u64,
 }
 
-impl<const N: usize> Default for PipeNameWaiterTable<N> {
+impl Default for PipeNameWaiterTable {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> PipeNameWaiterTable<N> {
+impl PipeNameWaiterTable {
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            allocation_failures: 0,
+            store_failures: 0,
+        }
     }
 
     fn grow_reservation(&mut self) -> bool {
         if self.slots.len() == self.slots.capacity() {
-            let reserve = if self.slots.capacity() == 0 {
-                N.max(1)
-            } else {
-                1
-            };
-            if self.slots.try_reserve(reserve).is_err() {
+            if self.slots.try_reserve(1).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.slots.clear();
+        if self.slots.capacity() < initial_reserve {
+            let additional = initial_reserve - self.slots.capacity();
+            if self.slots.try_reserve(additional).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
                 return false;
             }
         }
@@ -1409,6 +1423,10 @@ impl<const N: usize> PipeNameWaiterTable<N> {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
+    pub fn records(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(|slot| slot.is_none())
     }
@@ -1419,6 +1437,14 @@ impl<const N: usize> PipeNameWaiterTable<N> {
 
     pub fn capacity(&self) -> usize {
         self.slots.capacity()
+    }
+
+    pub fn allocation_failures(&self) -> u64 {
+        self.allocation_failures
+    }
+
+    pub fn store_failures(&self) -> u64 {
+        self.store_failures
     }
 
     pub fn has_thread(&self, tid: u64) -> bool {
@@ -1435,6 +1461,7 @@ impl<const N: usize> PipeNameWaiterTable<N> {
             }
         }
         if !self.grow_reservation() {
+            self.store_failures = self.store_failures.saturating_add(1);
             return None;
         }
         self.slots.push(Some(waiter));
@@ -2879,7 +2906,7 @@ mod tests {
     fn pipe_name_waiter_complete_by_name_is_specific_and_rearmable() {
         let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = PipeNameWaiterTable::<4>::new();
+        let mut t = PipeNameWaiterTable::new();
         t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
         t.arm(pnw(&ntsvcs, 11, 0x31, u64::MAX)).unwrap();
 
@@ -2904,14 +2931,18 @@ mod tests {
         let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
         let samr: std::vec::Vec<u16> = "\\samr".encode_utf16().collect();
-        let mut t = PipeNameWaiterTable::<1>::new();
+        let mut t = PipeNameWaiterTable::new();
 
+        assert!(t.reset(1));
         assert!(t.ensure_capacity());
         assert!(t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).is_some());
         assert!(t.arm(pnw(&ntsvcs, 11, 0x31, 200)).is_some());
         assert!(t.arm(pnw(&samr, 12, 0x32, 300)).is_some());
         assert_eq!(t.len(), 3);
+        assert_eq!(t.records(), 3);
         assert!(t.capacity() >= 3);
+        assert_eq!(t.allocation_failures(), 0);
+        assert_eq!(t.store_failures(), 0);
 
         assert_eq!(
             t.complete_by_name(pipe_name_hash(&ntsvcs))
@@ -2929,7 +2960,7 @@ mod tests {
     fn pipe_name_waiter_pop_due_ignores_unbounded_waits() {
         let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = PipeNameWaiterTable::<4>::new();
+        let mut t = PipeNameWaiterTable::new();
         t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
         t.arm(pnw(&ntsvcs, 11, 0x31, 150)).unwrap();
 
@@ -2945,7 +2976,7 @@ mod tests {
     fn pipe_name_waiter_cancel_thread_collects_reply_caps() {
         let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = PipeNameWaiterTable::<4>::new();
+        let mut t = PipeNameWaiterTable::new();
         t.arm(pnw(&eventlog, 10, 0x30, u64::MAX)).unwrap();
         t.arm(pnw(&ntsvcs, 10, 0x31, 200)).unwrap();
         t.arm(pnw(&ntsvcs, 11, 0x32, 300)).unwrap();
@@ -2962,7 +2993,7 @@ mod tests {
     fn pipe_name_waiter_cancel_thread_handle_only_removes_matching_waits() {
         let eventlog: std::vec::Vec<u16> = "\\EventLog".encode_utf16().collect();
         let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
-        let mut t = PipeNameWaiterTable::<4>::new();
+        let mut t = PipeNameWaiterTable::new();
         let mut first = pnw(&eventlog, 10, 0x30, u64::MAX);
         first.root_handle = 0x80;
         let mut second = pnw(&ntsvcs, 10, 0x31, 200);
