@@ -1041,7 +1041,7 @@ unsafe fn record_process_token_context(
     token_user_sid_len: usize,
 ) -> bool {
     let token_user_sid_len = native_sid_len(token_user_sid, token_user_sid_len).unwrap_or(0);
-    if process_index >= WIN32K_GUI_PROCESS_CAP
+    if !process_ctx_index_valid(process_index)
         || token_authentication_id == 0
         || token_user_sid_len == 0
         || token_user_sid_len > WIN32K_TOKEN_USER_SID_MAX
@@ -1049,8 +1049,8 @@ unsafe fn record_process_token_context(
     {
         let n = WIN32K_CLIENT_TOKEN_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            let pid = if process_index < WIN32K_GUI_PROCESS_CAP {
-                WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed)
+            let pid = if process_ctx_index_valid(process_index) {
+                process_ctx_pid(process_index)
             } else {
                 0
             };
@@ -1064,7 +1064,7 @@ unsafe fn record_process_token_context(
         }
         return false;
     }
-    WIN32K_PROCESS_CTX_TOKEN_AUTH[process_index].store(token_authentication_id, Ordering::Relaxed);
+    set_process_ctx_token_authentication_id(process_index, token_authentication_id);
 
     let token = ensure_primary_token_object(process_index);
     if token == 0 {
@@ -1089,15 +1089,14 @@ unsafe fn record_process_token_context(
 }
 
 unsafe fn ensure_primary_token_object(process_index: usize) -> u64 {
-    if process_index >= WIN32K_GUI_PROCESS_CAP {
+    if !process_ctx_index_valid(process_index) {
         return 0;
     }
-    let token_authentication_id =
-        WIN32K_PROCESS_CTX_TOKEN_AUTH[process_index].load(Ordering::Relaxed);
+    let token_authentication_id = process_ctx_token_authentication_id(process_index);
     if token_authentication_id == 0 {
         return 0;
     }
-    let existing = WIN32K_PROCESS_CTX_PRIMARY_TOKEN[process_index].load(Ordering::Relaxed);
+    let existing = process_ctx_primary_token(process_index);
     let token = if existing != 0 {
         existing
     } else {
@@ -1106,7 +1105,7 @@ unsafe fn ensure_primary_token_object(process_index: usize) -> u64 {
             return 0;
         }
         write_volatile(allocated as *mut u64, WIN32K_PRIMARY_TOKEN_MAGIC);
-        WIN32K_PROCESS_CTX_PRIMARY_TOKEN[process_index].store(allocated, Ordering::Relaxed);
+        set_process_ctx_primary_token(process_index, allocated);
         allocated
     };
     write_volatile(
@@ -1115,11 +1114,11 @@ unsafe fn ensure_primary_token_object(process_index: usize) -> u64 {
     );
     write_volatile(
         (token + TOKEN_EPROCESS_OFF) as *mut u64,
-        WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed),
+        process_ctx_eprocess(process_index),
     );
     write_volatile(
         (token + TOKEN_PID_OFF) as *mut u64,
-        WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed),
+        process_ctx_pid(process_index),
     );
     token
 }
@@ -1128,8 +1127,8 @@ unsafe fn token_context_index(token: u64) -> Option<usize> {
     if token == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_PROCESS_CAP {
-        if WIN32K_PROCESS_CTX_PRIMARY_TOKEN[index].load(Ordering::Relaxed) == token {
+    for index in 0..process_ctx_len() {
+        if process_ctx_primary_token(index) == token {
             if read_volatile(token as *const u64) != WIN32K_PRIMARY_TOKEN_MAGIC {
                 return None;
             }
@@ -1747,7 +1746,7 @@ extern "win64" fn s_current_thread() -> u64 {
 extern "win64" fn s_ps_get_process_id(process: u64) -> u64 {
     unsafe {
         process_context_index_for_eprocess(process)
-            .map(|index| WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed))
+            .map(|index| process_ctx_pid(index))
             .unwrap_or(0)
     }
 }
@@ -1761,7 +1760,7 @@ extern "win64" fn s_ps_get_current_thread_id() -> u64 {
 extern "win64" fn s_ps_get_thread_id(thread: u64) -> u64 {
     unsafe {
         if let Some(index) = thread_context_index_for_ethread(thread) {
-            return WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed);
+            return thread_ctx_tid(index);
         }
         if thread != 0 {
             read_volatile((thread + ETHREAD_CID_UNIQUE_THREAD_OFF) as *const u64)
@@ -1775,7 +1774,7 @@ extern "win64" fn s_ps_get_thread_id(thread: u64) -> u64 {
 extern "win64" fn s_ps_get_thread_process_id(thread: u64) -> u64 {
     unsafe {
         if let Some(index) = thread_context_index_for_ethread(thread) {
-            return WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
+            return thread_ctx_pid(index);
         }
         if thread != 0 {
             read_volatile((thread + ETHREAD_CID_UNIQUE_PROCESS_OFF) as *const u64)
@@ -1790,7 +1789,7 @@ extern "win64" fn s_ps_get_thread_process_id(thread: u64) -> u64 {
 extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
     unsafe {
         if let Some(index) = thread_context_index_for_ethread(thread) {
-            let pid = WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
+            let pid = thread_ctx_pid(index);
             return eprocess_for_pid(pid);
         }
         if thread != 0 {
@@ -1823,7 +1822,7 @@ extern "win64" fn s_ps_reference_primary_token(process: u64) -> u64 {
             let n = WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 print_str(b"[win32k-token] ERROR: PsReferencePrimaryToken missing token pid=");
-                print_u64(WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed));
+                print_u64(process_ctx_pid(index));
                 print_str(b"\n");
             }
         }
@@ -2002,7 +2001,7 @@ extern "win64" fn s_get_current_win32thread() -> u64 {
 extern "win64" fn s_get_thread_win32thread(thread: u64) -> u64 {
     unsafe {
         if let Some(index) = thread_context_index_for_ethread(thread) {
-            let w32thread = WIN32K_THREAD_CTX_W32THREAD[index].load(Ordering::Relaxed);
+            let w32thread = thread_ctx_w32thread(index);
             if w32thread != 0 {
                 return w32thread;
             }
@@ -2037,7 +2036,7 @@ extern "win64" fn s_set_win32process(process: u64, w32process: u64, old: u64) ->
             return 0xC000_0001u32 as i32; // STATUS_UNSUCCESSFUL
         }
         if let Some(index) = context_index {
-            WIN32K_PROCESS_CTX_W32PROCESS[index].store(w32process, Ordering::Relaxed);
+            set_process_ctx_w32process(index, w32process);
             if index == current_process_context_index().unwrap_or(usize::MAX) {
                 write_volatile(SLOT_W32PROCESS as *mut u64, w32process);
             }
@@ -2069,7 +2068,7 @@ extern "win64" fn s_set_win32thread(thread: u64, w32thread: u64, old: u64) -> u6
         if w32thread != 0 || previous == old {
             write_volatile(field, w32thread);
             if let Some(index) = context_index {
-                WIN32K_THREAD_CTX_W32THREAD[index].store(w32thread, Ordering::Relaxed);
+                set_thread_ctx_w32thread(index, w32thread);
                 if let Some(process_index) = current_process_context_index() {
                     publish_selected_context(process_index, index);
                 }
@@ -2966,7 +2965,7 @@ unsafe fn object_attributes_security_descriptor(
 
 unsafe fn current_token_authentication_id() -> u64 {
     current_process_context_index()
-        .map(|index| WIN32K_PROCESS_CTX_TOKEN_AUTH[index].load(Ordering::Relaxed))
+        .map(|index| process_ctx_token_authentication_id(index))
         .unwrap_or(0)
 }
 
@@ -4952,39 +4951,44 @@ extern "win64" fn s_rtl_destroy_atom_table(table: u64) -> i32 {
 static WIN32K_CURRENT_PROCESS_ID: AtomicU64 = AtomicU64::new(FAKE_PROCESS_HANDLE);
 static WIN32K_CURRENT_THREAD_ID: AtomicU64 = AtomicU64::new(WIN32K_BOOTSTRAP_TID);
 static WIN32K_CURRENT_CLIENT_PI: AtomicU64 = AtomicU64::new(WIN32K_BOOTSTRAP_PI as u64);
-const WIN32K_GUI_PROCESS_CAP: usize = MAX_PI;
-const WIN32K_GUI_THREAD_CAP: usize = MAX_PI * 8;
-static WIN32K_PROCESS_CTX_PIDS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_PIS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_EPROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_W32PROCESS: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_CLIENT_PEB: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_TOKEN_AUTH: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
-static WIN32K_PROCESS_CTX_PRIMARY_TOKEN: [AtomicU64; WIN32K_GUI_PROCESS_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_PROCESS_CAP];
+const WIN32K_PROCESS_CTX_INITIAL_CAP: u64 = 8;
+const WIN32K_THREAD_CTX_INITIAL_CAP: u64 = 64;
+
+#[derive(Clone, Copy)]
+struct Win32kProcessContextRecord {
+    pid: u64,
+    pi: u64,
+    eprocess: u64,
+    w32process: u64,
+    client_peb: u64,
+    token_authentication_id: u64,
+    primary_token: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Win32kThreadContextRecord {
+    tid: u64,
+    pid: u64,
+    pi: u64,
+    teb: u64,
+    callout_teb: u64,
+    ethread: u64,
+    w32thread: u64,
+}
+
+static WIN32K_PROCESS_CTX_PTR: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PROCESS_CTX_LEN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PROCESS_CTX_CAP: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PROCESS_CTX_GROWTHS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PROCESS_CTX_ALLOC_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_CTX_PTR: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_CTX_LEN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_CTX_CAP: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_CTX_GROWTHS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_THREAD_CTX_ALLOC_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TOKEN_HANDLE_SLOTS_PTR: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TOKEN_HANDLE_LEN: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TOKEN_HANDLE_CAPACITY: AtomicU64 = AtomicU64::new(0);
-static WIN32K_THREAD_CTX_TIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_PIDS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_PIS: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_TEB: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_CALLOUT_TEB: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_ETHREAD: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
-static WIN32K_THREAD_CTX_W32THREAD: [AtomicU64; WIN32K_GUI_THREAD_CAP] =
-    [const { AtomicU64::new(0) }; WIN32K_GUI_THREAD_CAP];
 static WIN32K_CLIENT_PROCESS_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_THREAD_CALLOUTS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -5172,12 +5176,328 @@ unsafe fn allocate_kernel_object_body(size: u64) -> u64 {
     body
 }
 
+unsafe fn process_ctx_record_ptr(base: u64, index: usize) -> *mut Win32kProcessContextRecord {
+    (base + index as u64 * core::mem::size_of::<Win32kProcessContextRecord>() as u64)
+        as *mut Win32kProcessContextRecord
+}
+
+unsafe fn thread_ctx_record_ptr(base: u64, index: usize) -> *mut Win32kThreadContextRecord {
+    (base + index as u64 * core::mem::size_of::<Win32kThreadContextRecord>() as u64)
+        as *mut Win32kThreadContextRecord
+}
+
+unsafe fn process_ctx_len() -> usize {
+    WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed) as usize
+}
+
+unsafe fn thread_ctx_len() -> usize {
+    WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed) as usize
+}
+
+unsafe fn process_ctx_index_valid(index: usize) -> bool {
+    index < process_ctx_len()
+}
+
+unsafe fn thread_ctx_index_valid(index: usize) -> bool {
+    index < thread_ctx_len()
+}
+
+unsafe fn process_ctx_ptr(index: usize) -> Option<*mut Win32kProcessContextRecord> {
+    if !process_ctx_index_valid(index) {
+        return None;
+    }
+    let base = WIN32K_PROCESS_CTX_PTR.load(Ordering::Relaxed);
+    (base != 0).then_some(process_ctx_record_ptr(base, index))
+}
+
+unsafe fn thread_ctx_ptr(index: usize) -> Option<*mut Win32kThreadContextRecord> {
+    if !thread_ctx_index_valid(index) {
+        return None;
+    }
+    let base = WIN32K_THREAD_CTX_PTR.load(Ordering::Relaxed);
+    (base != 0).then_some(thread_ctx_record_ptr(base, index))
+}
+
+macro_rules! process_ctx_getter {
+    ($name:ident, $field:ident) => {
+        unsafe fn $name(index: usize) -> u64 {
+            process_ctx_ptr(index)
+                .map(|ptr| read_volatile(core::ptr::addr_of!((*ptr).$field)))
+                .unwrap_or(0)
+        }
+    };
+}
+
+macro_rules! process_ctx_setter {
+    ($name:ident, $field:ident) => {
+        unsafe fn $name(index: usize, value: u64) {
+            if let Some(ptr) = process_ctx_ptr(index) {
+                write_volatile(core::ptr::addr_of_mut!((*ptr).$field), value);
+            }
+        }
+    };
+}
+
+macro_rules! thread_ctx_getter {
+    ($name:ident, $field:ident) => {
+        unsafe fn $name(index: usize) -> u64 {
+            thread_ctx_ptr(index)
+                .map(|ptr| read_volatile(core::ptr::addr_of!((*ptr).$field)))
+                .unwrap_or(0)
+        }
+    };
+}
+
+macro_rules! thread_ctx_setter {
+    ($name:ident, $field:ident) => {
+        unsafe fn $name(index: usize, value: u64) {
+            if let Some(ptr) = thread_ctx_ptr(index) {
+                write_volatile(core::ptr::addr_of_mut!((*ptr).$field), value);
+            }
+        }
+    };
+}
+
+process_ctx_getter!(process_ctx_pid, pid);
+process_ctx_getter!(process_ctx_pi, pi);
+process_ctx_getter!(process_ctx_eprocess, eprocess);
+process_ctx_getter!(process_ctx_w32process, w32process);
+process_ctx_getter!(process_ctx_client_peb, client_peb);
+process_ctx_getter!(process_ctx_token_authentication_id, token_authentication_id);
+process_ctx_getter!(process_ctx_primary_token, primary_token);
+process_ctx_setter!(set_process_ctx_pid, pid);
+process_ctx_setter!(set_process_ctx_pi, pi);
+process_ctx_setter!(set_process_ctx_eprocess, eprocess);
+process_ctx_setter!(set_process_ctx_w32process, w32process);
+process_ctx_setter!(set_process_ctx_client_peb, client_peb);
+process_ctx_setter!(
+    set_process_ctx_token_authentication_id,
+    token_authentication_id
+);
+process_ctx_setter!(set_process_ctx_primary_token, primary_token);
+
+thread_ctx_getter!(thread_ctx_tid, tid);
+thread_ctx_getter!(thread_ctx_pid, pid);
+thread_ctx_getter!(thread_ctx_pi, pi);
+thread_ctx_getter!(thread_ctx_teb, teb);
+thread_ctx_getter!(thread_ctx_callout_teb, callout_teb);
+thread_ctx_getter!(thread_ctx_ethread, ethread);
+thread_ctx_getter!(thread_ctx_w32thread, w32thread);
+thread_ctx_setter!(set_thread_ctx_tid, tid);
+thread_ctx_setter!(set_thread_ctx_pid, pid);
+thread_ctx_setter!(set_thread_ctx_pi, pi);
+thread_ctx_setter!(set_thread_ctx_teb, teb);
+thread_ctx_setter!(set_thread_ctx_callout_teb, callout_teb);
+thread_ctx_setter!(set_thread_ctx_ethread, ethread);
+thread_ctx_setter!(set_thread_ctx_w32thread, w32thread);
+
+unsafe fn ensure_process_ctx_capacity(required: u64) -> bool {
+    let cap = WIN32K_PROCESS_CTX_CAP.load(Ordering::Relaxed);
+    if cap >= required {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        WIN32K_PROCESS_CTX_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let next = new_cap.saturating_mul(2);
+        if next <= new_cap {
+            return false;
+        }
+        new_cap = next;
+    }
+    let Some(bytes) =
+        (core::mem::size_of::<Win32kProcessContextRecord>() as u64).checked_mul(new_cap)
+    else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+    let old_base = WIN32K_PROCESS_CTX_PTR.load(Ordering::Relaxed);
+    let len = WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed) as usize;
+    if old_base != 0 {
+        for index in 0..len {
+            let record = read_volatile(process_ctx_record_ptr(old_base, index));
+            write_volatile(process_ctx_record_ptr(new_base, index), record);
+        }
+    }
+    WIN32K_PROCESS_CTX_PTR.store(new_base, Ordering::Relaxed);
+    WIN32K_PROCESS_CTX_CAP.store(new_cap, Ordering::Relaxed);
+    WIN32K_PROCESS_CTX_GROWTHS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn ensure_thread_ctx_capacity(required: u64) -> bool {
+    let cap = WIN32K_THREAD_CTX_CAP.load(Ordering::Relaxed);
+    if cap >= required {
+        return true;
+    }
+    let mut new_cap = if cap == 0 {
+        WIN32K_THREAD_CTX_INITIAL_CAP
+    } else {
+        cap.saturating_mul(2)
+    };
+    while new_cap < required {
+        let next = new_cap.saturating_mul(2);
+        if next <= new_cap {
+            return false;
+        }
+        new_cap = next;
+    }
+    let Some(bytes) =
+        (core::mem::size_of::<Win32kThreadContextRecord>() as u64).checked_mul(new_cap)
+    else {
+        return false;
+    };
+    let new_base = pool_alloc(bytes);
+    if new_base == 0 {
+        return false;
+    }
+    let old_base = WIN32K_THREAD_CTX_PTR.load(Ordering::Relaxed);
+    let len = WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed) as usize;
+    if old_base != 0 {
+        for index in 0..len {
+            let record = read_volatile(thread_ctx_record_ptr(old_base, index));
+            write_volatile(thread_ctx_record_ptr(new_base, index), record);
+        }
+    }
+    WIN32K_THREAD_CTX_PTR.store(new_base, Ordering::Relaxed);
+    WIN32K_THREAD_CTX_CAP.store(new_cap, Ordering::Relaxed);
+    WIN32K_THREAD_CTX_GROWTHS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn reserve_process_ctx_record() -> Option<usize> {
+    let len = WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed);
+    let required = len.checked_add(1)?;
+    if !ensure_process_ctx_capacity(required) {
+        let n = WIN32K_PROCESS_CTX_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: process context table allocation failed required=");
+            print_u64(required);
+            print_str(b"\n");
+        }
+        return None;
+    }
+    let base = WIN32K_PROCESS_CTX_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    Some(len as usize)
+}
+
+unsafe fn commit_process_ctx_record(index: usize, record: Win32kProcessContextRecord) {
+    let base = WIN32K_PROCESS_CTX_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    write_volatile(process_ctx_record_ptr(base, index), record);
+    WIN32K_PROCESS_CTX_LEN.store(index as u64 + 1, Ordering::Relaxed);
+}
+
+unsafe fn reserve_thread_ctx_record() -> Option<usize> {
+    let len = WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed);
+    let required = len.checked_add(1)?;
+    if !ensure_thread_ctx_capacity(required) {
+        let n = WIN32K_THREAD_CTX_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            print_str(b"[win32k-context] ERROR: thread context table allocation failed required=");
+            print_u64(required);
+            print_str(b"\n");
+        }
+        return None;
+    }
+    let base = WIN32K_THREAD_CTX_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
+    Some(len as usize)
+}
+
+unsafe fn commit_thread_ctx_record(index: usize, record: Win32kThreadContextRecord) {
+    let base = WIN32K_THREAD_CTX_PTR.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    write_volatile(thread_ctx_record_ptr(base, index), record);
+    WIN32K_THREAD_CTX_LEN.store(index as u64 + 1, Ordering::Relaxed);
+}
+
+unsafe fn process_context_object_matches_or_empty(index: usize, supplied: u64) -> bool {
+    let existing = process_ctx_eprocess(index);
+    supplied == 0 || existing == 0 || existing == supplied
+}
+
+unsafe fn thread_context_object_matches_or_empty(index: usize, supplied: u64) -> bool {
+    let existing = thread_ctx_ethread(index);
+    supplied == 0 || existing == 0 || existing == supplied
+}
+
+unsafe fn process_context_object_or_allocate(
+    index: usize,
+    supplied: u64,
+    size: u64,
+) -> Option<u64> {
+    let existing = process_ctx_eprocess(index);
+    if existing != 0 {
+        return Some(existing);
+    }
+    let object = if supplied != 0 {
+        supplied
+    } else {
+        allocate_kernel_object_body(size)
+    };
+    if object == 0 {
+        return None;
+    }
+    set_process_ctx_eprocess(index, object);
+    Some(object)
+}
+
+unsafe fn thread_context_object_or_allocate(
+    index: usize,
+    supplied: u64,
+    size: u64,
+) -> Option<u64> {
+    let existing = thread_ctx_ethread(index);
+    if existing != 0 {
+        return Some(existing);
+    }
+    let object = if supplied != 0 {
+        supplied
+    } else {
+        allocate_kernel_object_body(size)
+    };
+    if object == 0 {
+        return None;
+    }
+    set_thread_ctx_ethread(index, object);
+    Some(object)
+}
+
+pub(crate) fn win32k_context_store_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed),
+        WIN32K_PROCESS_CTX_CAP.load(Ordering::Relaxed),
+        WIN32K_PROCESS_CTX_GROWTHS.load(Ordering::Relaxed),
+        WIN32K_PROCESS_CTX_ALLOC_FAILURES.load(Ordering::Relaxed),
+        WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed),
+        WIN32K_THREAD_CTX_CAP.load(Ordering::Relaxed),
+        WIN32K_THREAD_CTX_GROWTHS.load(Ordering::Relaxed),
+        WIN32K_THREAD_CTX_ALLOC_FAILURES.load(Ordering::Relaxed),
+    )
+}
+
 unsafe fn process_context_index_for_pid(pid: u64) -> Option<usize> {
     if pid == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_PROCESS_CAP {
-        if WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed) == pid {
+    for index in 0..process_ctx_len() {
+        if process_ctx_pid(index) == pid {
             return Some(index);
         }
     }
@@ -5188,8 +5508,8 @@ unsafe fn process_context_index_for_eprocess(process: u64) -> Option<usize> {
     if process == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_PROCESS_CAP {
-        if WIN32K_PROCESS_CTX_EPROCESS[index].load(Ordering::Relaxed) == process {
+    for index in 0..process_ctx_len() {
+        if process_ctx_eprocess(index) == process {
             return Some(index);
         }
     }
@@ -5204,8 +5524,8 @@ unsafe fn thread_context_index_for_tid(tid: u64) -> Option<usize> {
     if tid == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_THREAD_CAP {
-        if WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed) == tid {
+    for index in 0..thread_ctx_len() {
+        if thread_ctx_tid(index) == tid {
             return Some(index);
         }
     }
@@ -5216,8 +5536,8 @@ unsafe fn thread_context_index_for_ethread(thread: u64) -> Option<usize> {
     if thread == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_THREAD_CAP {
-        if WIN32K_THREAD_CTX_ETHREAD[index].load(Ordering::Relaxed) == thread {
+    for index in 0..thread_ctx_len() {
+        if thread_ctx_ethread(index) == thread {
             return Some(index);
         }
     }
@@ -5228,8 +5548,8 @@ unsafe fn thread_context_index_for_w32thread(thread: u64) -> Option<usize> {
     if thread == 0 {
         return None;
     }
-    for index in 0..WIN32K_GUI_THREAD_CAP {
-        if WIN32K_THREAD_CTX_W32THREAD[index].load(Ordering::Relaxed) == thread {
+    for index in 0..thread_ctx_len() {
+        if thread_ctx_w32thread(index) == thread {
             return Some(index);
         }
     }
@@ -5242,13 +5562,13 @@ unsafe fn current_thread_context_index() -> Option<usize> {
 
 unsafe fn current_eprocess() -> u64 {
     current_process_context_index()
-        .map(|index| WIN32K_PROCESS_CTX_EPROCESS[index].load(Ordering::Relaxed))
+        .map(|index| process_ctx_eprocess(index))
         .unwrap_or(0)
 }
 
 unsafe fn current_ethread() -> u64 {
     current_thread_context_index()
-        .map(|index| WIN32K_THREAD_CTX_ETHREAD[index].load(Ordering::Relaxed))
+        .map(|index| thread_ctx_ethread(index))
         .unwrap_or(0)
 }
 
@@ -5256,22 +5576,22 @@ unsafe fn current_w32process() -> u64 {
     let Some(index) = current_process_context_index() else {
         return 0;
     };
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[index].load(Ordering::Relaxed);
+    let eprocess = process_ctx_eprocess(index);
     if eprocess != 0 {
         let field = read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64);
         if field != 0 {
-            if WIN32K_PROCESS_CTX_W32PROCESS[index].load(Ordering::Relaxed) == 0 {
-                WIN32K_PROCESS_CTX_W32PROCESS[index].store(field, Ordering::Relaxed);
+            if process_ctx_w32process(index) == 0 {
+                set_process_ctx_w32process(index, field);
             }
             return field;
         }
     }
-    WIN32K_PROCESS_CTX_W32PROCESS[index].load(Ordering::Relaxed)
+    process_ctx_w32process(index)
 }
 
 unsafe fn current_w32thread() -> u64 {
     current_thread_context_index()
-        .map(|index| WIN32K_THREAD_CTX_W32THREAD[index].load(Ordering::Relaxed))
+        .map(|index| thread_ctx_w32thread(index))
         .unwrap_or(0)
 }
 
@@ -5545,14 +5865,14 @@ pub(crate) unsafe fn trace_win32k_wall_context() {
     print_str(b"\n");
 
     let mut printed = 0usize;
-    for index in 0..WIN32K_GUI_THREAD_CAP {
-        let row_tid = WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed);
-        if row_tid == 0 || WIN32K_THREAD_CTX_PIS[index].load(Ordering::Relaxed) != pi {
+    for index in 0..thread_ctx_len() {
+        let row_tid = thread_ctx_tid(index);
+        if row_tid == 0 || thread_ctx_pi(index) != pi {
             continue;
         }
-        let row_pid = WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed);
-        let row_ethread = WIN32K_THREAD_CTX_ETHREAD[index].load(Ordering::Relaxed);
-        let row_w32thread = WIN32K_THREAD_CTX_W32THREAD[index].load(Ordering::Relaxed);
+        let row_pid = thread_ctx_pid(index);
+        let row_ethread = thread_ctx_ethread(index);
+        let row_w32thread = thread_ctx_w32thread(index);
         let row_refs = read_u64_field_if_present(row_w32thread, 0x2f8);
         let row_kthread_w32thread = read_u64_field_if_present(row_ethread, KTHREAD_WIN32THREAD_OFF);
         print_str(b"[w32ctx-wall] table idx=");
@@ -5582,7 +5902,7 @@ unsafe fn eprocess_for_pid(process_id: u64) -> u64 {
         return current_eprocess();
     }
     process_context_index_for_pid(process_id)
-        .map(|index| WIN32K_PROCESS_CTX_EPROCESS[index].load(Ordering::Relaxed))
+        .map(|index| process_ctx_eprocess(index))
         .unwrap_or(0)
 }
 
@@ -5600,7 +5920,7 @@ unsafe fn client_peb_from_teb(client_teb: u64) -> u64 {
 
 unsafe fn record_process_client_peb(process_index: usize, client_peb: u64) {
     if client_peb != 0 {
-        WIN32K_PROCESS_CTX_CLIENT_PEB[process_index].store(client_peb, Ordering::Relaxed);
+        set_process_ctx_client_peb(process_index, client_peb);
     }
 }
 
@@ -5641,14 +5961,14 @@ unsafe fn initialize_eprocess_body(eprocess: u64, process_id: u64, client_peb: u
 }
 
 unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
-    let existing = WIN32K_THREAD_CTX_CALLOUT_TEB[thread_index].load(Ordering::Relaxed);
+    let existing = thread_ctx_callout_teb(thread_index);
     let teb = if existing != 0 {
         existing
     } else {
         let allocated = pool_alloc(0x1000);
         if allocated != 0 {
             s_memset(allocated, 0, 0x1000);
-            WIN32K_THREAD_CTX_CALLOUT_TEB[thread_index].store(allocated, Ordering::Relaxed);
+            set_thread_ctx_callout_teb(thread_index, allocated);
             allocated
         } else {
             return None;
@@ -5657,8 +5977,8 @@ unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
 
     let peb = teb + 0xA00;
     let process_params = teb + 0xB00;
-    let mut pid = WIN32K_THREAD_CTX_PIDS[thread_index].load(Ordering::Relaxed);
-    let mut tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
+    let mut pid = thread_ctx_pid(thread_index);
+    let mut tid = thread_ctx_tid(thread_index);
     if pid == 0 {
         pid = FAKE_PROCESS_HANDLE;
     }
@@ -5678,15 +5998,15 @@ unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
 }
 
 unsafe fn prepare_ethread_for_win32k_callout(thread_index: usize, teb: u64) {
-    let pid = WIN32K_THREAD_CTX_PIDS[thread_index].load(Ordering::Relaxed);
+    let pid = thread_ctx_pid(thread_index);
     let eprocess = eprocess_for_pid(pid);
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let ethread = thread_ctx_ethread(thread_index);
     if eprocess == 0 || ethread == 0 {
         return;
     }
 
     let mut process_id = pid;
-    let mut tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
+    let mut tid = thread_ctx_tid(thread_index);
     if process_id == 0 {
         process_id = FAKE_PROCESS_HANDLE;
     }
@@ -5707,39 +6027,13 @@ unsafe fn prepare_ethread_for_win32k_callout(thread_index: usize, teb: u64) {
     );
 }
 
-unsafe fn context_object_matches_or_empty(slot: &AtomicU64, supplied: u64) -> bool {
-    let existing = slot.load(Ordering::Relaxed);
-    supplied == 0 || existing == 0 || existing == supplied
-}
-
-unsafe fn store_context_object_or_allocate(
-    slot: &AtomicU64,
-    supplied: u64,
-    size: u64,
-) -> Option<u64> {
-    let existing = slot.load(Ordering::Relaxed);
-    if existing != 0 {
-        return Some(existing);
-    }
-    let object = if supplied != 0 {
-        supplied
-    } else {
-        allocate_kernel_object_body(size)
-    };
-    if object == 0 {
-        return None;
-    }
-    slot.store(object, Ordering::Relaxed);
-    Some(object)
-}
-
 unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {
-    let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
-    let tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
-    let w32process = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
-    let w32thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+    let pid = process_ctx_pid(process_index);
+    let tid = thread_ctx_tid(thread_index);
+    let eprocess = process_ctx_eprocess(process_index);
+    let ethread = thread_ctx_ethread(thread_index);
+    let w32process = process_ctx_w32process(process_index);
+    let w32thread = thread_ctx_w32thread(thread_index);
     write_volatile((WIN32K_SHARED_VADDR + SH_CTX_PROCESS_ID) as *mut u64, pid);
     write_volatile((WIN32K_SHARED_VADDR + SH_CTX_THREAD_ID) as *mut u64, tid);
     write_volatile(
@@ -5775,13 +6069,13 @@ unsafe fn callback_request_context_for_request(
         return None;
     }
     let thread_index = thread_context_index_for_tid(request.client_tid)?;
-    let pid = WIN32K_THREAD_CTX_PIDS[thread_index].load(Ordering::Relaxed);
+    let pid = thread_ctx_pid(thread_index);
     if pid == 0 {
         return None;
     }
     let process_index = process_context_index_for_pid(pid)?;
-    if WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed) != request.client_pi as u64
-        || WIN32K_THREAD_CTX_PIS[thread_index].load(Ordering::Relaxed) != request.client_pi as u64
+    if process_ctx_pi(process_index) != request.client_pi as u64
+        || thread_ctx_pi(thread_index) != request.client_pi as u64
     {
         return None;
     }
@@ -5793,9 +6087,9 @@ unsafe fn callback_request_context_for_request(
     let sh_matches_request =
         sh_pi == request.client_pi as u64 && sh_pid == pid && sh_tid == request.client_tid;
     let role_matches_process = sh_pi == request.client_pi as u64 && sh_pid == pid;
-    let table_teb = WIN32K_THREAD_CTX_TEB[thread_index].load(Ordering::Relaxed);
-    let supplied_eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    let supplied_ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let table_teb = thread_ctx_teb(thread_index);
+    let supplied_eprocess = process_ctx_eprocess(process_index);
+    let supplied_ethread = thread_ctx_ethread(thread_index);
 
     Some(Win32kCallbackRequestContext {
         pi: request.client_pi,
@@ -5903,8 +6197,8 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
         }
         return false;
     };
-    if WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed) != pi as u64
-        || WIN32K_THREAD_CTX_PIS[thread_index].load(Ordering::Relaxed) != pi as u64
+    if process_ctx_pi(process_index) != pi as u64
+        || thread_ctx_pi(thread_index) != pi as u64
     {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
@@ -5918,14 +6212,14 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
         }
         return false;
     }
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
-    let w32process = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
-    let w32thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+    let eprocess = process_ctx_eprocess(process_index);
+    let ethread = thread_ctx_ethread(thread_index);
+    let w32process = process_ctx_w32process(process_index);
+    let w32thread = thread_ctx_w32thread(thread_index);
     if client_teb != 0 {
-        WIN32K_THREAD_CTX_TEB[thread_index].store(client_teb, Ordering::Relaxed);
+        set_thread_ctx_teb(thread_index, client_teb);
     }
-    let recorded_client_peb = WIN32K_PROCESS_CTX_CLIENT_PEB[process_index].load(Ordering::Relaxed);
+    let recorded_client_peb = process_ctx_client_peb(process_index);
     initialize_eprocess_body(eprocess, pid, recorded_client_peb);
     let Some(teb) = seed_win32k_callout_teb(thread_index) else {
         let n = WIN32K_CALLBACK_RESUME_CONTEXT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -6030,38 +6324,39 @@ unsafe fn ensure_process_context(
         return None;
     }
     if let Some(index) = process_context_index_for_pid(pid) {
-        WIN32K_PROCESS_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
-        if !context_object_matches_or_empty(&WIN32K_PROCESS_CTX_EPROCESS[index], supplied_eprocess)
-        {
+        set_process_ctx_pi(index, pi as u64);
+        if !process_context_object_matches_or_empty(index, supplied_eprocess) {
             print_str(b"[win32k-context] ERROR: supplied EPROCESS mismatch for pid=");
             print_u64(pid);
             print_str(b"\n");
             return None;
         }
-        let eprocess = store_context_object_or_allocate(
-            &WIN32K_PROCESS_CTX_EPROCESS[index],
-            supplied_eprocess,
-            WIN32K_EPROCESS_BYTES,
-        )?;
+        let eprocess =
+            process_context_object_or_allocate(index, supplied_eprocess, WIN32K_EPROCESS_BYTES)?;
         record_process_client_peb(index, client_peb);
         initialize_eprocess_body(eprocess, pid, client_peb);
         return Some(index);
     }
-    for index in 0..WIN32K_GUI_PROCESS_CAP {
-        if WIN32K_PROCESS_CTX_PIDS[index].load(Ordering::Relaxed) == 0 {
-            let eprocess = store_context_object_or_allocate(
-                &WIN32K_PROCESS_CTX_EPROCESS[index],
-                supplied_eprocess,
-                WIN32K_EPROCESS_BYTES,
-            )?;
-            WIN32K_PROCESS_CTX_PIDS[index].store(pid, Ordering::Relaxed);
-            WIN32K_PROCESS_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
-            record_process_client_peb(index, client_peb);
-            initialize_eprocess_body(eprocess, pid, client_peb);
-            return Some(index);
-        }
+    let index = reserve_process_ctx_record()?;
+    let eprocess = if supplied_eprocess != 0 {
+        supplied_eprocess
+    } else {
+        allocate_kernel_object_body(WIN32K_EPROCESS_BYTES)
+    };
+    if eprocess == 0 {
+        return None;
     }
-    None
+    commit_process_ctx_record(index, Win32kProcessContextRecord {
+        pid,
+        pi: pi as u64,
+        eprocess,
+        w32process: 0,
+        client_peb,
+        token_authentication_id: 0,
+        primary_token: 0,
+    });
+    initialize_eprocess_body(eprocess, pid, client_peb);
+    Some(index)
 }
 
 unsafe fn ensure_thread_context(
@@ -6075,41 +6370,41 @@ unsafe fn ensure_thread_context(
         return None;
     }
     if let Some(index) = thread_context_index_for_tid(tid) {
-        if WIN32K_THREAD_CTX_PIDS[index].load(Ordering::Relaxed) != pid {
+        if thread_ctx_pid(index) != pid {
             return None;
         }
-        WIN32K_THREAD_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
+        set_thread_ctx_pi(index, pi as u64);
         if teb != 0 {
-            WIN32K_THREAD_CTX_TEB[index].store(teb, Ordering::Relaxed);
+            set_thread_ctx_teb(index, teb);
         }
-        if !context_object_matches_or_empty(&WIN32K_THREAD_CTX_ETHREAD[index], supplied_ethread) {
+        if !thread_context_object_matches_or_empty(index, supplied_ethread) {
             print_str(b"[win32k-context] ERROR: supplied ETHREAD mismatch for tid=");
             print_u64(tid);
             print_str(b"\n");
             return None;
         }
-        let _ = store_context_object_or_allocate(
-            &WIN32K_THREAD_CTX_ETHREAD[index],
-            supplied_ethread,
-            WIN32K_ETHREAD_BYTES,
-        )?;
+        let _ = thread_context_object_or_allocate(index, supplied_ethread, WIN32K_ETHREAD_BYTES)?;
         return Some(index);
     }
-    for index in 0..WIN32K_GUI_THREAD_CAP {
-        if WIN32K_THREAD_CTX_TIDS[index].load(Ordering::Relaxed) == 0 {
-            let _ethread = store_context_object_or_allocate(
-                &WIN32K_THREAD_CTX_ETHREAD[index],
-                supplied_ethread,
-                WIN32K_ETHREAD_BYTES,
-            )?;
-            WIN32K_THREAD_CTX_TIDS[index].store(tid, Ordering::Relaxed);
-            WIN32K_THREAD_CTX_PIDS[index].store(pid, Ordering::Relaxed);
-            WIN32K_THREAD_CTX_PIS[index].store(pi as u64, Ordering::Relaxed);
-            WIN32K_THREAD_CTX_TEB[index].store(teb, Ordering::Relaxed);
-            return Some(index);
-        }
+    let index = reserve_thread_ctx_record()?;
+    let ethread = if supplied_ethread != 0 {
+        supplied_ethread
+    } else {
+        allocate_kernel_object_body(WIN32K_ETHREAD_BYTES)
+    };
+    if ethread == 0 {
+        return None;
     }
-    None
+    commit_thread_ctx_record(index, Win32kThreadContextRecord {
+        tid,
+        pid,
+        pi: pi as u64,
+        teb,
+        callout_teb: 0,
+        ethread,
+        w32thread: 0,
+    });
+    Some(index)
 }
 
 unsafe fn derive_client_identity(
@@ -6165,7 +6460,7 @@ unsafe fn adopt_bootstrap_csrss_context(
     } else {
         process_context_index_for_pid(FAKE_PROCESS_HANDLE)?
     };
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
+    let eprocess = process_ctx_eprocess(process_index);
     if eprocess == 0 || (supplied_eprocess != 0 && supplied_eprocess != eprocess) {
         return None;
     }
@@ -6175,13 +6470,13 @@ unsafe fn adopt_bootstrap_csrss_context(
     } else {
         thread_context_index_for_tid(WIN32K_BOOTSTRAP_TID)?
     };
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let ethread = thread_ctx_ethread(thread_index);
     if ethread == 0 || (supplied_ethread != 0 && supplied_ethread != ethread) {
         return None;
     }
 
-    WIN32K_PROCESS_CTX_PIDS[process_index].store(pid, Ordering::Relaxed);
-    WIN32K_PROCESS_CTX_PIS[process_index].store(pi as u64, Ordering::Relaxed);
+    set_process_ctx_pid(process_index, pid);
+    set_process_ctx_pi(process_index, pi as u64);
     let client_peb = client_peb_from_teb(teb);
     record_process_client_peb(process_index, client_peb);
     initialize_eprocess_body(eprocess, pid, client_peb);
@@ -6194,17 +6489,17 @@ unsafe fn adopt_bootstrap_csrss_context(
         return None;
     }
 
-    let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+    let ppi = process_ctx_w32process(process_index);
     if ppi != 0 {
         write_volatile((ppi + W32PROCESS_PEPROCESS_OFF) as *mut u64, eprocess);
         write_volatile((ppi + W32PROCESS_W32PID_OFF) as *mut u32, pid as u32);
     }
 
-    WIN32K_THREAD_CTX_TIDS[thread_index].store(tid, Ordering::Relaxed);
-    WIN32K_THREAD_CTX_PIDS[thread_index].store(pid, Ordering::Relaxed);
-    WIN32K_THREAD_CTX_PIS[thread_index].store(pi as u64, Ordering::Relaxed);
+    set_thread_ctx_tid(thread_index, tid);
+    set_thread_ctx_pid(thread_index, pid);
+    set_thread_ctx_pi(thread_index, pi as u64);
     let effective_teb = if teb != 0 {
-        WIN32K_THREAD_CTX_TEB[thread_index].store(teb, Ordering::Relaxed);
+        set_thread_ctx_teb(thread_index, teb);
         seed_win32k_callout_teb(thread_index)?
     } else {
         seed_win32k_callout_teb(thread_index)?
@@ -6218,11 +6513,11 @@ unsafe fn adopt_bootstrap_csrss_context(
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed),
+        process_ctx_w32process(process_index),
     );
     write_volatile(
         SLOT_W32THREAD as *mut u64,
-        WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed),
+        thread_ctx_w32thread(thread_index),
     );
     publish_selected_context(process_index, thread_index);
 
@@ -6285,8 +6580,8 @@ unsafe fn select_win32k_client_context(
         return None;
     }
     let thread_index = ensure_thread_context(pi, pid, tid, client_teb, supplied_ethread)?;
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let eprocess = process_ctx_eprocess(process_index);
+    let ethread = thread_ctx_ethread(thread_index);
     record_process_client_peb(process_index, client_peb);
     initialize_eprocess_body(eprocess, pid, client_peb);
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -6296,11 +6591,11 @@ unsafe fn select_win32k_client_context(
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed),
+        process_ctx_w32process(process_index),
     );
     write_volatile(
         SLOT_W32THREAD as *mut u64,
-        WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed),
+        thread_ctx_w32thread(thread_index),
     );
     publish_selected_context(process_index, thread_index);
     Some((process_index, thread_index))
@@ -6324,22 +6619,22 @@ unsafe fn ensure_bootstrap_win32k_context() -> Option<(usize, usize)> {
 }
 
 unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64) -> bool {
-    if process_index >= WIN32K_GUI_PROCESS_CAP {
+    if !process_ctx_index_valid(process_index) {
         return false;
     }
-    if WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed) == 0 {
+    if process_ctx_w32process(process_index) == 0 {
         let callout = read_volatile(WIN32_CALLOUTS as *const u64);
         if callout != 0 {
-            let process = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
+            let process = process_ctx_eprocess(process_index);
             let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
             let status = co(process, 1);
             let slot_value = read_volatile(SLOT_W32PROCESS as *const u64);
             if slot_value != 0 {
-                WIN32K_PROCESS_CTX_W32PROCESS[process_index].store(slot_value, Ordering::Relaxed);
+                set_process_ctx_w32process(process_index, slot_value);
             } else if process != 0 {
                 let field = read_volatile((process + EPROCESS_WIN32PROCESS_OFF) as *const u64);
                 if field != 0 {
-                    WIN32K_PROCESS_CTX_W32PROCESS[process_index].store(field, Ordering::Relaxed);
+                    set_process_ctx_w32process(process_index, field);
                     write_volatile(SLOT_W32PROCESS as *mut u64, field);
                 }
             }
@@ -6348,8 +6643,8 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
             }
             let n = WIN32K_CLIENT_PROCESS_CALLOUTS.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
-                let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
-                let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
+                let pi = process_ctx_pi(process_index);
+                let pid = process_ctx_pid(process_index);
                 print_str(b"[win32k-context] process callout pid=");
                 print_u64(pid);
                 print_str(b" pi=");
@@ -6357,15 +6652,15 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
                 print_str(b" status=0x");
                 print_hex(status as u32);
                 print_str(b" ppi=0x");
-                let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+                let ppi = process_ctx_w32process(process_index);
                 print_hex((ppi >> 32) as u32);
                 print_hex(ppi as u32);
                 print_str(b"\n");
             }
         }
     }
-    if WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed) == 0 {
-        let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
+    if process_ctx_w32process(process_index) == 0 {
+        let pid = process_ctx_pid(process_index);
         print_str(b"[win32k-context] ERROR: process callout did not publish W32PROCESS for pid=");
         print_u64(pid);
         print_str(b"\n");
@@ -6373,15 +6668,15 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
     }
     write_volatile(
         SLOT_W32PROCESS as *mut u64,
-        WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed),
+        process_ctx_w32process(process_index),
     );
     link_processinfo_to_eprocess(process_index);
     if hosted_process_role_is_noninteractive_service_class(process_role) {
         let n = WIN32K_NONINTERACTIVE_WINSTA_RESOLVES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
-            let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
-            let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+            let pi = process_ctx_pi(process_index);
+            let pid = process_ctx_pid(process_index);
+            let ppi = process_ctx_w32process(process_index);
             print_str(
                 b"[win32k-host] noninteractive service desktop left to InitThreadCallback pid=",
             );
@@ -6400,8 +6695,8 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
 }
 
 unsafe fn link_processinfo_to_eprocess(process_index: usize) {
-    let process = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
-    let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+    let process = process_ctx_eprocess(process_index);
+    let ppi = process_ctx_w32process(process_index);
     if process == 0 || ppi == 0 {
         return;
     }
@@ -6415,7 +6710,7 @@ unsafe fn link_processinfo_to_eprocess(process_index: usize) {
 }
 
 unsafe fn seed_inherited_process_window_station(process_index: usize) {
-    let ppi = WIN32K_PROCESS_CTX_W32PROCESS[process_index].load(Ordering::Relaxed);
+    let ppi = process_ctx_w32process(process_index);
     if ppi == 0 {
         return;
     }
@@ -6427,7 +6722,7 @@ unsafe fn seed_inherited_process_window_station(process_index: usize) {
     }
 
     link_processinfo_to_eprocess(process_index);
-    let eprocess = WIN32K_PROCESS_CTX_EPROCESS[process_index].load(Ordering::Relaxed);
+    let eprocess = process_ctx_eprocess(process_index);
     if eprocess != 0 && s_ps_get_process_winsta(eprocess) == 0 {
         s_ps_set_process_winsta(eprocess, winsta_handle);
     }
@@ -6450,8 +6745,8 @@ unsafe fn seed_inherited_process_window_station(process_index: usize) {
     seed_default_startup_desktop_for_process(ppi, 0);
 
     if seeded_winsta && WIN32K_INHERITED_WINSTA_SEEDS.fetch_add(1, Ordering::Relaxed) < 16 {
-        let pi = WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed);
-        let pid = WIN32K_PROCESS_CTX_PIDS[process_index].load(Ordering::Relaxed);
+        let pi = process_ctx_pi(process_index);
+        let pid = process_ctx_pid(process_index);
         print_str(b"[win32k-host] inherited WinSta0 for pid=");
         print_u64(pid);
         print_str(b" pi=");
@@ -6598,15 +6893,15 @@ unsafe fn seed_default_startup_desktop_for_process(ppi: u64, pti: u64) -> bool {
 }
 
 unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool {
-    if thread_index >= WIN32K_GUI_THREAD_CAP {
+    if !thread_ctx_index_valid(thread_index) {
         return false;
     }
-    if WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed) == 0 {
+    if thread_ctx_w32thread(thread_index) == 0 {
         if client_teb != 0 {
-            WIN32K_THREAD_CTX_TEB[thread_index].store(client_teb, Ordering::Relaxed);
+            set_thread_ctx_teb(thread_index, client_teb);
         }
         let Some(teb) = seed_win32k_callout_teb(thread_index) else {
-            let tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
+            let tid = thread_ctx_tid(thread_index);
             print_str(b"[win32k-context] ERROR: could not allocate thread callout TEB for tid=");
             print_u64(tid);
             print_str(b"\n");
@@ -6618,16 +6913,16 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
 
         let callout = read_volatile((WIN32_CALLOUTS + 8) as *const u64);
         if callout != 0 {
-            let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+            let ethread = thread_ctx_ethread(thread_index);
             let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
             let status = co(ethread, PS_W32_THREAD_CALLOUT_INITIALIZE);
             let slot_value = read_volatile(SLOT_W32THREAD as *const u64);
             if slot_value != 0 {
-                WIN32K_THREAD_CTX_W32THREAD[thread_index].store(slot_value, Ordering::Relaxed);
+                set_thread_ctx_w32thread(thread_index, slot_value);
             } else {
                 let field = read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64);
                 if field != 0 {
-                    WIN32K_THREAD_CTX_W32THREAD[thread_index].store(field, Ordering::Relaxed);
+                    set_thread_ctx_w32thread(thread_index, field);
                     write_volatile(SLOT_W32THREAD as *mut u64, field);
                 }
             }
@@ -6636,8 +6931,8 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
             }
             let n = WIN32K_CLIENT_THREAD_CALLOUTS.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
-                let pi = WIN32K_THREAD_CTX_PIS[thread_index].load(Ordering::Relaxed);
-                let tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
+                let pi = thread_ctx_pi(thread_index);
+                let tid = thread_ctx_tid(thread_index);
                 print_str(b"[win32k-context] thread callout tid=");
                 print_u64(tid);
                 print_str(b" pi=");
@@ -6645,7 +6940,7 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
                 print_str(b" status=0x");
                 print_hex(status as u32);
                 print_str(b" pti=0x");
-                let pti = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+                let pti = thread_ctx_w32thread(thread_index);
                 print_hex((pti >> 32) as u32);
                 print_hex(pti as u32);
                 print_str(b" teb=0x");
@@ -6655,17 +6950,17 @@ unsafe fn ensure_win32k_threadinfo(thread_index: usize, client_teb: u64) -> bool
             }
         }
     }
-    if WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed) == 0 {
-        let tid = WIN32K_THREAD_CTX_TIDS[thread_index].load(Ordering::Relaxed);
+    if thread_ctx_w32thread(thread_index) == 0 {
+        let tid = thread_ctx_tid(thread_index);
         print_str(b"[win32k-context] ERROR: thread callout did not publish W32THREAD for tid=");
         print_u64(tid);
         print_str(b"\n");
         return false;
     }
-    let thread = WIN32K_THREAD_CTX_W32THREAD[thread_index].load(Ordering::Relaxed);
+    let thread = thread_ctx_w32thread(thread_index);
     write_volatile(SLOT_W32THREAD as *mut u64, thread);
     init_threadinfo_placeholder(thread);
-    let ethread = WIN32K_THREAD_CTX_ETHREAD[thread_index].load(Ordering::Relaxed);
+    let ethread = thread_ctx_ethread(thread_index);
     if ethread != 0 {
         write_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *mut u64, thread);
         if read_volatile(thread as *const u64) == 0 {
@@ -6685,9 +6980,9 @@ pub(crate) unsafe fn win32k_window_owner_pi(hwnd: u64) -> Option<u32> {
         return None;
     }
     let thread_index = thread_context_index_for_w32thread(pti)?;
-    let pid = WIN32K_THREAD_CTX_PIDS[thread_index].load(Ordering::Relaxed);
+    let pid = thread_ctx_pid(thread_index);
     let process_index = process_context_index_for_pid(pid)?;
-    Some(WIN32K_PROCESS_CTX_PIS[process_index].load(Ordering::Relaxed) as u32)
+    Some(process_ctx_pi(process_index) as u32)
 }
 
 /// `NTSTATUS ZwOpenFile(...)` — win32k's font init (IntLoadSystemFonts) opens `\SystemRoot\Fonts\`
@@ -10592,7 +10887,7 @@ unsafe fn establish_client_and_dispatch() {
         print_str(b" W32PROCESS=0x");
         let w32 = read_volatile(SLOT_W32PROCESS as *const u64);
         if w32 != 0 {
-            WIN32K_PROCESS_CTX_W32PROCESS[process_index].store(w32, Ordering::Relaxed);
+            set_process_ctx_w32process(process_index, w32);
         }
         print_hex((w32 >> 32) as u32);
         print_hex(w32 as u32);

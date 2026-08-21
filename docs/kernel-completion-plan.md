@@ -349,8 +349,8 @@ checks passing, keeps `exec_msgina_logon_dialog_painted`, `exec_userinit_builtin
 `exec_userinit_scrollbar_classinfo`, and `exec_explorer_shell_chrome_painted` green, records
 `class-atom-names=365 atom-name-session-serves/failures=15/0`, and emits no `[win32k-atom]`
 allocation diagnostics. Review adjustment: atom-table arena count is closed for the current desktop
-frontier; continue the runtime-table audit with the larger GUI process/thread context registry or a
-smaller ownership-local table if that registry needs preparatory refactoring.
+frontier; continue the runtime-table audit against remaining SEC_IMAGE/fault scratch or other
+subsystem-owned runtime ceilings.
 
 A4/B3 client-copyin frame registry scaling cleanup (2026-08-21): the executive SEC_IMAGE copy-in
 prefetch registry now uses vector-backed `{pi, page, frame, alias}` records instead of four fixed
@@ -365,8 +365,7 @@ x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
 `293/293` checks passing, keeps `exec_sec_image_demand_loaded`, `exec_sec_image_two_sections`,
 `exec_userinit_process_spawned`, and `exec_explorer_shell_chrome_painted` green, and emits no
 `[client-copyin]` allocation or alias-capacity diagnostics. Review adjustment: the client-copyin
-prefetch table cap is closed; continue with remaining SEC_IMAGE/fault scratch fixed arrays or the
-larger GUI process/thread context registry.
+prefetch table cap is closed; continue with remaining SEC_IMAGE/fault scratch fixed arrays.
 
 A4/B3 executive paging seen-set scaling cleanup (2026-08-21): the root executive paging hierarchy
 seen set now uses a vector-backed level-key store instead of the old fixed 8192-entry array.
@@ -382,8 +381,7 @@ and emits no `[exec-paging]` allocation diagnostics. The same proof exposed stal
 acceptance logic: rust-micro's canonical `qemu_exit(0)` through QEMU `isa-debug-exit` returns process
 code `1`, so `run.sh` now accepts rc `1` only when the desktop-paint PASS marker is present and no
 matching FAIL marker exists. Review adjustment: executive paging seen-set capacity is closed;
-continue with remaining SEC_IMAGE/fault scratch arrays, TEB-tail shadow tables, or the larger GUI
-process/thread context registry.
+continue with remaining SEC_IMAGE/fault scratch arrays.
 
 A4/B3 TEB-tail registry and shadow scaling cleanup (2026-08-21): protected client TEB tail page
 tracking now uses a vector-backed de-duplicated page set instead of a fixed 32-entry array, and
@@ -400,7 +398,7 @@ checks passing, keeps `exec_teb_not_clobbered_by_win32k`, `exec_win32k_desktop_p
 `exec_explorer_shell_chrome_painted` green, records `win32k ro-maps=246 store-faults=0
 gdi-write-windows=246 shadows=0`, and emits no TEB-tail allocation/alias/shadow diagnostics. Review
 adjustment: TEB-tail registry and COW shadow fixed-table caps are closed; continue with remaining
-SEC_IMAGE/fault scratch arrays or the larger GUI process/thread context registry.
+SEC_IMAGE/fault scratch arrays.
 
 A4/B3 shared DLL cache scaling cleanup (2026-08-21): the SEC_IMAGE shared executable
 page cache is now moved from the fixed 16384-entry `{va, frame}` parallel arrays to growable
@@ -427,8 +425,26 @@ Serialized desktop proof `.tmp/run-desktop-dll-cache-dirty-pin-20260821.log` rea
 userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing. The accepted run
 reports `shared-frames=3361/3584`, `shared-hits=8521`, `shared-insert-fails=0`, `shared-dup=0`,
 `shared-evict=228`, and no image-mapcap failures. Review adjustment: the shared DLL cache fixed
-capacity is closed; continue the fixed-table audit against remaining SEC_IMAGE/fault scratch and GUI
-process/thread context state.
+capacity is closed; continue the fixed-table audit against remaining SEC_IMAGE/fault scratch. The
+GUI process/thread context state is closed by the following accepted cleanup.
+
+A4/B3 win32k GUI context registry scaling cleanup (2026-08-21): the live
+win32k process/thread context authority no longer uses parallel static arrays capped at `MAX_PI` and
+`MAX_PI * 8`. Process records now grow on demand with typed `{pid, pi, eprocess, w32process,
+client_peb, token}` state, and thread records grow on demand with typed `{tid, pid, pi, teb,
+callout_teb, ethread, w32thread}` state. Existing PID/TID/EPROCESS/ETHREAD lookups keep their
+identity semantics, callback resume remains fail-closed on object mismatches, and new records reserve
+store capacity before allocating EPROCESS/ETHREAD bodies so untracked context objects are not
+created. The pool census now reports `w32-ctx=<proc len/cap/growth/fail>:<thread
+len/cap/growth/fail>`. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-w32-context-vec-20260822-002434.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, reports `w32-ctx=16/16/2/0:18/64/1/0`, keeps
+`exec_explorer_shell_chrome_painted` green, and emits no context allocation diagnostics. Review
+adjustment: the GUI process/thread context fixed-table cap is closed; continue the runtime-table
+audit against remaining SEC_IMAGE/fault scratch or other subsystem-owned tables that still hide real
+runtime ceilings.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -2011,8 +2027,10 @@ notification-package fallbacks.
   serialized proof `.tmp/run-headless-root-pdo-identity-20260821-155718.log` reaches userinit,
   Explorer, and shell chrome with `293/293` checks passing. Provider-domain pointer allocation
   records and the NDIS packet/buffer shadow stores now grow on demand instead of imposing fixed
-  executive-side table caps; remaining provider-domain fixed tables are tracked as follow-on B3
-  cleanup below.
+  executive-side table caps; the subsequent provider runtime/publication cleanups and win32k GUI
+  context registry cleanup remove the next fixed runtime ceilings from the current desktop path.
+  Remaining B3 cleanup should continue by subsystem ownership, with priority on real SEC_IMAGE/fault
+  scratch ceilings and any device/runtime publication state that still encodes a one-boot fixture.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 

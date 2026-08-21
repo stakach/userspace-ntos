@@ -9509,6 +9509,32 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_bank_segments);
     print_str(b" w32-bank-fails=");
     print_u64(w32_bank_fails);
+    let (
+        w32_ctx_proc_len,
+        w32_ctx_proc_cap,
+        w32_ctx_proc_growths,
+        w32_ctx_proc_fails,
+        w32_ctx_thread_len,
+        w32_ctx_thread_cap,
+        w32_ctx_thread_growths,
+        w32_ctx_thread_fails,
+    ) = win32k_subsystem::win32k_context_store_stats();
+    print_str(b" w32-ctx=");
+    print_u64(w32_ctx_proc_len);
+    print_str(b"/");
+    print_u64(w32_ctx_proc_cap);
+    print_str(b"/");
+    print_u64(w32_ctx_proc_growths);
+    print_str(b"/");
+    print_u64(w32_ctx_proc_fails);
+    print_str(b":");
+    print_u64(w32_ctx_thread_len);
+    print_str(b"/");
+    print_u64(w32_ctx_thread_cap);
+    print_str(b"/");
+    print_u64(w32_ctx_thread_growths);
+    print_str(b"/");
+    print_u64(w32_ctx_thread_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
