@@ -281,6 +281,22 @@ reports `ucb-redirects=906 ucb-returns=906`, and shows no `[w32paging]` allocati
 adjustment: continue the win32k attach-table cleanup separately because attach records own live
 mapped caps and need fail-closed record insertion.
 
+A4/B3 win32k attach-table scaling cleanup (2026-08-21): win32k's currently attached client leaf
+mappings now use vector-backed `{page, slot, rights}` records instead of three parallel 8192-entry
+arrays. Mapping record insertion returns a success bit; when a newly mapped copy cap cannot be
+recorded, the code unmaps and recycles that cap instead of leaving hidden win32k state. Client detach
+removes records as each mapped cap is successfully unmapped and recycled, so a failed detach no
+longer leaves already-detached pages in the live table. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-w32-attach-vec-20260821.log` reaches Explorer shell chrome with `293/293` checks
+passing, keeps `exec_win32k_desktop_painted`, `exec_msgina_modal_paint_prefix`,
+`exec_explorer_user_callbacks_redirected`, and `exec_explorer_wndproc_installed_by_client` green,
+reports `ucb-redirects=893 ucb-returns=893`, and shows no attach record allocation or untracked
+mapping cleanup failures. Review adjustment: win32k client attach capacity is closed for the current
+desktop frontier; continue auditing the remaining fixed runtime tables outside this attach cluster.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

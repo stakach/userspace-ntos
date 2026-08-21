@@ -4156,76 +4156,90 @@ pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
 /// before each dispatch; defaults to csrss so bring-up/self-test dispatches attach to pi 1). Read by
 /// `win32k_dispatch` at entry to drive `w32_client_attach`.
 pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(1);
-pub(crate) const W32_ATTACH_CAP: usize = 8192;
-pub(crate) static mut W32_ATTACH_PAGE: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
-pub(crate) static mut W32_ATTACH_SLOT: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
-pub(crate) static mut W32_ATTACH_RIGHTS: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
-pub(crate) static mut W32_ATTACH_N: usize = 0;
-/// Is `page` currently mapped into win32k for the attached client?
-pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let pages = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
-    let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(pages.add(i)) == page && core::ptr::read(slots.add(i)) != 0 {
-            return true;
-        }
-    }
-    false
+
+#[derive(Clone, Copy)]
+struct W32AttachMapping {
+    page: u64,
+    slot: u64,
+    rights: u64,
 }
 
-unsafe fn w32_attach_remove_at(index: usize, n: usize) {
-    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
-    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
-    let rights = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
-    let last = n - 1;
-    if index != last {
-        core::ptr::write(pages.add(index), core::ptr::read(pages.add(last)));
-        core::ptr::write(slots.add(index), core::ptr::read(slots.add(last)));
-        core::ptr::write(rights.add(index), core::ptr::read(rights.add(last)));
+static mut W32_ATTACH_MAPPINGS: Option<Vec<W32AttachMapping>> = None;
+
+unsafe fn w32_attach_mappings_mut() -> &'static mut Vec<W32AttachMapping> {
+    let slot = &mut *core::ptr::addr_of_mut!(W32_ATTACH_MAPPINGS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
     }
-    core::ptr::write(pages.add(last), 0);
-    core::ptr::write(slots.add(last), 0);
-    core::ptr::write(rights.add(last), 0);
-    core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), last);
+    slot.as_mut().unwrap()
+}
+
+/// Is `page` currently mapped into win32k for the attached client?
+pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
+    (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS))
+        .as_ref()
+        .is_some_and(|mappings| {
+            mappings
+                .iter()
+                .any(|mapping| mapping.page == page && mapping.slot != 0)
+        })
 }
 
 /// Re-point `page`'s attach record at a NEW copy-cap `slot` with `rights` (the copy-on-write and
 /// narrow-remap swaps below), so detach Unmap tears down whichever frame is actually mapped.
-/// Returns the OLD slot and OLD rights, or `(0, 0)`.
-pub(crate) unsafe fn w32_attach_replace_mapping(page: u64, slot: u64, rights: u64) -> (u64, u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let pages = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
-    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
-    let rights_table = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
-    for i in 0..n {
-        if core::ptr::read(pages.add(i)) == page {
-            let old = core::ptr::read(slots.add(i));
-            let old_rights = core::ptr::read(rights_table.add(i));
+/// Returns the OLD slot, OLD rights, and whether the requested replacement was recorded.
+pub(crate) unsafe fn w32_attach_replace_mapping(
+    page: u64,
+    slot: u64,
+    rights: u64,
+) -> (u64, u64, bool) {
+    let mappings = w32_attach_mappings_mut();
+    let mut i = 0usize;
+    while i < mappings.len() {
+        if mappings[i].page == page {
+            let old = mappings[i].slot;
+            let old_rights = mappings[i].rights;
             if slot == 0 {
-                w32_attach_remove_at(i, n);
+                mappings.swap_remove(i);
             } else {
-                core::ptr::write(slots.add(i), slot);
-                core::ptr::write(rights_table.add(i), rights);
+                mappings[i].slot = slot;
+                mappings[i].rights = rights;
             }
-            return (old, old_rights);
+            return (old, old_rights, true);
         }
+        i += 1;
     }
-    if slot != 0 {
-        w32_attach_record(page, slot, rights);
+    let recorded = slot == 0 || w32_attach_record(page, slot, rights);
+    (0, 0, recorded)
+}
+
+unsafe fn w32_attach_forget_or_release(page: u64, slot: u64, rights: u64) -> bool {
+    if w32_attach_record(page, slot, rights) {
+        return true;
     }
-    (0, 0)
+    let error = page_unmap_r(slot);
+    if error != 0 {
+        print_str(b"[w32attach] untracked mapping cleanup unmap failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+    }
+    let _ = cnode_delete_recycle_r(slot);
+    false
 }
 
 /// Forget a page's attach record after its leaf has been unmapped and no mapped cap remains.
 pub(crate) unsafe fn w32_attach_remove(page: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
-    for i in 0..n {
-        if core::ptr::read(pages.add(i)) == page {
-            w32_attach_remove_at(i, n);
+    let mappings = w32_attach_mappings_mut();
+    let mut i = 0usize;
+    while i < mappings.len() {
+        if mappings[i].page == page {
+            mappings.swap_remove(i);
             return true;
         }
+        i += 1;
     }
     false
 }
@@ -4259,14 +4273,16 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
         print_str(b"\n");
         return false;
     }
-    let (old, old_rights) = w32_attach_replace_mapping(page, 0, 0);
+    let (old, old_rights, _) = w32_attach_replace_mapping(page, 0, 0);
     if old != 0 {
         let error = page_unmap_r(old);
         if error != 0 {
             print_str(b"[teb-tail] COW unmap failed error=");
             print_u64(error);
             print_str(b"\n");
-            let _ = w32_attach_replace_mapping(page, old, old_rights);
+            if !w32_attach_replace_mapping(page, old, old_rights).2 {
+                print_str(b"[teb-tail] COW record restore failed after unmap failure\n");
+            }
             return false;
         }
     }
@@ -4275,7 +4291,9 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
         if old != 0 {
             let restore = page_map_r(old, page, old_rights, w_pml4);
             if restore == 0 {
-                let _ = w32_attach_replace_mapping(page, old, old_rights);
+                if !w32_attach_replace_mapping(page, old, old_rights).2 {
+                    return false;
+                }
             } else {
                 print_str(b"[teb-tail] COW restore failed error=");
                 print_u64(restore);
@@ -4289,10 +4307,15 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
     if old != 0 {
         let _ = cnode_delete_recycle_r(old);
     }
-    if old != 0 {
-        let _ = w32_attach_replace_mapping(page, cc, RW_NX);
+    let recorded = if old != 0 {
+        w32_attach_replace_mapping(page, cc, RW_NX).2
     } else {
-        w32_attach_record(page, cc, RW_NX);
+        w32_attach_record(page, cc, RW_NX)
+    };
+    if !recorded {
+        let _ = page_unmap_r(cc);
+        let _ = cnode_delete_recycle_r(cc);
+        return false;
     }
     if seen < 6 {
         print_str(b"[teb-tail] win32k STORE into the client TEB tail REFUSED (page=0x");
@@ -4312,33 +4335,28 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
 }
 
 /// Record that `page` is now mapped into win32k via copy-cap `slot` (for a later detach Unmap).
-pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64, rights: u64) {
+pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64, rights: u64) -> bool {
     if slot == 0 {
         let _ = w32_attach_remove(page);
-        return;
+        return true;
     }
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let pages = core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64;
-    let slots = core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64;
-    let rights_table = core::ptr::addr_of_mut!(W32_ATTACH_RIGHTS) as *mut u64;
-    for i in 0..n {
-        if core::ptr::read(pages.add(i)) == page {
-            core::ptr::write(slots.add(i), slot);
-            core::ptr::write(rights_table.add(i), rights);
-            return;
+    let mappings = w32_attach_mappings_mut();
+    for mapping in mappings.iter_mut() {
+        if mapping.page == page {
+            mapping.slot = slot;
+            mapping.rights = rights;
+            return true;
         }
     }
-    if n < W32_ATTACH_CAP {
-        core::ptr::write(pages.add(n), page);
-        core::ptr::write(slots.add(n), slot);
-        core::ptr::write(rights_table.add(n), rights);
-        core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), n + 1);
-    } else {
-        print_str(b"[w32attach] attach table full page=0x");
+    if mappings.try_reserve(1).is_err() {
+        print_str(b"[w32attach] attach record allocation failed page=0x");
         print_hex((page >> 32) as u32);
         print_hex(page as u32);
         print_str(b"\n");
+        return false;
     }
+    mappings.push(W32AttachMapping { page, slot, rights });
+    true
 }
 
 /// Re-map a currently selected client frame into win32k with explicit rights. This is used for
@@ -4363,10 +4381,10 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
         return false;
     }
     let was_mapped = w32_attach_mapped(page);
-    let (old, old_rights) = if was_mapped {
+    let (old, old_rights, _) = if was_mapped {
         w32_attach_replace_mapping(page, 0, 0)
     } else {
-        (0, 0)
+        (0, 0, true)
     };
     if old != 0 {
         let error = page_unmap_r(old);
@@ -4396,7 +4414,9 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
         }
 
         if map == 0 {
-            let _ = w32_attach_replace_mapping(page, old, rights);
+            if !w32_attach_replace_mapping(page, old, rights).2 {
+                return false;
+            }
         } else {
             print_str(b"[w32attach] remap existing map failed page=0x");
             print_hex((page >> 32) as u32);
@@ -4409,7 +4429,9 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
 
             let restore = page_map_r(old, page, old_rights, w_pml4);
             if restore == 0 {
-                let _ = w32_attach_replace_mapping(page, old, old_rights);
+                if !w32_attach_replace_mapping(page, old, old_rights).2 {
+                    return false;
+                }
             } else {
                 print_str(b"[w32attach] remap restore failed page=0x");
                 print_hex((page >> 32) as u32);
@@ -4427,7 +4449,9 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
         if cc == 0 {
             return false;
         }
-        w32_attach_record(page, cc, rights);
+        if !w32_attach_forget_or_release(page, cc, rights) {
+            return false;
+        }
     }
     if crate::W32_CLIENT_TEB_TAIL_PROTECTED
         && rights == crate::RO_NX
@@ -4445,34 +4469,34 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     if prev == pi {
         return true;
     }
-    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
-    let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
-    for i in 0..n {
+    let mappings = w32_attach_mappings_mut();
+    let mut detached = 0usize;
+    while !mappings.is_empty() {
         // Unmap win32k's mapping of the previous client's page (arch Unmap uses this cap's win32k
         // asid → csrss/winlogon's own VSpace mapping is untouched), then delete the transient copy
         // cap so the executive's root-slot allocator can recycle it.
-        let cap = core::ptr::read(slots.add(i));
-        let error = page_unmap_r(cap);
+        let mapping = mappings[mappings.len() - 1];
+        let error = page_unmap_r(mapping.slot);
         if error != 0 {
             print_str(b"[w32attach] page_unmap failed page=0x");
-            print_hex(
-                core::ptr::read((core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64).add(i)) as u32,
-            );
+            print_hex((mapping.page >> 32) as u32);
+            print_hex(mapping.page as u32);
             print_str(b" error=");
             print_u64(error);
             print_str(b"\n");
             return false;
         }
-        let _ = cnode_delete_recycle_r(cap);
+        let _ = cnode_delete_recycle_r(mapping.slot);
+        let _ = mappings.pop();
+        detached += 1;
     }
     print_str(b"[w32attach] client ");
     print_u64(prev);
     print_str(b" -> ");
     print_u64(pi);
     print_str(b" (detached ");
-    print_u64(n as u64);
+    print_u64(detached as u64);
     print_str(b" client pages)\n");
-    core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), 0);
     W32_ATTACHED_PI.store(pi, Ordering::Relaxed);
     true
 }
@@ -4510,8 +4534,7 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     if cc == 0 {
         return false;
     }
-    w32_attach_record(page, cc, rights);
-    true
+    w32_attach_forget_or_release(page, cc, rights)
 }
 
 /// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,

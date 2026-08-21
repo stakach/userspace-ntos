@@ -679,7 +679,7 @@ unsafe fn detach_win32k_attached_page_for_thread_release(pi: usize, page: u64) {
     if W32_ATTACHED_PI.load(Ordering::Relaxed) != pi as u64 {
         return;
     }
-    let (cap, _) = w32_attach_replace_mapping(page, 0, 0);
+    let (cap, _, _) = w32_attach_replace_mapping(page, 0, 0);
     recycle_mapped_cap(cap);
 }
 
