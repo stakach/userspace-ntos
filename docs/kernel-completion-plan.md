@@ -368,6 +368,23 @@ x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
 prefetch table cap is closed; continue with remaining SEC_IMAGE/fault scratch fixed arrays or the
 larger GUI process/thread context registry.
 
+A4/B3 executive paging seen-set scaling cleanup (2026-08-21): the root executive paging hierarchy
+seen set now uses a vector-backed level-key store instead of the old fixed 8192-entry array.
+`ensure_executive_paging` reserves the record before allocating and mapping a new paging object, so
+heap pressure produces an explicit `[exec-paging] seen-set allocation failed` diagnostic and the
+caller sees failure rather than an unrecorded hierarchy level. Local validation is green for
+`cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, `git diff --check`, and `bash -n run.sh`. Serialized desktop proof
+`.tmp/run-headless-exec-paging-seen-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing, keeps `exec_win32k_desktop_painted` and `exec_explorer_shell_chrome_painted` green,
+and emits no `[exec-paging]` allocation diagnostics. The same proof exposed stale launcher
+acceptance logic: rust-micro's canonical `qemu_exit(0)` through QEMU `isa-debug-exit` returns process
+code `1`, so `run.sh` now accepts rc `1` only when the desktop-paint PASS marker is present and no
+matching FAIL marker exists. Review adjustment: executive paging seen-set capacity is closed;
+continue with remaining SEC_IMAGE/fault scratch arrays, TEB-tail shadow tables, or the larger GUI
+process/thread context registry.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

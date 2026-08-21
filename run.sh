@@ -228,7 +228,7 @@ set -e
 echo
 if grep -q 'PASS exec_win32k_desktop_painted' "$RUN_LOG" \
    && ! grep -q 'FAIL exec_win32k_desktop_painted' "$RUN_LOG" \
-   && { [ "$rc" = 3 ] || [ "$rc" = 0 ]; }; then
+   && { [ "$rc" = 1 ] || [ "$rc" = 3 ] || [ "$rc" = 0 ]; }; then
   say "SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)."
   say "         Log: $RUN_LOG"
   say "         Run ./run.sh --desktop to view it."

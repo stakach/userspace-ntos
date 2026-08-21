@@ -12740,8 +12740,7 @@ unsafe fn make_object(obj: u64) -> u64 {
     s
 }
 
-static mut EXEC_PAGING_SEEN: [u64; 8192] = [0; 8192];
-static mut EXEC_PAGING_SEEN_N: usize = 0;
+static mut EXEC_PAGING_SEEN: Option<Vec<u64>> = None;
 const EXEC_PAGING_SEEN_PDPT: u64 = 1u64 << 60;
 const EXEC_PAGING_SEEN_PD: u64 = 2u64 << 60;
 const EXEC_PAGING_SEEN_PT: u64 = 3u64 << 60;
@@ -12749,25 +12748,44 @@ const SEL4_RANGE_ERROR: u64 = 4;
 const SEL4_FAILED_LOOKUP: u64 = 6;
 const SEL4_DELETE_FIRST: u64 = 8;
 
-unsafe fn exec_paging_seen(key: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(EXEC_PAGING_SEEN_N));
-    let entries = core::ptr::addr_of!(EXEC_PAGING_SEEN) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(entries.add(i)) == key {
-            return true;
-        }
+unsafe fn exec_paging_seen_mut() -> &'static mut Vec<u64> {
+    let slot = &mut *core::ptr::addr_of_mut!(EXEC_PAGING_SEEN);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
     }
-    false
+    slot.as_mut().expect("initialized above")
+}
+
+unsafe fn exec_paging_seen(key: u64) -> bool {
+    (&*core::ptr::addr_of!(EXEC_PAGING_SEEN))
+        .as_ref()
+        .is_some_and(|entries| entries.iter().any(|entry| *entry == key))
+}
+
+unsafe fn exec_paging_prepare_mark(key: u64, page: u64, level: &[u8]) -> bool {
+    let entries = exec_paging_seen_mut();
+    if entries.iter().any(|entry| *entry == key) {
+        return true;
+    }
+    if entries.try_reserve(1).is_err() {
+        print_str(b"[exec-paging] seen-set allocation failed ");
+        print_str(level);
+        print_str(b" page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" key=0x");
+        print_hex((key >> 32) as u32);
+        print_hex(key as u32);
+        print_str(b"\n");
+        return false;
+    }
+    true
 }
 
 unsafe fn exec_paging_mark(key: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(EXEC_PAGING_SEEN_N));
-    if n < 8192 {
-        core::ptr::write(
-            (core::ptr::addr_of_mut!(EXEC_PAGING_SEEN) as *mut u64).add(n),
-            key,
-        );
-        core::ptr::write(core::ptr::addr_of_mut!(EXEC_PAGING_SEEN_N), n + 1);
+    let entries = exec_paging_seen_mut();
+    if !entries.iter().any(|entry| *entry == key) {
+        entries.push(key);
     }
 }
 
@@ -12789,6 +12807,9 @@ unsafe fn ensure_executive_paging_level(
 ) -> bool {
     if exec_paging_seen(key) {
         return true;
+    }
+    if !exec_paging_prepare_mark(key, page, level) {
+        return false;
     }
     let slot = alloc_slot();
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
