@@ -582,6 +582,22 @@ Review adjustment: hosted executable PE metadata no longer has a fixed per-proce
 Remaining `MAX_PI` arrays are mostly diagnostic counters/cap-bank summaries; audit those by owner
 instead of converting every counter mechanically.
 
+A4/B3 win32k client process-row scaling cleanup (2026-08-21): the live win32k client cap-bank counts
+and USER heap, POOL, and GDI user-attribute mapped-frame rows now use vector-backed rows instead of
+`[AtomicU64; MAX_PI]` arrays. The existing process-store reset provisions these rows before the
+SEC_IMAGE and desktop workload, mapping paths fail closed when a process row has not been
+provisioned, and process teardown clears the row through the same ownership helpers. The pool census
+reports `w32-rows=<cap len/cap>:<heap len/cap>:<pool len/cap>:<uservm len/cap>/<fail>`. Local
+validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-win32k-client-rows-vec-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_explorer_shell_chrome_painted`
+green, and reports `w32-rows=24/24:24/24:24/24:24/24/0`. Review adjustment: win32k per-process
+mapped-frame rows no longer have fixed backing storage. The remaining fixed cap-bank owner/free
+tables are explicit finite cap-bank geometry rather than process identity rows; audit them with the
+cap-bank allocator rather than converting them mechanically.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

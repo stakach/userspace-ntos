@@ -80,8 +80,7 @@ static WIN32K_CLIENT_CAP_BANK_RAW: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SEGMENTS] 
 static WIN32K_CLIENT_CAP_BANK_CNODE: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SEGMENTS] =
     [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SEGMENTS];
 static WIN32K_CLIENT_CAP_BANK_NEXT: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
+static mut WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI: Vec<AtomicU64> = Vec::new();
 static WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
@@ -92,15 +91,109 @@ static WIN32K_CLIENT_CAP_BANK_OWNER: [AtomicU8; WIN32K_CLIENT_CAP_BANK_SLOTS as 
     [const { AtomicU8::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
 static WIN32K_CLIENT_CAP_BANK_FREE_NEXT: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SLOTS as usize] =
     [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
-static WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-static WIN32K_POOL_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] =
-    [const { AtomicU64::new(0) }; MAX_PI];
-static GDI_USERVM_CLIENT_MAPPED_FRAMES: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
+static mut WIN32K_POOL_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
+static mut GDI_USERVM_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
     nt_user_callback::ActiveCallbackStack::new();
+
+unsafe fn reset_win32k_atomic_process_rows(rows: &mut Vec<AtomicU64>, slots: usize) -> bool {
+    rows.clear();
+    if rows.try_reserve(slots).is_err() {
+        WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while rows.len() < slots {
+        rows.push(AtomicU64::new(0));
+    }
+    for row in rows.iter() {
+        row.store(0, Ordering::Relaxed);
+    }
+    true
+}
+
+pub(crate) fn reset_win32k_client_process_rows(slots: usize) -> bool {
+    unsafe {
+        let cap_rows = reset_win32k_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI),
+            slots,
+        );
+        let heap_rows = reset_win32k_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES),
+            slots,
+        );
+        let pool_rows = reset_win32k_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(WIN32K_POOL_CLIENT_MAPPED_FRAMES),
+            slots,
+        );
+        let uservm_rows = reset_win32k_atomic_process_rows(
+            &mut *core::ptr::addr_of_mut!(GDI_USERVM_CLIENT_MAPPED_FRAMES),
+            slots,
+        );
+        cap_rows && heap_rows && pool_rows && uservm_rows
+    }
+}
+
+unsafe fn win32k_client_cap_bank_live_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI)).get(pi)
+}
+
+unsafe fn win32k_user_heap_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES)).get(pi)
+}
+
+unsafe fn win32k_pool_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).get(pi)
+}
+
+unsafe fn gdi_uservm_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES)).get(pi)
+}
+
+unsafe fn win32k_user_heap_mapped_rows() -> &'static [AtomicU64] {
+    (&*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES)).as_slice()
+}
+
+unsafe fn win32k_pool_mapped_rows() -> &'static [AtomicU64] {
+    (&*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES)).as_slice()
+}
+
+unsafe fn gdi_uservm_mapped_rows() -> &'static [AtomicU64] {
+    (&*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES)).as_slice()
+}
+
+pub(crate) fn win32k_client_process_row_stats() -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    u64,
+) {
+    unsafe {
+        let cap_rows = &*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI);
+        let heap_rows = &*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES);
+        let pool_rows = &*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES);
+        let uservm_rows = &*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES);
+        (
+            cap_rows.len(),
+            cap_rows.capacity(),
+            heap_rows.len(),
+            heap_rows.capacity(),
+            pool_rows.len(),
+            pool_rows.capacity(),
+            uservm_rows.len(),
+            uservm_rows.capacity(),
+            WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Clone, Copy)]
 struct UserCallbackClientRecord {
@@ -3232,7 +3325,7 @@ unsafe fn map_win32k_arena_prefix_into_client(
     client_base: u64,
     max_frames: u64,
     target_frames: u64,
-    mapped_frames: &[AtomicU64; MAX_PI],
+    mapped_frames: &[AtomicU64],
     mapped_guard: &AtomicU64,
     rights: u64,
     label: &[u8],
@@ -3240,13 +3333,17 @@ unsafe fn map_win32k_arena_prefix_into_client(
     if frame_base == 0 || pi >= MAX_PI || pi >= 64 || max_frames == 0 {
         return false;
     }
+    let Some(mapped_row) = mapped_frames.get(pi) else {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
 
     let target_frames = target_frames.min(max_frames);
     if target_frames == 0 {
         return false;
     }
     let bit = 1u64 << pi;
-    let already_mapped = mapped_frames[pi].load(Ordering::Relaxed).min(max_frames);
+    let already_mapped = mapped_row.load(Ordering::Relaxed).min(max_frames);
     if already_mapped >= target_frames {
         mapped_guard.fetch_or(bit, Ordering::Relaxed);
         return true;
@@ -3301,7 +3398,7 @@ unsafe fn map_win32k_arena_prefix_into_client(
             let _ = cnode_delete_recycle_r(cp);
             return false;
         }
-        mapped_frames[pi].store(i + 1, Ordering::Relaxed);
+        mapped_row.store(i + 1, Ordering::Relaxed);
     }
 
     mapped_guard.fetch_or(bit, Ordering::Relaxed);
@@ -3463,6 +3560,10 @@ unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
         WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    let Some(live_row) = win32k_client_cap_bank_live_row(pi) else {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
     let Some((next, segment, segment_slot)) = win32k_client_cap_bank_next_slot() else {
         return false;
     };
@@ -3485,7 +3586,7 @@ unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
         WIN32K_CLIENT_CAP_BANK_NEXT.store(next + 1, Ordering::Relaxed);
     }
     WIN32K_CLIENT_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
-    WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].fetch_add(1, Ordering::Relaxed);
+    live_row.fetch_add(1, Ordering::Relaxed);
     let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     note_high_water(&WIN32K_CLIENT_CAP_BANK_LIVE_HW, live);
     true
@@ -3494,8 +3595,9 @@ unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
 pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
     let mut processes = 0u64;
     let mut banks = 0u64;
-    for pi in 0..MAX_PI {
-        if WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed) != 0 {
+    let rows = unsafe { &*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI) };
+    for row in rows.iter() {
+        if row.load(Ordering::Relaxed) != 0 {
             processes += 1;
         }
     }
@@ -3524,6 +3626,13 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
     if pi >= MAX_PI || pi >= u8::MAX as usize {
         return Win32kClientCapBankReclaimStats::default();
     }
+    let Some(live_row) = win32k_client_cap_bank_live_row(pi) else {
+        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return Win32kClientCapBankReclaimStats {
+            caps: 0,
+            failures: 1,
+        };
+    };
     if pi < 64 {
         let bit = !(1u64 << pi);
         WIN32K_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
@@ -3531,11 +3640,17 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
         GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
         GDI_USERVM_MAPPED.fetch_and(bit, Ordering::Relaxed);
     }
-    WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
-    WIN32K_POOL_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
-    GDI_USERVM_CLIENT_MAPPED_FRAMES[pi].store(0, Ordering::Relaxed);
+    if let Some(row) = win32k_user_heap_mapped_row(pi) {
+        row.store(0, Ordering::Relaxed);
+    }
+    if let Some(row) = win32k_pool_mapped_row(pi) {
+        row.store(0, Ordering::Relaxed);
+    }
+    if let Some(row) = gdi_uservm_mapped_row(pi) {
+        row.store(0, Ordering::Relaxed);
+    }
 
-    let live = WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed);
+    let live = live_row.load(Ordering::Relaxed);
     if live == 0 {
         return Win32kClientCapBankReclaimStats::default();
     }
@@ -3616,10 +3731,9 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
         WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_sub(accounted, Ordering::Relaxed);
     }
     if failures == 0 {
-        WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi].store(0, Ordering::Relaxed);
+        live_row.store(0, Ordering::Relaxed);
     } else {
-        WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI[pi]
-            .store(live.saturating_sub(accounted), Ordering::Relaxed);
+        live_row.store(live.saturating_sub(accounted), Ordering::Relaxed);
         WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(failures, Ordering::Relaxed);
     }
     if released != 0 || failures != 0 {
@@ -3648,8 +3762,8 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
 pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
     let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
-    let already_mapped = (pi < MAX_PI
-        && WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0)
+    let already_mapped = win32k_user_heap_mapped_row(pi)
+        .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
         || (pi < 64 && WIN32K_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
     if !map_win32k_arena_prefix_into_client(
         pml4,
@@ -3658,7 +3772,7 @@ pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> O
         win32k_subsystem::CSRSS_W32_SHARED_VA,
         win32k_subsystem::WIN32K_HEAP_FRAMES,
         win32k_subsystem::win32k_user_heap_committed_frames(),
-        &WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES,
+        win32k_user_heap_mapped_rows(),
         &WIN32K_CLIENT_MAPPED,
         2 | PAGE_EXECUTE_NEVER,
         b"win32k USER heap",
@@ -3686,8 +3800,8 @@ pub(crate) unsafe fn map_win32k_user_heap_into_client(pml4: u64, pi: usize) -> O
 pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option<u64> {
     let delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
     let pool_base = WIN32K_POOL_FRAME_BASE.load(Ordering::Relaxed);
-    let already_mapped = (pi < MAX_PI
-        && WIN32K_POOL_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0)
+    let already_mapped = win32k_pool_mapped_row(pi)
+        .is_some_and(|row| row.load(Ordering::Relaxed) != 0)
         || (pi < 64 && WIN32K_POOL_CLIENT_MAPPED.load(Ordering::Relaxed) & (1u64 << pi) != 0);
     if !map_win32k_arena_prefix_into_client(
         pml4,
@@ -3696,7 +3810,7 @@ pub(crate) unsafe fn map_win32k_pool_into_client(pml4: u64, pi: usize) -> Option
         win32k_subsystem::CSRSS_W32_POOL_VA,
         win32k_subsystem::WIN32K_POOL_FRAMES,
         win32k_subsystem::WIN32K_POOL_FRAMES,
-        &WIN32K_POOL_CLIENT_MAPPED_FRAMES,
+        win32k_pool_mapped_rows(),
         &WIN32K_POOL_CLIENT_MAPPED,
         2 | PAGE_EXECUTE_NEVER,
         b"win32k POOL",
@@ -3773,7 +3887,7 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
         return false;
     }
     let already_mapped =
-        pi < MAX_PI && GDI_USERVM_CLIENT_MAPPED_FRAMES[pi].load(Ordering::Relaxed) != 0;
+        gdi_uservm_mapped_row(pi).is_some_and(|row| row.load(Ordering::Relaxed) != 0);
     let mapped = map_win32k_arena_prefix_into_client(
         pml4,
         pi,
@@ -3781,7 +3895,7 @@ pub(crate) unsafe fn map_gdi_user_attributes_into_client(pml4: u64, pi: usize) -
         win32k_subsystem::WIN32K_USERVM_VADDR,
         win32k_subsystem::WIN32K_USERVM_FRAMES,
         win32k_subsystem::win32k_uservm_committed_frames(),
-        &GDI_USERVM_CLIENT_MAPPED_FRAMES,
+        gdi_uservm_mapped_rows(),
         &GDI_USERVM_MAPPED,
         RW_NX,
         b"live GDI user attributes",

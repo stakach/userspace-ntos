@@ -9895,6 +9895,35 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b" w32-bank-fails=");
     print_u64(w32_bank_fails);
     let (
+        w32_row_cap_len,
+        w32_row_cap_cap,
+        w32_row_heap_len,
+        w32_row_heap_cap,
+        w32_row_pool_len,
+        w32_row_pool_cap,
+        w32_row_uservm_len,
+        w32_row_uservm_cap,
+        w32_row_fails,
+    ) = win32k_glue::win32k_client_process_row_stats();
+    print_str(b" w32-rows=");
+    print_u64(w32_row_cap_len as u64);
+    print_str(b"/");
+    print_u64(w32_row_cap_cap as u64);
+    print_str(b":");
+    print_u64(w32_row_heap_len as u64);
+    print_str(b"/");
+    print_u64(w32_row_heap_cap as u64);
+    print_str(b":");
+    print_u64(w32_row_pool_len as u64);
+    print_str(b"/");
+    print_u64(w32_row_pool_cap as u64);
+    print_str(b":");
+    print_u64(w32_row_uservm_len as u64);
+    print_str(b"/");
+    print_u64(w32_row_uservm_cap as u64);
+    print_str(b"/");
+    print_u64(w32_row_fails);
+    let (
         w32_ctx_proc_len,
         w32_ctx_proc_cap,
         w32_ctx_proc_growths,
@@ -25320,6 +25349,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // ntdll/smss will load: memory-efficient, only touched pages materialized.
     if !reset_process_vm_state(MAX_PI) {
         panic!("process VM state allocation failed");
+    }
+    if !win32k_glue::reset_win32k_client_process_rows(MAX_PI) {
+        panic!("win32k client process row allocation failed");
     }
     print_str(b"[ntos-exec] P3: demand-loading a PE via SEC_IMAGE (pages fault in by RVA)\n");
     let sec_magic = 0x5EC1_1A6E_D15C_0DE5u64;
