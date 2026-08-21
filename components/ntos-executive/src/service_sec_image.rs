@@ -102,9 +102,7 @@ static NTUSER_CALL_ONE_PARAM_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut SERVICE_SSN_RING_WORK: [u16; 32] = [0; 32];
 static mut SERVICE_SSN_RING_BADGE_WORK: [u8; 32] = [0; 32];
 static mut SERVICE_WL_RING_WORK: [u16; 48] = [0; 48];
-static mut SERVICE_DLL_PD_CREATED_WORK: [bool; MAX_PI] = [false; MAX_PI];
-static mut SERVICE_DLL_PT_BITS_WORK: [[u64; DLL_ARENA_PT_WORDS]; MAX_PI] =
-    [[0; DLL_ARENA_PT_WORDS]; MAX_PI];
+static mut SERVICE_DLL_ARENA_PAGING_WORK: DllArenaPagingState = DllArenaPagingState::new();
 static mut SERVICE_PROCS_WORK: [ProcExec; MAX_PI] = [ProcExec::empty(); MAX_PI];
 static mut SERVICE_EXE_IMAGES_WORK: nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP> =
     nt_exe_image::ImageTable::new();
@@ -1161,6 +1159,21 @@ unsafe fn reset_service_generic_sections_work() -> &'static mut GenericSectionTa
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
     (*slot).reset();
     &mut *slot
+}
+
+#[inline(never)]
+unsafe fn reset_service_dll_arena_paging_work() -> &'static mut DllArenaPagingState {
+    let state = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_ARENA_PAGING_WORK);
+    state.reset();
+    state
+}
+
+pub(crate) fn service_dll_arena_paging_stats() -> DllArenaPagingStats {
+    unsafe { (&*core::ptr::addr_of!(SERVICE_DLL_ARENA_PAGING_WORK)).stats() }
+}
+
+fn take_service_dll_arena_paging_dirty() -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(SERVICE_DLL_ARENA_PAGING_WORK)).take_dirty() }
 }
 
 #[inline(never)]
@@ -4995,17 +5008,9 @@ pub(crate) unsafe fn service_sec_image(
         }
     }
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
-    // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
-    // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
-    // Per-process (indexed by pi: 0=smss, 1=csrss, 2=winlogon): the DLL page-directory once-flag +
-    // a bitset of which arena PT windows are reserved in that process's VSpace. Compact DLLs may
-    // share a PT and large DLLs may span several.
-    let dll_pd_created = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PD_CREATED_WORK);
-    dll_pd_created.fill(false);
-    let dll_pt_bits = &mut *core::ptr::addr_of_mut!(SERVICE_DLL_PT_BITS_WORK);
-    for entry in dll_pt_bits.iter_mut() {
-        entry.fill(0);
-    }
+    // nt-dll-registry, built below once their PEs are parsed. Each hosted VSpace gets its own
+    // growable DLL arena paging record as images map into the compact 0x8000_0000 range.
+    let dll_arena_paging = reset_service_dll_arena_paging_work();
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -5892,10 +5897,10 @@ pub(crate) unsafe fn service_sec_image(
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
             PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
         }
-        // LOUD overflow guard: `pi` indexes fixed-size per-process arrays (procs / pfilled /
-        // dll_pd_created / dll_pt_bits, all sized to MAX_PI). Dynamic hosted processes are admitted
-        // through the catalog/runtime tables; if one ever exceeds the current executive ceiling this
-        // panics with a clear file:line instead of corrupting an adjacent array.
+        // LOUD overflow guard: `pi` still indexes the core process/fault scratch arrays
+        // (`procs` / `pfilled`, sized to MAX_PI). Dynamic hosted processes are admitted through the
+        // catalog/runtime tables; if one ever exceeds this remaining executive ceiling this panics
+        // with a clear file:line instead of corrupting an adjacent array.
         assert!(
             pi < MAX_PI,
             "hosted process pi exceeds MAX_PI - raise the runtime ceiling"
@@ -7951,7 +7956,10 @@ pub(crate) unsafe fn service_sec_image(
             // Image faults bypass the native-syscall reply tail below. Shared RX DLL pages can still
             // grow the loop-owned shared-image mapping table and the shared DLL source-frame cache in
             // this branch, so pin that durable metadata before the next loop-top heap reset.
-            if take_shared_image_mapping_dirty() || take_dll_cache_dirty() {
+            if take_shared_image_mapping_dirty()
+                || take_dll_cache_dirty()
+                || take_service_dll_arena_paging_dirty()
+            {
                 pin_durable_heap_mark(&mut heap_mark);
             }
             if allocation_failed {
@@ -8924,8 +8932,7 @@ pub(crate) unsafe fn service_sec_image(
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     generic_sections: generic_sections as *mut GenericSectionTable,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: dll_pd_created as *mut [bool; MAX_PI],
-                    dll_pt_bits: dll_pt_bits as *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
+                    dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
@@ -9413,7 +9420,10 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 nt_handler.writable_fs_commit_required = false;
-                if take_shared_image_mapping_dirty() || take_dll_cache_dirty() {
+                if take_shared_image_mapping_dirty()
+                    || take_dll_cache_dirty()
+                    || take_service_dll_arena_paging_dirty()
+                {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace

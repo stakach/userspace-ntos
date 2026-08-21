@@ -29717,9 +29717,11 @@ impl ExecNtHandler {
                         // an overlapping DLL set at identical bases into distinct VSpaces, so gate the
                         // reservation on this process's bitmask, not any other process's image view.
                         let pi = self.pi;
-                        let dll_pd_created = &mut *ctx.dll_pd_created;
-                        let dll_pt_bits = &mut *ctx.dll_pt_bits;
-                        if !dll_pd_created[pi] {
+                        let dll_arena_paging = &mut *ctx.dll_arena_paging;
+                        if let Err(status) = dll_arena_paging.reserve_process(pi) {
+                            return status;
+                        }
+                        if !dll_arena_paging.pd_created(pi) {
                             let pd = alloc_slot();
                             let _ = untyped_retype(
                                 CAP_INIT_UNTYPED,
@@ -29734,13 +29736,13 @@ impl ExecNtHandler {
                                 DLL_ARENA_START,
                                 pml4,
                             );
-                            dll_pd_created[pi] = true;
+                            if let Err(status) = dll_arena_paging.mark_pd_created(pi) {
+                                return status;
+                            }
                         }
                         if let Some(pt_range) = reg.page_table_range(i) {
                             for pt_index in pt_range {
-                                let word = pt_index / 64;
-                                let bit = 1u64 << (pt_index % 64);
-                                if dll_pt_bits[pi][word] & bit == 0 {
+                                if !dll_arena_paging.pt_created(pi, pt_index) {
                                     let pt = alloc_slot();
                                     let _ = untyped_retype(
                                         CAP_INIT_UNTYPED,
@@ -29753,7 +29755,11 @@ impl ExecNtHandler {
                                         + pt_index as u64 * nt_dll_registry::PAGE_TABLE_SPAN;
                                     let _ =
                                         paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_va, pml4);
-                                    dll_pt_bits[pi][word] |= bit;
+                                    if let Err(status) =
+                                        dll_arena_paging.mark_pt_created(pi, pt_index)
+                                    {
+                                        return status;
+                                    }
                                 }
                             }
                         }

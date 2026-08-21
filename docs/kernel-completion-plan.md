@@ -446,6 +446,24 @@ adjustment: the GUI process/thread context fixed-table cap is closed; continue t
 audit against remaining SEC_IMAGE/fault scratch or other subsystem-owned tables that still hide real
 runtime ceilings.
 
+A4/B3 DLL arena paging-state scaling cleanup (2026-08-21): the SEC_IMAGE DLL mapping path no longer
+uses the old `SERVICE_DLL_PD_CREATED_WORK: [bool; MAX_PI]` and
+`SERVICE_DLL_PT_BITS_WORK: [[u64; DLL_ARENA_PT_WORDS]; MAX_PI]` arrays. The service loop now owns a
+growable `DllArenaPagingState` keyed by hosted process index, with typed records containing the
+per-process DLL arena page-directory flag and 2 MiB page-table-window bitset. `NtMapViewOfSection`
+reserves a process record before allocating seL4 paging objects, process teardown clears the same
+record through the table, and runtime growth uses the existing service-loop durable-heap pinning
+contract so late processes cannot leave metadata above the bump-reset mark. The pool census now
+reports `dll-paging=<records>/<capacity>/<growths>/<failures>`. Local validation is green for
+`cargo fmt --all`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml
+--target x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-dll-paging-state-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, reports `dll-paging=13/16/3/0`, keeps
+`exec_explorer_shell_chrome_painted` green, and has zero DLL paging allocation failures. Review
+adjustment: the DLL arena PD/PT fixed-table cap is closed. The remaining SEC_IMAGE runtime ceiling is
+now the deeper core process/fault scratch (`procs` / `pfilled`) rather than the DLL arena mapping
+state.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

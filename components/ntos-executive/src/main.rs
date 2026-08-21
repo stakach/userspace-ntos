@@ -2006,6 +2006,139 @@ const _: () = assert!(
     win32k_subsystem::CSRSS_W32_SHARED_VA + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000
         <= 0xA000_0000
 );
+
+#[derive(Clone, Copy)]
+pub(crate) struct DllArenaPagingStats {
+    pub records: usize,
+    pub capacity: usize,
+    pub growths: u64,
+    pub allocation_failures: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DllArenaPagingRecord {
+    pi: usize,
+    pd_created: bool,
+    pt_bits: [u64; DLL_ARENA_PT_WORDS],
+}
+
+impl DllArenaPagingRecord {
+    const fn new(pi: usize) -> Self {
+        Self {
+            pi,
+            pd_created: false,
+            pt_bits: [0; DLL_ARENA_PT_WORDS],
+        }
+    }
+}
+
+pub(crate) struct DllArenaPagingState {
+    records: Vec<DllArenaPagingRecord>,
+    dirty: bool,
+    growths: u64,
+    allocation_failures: u64,
+}
+
+impl DllArenaPagingState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            dirty: false,
+            growths: 0,
+            allocation_failures: 0,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.records.clear();
+        self.dirty = false;
+        self.growths = 0;
+        self.allocation_failures = 0;
+    }
+
+    fn index_for(&self, pi: usize) -> Option<usize> {
+        self.records.iter().position(|record| record.pi == pi)
+    }
+
+    fn ensure_index(&mut self, pi: usize) -> Result<usize, u32> {
+        if let Some(index) = self.index_for(pi) {
+            return Ok(index);
+        }
+        let old_capacity = self.records.capacity();
+        if self.records.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        if self.records.capacity() != old_capacity {
+            self.growths = self.growths.saturating_add(1);
+            self.dirty = true;
+        }
+        self.records.push(DllArenaPagingRecord::new(pi));
+        self.dirty = true;
+        Ok(self.records.len() - 1)
+    }
+
+    pub(crate) fn reserve_process(&mut self, pi: usize) -> Result<(), u32> {
+        self.ensure_index(pi).map(|_| ())
+    }
+
+    pub(crate) fn pd_created(&self, pi: usize) -> bool {
+        self.index_for(pi)
+            .map(|index| self.records[index].pd_created)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn mark_pd_created(&mut self, pi: usize) -> Result<(), u32> {
+        let index = self.ensure_index(pi)?;
+        self.records[index].pd_created = true;
+        Ok(())
+    }
+
+    pub(crate) fn pt_created(&self, pi: usize, pt_index: usize) -> bool {
+        if pt_index >= DLL_ARENA_PT_COUNT {
+            return false;
+        }
+        let Some(index) = self.index_for(pi) else {
+            return false;
+        };
+        let word = pt_index / 64;
+        let bit = 1u64 << (pt_index % 64);
+        self.records[index].pt_bits[word] & bit != 0
+    }
+
+    pub(crate) fn mark_pt_created(&mut self, pi: usize, pt_index: usize) -> Result<(), u32> {
+        if pt_index >= DLL_ARENA_PT_COUNT {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER_3);
+        }
+        let index = self.ensure_index(pi)?;
+        let word = pt_index / 64;
+        let bit = 1u64 << (pt_index % 64);
+        self.records[index].pt_bits[word] |= bit;
+        Ok(())
+    }
+
+    pub(crate) fn clear_process(&mut self, pi: usize) {
+        if let Some(index) = self.index_for(pi) {
+            self.records.swap_remove(index);
+        }
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        let dirty = self.dirty;
+        self.dirty = false;
+        dirty
+    }
+
+    pub(crate) fn stats(&self) -> DllArenaPagingStats {
+        DllArenaPagingStats {
+            records: self.records.len(),
+            capacity: self.records.capacity(),
+            growths: self.growths,
+            allocation_failures: self.allocation_failures,
+        }
+    }
+}
+
 /// Slots PINNED (eagerly loaded + registered at BOOT, NOT demand-loaded). The FLAGGED IRREDUCIBLE
 /// MINIMUM — every OTHER System32 DLL demand-loads on the fly. Two reasons a DLL must be pinned:
 ///   • **csrsrv** (slot 0) — needs base 0x8000_0000 (its preferred ImageBase → relocation delta 0 →
@@ -9535,6 +9668,15 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_ctx_thread_growths);
     print_str(b"/");
     print_u64(w32_ctx_thread_fails);
+    let dll_paging = service_sec_image::service_dll_arena_paging_stats();
+    print_str(b" dll-paging=");
+    print_u64(dll_paging.records as u64);
+    print_str(b"/");
+    print_u64(dll_paging.capacity as u64);
+    print_str(b"/");
+    print_u64(dll_paging.growths);
+    print_str(b"/");
+    print_u64(dll_paging.allocation_failures);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -15906,13 +16048,11 @@ unsafe fn reclaim_final_process_vm(
         }
 
         stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
+        {
+            let dll_arena_paging = &mut *ctx.dll_arena_paging;
+            dll_arena_paging.clear_process(pi);
+        }
         if pi < MAX_PI {
-            let dll_pd_created = &mut *ctx.dll_pd_created;
-            dll_pd_created[pi] = false;
-            let dll_pt_bits = &mut *ctx.dll_pt_bits;
-            for word in dll_pt_bits[pi].iter_mut() {
-                *word = 0;
-            }
             let procs = &mut *ctx.procs;
             procs[pi] = ProcExec::empty();
         }
@@ -19880,14 +20020,11 @@ struct ExecLoopCtx {
     /// for non-SEC_IMAGE mappings: NtCreateSection records backing, NtMapViewOfSection reserves a
     /// VAD, and the fault router materialises pages on demand.
     generic_sections: *mut GenericSectionTable,
-    /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) + the
-    /// PER-PROCESS once-only flag for the shared 0x8000_0000 DLL page-directory (indexed by pi:
-    /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
-    /// loop-locals.
+    /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) and
+    /// the per-hosted-process DLL arena paging state. Each hosted VSpace needs its own PD covering
+    /// the compact DLL range plus PT windows for every mapped DLL.
     csrss_anon_base: *mut u64,
-    dll_pd_created: *mut [bool; MAX_PI],
-    /// Per-process bitset of installed 2 MiB page-table windows across the compact DLL arena.
-    dll_pt_bits: *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
+    dll_arena_paging: *mut DllArenaPagingState,
 }
 
 impl ExecLoopCtx {
