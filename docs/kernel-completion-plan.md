@@ -118,6 +118,18 @@ same instrumented desktop proof below now accepts the legacy E1000 receive callb
 remaining B3 packet frontier is separate live packet-array proof with a miniport that calls the
 internal NDIS receive indication helper.
 
+B3 provider-shadow scaling cleanup (2026-08-21): provider-domain pointer allocation records and the
+NDIS packet/MDL buffer shadow stores now use growable vector-backed tables with reusable empty
+records instead of fixed 512/1024/2048-entry executive arrays. Registration still validates the same
+provider/dependent ownership, buffer lengths, and bridge-owned component allocations, but capacity is
+no longer a baked-in multi-NIC or multi-driver ceiling. Validation is green for `cargo fmt --all`,
+executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+`.tmp/run-headless-b3-provider-shadow-vec-20260821.log`, which reaches Explorer shell chrome with
+`293/293` checks passing. Review adjustment: continue removing fixed provider-domain runtime tables
+for interrupt/timer/work-item/miniport mirrors and internal marshal policies, keeping failures
+fail-closed and service/provider identity registry-derived.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
@@ -1697,7 +1709,10 @@ notification-package fallbacks.
   carries real device, instance, and hardware IDs before the executive creates the I/O Manager PDO;
   the old executive-side hardware-ID synthesis from the instance path has been removed. The
   serialized proof `.tmp/run-headless-root-pdo-identity-20260821-155718.log` reaches userinit,
-  Explorer, and shell chrome with `293/293` checks passing.
+  Explorer, and shell chrome with `293/293` checks passing. Provider-domain pointer allocation
+  records and the NDIS packet/buffer shadow stores now grow on demand instead of imposing fixed
+  executive-side table caps; remaining provider-domain fixed tables are tracked as follow-on B3
+  cleanup below.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, dispatch, stop, unload, object teardown.
 

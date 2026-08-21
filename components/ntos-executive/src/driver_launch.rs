@@ -13735,26 +13735,12 @@ const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
-const HOSTED_PROVIDER_POINTER_ALLOCATION_CAP: usize = 512;
-static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: [HostedProviderPointerAllocation;
-    HOSTED_PROVIDER_POINTER_ALLOCATION_CAP] =
-    [HostedProviderPointerAllocation::empty(); HOSTED_PROVIDER_POINTER_ALLOCATION_CAP];
-static HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> =
+    None;
 static HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
-const HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP: usize = 1024;
-static mut HOSTED_PROVIDER_NDIS_PACKET_SHADOWS: [HostedProviderNdisPacketShadow;
-    HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP] =
-    [HostedProviderNdisPacketShadow::empty(); HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP];
-static HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_NDIS_PACKET_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_NDIS_PACKET_SHADOWS: Option<Vec<HostedProviderNdisPacketShadow>> = None;
 static HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
-const HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP: usize = 2048;
-static mut HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS: [HostedProviderNdisBufferShadow;
-    HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP] =
-    [HostedProviderNdisBufferShadow::empty(); HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP];
-static HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS: Option<Vec<HostedProviderNdisBufferShadow>> = None;
 static HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_CAP: usize = 128;
 static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: [HostedProviderMiniportInterruptShadow;
@@ -13806,6 +13792,48 @@ unsafe fn clear_hosted_dependency_images() {
     if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
         images.clear();
     }
+}
+
+unsafe fn hosted_provider_pointer_allocations_mut(
+) -> &'static mut Vec<HostedProviderPointerAllocation> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_POINTER_ALLOCATIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_pointer_allocations(
+) -> Option<&'static Vec<HostedProviderPointerAllocation>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)).as_ref()
+}
+
+unsafe fn hosted_provider_ndis_packet_shadows_mut(
+) -> &'static mut Vec<HostedProviderNdisPacketShadow> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_ndis_packet_shadows(
+) -> Option<&'static Vec<HostedProviderNdisPacketShadow>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)).as_ref()
+}
+
+unsafe fn hosted_provider_ndis_buffer_shadows_mut(
+) -> &'static mut Vec<HostedProviderNdisBufferShadow> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_ndis_buffer_shadows(
+) -> Option<&'static Vec<HostedProviderNdisBufferShadow>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)).as_ref()
 }
 
 fn hosted_provider_leaf_from_path(path: &[u8]) -> Option<HostedAscii<HOSTED_DEP_PROVIDER_MAX>> {
@@ -14918,13 +14946,8 @@ unsafe fn register_hosted_provider_pointer_allocation(
     if component_va == 0 || bytes == 0 {
         return false;
     }
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
-        as *mut HostedProviderPointerAllocation;
-    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_pointer_allocations_mut();
+    for record in records.iter_mut() {
         if !record.present {
             *record = HostedProviderPointerAllocation {
                 present: true,
@@ -14934,19 +14957,13 @@ unsafe fn register_hosted_provider_pointer_allocation(
             };
             return true;
         }
-        index += 1;
     }
-    if bounded_count >= HOSTED_PROVIDER_POINTER_ALLOCATION_CAP {
-        HOSTED_PROVIDER_POINTER_ALLOCATION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    *records.add(bounded_count) = HostedProviderPointerAllocation {
+    records.push(HostedProviderPointerAllocation {
         present: true,
         dependent_instance,
         component_va,
         bytes,
-    };
-    HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.store((bounded_count + 1) as u64, Ordering::Relaxed);
+    });
     true
 }
 
@@ -14955,13 +14972,10 @@ unsafe fn hosted_provider_pointer_allocation_matches(
     component_va: u64,
     bytes: u64,
 ) -> bool {
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
-        as *const HostedProviderPointerAllocation;
-    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = *records.add(index);
+    let Some(records) = hosted_provider_pointer_allocations() else {
+        return false;
+    };
+    for record in records.iter().copied() {
         if record.present
             && record.dependent_instance == dependent_instance
             && record.component_va == component_va
@@ -14969,7 +14983,6 @@ unsafe fn hosted_provider_pointer_allocation_matches(
         {
             return true;
         }
-        index += 1;
     }
     false
 }
@@ -14978,13 +14991,8 @@ unsafe fn take_hosted_provider_pointer_allocation(
     dependent_instance: usize,
     component_va: u64,
 ) -> Option<HostedProviderPointerAllocation> {
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_POINTER_ALLOCATIONS)
-        as *mut HostedProviderPointerAllocation;
-    let count = HOSTED_PROVIDER_POINTER_ALLOCATION_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_POINTER_ALLOCATION_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_pointer_allocations_mut();
+    for record in records.iter_mut() {
         if record.present
             && record.dependent_instance == dependent_instance
             && record.component_va == component_va
@@ -14993,7 +15001,6 @@ unsafe fn take_hosted_provider_pointer_allocation(
             *record = HostedProviderPointerAllocation::empty();
             return Some(taken);
         }
-        index += 1;
     }
     HOSTED_PROVIDER_POINTER_ALLOCATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
     None
@@ -15048,13 +15055,10 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_dependent(
     if dependent_component_va == 0 {
         return None;
     }
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *const HostedProviderNdisPacketShadow;
-    let count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = *records.add(index);
+    let Some(records) = hosted_provider_ndis_packet_shadows() else {
+        return None;
+    };
+    for (index, record) in records.iter().copied().enumerate() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15062,7 +15066,6 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_dependent(
         {
             return Some((index, record));
         }
-        index += 1;
     }
     None
 }
@@ -15075,13 +15078,10 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
     if provider_component_va == 0 {
         return None;
     }
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *const HostedProviderNdisPacketShadow;
-    let count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = *records.add(index);
+    let Some(records) = hosted_provider_ndis_packet_shadows() else {
+        return None;
+    };
+    for (index, record) in records.iter().copied().enumerate() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15089,7 +15089,6 @@ unsafe fn find_hosted_provider_ndis_packet_shadow_by_provider_for_dependent(
         {
             return Some((index, record));
         }
-        index += 1;
     }
     None
 }
@@ -15102,13 +15101,8 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
     provider_sg_component_va: u64,
     dependent_sg_component_owned_by_bridge: bool,
 ) -> bool {
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *mut HostedProviderNdisPacketShadow;
-    let count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_ndis_packet_shadows_mut();
+    for record in records.iter_mut() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15119,7 +15113,6 @@ unsafe fn update_hosted_provider_ndis_packet_sg_shadow(
             record.dependent_sg_component_owned_by_bridge = dependent_sg_component_owned_by_bridge;
             return true;
         }
-        index += 1;
     }
     false
 }
@@ -15134,13 +15127,8 @@ unsafe fn register_hosted_provider_ndis_packet_shadow(
     {
         return false;
     }
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *mut HostedProviderNdisPacketShadow;
-    let count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_ndis_packet_shadows_mut();
+    for record in records.iter_mut() {
         if record.present
             && record.provider_instance == shadow.provider_instance
             && record.dependent_instance == shadow.dependent_instance
@@ -15176,14 +15164,8 @@ unsafe fn register_hosted_provider_ndis_packet_shadow(
             *record = shadow;
             return true;
         }
-        index += 1;
     }
-    if bounded_count >= HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP {
-        HOSTED_PROVIDER_NDIS_PACKET_SHADOW_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    *records.add(bounded_count) = shadow;
-    HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.store((bounded_count + 1) as u64, Ordering::Relaxed);
+    records.push(shadow);
     true
 }
 
@@ -15195,13 +15177,8 @@ unsafe fn take_hosted_provider_ndis_packet_shadow_by_dependent(
     if dependent_component_va == 0 {
         return None;
     }
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *mut HostedProviderNdisPacketShadow;
-    let count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_ndis_packet_shadows_mut();
+    for record in records.iter_mut() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15211,7 +15188,6 @@ unsafe fn take_hosted_provider_ndis_packet_shadow_by_dependent(
             *record = HostedProviderNdisPacketShadow::empty();
             return Some(taken);
         }
-        index += 1;
     }
     HOSTED_PROVIDER_NDIS_PACKET_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
     None
@@ -15225,13 +15201,10 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_dependent(
     if dependent_component_va == 0 {
         return None;
     }
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
-        as *const HostedProviderNdisBufferShadow;
-    let count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = *records.add(index);
+    let Some(records) = hosted_provider_ndis_buffer_shadows() else {
+        return None;
+    };
+    for (index, record) in records.iter().copied().enumerate() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15239,7 +15212,6 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_dependent(
         {
             return Some((index, record));
         }
-        index += 1;
     }
     None
 }
@@ -15252,13 +15224,10 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
     if provider_component_va == 0 {
         return None;
     }
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
-        as *const HostedProviderNdisBufferShadow;
-    let count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = *records.add(index);
+    let Some(records) = hosted_provider_ndis_buffer_shadows() else {
+        return None;
+    };
+    for (index, record) in records.iter().copied().enumerate() {
         if record.present
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
@@ -15266,7 +15235,6 @@ unsafe fn find_hosted_provider_ndis_buffer_shadow_by_provider_for_dependent(
         {
             return Some((index, record));
         }
-        index += 1;
     }
     None
 }
@@ -15286,13 +15254,10 @@ unsafe fn provider_receive_buffer_exec_va(
         return Some(exec_va);
     }
 
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
-        as *const HostedProviderNdisBufferShadow;
-    let count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let shadow = *records.add(index);
+    let Some(records) = hosted_provider_ndis_buffer_shadows() else {
+        return None;
+    };
+    for shadow in records.iter().copied() {
         if shadow.present && shadow.provider_instance == provider_instance {
             if let Some(offset) = component_subrange_offset(
                 shadow.provider_data_component_va,
@@ -15322,7 +15287,6 @@ unsafe fn provider_receive_buffer_exec_va(
                 });
             }
         }
-        index += 1;
     }
     None
 }
@@ -15339,13 +15303,8 @@ unsafe fn register_hosted_provider_ndis_buffer_shadow(
     {
         return false;
     }
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
-        as *mut HostedProviderNdisBufferShadow;
-    let count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
-    let mut index = 0usize;
-    while index < bounded_count {
-        let record = &mut *records.add(index);
+    let records = hosted_provider_ndis_buffer_shadows_mut();
+    for record in records.iter_mut() {
         if record.present
             && record.provider_instance == shadow.provider_instance
             && record.dependent_instance == shadow.dependent_instance
@@ -15387,25 +15346,13 @@ unsafe fn register_hosted_provider_ndis_buffer_shadow(
             *record = shadow;
             return true;
         }
-        index += 1;
     }
-    if bounded_count >= HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP {
-        HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    *records.add(bounded_count) = shadow;
-    HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.store((bounded_count + 1) as u64, Ordering::Relaxed);
+    records.push(shadow);
     true
 }
 
 unsafe fn clear_hosted_provider_ndis_shadows_for_instance(instance_index: usize) {
-    let packet_records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_PACKET_SHADOWS)
-        as *mut HostedProviderNdisPacketShadow;
-    let packet_count = HOSTED_PROVIDER_NDIS_PACKET_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let packet_bounded_count = packet_count.min(HOSTED_PROVIDER_NDIS_PACKET_SHADOW_CAP);
-    let mut packet_index = 0usize;
-    while packet_index < packet_bounded_count {
-        let record = &mut *packet_records.add(packet_index);
+    for record in hosted_provider_ndis_packet_shadows_mut().iter_mut() {
         if record.present
             && (record.provider_instance == instance_index
                 || record.dependent_instance == instance_index)
@@ -15427,16 +15374,9 @@ unsafe fn clear_hosted_provider_ndis_shadows_for_instance(instance_index: usize)
             }
             *record = HostedProviderNdisPacketShadow::empty();
         }
-        packet_index += 1;
     }
 
-    let buffer_records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_BUFFER_SHADOWS)
-        as *mut HostedProviderNdisBufferShadow;
-    let buffer_count = HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
-    let buffer_bounded_count = buffer_count.min(HOSTED_PROVIDER_NDIS_BUFFER_SHADOW_CAP);
-    let mut buffer_index = 0usize;
-    while buffer_index < buffer_bounded_count {
-        let record = &mut *buffer_records.add(buffer_index);
+    for record in hosted_provider_ndis_buffer_shadows_mut().iter_mut() {
         if record.present
             && (record.provider_instance == instance_index
                 || record.dependent_instance == instance_index)
@@ -15459,7 +15399,6 @@ unsafe fn clear_hosted_provider_ndis_shadows_for_instance(instance_index: usize)
             }
             *record = HostedProviderNdisBufferShadow::empty();
         }
-        buffer_index += 1;
     }
 }
 
