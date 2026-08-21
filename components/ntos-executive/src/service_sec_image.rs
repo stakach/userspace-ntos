@@ -7640,6 +7640,9 @@ pub(crate) unsafe fn service_sec_image(
                         image_fault_plan.map_protection,
                     ) || clean_writecopy_shareable);
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                let shared_mapping_registered =
+                    shared_image_mapping_contains(pi as u64, bpage);
+                let shareable_mapping_registered = shareable && shared_mapping_registered;
                 if !is_fault_page && !shareable && !forward_policy.private_neighbours {
                     SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
                     bi += 1;
@@ -7650,7 +7653,7 @@ pub(crate) unsafe fn service_sec_image(
                         nt_address_space::image_view_fault_plan(image_view_info.protect, false)
                             .map_protection;
                     if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
-                        || shared_image_mapping_contains(pi as u64, bpage)
+                        || shared_mapping_registered
                     {
                         match vm_promote_image_cow_page(
                             pi,
@@ -7751,10 +7754,11 @@ pub(crate) unsafe fn service_sec_image(
                 //  - In the small FORWARD-RUN (non-eager) path, THIS process may already have the
                 //    cached shared page mapped (it's a re-entry) → skip pre-mapping to avoid a
                 //    double-map; let it fault normally if unmapped.
-                // A cached shared neighbour may already be mapped by an overlapping prior window.
-                // Without a mapping query, leave it for its own cheap cache-hit fault rather than
-                // risking DeleteFirst and consuming another destination cap.
-                if !is_fault_page && shareable && cached != 0 {
+                // A cached or already-registered shared neighbour may have been installed by an
+                // overlapping prior window. Leave it for its own cheap fault if it is not resident;
+                // the actual faulting page below still repairs stale registry state by mapping and
+                // replacing the old retained cap.
+                if !is_fault_page && shareable && (cached != 0 || shareable_mapping_registered) {
                     bi += 1;
                     continue;
                 }
@@ -7799,18 +7803,22 @@ pub(crate) unsafe fn service_sec_image(
                         // table cannot record it, do not leave a scratch-mapped frame without a
                         // reclaim path; surface the resource wall to the caller instead.
                         if !dll_cache_put(bpage, f) {
-                            let full = DLL_CACHE_FULL.load(Ordering::Relaxed);
+                            let insert_failures =
+                                DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed);
                             let duplicate = DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed);
-                            if full + duplicate <= 16 {
+                            if insert_failures + duplicate <= 16 {
+                                let (records, capacity) = dll_cache_stats();
                                 print_str(b"[image-shared] cache insert failed pi=");
                                 print_u64(pi as u64);
                                 print_str(b" page=0x");
                                 print_hex((bpage >> 32) as u32);
                                 print_hex(bpage as u32);
-                                print_str(b" cap=");
-                                print_u64(DLL_CACHE_CAP as u64);
-                                print_str(b" full=");
-                                print_u64(full);
+                                print_str(b" records=");
+                                print_u64(records as u64);
+                                print_str(b"/");
+                                print_u64(capacity as u64);
+                                print_str(b" alloc-fails=");
+                                print_u64(insert_failures);
                                 print_str(b" dup=");
                                 print_u64(duplicate);
                                 print_str(b"\n");
@@ -7859,21 +7867,30 @@ pub(crate) unsafe fn service_sec_image(
                     // the first handler reply reaches user mode. The first event maps the page; the
                     // second sees seL4_DeleteFirst on the same VA. That is an idempotent stale fault,
                     // not resource exhaustion, so resume the second thread.
-                    let duplicate_shared_fault =
-                        ce == 0 && me == 8 && shareable && is_fault_page && cached != 0;
-                    print_str(if duplicate_shared_fault {
-                        b"[map-idempotent] va=0x"
-                    } else {
-                        b"[map-fail] va=0x"
-                    });
-                    print_hex(bpage as u32);
-                    print_str(b" copy=");
-                    print_u64(ce);
-                    print_str(b" map=");
-                    print_u64(me);
-                    print_str(b" shared=");
-                    print_u64(shareable as u64);
-                    print_str(b"\n");
+                    let duplicate_shared_mapping = ce == 0
+                        && me == 8
+                        && shareable
+                        && (cached != 0 || shared_mapping_registered);
+                    let duplicate_shared_fault = duplicate_shared_mapping && is_fault_page;
+                    if is_fault_page || !duplicate_shared_mapping {
+                        print_str(if duplicate_shared_fault {
+                            b"[map-idempotent] va=0x"
+                        } else {
+                            b"[map-fail] va=0x"
+                        });
+                        print_hex(bpage as u32);
+                        print_str(b" copy=");
+                        print_u64(ce);
+                        print_str(b" map=");
+                        print_u64(me);
+                        print_str(b" shared=");
+                        print_u64(shareable as u64);
+                        print_str(b" cached=");
+                        print_u64((cached != 0) as u64);
+                        print_str(b" registered=");
+                        print_u64(shared_mapping_registered as u64);
+                        print_str(b"\n");
+                    }
                     if ce != 0 || me != 8 || (is_fault_page && !duplicate_shared_fault) {
                         allocation_failed = true;
                         break;
@@ -7886,7 +7903,8 @@ pub(crate) unsafe fn service_sec_image(
                     fault_page_serviced = true;
                 }
                 if mapped_into_process && shareable {
-                    let registered = shared_image_mapping_put_banked(pi as u64, bpage, cc);
+                    let registered =
+                        shared_image_mapping_replace_banked_after_map(pi as u64, bpage, cc);
                     if !registered {
                         let _ = page_unmap_r(cc);
                         let _ = cnode_delete_recycle_r(cc);
@@ -7931,9 +7949,9 @@ pub(crate) unsafe fn service_sec_image(
                 bi += 1;
             }
             // Image faults bypass the native-syscall reply tail below. Shared RX DLL pages can still
-            // grow the loop-owned shared-image mapping table in this branch, so pin that durable
-            // metadata before the next loop-top heap reset.
-            if take_shared_image_mapping_dirty() {
+            // grow the loop-owned shared-image mapping table and the shared DLL source-frame cache in
+            // this branch, so pin that durable metadata before the next loop-top heap reset.
+            if take_shared_image_mapping_dirty() || take_dll_cache_dirty() {
                 pin_durable_heap_mark(&mut heap_mark);
             }
             if allocation_failed {
@@ -9395,7 +9413,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 nt_handler.writable_fs_commit_required = false;
-                if take_shared_image_mapping_dirty() {
+                if take_shared_image_mapping_dirty() || take_dll_cache_dirty() {
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
@@ -19696,7 +19714,7 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b"[sec-stop] NEXT_SLOT=");
     print_u64(NEXT_SLOT.load(Ordering::Relaxed));
     print_str(b" shared_frames=");
-    print_u64(core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64);
+    print_u64(dll_cache_stats().0 as u64);
     print_str(b" shared_hits=");
     print_u64(DLL_SHARED_HITS.load(Ordering::Relaxed));
     print_str(b"\n[sec-stop] scratch-faults/pi=");

@@ -402,6 +402,34 @@ gdi-write-windows=246 shadows=0`, and emits no TEB-tail allocation/alias/shadow 
 adjustment: TEB-tail registry and COW shadow fixed-table caps are closed; continue with remaining
 SEC_IMAGE/fault scratch arrays or the larger GUI process/thread context registry.
 
+A4/B3 shared DLL cache scaling cleanup (2026-08-21): the SEC_IMAGE shared executable
+page cache is now moved from the fixed 16384-entry `{va, frame}` parallel arrays to growable
+512-record chunks. Cache insertion still fails closed: duplicate records and allocation failures
+return failure to the fault path, which tears down the just-filled shared frame rather than leaving
+an untracked cache source alive. Diagnostics now report live record count and allocated chunk
+capacity plus `shared-insert-fails` instead of an old `shared-full` fixed-table counter. The first
+chunked run `.tmp/run-headless-dll-cache-chunks-20260821.log` avoided the earlier Vec-backed cache
+panic, then parked CSRSS at `[image-shared] register failed pi=1 page=0x801ef000` with
+`image-mapcap-fails=1`. The follow-up shared-map replacement pass got past that page and exposed
+rust-micro stale-TCB lifetime bugs during TCB slot reuse; rust-micro now scrubs stale ready-queue,
+endpoint, notification, scheduler-current, direct-handoff, and syscall-return references before a
+deleted TCB slot can be reused. `.tmp/run-headless-dll-cache-chunks-self-delete-long-20260821.log`
+no longer panicked, but it stalled in the CSRSS shared-image fault stream after `cr2=0x801eed60` and
+showed many speculative shared `map=8` attempts. Follow-up review found that the chunked DLL cache
+was allocating durable cache chunks above the service loop's transient heap mark without a dirty/pin
+signal. The cache now mirrors the shared-image mapping table: cache chunk/vector growth marks
+`take_dll_cache_dirty()`, and both image-fault and syscall-tail paths pin the durable heap mark before
+the next reset. Local validation is green for `cargo fmt --all`,
+rust-micro `cargo check --manifest-path rust-micro/Cargo.toml --target x86_64-unknown-none
+--features extern-rootserver`, executive `cargo check --manifest-path
+components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`.
+Serialized desktop proof `.tmp/run-desktop-dll-cache-dirty-pin-20260821.log` reaches genuine
+userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing. The accepted run
+reports `shared-frames=3361/3584`, `shared-hits=8521`, `shared-insert-fails=0`, `shared-dup=0`,
+`shared-evict=228`, and no image-mapcap failures. Review adjustment: the shared DLL cache fixed
+capacity is closed; continue the fixed-table audit against remaining SEC_IMAGE/fault scratch and GUI
+process/thread context state.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

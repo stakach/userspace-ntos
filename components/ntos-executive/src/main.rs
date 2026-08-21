@@ -7735,80 +7735,210 @@ fn root_slot_available_count() -> u64 {
 // frames persist while at least one process owns a shared mapping for the page; teardown evicts
 // unreferenced source frames so service churn does not pin dead image text forever. Accessed via raw
 // pointers to avoid the static_mut_refs lint; single-threaded executive, so no races.
-const DLL_CACHE_CAP: usize = 16384;
-static mut DLL_CACHE_VA: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
-static mut DLL_CACHE_FR: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
-static mut DLL_CACHE_N: usize = 0;
-static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
-static DLL_CACHE_FULL: AtomicU64 = AtomicU64::new(0);
-static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
-static DLL_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-/// The shared frame cap for page VA `va`, or 0 if not yet cached.
-unsafe fn dll_cache_get(va: u64) -> u64 {
-    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
-    let vas = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
-    let frs = core::ptr::addr_of!(DLL_CACHE_FR) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(vas.add(i)) == va {
-            return core::ptr::read(frs.add(i));
+#[derive(Clone, Copy)]
+struct DllCacheRecord {
+    va: u64,
+    frame: u64,
+}
+
+impl DllCacheRecord {
+    const fn empty() -> Self {
+        Self { va: 0, frame: 0 }
+    }
+}
+
+const DLL_CACHE_CHUNK_RECORDS: usize = 512;
+
+struct DllCacheChunk {
+    len: usize,
+    records: [DllCacheRecord; DLL_CACHE_CHUNK_RECORDS],
+}
+
+impl DllCacheChunk {
+    const fn empty() -> Self {
+        Self {
+            len: 0,
+            records: [DllCacheRecord::empty(); DLL_CACHE_CHUNK_RECORDS],
         }
     }
-    0
+}
+
+static mut DLL_CACHE_CHUNKS: Option<Vec<*mut DllCacheChunk>> = None;
+static DLL_CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
+static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_INSERT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
+static DLL_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_dll_cache_dirty() -> bool {
+    DLL_CACHE_DIRTY.swap(false, Ordering::Relaxed)
+}
+
+unsafe fn dll_cache_chunks_mut() -> &'static mut Vec<*mut DllCacheChunk> {
+    let slot = &mut *core::ptr::addr_of_mut!(DLL_CACHE_CHUNKS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().expect("initialized above")
+}
+
+unsafe fn dll_cache_chunks() -> Option<&'static Vec<*mut DllCacheChunk>> {
+    (&*core::ptr::addr_of!(DLL_CACHE_CHUNKS)).as_ref()
+}
+
+unsafe fn dll_cache_alloc_chunk() -> Option<*mut DllCacheChunk> {
+    let layout = core::alloc::Layout::new::<DllCacheChunk>();
+    let ptr = alloc(layout) as *mut DllCacheChunk;
+    if ptr.is_null() {
+        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    core::ptr::write(ptr, DllCacheChunk::empty());
+    DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
+    Some(ptr)
+}
+
+unsafe fn dll_cache_chunk_len(chunk: *mut DllCacheChunk) -> usize {
+    if chunk.is_null() {
+        return 0;
+    }
+    (*chunk).len.min(DLL_CACHE_CHUNK_RECORDS)
+}
+
+unsafe fn dll_cache_find(va: u64) -> Option<(usize, usize)> {
+    let chunks = dll_cache_chunks()?;
+    for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
+        let len = dll_cache_chunk_len(chunk);
+        let chunk = &*chunk;
+        for record_index in 0..len {
+            if chunk.records[record_index].va == va {
+                return Some((chunk_index, record_index));
+            }
+        }
+    }
+    None
+}
+
+unsafe fn dll_cache_last_nonempty_chunk(
+    chunks: &[*mut DllCacheChunk],
+) -> Option<(usize, usize)> {
+    let mut index = chunks.len();
+    while index != 0 {
+        index -= 1;
+        let len = dll_cache_chunk_len(chunks[index]);
+        if len != 0 {
+            return Some((index, len));
+        }
+    }
+    None
+}
+
+unsafe fn dll_cache_stats() -> (usize, usize) {
+    let Some(chunks) = dll_cache_chunks() else {
+        return (0, 0);
+    };
+    let mut records = 0usize;
+    for chunk in chunks.iter().copied() {
+        records = records.saturating_add(dll_cache_chunk_len(chunk));
+    }
+    (records, chunks.len() * DLL_CACHE_CHUNK_RECORDS)
+}
+
+/// The shared frame cap for page VA `va`, or 0 if not yet cached.
+unsafe fn dll_cache_get(va: u64) -> u64 {
+    let Some((chunk_index, record_index)) = dll_cache_find(va) else {
+        return 0;
+    };
+    let Some(chunks) = dll_cache_chunks() else {
+        return 0;
+    };
+    if chunk_index >= chunks.len() || record_index >= dll_cache_chunk_len(chunks[chunk_index]) {
+        return 0;
+    }
+    (*chunks[chunk_index]).records[record_index].frame
 }
 /// Record the shared frame `fr` for page VA `va` (once, on first fill).
 unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
-    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
-    let vas_ro = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
-    for i in 0..n {
-        if core::ptr::read(vas_ro.add(i)) == va {
-            DLL_CACHE_DUPLICATE_INSERTS.fetch_add(1, Ordering::Relaxed);
+    if dll_cache_find(va).is_some() {
+        DLL_CACHE_DUPLICATE_INSERTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let chunks = dll_cache_chunks_mut();
+    let needs_chunk = chunks
+        .last()
+        .is_none_or(|chunk| chunk.is_null() || (**chunk).len >= DLL_CACHE_CHUNK_RECORDS);
+    if needs_chunk {
+        if chunks.try_reserve(1).is_err() {
+            DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        DLL_CACHE_DIRTY.store(true, Ordering::Relaxed);
+        let Some(chunk) = dll_cache_alloc_chunk() else {
+            return false;
+        };
+        chunks.push(chunk);
     }
-    if n < DLL_CACHE_CAP {
-        let vas = core::ptr::addr_of_mut!(DLL_CACHE_VA) as *mut u64;
-        let frs = core::ptr::addr_of_mut!(DLL_CACHE_FR) as *mut u64;
-        core::ptr::write(vas.add(n), va);
-        core::ptr::write(frs.add(n), fr);
-        core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), n + 1);
-        true
-    } else {
-        DLL_CACHE_FULL.fetch_add(1, Ordering::Relaxed);
-        false
+    let chunk = chunks.last_mut().expect("chunk created above");
+    let chunk = &mut **chunk;
+    let index = chunk.len;
+    if index >= DLL_CACHE_CHUNK_RECORDS {
+        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
+    chunk.records[index] = DllCacheRecord { va, frame: fr };
+    chunk.len += 1;
+    true
 }
 
-unsafe fn dll_cache_evict_index(index: usize) {
-    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)).min(DLL_CACHE_CAP);
-    if index >= n {
-        return;
+unsafe fn dll_cache_remove_at(
+    chunks: &mut Vec<*mut DllCacheChunk>,
+    chunk_index: usize,
+    record_index: usize,
+) -> Option<DllCacheRecord> {
+    if chunk_index >= chunks.len() || record_index >= dll_cache_chunk_len(chunks[chunk_index]) {
+        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
     }
-    let vas = core::ptr::addr_of_mut!(DLL_CACHE_VA) as *mut u64;
-    let frs = core::ptr::addr_of_mut!(DLL_CACHE_FR) as *mut u64;
-    let frame = core::ptr::read(frs.add(index));
-    vm_frame_release(frame, 0);
-    let last = n - 1;
-    if index != last {
-        core::ptr::write(vas.add(index), core::ptr::read(vas.add(last)));
-        core::ptr::write(frs.add(index), core::ptr::read(frs.add(last)));
+    let removed = (*chunks[chunk_index]).records[record_index];
+    let Some((last_chunk_index, last_len)) = dll_cache_last_nonempty_chunk(chunks) else {
+        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let last_record_index = last_len - 1;
+    let last = (*chunks[last_chunk_index]).records[last_record_index];
+    (*chunks[last_chunk_index]).records[last_record_index] = DllCacheRecord::empty();
+    (*chunks[last_chunk_index]).len = last_record_index;
+    if chunk_index != last_chunk_index || record_index != last_record_index {
+        (*chunks[chunk_index]).records[record_index] = last;
     }
-    core::ptr::write(vas.add(last), 0);
-    core::ptr::write(frs.add(last), 0);
-    core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), last);
-    DLL_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+    Some(removed)
 }
 
 unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
+    let Some(chunks) = (*core::ptr::addr_of_mut!(DLL_CACHE_CHUNKS)).as_mut() else {
+        return 0;
+    };
     let mut evicted = 0u64;
-    let mut index = 0usize;
-    while index < core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)).min(DLL_CACHE_CAP) {
-        let page = core::ptr::read((core::ptr::addr_of!(DLL_CACHE_VA) as *const u64).add(index));
-        if !shared_image_mapping_page_referenced(page) {
-            dll_cache_evict_index(index);
-            evicted = evicted.saturating_add(1);
-        } else {
-            index += 1;
+    let mut chunk_index = 0usize;
+    while chunk_index < chunks.len() {
+        let mut record_index = 0usize;
+        while chunk_index < chunks.len()
+            && record_index < dll_cache_chunk_len(chunks[chunk_index])
+        {
+            let page = (*chunks[chunk_index]).records[record_index].va;
+            if !shared_image_mapping_page_referenced(page) {
+                if let Some(record) = dll_cache_remove_at(chunks, chunk_index, record_index) {
+                    vm_frame_release(record.frame, 0);
+                    DLL_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                    evicted = evicted.saturating_add(1);
+                } else {
+                    record_index += 1;
+                }
+            } else {
+                record_index += 1;
+            }
         }
+        chunk_index += 1;
     }
     evicted
 }
@@ -8587,6 +8717,7 @@ static IMAGE_MAP_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_ROOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
+static IMAGE_MAP_CAP_REPLACEMENTS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn shared_image_mapping_chunks_mut() -> &'static mut Vec<*mut SharedImageMappingChunk> {
     let slot = &mut *core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS);
@@ -8900,7 +9031,28 @@ unsafe fn shared_image_mapping_put_banked(pi: u64, page: u64, map_cap: u64) -> b
         SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    shared_image_mapping_push_prepared(pi, page, cap)
+    if shared_image_mapping_push_prepared(pi, page, cap) {
+        true
+    } else {
+        shared_image_mapping_delete_cap(pi as u8, cap);
+        false
+    }
+}
+
+unsafe fn shared_image_mapping_replace_banked_after_map(
+    pi: u64,
+    page: u64,
+    map_cap: u64,
+) -> bool {
+    if pi > u8::MAX as u64 || map_cap == 0 {
+        SHARED_IMAGE_MAPPING_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if let Some(old_map_cap) = shared_image_mapping_take(pi, page) {
+        let _ = cnode_delete_recycle_r(old_map_cap);
+        IMAGE_MAP_CAP_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    shared_image_mapping_put_banked(pi, page, map_cap)
 }
 
 unsafe fn shared_image_mapping_contains(pi: u64, page: u64) -> bool {
@@ -9343,6 +9495,8 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(IMAGE_MAP_CAP_BANK_TO_ROOT.load(Ordering::Relaxed));
     print_str(b" image-bank-fails=");
     print_u64(IMAGE_MAP_CAP_BANK_FAILS.load(Ordering::Relaxed));
+    print_str(b" image-map-replace=");
+    print_u64(IMAGE_MAP_CAP_REPLACEMENTS.load(Ordering::Relaxed));
     let (w32_bank_live, w32_bank_next, w32_bank_pis, w32_bank_segments, w32_bank_fails) =
         win32k_glue::win32k_client_cap_bank_stats();
     print_str(b" w32-bank=");
@@ -9355,14 +9509,15 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_bank_segments);
     print_str(b" w32-bank-fails=");
     print_u64(w32_bank_fails);
+    let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
-    print_u64(unsafe { core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64 });
+    print_u64(dll_cache_len as u64);
     print_str(b"/");
-    print_u64(DLL_CACHE_CAP as u64);
+    print_u64(dll_cache_capacity as u64);
     print_str(b" shared-hits=");
     print_u64(DLL_SHARED_HITS.load(Ordering::Relaxed));
-    print_str(b" shared-full=");
-    print_u64(DLL_CACHE_FULL.load(Ordering::Relaxed));
+    print_str(b" shared-insert-fails=");
+    print_u64(DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed));
     print_str(b" shared-dup=");
     print_u64(DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed));
     print_str(b" shared-evict=");
@@ -9824,14 +9979,18 @@ pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
             print_hex_u64(core::ptr::read(vas.add(index)));
         }
     }
-    let dn = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
-    let dvas = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
-    let dfrs = core::ptr::addr_of!(DLL_CACHE_FR) as *const u64;
-    for index in 0..dn {
-        if core::ptr::read(dfrs.add(index)) == frame {
-            aliases += 1;
-            print_str(b" | dll-cache va=0x");
-            print_hex_u64(core::ptr::read(dvas.add(index)));
+    if let Some(chunks) = dll_cache_chunks() {
+        for chunk in chunks.iter().copied() {
+            let len = dll_cache_chunk_len(chunk);
+            let chunk = &*chunk;
+            for record_index in 0..len {
+                let record = chunk.records[record_index];
+                if record.frame == frame {
+                    aliases += 1;
+                    print_str(b" | dll-cache va=0x");
+                    print_hex_u64(record.va);
+                }
+            }
         }
     }
     print_str(b" aliases=");
