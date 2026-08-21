@@ -533,6 +533,21 @@ allocation failures. Review adjustment: this closes the current SEC_IMAGE/fault 
 cluster. Continue the fixed-runtime-table audit in the remaining process-index side tables such as
 KUSER aliases or frame/census summaries before changing the `MAX_PI` admission policy itself.
 
+A4/B3 KUSER alias table scaling cleanup (2026-08-21): the hosted-process KUSER shared-data alias
+registry now uses a durable vector of `AtomicU64` rows instead of `[AtomicU64; MAX_PI]`. Early
+process VM provisioning initializes the alias rows before the first SEC_IMAGE spawn, hosted image
+spawn now treats a missing alias row as a hard error with a `[spawn-vad]` diagnostic, KUSER clock and
+`NtQueryVirtualMemory` paths read through the vector helper, and final process teardown clears the
+row through the same authority. The pool census reports `kuser-alias=<len>/<cap>/<alloc-fail>/<store-fail>`.
+Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof `.tmp/run-desktop-kuser-alias-vec-20260821.log`
+reaches genuine userinit/Explorer launch and Explorer shell chrome with `293/293` checks passing,
+keeps `exec_explorer_shell_chrome_painted` green, reports `kuser-alias=24/24/0/0`, and records zero
+KUSER alias allocation or store failures. Review adjustment: KUSER alias process-index backing is
+closed; continue separating diagnostic summary arrays from live runtime capacity before changing the
+process admission limit itself.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

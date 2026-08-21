@@ -2038,7 +2038,9 @@ static mut PROCESS_VM_PT_CAPS: alloc::vec::Vec<[u64; PRIVATE_VM_PT_COUNT]> =
 const VM_FREE_FRAME_CAPACITY: usize = 4096;
 static mut VM_FREE_FRAMES: [u64; VM_FREE_FRAME_CAPACITY] = [0; VM_FREE_FRAME_CAPACITY];
 static mut VM_FREE_FRAME_N: usize = 0;
-static KUSER_PAGE_ALIAS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static KUSER_PAGE_ALIAS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static KUSER_PAGE_ALIAS_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<AtomicU64> = alloc::vec::Vec::new();
 
 pub(crate) unsafe fn reset_process_private_pt_caps(slots: usize) -> bool {
     let caps = &mut *core::ptr::addr_of_mut!(PROCESS_VM_PT_CAPS);
@@ -2074,20 +2076,54 @@ pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
     reset_process_vm_region_maps(slots)
         && reset_process_committed_mappings(slots)
         && reset_process_private_pt_caps(slots)
+        && reset_kuser_page_aliases(slots)
 }
 
-unsafe fn kuser_page_alias_put(pi: u64, alias: u64) {
-    let index = pi as usize;
-    if index < MAX_PI {
-        KUSER_PAGE_ALIAS[index].store(alias, Ordering::Release);
+pub(crate) unsafe fn reset_kuser_page_aliases(slots: usize) -> bool {
+    let aliases = &mut *core::ptr::addr_of_mut!(KUSER_PAGE_ALIASES);
+    aliases.clear();
+    if aliases.try_reserve(slots).is_err() {
+        KUSER_PAGE_ALIAS_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while aliases.len() < slots {
+        aliases.push(AtomicU64::new(0));
+    }
+    true
+}
+
+unsafe fn kuser_page_alias_put(pi: u64, alias: u64) -> bool {
+    if let Some(slot) = (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES)).get(pi as usize) {
+        slot.store(alias, Ordering::Release);
+        true
+    } else {
+        KUSER_PAGE_ALIAS_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+unsafe fn kuser_page_alias_clear(pi: usize) {
+    if let Some(slot) = (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES)).get(pi) {
+        slot.store(0, Ordering::Release);
     }
 }
 
 unsafe fn kuser_page_alias_get(pi: usize) -> u64 {
-    if pi < MAX_PI {
-        KUSER_PAGE_ALIAS[pi].load(Ordering::Acquire)
-    } else {
-        0
+    (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES))
+        .get(pi)
+        .map(|slot| slot.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+fn kuser_page_alias_stats() -> (usize, usize, u64, u64) {
+    unsafe {
+        let aliases = &*core::ptr::addr_of!(KUSER_PAGE_ALIASES);
+        (
+            aliases.len(),
+            aliases.capacity(),
+            KUSER_PAGE_ALIAS_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            KUSER_PAGE_ALIAS_STORE_FAILURES.load(Ordering::Relaxed),
+        )
     }
 }
 /// Hosted-process DLL VA arena. Images receive stable bases at activation and pack at Windows'
@@ -9945,6 +9981,15 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(vm_pt_cap as u64);
     print_str(b"/");
     print_u64(vm_pt_fails);
+    let (kuser_len, kuser_cap, kuser_alloc_fails, kuser_store_fails) = kuser_page_alias_stats();
+    print_str(b" kuser-alias=");
+    print_u64(kuser_len as u64);
+    print_str(b"/");
+    print_u64(kuser_cap as u64);
+    print_str(b"/");
+    print_u64(kuser_alloc_fails);
+    print_str(b"/");
+    print_u64(kuser_store_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -16336,7 +16381,7 @@ unsafe fn reclaim_final_process_vm(
     let (private_pts, private_pt_failures) = process_private_pt_caps_release(pi);
     stats.private_pts = private_pts;
     stats.private_pt_failures = private_pt_failures;
-    KUSER_PAGE_ALIAS[pi].store(0, Ordering::Release);
+    kuser_page_alias_clear(pi);
     if let Some(slot) = handler.process_vspaces.get_mut(pi) {
         *slot = 0;
     }

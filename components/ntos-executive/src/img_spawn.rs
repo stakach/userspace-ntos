@@ -1372,7 +1372,15 @@ pub(crate) unsafe fn spawn_sec_image(
         );
         zero_scratch_page(kscr);
         unsafe { initialize_kuser_snapshot(kscr) };
-        kuser_page_alias_put(pi, kscr);
+        if !kuser_page_alias_put(pi, kscr) {
+            print_str(b"[spawn-vad] kuser alias record failed pi=");
+            print_u64(pi);
+            print_str(b" alias=0x");
+            print_hex((kscr >> 32) as u32);
+            print_hex(kscr as u32);
+            print_str(b"\n");
+            panic!("hosted kuser alias table unavailable");
+        }
         let kuser_client = checked_spawn_copy_cap(kuser_f, b"kuser-target");
         let _ = checked_spawn_page_map(
             kuser_client,
