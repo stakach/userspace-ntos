@@ -358,6 +358,7 @@ const SSN_GDI_CREATE_COMPATIBLE_DC: u64 = 0x1054;
 const SSN_GDI_CREATE_BITMAP: u64 = 0x106C;
 const SSN_GDI_CREATE_DIB_SECTION: u64 = 0x109B;
 const SSN_GDI_CREATE_DIBITMAP_INTERNAL: u64 = 0x10A0;
+const SSN_GDI_CREATE_PATTERN_BRUSH_INTERNAL: u64 = 0x10B5;
 const SSN_GDI_OPEN_DCW: u64 = 0x10DE;
 const GDI_HANDLE_TYPE_MASK: u32 = 0x007f_0000;
 const GDI_HANDLE_BASETYPE_MASK: u32 = 0x001f_0000;
@@ -367,6 +368,7 @@ const GDI_ENTRY_USER_DATA_OFF: u64 = 0x10;
 const GDI_ENTRY_UPPER_SHIFT: u32 = 16;
 const GDI_OBJECT_TYPE_DC: u32 = 0x0001_0000;
 const GDI_OBJECT_TYPE_BITMAP: u32 = 0x0005_0000;
+const GDI_OBJECT_TYPE_BRUSH: u32 = 0x0010_0000;
 
 /// Fix (B) self-test SSN — a SYNTHETIC dispatch (well outside win32k's real 740-entry SSDT) whose
 /// handler deliberately READS an un-demand-paged data page in this component's VSpace. The read
@@ -9280,6 +9282,7 @@ fn expected_gdi_return_type(ssn: u64) -> Option<u32> {
         | SSN_GDI_CREATE_BITMAP
         | SSN_GDI_CREATE_DIB_SECTION
         | SSN_GDI_CREATE_DIBITMAP_INTERNAL => Some(GDI_OBJECT_TYPE_BITMAP),
+        SSN_GDI_CREATE_PATTERN_BRUSH_INTERNAL => Some(GDI_OBJECT_TYPE_BRUSH),
         _ => None,
     }
 }
@@ -9312,7 +9315,9 @@ unsafe fn observe_gdi_handle_return(ssn: u64, handle: u64) {
         && gdi32_entry_type == expected_type
         && (entry_type & GDI_HANDLE_BASETYPE_MASK) == (expected_type & GDI_HANDLE_BASETYPE_MASK);
     let owner_ok = owner_pid == current_pid;
-    let user_data_ok = expected_type != GDI_OBJECT_TYPE_DC || user_data != 0;
+    let user_data_required =
+        expected_type == GDI_OBJECT_TYPE_DC || expected_type == GDI_OBJECT_TYPE_BRUSH;
+    let user_data_ok = !user_data_required || user_data != 0;
     let mismatch = !type_ok || !owner_ok || !user_data_ok;
     if !mismatch {
         return;

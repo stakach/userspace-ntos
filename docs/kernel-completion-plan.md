@@ -8510,3 +8510,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     path is executing through a stale or unmapped user pointer, and why the final system thread
     reaches a no-handler `#GP`. Do not add kbswitch-specific success handling; fix the shared GDI
     handle publication, client mapping, or fault-attribution mechanism that the run exposes.
+
+    Post-desktop writable-overlay lifetime slice (2026-08-21): the final no-handler `#GP` maps to
+    `nt_fs::MemFs::child_folded_bytes`, not to the GDI calls themselves. The crash shape is consistent
+    with corrupted MemFs child `Vec/String` metadata: `NtCreateFile` could materialize a read-only
+    parent directory into the writable overlay for a union create, then fail the later create before
+    marking `writable_fs_dirty`. That left newly allocated durable directory metadata above the
+    service-loop bump-heap mark, so the next per-syscall `reset_to(heap_mark)` could hand those
+    allocations back to unrelated transient work. The overlay provisioning API now reports whether it
+    actually grew the MemFs tree, and the `NtCreateFile` union path pins the heap mark only for that
+    real growth. This is not a fallback: failed creates still fail, but durable filesystem metadata is
+    no longer reclaimed as transient syscall state. The same slice extends GDI shared-table proofing
+    to `NtGdiCreatePatternBrushInternal` (`SSN 0x10b5`) as a brush object with required client
+    `UserData`, so a follow-up run can distinguish a remaining brush publication bug from the fixed
+    filesystem lifetime bug. Local validation is green for `cargo fmt --all`,
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Review adjustment: rerun the serialized desktop
+    proof from the restored rust-micro baseline. If `kbswitch.exe` still fails, first inspect bounded
+    `[gdi-entry]` lines for bitmap/brush shared-table mismatches before adding any new mechanism.

@@ -27872,7 +27872,11 @@ impl ExecNtHandler {
                     } else {
                         if let Some(parent) = Self::volume_relative_parent(relative) {
                             if Self::readonly_volume_relative_is_dir(parent) {
-                                let _ = crate::writable_fs::provision_directory_relative(parent);
+                                if crate::writable_fs::provision_directory_relative_change(parent)
+                                    == Some(true)
+                                {
+                                    self.writable_fs_dirty = true;
+                                }
                             }
                         }
                         let (st, file_id, information) = crate::writable_fs::create(
