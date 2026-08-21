@@ -225,6 +225,19 @@ profile hive load plus dynamic userinit/Explorer launch. Review adjustment: the 
 loader-cache entry-count cap is closed; remaining storage cleanup should target real read/DMA or
 writable-overlay mechanics rather than this cache.
 
+A4/D2 staged FAT file copy cleanup (2026-08-21): profile/config materialization no longer skips
+staged FAT files above a fixed 1 MiB static copy buffer. Each staged file is read into an exact-size
+temporary allocation, then handed to the writable filesystem's normal provisioning path which copies
+it into owned mounted state before the temporary buffer is released. Config hive probes use the same
+dynamic read path. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-staged-file-dynamic-read-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing, keeps the staged config hives valid with `skipped-large=0`, and restores
+the final profile source proof to `files=32 bytes=135989 ntuser.dat=130682B`. Review adjustment:
+the static staged-file copy-size cap is closed; future profile/config work should target durability
+or hive semantics rather than copy-buffer sizing.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

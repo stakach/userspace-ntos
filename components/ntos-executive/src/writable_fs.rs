@@ -1696,11 +1696,23 @@ pub(crate) unsafe fn default_hive_bytes() -> Option<&'static [u8]> {
 /// nothing is invented. The result is then read back the way a hosted process reads it (by path,
 /// by content and by ENUMERATION) so the "real, enumerable tree" claim is measured, not asserted.
 ///
-/// The FAT read buffer is fixed storage, not a temporary `Vec`: the writable filesystem owns the
-/// copied bytes after `provision_file`, and the service loop pins the mount syscall's dirty state.
-/// Keeping the read scratch out of the bump heap prevents that pin from retaining staging bytes.
-const MAX_STAGED_FILE: usize = 1024 * 1024;
-static mut STAGED_FILE_COPY_BUF: [u8; MAX_STAGED_FILE] = [0; MAX_STAGED_FILE];
+/// Read a staged FAT file into temporary storage before handing it to the writable filesystem. The
+/// filesystem copies the bytes into its own file record, so this buffer is released after each file
+/// instead of becoming long-lived mounted state.
+unsafe fn read_staged_file(fat: &Fat32, cluster: u32, size: u32) -> Option<alloc::vec::Vec<u8>> {
+    let len = size as usize;
+    let mut data = alloc::vec::Vec::new();
+    if data.try_reserve_exact(len).is_err() {
+        return None;
+    }
+    data.resize(len, 0);
+    let got = if size == 0 {
+        0
+    } else {
+        crate::fs_loader::fat_read_file(fat, cluster, size, data.as_mut_ptr() as u64)
+    };
+    (got == size).then_some(data)
+}
 
 #[derive(Clone, Copy, Default)]
 struct StagedTreeStats {
@@ -1770,17 +1782,8 @@ unsafe fn provision_staged_tree(
                 }
             } else if is_deferred_boot_hive_source(&path) {
                 stats.deferred_boot_hives += 1;
-            } else if size as usize <= MAX_STAGED_FILE {
-                let data = core::slice::from_raw_parts_mut(
-                    core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
-                    size as usize,
-                );
-                let got = if size == 0 {
-                    0
-                } else {
-                    crate::fs_loader::fat_read_file(fat, child, size, data.as_mut_ptr() as u64)
-                };
-                if got == size && fs.provision_file_relative(&path, data) {
+            } else if let Some(data) = read_staged_file(fat, child, size) {
+                if fs.provision_file_relative(&path, &data) {
                     stats.files += 1;
                     stats.bytes += size as u64;
                 }
@@ -1797,19 +1800,12 @@ unsafe fn staged_config_hive_ok(fat: &Fat32, root_cluster: u32, leaf: &[u8]) -> 
     else {
         return false;
     };
-    if attr & 0x10 != 0 || size as usize > MAX_STAGED_FILE {
+    if attr & 0x10 != 0 {
         return false;
     }
-    let data = core::slice::from_raw_parts_mut(
-        core::ptr::addr_of_mut!(STAGED_FILE_COPY_BUF) as *mut u8,
-        size as usize,
-    );
-    let got = if size == 0 {
-        0
-    } else {
-        crate::fs_loader::fat_read_file(fat, cluster, size, data.as_mut_ptr() as u64)
-    };
-    got == size && hive_image_ok(data)
+    read_staged_file(fat, cluster, size)
+        .as_deref()
+        .is_some_and(hive_image_ok)
 }
 
 unsafe fn provision_staged_profiles(fs: &mut nt_fs::FileSystem) {
