@@ -8343,10 +8343,70 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     --nocapture`, focused `cargo test -p nt-hive-core
     generated_hive_can_declare_registry_selected_dc21x4_packet_array_driver -- --nocapture`, and
     `NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4 cargo run -q --release -p nt-hive-core --bin
-    gen_hive -- .tmp/generated-e1000-dc21x4-hive.dat` (12,684-byte output). Review adjustment: next
-    code should run a serialized boot with `-device tulip` and fix the first genuine DC21x4/NDIS
-    resource, interrupt, DMA, or packet-array projection gap observed; do not special-case
-    `dc21x4.sys` success.
+    gen_hive -- .tmp/generated-e1000-dc21x4-hive.dat` (12,684-byte output). The first mixed-NIC
+    serialized boot selected `dc21x4.sys` from the generated registry/devnode metadata and loaded the
+    image, then failed closed in the provider import planner at `ndis.sys!NdisMSetTimer`. Follow-up
+    code now gives NDIS miniport timers a typed provider/dependent shadow for
+    `NdisMInitializeTimer`, `NdisMSetTimer`, `NdisMSetPeriodicTimer`, and `NdisMCancelTimer`, emits a
+    reverse callback thunk for `MiniportTimerFunction`, maps the timer callback KDPC argument back to
+    the dependent timer storage, and adds accurate scalar/buffer policies for `NdisMSleep`,
+    `NdisGetSharedDataAlignment`, `NdisMRemoveMiniport`, and `NdisWritePciSlotInformation`. Rejected
+    follow-up proof `.tmp/run-headless-b3-dc21x4-timer-20260821.log` confirms that the previous
+    timer blocker is gone and the OS still reaches Explorer, but `dc21x4.sys` then fails closed at
+    `ndis.sys!NdisWriteErrorLogEntry`; the same slice now adds a bounded vararg provider policy for
+    that export (`ProviderHandle` plus scalar error values up to the marshal argument cap). Rejected
+    follow-up proof `.tmp/run-headless-b3-dc21x4-errorlog-20260821.log` confirms the error-log
+    blocker is gone and advances to `ndis.sys!NdisAllocatePacketPool`, so the current slice adds the
+    NT5 non-Ex packet-pool policy using typed status/handle copyouts and scalar descriptor/reserved
+    lengths, matching the existing typed `NdisAllocatePacketPoolEx` boundary without pointer
+    passthrough. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-packetpool-20260821.log` confirms the packet-pool blocker is gone
+    and advances to `ndis.sys!NdisReadNetworkAddress`. The current slice now adds typed NDIS
+    configuration policies for `NdisOpenConfiguration`, `NdisCloseConfiguration`,
+    `NdisReadConfiguration`, and `NdisReadNetworkAddress`: provider-owned configuration handles stay
+    provider handles, integer `NDIS_CONFIGURATION_PARAMETER` outputs are projected into dependent
+    pool storage, and returned network-address pointer/length pairs copy bounded provider data into
+    dependent storage instead of exposing provider pointers. String/binary config-parameter payload
+    projection remains intentionally fail-closed until a live driver proves it needs that returned
+    payload across the boundary. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-config-20260821.log` confirms those config exports are now present
+    in the import planner and advances to `ndis.sys!NdisInitUnicodeString`. The current slice adds a
+    typed descriptor-initializer policy for that export: the dependent `PCWSTR` source is copied into
+    provider scratch for the provider call, then the initialized `UNICODE_STRING` descriptor is copied
+    back with `Buffer` restored to the dependent-domain source pointer so later
+    `NdisReadConfiguration` calls see a valid dependent descriptor. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-initunicode-20260821.log` confirms `NdisInitUnicodeString` is no
+    longer the import blocker and advances to `ndis.sys!NdisMGetDeviceProperty`. The current slice
+    adds a typed nullable output policy for that export: provider NDIS still populates its own output
+    cells, then completion rewrites non-null PDO/FDO/next-device cells to the dependent devnode's
+    device-object identities so dependent callers can use `IoGetDeviceProperty` against the kernel's
+    real device binding. Resource-list outputs remain null until a live caller proves it needs that
+    projection through this API; DC21x4 requests only the PDO and uses `NdisMQueryAdapterResources`
+    for resources. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-deviceproperty-20260821.log` confirms that device-property
+    projection is no longer the import blocker and advances to `ndis.sys!NdisScheduleWorkItem`. The
+    current slice adds a typed NT5 work-item policy for that export: the dependent
+    `NdisInitializeWorkItem` macro-initialized `NDIS_WORK_ITEM` is validated, a persistent
+    provider-domain work-item shadow is allocated/reused, the provider copy's routine is replaced by
+    a reverse callback thunk, and queued ReactOS NDIS work-item callbacks map back to the dependent
+    work-item pointer and dependent context instead of exposing raw dependent storage to provider
+    NDIS. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-workitem-20260821.log` confirms the mixed-NIC boot continues to
+    desktop-capable E1000 progress, but the selected `dc21x4.sys` image then fails closed at the
+    ordinary kernel import `ntoskrnl.exe!KeFlushQueuedDpcs`. The current slice now exposes that
+    kernel export by draining the hosted driver's existing KDPC queue to quiescence before returning,
+    matching the existing `KeInitializeDpc`/`KeInsertQueueDpc` queue model rather than adding an
+    empty stub. Local
+    validation: `cargo fmt --all`, `cargo test -p nt-hosted-runtime -- --nocapture`, executive
+    `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, and `git diff --check`. Rejected follow-up proof
+    `.tmp/run-headless-b3-dc21x4-flushdpcs-20260821.log` confirms `dc21x4.sys` now resolves its
+    imports, runs `DriverEntry`, publishes the provider miniport route, and reaches generic hardware
+    `AddDevice`; it then fails `StartDevice` with `STATUS_INVALID_DEVICE_REQUEST` before the
+    provider-domain miniport `Initialize` callback or resource grant evidence appears. Review
+    adjustment: continue at generic PCI devnode-to-resource binding for registry-selected multi-NIC
+    hardware, then rerun the serialized mixed-NIC boot with `-device tulip`; do not special-case
+    `dc21x4.sys` success and do not add raw-pointer fallbacks.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

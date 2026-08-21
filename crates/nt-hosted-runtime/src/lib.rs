@@ -20,6 +20,7 @@ pub const NDIS40_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0x88;
 pub const NDIS50_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xb8;
 pub const NDIS51_MINIPORT_CHARACTERISTICS_LEN_X64: u64 = 0xf0;
 pub const NDIS_MINIPORT_INTERRUPT_LEN_X64: u64 = 0x98;
+pub const NDIS_MINIPORT_TIMER_LEN_X64: u64 = 0xa0;
 pub const NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64: u64 = 0x190;
 pub const NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64: u64 = 0x1b0;
 pub const NDIS_MINIPORT_BLOCK_SEND_COMPLETE_HANDLER_OFFSET_X64: u64 = 0x1b8;
@@ -243,6 +244,9 @@ pub enum HostedProviderArgumentMarshal {
     CallerInDriverObject,
     CallerInUnicodeString,
     CallerInAnsiString,
+    CallerOutUnicodeStringFromSource {
+        source_arg: u8,
+    },
     CallerInBuffer {
         length_arg: u8,
     },
@@ -273,11 +277,23 @@ pub enum HostedProviderArgumentMarshal {
     },
     CallerOutNdisBufferFromPacket,
     CallerOutNdisBufferVirtualAddress,
+    CallerOutNdisConfigurationParameter,
+    CallerOutNetworkAddress {
+        length_arg: u8,
+    },
+    CallerInOutNdisWorkItem,
     CallerInOutRequest,
     CallerInOutResourceList {
         length_pointer_arg: u8,
     },
+    CallerOutNdisDeviceProperty {
+        kind: u8,
+    },
     CallerInOutMiniportInterrupt,
+    CallerInOutMiniportTimer {
+        allow_create: bool,
+    },
+    CallerInMiniportTimerFunction,
     CallerInPointerArray {
         count_arg: u8,
     },
@@ -286,6 +302,7 @@ pub enum HostedProviderArgumentMarshal {
     },
     CallerOutStatus,
     CallerOutHandle,
+    CallerOutU8,
     CallerOutPointer,
     CallerOutPointerFromLength {
         length_arg: u8,
@@ -571,6 +588,7 @@ pub fn hosted_provider_export_marshal_policy(
         "NdisMSetAttributesEx" => {
             void_export_policy(&[ProviderHandle, CallerContext, Scalar, Scalar, Scalar])
         }
+        "NdisMRemoveMiniport" => export_policy(&[ProviderHandle]),
         "NdisMQueryAdapterResources" => void_export_policy(&[
             CallerOutStatus,
             ProviderHandle,
@@ -579,12 +597,50 @@ pub fn hosted_provider_export_marshal_policy(
             },
             CallerInOutU32,
         ]),
+        "NdisMGetDeviceProperty" => void_export_policy(&[
+            ProviderHandle,
+            CallerOutNdisDeviceProperty { kind: 1 },
+            CallerOutNdisDeviceProperty { kind: 2 },
+            CallerOutNdisDeviceProperty { kind: 3 },
+            CallerOutNdisDeviceProperty { kind: 4 },
+            CallerOutNdisDeviceProperty { kind: 5 },
+        ]),
+        "NdisMSleep" => void_export_policy(&[Scalar]),
+        "NdisGetSharedDataAlignment" => export_policy(&[]),
+        "NdisOpenConfiguration" => {
+            void_export_policy(&[CallerOutStatus, CallerOutHandle, ProviderHandle])
+        }
+        "NdisCloseConfiguration" => void_export_policy(&[ProviderHandle]),
+        "NdisInitUnicodeString" => {
+            void_export_policy(&[CallerOutUnicodeStringFromSource { source_arg: 1 }, Scalar])
+        }
+        "NdisReadConfiguration" => void_export_policy(&[
+            CallerOutStatus,
+            CallerOutNdisConfigurationParameter,
+            ProviderHandle,
+            CallerInUnicodeString,
+            Scalar,
+        ]),
+        "NdisReadNetworkAddress" => void_export_policy(&[
+            CallerOutStatus,
+            CallerOutNetworkAddress { length_arg: 2 },
+            Scalar,
+            ProviderHandle,
+        ]),
+        "NdisScheduleWorkItem" => export_policy(&[CallerInOutNdisWorkItem]),
         "NdisTerminateWrapper" => void_export_policy(&[ProviderHandle, Scalar]),
         "NdisReadPciSlotInformation" => export_policy(&[
             ProviderHandle,
             Scalar,
             Scalar,
             CallerOutBuffer { length_arg: 4 },
+            Scalar,
+        ]),
+        "NdisWritePciSlotInformation" => export_policy(&[
+            ProviderHandle,
+            Scalar,
+            Scalar,
+            CallerInBuffer { length_arg: 4 },
             Scalar,
         ]),
         "NdisMFreeSharedMemory" => void_export_policy(&[
@@ -602,6 +658,24 @@ pub fn hosted_provider_export_marshal_policy(
             HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration,
             HostedProviderExportResultSemantics::Void,
         ),
+        "NdisMInitializeTimer" => void_export_policy(&[
+            CallerInOutMiniportTimer { allow_create: true },
+            ProviderHandle,
+            CallerInMiniportTimerFunction,
+            CallerContext,
+        ]),
+        "NdisMSetTimer" | "NdisMSetPeriodicTimer" => void_export_policy(&[
+            CallerInOutMiniportTimer {
+                allow_create: false,
+            },
+            Scalar,
+        ]),
+        "NdisMCancelTimer" => void_export_policy(&[
+            CallerInOutMiniportTimer {
+                allow_create: false,
+            },
+            CallerOutU8,
+        ]),
         "NdisMRegisterInterrupt" => export_policy(&[
             CallerInOutMiniportInterrupt,
             ProviderHandle,
@@ -671,6 +745,20 @@ pub fn hosted_provider_export_marshal_policy(
             CallerInBuffer { length_arg: 3 },
             Scalar,
         ]),
+        "NdisWriteErrorLogEntry" => void_export_policy(&[
+            ProviderHandle,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+            Scalar,
+        ]),
         "NdisMIndicateStatusComplete" => void_export_policy(&[ProviderHandle]),
         "NdisMQueryInformationComplete" => void_export_policy(&[ProviderHandle, Scalar]),
         "NdisMSetInformationComplete" => void_export_policy(&[ProviderHandle, Scalar]),
@@ -723,6 +811,9 @@ pub fn hosted_provider_export_marshal_policy(
         ]),
         "NdisAllocateBufferPool" => void_export_policy(&[CallerOutStatus, CallerOutHandle, Scalar]),
         "NdisFreeBufferPool" => void_export_policy(&[ProviderHandle]),
+        "NdisAllocatePacketPool" => {
+            void_export_policy(&[CallerOutStatus, CallerOutHandle, Scalar, Scalar])
+        }
         "NdisAllocatePacketPoolEx" => {
             void_export_policy(&[CallerOutStatus, CallerOutHandle, Scalar, Scalar, Scalar])
         }
@@ -1240,6 +1331,13 @@ mod tests {
             "NdisMRegisterMiniport",
             "NdisMSetAttributesEx",
             "NdisMQueryAdapterResources",
+            "NdisMGetDeviceProperty",
+            "NdisOpenConfiguration",
+            "NdisCloseConfiguration",
+            "NdisInitUnicodeString",
+            "NdisReadConfiguration",
+            "NdisReadNetworkAddress",
+            "NdisScheduleWorkItem",
             "NdisTerminateWrapper",
             "NdisReadPciSlotInformation",
             "NdisMFreeSharedMemory",
@@ -1305,6 +1403,7 @@ mod tests {
             "NdisGetFirstBufferFromPacket",
             "NdisAllocateBufferPool",
             "NdisFreeBufferPool",
+            "NdisAllocatePacketPool",
             "NdisAllocatePacketPoolEx",
             "NdisFreePacketPool",
             "NdisAllocateBuffer",
@@ -1368,6 +1467,77 @@ mod tests {
     }
 
     #[test]
+    fn ndis_configuration_policies_use_typed_copyouts() {
+        let open =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisOpenConfiguration").unwrap();
+        assert_eq!(open.argument_count, 3);
+        assert_eq!(open.args[0], HostedProviderArgumentMarshal::CallerOutStatus);
+        assert_eq!(open.args[1], HostedProviderArgumentMarshal::CallerOutHandle);
+        assert_eq!(open.args[2], HostedProviderArgumentMarshal::ProviderHandle);
+
+        let read =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisReadConfiguration").unwrap();
+        assert_eq!(read.argument_count, 5);
+        assert_eq!(read.args[0], HostedProviderArgumentMarshal::CallerOutStatus);
+        assert_eq!(
+            read.args[1],
+            HostedProviderArgumentMarshal::CallerOutNdisConfigurationParameter
+        );
+        assert_eq!(read.args[2], HostedProviderArgumentMarshal::ProviderHandle);
+        assert_eq!(
+            read.args[3],
+            HostedProviderArgumentMarshal::CallerInUnicodeString
+        );
+        assert_eq!(read.args[4], HostedProviderArgumentMarshal::Scalar);
+
+        let network =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisReadNetworkAddress").unwrap();
+        assert_eq!(network.argument_count, 4);
+        assert_eq!(
+            network.args[0],
+            HostedProviderArgumentMarshal::CallerOutStatus
+        );
+        assert_eq!(
+            network.args[1],
+            HostedProviderArgumentMarshal::CallerOutNetworkAddress { length_arg: 2 }
+        );
+        assert_eq!(network.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            network.args[3],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+
+        let close =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisCloseConfiguration").unwrap();
+        assert_eq!(close.argument_count, 1);
+        assert_eq!(close.args[0], HostedProviderArgumentMarshal::ProviderHandle);
+
+        let init =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisInitUnicodeString").unwrap();
+        assert_eq!(init.argument_count, 2);
+        assert_eq!(
+            init.args[0],
+            HostedProviderArgumentMarshal::CallerOutUnicodeStringFromSource { source_arg: 1 }
+        );
+        assert_eq!(init.args[1], HostedProviderArgumentMarshal::Scalar);
+    }
+
+    #[test]
+    fn ndis_schedule_work_item_policy_uses_typed_shadow() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisScheduleWorkItem").unwrap();
+        assert_eq!(policy.argument_count, 1);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::CallerInOutNdisWorkItem
+        );
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::NtStatus
+        );
+    }
+
+    #[test]
     fn ndis_read_pci_policy_copies_caller_output_buffer() {
         let policy =
             hosted_provider_export_marshal_policy("ndis.sys", "NdisReadPciSlotInformation")
@@ -1377,6 +1547,27 @@ mod tests {
         assert_eq!(
             policy.args[3],
             HostedProviderArgumentMarshal::CallerOutBuffer { length_arg: 4 }
+        );
+
+        let write =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisWritePciSlotInformation")
+                .unwrap();
+        assert_eq!(write.argument_count, 5);
+        assert_eq!(write.stack_qwords, 1);
+        assert_eq!(
+            write.args[3],
+            HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 4 }
+        );
+    }
+
+    #[test]
+    fn ndis_remove_miniport_policy_maps_provider_handle() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMRemoveMiniport").unwrap();
+        assert_eq!(policy.argument_count, 1);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
         );
     }
 
@@ -1400,6 +1591,29 @@ mod tests {
             policy.args[3],
             HostedProviderArgumentMarshal::CallerInOutU32
         );
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+    }
+
+    #[test]
+    fn ndis_get_device_property_uses_nullable_typed_outputs() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMGetDeviceProperty").unwrap();
+        assert_eq!(policy.argument_count, 6);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        let mut index = 1usize;
+        while index < 6 {
+            assert_eq!(
+                policy.args[index],
+                HostedProviderArgumentMarshal::CallerOutNdisDeviceProperty { kind: index as u8 }
+            );
+            index += 1;
+        }
         assert_eq!(
             policy.result_semantics,
             HostedProviderExportResultSemantics::Void
@@ -1489,6 +1703,29 @@ mod tests {
             free.side_effect,
             HostedProviderExportSideEffect::NdisPacketFree
         );
+
+        let pool =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisAllocatePacketPool").unwrap();
+        assert_eq!(pool.argument_count, 4);
+        assert_eq!(pool.args[0], HostedProviderArgumentMarshal::CallerOutStatus);
+        assert_eq!(pool.args[1], HostedProviderArgumentMarshal::CallerOutHandle);
+        assert_eq!(pool.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(pool.args[3], HostedProviderArgumentMarshal::Scalar);
+
+        let pool_ex =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisAllocatePacketPoolEx").unwrap();
+        assert_eq!(pool_ex.argument_count, 5);
+        assert_eq!(
+            pool_ex.args[0],
+            HostedProviderArgumentMarshal::CallerOutStatus
+        );
+        assert_eq!(
+            pool_ex.args[1],
+            HostedProviderArgumentMarshal::CallerOutHandle
+        );
+        assert_eq!(pool_ex.args[2], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(pool_ex.args[3], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(pool_ex.args[4], HostedProviderArgumentMarshal::Scalar);
     }
 
     #[test]
@@ -1643,10 +1880,79 @@ mod tests {
     }
 
     #[test]
+    fn ndis_timer_policies_use_typed_miniport_timer_storage() {
+        assert_eq!(NDIS_MINIPORT_TIMER_LEN_X64, 0xa0);
+
+        let initialize =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMInitializeTimer").unwrap();
+        assert_eq!(initialize.argument_count, 4);
+        assert_eq!(
+            initialize.args[0],
+            HostedProviderArgumentMarshal::CallerInOutMiniportTimer { allow_create: true }
+        );
+        assert_eq!(
+            initialize.args[1],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        assert_eq!(
+            initialize.args[2],
+            HostedProviderArgumentMarshal::CallerInMiniportTimerFunction
+        );
+        assert_eq!(
+            initialize.args[3],
+            HostedProviderArgumentMarshal::CallerContext
+        );
+        assert_eq!(
+            initialize.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+
+        let set = hosted_provider_export_marshal_policy("ndis.sys", "NdisMSetTimer").unwrap();
+        assert_eq!(set.argument_count, 2);
+        assert_eq!(
+            set.args[0],
+            HostedProviderArgumentMarshal::CallerInOutMiniportTimer {
+                allow_create: false
+            }
+        );
+        assert_eq!(set.args[1], HostedProviderArgumentMarshal::Scalar);
+        assert_eq!(
+            set.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+
+        let periodic =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisMSetPeriodicTimer").unwrap();
+        assert_eq!(periodic.argument_count, 2);
+        assert_eq!(periodic.args[0], set.args[0]);
+        assert_eq!(periodic.args[1], HostedProviderArgumentMarshal::Scalar);
+
+        let cancel = hosted_provider_export_marshal_policy("ndis.sys", "NdisMCancelTimer").unwrap();
+        assert_eq!(cancel.argument_count, 2);
+        assert_eq!(cancel.args[0], set.args[0]);
+        assert_eq!(cancel.args[1], HostedProviderArgumentMarshal::CallerOutU8);
+        assert_eq!(
+            cancel.result_semantics,
+            HostedProviderExportResultSemantics::Void
+        );
+    }
+
+    #[test]
     fn ndis_void_exports_do_not_treat_rax_as_status() {
         for export in [
             "NdisInitializeWrapper",
             "NdisMSetAttributesEx",
+            "NdisMInitializeTimer",
+            "NdisMSetTimer",
+            "NdisMSetPeriodicTimer",
+            "NdisMCancelTimer",
+            "NdisMGetDeviceProperty",
+            "NdisMSleep",
+            "NdisOpenConfiguration",
+            "NdisCloseConfiguration",
+            "NdisInitUnicodeString",
+            "NdisReadConfiguration",
+            "NdisReadNetworkAddress",
             "NdisMAllocateSharedMemory",
             "NdisMFreeSharedMemory",
             "NdisMDeregisterInterrupt",
@@ -1655,6 +1961,7 @@ mod tests {
             "EthFilterDprIndicateReceive",
             "EthFilterDprIndicateReceiveComplete",
             "NdisMIndicateStatus",
+            "NdisWriteErrorLogEntry",
             "NdisMIndicateStatusComplete",
             "NdisMQueryInformationComplete",
             "NdisMSetInformationComplete",
@@ -1676,6 +1983,7 @@ mod tests {
             "NdisGetFirstBufferFromPacket",
             "NdisAllocateBufferPool",
             "NdisFreeBufferPool",
+            "NdisAllocatePacketPool",
             "NdisAllocatePacketPoolEx",
             "NdisFreePacketPool",
             "NdisAllocateBuffer",
@@ -1688,6 +1996,18 @@ mod tests {
                 HostedProviderExportResultSemantics::Void
             );
         }
+    }
+
+    #[test]
+    fn ndis_shared_data_alignment_policy_is_scalar_return_only() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisGetSharedDataAlignment")
+                .unwrap();
+        assert_eq!(policy.argument_count, 0);
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::NtStatus
+        );
     }
 
     #[test]
@@ -1735,6 +2055,27 @@ mod tests {
         assert_eq!(
             status.args[2],
             HostedProviderArgumentMarshal::CallerInBuffer { length_arg: 3 }
+        );
+    }
+
+    #[test]
+    fn ndis_error_log_policy_bounds_varargs() {
+        let policy =
+            hosted_provider_export_marshal_policy("ndis.sys", "NdisWriteErrorLogEntry").unwrap();
+        assert_eq!(policy.argument_count, HOSTED_PROVIDER_EXPORT_ARG_CAP as u8);
+        assert_eq!(policy.stack_qwords, 8);
+        assert_eq!(
+            policy.args[0],
+            HostedProviderArgumentMarshal::ProviderHandle
+        );
+        let mut index = 1usize;
+        while index < HOSTED_PROVIDER_EXPORT_ARG_CAP {
+            assert_eq!(policy.args[index], HostedProviderArgumentMarshal::Scalar);
+            index += 1;
+        }
+        assert_eq!(
+            policy.result_semantics,
+            HostedProviderExportResultSemantics::Void
         );
     }
 

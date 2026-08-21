@@ -56,7 +56,7 @@ use nt_hosted_runtime::{
     NDIS_MINIPORT_BLOCK_STATUS_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_STATUS_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_TD_COMPLETE_HANDLER_OFFSET_X64, NDIS_MINIPORT_INTERRUPT_LEN_X64,
-    NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
+    NDIS_MINIPORT_TIMER_LEN_X64, NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
 };
 use nt_io_abi::{ioctl, major};
 use nt_io_manager::{
@@ -523,6 +523,14 @@ const NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64: u64 = 0x78;
 const NDIS_MINIPORT_ALLOCATE_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x80;
 const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT: u8 = 1;
 const HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL: u8 = 2;
+const HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER: u8 = 3;
+const HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM: u8 = 4;
+const NDIS_MINIPORT_TIMER_DPC_OFFSET_X64: u64 = 0x40;
+const NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64: u64 = 0x80;
+const NDIS_WORK_ITEM_CONTEXT_OFFSET_X64: u64 = 0x00;
+const NDIS_WORK_ITEM_ROUTINE_OFFSET_X64: u64 = 0x08;
+const NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64: u64 = 0x08;
+const NDIS_WORK_ITEM_LEN_X64: u64 = 0x50;
 const NDIS_PROTOCOL_OPEN_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x08;
 const NDIS_PROTOCOL_CLOSE_ADAPTER_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x10;
 const NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64: u64 = 0x18;
@@ -549,6 +557,11 @@ const NDIS_REQUEST_BYTES_DONE_OFFSET_X64: u64 = 0x3c;
 const NDIS_REQUEST_BYTE_COUNTERS_LEN_X64: u64 = 8;
 const NDIS_REQUEST_QUERY_INFORMATION: u32 = 0;
 const NDIS_REQUEST_SET_INFORMATION: u32 = 1;
+const NDIS_CONFIGURATION_PARAMETER_LEN_X64: u64 = 0x18;
+const NDIS_CONFIGURATION_PARAMETER_INTEGER: u32 = 0;
+const NDIS_CONFIGURATION_PARAMETER_HEX_INTEGER: u32 = 1;
+const NDIS_NETWORK_ADDRESS_MAX_LEN: u64 = 256;
+const NDIS_INIT_UNICODE_STRING_MAX_BYTES: u64 = 512;
 const NDIS_PACKET_PRIVATE_HEAD_OFFSET_X64: u64 = 0x08;
 const NDIS_PACKET_PRIVATE_TAIL_OFFSET_X64: u64 = 0x10;
 const NDIS_PACKET_PRIVATE_OOB_OFFSET_X64: u64 = 0x2a;
@@ -10281,6 +10294,29 @@ unsafe fn fsd_drain_queued_dpcs() -> u64 {
     delivered
 }
 
+/// `VOID KeFlushQueuedDpcs(VOID)` — drain the hosted driver's KDPC queue before returning.
+extern "win64" fn s_ke_flush_queued_dpcs() {
+    unsafe {
+        let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
+        if capacity == 0 {
+            return;
+        }
+        let mut rounds = 0u64;
+        let max_rounds = capacity.saturating_mul(4).max(1);
+        while rounds < max_rounds {
+            let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
+            let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
+            if head == tail {
+                break;
+            }
+            if fsd_drain_queued_dpcs() == 0 {
+                break;
+            }
+            rounds = rounds.saturating_add(1);
+        }
+    }
+}
+
 /// `BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE, BOOLEAN Wait)` /
 /// `ExAcquireResourceSharedLite` — uncontended single-threaded host: always granted.
 extern "win64" fn s_acquire_resource(_res: u64, _wait: u64) -> u64 {
@@ -12933,8 +12969,20 @@ struct ProviderMarshalDeferredFree {
     condition: u8,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderMarshalNdisDevicePropertyOutput {
+    dependent_exec_va: u64,
+    provider_exec_va: u64,
+    kind: u8,
+}
+
 const PROVIDER_MARSHAL_FREE_ALWAYS: u8 = 1;
 const PROVIDER_MARSHAL_FREE_ON_FAILURE: u8 = 2;
+const NDIS_DEVICE_PROPERTY_PDO: u8 = 1;
+const NDIS_DEVICE_PROPERTY_FDO: u8 = 2;
+const NDIS_DEVICE_PROPERTY_NEXT: u8 = 3;
+const NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES: u8 = 4;
+const NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES: u8 = 5;
 
 #[derive(Clone, Copy)]
 struct HostedProviderDispatchRoute {
@@ -12980,6 +13028,9 @@ struct ProviderMarshalState {
     copyout_count: usize,
     deferred_frees: [ProviderMarshalDeferredFree; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     deferred_free_count: usize,
+    ndis_device_property_outputs:
+        [ProviderMarshalNdisDevicePropertyOutput; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    ndis_device_property_output_count: usize,
     resource_projection_required: bool,
     resource_mapping_copyback: bool,
     resource_state_copyback: bool,
@@ -13003,6 +13054,15 @@ struct ProviderMarshalState {
     ndis_first_buffer_provider_exec_va: u64,
     ndis_first_buffer_va_dependent_exec_va: u64,
     ndis_first_buffer_va_provider_exec_va: u64,
+    ndis_unicode_init_dependent_desc_exec_va: u64,
+    ndis_unicode_init_provider_desc_exec_va: u64,
+    ndis_unicode_init_dependent_source_component_va: u64,
+    ndis_config_param_dependent_exec_va: u64,
+    ndis_config_param_provider_exec_va: u64,
+    ndis_network_address_dependent_ptr_exec_va: u64,
+    ndis_network_address_provider_ptr_exec_va: u64,
+    ndis_network_address_dependent_len_exec_va: u64,
+    ndis_network_address_provider_len_exec_va: u64,
     ndis_packet_copyback_dependent_component_va: u64,
     ndis_packet_copyback_provider_component_va: u64,
     ndis_packet_copyback_bytes: u64,
@@ -13031,6 +13091,12 @@ impl ProviderMarshalState {
                 condition: 0,
             }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
             deferred_free_count: 0,
+            ndis_device_property_outputs: [ProviderMarshalNdisDevicePropertyOutput {
+                dependent_exec_va: 0,
+                provider_exec_va: 0,
+                kind: 0,
+            }; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+            ndis_device_property_output_count: 0,
             resource_projection_required: false,
             resource_mapping_copyback: false,
             resource_state_copyback: false,
@@ -13054,6 +13120,15 @@ impl ProviderMarshalState {
             ndis_first_buffer_provider_exec_va: 0,
             ndis_first_buffer_va_dependent_exec_va: 0,
             ndis_first_buffer_va_provider_exec_va: 0,
+            ndis_unicode_init_dependent_desc_exec_va: 0,
+            ndis_unicode_init_provider_desc_exec_va: 0,
+            ndis_unicode_init_dependent_source_component_va: 0,
+            ndis_config_param_dependent_exec_va: 0,
+            ndis_config_param_provider_exec_va: 0,
+            ndis_network_address_dependent_ptr_exec_va: 0,
+            ndis_network_address_provider_ptr_exec_va: 0,
+            ndis_network_address_dependent_len_exec_va: 0,
+            ndis_network_address_provider_len_exec_va: 0,
             ndis_packet_copyback_dependent_component_va: 0,
             ndis_packet_copyback_provider_component_va: 0,
             ndis_packet_copyback_bytes: 0,
@@ -13151,6 +13226,58 @@ impl HostedProviderMiniportInterruptShadow {
             dependent_instance: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
+            bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderMiniportTimerShadow {
+    present: bool,
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+    provider_component_va: u64,
+    bytes: u64,
+}
+
+impl HostedProviderMiniportTimerShadow {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider_instance: 0,
+            dependent_instance: 0,
+            dependent_component_va: 0,
+            provider_component_va: 0,
+            bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderNdisWorkItemShadow {
+    present: bool,
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+    provider_component_va: u64,
+    dependent_context: u64,
+    dependent_routine: u64,
+    provider_routine_thunk: u64,
+    bytes: u64,
+}
+
+impl HostedProviderNdisWorkItemShadow {
+    const fn empty() -> Self {
+        Self {
+            present: false,
+            provider_instance: 0,
+            dependent_instance: 0,
+            dependent_component_va: 0,
+            provider_component_va: 0,
+            dependent_context: 0,
+            dependent_routine: 0,
+            provider_routine_thunk: 0,
             bytes: 0,
         }
     }
@@ -13337,6 +13464,20 @@ static mut HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOWS: [HostedProviderMiniportIn
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_MINIPORT_INTERRUPT_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP: usize = 128;
+static mut HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS: [HostedProviderMiniportTimerShadow;
+    HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP] =
+    [HostedProviderMiniportTimerShadow::empty(); HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP];
+static HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP: usize = 128;
+static mut HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS: [HostedProviderNdisWorkItemShadow;
+    HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP] =
+    [HostedProviderNdisWorkItemShadow::empty(); HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP];
+static HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP: usize = 128;
 static mut HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS: [HostedProviderNdisMiniportBlockMirror;
     HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP] =
@@ -13842,6 +13983,8 @@ fn print_hosted_provider_callback_kind_name(kind: u8) {
     match kind {
         HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => print_str(b"miniport"),
         HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => print_str(b"protocol"),
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => print_str(b"miniport-timer"),
+        HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => print_str(b"ndis-work-item"),
         _ => print_str(b"unknown"),
     }
 }
@@ -13854,6 +13997,14 @@ fn print_hosted_provider_callback_name(record: HostedProviderCallbackRecord) {
         HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => {
             print_ndis_protocol_callback_name(record.callback_offset)
         }
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => match record.callback_offset {
+            NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64 => print_str(b"TimerFunction"),
+            _ => print_str(b"unknown"),
+        },
+        HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => match record.callback_offset {
+            NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64 => print_str(b"WorkItemRoutine"),
+            _ => print_str(b"unknown"),
+        },
         _ => print_str(b"unknown"),
     }
 }
@@ -16174,6 +16325,65 @@ unsafe fn provider_marshal_output_ndis_first_buffer_va(
     Ok(provider_component_va)
 }
 
+unsafe fn provider_marshal_output_ndis_configuration_parameter(
+    state: &mut ProviderMarshalState,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_instance, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 8)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    state.ndis_config_param_dependent_exec_va = dependent_exec_va;
+    state.ndis_config_param_provider_exec_va = provider_exec_va;
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_output_network_address(
+    state: &mut ProviderMarshalState,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    length_arg_value: u64,
+) -> Result<(u64, u64), i32> {
+    let Some(dependent_ptr_exec_va) =
+        component_to_exec_va_for_instance(dependent_instance, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(dependent_len_exec_va) =
+        component_to_exec_va_for_instance(dependent_instance, dependent_inst, length_arg_value, 4)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_ptr_component_va, provider_ptr_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 8)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let Some((provider_len_component_va, provider_len_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 4)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    state.ndis_network_address_dependent_ptr_exec_va = dependent_ptr_exec_va;
+    state.ndis_network_address_provider_ptr_exec_va = provider_ptr_exec_va;
+    state.ndis_network_address_dependent_len_exec_va = dependent_len_exec_va;
+    state.ndis_network_address_provider_len_exec_va = provider_len_exec_va;
+    write_unaligned(provider_ptr_exec_va as *mut u64, 0);
+    write_unaligned(provider_len_exec_va as *mut u32, 0);
+    Ok((provider_ptr_component_va, provider_len_component_va))
+}
+
 unsafe fn write_provider_ndis_status(state: &ProviderMarshalState, status: i32) {
     if state.ndis_status_provider_exec_va != 0 {
         write_unaligned(
@@ -16186,6 +16396,222 @@ unsafe fn write_provider_ndis_status(state: &ProviderMarshalState, status: i32) 
 unsafe fn provider_ndis_status_success(state: &ProviderMarshalState) -> bool {
     state.ndis_status_provider_exec_va == 0
         || read_unaligned(state.ndis_status_provider_exec_va as *const u32) == STATUS_SUCCESS as u32
+}
+
+unsafe fn complete_provider_unicode_string_init(state: &ProviderMarshalState) {
+    if state.ndis_unicode_init_dependent_desc_exec_va == 0
+        || state.ndis_unicode_init_provider_desc_exec_va == 0
+        || state.ndis_unicode_init_dependent_source_component_va == 0
+    {
+        return;
+    }
+    copy_bytes(
+        state.ndis_unicode_init_dependent_desc_exec_va,
+        state.ndis_unicode_init_provider_desc_exec_va,
+        16,
+    );
+    write_unaligned(
+        (state.ndis_unicode_init_dependent_desc_exec_va + 8) as *mut u64,
+        state.ndis_unicode_init_dependent_source_component_va,
+    );
+}
+
+unsafe fn complete_provider_ndis_device_properties(
+    state: &ProviderMarshalState,
+    dependent_inst: DriverInstance,
+) {
+    if state.ndis_device_property_output_count == 0 {
+        return;
+    }
+    let binding = if dependent_inst.device_id == 0 {
+        None
+    } else {
+        hosted_device_binding_by_device_id(dependent_inst.device_id)
+    };
+    let mut index = 0usize;
+    while index < state.ndis_device_property_output_count {
+        let output = state.ndis_device_property_outputs[index];
+        let provider_value = read_unaligned(output.provider_exec_va as *const u64);
+        let value = if provider_value == 0 {
+            0
+        } else {
+            match output.kind {
+                NDIS_DEVICE_PROPERTY_PDO => binding.map(|slot| slot.pdo_object).unwrap_or(0),
+                NDIS_DEVICE_PROPERTY_FDO => binding
+                    .map(|slot| slot.device_object)
+                    .filter(|value| *value != 0)
+                    .unwrap_or(dependent_inst.device_object),
+                NDIS_DEVICE_PROPERTY_NEXT => binding.map(|slot| slot.pdo_object).unwrap_or(0),
+                NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES
+                | NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES => 0,
+                _ => 0,
+            }
+        };
+        write_unaligned(output.dependent_exec_va as *mut u64, value);
+        index += 1;
+    }
+}
+
+unsafe fn complete_provider_ndis_configuration_parameter(
+    state: &ProviderMarshalState,
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+) {
+    if state.ndis_config_param_provider_exec_va == 0
+        || state.ndis_config_param_dependent_exec_va == 0
+    {
+        return;
+    }
+    if !provider_ndis_status_success(state) {
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    }
+    let provider_param = read_unaligned(state.ndis_config_param_provider_exec_va as *const u64);
+    if provider_param == 0 {
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    }
+    let Some(provider_param_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_param,
+        NDIS_CONFIGURATION_PARAMETER_LEN_X64,
+    ) else {
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    };
+    let parameter_type = read_unaligned(provider_param_exec as *const u32);
+    if parameter_type != NDIS_CONFIGURATION_PARAMETER_INTEGER
+        && parameter_type != NDIS_CONFIGURATION_PARAMETER_HEX_INTEGER
+    {
+        write_provider_ndis_status(state, STATUS_NOT_SUPPORTED);
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    }
+    let Some(dependent_param) =
+        hosted_instance_pool_alloc(dependent_inst, NDIS_CONFIGURATION_PARAMETER_LEN_X64)
+    else {
+        write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    };
+    let Some(dependent_param_exec) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_param,
+        NDIS_CONFIGURATION_PARAMETER_LEN_X64,
+    ) else {
+        hosted_instance_pool_free(dependent_inst, dependent_param);
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(state.ndis_config_param_dependent_exec_va as *mut u64, 0);
+        return;
+    };
+    copy_bytes(
+        dependent_param_exec,
+        provider_param_exec,
+        NDIS_CONFIGURATION_PARAMETER_LEN_X64,
+    );
+    write_unaligned(
+        state.ndis_config_param_dependent_exec_va as *mut u64,
+        dependent_param,
+    );
+}
+
+unsafe fn complete_provider_network_address(
+    state: &ProviderMarshalState,
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+) {
+    if state.ndis_network_address_provider_ptr_exec_va == 0
+        || state.ndis_network_address_provider_len_exec_va == 0
+        || state.ndis_network_address_dependent_ptr_exec_va == 0
+        || state.ndis_network_address_dependent_len_exec_va == 0
+    {
+        return;
+    }
+    if !provider_ndis_status_success(state) {
+        write_unaligned(
+            state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+            0,
+        );
+        write_unaligned(
+            state.ndis_network_address_dependent_len_exec_va as *mut u32,
+            0,
+        );
+        return;
+    }
+    let provider_buffer =
+        read_unaligned(state.ndis_network_address_provider_ptr_exec_va as *const u64);
+    let bytes =
+        read_unaligned(state.ndis_network_address_provider_len_exec_va as *const u32) as u64;
+    if provider_buffer == 0 || bytes == 0 || bytes > NDIS_NETWORK_ADDRESS_MAX_LEN {
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(
+            state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+            0,
+        );
+        write_unaligned(
+            state.ndis_network_address_dependent_len_exec_va as *mut u32,
+            0,
+        );
+        return;
+    }
+    let Some(provider_buffer_exec) =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, provider_buffer, bytes)
+    else {
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(
+            state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+            0,
+        );
+        write_unaligned(
+            state.ndis_network_address_dependent_len_exec_va as *mut u32,
+            0,
+        );
+        return;
+    };
+    let Some(dependent_buffer) = hosted_instance_pool_alloc(dependent_inst, bytes) else {
+        write_provider_ndis_status(state, STATUS_INSUFFICIENT_RESOURCES);
+        write_unaligned(
+            state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+            0,
+        );
+        write_unaligned(
+            state.ndis_network_address_dependent_len_exec_va as *mut u32,
+            0,
+        );
+        return;
+    };
+    let Some(dependent_buffer_exec) =
+        component_to_exec_va_for_instance(dependent_instance, dependent_inst, dependent_buffer, bytes)
+    else {
+        hosted_instance_pool_free(dependent_inst, dependent_buffer);
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(
+            state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+            0,
+        );
+        write_unaligned(
+            state.ndis_network_address_dependent_len_exec_va as *mut u32,
+            0,
+        );
+        return;
+    };
+    copy_bytes(dependent_buffer_exec, provider_buffer_exec, bytes);
+    write_unaligned(
+        state.ndis_network_address_dependent_ptr_exec_va as *mut u64,
+        dependent_buffer,
+    );
+    write_unaligned(
+        state.ndis_network_address_dependent_len_exec_va as *mut u32,
+        bytes as u32,
+    );
 }
 
 unsafe fn complete_provider_ndis_packet_allocation(
@@ -16550,6 +16976,22 @@ unsafe fn complete_provider_ndis_object_shadows(
     dependent_instance: usize,
     dependent_inst: DriverInstance,
 ) {
+    complete_provider_unicode_string_init(state);
+    complete_provider_ndis_device_properties(state, dependent_inst);
+    complete_provider_ndis_configuration_parameter(
+        state,
+        provider_instance,
+        provider_inst,
+        dependent_instance,
+        dependent_inst,
+    );
+    complete_provider_network_address(
+        state,
+        provider_instance,
+        provider_inst,
+        dependent_instance,
+        dependent_inst,
+    );
     complete_provider_ndis_packet_allocation(
         state,
         provider_instance,
@@ -16788,6 +17230,422 @@ unsafe fn clear_hosted_provider_miniport_interrupt_shadows_for_instance(instance
                 hosted_instance_pool_free(provider_inst, record.provider_component_va);
             }
             *record = HostedProviderMiniportInterruptShadow::empty();
+        }
+        index += 1;
+    }
+}
+
+unsafe fn find_hosted_provider_miniport_timer_shadow(
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Option<(usize, HostedProviderMiniportTimerShadow)> {
+    if dependent_component_va == 0 {
+        return None;
+    }
+    let records =
+        core::ptr::addr_of!(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS) as *const HostedProviderMiniportTimerShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+        {
+            return Some((index, record));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn find_hosted_provider_miniport_timer_shadow_by_provider(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_component_va: u64,
+) -> Option<HostedProviderMiniportTimerShadow> {
+    if provider_component_va == 0 {
+        return None;
+    }
+    let records =
+        core::ptr::addr_of!(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS) as *const HostedProviderMiniportTimerShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.provider_component_va == provider_component_va
+        {
+            return Some(record);
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn find_hosted_provider_miniport_timer_shadow_by_provider_dpc(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_dpc_component_va: u64,
+) -> Option<HostedProviderMiniportTimerShadow> {
+    let provider_timer_component_va =
+        provider_dpc_component_va.checked_sub(NDIS_MINIPORT_TIMER_DPC_OFFSET_X64)?;
+    find_hosted_provider_miniport_timer_shadow_by_provider(
+        provider_instance,
+        dependent_instance,
+        provider_timer_component_va,
+    )
+}
+
+unsafe fn allocate_hosted_provider_miniport_timer_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Result<HostedProviderMiniportTimerShadow, i32> {
+    let Some(provider_component_va) =
+        hosted_instance_pool_alloc(provider_inst, NDIS_MINIPORT_TIMER_LEN_X64)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_component_va,
+        NDIS_MINIPORT_TIMER_LEN_X64,
+    )
+    .is_none()
+    {
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let records =
+        core::ptr::addr_of_mut!(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS) as *mut HostedProviderMiniportTimerShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP);
+    let shadow = HostedProviderMiniportTimerShadow {
+        present: true,
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+        provider_component_va,
+        bytes: NDIS_MINIPORT_TIMER_LEN_X64,
+    };
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if !record.present {
+            *record = shadow;
+            return Ok(shadow);
+        }
+        index += 1;
+    }
+    if bounded_count >= HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP {
+        HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    *records.add(bounded_count) = shadow;
+    HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT
+        .store((bounded_count + 1) as u64, Ordering::Relaxed);
+    Ok(shadow)
+}
+
+unsafe fn hosted_provider_miniport_timer_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    dependent_component_va: u64,
+    allow_create: bool,
+) -> Result<(u64, u64, u64), i32> {
+    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_component_va,
+        NDIS_MINIPORT_TIMER_LEN_X64,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let shadow = match find_hosted_provider_miniport_timer_shadow(
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+    ) {
+        Some((_index, shadow)) => shadow,
+        None if allow_create => allocate_hosted_provider_miniport_timer_shadow(
+            provider_instance,
+            provider_inst,
+            dependent_instance,
+            dependent_component_va,
+        )?,
+        None => {
+            HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+    if shadow.bytes < NDIS_MINIPORT_TIMER_LEN_X64 {
+        HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(provider_exec_va) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        shadow.provider_component_va,
+        NDIS_MINIPORT_TIMER_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    copy_bytes(provider_exec_va, dependent_exec_va, NDIS_MINIPORT_TIMER_LEN_X64);
+    Ok((
+        shadow.provider_component_va,
+        dependent_exec_va,
+        provider_exec_va,
+    ))
+}
+
+unsafe fn clear_hosted_provider_miniport_timer_shadows_for_instance(instance_index: usize) {
+    let records =
+        core::ptr::addr_of_mut!(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOWS) as *mut HostedProviderMiniportTimerShadow;
+    let count = HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && (record.provider_instance == instance_index || record.dependent_instance == instance_index)
+        {
+            if let Some(provider_inst) = instance(record.provider_instance) {
+                hosted_instance_pool_free(provider_inst, record.provider_component_va);
+            }
+            *record = HostedProviderMiniportTimerShadow::empty();
+        }
+        index += 1;
+    }
+}
+
+unsafe fn find_hosted_provider_ndis_work_item_shadow(
+    provider_instance: usize,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Option<(usize, HostedProviderNdisWorkItemShadow)> {
+    if dependent_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS)
+        as *const HostedProviderNdisWorkItemShadow;
+    let count = HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.dependent_component_va == dependent_component_va
+        {
+            return Some((index, record));
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn find_hosted_provider_ndis_work_item_shadow_by_provider(
+    provider_instance: usize,
+    dependent_instance: usize,
+    provider_component_va: u64,
+) -> Option<HostedProviderNdisWorkItemShadow> {
+    if provider_component_va == 0 {
+        return None;
+    }
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS)
+        as *const HostedProviderNdisWorkItemShadow;
+    let count = HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = *records.add(index);
+        if record.present
+            && record.provider_instance == provider_instance
+            && record.dependent_instance == dependent_instance
+            && record.provider_component_va == provider_component_va
+        {
+            return Some(record);
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn store_hosted_provider_ndis_work_item_shadow(
+    index: usize,
+    shadow: HostedProviderNdisWorkItemShadow,
+) {
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS)
+        as *mut HostedProviderNdisWorkItemShadow;
+    *records.add(index) = shadow;
+}
+
+unsafe fn allocate_hosted_provider_ndis_work_item_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_component_va: u64,
+) -> Result<(usize, HostedProviderNdisWorkItemShadow), i32> {
+    let Some(provider_component_va) =
+        hosted_instance_pool_alloc(provider_inst, NDIS_WORK_ITEM_LEN_X64)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_component_va,
+        NDIS_WORK_ITEM_LEN_X64,
+    )
+    .is_none()
+    {
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS)
+        as *mut HostedProviderNdisWorkItemShadow;
+    let count = HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP);
+    let shadow = HostedProviderNdisWorkItemShadow {
+        present: true,
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+        provider_component_va,
+        dependent_context: 0,
+        dependent_routine: 0,
+        provider_routine_thunk: 0,
+        bytes: NDIS_WORK_ITEM_LEN_X64,
+    };
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if !record.present {
+            *record = shadow;
+            return Ok((index, shadow));
+        }
+        index += 1;
+    }
+    if bounded_count >= HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        hosted_instance_pool_free(provider_inst, provider_component_va);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    *records.add(bounded_count) = shadow;
+    HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT
+        .store((bounded_count + 1) as u64, Ordering::Relaxed);
+    Ok((bounded_count, shadow))
+}
+
+unsafe fn hosted_provider_ndis_work_item_shadow(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    dependent_inst: DriverInstance,
+    dependent_component_va: u64,
+) -> Result<u64, i32> {
+    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+        dependent_instance,
+        dependent_inst,
+        dependent_component_va,
+        NDIS_WORK_ITEM_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let dependent_context = read_unaligned(
+        (dependent_exec_va + NDIS_WORK_ITEM_CONTEXT_OFFSET_X64) as *const u64,
+    );
+    let dependent_routine = read_unaligned(
+        (dependent_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *const u64,
+    );
+    if dependent_routine == 0 {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let (index, mut shadow) = match find_hosted_provider_ndis_work_item_shadow(
+        provider_instance,
+        dependent_instance,
+        dependent_component_va,
+    ) {
+        Some(found) => found,
+        None => allocate_hosted_provider_ndis_work_item_shadow(
+            provider_instance,
+            provider_inst,
+            dependent_instance,
+            dependent_component_va,
+        )?,
+    };
+    if shadow.bytes < NDIS_WORK_ITEM_LEN_X64 {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if shadow.dependent_routine != dependent_routine || shadow.provider_routine_thunk == 0 {
+        shadow.provider_routine_thunk = provider_marshal_emit_callback_thunk(
+            provider_instance,
+            dependent_instance,
+            dependent_routine,
+            NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64,
+            HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM,
+        )?;
+        shadow.dependent_routine = dependent_routine;
+    }
+    shadow.dependent_context = dependent_context;
+    store_hosted_provider_ndis_work_item_shadow(index, shadow);
+
+    let Some(provider_exec_va) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        shadow.provider_component_va,
+        NDIS_WORK_ITEM_LEN_X64,
+    ) else {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    provider_marshal_zero(provider_exec_va, NDIS_WORK_ITEM_LEN_X64);
+    write_unaligned(
+        (provider_exec_va + NDIS_WORK_ITEM_CONTEXT_OFFSET_X64) as *mut u64,
+        dependent_context,
+    );
+    write_unaligned(
+        (provider_exec_va + NDIS_WORK_ITEM_ROUTINE_OFFSET_X64) as *mut u64,
+        shadow.provider_routine_thunk,
+    );
+    Ok(shadow.provider_component_va)
+}
+
+unsafe fn clear_hosted_provider_ndis_work_item_shadows_for_instance(instance_index: usize) {
+    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOWS)
+        as *mut HostedProviderNdisWorkItemShadow;
+    let count = HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let record = &mut *records.add(index);
+        if record.present
+            && (record.provider_instance == instance_index
+                || record.dependent_instance == instance_index)
+        {
+            if let Some(provider_inst) = instance(record.provider_instance) {
+                hosted_instance_pool_free(provider_inst, record.provider_component_va);
+            }
+            *record = HostedProviderNdisWorkItemShadow::empty();
         }
         index += 1;
     }
@@ -17532,6 +18390,25 @@ fn provider_marshal_add_deferred_free(
     Some(())
 }
 
+fn provider_marshal_add_ndis_device_property_output(
+    state: &mut ProviderMarshalState,
+    dependent_exec_va: u64,
+    provider_exec_va: u64,
+    kind: u8,
+) -> Option<()> {
+    if state.ndis_device_property_output_count >= state.ndis_device_property_outputs.len() {
+        return None;
+    }
+    state.ndis_device_property_outputs[state.ndis_device_property_output_count] =
+        ProviderMarshalNdisDevicePropertyOutput {
+            dependent_exec_va,
+            provider_exec_va,
+            kind,
+        };
+    state.ndis_device_property_output_count += 1;
+    Some(())
+}
+
 unsafe fn provider_marshal_output_cell(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -17552,6 +18429,41 @@ unsafe fn provider_marshal_output_cell(
     };
     provider_marshal_add_copyout(state, dependent_exec_va, provider_exec_va, bytes)
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_component_va)
+}
+
+unsafe fn provider_marshal_ndis_device_property_output(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    arg_value: u64,
+    kind: u8,
+) -> Result<u64, i32> {
+    if arg_value == 0 {
+        return Ok(0);
+    }
+    if kind == 0 || kind > NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_exec_va) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_component_va, provider_exec_va)) =
+        provider_marshal_alloc(state, provider_shared, 8)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    write_unaligned(provider_exec_va as *mut u64, 0);
+    provider_marshal_add_ndis_device_property_output(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        kind,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     Ok(provider_component_va)
 }
 
@@ -17825,6 +18737,71 @@ unsafe fn provider_marshal_miniport_interrupt(
     state.miniport_interrupt_provider_component_va = provider_arg;
     state.miniport_interrupt_free_on_success = free_on_success;
     Ok(provider_arg)
+}
+
+unsafe fn provider_marshal_miniport_timer(
+    state: &mut ProviderMarshalState,
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    arg_value: u64,
+    allow_create: bool,
+) -> Result<u64, i32> {
+    let (provider_arg, dependent_exec_va, provider_exec_va) = hosted_provider_miniport_timer_shadow(
+        provider_instance,
+        provider_inst,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        allow_create,
+    )?;
+    provider_marshal_add_copyout(
+        state,
+        dependent_exec_va,
+        provider_exec_va,
+        NDIS_MINIPORT_TIMER_LEN_X64,
+    )
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(provider_arg)
+}
+
+unsafe fn provider_marshal_miniport_timer_function(
+    provider_instance: usize,
+    dependent_index: usize,
+    target: u64,
+) -> Result<u64, i32> {
+    if target == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if hosted_provider_callback_record_available() == 0
+        || instance_executable_thunk_available(provider_instance) == 0
+    {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    provider_marshal_emit_callback_thunk(
+        provider_instance,
+        dependent_index,
+        target,
+        NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64,
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER,
+    )
+}
+
+unsafe fn provider_marshal_ndis_work_item(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    arg_value: u64,
+) -> Result<u64, i32> {
+    hosted_provider_ndis_work_item_shadow(
+        provider_instance,
+        provider_inst,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+    )
 }
 
 unsafe fn provider_marshal_fixed_output_pointer(
@@ -18315,6 +19292,72 @@ unsafe fn provider_marshal_unicode_string(
     Ok(provider_desc_va)
 }
 
+unsafe fn provider_marshal_unicode_string_from_source(
+    state: &mut ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    provider_shared: u64,
+    desc_arg_value: u64,
+    source_arg_value: u64,
+) -> Result<(u64, u64), i32> {
+    if source_arg_value == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(dependent_desc_exec) =
+        component_to_exec_va_for_instance(dependent_index, dependent_inst, desc_arg_value, 16)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+
+    let mut source_bytes = 0u64;
+    loop {
+        if source_bytes >= NDIS_INIT_UNICODE_STRING_MAX_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Some(ch_exec) = component_to_exec_va_for_instance(
+            dependent_index,
+            dependent_inst,
+            source_arg_value
+                .checked_add(source_bytes)
+                .ok_or(STATUS_INVALID_PARAMETER)?,
+            2,
+        ) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let ch = read_unaligned(ch_exec as *const u16);
+        if ch == 0 {
+            break;
+        }
+        source_bytes = source_bytes.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+    }
+
+    let source_total = source_bytes.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
+    let Some(source_exec) = component_to_exec_va_for_instance(
+        dependent_index,
+        dependent_inst,
+        source_arg_value,
+        source_total,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some((provider_desc_va, provider_desc_exec)) =
+        provider_marshal_alloc(state, provider_shared, 16)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    let Some((provider_source_va, provider_source_exec)) =
+        provider_marshal_alloc(state, provider_shared, source_total)
+    else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
+    provider_marshal_zero(provider_desc_exec, 16);
+    copy_bytes(provider_source_exec, source_exec, source_total);
+    state.ndis_unicode_init_dependent_desc_exec_va = dependent_desc_exec;
+    state.ndis_unicode_init_provider_desc_exec_va = provider_desc_exec;
+    state.ndis_unicode_init_dependent_source_component_va = source_arg_value;
+    Ok((provider_desc_va, provider_source_va))
+}
+
 unsafe fn provider_marshal_embedded_unicode_string_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -18593,9 +19636,11 @@ unsafe fn prepare_provider_export_marshal(
                 provider_arg
             }
             HostedProviderArgumentMarshal::CallerOutHandle
+            | HostedProviderArgumentMarshal::CallerOutU8
             | HostedProviderArgumentMarshal::CallerOutU32
             | HostedProviderArgumentMarshal::CallerOutPhysicalAddress => {
                 let bytes = match policy.args[index] {
+                    HostedProviderArgumentMarshal::CallerOutU8 => 1,
                     HostedProviderArgumentMarshal::CallerOutU32 => 4,
                     _ => 8,
                 };
@@ -18634,6 +19679,23 @@ unsafe fn prepare_provider_export_marshal(
                     provider_shared,
                     arg,
                 )?
+            }
+            HostedProviderArgumentMarshal::CallerOutUnicodeStringFromSource { source_arg } => {
+                let source_index = source_arg as usize;
+                if source_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let (provider_desc_va, provider_source_va) =
+                    provider_marshal_unicode_string_from_source(
+                        &mut state,
+                        dependent_index,
+                        dependent_inst,
+                        provider_shared,
+                        arg,
+                        args[source_index],
+                    )?;
+                args[source_index] = provider_source_va;
+                provider_desc_va
             }
             HostedProviderArgumentMarshal::CallerInAnsiString => provider_marshal_ansi_string(
                 &mut state,
@@ -18785,6 +19847,32 @@ unsafe fn prepare_provider_export_marshal(
                     arg,
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutNdisConfigurationParameter => {
+                provider_marshal_output_ndis_configuration_parameter(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerOutNetworkAddress { length_arg } => {
+                let length_index = length_arg as usize;
+                if length_index >= policy.argument_count as usize {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let (provider_ptr_component_va, provider_len_component_va) =
+                    provider_marshal_output_network_address(
+                        &mut state,
+                        dependent_index,
+                        dependent_inst,
+                        provider_shared,
+                        arg,
+                        args[length_index],
+                    )?;
+                args[length_index] = provider_len_component_va;
+                provider_ptr_component_va
+            }
             HostedProviderArgumentMarshal::CallerInOutRequest => provider_marshal_ndis_request(
                 &mut state,
                 dependent_index,
@@ -18841,6 +19929,16 @@ unsafe fn prepare_provider_export_marshal(
                     args[length_index],
                 )?
             }
+            HostedProviderArgumentMarshal::CallerOutNdisDeviceProperty { kind } => {
+                provider_marshal_ndis_device_property_output(
+                    &mut state,
+                    dependent_index,
+                    dependent_inst,
+                    provider_shared,
+                    arg,
+                    kind,
+                )?
+            }
             HostedProviderArgumentMarshal::CallerInOutMiniportInterrupt => {
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
@@ -18854,6 +19952,35 @@ unsafe fn prepare_provider_export_marshal(
                     arg,
                     policy.side_effect
                         == HostedProviderExportSideEffect::NdisMiniportInterruptDeregistration,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInOutMiniportTimer { allow_create } => {
+                let Some(provider_inst) = instance(provider_instance) else {
+                    return Err(STATUS_DEVICE_NOT_READY);
+                };
+                provider_marshal_miniport_timer(
+                    &mut state,
+                    provider_instance,
+                    provider_inst,
+                    dependent_index,
+                    dependent_inst,
+                    arg,
+                    allow_create,
+                )?
+            }
+            HostedProviderArgumentMarshal::CallerInMiniportTimerFunction => {
+                provider_marshal_miniport_timer_function(provider_instance, dependent_index, arg)?
+            }
+            HostedProviderArgumentMarshal::CallerInOutNdisWorkItem => {
+                let Some(provider_inst) = instance(provider_instance) else {
+                    return Err(STATUS_DEVICE_NOT_READY);
+                };
+                provider_marshal_ndis_work_item(
+                    provider_instance,
+                    provider_inst,
+                    dependent_index,
+                    dependent_inst,
+                    arg,
                 )?
             }
             HostedProviderArgumentMarshal::CallerOutIoPortRange {
@@ -21163,6 +22290,74 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
     Ok(result)
 }
 
+unsafe fn service_ndis_miniport_timer_callback(
+    provider_instance: usize,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> Result<u64, i32> {
+    if record.callback_offset != NDIS_MINIPORT_TIMER_FUNCTION_CALLBACK_OFFSET_X64 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let Some(shadow) = find_hosted_provider_miniport_timer_shadow_by_provider_dpc(
+        provider_instance,
+        record.dependent_instance,
+        arg0,
+    ) else {
+        HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(dpc_arg) = shadow
+        .dependent_component_va
+        .checked_add(NDIS_MINIPORT_TIMER_DPC_OFFSET_X64)
+    else {
+        HOSTED_PROVIDER_MINIPORT_TIMER_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [dpc_arg, arg1, arg2, arg3],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
+unsafe fn service_ndis_work_item_callback(
+    provider_instance: usize,
+    record: HostedProviderCallbackRecord,
+    dependent_inst: DriverInstance,
+    exec_code_va: u64,
+    arg0: u64,
+) -> Result<u64, i32> {
+    if record.callback_offset != NDIS_WORK_ITEM_ROUTINE_CALLBACK_OFFSET_X64 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let Some(shadow) = find_hosted_provider_ndis_work_item_shadow_by_provider(
+        provider_instance,
+        record.dependent_instance,
+        arg0,
+    ) else {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if shadow.dependent_routine != record.target || shadow.dependent_component_va == 0 {
+        HOSTED_PROVIDER_NDIS_WORK_ITEM_SHADOW_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    dispatch_dependent_provider_callback(
+        record,
+        dependent_inst,
+        exec_code_va,
+        [shadow.dependent_component_va, shadow.dependent_context, 0, 0],
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    )
+}
+
 pub(crate) unsafe fn service_hosted_provider_callback(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
@@ -21196,7 +22391,9 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         || record.target == 0
         || record.callback_offset == 0
         || (record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
-            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL)
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER
+            && record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM)
         || dependent_inst.fault_ep == 0
         || dependent_inst.pml4 == 0
         || dependent_inst.reply_cap == 0
@@ -21488,6 +22685,23 @@ pub(crate) unsafe fn service_hosted_provider_callback(
                     }
                     _ => Err(STATUS_NOT_SUPPORTED),
                 },
+                HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => service_ndis_miniport_timer_callback(
+                    provider_instance,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
+                ),
+                HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => service_ndis_work_item_callback(
+                    provider_instance,
+                    record,
+                    dependent_inst,
+                    exec_code_va,
+                    arg0,
+                ),
                 _ => Err(STATUS_NOT_SUPPORTED),
             }
         }
@@ -22289,6 +23503,10 @@ fn register_fsd_trampolines() {
     reg.bind(
         "KeInsertQueueDpc",
         s_ke_insert_queue_dpc as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeFlushQueuedDpcs",
+        s_ke_flush_queued_dpcs as *const () as usize as u64,
     );
     reg.bind(
         "KeQueryTimeIncrement",
@@ -29704,6 +30922,8 @@ fn clear_instance(i: usize) {
     unsafe {
         clear_hosted_provider_ndis_shadows_for_instance(i);
         clear_hosted_provider_miniport_interrupt_shadows_for_instance(i);
+        clear_hosted_provider_miniport_timer_shadows_for_instance(i);
+        clear_hosted_provider_ndis_work_item_shadows_for_instance(i);
         clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i);
         clear_hosted_provider_dispatch_routes_for_instance(i);
         clear_hosted_provider_singletons_for_instance(i);
