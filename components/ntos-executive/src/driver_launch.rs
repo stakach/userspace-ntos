@@ -13637,19 +13637,6 @@ struct HostedProviderCallbackRecord {
     callback_kind: u8,
 }
 
-impl HostedProviderCallbackRecord {
-    const fn empty() -> Self {
-        Self {
-            present: false,
-            provider_instance: 0,
-            dependent_instance: 0,
-            target: 0,
-            callback_offset: 0,
-            callback_kind: 0,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct HostedProviderPointerAllocation {
     present: bool,
@@ -13688,12 +13675,7 @@ static HOSTED_PROVIDER_EXPORT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_EXPORT_FRAME_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_FRAME_TRACE_CAP: u64 = 16;
-const HOSTED_PROVIDER_CALLBACK_RECORD_CAP: usize = 256;
-static mut HOSTED_PROVIDER_CALLBACK_RECORDS: [HostedProviderCallbackRecord;
-    HOSTED_PROVIDER_CALLBACK_RECORD_CAP] =
-    [HostedProviderCallbackRecord::empty(); HOSTED_PROVIDER_CALLBACK_RECORD_CAP];
-static HOSTED_PROVIDER_CALLBACK_RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_CALLBACK_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_PROVIDER_CALLBACK_RECORDS: Option<Vec<HostedProviderCallbackRecord>> = None;
 static HOSTED_PROVIDER_CALLBACK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -13757,6 +13739,19 @@ unsafe fn clear_hosted_dependency_images() {
     if let Some(images) = (*core::ptr::addr_of_mut!(HOSTED_DEP_IMAGES)).as_mut() {
         images.clear();
     }
+}
+
+unsafe fn hosted_provider_callback_records_mut(
+) -> &'static mut Vec<HostedProviderCallbackRecord> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_RECORDS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_provider_callback_records() -> Option<&'static Vec<HostedProviderCallbackRecord>> {
+    (&*core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_RECORDS)).as_ref()
 }
 
 unsafe fn hosted_provider_pointer_allocations_mut(
@@ -14638,11 +14633,6 @@ fn record_provider_protocol_receive_completion(record: HostedProviderCallbackRec
     }
 }
 
-unsafe fn hosted_provider_callback_record_available() -> u64 {
-    let count = HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed);
-    (HOSTED_PROVIDER_CALLBACK_RECORD_CAP as u64).saturating_sub(count)
-}
-
 unsafe fn instance_executable_thunk_available(instance_index: usize) -> u64 {
     let Some(inst) = instance(instance_index) else {
         return 0;
@@ -14661,38 +14651,30 @@ unsafe fn register_hosted_provider_callback_record(
     callback_offset: u64,
     callback_kind: u8,
 ) -> Option<u64> {
-    let count = HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed) as usize;
-    if count >= HOSTED_PROVIDER_CALLBACK_RECORD_CAP {
-        HOSTED_PROVIDER_CALLBACK_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let records = core::ptr::addr_of_mut!(HOSTED_PROVIDER_CALLBACK_RECORDS)
-        as *mut HostedProviderCallbackRecord;
-    *records.add(count) = HostedProviderCallbackRecord {
+    let records = hosted_provider_callback_records_mut();
+    let cookie = (records.len() as u64).checked_add(1)?;
+    records.push(HostedProviderCallbackRecord {
         present: true,
         provider_instance,
         dependent_instance,
         target,
         callback_offset,
         callback_kind,
-    };
-    HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.store((count + 1) as u64, Ordering::Relaxed);
-    Some((count as u64).saturating_add(1))
+    });
+    Some(cookie)
 }
 
 unsafe fn hosted_provider_callback_record(cookie: u64) -> Option<HostedProviderCallbackRecord> {
     if cookie == 0 {
         return None;
     }
-    let index = cookie.checked_sub(1)? as usize;
-    if index >= HOSTED_PROVIDER_CALLBACK_RECORD_COUNT.load(Ordering::Relaxed) as usize
-        || index >= HOSTED_PROVIDER_CALLBACK_RECORD_CAP
-    {
+    let index = cookie.checked_sub(1)?;
+    if index > usize::MAX as u64 {
         return None;
     }
-    let records = core::ptr::addr_of!(HOSTED_PROVIDER_CALLBACK_RECORDS)
-        as *const HostedProviderCallbackRecord;
-    let record = *records.add(index);
+    let record = hosted_provider_callback_records()?
+        .get(index as usize)
+        .copied()?;
     record.present.then_some(record)
 }
 
@@ -19102,9 +19084,7 @@ unsafe fn provider_marshal_miniport_timer_function(
     if target == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if hosted_provider_callback_record_available() == 0
-        || instance_executable_thunk_available(provider_instance) == 0
-    {
+    if instance_executable_thunk_available(provider_instance) == 0 {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     provider_marshal_emit_callback_thunk(
@@ -19842,9 +19822,7 @@ unsafe fn provider_marshal_miniport_characteristics(
         }
         callback_index += 1;
     }
-    if callback_count > 0
-        && (callback_count > hosted_provider_callback_record_available()
-            || callback_count > instance_executable_thunk_available(provider_instance))
+    if callback_count > 0 && callback_count > instance_executable_thunk_available(provider_instance)
     {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -19925,9 +19903,7 @@ unsafe fn provider_marshal_protocol_characteristics(
         }
         callback_index += 1;
     }
-    if callback_count > 0
-        && (callback_count > hosted_provider_callback_record_available()
-            || callback_count > instance_executable_thunk_available(provider_instance))
+    if callback_count > 0 && callback_count > instance_executable_thunk_available(provider_instance)
     {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }

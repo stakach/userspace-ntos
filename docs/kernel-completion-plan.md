@@ -144,6 +144,20 @@ x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
 adjustment: provider callback records remain intentionally bounded by executable thunk slots for now;
 audit that table separately if future driver mixes exhaust callback-thunk identity.
 
+B3 provider-callback record scaling cleanup (2026-08-21): provider callback
+cookie records now grow in a vector instead of a fixed 256-entry executive array. Callback thunk
+publication still fails closed on the actual finite resource, the provider instance's executable
+thunk arena, and cookie decoding remains `index + 1` against the vector-backed record store. Local
+validation is green for `cargo fmt --all` and executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+plus `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-b3-provider-callback-record-vec-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing and keeps provider sharing alive with `exports=49/49`,
+`callbacks=24/25`, zero export rejections, and zero singleton overflow/conflict records. Review
+adjustment: the remaining provider singleton and summary tables are diagnostic/publication summaries
+rather than per-callback runtime transport capacity; audit them separately if the provider mix grows
+past today's NDIS stack.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
