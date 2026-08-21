@@ -4,6 +4,7 @@
 //! address bands below preserve the current boot layout, but callers no longer pass image-specific
 //! `HostedProcessRuntime` constants around as identity.
 #![allow(clippy::all)]
+use alloc::vec::Vec;
 use crate::*;
 use nt_hosted_runtime::{DynamicRuntimeArena, ProcessRuntimeLayout};
 
@@ -27,33 +28,41 @@ pub(crate) enum HostedProcessRuntimeRegistrationError {
     MissingLayout,
 }
 
-#[derive(Clone, Copy)]
 struct HostedProcessRuntimeTable {
-    entries: [Option<HostedProcessRuntime>; MAX_PI],
+    entries: Vec<Option<HostedProcessRuntime>>,
 }
 
 impl HostedProcessRuntimeTable {
     const fn new() -> Self {
         Self {
-            entries: [None; MAX_PI],
+            entries: Vec::new(),
         }
     }
 
-    fn reset(&mut self) {
-        self.entries = [None; MAX_PI];
+    fn reset(&mut self, slots: usize) -> bool {
+        self.entries.clear();
+        if self.entries.try_reserve(slots).is_err() {
+            HOSTED_PROCESS_RUNTIME_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        while self.entries.len() < slots {
+            self.entries.push(None);
+        }
+        true
     }
 
     fn register(
         &mut self,
         runtime: HostedProcessRuntime,
     ) -> Result<(), HostedProcessRuntimeRegistrationError> {
-        if runtime.pi >= MAX_PI {
+        if runtime.pi >= MAX_PI || runtime.pi >= self.entries.len() {
             return Err(HostedProcessRuntimeRegistrationError::InvalidPi);
         }
-        if self.entries[runtime.pi].is_some() {
+        let entry = &mut self.entries[runtime.pi];
+        if entry.is_some() {
             return Err(HostedProcessRuntimeRegistrationError::DuplicatePi);
         }
-        self.entries[runtime.pi] = Some(runtime);
+        *entry = Some(runtime);
         Ok(())
     }
 
@@ -62,11 +71,16 @@ impl HostedProcessRuntimeTable {
     }
 }
 
+static HOSTED_PROCESS_RUNTIME_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_PROCESS_RUNTIMES: HostedProcessRuntimeTable = HostedProcessRuntimeTable::new();
 
 pub(crate) fn reset_hosted_process_runtimes() {
-    unsafe { (&mut *core::ptr::addr_of_mut!(HOSTED_PROCESS_RUNTIMES)).reset() };
-    reset_dynamic_spawned_signals();
+    let runtimes_ok =
+        unsafe { (&mut *core::ptr::addr_of_mut!(HOSTED_PROCESS_RUNTIMES)).reset(MAX_PI) };
+    let spawned_ok = reset_dynamic_spawned_signals(MAX_PI);
+    if !runtimes_ok || !spawned_ok {
+        panic!("hosted process runtime table allocation failed");
+    }
 }
 
 pub(crate) fn register_hosted_process_runtime(
@@ -122,12 +136,23 @@ const _: () = {
     assert!(HOSTED_DYNAMIC_RUNTIME_LIMIT >= HOSTED_DYNAMIC_RUNTIME_BASE);
 };
 
-static HOSTED_DYNAMIC_SPAWNED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static HOSTED_DYNAMIC_SPAWNED_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_DYNAMIC_SPAWNED: Vec<AtomicU64> = Vec::new();
 
-fn reset_dynamic_spawned_signals() {
-    for spawned in HOSTED_DYNAMIC_SPAWNED.iter() {
+fn reset_dynamic_spawned_signals(slots: usize) -> bool {
+    let spawned = unsafe { &mut *core::ptr::addr_of_mut!(HOSTED_DYNAMIC_SPAWNED) };
+    spawned.clear();
+    if spawned.try_reserve(slots).is_err() {
+        HOSTED_DYNAMIC_SPAWNED_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while spawned.len() < slots {
+        spawned.push(AtomicU64::new(0));
+    }
+    for spawned in spawned.iter() {
         spawned.store(0, Ordering::Relaxed);
     }
+    true
 }
 
 fn spawned_signal_for_pi(pi: usize) -> Option<&'static AtomicU64> {
@@ -138,8 +163,25 @@ fn spawned_signal_for_pi(pi: usize) -> Option<&'static AtomicU64> {
         4 => Some(&LSASS_SPAWNED),
         5 => Some(&USERINIT_SPAWNED),
         6 => Some(&EXPLORER_SPAWNED),
-        HOSTED_DYNAMIC_FIRST_PI..MAX_PI => HOSTED_DYNAMIC_SPAWNED.get(pi),
+        HOSTED_DYNAMIC_FIRST_PI..MAX_PI => unsafe {
+            (&*core::ptr::addr_of!(HOSTED_DYNAMIC_SPAWNED)).get(pi)
+        },
         _ => None,
+    }
+}
+
+pub(crate) fn hosted_process_runtime_store_stats() -> (usize, usize, u64, usize, usize, u64) {
+    unsafe {
+        let runtimes = &*core::ptr::addr_of!(HOSTED_PROCESS_RUNTIMES);
+        let spawned = &*core::ptr::addr_of!(HOSTED_DYNAMIC_SPAWNED);
+        (
+            runtimes.entries.len(),
+            runtimes.entries.capacity(),
+            HOSTED_PROCESS_RUNTIME_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+            spawned.len(),
+            spawned.capacity(),
+            HOSTED_DYNAMIC_SPAWNED_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
     }
 }
 

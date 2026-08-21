@@ -9990,6 +9990,26 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(kuser_alloc_fails);
     print_str(b"/");
     print_u64(kuser_store_fails);
+    let (
+        hosted_runtime_len,
+        hosted_runtime_cap,
+        hosted_runtime_fails,
+        hosted_spawned_len,
+        hosted_spawned_cap,
+        hosted_spawned_fails,
+    ) = hosted_process_runtime_store_stats();
+    print_str(b" hosted-runtime=");
+    print_u64(hosted_runtime_len as u64);
+    print_str(b"/");
+    print_u64(hosted_runtime_cap as u64);
+    print_str(b"/");
+    print_u64(hosted_runtime_fails);
+    print_str(b":");
+    print_u64(hosted_spawned_len as u64);
+    print_str(b"/");
+    print_u64(hosted_spawned_cap as u64);
+    print_str(b"/");
+    print_u64(hosted_spawned_fails);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);

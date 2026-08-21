@@ -548,6 +548,22 @@ KUSER alias allocation or store failures. Review adjustment: KUSER alias process
 closed; continue separating diagnostic summary arrays from live runtime capacity before changing the
 process admission limit itself.
 
+A4/B3 hosted runtime table scaling cleanup (2026-08-21): hosted process runtime registration now
+uses a vector-backed `HostedProcessRuntimeTable` instead of `[Option<HostedProcessRuntime>; MAX_PI]`,
+and dynamic spawned-signal rows now use a vector of `AtomicU64` instead of
+`[AtomicU64; MAX_PI]`. Reset still provisions the current admission window before any hosted image
+registration, duplicate/invalid process indices still fail through the same registration errors, and
+the actual admission limit remains `MAX_PI` until the process-manager policy is deliberately
+changed. The pool census reports `hosted-runtime=<runtime len/cap/fail>:<spawned len/cap/fail>`.
+Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-hosted-runtime-vec-rerun-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_explorer_shell_chrome_painted`
+green, and reports `hosted-runtime=24/24/0:24/24/0`. Review adjustment: hosted process runtime
+registration backing is closed; remaining process-index arrays are now mostly diagnostic counters,
+cap-bank summaries, or explicit admission geometry and should be audited by owner before conversion.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
