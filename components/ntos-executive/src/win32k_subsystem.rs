@@ -4794,68 +4794,76 @@ extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
 
 use nt_kernel_exec::rtl_atom;
 
-/// The single arena backing every atom table this component hands out (`gAtomTable` +
-/// per-window-station tables). Lazily pool-allocated on the first `RtlCreateAtomTable`; each table
-/// is a distinct sub-region so class atoms (global table) and global atoms (winsta tables) don't
-/// collide. Each arena is 64 KiB (≈125 full-length entries — ample for system classes + user atoms).
+/// Reusable arenas backing the atom tables this component hands out (`gAtomTable` +
+/// per-window-station tables). Lazily pool-allocated on demand; each table is a distinct sub-region
+/// so class atoms (global table) and global atoms (winsta tables) don't collide. Each arena is 64 KiB
+/// (≈125 full-length entries — ample for system classes + user atoms).
 const ATOM_ARENA_BYTES: u64 = 0x10000;
-const ATOM_ARENA_CAP: usize = (WIN32K_POOL_FRAMES * 0x1000 / ATOM_ARENA_BYTES) as usize;
-const ATOM_ARENA_WORDS: usize = (ATOM_ARENA_CAP + 63) / 64;
-static ATOM_ARENA_PTRS: [AtomicU64; ATOM_ARENA_CAP] = [const { AtomicU64::new(0) }; ATOM_ARENA_CAP];
-static ATOM_ARENA_IN_USE: [AtomicU64; ATOM_ARENA_WORDS] =
-    [const { AtomicU64::new(0) }; ATOM_ARENA_WORDS];
 
-#[inline]
-fn atom_arena_bit(slot: usize) -> (usize, u64) {
-    (slot / 64, 1u64 << (slot % 64))
+#[derive(Clone, Copy)]
+struct AtomArenaRecord {
+    table: u64,
+    in_use: bool,
+}
+
+static mut ATOM_ARENAS: Option<Vec<AtomArenaRecord>> = None;
+
+fn atom_arenas_mut() -> &'static mut Vec<AtomArenaRecord> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(ATOM_ARENAS);
+        if slot.is_none() {
+            *slot = Some(Vec::new());
+        }
+        slot.as_mut().expect("initialized above")
+    }
+}
+
+fn atom_arenas() -> Option<&'static Vec<AtomArenaRecord>> {
+    unsafe { (&*core::ptr::addr_of!(ATOM_ARENAS)).as_ref() }
 }
 
 unsafe fn atom_arena_alloc() -> u64 {
-    for slot in 0..ATOM_ARENA_CAP {
-        let (word, bit) = atom_arena_bit(slot);
-        let ptr = ATOM_ARENA_PTRS[slot].load(Ordering::Acquire);
-        if ptr != 0
-            && ptr != u64::MAX
-            && ATOM_ARENA_IN_USE[word].fetch_or(bit, Ordering::AcqRel) & bit == 0
-        {
-            return ptr;
+    let arenas = atom_arenas_mut();
+    for record in arenas.iter_mut() {
+        if record.table != 0 && !record.in_use {
+            record.in_use = true;
+            return record.table;
         }
     }
-    for slot in 0..ATOM_ARENA_CAP {
-        if ATOM_ARENA_PTRS[slot]
-            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            continue;
-        }
-        let arena = pool_alloc(ATOM_ARENA_BYTES);
-        if arena == 0 {
-            ATOM_ARENA_PTRS[slot].store(0, Ordering::Release);
-            return 0;
-        }
-        ATOM_ARENA_PTRS[slot].store(arena, Ordering::Release);
-        let (word, bit) = atom_arena_bit(slot);
-        ATOM_ARENA_IN_USE[word].fetch_or(bit, Ordering::AcqRel);
-        return arena;
+    if arenas.try_reserve(1).is_err() {
+        print_str(b"[win32k-atom] ERROR: arena record allocation failed\n");
+        return 0;
     }
-    0
+    let arena = pool_alloc(ATOM_ARENA_BYTES);
+    if arena == 0 {
+        return 0;
+    }
+    arenas.push(AtomArenaRecord {
+        table: arena,
+        in_use: true,
+    });
+    arena
 }
 
 fn atom_arena_release(table: u64) -> bool {
-    for slot in 0..ATOM_ARENA_CAP {
-        if ATOM_ARENA_PTRS[slot].load(Ordering::Acquire) == table {
-            let (word, bit) = atom_arena_bit(slot);
-            return ATOM_ARENA_IN_USE[word].fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+    unsafe {
+        if let Some(arenas) = (&mut *core::ptr::addr_of_mut!(ATOM_ARENAS)).as_mut() {
+            if let Some(record) = arenas.iter_mut().find(|record| record.table == table) {
+                let was_in_use = record.in_use;
+                record.in_use = false;
+                return was_in_use;
+            }
         }
     }
     false
 }
 
 fn atom_arena_is_in_use(table: u64) -> bool {
-    for slot in 0..ATOM_ARENA_CAP {
-        if ATOM_ARENA_PTRS[slot].load(Ordering::Acquire) == table {
-            let (word, bit) = atom_arena_bit(slot);
-            return ATOM_ARENA_IN_USE[word].load(Ordering::Acquire) & bit != 0;
+    if let Some(arenas) = atom_arenas() {
+        for record in arenas {
+            if record.table == table {
+                return record.in_use;
+            }
         }
     }
     false

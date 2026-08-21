@@ -336,6 +336,22 @@ delivers all 13 username characters plus `VK_RETURN`, and emits no driver-load s
 allocation diagnostics. Review adjustment: the current driver-image loader scratch-size cap is
 closed; continue the fixed-runtime-table audit outside this loader cluster.
 
+A4/B3 win32k atom-arena scaling cleanup (2026-08-21): win32k's RTL atom-table backing arenas now
+use a reusable vector of arena records instead of a fixed bitmap/table sized from the current
+win32k pool frame count. `RtlCreateAtomTable` reuses destroyed arenas first, appends new arenas on
+demand, and fails closed with `STATUS_NO_MEMORY` plus a `[win32k-atom]` diagnostic when the arena
+record cannot be allocated. `RtlDestroyAtomTable` still rejects unknown or already-free table
+pointers before clearing the table. Local validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-win32k-atom-arena-vec-20260821.log` reaches Explorer shell chrome with `293/293`
+checks passing, keeps `exec_msgina_logon_dialog_painted`, `exec_userinit_builtin_classes_reused`,
+`exec_userinit_scrollbar_classinfo`, and `exec_explorer_shell_chrome_painted` green, records
+`class-atom-names=365 atom-name-session-serves/failures=15/0`, and emits no `[win32k-atom]`
+allocation diagnostics. Review adjustment: atom-table arena count is closed for the current desktop
+frontier; continue the runtime-table audit with the larger GUI process/thread context registry or a
+smaller ownership-local table if that registry needs preparatory refactoring.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
