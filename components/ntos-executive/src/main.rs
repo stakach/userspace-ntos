@@ -9096,13 +9096,42 @@ static IMAGE_MAP_CAP_BANK_RAW: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
 static IMAGE_MAP_CAP_BANK_CNODE: [AtomicU64; IMAGE_MAP_CAP_BANK_SEGMENTS] =
     [const { AtomicU64::new(0) }; IMAGE_MAP_CAP_BANK_SEGMENTS];
 static IMAGE_MAP_CAP_BANK_NEXT: AtomicU64 = AtomicU64::new(0);
-static IMAGE_MAP_CAP_BANK_LIVE_BY_PI: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+static IMAGE_MAP_CAP_BANK_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static mut IMAGE_MAP_CAP_BANK_LIVE_BY_PI: Vec<AtomicU64> = Vec::new();
 static IMAGE_MAP_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_TO_ROOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static IMAGE_MAP_CAP_REPLACEMENTS: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn reset_image_map_cap_bank_process_rows(slots: usize) -> bool {
+    let rows = &mut *core::ptr::addr_of_mut!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI);
+    rows.clear();
+    if rows.try_reserve(slots).is_err() {
+        IMAGE_MAP_CAP_BANK_ROW_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    while rows.len() < slots {
+        rows.push(AtomicU64::new(0));
+    }
+    true
+}
+
+unsafe fn image_map_cap_bank_live_row(pi: usize) -> Option<&'static AtomicU64> {
+    (&*core::ptr::addr_of!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI)).get(pi)
+}
+
+fn image_map_cap_bank_row_stats() -> (usize, usize, u64) {
+    unsafe {
+        let rows = &*core::ptr::addr_of!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI);
+        (
+            rows.len(),
+            rows.capacity(),
+            IMAGE_MAP_CAP_BANK_ROW_ALLOCATION_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+}
 
 unsafe fn shared_image_mapping_chunks_mut() -> &'static mut Vec<*mut SharedImageMappingChunk> {
     let slot = &mut *core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS);
@@ -9182,6 +9211,10 @@ unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImage
         return None;
     }
     let pi = pi as usize;
+    let Some(live_row) = image_map_cap_bank_live_row(pi) else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     let (next, segment, slot) = image_map_cap_bank_next_slot()?;
     let cnode = image_map_cap_bank_ensure_segment(segment as usize)?;
     let label = cnode_move_root_to_cnode_r(cnode, slot as u64, root_cap);
@@ -9192,13 +9225,17 @@ unsafe fn image_map_cap_bank_store(pi: u64, root_cap: u64) -> Option<SharedImage
     IMAGE_MAP_CAP_BANK_NEXT.store(next + 1, Ordering::Relaxed);
     recycle_deleted_root_slot(root_cap);
     IMAGE_MAP_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].fetch_add(1, Ordering::Relaxed);
+    live_row.fetch_add(1, Ordering::Relaxed);
     let live = IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     note_high_water(&IMAGE_MAP_CAP_BANK_LIVE_HW, live);
     Some(SharedImageMappingCap::Bank { cnode, slot })
 }
 
 unsafe fn image_map_cap_bank_take_root(pi: u8, cnode: u64, slot: u16) -> Result<u64, u64> {
+    let Some(live_row) = image_map_cap_bank_live_row(pi as usize) else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return Err(4);
+    };
     let Some(root_cap) = try_alloc_slot() else {
         IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
         return Err(4);
@@ -9210,15 +9247,19 @@ unsafe fn image_map_cap_bank_take_root(pi: u8, cnode: u64, slot: u16) -> Result<
         return Err(label);
     }
     IMAGE_MAP_CAP_BANK_TO_ROOT.fetch_add(1, Ordering::Relaxed);
-    IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi as usize].fetch_sub(1, Ordering::Relaxed);
+    live_row.fetch_sub(1, Ordering::Relaxed);
     IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
     Ok(root_cap)
 }
 
 unsafe fn image_map_cap_bank_delete(pi: u8, cnode: u64, slot: u16) -> bool {
+    let Some(live_row) = image_map_cap_bank_live_row(pi as usize) else {
+        IMAGE_MAP_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
     let label = cnode_delete_in_cnode_r(cnode, slot as u64);
     if label == 0 {
-        IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi as usize].fetch_sub(1, Ordering::Relaxed);
+        live_row.fetch_sub(1, Ordering::Relaxed);
         IMAGE_MAP_CAP_BANK_LIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
         true
     } else {
@@ -9314,8 +9355,9 @@ fn image_map_cap_bank_live_next_totals() -> (u64, u64) {
 
 fn image_map_cap_bank_live_process_count() -> u64 {
     let mut count = 0u64;
-    for pi in 0..MAX_PI {
-        if IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed) != 0 {
+    let rows = unsafe { &*core::ptr::addr_of!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI) };
+    for row in rows.iter() {
+        if row.load(Ordering::Relaxed) != 0 {
             count += 1;
         }
     }
@@ -9323,28 +9365,41 @@ fn image_map_cap_bank_live_process_count() -> u64 {
 }
 
 fn print_image_map_cap_bank_top_pi() {
-    let mut used = [false; MAX_PI];
+    let rows = unsafe { &*core::ptr::addr_of!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI) };
+    let mut best_pis = [usize::MAX; FRAME_REGISTRY_TOP_PI_COUNT];
+    let mut best_lives = [0u64; FRAME_REGISTRY_TOP_PI_COUNT];
+    for (pi, row) in rows.iter().enumerate() {
+        let live = row.load(Ordering::Relaxed);
+        if live == 0 {
+            continue;
+        }
+        let mut slot = 0usize;
+        while slot < FRAME_REGISTRY_TOP_PI_COUNT && live <= best_lives[slot] {
+            slot += 1;
+        }
+        if slot == FRAME_REGISTRY_TOP_PI_COUNT {
+            continue;
+        }
+        let mut move_slot = FRAME_REGISTRY_TOP_PI_COUNT - 1;
+        while move_slot > slot {
+            best_pis[move_slot] = best_pis[move_slot - 1];
+            best_lives[move_slot] = best_lives[move_slot - 1];
+            move_slot -= 1;
+        }
+        best_pis[slot] = pi;
+        best_lives[slot] = live;
+    }
     let mut printed = 0usize;
-    while printed < FRAME_REGISTRY_TOP_PI_COUNT {
-        let mut best_pi = usize::MAX;
-        let mut best_live = 0u64;
-        for pi in 0..MAX_PI {
-            let live = IMAGE_MAP_CAP_BANK_LIVE_BY_PI[pi].load(Ordering::Relaxed);
-            if !used[pi] && live > best_live {
-                best_pi = pi;
-                best_live = live;
-            }
-        }
-        if best_pi == usize::MAX || best_live == 0 {
-            break;
-        }
+    while printed < FRAME_REGISTRY_TOP_PI_COUNT
+        && best_pis[printed] != usize::MAX
+        && best_lives[printed] != 0
+    {
         if printed != 0 {
             print_str(b",");
         }
-        print_u64(best_pi as u64);
+        print_u64(best_pis[printed] as u64);
         print_str(b":");
-        print_u64(best_live);
-        used[best_pi] = true;
+        print_u64(best_lives[printed]);
         printed += 1;
     }
     if printed == 0 {
@@ -9880,6 +9935,14 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(IMAGE_MAP_CAP_BANK_TO_ROOT.load(Ordering::Relaxed));
     print_str(b" image-bank-fails=");
     print_u64(IMAGE_MAP_CAP_BANK_FAILS.load(Ordering::Relaxed));
+    let (image_bank_row_len, image_bank_row_cap, image_bank_row_fails) =
+        image_map_cap_bank_row_stats();
+    print_str(b" image-bank-rows=");
+    print_u64(image_bank_row_len as u64);
+    print_str(b"/");
+    print_u64(image_bank_row_cap as u64);
+    print_str(b"/");
+    print_u64(image_bank_row_fails);
     print_str(b" image-map-replace=");
     print_u64(IMAGE_MAP_CAP_REPLACEMENTS.load(Ordering::Relaxed));
     let (w32_bank_live, w32_bank_next, w32_bank_pis, w32_bank_segments, w32_bank_fails) =
@@ -25349,6 +25412,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // ntdll/smss will load: memory-efficient, only touched pages materialized.
     if !reset_process_vm_state(MAX_PI) {
         panic!("process VM state allocation failed");
+    }
+    if !reset_image_map_cap_bank_process_rows(MAX_PI) {
+        panic!("image map cap-bank process row allocation failed");
     }
     if !win32k_glue::reset_win32k_client_process_rows(MAX_PI) {
         panic!("win32k client process row allocation failed");

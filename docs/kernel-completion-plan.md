@@ -598,6 +598,31 @@ mapped-frame rows no longer have fixed backing storage. The remaining fixed cap-
 tables are explicit finite cap-bank geometry rather than process identity rows; audit them with the
 cap-bank allocator rather than converting them mechanically.
 
+A4/B3 shared-image cap-bank process-row scaling cleanup (2026-08-21): the `SharedImageMapping`
+cap-bank's per-process live-count table now uses reset-provisioned vector rows instead of
+`[AtomicU64; MAX_PI]`. The cap-bank segment/slot arrays remain the explicit finite cap allocator
+geometry, but process accounting now fails closed when rows are not provisioned and the top-pi
+printer no longer uses a `MAX_PI` scratch bitmap. The pool census reports
+`image-bank-rows=<len>/<cap>/<fail>`. During validation the strict credential queue gate caught a
+real ordering bug: exact GDI text readback could let RETURN post before the final username
+`WM_CHAR` was retrieved from the modal queue. The shared `nt-user-callback`
+`CredentialInjectionSequence` now requires every posted character to be retrieved from the real modal
+queue before RETURN may be posted; exact GDI text readback remains a separate proof of edit-control
+state, not a queue-drain shortcut. Local validation is green for `cargo fmt --all`,
+`cargo test -p nt-user-callback credential_injection -- --nocapture`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-image-bank-rows-vec-cred-drain-20260821.log` reaches genuine userinit/Explorer
+launch and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_explorer_shell_chrome_painted` and `exec_msgina_credential_keystrokes_delivered` green,
+reports `posted-chars=13 retrieved-chars=13 return posted/retrieved=1/1 gdi-readbacks=1`,
+`image-bank-rows=24/24/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822086`. Review adjustment:
+shared-image cap-bank per-process live-count rows no longer have fixed backing storage. The
+remaining fixed `MAX_PI` users are diagnostic row summaries (`W32_TOTAL_DISPATCH`,
+`TP_WORKER_SLOT_EVENT_TRACE`, `FrameRegistryCensus.by_pi`) or remaining live TEB-tail rows
+(`TEB2_FRAME_CAP`, `TEB_WATCH_GOOD`) and should be audited next.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.

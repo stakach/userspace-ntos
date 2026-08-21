@@ -630,9 +630,9 @@ impl CredentialInjectionSequence {
     }
 
     /// Record the posted `WM_KEYDOWN`/`VK_RETURN` that drives the dialog to its decision. Valid
-    /// only once the whole user name has been typed and the real edit control has proven it received
-    /// the text, either by returning each posted `WM_CHAR` from the modal queue or by rendering the
-    /// exact user name through the real GDI text path.
+    /// only once the whole user name has been typed and every posted `WM_CHAR` came back out of the
+    /// real modal queue. Rendering the exact user name is useful proof of edit-control state, but it
+    /// must not skip queue-drain evidence.
     pub fn record_return_post(&mut self, hwnd: u64) -> Result<(), ValidationError> {
         if self.username_hwnd == 0
             || hwnd != self.username_hwnd
@@ -708,7 +708,7 @@ impl CredentialInjectionSequence {
     }
 
     pub const fn username_ready_for_return(self) -> bool {
-        self.username_chars_delivered() || self.text_readbacks != 0
+        self.username_chars_delivered()
     }
 
     pub const fn retrieved_return(self) -> bool {
@@ -2524,7 +2524,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_injection_accepts_exact_rendered_username_before_return() {
+    fn credential_injection_keeps_rendered_username_separate_from_queue_delivery() {
         let mut injection = CredentialInjectionSequence::new();
         assert_eq!(injection.begin(0x2008c, 0x20088), Ok(()));
         for index in 0..LOGON_USERNAME.len() {
@@ -2539,6 +2539,12 @@ mod tests {
             Err(ValidationError::Sequence)
         );
         injection.record_text_readback();
+        assert!(!injection.username_ready_for_return());
+        assert_eq!(
+            injection.record_return_post(0x2008c),
+            Err(ValidationError::Sequence)
+        );
+        assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
         assert!(injection.username_ready_for_return());
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
     }
