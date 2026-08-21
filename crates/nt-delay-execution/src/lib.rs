@@ -1,5 +1,9 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Due {
     Immediate,
@@ -89,26 +93,51 @@ pub struct Waiter {
     pub badge: u64,
 }
 
-pub struct Queue<const N: usize> {
-    slots: [Option<Waiter>; N],
+pub struct Queue {
+    slots: Vec<Option<Waiter>>,
     next_sequence: u64,
+    allocation_failures: u64,
+    store_failures: u64,
 }
 
-impl<const N: usize> Queue<N> {
+impl Queue {
     pub const fn new() -> Self {
         Self {
-            slots: [None; N],
+            slots: Vec::new(),
             next_sequence: 0,
+            allocation_failures: 0,
+            store_failures: 0,
         }
     }
 
+    pub fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.slots.clear();
+        self.next_sequence = 0;
+        if self.slots.capacity() < initial_reserve {
+            let additional = initial_reserve - self.slots.capacity();
+            if self.slots.try_reserve(additional).is_err() {
+                self.allocation_failures = self.allocation_failures.saturating_add(1);
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn insert(&mut self, mut waiter: Waiter) -> Result<(), Waiter> {
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) {
+            waiter.sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            *slot = Some(waiter);
+            return Ok(());
+        }
+        if self.slots.len() == self.slots.capacity() && self.slots.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            self.store_failures = self.store_failures.saturating_add(1);
             return Err(waiter);
-        };
+        }
         waiter.sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        *slot = Some(waiter);
+        self.slots.push(Some(waiter));
         Ok(())
     }
 
@@ -144,6 +173,22 @@ impl<const N: usize> Queue<N> {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
+    pub fn records(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    pub fn allocation_failures(&self) -> u64 {
+        self.allocation_failures
+    }
+
+    pub fn store_failures(&self) -> u64 {
+        self.store_failures
+    }
+
     pub fn has_badge_other_than(&self, badge: u64) -> bool {
         self.slots
             .iter()
@@ -152,7 +197,7 @@ impl<const N: usize> Queue<N> {
     }
 }
 
-impl<const N: usize> Default for Queue<N> {
+impl Default for Queue {
     fn default() -> Self {
         Self::new()
     }
@@ -247,7 +292,7 @@ mod tests {
 
     #[test]
     fn queue_returns_due_waiters_in_deadline_then_fifo_order() {
-        let mut queue = Queue::<4>::new();
+        let mut queue = Queue::new();
         queue.insert(waiter(20, 1)).unwrap();
         queue.insert(waiter(10, 2)).unwrap();
         queue.insert(waiter(10, 3)).unwrap();
@@ -259,16 +304,22 @@ mod tests {
     }
 
     #[test]
-    fn queue_is_bounded_and_cancels_terminated_threads() {
-        let mut queue = Queue::<3>::new();
+    fn queue_grows_and_cancels_terminated_threads() {
+        let mut queue = Queue::new();
+        assert!(queue.reset(1));
         queue.insert(waiter(10, 1)).unwrap();
         queue.insert(waiter(20, 1)).unwrap();
         queue.insert(waiter(30, 2)).unwrap();
-        assert!(queue.insert(waiter(40, 3)).is_err());
+        queue.insert(waiter(40, 3)).unwrap();
+        assert_eq!(queue.records(), 4);
+        assert!(queue.capacity() >= 4);
+        assert_eq!(queue.allocation_failures(), 0);
+        assert_eq!(queue.store_failures(), 0);
         assert_eq!(queue.pop_thread(1).unwrap().thread_id, 1);
         assert_eq!(queue.pop_thread(1).unwrap().thread_id, 1);
         assert_eq!(queue.pop_thread(1), None);
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.len(), 2);
         assert_eq!(queue.pop_due(30).unwrap().thread_id, 2);
+        assert_eq!(queue.pop_due(40).unwrap().thread_id, 3);
     }
 }

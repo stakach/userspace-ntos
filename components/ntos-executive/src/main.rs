@@ -3367,7 +3367,7 @@ pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
             .unwrap_or(0)
     }
 }
-const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
+const DELAY_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
 /// ★ A bound-notification TICK that the COMPONENT PUMP absorbed, deferred to the main service loop.
 ///
@@ -3458,7 +3458,7 @@ fn watchdog_deadline() -> Option<u64> {
 /// Arm the deadman. Scoped ON once the GUI stack has produced authentic desktop pixels. From there
 /// the boot frontier includes SCM/EventLog/shell work that can block inside nested component receives;
 /// any true silence must produce diagnostics instead of leaving the run to hang.
-pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+pub(crate) unsafe fn watchdog_arm(queue: &nt_delay_execution::Queue) {
     if !EXEC_DEADMAN_WATCHDOG || WATCHDOG_ARMED.swap(1, Ordering::Relaxed) != 0 {
         return;
     }
@@ -10592,6 +10592,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b"/");
     print_u64(hosted_thread_store_fails);
     let (
+        delay_wait_live,
+        delay_wait_records,
+        delay_wait_cap,
+        delay_wait_alloc_fails,
+        delay_wait_store_fails,
+    ) = service_delay_queue_stats();
+    print_str(b" delay-wait=");
+    print_u64(delay_wait_live as u64);
+    print_str(b"/");
+    print_u64(delay_wait_records as u64);
+    print_str(b"/");
+    print_u64(delay_wait_cap as u64);
+    print_str(b"/");
+    print_u64(delay_wait_alloc_fails);
+    print_str(b"/");
+    print_u64(delay_wait_store_fails);
+    let (
         object_wait_live,
         object_wait_records,
         object_wait_cap,
@@ -15879,7 +15896,7 @@ unsafe fn delay_timer_init() -> bool {
 }
 
 unsafe fn delay_timer_next_deadline(
-    queue: &nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &nt_delay_execution::Queue,
 ) -> Option<(u64, u64)> {
     let delay_deadline = queue.next_deadline();
     let event_deadline = object_waiter_next_deadline();
@@ -15928,7 +15945,7 @@ unsafe fn delay_timer_next_deadline(
     Some((deadline, source))
 }
 
-unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue) {
     let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
     if handler == 0 {
         return;
@@ -15996,7 +16013,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
 }
 
 unsafe fn delay_timer_rearm_and_drain_overdue(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> u64 {
     delay_timer_rearm(queue);
@@ -16005,7 +16022,7 @@ unsafe fn delay_timer_rearm_and_drain_overdue(
 
 unsafe fn delay_park(
     handler: &mut ExecNtHandler,
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     deadline_100ns: u64,
     reply_cap: u64,
     resume_ip: u64,
@@ -16030,8 +16047,12 @@ unsafe fn delay_park(
         thread_id,
         badge,
     };
+    let old_capacity = queue.capacity();
     if queue.insert(waiter).is_err() {
         return false;
+    }
+    if queue.capacity() != old_capacity {
+        mark_wait_table_growth_dirty();
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
@@ -16047,7 +16068,7 @@ unsafe fn delay_park(
 
 unsafe fn delay_wake_due(
     handler: &mut ExecNtHandler,
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     now: u64,
 ) -> u64 {
     let mut woken = 0;
@@ -16150,7 +16171,7 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
 }
 
 unsafe fn delay_timer_drain_due_work(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
     now_100ns: u64,
 ) -> u64 {
@@ -16167,7 +16188,7 @@ unsafe fn delay_timer_drain_due_work(
 }
 
 pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> u64 {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 {
@@ -16425,7 +16446,7 @@ fn thread_wait_state_stats() -> (usize, usize, usize, u64, u64) {
 }
 
 unsafe fn delay_timer_interrupt(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
@@ -16525,7 +16546,7 @@ unsafe fn delay_timer_interrupt(
     delay_timer_ack_irq();
 }
 
-unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue) {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || delay_timer_next_deadline(queue).is_some()
     {
@@ -16540,7 +16561,7 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>
 }
 
 unsafe fn delay_cancel_thread(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     thread_id: u64,
 ) {
     while let Some(waiter) = queue.pop_thread(thread_id) {
@@ -17159,7 +17180,7 @@ unsafe fn pipe_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
 
 unsafe fn terminate_hosted_thread_mechanism(
     tid: u64,
-    delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> bool {
     delay_cancel_thread(delay_queue, tid);
@@ -17313,7 +17334,7 @@ unsafe fn reclaim_final_process_vm(
 unsafe fn terminate_hosted_process_mechanisms(
     process_index: u8,
     preserve_tid: Option<u64>,
-    delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> usize {
     const MAX_PROCESS_TERMINATE_TIDS: usize = 64;
@@ -30935,7 +30956,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let future = matches!(due_time(-500, 1000, 2000), Due::Monotonic100ns(1500));
         // Park/wake: a waiter is NOT due before its deadline (parked) and pops exactly at/after it
         // (woken), leaving the queue empty.
-        let mut q = Queue::<4>::new();
+        let mut q = Queue::new();
         let w = Waiter {
             deadline_100ns: 1500,
             sequence: 0,
@@ -30971,7 +30992,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // Multiplex property: waiters from DIFFERENT badges park concurrently, so while one badge
         // is parked the loop can still progress another. Wakes happen in deadline order regardless
         // of badge (the earlier-deadline badge-5 waiter wakes before the badge-3 one).
-        let mut q = Queue::<4>::new();
+        let mut q = Queue::new();
         let ins1 = q.insert(mk(2000, 1, 3)).is_ok();
         let ins2 = q.insert(mk(1000, 2, 5)).is_ok();
         let cross = q.has_badge_other_than(3) && q.has_badge_other_than(5);

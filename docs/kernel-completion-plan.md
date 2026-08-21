@@ -684,6 +684,27 @@ Explorer shell chrome with `293/293` checks passing, keeps
 bookkeeping capacity is closed. The remaining finite wait capacity is the real seL4 reply-cap pool
 plus the still-audited delay wait queue.
 
+A4/B3 delay waiter scaling cleanup (2026-08-22): `NtDelayExecution` waiter bookkeeping no longer
+uses the const-generic `Queue<DELAY_WAITER_N>` row store sized from `WAIT_REPLY_POOL_N - 1`.
+`nt-delay-execution::Queue` is now a non-generic growable vector-backed table with explicit reset,
+live/record/capacity stats, and allocation/store failure counters. It preserves the existing
+deadline-then-FIFO wake order, cancellation by hosted thread, and badge multiplex checks while
+reusing cleared rows. The SEC_IMAGE service loop pre-reserves the durable delay queue before the
+heap rewind mark, marks later successful growth through the shared wait-table dirty bit, and reports
+`delay-wait=<live>/<records>/<cap>/<alloc-fail>/<store-fail>` in pool census. Local validation is
+green for `cargo fmt --all`, `cargo test -p nt-delay-execution`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-delay-waiters-vec-20260822.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_delay_execution_park_wake`,
+`exec_delay_execution_multiplex`, `exec_delay_timer_disarms`,
+`exec_teb_not_clobbered_by_win32k`, `exec_profile_ntuser_dat_present`, and
+`exec_explorer_shell_chrome_painted` green, reports `delay-wait=1/1/808/0/0`, and commits writable
+profile state with `[writable-fs-snapshot] committed generation=5 bytes=822114`. Review adjustment:
+delay waiter record capacity is closed. The remaining finite wait capacity is the real seL4
+reply-cap pool because it owns live kernel reply objects and resume slots; treat that as a transport
+capacity redesign, not as a bookkeeping vectorization.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before

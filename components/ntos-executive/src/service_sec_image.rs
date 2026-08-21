@@ -113,7 +113,7 @@ static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
-static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue<DELAY_WAITER_N> =
+static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue =
     nt_delay_execution::Queue::new();
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -1667,20 +1667,33 @@ unsafe fn service_private_guard_page_fault(
 }
 
 #[inline(never)]
-unsafe fn reset_service_delay_queue_work() -> &'static mut nt_delay_execution::Queue<DELAY_WAITER_N>
-{
-    let slot = core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
-    core::ptr::write(slot, nt_delay_execution::Queue::<DELAY_WAITER_N>::new());
-    &mut *slot
+unsafe fn reset_service_delay_queue_work() -> Option<&'static mut nt_delay_execution::Queue> {
+    let queue = &mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK);
+    queue
+        .reset(DELAY_WAITER_INITIAL_RESERVE)
+        .then_some(queue)
+}
+
+pub(crate) fn service_delay_queue_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe {
+        let queue = &*core::ptr::addr_of!(SERVICE_DELAY_QUEUE_WORK);
+        (
+            queue.len(),
+            queue.records(),
+            queue.capacity(),
+            queue.allocation_failures(),
+            queue.store_failures(),
+        )
+    }
 }
 
 unsafe fn register_service_delay_drain_context(
     handler: &mut ExecNtHandler,
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
 ) {
     SERVICE_DELAY_DRAIN_HANDLER.store(handler as *mut ExecNtHandler as u64, Ordering::Release);
     SERVICE_DELAY_DRAIN_QUEUE.store(
-        queue as *mut nt_delay_execution::Queue<DELAY_WAITER_N> as u64,
+        queue as *mut nt_delay_execution::Queue as u64,
         Ordering::Release,
     );
 }
@@ -1699,7 +1712,7 @@ fn service_watchdog_record_crash_parked(mask: u64) {
 pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
-        as *mut nt_delay_execution::Queue<DELAY_WAITER_N>;
+        as *mut nt_delay_execution::Queue;
     if handler_ptr.is_null() || queue_ptr.is_null() || !delay_timer_init() {
         return false;
     }
@@ -1708,7 +1721,7 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
 }
 
 unsafe fn delay_timer_rearm_after_park(
-    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
     has_deadline: bool,
 ) {
@@ -1725,7 +1738,7 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     let queue_ptr = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire)
-        as *mut nt_delay_execution::Queue<DELAY_WAITER_N>;
+        as *mut nt_delay_execution::Queue;
     if handler_ptr.is_null() || queue_ptr.is_null() {
         return false;
     }
@@ -5204,7 +5217,8 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b"[sec-init] handler-ready\n");
     }
     nt_handler.register_main_thread_tcb(primary_pi, main_tcb);
-    let delay_queue = reset_service_delay_queue_work();
+    let delay_queue =
+        reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     if ntdll.is_some() {
         publish_kuser_clocks();
