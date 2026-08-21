@@ -9001,11 +9001,20 @@ struct FrameRegistryCensus {
     vad_private: u64,
     vad_reserved: u64,
     unknown: u64,
-    by_pi: [u64; MAX_PI],
+    by_pi: Vec<u64>,
+    by_pi_allocation_failed: bool,
+    by_pi_misses: u64,
 }
 
 impl FrameRegistryCensus {
-    const fn new() -> Self {
+    fn new(process_slots: usize) -> Self {
+        let mut by_pi = Vec::new();
+        let by_pi_allocation_failed = if by_pi.try_reserve(process_slots).is_err() {
+            true
+        } else {
+            by_pi.resize(process_slots, 0);
+            false
+        };
         Self {
             live: 0,
             owned: 0,
@@ -9018,13 +9027,15 @@ impl FrameRegistryCensus {
             vad_private: 0,
             vad_reserved: 0,
             unknown: 0,
-            by_pi: [0; MAX_PI],
+            by_pi,
+            by_pi_allocation_failed,
+            by_pi_misses: 0,
         }
     }
 }
 
 unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
-    let mut census = FrameRegistryCensus::new();
+    let mut census = FrameRegistryCensus::new(MAX_PI);
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
@@ -9047,11 +9058,12 @@ unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
         if core::ptr::read(aliases.add(index)) != 0 {
             census.aliases = census.aliases.saturating_add(1);
         }
-        if pi >= MAX_PI {
+        let Some(by_pi) = census.by_pi.get_mut(pi) else {
             census.unknown = census.unknown.saturating_add(1);
+            census.by_pi_misses = census.by_pi_misses.saturating_add(1);
             continue;
-        }
-        census.by_pi[pi] = census.by_pi[pi].saturating_add(1);
+        };
+        *by_pi = by_pi.saturating_add(1);
 
         if let Some(info) = process_committed_mapping_basic_information(pi as u64, page) {
             match info.type_ {
@@ -9091,17 +9103,19 @@ unsafe fn collect_frame_registry_census() -> FrameRegistryCensus {
     census
 }
 
-fn print_frame_registry_top_pi(by_pi: &[u64; MAX_PI]) {
-    let mut used = [false; MAX_PI];
+fn print_frame_registry_top_pi(by_pi: &[u64]) {
+    let mut selected = [usize::MAX; FRAME_REGISTRY_TOP_PI_COUNT];
     let mut printed = 0usize;
     while printed < FRAME_REGISTRY_TOP_PI_COUNT {
         let mut best_pi = usize::MAX;
         let mut best_count = 0u64;
-        for pi in 0..MAX_PI {
-            let count = by_pi[pi];
-            if !used[pi] && count > best_count {
+        for (pi, count) in by_pi.iter().enumerate() {
+            if selected[..printed].iter().any(|&selected_pi| selected_pi == pi) {
+                continue;
+            }
+            if *count > best_count {
                 best_pi = pi;
-                best_count = count;
+                best_count = *count;
             }
         }
         if best_pi == usize::MAX || best_count == 0 {
@@ -9113,7 +9127,7 @@ fn print_frame_registry_top_pi(by_pi: &[u64; MAX_PI]) {
         print_u64(best_pi as u64);
         print_str(b":");
         print_u64(best_count);
-        used[best_pi] = true;
+        selected[printed] = best_pi;
         printed += 1;
     }
     if printed == 0 {
@@ -9149,6 +9163,14 @@ fn print_frame_registry_census(tag: &[u8]) {
     print_u64(census.vad_reserved);
     print_str(b" unknown=");
     print_u64(census.unknown);
+    print_str(b" by-pi-rows=");
+    print_u64(census.by_pi.len() as u64);
+    print_str(b"/");
+    print_u64(census.by_pi.capacity() as u64);
+    print_str(b"/");
+    print_u64(census.by_pi_allocation_failed as u64);
+    print_str(b"/");
+    print_u64(census.by_pi_misses);
     print_str(b" top-pi=");
     print_frame_registry_top_pi(&census.by_pi);
     print_str(b"\n");

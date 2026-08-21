@@ -675,6 +675,23 @@ reports `tp-worker-event-rows=384/384/0/0`, and commits writable profile state w
 diagnostic row in this cluster is `FrameRegistryCensus.by_pi`; keep process-manager admission policy
 as its own explicit boundary.
 
+A4 diagnostic frame-registry census row cleanup (2026-08-21): `FrameRegistryCensus.by_pi` no longer
+uses fixed `[u64; MAX_PI]` scratch storage. Frame-registry census collection now allocates
+vector-backed per-process rows for the current process-slot capacity, counts allocation failures and
+row misses explicitly, and keeps the top-process summary in a bounded local top-list instead of a
+full fixed selected-process array. The census line now reports
+`by-pi-rows=<len>/<cap>/<alloc-fail>/<miss>` next to `top-pi`, so attribution gaps are visible
+without depending on a compile-time process ceiling. Local validation is green for `cargo fmt
+--all`, executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, `git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop
+proof `.tmp/run-desktop-frame-census-rows-20260821.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps `exec_teb_not_clobbered_by_win32k`,
+`exec_msgina_credential_keystrokes_delivered`, and `exec_explorer_shell_chrome_painted` green,
+reports `by-pi-rows=24/24/0/0`, and commits writable profile state with
+`[writable-fs-snapshot] committed generation=5 bytes=822600`. Review adjustment: this closes the
+remaining fixed diagnostic row cluster from the process-slot scaling pass; process-manager admission
+tables remain a separate explicit policy boundary rather than diagnostic scratch.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
