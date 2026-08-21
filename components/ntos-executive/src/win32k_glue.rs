@@ -4,6 +4,7 @@
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicU8;
 
 const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
@@ -100,7 +101,6 @@ static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
     nt_user_callback::ActiveCallbackStack::new();
-const USER_CALLBACK_CLIENT_REGISTRY_CAP: usize = MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS) + 16;
 
 #[derive(Clone, Copy)]
 struct UserCallbackClientRecord {
@@ -108,8 +108,20 @@ struct UserCallbackClientRecord {
     client: crate::spawn_hosts::UserCallbackClient,
 }
 
-static mut USER_CALLBACK_CLIENT_REGISTRY: [Option<UserCallbackClientRecord>;
-    USER_CALLBACK_CLIENT_REGISTRY_CAP] = [None; USER_CALLBACK_CLIENT_REGISTRY_CAP];
+static mut USER_CALLBACK_CLIENT_REGISTRY: Option<Vec<UserCallbackClientRecord>> = None;
+
+unsafe fn user_callback_client_registry_mut() -> &'static mut Vec<UserCallbackClientRecord> {
+    let slot = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn user_callback_client_registry() -> Option<&'static Vec<UserCallbackClientRecord>> {
+    (&*core::ptr::addr_of!(USER_CALLBACK_CLIENT_REGISTRY)).as_ref()
+}
+
 static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequence =
     nt_user_callback::SasWmCreateNestedSequence::new();
 static USER_CALLBACK_SAS_SEQUENCE_ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -310,32 +322,20 @@ unsafe fn register_user_callback_client_for_dispatch(
     if dispatch_id == 0 || !user_callback_client_can_register(client) {
         return false;
     }
-    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
-    let mut empty = None;
-    for (index, slot) in registry.iter_mut().enumerate() {
-        match slot {
-            Some(record)
-                if user_callback_client_record_matches(
-                    record,
-                    dispatch_id,
-                    client.pi,
-                    client.tid,
-                    client.badge,
-                ) =>
-            {
-                record.client = client;
-                return true;
-            }
-            Some(_) => {}
-            None if empty.is_none() => empty = Some(index),
-            None => {}
+    let registry = user_callback_client_registry_mut();
+    for record in registry.iter_mut() {
+        if user_callback_client_record_matches(
+            record,
+            dispatch_id,
+            client.pi,
+            client.tid,
+            client.badge,
+        ) {
+            record.client = client;
+            return true;
         }
     }
-    let Some(index) = empty else {
-        USER_CALLBACK_CLIENT_LOOKUP_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    registry[index] = Some(UserCallbackClientRecord {
+    registry.push(UserCallbackClientRecord {
         dispatch_id,
         client,
     });
@@ -348,29 +348,28 @@ unsafe fn unregister_user_callback_client_for_dispatch(
     client_tid: u64,
     client_badge: u64,
 ) {
-    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
-    for slot in registry.iter_mut() {
-        if slot.is_some_and(|record| {
-            user_callback_client_record_matches(
-                &record,
-                dispatch_id,
-                client_pi,
-                client_tid,
-                client_badge,
-            )
-        }) {
-            *slot = None;
+    let registry = user_callback_client_registry_mut();
+    let mut index = 0usize;
+    while index < registry.len() {
+        if user_callback_client_record_matches(
+            &registry[index],
+            dispatch_id,
+            client_pi,
+            client_tid,
+            client_badge,
+        ) {
+            registry.swap_remove(index);
             return;
         }
+        index += 1;
     }
 }
 
 unsafe fn user_callback_client_for_request(
     request: &nt_user_callback::CallbackHeader,
 ) -> Option<crate::spawn_hosts::UserCallbackClient> {
-    let registry = &*core::ptr::addr_of!(USER_CALLBACK_CLIENT_REGISTRY);
-    registry.iter().find_map(|slot| {
-        let record = slot.as_ref()?;
+    let registry = user_callback_client_registry()?;
+    registry.iter().find_map(|record| {
         user_callback_client_record_matches(
             record,
             request.dispatch_id,
@@ -383,9 +382,8 @@ unsafe fn user_callback_client_for_request(
 }
 
 unsafe fn clear_user_callback_client_registry() {
-    let registry = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY);
-    for slot in registry.iter_mut() {
-        *slot = None;
+    if let Some(registry) = (*core::ptr::addr_of_mut!(USER_CALLBACK_CLIENT_REGISTRY)).as_mut() {
+        registry.clear();
     }
 }
 

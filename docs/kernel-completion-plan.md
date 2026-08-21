@@ -238,6 +238,21 @@ the final profile source proof to `files=32 bytes=135989 ntuser.dat=130682B`. Re
 the static staged-file copy-size cap is closed; future profile/config work should target durability
 or hive semantics rather than copy-buffer sizing.
 
+A4/B3 user-callback client registry scaling cleanup (2026-08-21): the executive-side win32k
+user-callback client registry now grows as a vector of live dispatch/client records instead of a
+fixed array sized from process/thread slot constants. Registration still requires real client
+identity, updates matching dispatch records in place, lookup remains scoped by dispatch id plus
+client process/thread/badge, and unregister removes the completed record. Local validation is green
+for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+x86_64-unknown-none`, and `git diff --check`. Serialized desktop proof
+`.tmp/run-headless-user-callback-registry-vec-20260821.log` reaches Explorer shell chrome with
+`293/293` checks passing, keeps `exec_msgina_modal_paint_prefix`,
+`exec_explorer_user_callbacks_redirected`, and `exec_explorer_wndproc_installed_by_client` green,
+and reports `ucb-redirects=893 ucb-returns=893` with Explorer callback failures still zero. Review
+adjustment: callback client registration capacity is closed; remaining user-callback work should
+target actual callback semantics or continuation-stack behavior.
+
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
 shadow synchronization and a dependent scratch `BytesTransferred` cell copied back to provider NDIS.
