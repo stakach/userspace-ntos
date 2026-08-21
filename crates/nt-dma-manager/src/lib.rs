@@ -396,7 +396,11 @@ impl DmaManager {
             .map(|decoded| decoded.0)
     }
 
-    fn decode_owner_logical_with_kind(
+    /// Owner-scoped logical decode with the backing range class. Device models use
+    /// this when their behavior must distinguish persistent common buffers from
+    /// one-shot packet-transfer mappings while preserving the same IOMMU boundary as
+    /// [`Self::decode_owner_logical`].
+    pub fn decode_owner_logical_with_kind(
         &self,
         owner: DmaOwner,
         logical: u64,
@@ -883,6 +887,29 @@ mod tests {
         );
         d.free_common_buffer(owner_b, 0x1000, 4096).unwrap();
         assert_eq!(d.decode_owner_logical(owner_a, 0x1000, 4), Ok(0x2_0000));
+    }
+
+    #[test]
+    fn owner_decode_reports_range_kind() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 4096, true);
+        d.register_common_buffer_at(owner(), adapter, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+        d.register_mapping_at(owner(), adapter, 0x3000, 512, 1024)
+            .unwrap();
+
+        assert_eq!(
+            d.decode_owner_logical_with_kind(owner(), 0x1100, 16),
+            Ok((0x2_0100, DmaLogicalRangeKind::CommonBuffer))
+        );
+        assert_eq!(
+            d.decode_owner_logical_with_kind(owner(), 0x3200, 16),
+            Ok((1024, DmaLogicalRangeKind::TransferMapping))
+        );
+        assert_eq!(
+            d.decode_owner_logical_with_kind(DmaOwner::new(1, 12), 0x3200, 16),
+            Err(DmaError::LogicalViolation)
+        );
     }
 
     #[test]

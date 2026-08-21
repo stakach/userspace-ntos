@@ -344,6 +344,19 @@ pub(crate) struct HostedPnpStartReport {
     pub(crate) dma_device_rx_completion_count: u64,
     pub(crate) dma_device_interrupt_cause_count: u64,
     pub(crate) dma_device_model_failure_count: u64,
+    pub(crate) dma_tx_window_observation_count: u64,
+    pub(crate) dma_tx_window_enabled_count: u64,
+    pub(crate) dma_tx_window_ring_ready_count: u64,
+    pub(crate) dma_tx_window_posted_count: u64,
+    pub(crate) dma_tx_window_idle_count: u64,
+    pub(crate) dma_tx_descriptor_candidate_count: u64,
+    pub(crate) dma_tx_descriptor_map_candidate_count: u64,
+    pub(crate) dma_tx_descriptor_done_seen_count: u64,
+    pub(crate) dma_tx_last_candidate_address: u64,
+    pub(crate) dma_tx_last_candidate_len: u64,
+    pub(crate) dma_tx_last_candidate_status: u64,
+    pub(crate) dma_tx_last_head: u64,
+    pub(crate) dma_tx_last_tail: u64,
     pub(crate) io_port_out32_count: u64,
     pub(crate) root_started_count: u64,
     pub(crate) video_route_attempted_count: u64,
@@ -695,6 +708,13 @@ unsafe fn inject_proof_interrupt(
                             report.interrupt_acknowledged_count += 1;
                         }
                     }
+                    match driver_launch::redrive_hosted_device_tx_interrupt(device_id) {
+                        Ok(_) => {}
+                        Err(status) => {
+                            print_interrupt_delivery_failure(trace, status);
+                            remember_error(report, status);
+                        }
+                    }
                     print_interrupt_delivery(trace, service_name, instance_id, delivery, ack);
                 }
                 Err(status) => {
@@ -728,6 +748,9 @@ fn collect_hardware_evidence(
     start_status_raw: u32,
     report: &mut HostedPnpStartReport,
 ) {
+    if let Err(status) = unsafe { driver_launch::redrive_hosted_device_tx_interrupt(device_id) } {
+        remember_error(report, status);
+    }
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
         if evidence.resource_granted() {
             report.resource_granted = true;
@@ -783,6 +806,41 @@ fn collect_hardware_evidence(
             report.dma_device_model_failure_count = report
                 .dma_device_model_failure_count
                 .saturating_add(evidence.dma_device_model_failures);
+            report.dma_tx_window_observation_count = report
+                .dma_tx_window_observation_count
+                .saturating_add(evidence.dma_tx_window_observations);
+            report.dma_tx_window_enabled_count = report
+                .dma_tx_window_enabled_count
+                .saturating_add(evidence.dma_tx_window_enabled);
+            report.dma_tx_window_ring_ready_count = report
+                .dma_tx_window_ring_ready_count
+                .saturating_add(evidence.dma_tx_window_ring_ready);
+            report.dma_tx_window_posted_count = report
+                .dma_tx_window_posted_count
+                .saturating_add(evidence.dma_tx_window_posted);
+            report.dma_tx_window_idle_count = report
+                .dma_tx_window_idle_count
+                .saturating_add(evidence.dma_tx_window_idle);
+            report.dma_tx_descriptor_candidate_count = report
+                .dma_tx_descriptor_candidate_count
+                .saturating_add(evidence.dma_tx_descriptor_candidates);
+            report.dma_tx_descriptor_map_candidate_count = report
+                .dma_tx_descriptor_map_candidate_count
+                .saturating_add(evidence.dma_tx_descriptor_map_candidates);
+            report.dma_tx_descriptor_done_seen_count = report
+                .dma_tx_descriptor_done_seen_count
+                .saturating_add(evidence.dma_tx_descriptor_done_seen);
+            if evidence.dma_tx_descriptor_candidates != 0
+                || evidence.dma_tx_descriptor_done_seen != 0
+            {
+                report.dma_tx_last_candidate_address = evidence.dma_tx_last_candidate_address;
+                report.dma_tx_last_candidate_len = evidence.dma_tx_last_candidate_len;
+                report.dma_tx_last_candidate_status = evidence.dma_tx_last_candidate_status;
+            }
+            if evidence.dma_tx_window_observations != 0 {
+                report.dma_tx_last_head = evidence.dma_tx_last_head;
+                report.dma_tx_last_tail = evidence.dma_tx_last_tail;
+            }
             if evidence.io_port_out32_serviced() {
                 report.io_port_out32_count += 1;
             }
@@ -1064,6 +1122,32 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_device_interrupt_causes);
     print_str(b"/");
     print_u64(evidence.dma_device_model_failures);
+    print_str(b" dma_tx_window=");
+    print_u64(evidence.dma_tx_window_observations);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_window_enabled);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_window_ring_ready);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_window_posted);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_window_idle);
+    print_str(b" dma_tx_head/tail=");
+    print_u64(evidence.dma_tx_last_head);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_last_tail);
+    print_str(b" dma_tx_candidates/map/done=");
+    print_u64(evidence.dma_tx_descriptor_candidates);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_descriptor_map_candidates);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_descriptor_done_seen);
+    print_str(b" dma_tx_last_desc=0x");
+    print_hex(evidence.dma_tx_last_candidate_address as u32);
+    print_str(b"/");
+    print_u64(evidence.dma_tx_last_candidate_len);
+    print_str(b"/0x");
+    print_hex(evidence.dma_tx_last_candidate_status as u32);
     print_str(b"\n");
 
     print_hardware_evidence_prefix(trace, service_name, instance_id, b"io");

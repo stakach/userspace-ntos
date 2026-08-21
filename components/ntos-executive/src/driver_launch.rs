@@ -28,7 +28,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use nt_compat_exports::DriverExportRegistry;
-use nt_dma_manager::{DmaError, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout};
+use nt_dma_manager::{
+    DmaError, DmaLogicalRangeKind, DmaManager as HostedDmaManager, DmaOwner, FixedDescriptorLayout,
+};
 use nt_hosted_runtime::{
     classify_hosted_provider_domain, encode_hosted_provider_callback_thunk,
     encode_hosted_provider_import_thunk, hosted_provider_export_marshal_policy,
@@ -26797,6 +26799,19 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_device_rx_completions: u64,
     pub dma_device_interrupt_causes: u64,
     pub dma_device_model_failures: u64,
+    pub dma_tx_window_observations: u64,
+    pub dma_tx_window_enabled: u64,
+    pub dma_tx_window_ring_ready: u64,
+    pub dma_tx_window_posted: u64,
+    pub dma_tx_window_idle: u64,
+    pub dma_tx_descriptor_candidates: u64,
+    pub dma_tx_descriptor_map_candidates: u64,
+    pub dma_tx_descriptor_done_seen: u64,
+    pub dma_tx_last_candidate_address: u64,
+    pub dma_tx_last_candidate_len: u64,
+    pub dma_tx_last_candidate_status: u64,
+    pub dma_tx_last_head: u64,
+    pub dma_tx_last_tail: u64,
     pub root_pdo_started: bool,
     pub video_initialized: bool,
     pub video_find_adapter_calls: u64,
@@ -27428,6 +27443,19 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             dma_device_rx_completions: 0,
             dma_device_interrupt_causes: 0,
             dma_device_model_failures: 0,
+            dma_tx_window_observations: 0,
+            dma_tx_window_enabled: 0,
+            dma_tx_window_ring_ready: 0,
+            dma_tx_window_posted: 0,
+            dma_tx_window_idle: 0,
+            dma_tx_descriptor_candidates: 0,
+            dma_tx_descriptor_map_candidates: 0,
+            dma_tx_descriptor_done_seen: 0,
+            dma_tx_last_candidate_address: 0,
+            dma_tx_last_candidate_len: 0,
+            dma_tx_last_candidate_status: 0,
+            dma_tx_last_head: 0,
+            dma_tx_last_tail: 0,
             root_pdo_started,
             video_initialized: read_volatile((sh + SH_VIDEO_PORT_INITIALIZED) as *const u32) != 0,
             video_find_adapter_calls: read_volatile(
@@ -27471,6 +27499,20 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         evidence.dma_device_rx_completions = previous.evidence.dma_device_rx_completions;
         evidence.dma_device_interrupt_causes = previous.evidence.dma_device_interrupt_causes;
         evidence.dma_device_model_failures = previous.evidence.dma_device_model_failures;
+        evidence.dma_tx_window_observations = previous.evidence.dma_tx_window_observations;
+        evidence.dma_tx_window_enabled = previous.evidence.dma_tx_window_enabled;
+        evidence.dma_tx_window_ring_ready = previous.evidence.dma_tx_window_ring_ready;
+        evidence.dma_tx_window_posted = previous.evidence.dma_tx_window_posted;
+        evidence.dma_tx_window_idle = previous.evidence.dma_tx_window_idle;
+        evidence.dma_tx_descriptor_candidates = previous.evidence.dma_tx_descriptor_candidates;
+        evidence.dma_tx_descriptor_map_candidates =
+            previous.evidence.dma_tx_descriptor_map_candidates;
+        evidence.dma_tx_descriptor_done_seen = previous.evidence.dma_tx_descriptor_done_seen;
+        evidence.dma_tx_last_candidate_address = previous.evidence.dma_tx_last_candidate_address;
+        evidence.dma_tx_last_candidate_len = previous.evidence.dma_tx_last_candidate_len;
+        evidence.dma_tx_last_candidate_status = previous.evidence.dma_tx_last_candidate_status;
+        evidence.dma_tx_last_head = previous.evidence.dma_tx_last_head;
+        evidence.dma_tx_last_tail = previous.evidence.dma_tx_last_tail;
     }
     HostedDeviceResourceState {
         device_id: binding.device_id,
@@ -28035,6 +28077,19 @@ struct HostedDmaPacketModelReport {
     rx_completed: u64,
     interrupt_causes: u64,
     failures: u64,
+    tx_window_observations: u64,
+    tx_window_enabled: u64,
+    tx_window_ring_ready: u64,
+    tx_window_posted: u64,
+    tx_window_idle: u64,
+    tx_descriptor_candidates: u64,
+    tx_descriptor_map_candidates: u64,
+    tx_descriptor_done_seen: u64,
+    tx_last_candidate_address: u64,
+    tx_last_candidate_len: u64,
+    tx_last_candidate_status: u64,
+    tx_last_head: u64,
+    tx_last_tail: u64,
 }
 
 impl HostedDmaPacketModelReport {
@@ -28043,6 +28098,9 @@ impl HostedDmaPacketModelReport {
             && self.rx_completed == 0
             && self.interrupt_causes == 0
             && self.failures == 0
+            && self.tx_window_observations == 0
+            && self.tx_descriptor_candidates == 0
+            && self.tx_descriptor_done_seen == 0
     }
 
     fn merge(&mut self, other: Self) {
@@ -28050,6 +28108,35 @@ impl HostedDmaPacketModelReport {
         self.rx_completed = self.rx_completed.saturating_add(other.rx_completed);
         self.interrupt_causes |= other.interrupt_causes;
         self.failures = self.failures.saturating_add(other.failures);
+        self.tx_window_observations = self
+            .tx_window_observations
+            .saturating_add(other.tx_window_observations);
+        self.tx_window_enabled = self
+            .tx_window_enabled
+            .saturating_add(other.tx_window_enabled);
+        self.tx_window_ring_ready = self
+            .tx_window_ring_ready
+            .saturating_add(other.tx_window_ring_ready);
+        self.tx_window_posted = self.tx_window_posted.saturating_add(other.tx_window_posted);
+        self.tx_window_idle = self.tx_window_idle.saturating_add(other.tx_window_idle);
+        self.tx_descriptor_candidates = self
+            .tx_descriptor_candidates
+            .saturating_add(other.tx_descriptor_candidates);
+        self.tx_descriptor_map_candidates = self
+            .tx_descriptor_map_candidates
+            .saturating_add(other.tx_descriptor_map_candidates);
+        self.tx_descriptor_done_seen = self
+            .tx_descriptor_done_seen
+            .saturating_add(other.tx_descriptor_done_seen);
+        if other.tx_descriptor_candidates != 0 || other.tx_descriptor_done_seen != 0 {
+            self.tx_last_candidate_address = other.tx_last_candidate_address;
+            self.tx_last_candidate_len = other.tx_last_candidate_len;
+            self.tx_last_candidate_status = other.tx_last_candidate_status;
+        }
+        if other.tx_window_observations != 0 {
+            self.tx_last_head = other.tx_last_head;
+            self.tx_last_tail = other.tx_last_tail;
+        }
     }
 }
 
@@ -28352,6 +28439,48 @@ unsafe fn write_hosted_e1000_rx_stimulus_frame(
     frame[38..42].copy_from_slice(&config.target_ip);
 }
 
+unsafe fn complete_hosted_e1000_tx_descriptor_if_mapped(
+    binding: HostedDeviceBinding,
+    ring_logical: u64,
+    ring_component_va: u64,
+    ring: &mut [u8],
+    index: usize,
+    report: &mut HostedDmaPacketModelReport,
+) -> Result<bool, DmaError> {
+    let base = index * HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
+    let address = read_unaligned((ring.as_ptr().add(base)) as *const u64);
+    let length = read_unaligned((ring.as_ptr().add(base + 8)) as *const u16);
+    let status = read_unaligned((ring.as_ptr().add(base + 12)) as *const u8);
+    if address == 0 || length == 0 {
+        return Ok(false);
+    }
+    report.tx_last_candidate_address = address;
+    report.tx_last_candidate_len = length as u64;
+    report.tx_last_candidate_status = status as u64;
+    if status & E1000_TX_DESCRIPTOR_DONE != 0 {
+        report.tx_descriptor_done_seen = report.tx_descriptor_done_seen.saturating_add(1);
+        return Ok(false);
+    }
+    report.tx_descriptor_candidates = report.tx_descriptor_candidates.saturating_add(1);
+    let Ok((_, DmaLogicalRangeKind::TransferMapping)) = hosted_dma_manager_mut()
+        .decode_owner_logical_with_kind(hosted_dma_owner(binding), address, length as u64)
+    else {
+        return Ok(false);
+    };
+    report.tx_descriptor_map_candidates = report.tx_descriptor_map_candidates.saturating_add(1);
+    hosted_dma_manager_mut().complete_fixed_descriptor_at(
+        hosted_dma_owner(binding),
+        ring_logical,
+        ring_component_va,
+        ring,
+        HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT,
+        index,
+        None,
+        E1000_TX_DESCRIPTOR_DONE,
+    )?;
+    Ok(true)
+}
+
 unsafe fn drive_hosted_e1000_tx_descriptors(
     binding: HostedDeviceBinding,
     state: HostedDeviceResourceState,
@@ -28359,14 +28488,18 @@ unsafe fn drive_hosted_e1000_tx_descriptors(
 ) -> HostedDmaPacketModelReport {
     let mut report = HostedDmaPacketModelReport::default();
     let tctl = hosted_mmio_read_u32(state, E1000_REG_TCTL).unwrap_or(0);
-    if tctl & E1000_TCTL_EN == 0 {
-        return report;
-    }
     let ring_logical =
         hosted_mmio_read_u64_split(state, E1000_REG_TDBAL, E1000_REG_TDBAH).unwrap_or(0);
     let ring_len = hosted_mmio_read_u32(state, E1000_REG_TDLEN).unwrap_or(0) as u64;
     let head = hosted_mmio_read_u32(state, E1000_REG_TDH).unwrap_or(0) as usize;
     let tail = hosted_mmio_read_u32(state, E1000_REG_TDT).unwrap_or(0) as usize;
+    report.tx_window_observations = 1;
+    report.tx_last_head = head as u64;
+    report.tx_last_tail = tail as u64;
+    if tctl & E1000_TCTL_EN == 0 {
+        return report;
+    }
+    report.tx_window_enabled = 1;
     let Some((ring_component_va, ring_alias_va)) = hosted_dma_record_alias_for_logical_range(
         sh,
         state,
@@ -28386,31 +28519,57 @@ unsafe fn drive_hosted_e1000_tx_descriptors(
         report.failures = report.failures.saturating_add(1);
         return report;
     }
+    report.tx_window_ring_ready = 1;
     let ring = core::slice::from_raw_parts_mut(ring_alias_va as *mut u8, ring_len as usize);
+    if head == tail {
+        report.tx_window_idle = 1;
+        if head != 0 || tail != 0 {
+            let mut index = 0usize;
+            while index < descriptor_count {
+                match complete_hosted_e1000_tx_descriptor_if_mapped(
+                    binding,
+                    ring_logical,
+                    ring_component_va,
+                    ring,
+                    index,
+                    &mut report,
+                ) {
+                    Ok(true) => {
+                        report.tx_completed = report.tx_completed.saturating_add(1);
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        report.failures = report.failures.saturating_add(1);
+                        break;
+                    }
+                }
+                index += 1;
+            }
+            if report.tx_completed != 0 {
+                report.interrupt_causes |= (E1000_IMS_TXDW | E1000_IMS_TXQE) as u64;
+            }
+        }
+        return report;
+    }
+    report.tx_window_posted = 1;
     let mut index = head;
     let mut visited = 0usize;
     while index != tail && visited < descriptor_count {
-        let base = index * HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT.stride;
-        let address = read_unaligned((ring.as_ptr().add(base)) as *const u64);
-        let length = read_unaligned((ring.as_ptr().add(base + 8)) as *const u16);
-        if address != 0 && length != 0 {
-            match hosted_dma_manager_mut().complete_fixed_descriptor_at(
-                hosted_dma_owner(binding),
-                ring_logical,
-                ring_component_va,
-                ring,
-                HOSTED_DMA_PACKET_DESCRIPTOR_LAYOUT,
-                index,
-                None,
-                E1000_TX_DESCRIPTOR_DONE,
-            ) {
-                Ok(_) => {
-                    report.tx_completed = report.tx_completed.saturating_add(1);
-                }
-                Err(_) => {
-                    report.failures = report.failures.saturating_add(1);
-                    break;
-                }
+        match complete_hosted_e1000_tx_descriptor_if_mapped(
+            binding,
+            ring_logical,
+            ring_component_va,
+            ring,
+            index,
+            &mut report,
+        ) {
+            Ok(true) => {
+                report.tx_completed = report.tx_completed.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                report.failures = report.failures.saturating_add(1);
+                break;
             }
         }
         index = (index + 1) % descriptor_count;
@@ -28572,7 +28731,70 @@ unsafe fn record_hosted_dma_packet_model_report(
             .evidence
             .dma_device_model_failures
             .saturating_add(report.failures);
+        state.evidence.dma_tx_window_observations = state
+            .evidence
+            .dma_tx_window_observations
+            .saturating_add(report.tx_window_observations);
+        state.evidence.dma_tx_window_enabled = state
+            .evidence
+            .dma_tx_window_enabled
+            .saturating_add(report.tx_window_enabled);
+        state.evidence.dma_tx_window_ring_ready = state
+            .evidence
+            .dma_tx_window_ring_ready
+            .saturating_add(report.tx_window_ring_ready);
+        state.evidence.dma_tx_window_posted = state
+            .evidence
+            .dma_tx_window_posted
+            .saturating_add(report.tx_window_posted);
+        state.evidence.dma_tx_window_idle = state
+            .evidence
+            .dma_tx_window_idle
+            .saturating_add(report.tx_window_idle);
+        state.evidence.dma_tx_descriptor_candidates = state
+            .evidence
+            .dma_tx_descriptor_candidates
+            .saturating_add(report.tx_descriptor_candidates);
+        state.evidence.dma_tx_descriptor_map_candidates = state
+            .evidence
+            .dma_tx_descriptor_map_candidates
+            .saturating_add(report.tx_descriptor_map_candidates);
+        state.evidence.dma_tx_descriptor_done_seen = state
+            .evidence
+            .dma_tx_descriptor_done_seen
+            .saturating_add(report.tx_descriptor_done_seen);
+        if report.tx_descriptor_candidates != 0 || report.tx_descriptor_done_seen != 0 {
+            state.evidence.dma_tx_last_candidate_address = report.tx_last_candidate_address;
+            state.evidence.dma_tx_last_candidate_len = report.tx_last_candidate_len;
+            state.evidence.dma_tx_last_candidate_status = report.tx_last_candidate_status;
+        }
+        if report.tx_window_observations != 0 {
+            state.evidence.dma_tx_last_head = report.tx_last_head;
+            state.evidence.dma_tx_last_tail = report.tx_last_tail;
+        }
     }
+}
+
+pub(crate) unsafe fn redrive_hosted_device_tx_interrupt(
+    device_id: u64,
+) -> Result<bool, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if !inst.ready {
+        return Err(nt_status::NtStatus(0xC000_00A3u32 as i32)); // STATUS_DEVICE_NOT_READY
+    }
+
+    let sh = inst.exec_shared_va;
+    let state = restore_hosted_device_resource_state(binding, sh, false)?;
+    let report = drive_hosted_e1000_tx_packet_model(binding, state, sh)?;
+    let redrive_needed = report.interrupt_causes != 0;
+    record_hosted_dma_packet_model_report(device_id, report);
+    if redrive_needed {
+        let _ = dispatch_hosted_device_interrupt_once(binding, sh)?;
+    }
+    Ok(redrive_needed)
 }
 
 pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareEvidence> {

@@ -74,18 +74,20 @@ boots with two generated E1000 NICs, the extern rootserver discovers nine live d
 (architectural MMIO plus two E1000 BARs and the shifted AHCI BARs), both E1000 devnodes run
 AddDevice/StartDevice through the generic path, provider sharing reports `exports=91/91` with
 zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrome paints with
-`292/292` checks passing. The remaining B3 packet frontier is true TX traffic from the real stack
-and live proof of packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`.
-Latest B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
+`292/292` checks passing. With real TX traffic now accepted below, the remaining B3 packet frontier
+is live proof of packet-array receive with a miniport that reaches `MiniIndicateReceivePacket`.
+Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
-send callbacks, and hardware-bound packet completion exports request DMA copyback so SG-map release
-stays in the same validated record model. Serialized desktop proof
-`.tmp/run-desktop-b3-provider-dma-send-copyback-20260821.log` remains fully green with `292/292` and
-Explorer shell chrome painted. The proof advances the B3 evidence from no transfer mapping to a real
-TX-ring map-transfer observation (`dma_desc_common/map=128/1`) while preserving E1000 RX
-(`dma_dev_tx/rx=0/1`) and zero provider rejections. The active gap is now descriptor completion over
-the real E1000 tail/head window: the packet is mapped and a TX descriptor is visible, but the hosted
-packet model has not yet completed it as device TX.
+send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
+owner-scoped DMA manager `TransferMapping` classifier instead of a provider-shared VA alias. Local
+validation is green: `cargo fmt --all`, `cargo test -p nt-dma-manager`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and
+`git diff --check`. Serialized desktop proof
+`.tmp/run-desktop-b3-tx-manager-kind-20260821.log` reaches Explorer shell chrome with `292/292`,
+keeps `pci_provider_exports=44/44` with zero rejections, and advances the real E1000 data-plane
+evidence to `dma_desc_common/map=128/1`, `dma_desc_done_map=1`, and `dma_dev_tx/rx=1/1`. The
+remaining B3 packet frontier is live packet-array receive proof through the internal NDIS receive
+indication route, not TX descriptor completion.
 
 B3 transfer-data transport slice (2026-08-18): the provider-domain NDIS transport now has the
 real six-argument miniport `TransferData` callback path, including dependent-domain packet/MDL/data
@@ -8294,6 +8296,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     below SG creation: the TX descriptor is visible in the ring, but `dma_dev_tx/rx` is still `0/1`,
     so the next slice should inspect and fix the real E1000 `TDH`/`TDT` completion window without
     adding send-success or packet-specific fallbacks.
+    Provider DMA TX completion follow-up (2026-08-21): the first diagnostic rerun
+    `.tmp/run-desktop-b3-tx-candidates-20260821.log` kept the desktop proof green with `292/292` and
+    showed the completion miss was not ring timing: the E1000 model saw real TX descriptor
+    candidates (`dma_tx_candidates/map/done=3/0/0`, last logical `0x43000`, length `60`) while the
+    provider-shared VA alias guard rejected the live map-transfer record. The accepted fix exposes
+    `nt-dma-manager::DmaManager::decode_owner_logical_with_kind` as a tested public owner-scoped
+    query and has the E1000 TX completion path require `DmaLogicalRangeKind::TransferMapping` through
+    that canonical DMA decoder before writing descriptor DD. This keeps the same fail-closed IOMMU
+    boundary used by descriptor observation/completion and removes the incorrect dependency on
+    provider-local shared VAs. Validation: `cargo fmt --all`, `cargo test -p nt-dma-manager`,
+    executive `cargo check --manifest-path components/ntos-executive/Cargo.toml --target
+    x86_64-unknown-none`, `git diff --check`, and serialized desktop proof
+    `.tmp/run-desktop-b3-tx-manager-kind-20260821.log`, which reaches Explorer shell chrome with
+    `292/292`, keeps `pci_provider_exports=44/44` with zero rejections, and proves real TX completion:
+    `dma_desc_done_map=1`, `dma_dev_tx/rx=1/1`, and `dma_tx_candidates/map/done=1/1/2`. Review
+    adjustment: B3's remaining packet work is live packet-array receive indication through the
+    provider/internal NDIS route; true TCPIP-originated E1000 TX is no longer the blocker.
   - `[~]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

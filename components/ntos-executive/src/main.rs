@@ -27492,6 +27492,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_dma_device_rx_completion_count = 0u64;
     let mut generic_hw_dma_device_interrupt_cause_count = 0u64;
     let mut generic_hw_dma_device_model_failure_count = 0u64;
+    let mut generic_hw_dma_tx_window_observation_count = 0u64;
+    let mut generic_hw_dma_tx_window_enabled_count = 0u64;
+    let mut generic_hw_dma_tx_window_ring_ready_count = 0u64;
+    let mut generic_hw_dma_tx_window_posted_count = 0u64;
+    let mut generic_hw_dma_tx_window_idle_count = 0u64;
+    let mut generic_hw_dma_tx_descriptor_candidate_count = 0u64;
+    let mut generic_hw_dma_tx_descriptor_map_candidate_count = 0u64;
+    let mut generic_hw_dma_tx_descriptor_done_seen_count = 0u64;
+    let mut generic_hw_dma_tx_last_candidate_address = 0u64;
+    let mut generic_hw_dma_tx_last_candidate_len = 0u64;
+    let mut generic_hw_dma_tx_last_candidate_status = 0u64;
+    let mut generic_hw_dma_tx_last_head = 0u64;
+    let mut generic_hw_dma_tx_last_tail = 0u64;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
@@ -27638,6 +27651,49 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         generic_hw_dma_device_model_failure_count =
                             generic_hw_dma_device_model_failure_count
                                 .saturating_add(start_report.dma_device_model_failure_count);
+                        generic_hw_dma_tx_window_observation_count =
+                            generic_hw_dma_tx_window_observation_count.saturating_add(
+                                start_report.dma_tx_window_observation_count,
+                            );
+                        generic_hw_dma_tx_window_enabled_count =
+                            generic_hw_dma_tx_window_enabled_count
+                                .saturating_add(start_report.dma_tx_window_enabled_count);
+                        generic_hw_dma_tx_window_ring_ready_count =
+                            generic_hw_dma_tx_window_ring_ready_count.saturating_add(
+                                start_report.dma_tx_window_ring_ready_count,
+                            );
+                        generic_hw_dma_tx_window_posted_count =
+                            generic_hw_dma_tx_window_posted_count
+                                .saturating_add(start_report.dma_tx_window_posted_count);
+                        generic_hw_dma_tx_window_idle_count =
+                            generic_hw_dma_tx_window_idle_count
+                                .saturating_add(start_report.dma_tx_window_idle_count);
+                        generic_hw_dma_tx_descriptor_candidate_count =
+                            generic_hw_dma_tx_descriptor_candidate_count.saturating_add(
+                                start_report.dma_tx_descriptor_candidate_count,
+                            );
+                        generic_hw_dma_tx_descriptor_map_candidate_count =
+                            generic_hw_dma_tx_descriptor_map_candidate_count.saturating_add(
+                                start_report.dma_tx_descriptor_map_candidate_count,
+                            );
+                        generic_hw_dma_tx_descriptor_done_seen_count =
+                            generic_hw_dma_tx_descriptor_done_seen_count.saturating_add(
+                                start_report.dma_tx_descriptor_done_seen_count,
+                            );
+                        if start_report.dma_tx_descriptor_candidate_count != 0
+                            || start_report.dma_tx_descriptor_done_seen_count != 0
+                        {
+                            generic_hw_dma_tx_last_candidate_address =
+                                start_report.dma_tx_last_candidate_address;
+                            generic_hw_dma_tx_last_candidate_len =
+                                start_report.dma_tx_last_candidate_len;
+                            generic_hw_dma_tx_last_candidate_status =
+                                start_report.dma_tx_last_candidate_status;
+                        }
+                        if start_report.dma_tx_window_observation_count != 0 {
+                            generic_hw_dma_tx_last_head = start_report.dma_tx_last_head;
+                            generic_hw_dma_tx_last_tail = start_report.dma_tx_last_tail;
+                        }
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -27713,6 +27769,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_hw_dma_device_interrupt_cause_count);
         print_str(b"/");
         print_u64(generic_hw_dma_device_model_failure_count);
+        print_str(b" dma_tx_window=");
+        print_u64(generic_hw_dma_tx_window_observation_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_window_enabled_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_window_ring_ready_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_window_posted_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_window_idle_count);
+        print_str(b" dma_tx_head/tail=");
+        print_u64(generic_hw_dma_tx_last_head);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_last_tail);
+        print_str(b" dma_tx_candidates/map/done=");
+        print_u64(generic_hw_dma_tx_descriptor_candidate_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_descriptor_map_candidate_count);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_descriptor_done_seen_count);
+        print_str(b" dma_tx_last_desc=0x");
+        print_hex(generic_hw_dma_tx_last_candidate_address as u32);
+        print_str(b"/");
+        print_u64(generic_hw_dma_tx_last_candidate_len);
+        print_str(b"/0x");
+        print_hex(generic_hw_dma_tx_last_candidate_status as u32);
         print_str(b" video_route=");
         print_u64(generic_hw_video_route_published as u64);
         print_str(b" video_route_attempted=");
