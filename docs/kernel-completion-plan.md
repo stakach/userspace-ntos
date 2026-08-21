@@ -79,6 +79,12 @@ zero export rejections, `exec_lsa_worker_route` passes, and Explorer shell chrom
 `292/292` checks passing. With real E1000 TX/RX traffic now accepted below, the remaining generic
 B3 packet frontier is packet-array receive coverage for an NDIS5 miniport that actually reaches
 `MiniIndicateReceivePacket`; ReactOS e1000 correctly uses the legacy Ethernet receive path instead.
+Latest accepted DC21x4 checkpoint (2026-08-21): the generated mixed-NIC path now gets QEMU tulip
+through `dc21x4.sys` StartDevice and into real interrupt/DPC delivery using the dynamic PCI resource
+grant. The I/O-only hosted-device path models DC21x4 CSR status/ack semantics, completes one owned RX
+descriptor through validated common-buffer DMA aliases, and raises the tulip interrupt through the
+generic hosted-device dispatcher. The current proof keeps provider receive gates green but still does
+not reach live packet-array indication: `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0`.
 Latest accepted B3 TX checkpoint (2026-08-21): provider-originated `NdisSend`/`SendPackets` now copy
 validated provider DMA allocation records back into the bound miniport devnode after real miniport
 send callbacks, and the E1000 TX completion model validates descriptor buffers through the canonical
@@ -8446,6 +8452,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     initialization. Continue at the first real packet-array data-plane proof: interrupt/DPC activity
     for the tulip function, receive descriptor ownership, and a live
     `NdisMIndicateReceivePacket`/protocol receive-complete path.
+    The next slice closes the interrupt/DPC and first receive-descriptor ownership part of that
+    target without adding a driver-name shortcut. The hosted PCI I/O-port path now keeps a per-device
+    CSR status overlay for I/O-only devices, models DC21x4 CSR5 interrupt status/ack semantics,
+    observes DC21x4 common-buffer descriptor rings through the DMA manager, completes one owned
+    receive descriptor with the existing registry-derived ARP stimulus, and raises the tulip interrupt
+    through the same generic hosted-device interrupt delivery path used by other provider-domain
+    hardware. PnP proof-interrupt eligibility is now resource-shape based (`interrupt_connected` plus
+    MMIO or I/O-port service) instead of MMIO-only, so port-only PCI functions can prove real IRQ
+    delivery. Local validation: `cargo fmt --all -- --check`, executive `cargo check
+    --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and a
+    serialized mixed-NIC proof
+    `.tmp/run-headless-b3-dc21x4-io-model-restored-20260821.log` with
+    `NTOS_GENERATED_NETWORK_ADAPTERS=e1000,dc21x4` plus QEMU `tulip`. That proof was manually stopped
+    after the target evidence rather than accepted as a final desktop sentinel, but it shows
+    `generic hardware interrupt delivery service=dc21x4 ... claimed=1`, `generic hardware evidence
+    service=dc21x4 ... start=0x00000000 mmio=0 irq=1/1 dpc=1 ... txrx=0/1 io=1`, and keeps provider
+    receive green with `packet-array=0/0 rx=1/1 rx-complete=1/1 rx-packet=0/0` plus
+    `PASS exec_provider_ndis_receive_indicated`. Review adjustment: a broad post-PnP full packet
+    redrive was rejected because it injected repeated RX completions before the packet-array path was
+    live and regressed the existing provider receive gate. Keep RX stimulus bounded to the proof
+    interrupt until the next slice proves why ReactOS `dc21x4.sys` is not reaching the
+    `NdisMIndicateReceivePacket` helper.
   - `[x]` B3 component lifecycle ownership cleanup (2026-08-18): the first capacity cleanup retry
     `.tmp/run-headless-b3-component-bank-quiesce-bounded-rerun2.log` restored component cap headroom
     and reached natural desktop background paint, but it regressed before LSASS created

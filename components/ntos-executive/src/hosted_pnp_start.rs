@@ -693,7 +693,9 @@ unsafe fn inject_proof_interrupt(
     report: &mut HostedPnpStartReport,
 ) {
     if let Some(evidence) = driver_launch::hosted_hardware_evidence(device_id) {
-        if evidence.mmio_mapped() && evidence.interrupt_connected() {
+        if evidence.interrupt_connected()
+            && (evidence.mmio_mapped() || evidence.io_port_out32_serviced())
+        {
             let ack_window = root_window_for_evidence(evidence);
             if let Some(window) = ack_window {
                 core::ptr::write_volatile(
