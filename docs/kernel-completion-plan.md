@@ -564,6 +564,24 @@ green, and reports `hosted-runtime=24/24/0:24/24/0`. Review adjustment: hosted p
 registration backing is closed; remaining process-index arrays are now mostly diagnostic counters,
 cap-bank summaries, or explicit admission geometry and should be audited by owner before conversion.
 
+A4/B3 hosted thread runtime registry scaling cleanup (2026-08-21): the executive's hosted
+TID-to-TCB runtime registry no longer uses `HostedThreadRuntimeTable<MAX_PI * slots + 16>` fixed
+backing storage. The scheduler wait/reply tables keep an explicit finite wait capacity for their
+own later audit, but hosted thread runtime records now grow in a vector, reuse released records, and
+fail closed with allocation/store failure counters if the executive heap cannot grow. The pool
+census reports `hosted-thread-runtime=<live>/<records>/<cap>/<alloc-fail>/<store-fail>`. Local
+validation is green for `cargo fmt --all`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-hosted-thread-runtime-vec-20260821.log` reaches genuine userinit/Explorer launch
+and Explorer shell chrome with `293/293` checks passing, keeps
+`exec_teb_not_clobbered_by_win32k`, `exec_msgina_credential_keystrokes_delivered`, and
+`exec_explorer_shell_chrome_painted` green, reports `hosted-thread-runtime=58/59/808/0/0`, and
+commits writable profile state with `[writable-fs-snapshot] committed generation=5 bytes=822086`.
+Review adjustment: hosted thread runtime identity is no longer capped by a fixed record array; the
+remaining wait/reply table capacity and process-manager admission policy are separate explicit
+mechanism boundaries.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before

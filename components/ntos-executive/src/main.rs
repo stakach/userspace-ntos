@@ -2721,7 +2721,10 @@ pub(crate) fn replace_fsd_reply_slot(i: usize, reply_cap: u64) {
 /// subsequent recvs. On `NtSetEvent(that event)` the loop does `client_reply_on(stolen_cap, WAIT_0)` to
 /// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
 /// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
-const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_RUNTIME_CAP + 1;
+const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
+    MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
+const HOSTED_THREAD_WAIT_CAP: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
+const WAIT_REPLY_POOL_N: usize = HOSTED_THREAD_WAIT_CAP + 1;
 const WAIT_REPLY_POOL_USED_WORDS: usize = (WAIT_REPLY_POOL_N + 63) / 64;
 /// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
 /// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
@@ -2777,7 +2780,7 @@ impl<const N: usize> ThreadWaitParkTable<N> {
     }
 }
 
-static mut THREAD_WAIT_PARKED: ThreadWaitParkTable<HOSTED_THREAD_RUNTIME_CAP> =
+static mut THREAD_WAIT_PARKED: ThreadWaitParkTable<HOSTED_THREAD_WAIT_CAP> =
     ThreadWaitParkTable::new();
 /// Compact identity for an NT object that can satisfy a native wait.
 ///
@@ -2856,7 +2859,7 @@ impl WaitObject {
 /// (count 1); a multi-object wait (NtWaitForMultipleObjects) records up to `WAITER_MAX_EVENTS`
 /// typed wait objects + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == `WaitObject::FREE.raw()` means
 /// the slot is free (it doubles as event[0]).
-const WAITER_N: usize = HOSTED_THREAD_RUNTIME_CAP;
+const WAITER_N: usize = HOSTED_THREAD_WAIT_CAP;
 /// NT's architectural maximum for one multi-object wait.
 const WAITER_MAX_EVENTS: usize = 64;
 /// object[0] of each waiter's set (u64::MAX = free slot). Kept as the slot-free sentinel for backward
@@ -10280,6 +10283,23 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(hosted_spawned_cap as u64);
     print_str(b"/");
     print_u64(hosted_spawned_fails);
+    let (
+        hosted_thread_live,
+        hosted_thread_records,
+        hosted_thread_cap,
+        hosted_thread_alloc_fails,
+        hosted_thread_store_fails,
+    ) = hosted_thread_runtime_table_stats();
+    print_str(b" hosted-thread-runtime=");
+    print_u64(hosted_thread_live as u64);
+    print_str(b"/");
+    print_u64(hosted_thread_records as u64);
+    print_str(b"/");
+    print_u64(hosted_thread_cap as u64);
+    print_str(b"/");
+    print_u64(hosted_thread_alloc_fails);
+    print_str(b"/");
+    print_u64(hosted_thread_store_fails);
     let (
         hosted_loaded_entries_len,
         hosted_loaded_entries_cap,
@@ -21874,15 +21894,27 @@ impl HostedThreadQuiesceRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HostedThreadRuntimeTable<const N: usize> {
-    entries: [HostedThreadRuntime; N],
+struct HostedThreadRuntimeTable {
+    entries: Vec<HostedThreadRuntime>,
+    allocation_failures: u64,
+    store_failures: u64,
 }
 
-impl<const N: usize> HostedThreadRuntimeTable<N> {
+impl HostedThreadRuntimeTable {
     const fn new() -> Self {
         Self {
-            entries: [HostedThreadRuntime::empty(); N],
+            entries: Vec::new(),
+            allocation_failures: 0,
+            store_failures: 0,
+        }
+    }
+
+    fn reset(&mut self, initial_reserve: usize) {
+        self.entries.clear();
+        if self.entries.capacity() < initial_reserve
+            && self.entries.try_reserve(initial_reserve).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
         }
     }
 
@@ -21949,11 +21981,23 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
             *empty = runtime;
             return Some(runtime);
         }
-        None
+        if self.entries.len() == self.entries.capacity() && self.entries.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            self.store_failures = self.store_failures.saturating_add(1);
+            return None;
+        }
+        self.entries.push(runtime);
+        Some(runtime)
     }
 
-    fn clear(&mut self) {
-        self.entries = [HostedThreadRuntime::empty(); N];
+    fn stats(&self) -> (usize, usize, usize, u64, u64) {
+        (
+            self.entries.iter().filter(|entry| entry.is_live()).count(),
+            self.entries.len(),
+            self.entries.capacity(),
+            self.allocation_failures,
+            self.store_failures,
+        )
     }
 
     fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
@@ -22067,19 +22111,15 @@ impl<const N: usize> HostedThreadRuntimeTable<N> {
     }
 }
 
-const HOSTED_THREAD_RUNTIME_CAP: usize =
-    MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
-
-static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable<HOSTED_THREAD_RUNTIME_CAP> =
-    HostedThreadRuntimeTable::new();
+static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRuntimeTable::new();
 
 /// Exclusive pointer to the serialized executive's hosted TID -> seL4 TCB table.
 ///
 /// The table is deliberately not stored inline in `ExecNtHandler`; that handler is constructed on the
-/// root task stack during the early SEC_IMAGE self-tests, and this fixed table is large enough to
-/// make stack pressure observable.
+/// root task stack during the early SEC_IMAGE self-tests. The record store grows in the executive
+/// heap and reuses released records.
 struct HostedThreadRuntimes {
-    table: *mut HostedThreadRuntimeTable<HOSTED_THREAD_RUNTIME_CAP>,
+    table: *mut HostedThreadRuntimeTable,
 }
 
 impl HostedThreadRuntimes {
@@ -22087,7 +22127,7 @@ impl HostedThreadRuntimes {
         let table = core::ptr::addr_of_mut!(HOSTED_THREAD_RUNTIME_WORK);
         // SAFETY: service_sec_image is serialized. A previous handler has been
         // dropped before a new one is constructed, so no other table reference exists.
-        unsafe { (&mut *table).clear() };
+        unsafe { (&mut *table).reset(HOSTED_THREAD_RUNTIME_INITIAL_RESERVE) };
         Self { table }
     }
 
@@ -22172,6 +22212,10 @@ impl HostedThreadRuntimes {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_tid(tid) }
     }
+}
+
+fn hosted_thread_runtime_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe { (&*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK)).stats() }
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
