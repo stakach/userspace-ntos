@@ -1056,6 +1056,12 @@ fn print_hardware_evidence(
         print_u64(evidence.dma_device_tx_completions);
         print_str(b"/");
         print_u64(evidence.dma_device_rx_completions);
+        print_str(b" pbrx=");
+        print_u64(evidence.dma_device_post_bind_rx_attempts);
+        print_str(b"/");
+        print_u64(evidence.dma_device_post_bind_rx_deliveries);
+        print_str(b"/");
+        print_u64(evidence.dma_device_post_bind_rx_failures);
         print_str(b" io=");
         print_u64(evidence.io_port_out32_serviced() as u64);
         print_str(b" video=");
@@ -1137,6 +1143,12 @@ fn print_hardware_evidence(
     print_u64(evidence.dma_device_interrupt_causes);
     print_str(b"/");
     print_u64(evidence.dma_device_model_failures);
+    print_str(b" dma_post_bind_rx=");
+    print_u64(evidence.dma_device_post_bind_rx_attempts);
+    print_str(b"/");
+    print_u64(evidence.dma_device_post_bind_rx_deliveries);
+    print_str(b"/");
+    print_u64(evidence.dma_device_post_bind_rx_failures);
     print_str(b" dma_tx_window=");
     print_u64(evidence.dma_tx_window_observations);
     print_str(b"/");

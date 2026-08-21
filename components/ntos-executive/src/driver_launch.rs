@@ -47,6 +47,7 @@ use nt_hosted_runtime::{
     HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
+    NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_QUERY_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_RESET_COMPLETE_HANDLER_OFFSET_X64,
@@ -20819,6 +20820,7 @@ fn provider_policy_uses_packet_array(policy: HostedProviderExportMarshalPolicy) 
 unsafe fn complete_provider_resource_mapping(
     policy: HostedProviderExportMarshalPolicy,
     state: &ProviderMarshalState,
+    binding: Option<HostedDeviceBinding>,
     dependent_shared: u64,
     provider_shared: u64,
     result: u64,
@@ -20831,6 +20833,11 @@ unsafe fn complete_provider_resource_mapping(
     }
     if state.resource_state_copyback {
         copy_provider_interrupt_state(dependent_shared, provider_shared);
+    }
+    if state.resource_mapping_copyback || state.resource_state_copyback {
+        if let Some(binding) = binding {
+            refresh_hosted_device_resource_state(binding, dependent_shared);
+        }
     }
 }
 
@@ -21521,6 +21528,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
     complete_provider_resource_mapping(
         policy,
         &marshal_state,
+        dependent_binding,
         dependent_channel.shared_va,
         provider_shared,
         result,
@@ -22454,6 +22462,253 @@ unsafe fn provider_callback_copy_unicode_string(
     Ok(())
 }
 
+unsafe fn provider_unicode_string_buffer_exec(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_desc_component: u64,
+) -> Result<(u64, u64), i32> {
+    let Some(provider_desc_exec) = component_to_exec_va_for_instance(
+        provider_instance,
+        provider_inst,
+        provider_desc_component,
+        16,
+    ) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let length = read_unaligned(provider_desc_exec as *const u16) as u64;
+    let maximum = read_unaligned((provider_desc_exec + 2) as *const u16) as u64;
+    let buffer = read_unaligned((provider_desc_exec + 8) as *const u64);
+    if length > maximum || length & 1 != 0 || length > NDIS_INIT_UNICODE_STRING_MAX_BYTES {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if length == 0 {
+        return Ok((0, 0));
+    }
+    let Some(buffer_exec) =
+        component_to_exec_va_for_instance(provider_instance, provider_inst, buffer, length)
+    else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    Ok((buffer_exec, length))
+}
+
+fn utf16_ascii_casefold(ch: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&ch) {
+        ch - 0x20
+    } else {
+        ch
+    }
+}
+
+unsafe fn provider_unicode_strings_equal_ci(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    left_desc_component: u64,
+    right_desc_component: u64,
+) -> Result<bool, i32> {
+    let (left_exec, left_len) =
+        provider_unicode_string_buffer_exec(provider_instance, provider_inst, left_desc_component)?;
+    let (right_exec, right_len) = provider_unicode_string_buffer_exec(
+        provider_instance,
+        provider_inst,
+        right_desc_component,
+    )?;
+    if left_len != right_len {
+        return Ok(false);
+    }
+    let mut offset = 0u64;
+    while offset < left_len {
+        let left = read_unaligned((left_exec + offset) as *const u16);
+        let right = read_unaligned((right_exec + offset) as *const u16);
+        if utf16_ascii_casefold(left) != utf16_ascii_casefold(right) {
+            return Ok(false);
+        }
+        offset += 2;
+    }
+    Ok(true)
+}
+
+unsafe fn provider_miniport_mirror_for_device_name(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_device_name_component: u64,
+) -> Option<(HostedProviderNdisMiniportBlockMirror, HostedDeviceBinding)> {
+    let records = core::ptr::addr_of!(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRRORS)
+        as *const HostedProviderNdisMiniportBlockMirror;
+    let count = HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_COUNT.load(Ordering::Relaxed) as usize;
+    let bounded_count = count.min(HOSTED_PROVIDER_NDIS_MINIPORT_BLOCK_MIRROR_CAP);
+    let mut index = 0usize;
+    while index < bounded_count {
+        let mirror = *records.add(index);
+        if mirror.present && mirror.provider_instance == provider_instance {
+            let miniport_name = match mirror
+                .provider_component_va
+                .checked_add(NDIS_MINIPORT_BLOCK_MINIPORT_NAME_OFFSET_X64)
+            {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    continue;
+                }
+            };
+            if provider_unicode_strings_equal_ci(
+                provider_instance,
+                provider_inst,
+                provider_device_name_component,
+                miniport_name,
+            )
+            .unwrap_or(false)
+            {
+                let dependent_device_id = instance(mirror.dependent_instance)
+                    .map(|inst| inst.device_id)
+                    .unwrap_or(0);
+                if dependent_device_id != 0 {
+                    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_device_id)
+                    {
+                        return Some((mirror, binding));
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+unsafe fn mark_hosted_post_bind_rx_attempt(device_id: u64) -> bool {
+    let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return false;
+    };
+    if state.evidence.dma_device_post_bind_rx_attempts != 0 {
+        return false;
+    }
+    state.evidence.dma_device_post_bind_rx_attempts = 1;
+    true
+}
+
+unsafe fn arm_hosted_post_bind_rx(device_id: u64) -> bool {
+    let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return false;
+    };
+    if state.post_bind_rx_pending || state.evidence.dma_device_post_bind_rx_attempts != 0 {
+        return false;
+    }
+    state.post_bind_rx_pending = true;
+    true
+}
+
+unsafe fn take_hosted_post_bind_rx_pending(device_id: u64) -> bool {
+    let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return false;
+    };
+    if !state.post_bind_rx_pending || state.evidence.dma_device_post_bind_rx_attempts != 0 {
+        return false;
+    }
+    state.post_bind_rx_pending = false;
+    true
+}
+
+unsafe fn record_hosted_post_bind_rx_result(
+    device_id: u64,
+    delivery: Option<HostedInterruptDelivery>,
+) {
+    let Some(state) = hosted_device_resource_states_mut()
+        .iter_mut()
+        .find(|state| state.device_id != 0 && state.device_id == device_id)
+    else {
+        return;
+    };
+    if let Some(delivery) = delivery {
+        if delivery.claimed {
+            state.evidence.dma_device_post_bind_rx_deliveries = state
+                .evidence
+                .dma_device_post_bind_rx_deliveries
+                .saturating_add(1);
+        }
+    } else {
+        state.evidence.dma_device_post_bind_rx_failures = state
+            .evidence
+            .dma_device_post_bind_rx_failures
+            .saturating_add(1);
+    }
+}
+
+unsafe fn trace_deferred_post_bind_rx_interrupt(
+    binding: HostedDeviceBinding,
+    status: Result<HostedInterruptDelivery, nt_status::NtStatus>,
+) {
+    print_str(b"[provider-ndis] post-bind rx drain device-id=");
+    print_u64(binding.device_id);
+    match status {
+        Ok(delivery) => {
+            print_str(b" id=");
+            print_u64(delivery.interrupt_id);
+            print_str(b" vector=");
+            print_u64(delivery.vector as u64);
+            print_str(b" claimed=");
+            print_u64(delivery.claimed as u64);
+        }
+        Err(status) => {
+            print_str(b" status=0x");
+            print_hex(status.raw() as u32);
+        }
+    }
+    print_str(b"\n");
+}
+
+unsafe fn arm_post_bind_receive_interrupt_for_device_name(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    provider_device_name_component: u64,
+) {
+    let Some((mirror, binding)) = provider_miniport_mirror_for_device_name(
+        provider_instance,
+        provider_inst,
+        provider_device_name_component,
+    ) else {
+        return;
+    };
+    if arm_hosted_post_bind_rx(binding.device_id) {
+        print_str(b"[provider-ndis] post-bind rx armed provider-inst=");
+        print_u64(provider_instance as u64);
+        print_str(b" miniport-inst=");
+        print_u64(mirror.dependent_instance as u64);
+        print_str(b" device-id=");
+        print_u64(binding.device_id);
+        print_str(b"\n");
+    }
+}
+
+unsafe fn drain_hosted_post_bind_receive_interrupt(binding: HostedDeviceBinding, sh: u64) {
+    if !take_hosted_post_bind_rx_pending(binding.device_id) {
+        return;
+    }
+    if !mark_hosted_post_bind_rx_attempt(binding.device_id) {
+        return;
+    }
+    let status = match publish_hosted_interrupt_connection_from_shared(binding, sh) {
+        Ok(()) => {
+            refresh_hosted_device_resource_state(binding, sh);
+            inject_hosted_device_interrupt(binding.device_id)
+        }
+        Err(status) => Err(status),
+    };
+    match &status {
+        Ok(delivery) => record_hosted_post_bind_rx_result(binding.device_id, Some(*delivery)),
+        Err(_) => record_hosted_post_bind_rx_result(binding.device_id, None),
+    }
+    trace_deferred_post_bind_rx_interrupt(binding, status);
+}
+
 unsafe fn service_ndis_protocol_bind_adapter_callback(
     provider_instance: usize,
     provider_inst: DriverInstance,
@@ -23296,6 +23551,12 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         } else {
             result = Err(STATUS_DEVICE_NOT_READY);
         }
+    }
+    if result.is_ok()
+        && record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
+        && record.callback_offset == NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64
+    {
+        arm_post_bind_receive_interrupt_for_device_name(provider_instance, provider_inst, arg2);
     }
     if result.is_ok() {
         record_provider_protocol_receive_completion(record);
@@ -28686,6 +28947,9 @@ pub(crate) struct HostedHardwareEvidence {
     pub dma_device_rx_completions: u64,
     pub dma_device_interrupt_causes: u64,
     pub dma_device_model_failures: u64,
+    pub dma_device_post_bind_rx_attempts: u64,
+    pub dma_device_post_bind_rx_deliveries: u64,
+    pub dma_device_post_bind_rx_failures: u64,
     pub dma_tx_window_observations: u64,
     pub dma_tx_window_enabled: u64,
     pub dma_tx_window_ring_ready: u64,
@@ -28793,6 +29057,7 @@ struct HostedDeviceResourceState {
     video_memory_phys: u64,
     video_memory_len: u64,
     video_memory_caller_va: u64,
+    post_bind_rx_pending: bool,
     evidence: HostedHardwareEvidence,
 }
 
@@ -29331,6 +29596,9 @@ unsafe fn read_hosted_hardware_evidence_from_shared(
             dma_device_rx_completions: 0,
             dma_device_interrupt_causes: 0,
             dma_device_model_failures: 0,
+            dma_device_post_bind_rx_attempts: 0,
+            dma_device_post_bind_rx_deliveries: 0,
+            dma_device_post_bind_rx_failures: 0,
             dma_tx_window_observations: 0,
             dma_tx_window_enabled: 0,
             dma_tx_window_ring_ready: 0,
@@ -29387,6 +29655,12 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         evidence.dma_device_rx_completions = previous.evidence.dma_device_rx_completions;
         evidence.dma_device_interrupt_causes = previous.evidence.dma_device_interrupt_causes;
         evidence.dma_device_model_failures = previous.evidence.dma_device_model_failures;
+        evidence.dma_device_post_bind_rx_attempts =
+            previous.evidence.dma_device_post_bind_rx_attempts;
+        evidence.dma_device_post_bind_rx_deliveries =
+            previous.evidence.dma_device_post_bind_rx_deliveries;
+        evidence.dma_device_post_bind_rx_failures =
+            previous.evidence.dma_device_post_bind_rx_failures;
         evidence.dma_tx_window_observations = previous.evidence.dma_tx_window_observations;
         evidence.dma_tx_window_enabled = previous.evidence.dma_tx_window_enabled;
         evidence.dma_tx_window_ring_ready = previous.evidence.dma_tx_window_ring_ready;
@@ -29429,6 +29703,9 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
         video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
         video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
+        post_bind_rx_pending: previous_state
+            .map(|state| state.post_bind_rx_pending)
+            .unwrap_or(false),
         evidence,
     }
 }
@@ -34234,25 +34511,56 @@ unsafe fn record_hosted_resource_usage(
         }
     }
 
+    publish_hosted_interrupt_connection_from_shared(binding, sh)?;
+
+    replay_hosted_dma_allocation_records(binding, sh)
+}
+
+unsafe fn publish_hosted_interrupt_connection_from_shared(
+    binding: HostedDeviceBinding,
+    sh: u64,
+) -> Result<(), nt_status::NtStatus> {
     let interrupt_object = read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
     let service_routine = read_volatile((sh + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
     let service_context = read_volatile((sh + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64);
-    if interrupt_object != 0 || service_routine != 0 || service_context != 0 {
-        if interrupt_object == 0 || service_routine == 0 {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        let connected = hosted_resource_manager_mut()
-            .connect_interrupt(owner, interrupt_id, service_routine, service_context)
-            .map_err(hosted_hal_status)?;
-        if connected == 0 {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
+    if interrupt_object == 0 && service_routine == 0 && service_context == 0 {
+        return Ok(());
     }
 
-    replay_hosted_dma_allocation_records(binding, sh)
+    let interrupt_vector = read_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
+    if interrupt_object == 0 || service_routine == 0 || interrupt_vector == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+    if existing != 0 {
+        let tokens = hosted_resource_manager_mut()
+            .inject_interrupt(existing)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if tokens.vector != interrupt_vector
+            || tokens.service_routine_token != service_routine
+            || tokens.service_context_token != service_context
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        return Ok(());
+    }
+
+    let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let connected = hosted_resource_manager_mut()
+        .connect_interrupt(
+            hosted_resource_owner(binding),
+            interrupt_id,
+            service_routine,
+            service_context,
+        )
+        .map_err(hosted_hal_status)?;
+    if connected == 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
+    Ok(())
 }
 
 unsafe fn dispatch_video_find_adapter_for_instance(
@@ -34700,6 +35008,7 @@ pub(crate) unsafe fn start_hosted_device(
         video_port_status(video_status)?;
         apply_hosted_device_interface_state(sh)?;
         refresh_hosted_device_resource_state(binding, sh);
+        drain_hosted_post_bind_receive_interrupt(binding, sh);
         return Ok(());
     }
     let mut out = [];
@@ -34726,6 +35035,7 @@ pub(crate) unsafe fn start_hosted_device(
         nt_status::NtStatus(root_status).to_result()?;
     }
     refresh_hosted_device_resource_state(binding, sh);
+    drain_hosted_post_bind_receive_interrupt(binding, sh);
     Ok(())
 }
 
