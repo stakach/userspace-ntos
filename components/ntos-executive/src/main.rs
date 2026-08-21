@@ -2949,38 +2949,132 @@ static USER_TIMER_APC_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// waits, but are keyed by an arbitrary user pointer instead of an object-namespace event index.
 /// ReactOS condition variables pass the address of each stack wait-entry's `WaitKey` field and wake
 /// with `NtReleaseKeyedEvent(..., &Entry->WaitKey, ...)`.
-const KEYED_WAITER_N: usize = 16;
-static KEYED_WAITER_KEY: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(u64::MAX) }; KEYED_WAITER_N];
-static KEYED_WAITER_REPLY_CAP: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
-static KEYED_WAITER_TID: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
-static KEYED_WAITER_DEADLINE: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(u64::MAX) }; KEYED_WAITER_N];
-static KEYED_WAITER_RESUME_IP: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
-static KEYED_WAITER_RESUME_SP: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
-static KEYED_WAITER_RESUME_FLAGS: [AtomicU64; KEYED_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+const KEYED_WAITER_INITIAL_RESERVE: usize = 16;
+
+#[derive(Clone, Copy)]
+struct KeyedWaiterRecord {
+    key: u64,
+    reply_cap: u64,
+    tid: u64,
+    deadline: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+}
+
+impl KeyedWaiterRecord {
+    const fn empty() -> Self {
+        Self {
+            key: u64::MAX,
+            reply_cap: 0,
+            tid: 0,
+            deadline: u64::MAX,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_flags: 0,
+        }
+    }
+
+    fn is_live(self) -> bool {
+        self.key != u64::MAX
+    }
+}
+
+struct KeyedWaiterTable {
+    entries: Vec<KeyedWaiterRecord>,
+    allocation_failures: u64,
+    store_failures: u64,
+}
+
+impl KeyedWaiterTable {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            allocation_failures: 0,
+            store_failures: 0,
+        }
+    }
+
+    fn reset(&mut self, initial_reserve: usize) -> bool {
+        self.entries.clear();
+        if self.entries.capacity() < initial_reserve
+            && self.entries.try_reserve(initial_reserve).is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
+    fn reserve_slot(&mut self) -> Option<usize> {
+        if let Some(index) = self.entries.iter().position(|entry| !entry.is_live()) {
+            return Some(index);
+        }
+        if self.entries.len() == self.entries.capacity() && self.entries.try_reserve(1).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            self.store_failures = self.store_failures.saturating_add(1);
+            return None;
+        }
+        let index = self.entries.len();
+        self.entries.push(KeyedWaiterRecord::empty());
+        Some(index)
+    }
+
+    fn park(&mut self, record: KeyedWaiterRecord) -> bool {
+        let Some(index) = self.reserve_slot() else {
+            return false;
+        };
+        self.entries[index] = record;
+        true
+    }
+
+    fn clear_slot(&mut self, slot: usize) {
+        if let Some(entry) = self.entries.get_mut(slot) {
+            *entry = KeyedWaiterRecord::empty();
+        }
+    }
+
+    fn record(&self, slot: usize) -> Option<KeyedWaiterRecord> {
+        self.entries
+            .get(slot)
+            .copied()
+            .filter(|entry| entry.is_live())
+    }
+
+    fn find_key(&self, key: u64) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.is_live() && entry.key == key)
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.is_live() && entry.deadline != u64::MAX)
+            .map(|entry| entry.deadline)
+            .min()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn stats(&self) -> (usize, usize, usize, u64, u64) {
+        (
+            self.entries.iter().filter(|entry| entry.is_live()).count(),
+            self.entries.len(),
+            self.entries.capacity(),
+            self.allocation_failures,
+            self.store_failures,
+        )
+    }
+}
+
+static mut KEYED_WAITERS: KeyedWaiterTable = KeyedWaiterTable::new();
 /// Keyed events are symmetric rendezvous objects: a wait pairs with a release, and whichever side
 /// arrives first parks until the other side arrives or its timeout expires.
-const KEYED_RELEASE_WAITER_N: usize = 16;
-static KEYED_RELEASE_WAITER_KEY: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(u64::MAX) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_REPLY_CAP: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_TID: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_DEADLINE: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(u64::MAX) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_RESUME_IP: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_RESUME_SP: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_RELEASE_WAITER_N];
-static KEYED_RELEASE_WAITER_RESUME_FLAGS: [AtomicU64; KEYED_RELEASE_WAITER_N] =
-    [const { AtomicU64::new(0) }; KEYED_RELEASE_WAITER_N];
+static mut KEYED_RELEASE_WAITERS: KeyedWaiterTable = KeyedWaiterTable::new();
 static KEYED_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_RELEASE_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3328,24 +3422,24 @@ unsafe fn watchdog_report(messages: u64) {
         print_hex_u64(WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
         print_str(b"\n");
     }
-    for slot in 0..KEYED_WAITER_N {
-        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX {
+    for slot in 0..keyed_waiter_len() {
+        let Some(record) = keyed_waiter_record(slot) else {
             continue;
-        }
+        };
         print_str(b"[deadman] keyed-waiter tid=");
-        print_u64(KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
+        print_u64(record.tid);
         print_str(b" key=0x");
-        print_hex_u64(KEYED_WAITER_KEY[slot].load(Ordering::Relaxed));
+        print_hex_u64(record.key);
         print_str(b"\n");
     }
-    for slot in 0..KEYED_RELEASE_WAITER_N {
-        if KEYED_RELEASE_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX {
+    for slot in 0..keyed_release_waiter_len() {
+        let Some(record) = keyed_release_waiter_record(slot) else {
             continue;
-        }
+        };
         print_str(b"[deadman] keyed-release-waiter tid=");
-        print_u64(KEYED_RELEASE_WAITER_TID[slot].load(Ordering::Relaxed));
+        print_u64(record.tid);
         print_str(b" key=0x");
-        print_hex_u64(KEYED_RELEASE_WAITER_KEY[slot].load(Ordering::Relaxed));
+        print_hex_u64(record.key);
         print_str(b"\n");
     }
     driver_launch::print_active_driver_dispatch_for_deadman();
@@ -10346,6 +10440,35 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(thread_wait_park_alloc_fails);
     print_str(b"/");
     print_u64(thread_wait_park_store_fails);
+    let (keyed_wait_live, keyed_wait_records, keyed_wait_cap, keyed_wait_alloc, keyed_wait_store) =
+        keyed_waiter_table_stats();
+    let (
+        keyed_release_live,
+        keyed_release_records,
+        keyed_release_cap,
+        keyed_release_alloc,
+        keyed_release_store,
+    ) = keyed_release_waiter_table_stats();
+    print_str(b" keyed-wait=");
+    print_u64(keyed_wait_live as u64);
+    print_str(b"/");
+    print_u64(keyed_wait_records as u64);
+    print_str(b"/");
+    print_u64(keyed_wait_cap as u64);
+    print_str(b"/");
+    print_u64(keyed_wait_alloc);
+    print_str(b"/");
+    print_u64(keyed_wait_store);
+    print_str(b":");
+    print_u64(keyed_release_live as u64);
+    print_str(b"/");
+    print_u64(keyed_release_records as u64);
+    print_str(b"/");
+    print_u64(keyed_release_cap as u64);
+    print_str(b"/");
+    print_u64(keyed_release_alloc);
+    print_str(b"/");
+    print_u64(keyed_release_store);
     let (
         hosted_loaded_entries_len,
         hosted_loaded_entries_cap,
@@ -15545,16 +15668,9 @@ unsafe fn delay_timer_next_deadline(
         .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
         .filter(|deadline| *deadline != u64::MAX)
         .min();
-    let keyed_deadline = (0..KEYED_WAITER_N)
-        .filter(|slot| KEYED_WAITER_KEY[*slot].load(Ordering::Relaxed) != u64::MAX)
-        .map(|slot| KEYED_WAITER_DEADLINE[slot].load(Ordering::Relaxed))
-        .filter(|deadline| *deadline != u64::MAX)
-        .min();
-    let keyed_release_deadline = (0..KEYED_RELEASE_WAITER_N)
-        .filter(|slot| KEYED_RELEASE_WAITER_KEY[*slot].load(Ordering::Relaxed) != u64::MAX)
-        .map(|slot| KEYED_RELEASE_WAITER_DEADLINE[slot].load(Ordering::Relaxed))
-        .filter(|deadline| *deadline != u64::MAX)
-        .min();
+    let keyed_deadline = unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).next_deadline() };
+    let keyed_release_deadline =
+        unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).next_deadline() };
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline() };
     let pipe_name_deadline = unsafe { (&*core::ptr::addr_of!(PIPE_NAME_WAITERS)).next_deadline() };
@@ -16343,14 +16459,60 @@ unsafe fn dbgk_reporter_abandon(block: &nt_process::dbgk::ReporterBlock) -> bool
     true
 }
 
+fn keyed_wait_tables_reset() -> bool {
+    unsafe {
+        let waiters_ok = (&mut *core::ptr::addr_of_mut!(KEYED_WAITERS))
+            .reset(KEYED_WAITER_INITIAL_RESERVE);
+        let releasers_ok = (&mut *core::ptr::addr_of_mut!(KEYED_RELEASE_WAITERS))
+            .reset(KEYED_WAITER_INITIAL_RESERVE);
+        waiters_ok && releasers_ok
+    }
+}
+
+fn keyed_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).stats() }
+}
+
+fn keyed_release_waiter_table_stats() -> (usize, usize, usize, u64, u64) {
+    unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).stats() }
+}
+
+fn keyed_waiter_len() -> usize {
+    unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).len() }
+}
+
+fn keyed_release_waiter_len() -> usize {
+    unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).len() }
+}
+
+fn keyed_waiter_record(slot: usize) -> Option<KeyedWaiterRecord> {
+    unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).record(slot) }
+}
+
+fn keyed_release_waiter_record(slot: usize) -> Option<KeyedWaiterRecord> {
+    unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).record(slot) }
+}
+
+fn keyed_waiter_find_key(key: u64) -> Option<usize> {
+    unsafe { (&*core::ptr::addr_of!(KEYED_WAITERS)).find_key(key) }
+}
+
+fn keyed_release_waiter_find_key(key: u64) -> Option<usize> {
+    unsafe { (&*core::ptr::addr_of!(KEYED_RELEASE_WAITERS)).find_key(key) }
+}
+
+fn keyed_waiter_park(record: KeyedWaiterRecord) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(KEYED_WAITERS)).park(record) }
+}
+
+fn keyed_release_waiter_park(record: KeyedWaiterRecord) -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(KEYED_RELEASE_WAITERS)).park(record) }
+}
+
 fn keyed_wait_clear_slot(slot: usize) {
-    KEYED_WAITER_KEY[slot].store(u64::MAX, Ordering::Relaxed);
-    KEYED_WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
-    KEYED_WAITER_TID[slot].store(0, Ordering::Relaxed);
-    KEYED_WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
-    KEYED_WAITER_RESUME_IP[slot].store(0, Ordering::Relaxed);
-    KEYED_WAITER_RESUME_SP[slot].store(0, Ordering::Relaxed);
-    KEYED_WAITER_RESUME_FLAGS[slot].store(0, Ordering::Relaxed);
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(KEYED_WAITERS)).clear_slot(slot);
+    }
 }
 
 /// PARK the current caller on a keyed-event key (`NtWaitForKeyedEvent`). This is the same
@@ -16364,17 +16526,6 @@ unsafe fn keyed_wait_park(
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
-    let mut slot = usize::MAX;
-    for index in 0..KEYED_WAITER_N {
-        if KEYED_WAITER_KEY[index].load(Ordering::Relaxed) == u64::MAX {
-            slot = index;
-            break;
-        }
-    }
-    if slot == usize::MAX {
-        return false;
-    }
-
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;
@@ -16383,13 +16534,17 @@ unsafe fn keyed_wait_park(
         return false;
     };
 
-    KEYED_WAITER_REPLY_CAP[slot].store(stolen, Ordering::Relaxed);
-    KEYED_WAITER_TID[slot].store(tid, Ordering::Relaxed);
-    KEYED_WAITER_DEADLINE[slot].store(deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
-    KEYED_WAITER_RESUME_IP[slot].store(resume_ip, Ordering::Relaxed);
-    KEYED_WAITER_RESUME_SP[slot].store(sp, Ordering::Relaxed);
-    KEYED_WAITER_RESUME_FLAGS[slot].store(flags, Ordering::Relaxed);
-    KEYED_WAITER_KEY[slot].store(key, Ordering::Relaxed);
+    if !keyed_waiter_park(KeyedWaiterRecord {
+        key,
+        reply_cap: stolen,
+        tid,
+        deadline: deadline.unwrap_or(u64::MAX),
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+    }) {
+        return false;
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     KEYED_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -16398,36 +16553,33 @@ unsafe fn keyed_wait_park(
 
 /// Wake one caller parked on `key`, returning `true` when a matching waiter was resumed.
 unsafe fn keyed_wait_wake_one(handler: &mut ExecNtHandler, key: u64, status: u64) -> bool {
-    for slot in 0..KEYED_WAITER_N {
-        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) != key {
-            continue;
-        }
-        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
-        if cap == 0 {
-            keyed_wait_clear_slot(slot);
-            return false;
-        }
-        set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
-        set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
-        set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
-        client_reply_on(cap, 18, status, 0, 0, 0);
-        release_reply_pool_cap(cap);
-        thread_wait_state_clear_tid_ready(handler, KEYED_WAITER_TID[slot].load(Ordering::Relaxed));
+    let Some(slot) = keyed_waiter_find_key(key) else {
+        return false;
+    };
+    let Some(record) = keyed_waiter_record(slot) else {
         keyed_wait_clear_slot(slot);
-        KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        return true;
+        return false;
+    };
+    let cap = record.reply_cap;
+    if cap == 0 {
+        keyed_wait_clear_slot(slot);
+        return false;
     }
-    false
+    set_reply_mr(15, record.resume_ip);
+    set_reply_mr(16, record.resume_sp);
+    set_reply_mr(17, record.resume_flags);
+    client_reply_on(cap, 18, status, 0, 0, 0);
+    release_reply_pool_cap(cap);
+    thread_wait_state_clear_tid_ready(handler, record.tid);
+    keyed_wait_clear_slot(slot);
+    KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 fn keyed_release_wait_clear_slot(slot: usize) {
-    KEYED_RELEASE_WAITER_KEY[slot].store(u64::MAX, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_TID[slot].store(0, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_IP[slot].store(0, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_SP[slot].store(0, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].store(0, Ordering::Relaxed);
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(KEYED_RELEASE_WAITERS)).clear_slot(slot);
+    }
 }
 
 /// PARK the current caller on the release side of a keyed-event rendezvous. A later
@@ -16440,17 +16592,6 @@ unsafe fn keyed_release_wait_park(
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
-    let mut slot = usize::MAX;
-    for index in 0..KEYED_RELEASE_WAITER_N {
-        if KEYED_RELEASE_WAITER_KEY[index].load(Ordering::Relaxed) == u64::MAX {
-            slot = index;
-            break;
-        }
-    }
-    if slot == usize::MAX {
-        return false;
-    }
-
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
         return false;
@@ -16459,13 +16600,17 @@ unsafe fn keyed_release_wait_park(
         return false;
     };
 
-    KEYED_RELEASE_WAITER_REPLY_CAP[slot].store(stolen, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_TID[slot].store(tid, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_DEADLINE[slot].store(deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_IP[slot].store(resume_ip, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_SP[slot].store(sp, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].store(flags, Ordering::Relaxed);
-    KEYED_RELEASE_WAITER_KEY[slot].store(key, Ordering::Relaxed);
+    if !keyed_release_waiter_park(KeyedWaiterRecord {
+        key,
+        reply_cap: stolen,
+        tid,
+        deadline: deadline.unwrap_or(u64::MAX),
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+    }) {
+        return false;
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     KEYED_RELEASE_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -16474,59 +16619,46 @@ unsafe fn keyed_release_wait_park(
 
 /// Wake one caller parked by `NtReleaseKeyedEvent`, returning true when this wait pairs with it.
 unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: u64) -> bool {
-    for slot in 0..KEYED_RELEASE_WAITER_N {
-        if KEYED_RELEASE_WAITER_KEY[slot].load(Ordering::Relaxed) != key {
-            continue;
-        }
-        let cap = KEYED_RELEASE_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
-        if cap == 0 {
-            keyed_release_wait_clear_slot(slot);
-            return false;
-        }
-        set_reply_mr(
-            15,
-            KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed),
-        );
-        set_reply_mr(
-            16,
-            KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed),
-        );
-        set_reply_mr(
-            17,
-            KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed),
-        );
-        client_reply_on(cap, 18, status, 0, 0, 0);
-        release_reply_pool_cap(cap);
-        thread_wait_state_clear_tid_ready(
-            handler,
-            KEYED_RELEASE_WAITER_TID[slot].load(Ordering::Relaxed),
-        );
+    let Some(slot) = keyed_release_waiter_find_key(key) else {
+        return false;
+    };
+    let Some(record) = keyed_release_waiter_record(slot) else {
         keyed_release_wait_clear_slot(slot);
-        KEYED_RELEASE_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        return true;
+        return false;
+    };
+    let cap = record.reply_cap;
+    if cap == 0 {
+        keyed_release_wait_clear_slot(slot);
+        return false;
     }
-    false
+    set_reply_mr(15, record.resume_ip);
+    set_reply_mr(16, record.resume_sp);
+    set_reply_mr(17, record.resume_flags);
+    client_reply_on(cap, 18, status, 0, 0, 0);
+    release_reply_pool_cap(cap);
+    thread_wait_state_clear_tid_ready(handler, record.tid);
+    keyed_release_wait_clear_slot(slot);
+    KEYED_RELEASE_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
-    for slot in 0..KEYED_WAITER_N {
-        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
-            || KEYED_WAITER_DEADLINE[slot].load(Ordering::Relaxed) > now
-        {
+    for slot in 0..keyed_waiter_len() {
+        let Some(record) = keyed_waiter_record(slot) else {
+            continue;
+        };
+        if record.deadline > now {
             continue;
         }
-        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
-            set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
-            set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
+            set_reply_mr(15, record.resume_ip);
+            set_reply_mr(16, record.resume_sp);
+            set_reply_mr(17, record.resume_flags);
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid_ready(
-                handler,
-                KEYED_WAITER_TID[slot].load(Ordering::Relaxed),
-            );
+            thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
         }
         keyed_wait_clear_slot(slot);
@@ -16536,32 +16668,21 @@ unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
 
 unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
     let mut woken = 0;
-    for slot in 0..KEYED_RELEASE_WAITER_N {
-        if KEYED_RELEASE_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
-            || KEYED_RELEASE_WAITER_DEADLINE[slot].load(Ordering::Relaxed) > now
-        {
+    for slot in 0..keyed_release_waiter_len() {
+        let Some(record) = keyed_release_waiter_record(slot) else {
+            continue;
+        };
+        if record.deadline > now {
             continue;
         }
-        let cap = KEYED_RELEASE_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
-            set_reply_mr(
-                15,
-                KEYED_RELEASE_WAITER_RESUME_IP[slot].load(Ordering::Relaxed),
-            );
-            set_reply_mr(
-                16,
-                KEYED_RELEASE_WAITER_RESUME_SP[slot].load(Ordering::Relaxed),
-            );
-            set_reply_mr(
-                17,
-                KEYED_RELEASE_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed),
-            );
+            set_reply_mr(15, record.resume_ip);
+            set_reply_mr(16, record.resume_sp);
+            set_reply_mr(17, record.resume_flags);
             client_reply_on(cap, 18, 0x102, 0, 0, 0);
             release_reply_pool_cap(cap);
-            thread_wait_state_clear_tid_ready(
-                handler,
-                KEYED_RELEASE_WAITER_TID[slot].load(Ordering::Relaxed),
-            );
+            thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
         }
         keyed_release_wait_clear_slot(slot);
@@ -16570,13 +16691,14 @@ unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> 
 }
 
 unsafe fn keyed_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
-    for slot in 0..KEYED_WAITER_N {
-        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
-            || KEYED_WAITER_TID[slot].load(Ordering::Relaxed) != tid
-        {
+    for slot in 0..keyed_waiter_len() {
+        let Some(record) = keyed_waiter_record(slot) else {
+            continue;
+        };
+        if record.tid != tid {
             continue;
         }
-        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
             let deleted = cnode_delete_r(cap);
             let retyped = if deleted == 0 {
@@ -16594,13 +16716,14 @@ unsafe fn keyed_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
 }
 
 unsafe fn keyed_release_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
-    for slot in 0..KEYED_RELEASE_WAITER_N {
-        if KEYED_RELEASE_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
-            || KEYED_RELEASE_WAITER_TID[slot].load(Ordering::Relaxed) != tid
-        {
+    for slot in 0..keyed_release_waiter_len() {
+        let Some(record) = keyed_release_waiter_record(slot) else {
+            continue;
+        };
+        if record.tid != tid {
             continue;
         }
-        let cap = KEYED_RELEASE_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        let cap = record.reply_cap;
         if cap != 0 {
             let deleted = cnode_delete_r(cap);
             let retyped = if deleted == 0 {

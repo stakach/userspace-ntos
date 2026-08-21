@@ -5316,6 +5316,9 @@ pub(crate) unsafe fn service_sec_image(
     if !thread_wait_state_reset() {
         panic!("thread wait parked-state allocation failed");
     }
+    if !keyed_wait_tables_reset() {
+        panic!("keyed wait table allocation failed");
+    }
     let mut wait_parked: u64 = 0;
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
