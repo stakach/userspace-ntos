@@ -761,6 +761,26 @@ capacity no longer has an artificial table type or executive constant to remove;
 should target real pipe completion semantics, cancellation, or diagnostics rather than fixed table
 identity.
 
+A4 generic mapped-section registry scaling cleanup (2026-08-22): the executive no longer embeds
+fixed 128-section, 256-view, and 2048-page arrays for non-image `NtCreateSection` /
+`NtMapViewOfSection` state. The reusable stable-index registry now lives in the host-testable
+`nt-memory-manager` crate and uses growable section, view, and committed-page vectors with explicit
+allocation failure, growth, and live-record accounting. The SEC_IMAGE service reserves bootstrap
+storage before its per-syscall heap checkpoint and advances that checkpoint after either syscall or
+page-fault growth, so durable metadata cannot be reclaimed by the bump-heap rewind. Create/map/page
+operations continue to fail closed on actual allocation failure, and cleared rows remain reusable
+without changing live section indices. Local validation is green for `cargo fmt --all`,
+`cargo test -p nt-memory-manager`, executive
+`cargo check --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none`,
+`git diff --check`, and `git -C rust-micro diff --check`. Serialized desktop proof
+`.tmp/run-desktop-generic-sections-vec-20260822.log` reaches genuine userinit/Explorer launch and
+Explorer shell chrome with `293/293` checks passing, keeps mapped-section writeback and both
+write-copy COW gates green, commits writable profile state at generation 5 with 822656 bytes, and
+reports `generic-section=2/3/16/0/0:1/2/32/0/0:2/13/128/0/0` with no runtime growth or allocation
+failure. Review adjustment: the artificial generic section/view/page capacities are closed. The
+next storage audit should distinguish real resource geometry such as typed frame/cap ownership from
+replaceable bookkeeping; do not vectorize finite kernel resources merely to hide exhaustion.
+
 A4/B3 hosted loaded-image registry scaling cleanup (2026-08-21): the SEC_IMAGE service loop's
 hosted executable PE registry now uses vector-backed entry and parsed-PE rows instead of
 `[Option<...>; MAX_PI]` arrays. The service reset provisions the current admission window before

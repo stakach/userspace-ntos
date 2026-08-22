@@ -20,6 +20,16 @@ use alloc::vec::Vec;
 
 use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
+mod runtime_section;
+
+pub use runtime_section::{
+    GenericSection, GenericSectionBacking, GenericSectionTable, GenericSectionTableStats,
+    GenericSectionView, GENERIC_SECTION_BACKING_ANON, GENERIC_SECTION_BACKING_DISK,
+    GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_BASED,
+    SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
+    SECTION_ATTR_SEC_RESERVE,
+};
+
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;

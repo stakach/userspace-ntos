@@ -1223,8 +1223,18 @@ unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoaded
 #[inline(never)]
 unsafe fn reset_service_generic_sections_work() -> &'static mut GenericSectionTable {
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
-    (*slot).reset();
+    if !(*slot).reset() {
+        panic!("generic section table allocation failed");
+    }
     &mut *slot
+}
+
+pub(crate) fn service_generic_section_stats() -> GenericSectionTableStats {
+    unsafe { (&*core::ptr::addr_of!(SERVICE_GENERIC_SECTIONS_WORK)).stats() }
+}
+
+fn take_service_generic_sections_dirty() -> bool {
+    unsafe { (&mut *core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK)).take_dirty() }
 }
 
 #[inline(never)]
@@ -1294,6 +1304,13 @@ fn pin_durable_heap_mark(heap_mark: &mut usize) {
 #[inline]
 fn pin_wait_table_growth_if_dirty(heap_mark: &mut usize) {
     if take_wait_table_growth_dirty() {
+        pin_durable_heap_mark(heap_mark);
+    }
+}
+
+#[inline]
+fn pin_generic_section_growth_if_dirty(heap_mark: &mut usize) {
+    if take_service_generic_sections_dirty() {
         pin_durable_heap_mark(heap_mark);
     }
 }
@@ -7347,6 +7364,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
+                    pin_generic_section_growth_if_dirty(&mut heap_mark);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
                     mi = nmi;
@@ -9516,6 +9534,7 @@ pub(crate) unsafe fn service_sec_image(
                     pin_durable_heap_mark(&mut heap_mark);
                 }
                 pin_wait_table_growth_if_dirty(&mut heap_mark);
+                pin_generic_section_growth_if_dirty(&mut heap_mark);
                 // HIVE MOUNT plane: `NtLoadKey`/`NtUnloadKey` grew the `\Registry\User` mount
                 // table's path `String`s and the mutable hive import arena above `heap_mark`. Same
                 // contract as `overlay_dirty` — a mounted hive must outlive the syscall that

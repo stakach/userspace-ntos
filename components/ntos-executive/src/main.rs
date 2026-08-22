@@ -95,6 +95,12 @@ use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_lpc_abi::LpcReply;
 use nt_lpc_client::LpcClient;
+pub(crate) use nt_memory_manager::{
+    GenericSection, GenericSectionBacking, GenericSectionTable, GenericSectionTableStats,
+    GenericSectionView, GENERIC_SECTION_BACKING_ANON, GENERIC_SECTION_BACKING_DISK,
+    GENERIC_SECTION_BACKING_OVERLAY, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE,
+    SECTION_ATTR_SEC_IMAGE, SECTION_ATTR_SEC_RESERVE,
+};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
 use nt_syscall::{
@@ -1576,443 +1582,6 @@ fn process_committed_mapping_stats() -> (usize, usize, u64) {
             mappings.capacity(),
             PROCESS_COMMITTED_MAPPING_ALLOCATION_FAILURES.load(Ordering::Relaxed),
         )
-    }
-}
-
-const GENERIC_SECTION_BACKING_NONE: u8 = 0;
-const GENERIC_SECTION_BACKING_ANON: u8 = 1;
-const GENERIC_SECTION_BACKING_DISK: u8 = 2;
-const GENERIC_SECTION_BACKING_OVERLAY: u8 = 3;
-const GENERIC_SECTION_CAP: usize = 128;
-const GENERIC_SECTION_VIEW_CAP: usize = 256;
-const GENERIC_SECTION_PAGE_CAP: usize = 2048;
-const SECTION_ATTR_SEC_BASED: u32 = 0x0020_0000;
-const SECTION_ATTR_SEC_FILE: u32 = 0x0080_0000;
-const SECTION_ATTR_SEC_IMAGE: u32 = 0x0100_0000;
-const SECTION_ATTR_SEC_RESERVE: u32 = 0x0400_0000;
-const SECTION_ATTR_SEC_COMMIT: u32 = 0x0800_0000;
-
-#[derive(Clone, Copy)]
-pub(crate) struct GenericSectionBacking {
-    pub(crate) kind: u8,
-    pub(crate) first_cluster: u32,
-    pub(crate) file_size: u32,
-    pub(crate) overlay_file_id: u64,
-}
-
-impl GenericSectionBacking {
-    pub(crate) const fn none() -> Self {
-        Self {
-            kind: GENERIC_SECTION_BACKING_NONE,
-            first_cluster: 0,
-            file_size: 0,
-            overlay_file_id: 0,
-        }
-    }
-
-    pub(crate) const fn anonymous() -> Self {
-        Self {
-            kind: GENERIC_SECTION_BACKING_ANON,
-            first_cluster: 0,
-            file_size: 0,
-            overlay_file_id: 0,
-        }
-    }
-
-    pub(crate) const fn disk(first_cluster: u32, file_size: u32) -> Self {
-        Self {
-            kind: GENERIC_SECTION_BACKING_DISK,
-            first_cluster,
-            file_size,
-            overlay_file_id: 0,
-        }
-    }
-
-    pub(crate) const fn overlay(file_id: u64) -> Self {
-        Self {
-            kind: GENERIC_SECTION_BACKING_OVERLAY,
-            first_cluster: 0,
-            file_size: 0,
-            overlay_file_id: file_id,
-        }
-    }
-
-    pub(crate) const fn is_live(self) -> bool {
-        self.kind != GENERIC_SECTION_BACKING_NONE
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct GenericSection {
-    pub(crate) live: bool,
-    pub(crate) owner_pi: usize,
-    pub(crate) handle: u64,
-    pub(crate) size: u64,
-    pub(crate) protection: u32,
-    pub(crate) allocation_attributes: u32,
-    pub(crate) backing: GenericSectionBacking,
-}
-
-impl GenericSection {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            live: false,
-            owner_pi: 0,
-            handle: 0,
-            size: 0,
-            protection: nt_address_space::PAGE_NOACCESS,
-            allocation_attributes: 0,
-            backing: GenericSectionBacking::none(),
-        }
-    }
-
-    pub(crate) fn basic_attributes(self) -> u32 {
-        let mut attributes = self.allocation_attributes
-            & (SECTION_ATTR_SEC_BASED
-                | SECTION_ATTR_SEC_IMAGE
-                | SECTION_ATTR_SEC_RESERVE
-                | SECTION_ATTR_SEC_COMMIT);
-        match self.backing.kind {
-            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY => {
-                attributes |= SECTION_ATTR_SEC_FILE;
-            }
-            GENERIC_SECTION_BACKING_ANON => {
-                if attributes & (SECTION_ATTR_SEC_COMMIT | SECTION_ATTR_SEC_RESERVE) == 0 {
-                    attributes |= SECTION_ATTR_SEC_COMMIT;
-                }
-            }
-            _ => {}
-        }
-        attributes
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct GenericSectionView {
-    pub(crate) live: bool,
-    pub(crate) pi: usize,
-    pub(crate) section_index: usize,
-    pub(crate) base: u64,
-    pub(crate) size: u64,
-    pub(crate) section_offset: u64,
-}
-
-impl GenericSectionView {
-    const fn empty() -> Self {
-        Self {
-            live: false,
-            pi: 0,
-            section_index: usize::MAX,
-            base: 0,
-            size: 0,
-            section_offset: 0,
-        }
-    }
-
-    fn contains(self, pi: usize, page: u64) -> bool {
-        self.live && self.pi == pi && page >= self.base && page < self.base + self.size
-    }
-}
-
-#[derive(Clone, Copy)]
-struct GenericSectionPage {
-    live: bool,
-    section_index: usize,
-    page_index: u64,
-    frame: u64,
-    dirty: bool,
-}
-
-impl GenericSectionPage {
-    const fn empty() -> Self {
-        Self {
-            live: false,
-            section_index: usize::MAX,
-            page_index: 0,
-            frame: 0,
-            dirty: false,
-        }
-    }
-}
-
-pub(crate) struct GenericSectionTable {
-    sections: [GenericSection; GENERIC_SECTION_CAP],
-    views: [GenericSectionView; GENERIC_SECTION_VIEW_CAP],
-    pages: [GenericSectionPage; GENERIC_SECTION_PAGE_CAP],
-}
-
-impl GenericSectionTable {
-    pub(crate) const fn new() -> Self {
-        Self {
-            sections: [GenericSection::empty(); GENERIC_SECTION_CAP],
-            views: [GenericSectionView::empty(); GENERIC_SECTION_VIEW_CAP],
-            pages: [GenericSectionPage::empty(); GENERIC_SECTION_PAGE_CAP],
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        for section in &mut self.sections {
-            *section = GenericSection::empty();
-        }
-        for view in &mut self.views {
-            *view = GenericSectionView::empty();
-        }
-        for page in &mut self.pages {
-            *page = GenericSectionPage::empty();
-        }
-    }
-
-    pub(crate) fn create(
-        &mut self,
-        owner_pi: usize,
-        handle: u64,
-        size: u64,
-        protection: u32,
-        allocation_attributes: u32,
-        backing: GenericSectionBacking,
-    ) -> Option<usize> {
-        if size == 0 || !backing.is_live() {
-            return None;
-        }
-        if handle != 0 {
-            if let Some(index) = self.index_for_handle(owner_pi, handle) {
-                self.sections[index].size = size;
-                self.sections[index].protection = protection;
-                self.sections[index].allocation_attributes = allocation_attributes;
-                self.sections[index].backing = backing;
-                return Some(index);
-            }
-        }
-        for index in 0..self.sections.len() {
-            if !self.sections[index].live {
-                self.sections[index] = GenericSection {
-                    live: true,
-                    owner_pi,
-                    handle,
-                    size,
-                    protection,
-                    allocation_attributes,
-                    backing,
-                };
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn bind_handle(&mut self, index: usize, handle: u64) -> bool {
-        if handle == 0 {
-            return false;
-        }
-        let Some(section) = self.sections.get_mut(index) else {
-            return false;
-        };
-        if !section.live {
-            return false;
-        }
-        section.handle = handle;
-        true
-    }
-
-    pub(crate) fn clear_section(&mut self, index: usize) {
-        if let Some(section) = self.sections.get_mut(index) {
-            *section = GenericSection::empty();
-        }
-        for view in &mut self.views {
-            if view.live && view.section_index == index {
-                *view = GenericSectionView::empty();
-            }
-        }
-        for page in &mut self.pages {
-            if page.live && page.section_index == index {
-                *page = GenericSectionPage::empty();
-            }
-        }
-    }
-
-    fn section_has_views(&self, index: usize) -> bool {
-        self.views
-            .iter()
-            .any(|view| view.live && view.section_index == index)
-    }
-
-    fn clear_section_if_unreferenced(&mut self, index: usize) {
-        if self
-            .sections
-            .get(index)
-            .is_some_and(|section| section.live && section.handle == 0)
-            && !self.section_has_views(index)
-        {
-            self.clear_section(index);
-        }
-    }
-
-    pub(crate) fn release_handle(&mut self, index: usize) -> bool {
-        let Some(section) = self.sections.get_mut(index) else {
-            return false;
-        };
-        if !section.live {
-            return false;
-        }
-        section.handle = 0;
-        self.clear_section_if_unreferenced(index);
-        true
-    }
-
-    pub(crate) fn index_for_handle(&self, owner_pi: usize, handle: u64) -> Option<usize> {
-        self.sections.iter().position(|section| {
-            section.live && section.owner_pi == owner_pi && section.handle == handle
-        })
-    }
-
-    pub(crate) fn section(&self, index: usize) -> Option<GenericSection> {
-        self.sections
-            .get(index)
-            .copied()
-            .filter(|section| section.live)
-    }
-
-    pub(crate) fn map_view(
-        &mut self,
-        pi: usize,
-        section_index: usize,
-        base: u64,
-        size: u64,
-        section_offset: u64,
-    ) -> bool {
-        if self.section(section_index).is_none() || base == 0 || size == 0 {
-            return false;
-        }
-        for view in &mut self.views {
-            if !view.live {
-                *view = GenericSectionView {
-                    live: true,
-                    pi,
-                    section_index,
-                    base,
-                    size,
-                    section_offset,
-                };
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn unmap_view(&mut self, pi: usize, base: u64) -> Option<GenericSectionView> {
-        for view in &mut self.views {
-            if view.live && view.pi == pi && view.base == base {
-                let removed = *view;
-                *view = GenericSectionView::empty();
-                self.clear_section_if_unreferenced(removed.section_index);
-                return Some(removed);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn first_view_for_process(&self, pi: usize) -> Option<GenericSectionView> {
-        self.views
-            .iter()
-            .copied()
-            .find(|view| view.live && view.pi == pi)
-    }
-
-    pub(crate) fn view_for_page(
-        &self,
-        pi: usize,
-        page: u64,
-    ) -> Option<(usize, GenericSectionView)> {
-        for view in &self.views {
-            if view.contains(pi, page) {
-                return Some((view.section_index, *view));
-            }
-        }
-        None
-    }
-
-    pub(crate) fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
-        self.pages
-            .iter()
-            .find(|page| {
-                page.live && page.section_index == section_index && page.page_index == page_index
-            })
-            .map(|page| page.frame)
-            .filter(|frame| *frame != 0)
-    }
-
-    pub(crate) fn set_page_frame(
-        &mut self,
-        section_index: usize,
-        page_index: u64,
-        frame: u64,
-    ) -> bool {
-        if frame == 0 {
-            return false;
-        }
-        for page in &mut self.pages {
-            if page.live && page.section_index == section_index && page.page_index == page_index {
-                page.frame = frame;
-                return true;
-            }
-        }
-        for page in &mut self.pages {
-            if !page.live {
-                *page = GenericSectionPage {
-                    live: true,
-                    section_index,
-                    page_index,
-                    frame,
-                    dirty: false,
-                };
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn mark_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
-        for page in &mut self.pages {
-            if page.live && page.section_index == section_index && page.page_index == page_index {
-                page.dirty = true;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn clear_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
-        for page in &mut self.pages {
-            if page.live && page.section_index == section_index && page.page_index == page_index {
-                page.dirty = false;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn next_dirty_page_for_view(
-        &self,
-        view: GenericSectionView,
-        section: GenericSection,
-    ) -> Option<(u64, u64, u64, usize)> {
-        let view_start = view.section_offset;
-        let view_end = view.section_offset.saturating_add(view.size);
-        for page in &self.pages {
-            if !page.live || !page.dirty || page.section_index != view.section_index {
-                continue;
-            }
-            let page_offset = page.page_index.saturating_mul(0x1000);
-            if page_offset < view_start || page_offset >= view_end {
-                continue;
-            }
-            let len = section.size.saturating_sub(page_offset).min(0x1000) as usize;
-            if len == 0 {
-                continue;
-            }
-            return Some((page.page_index, page.frame, page_offset, len));
-        }
-        None
     }
 }
 
@@ -10766,6 +10335,37 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(hosted_loaded_pes_cap as u64);
     print_str(b"/");
     print_u64(hosted_loaded_fails);
+    let generic_sections = service_sec_image::service_generic_section_stats();
+    print_str(b" generic-section=");
+    print_u64(generic_sections.live_sections as u64);
+    print_str(b"/");
+    print_u64(generic_sections.section_records as u64);
+    print_str(b"/");
+    print_u64(generic_sections.section_capacity as u64);
+    print_str(b"/");
+    print_u64(generic_sections.section_growths);
+    print_str(b"/");
+    print_u64(generic_sections.section_allocation_failures);
+    print_str(b":");
+    print_u64(generic_sections.live_views as u64);
+    print_str(b"/");
+    print_u64(generic_sections.view_records as u64);
+    print_str(b"/");
+    print_u64(generic_sections.view_capacity as u64);
+    print_str(b"/");
+    print_u64(generic_sections.view_growths);
+    print_str(b"/");
+    print_u64(generic_sections.view_allocation_failures);
+    print_str(b":");
+    print_u64(generic_sections.live_pages as u64);
+    print_str(b"/");
+    print_u64(generic_sections.page_records as u64);
+    print_str(b"/");
+    print_u64(generic_sections.page_capacity as u64);
+    print_str(b"/");
+    print_u64(generic_sections.page_growths);
+    print_str(b"/");
+    print_u64(generic_sections.page_allocation_failures);
     let (dll_cache_len, dll_cache_capacity) = unsafe { dll_cache_stats() };
     print_str(b" shared-frames=");
     print_u64(dll_cache_len as u64);
@@ -12101,7 +11701,13 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     let mut file_id = 0u64;
     let mut section_index = usize::MAX;
     let table = &mut *core::ptr::addr_of_mut!(MAPPED_SECTION_WRITEBACK_TABLE);
-    table.reset();
+    if !table.reset() {
+        MAPPED_SECTION_WRITEBACK_STATUS.store(
+            nt_address_space::STATUS_INSUFFICIENT_RESOURCES as u64,
+            Ordering::Relaxed,
+        );
+        return;
+    }
     let cleanup =
         |table: &mut GenericSectionTable, section_index: usize, frame: u64, file_id: u64| unsafe {
             if section_index != usize::MAX {
