@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use nt_io_abi::{DeviceId, FileId, IrpId};
+use nt_io_abi::{DeviceId, DriverId, FileId, IrpId};
 use nt_status::NtStatus;
 use nt_types::{AccessMask, ClientId};
 
@@ -208,6 +208,9 @@ impl IrpState {
 pub struct IrpRecord {
     pub id: IrpId,
     pub client_id: ClientId,
+    /// Driver that owns the dispatched IRP. This remains meaningful for
+    /// driver-level requests that do not target a device object.
+    pub driver_id: DriverId,
     pub file_id: Option<FileId>,
     pub device_id: DeviceId,
     pub major: u8,
@@ -236,6 +239,7 @@ impl IrpRecord {
         Self {
             id: IrpId::NULL,
             client_id,
+            driver_id: DriverId::NULL,
             file_id,
             device_id,
             major,

@@ -19,8 +19,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
-    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest,
-    ObQueryObjectInfo, ObReferenceFileHandleRequest, ObReply,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
+    ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
+    ObReferenceHandleRequest, ObReply,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
@@ -32,6 +33,14 @@ use nt_types::{
 /// The Object Manager service: an object model plus a wire-request dispatcher.
 pub struct Server {
     om: ObjectManager,
+    references: Vec<ServerReference>,
+    next_reference_id: u64,
+}
+
+struct ServerReference {
+    client: ClientId,
+    id: u64,
+    _object: ObjectRef,
 }
 
 impl Server {
@@ -39,7 +48,11 @@ impl Server {
     pub fn new() -> Result<Self, NtStatus> {
         let mut om = ObjectManager::new();
         om.bootstrap_namespace()?;
-        Ok(Self { om })
+        Ok(Self {
+            om,
+            references: Vec::new(),
+            next_reference_id: 0,
+        })
     }
 
     /// Borrow the underlying object manager (for the hosting component / tests).
@@ -55,6 +68,8 @@ impl Server {
 
     /// A client disconnected or faulted: close all its handles and retire its id.
     pub fn disconnect(&mut self, client: ClientId) -> Result<(), NtStatus> {
+        self.references
+            .retain(|reference| reference.client != client);
         self.om.close_client(client)
     }
 
@@ -86,6 +101,8 @@ impl Server {
             opcode::OB_OP_PING => Ok(ok()),
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
+            opcode::OB_OP_REFERENCE_HANDLE => self.op_reference_handle(client, in_buf),
+            opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
             opcode::OB_OP_LOOKUP_PATH => self.op_lookup(in_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
@@ -122,6 +139,41 @@ impl Server {
     fn op_close_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObCloseHandleRequest = read_req(buf)?;
         self.om.close_handle(client, HandleValue(req.handle))?;
+        Ok(ok())
+    }
+
+    fn op_reference_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObReferenceHandleRequest = read_req(buf)?;
+        check_size::<ObReferenceHandleRequest>(req.abi_size)?;
+        let object = self.om.reference_by_handle(
+            client,
+            HandleValue(req.handle),
+            type_of(req.expected_type),
+            AccessMask::from_bits_retain(req.desired_access),
+        )?;
+        self.next_reference_id = self
+            .next_reference_id
+            .checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let reference_id = self.next_reference_id;
+        let object_id = object.id();
+        self.references.push(ServerReference {
+            client,
+            id: reference_id,
+            _object: object,
+        });
+        Ok(reply(NtStatus::SUCCESS, 0, object_id.0, reference_id))
+    }
+
+    fn op_dereference_object(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObDereferenceObjectRequest = read_req(buf)?;
+        check_size::<ObDereferenceObjectRequest>(req.abi_size)?;
+        let index = self
+            .references
+            .iter()
+            .position(|reference| reference.client == client && reference.id == req.reference_id)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        self.references.remove(index);
         Ok(ok())
     }
 

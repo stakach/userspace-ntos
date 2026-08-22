@@ -71,9 +71,9 @@ use nt_io_manager::{
     write_wdm_driver_object, write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     CreateOptions, DeviceCharacteristics, DeviceControlParameters, DeviceFlags, DeviceType,
     DispatchContext, DispatchOutcome, DispatchTarget, DriverDispatchBackend, DriverId,
-    DriverPeerId, FileId, InformationParameters, IoManager, IoParameters, IrpId, IrpProjection,
-    MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess, WdmDriverObjectInit,
-    WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
+    DriverPeerId, ExternalDispatchResult, FileId, InformationParameters, IoManager, IoParameters,
+    IrpId, IrpProjection, MajorFunctionTable, ObjectManagerPort, ReadWriteParameters, ShareAccess,
+    WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters, WdmIrpInit,
     WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
     WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
     WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_FILE,
@@ -28610,6 +28610,22 @@ impl ObjectManagerPort for ExecutiveObjectManagerPort {
         unsafe { crate::object_manager_reference_file_handle(handle, desired_access).map(ObjectId) }
     }
 
+    fn retain_file_object(
+        &mut self,
+        _client: ClientId,
+        handle: HandleValue,
+    ) -> Result<u64, nt_status::NtStatus> {
+        unsafe { crate::object_manager_retain_file_handle(handle) }
+    }
+
+    fn release_object_reference(
+        &mut self,
+        _client: ClientId,
+        reference: u64,
+    ) -> Result<(), nt_status::NtStatus> {
+        unsafe { crate::object_manager_release_reference(reference) }
+    }
+
     fn reference_device(&mut self, device_object: ObjectId) -> Result<(), nt_status::NtStatus> {
         if device_object == ObjectId::NULL {
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -28926,7 +28942,7 @@ fn dispatch_external_irp_to_driver_record_result(
     let mut system_buffer = Vec::new();
     system_buffer.resize(system_buffer_len, 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
-    let (status, information) = io_manager_mut()
+    let result = io_manager_mut()
         .build_and_dispatch_external_to_driver(
             ClientId(IO_MANAGER_COMPONENT_ID),
             DriverId(driver_id),
@@ -28940,11 +28956,19 @@ fn dispatch_external_irp_to_driver_record_result(
             &mut system_buffer,
         )
         .map_err(|status| status.raw() as u32)?;
-    let copy_len = (information as usize)
-        .min(out.len())
-        .min(system_buffer.len());
-    out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-    Ok((status.raw(), information))
+    match result {
+        ExternalDispatchResult::Completed {
+            status,
+            information,
+        } => {
+            let copy_len = (information as usize)
+                .min(out.len())
+                .min(system_buffer.len());
+            out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
+            Ok((status.raw(), information))
+        }
+        ExternalDispatchResult::Pending { .. } => Ok((STATUS_PENDING as i32, 0)),
+    }
 }
 
 fn dispatch_external_irp_to_device_record_result(
@@ -28964,7 +28988,7 @@ fn dispatch_external_irp_to_device_record_result(
     let mut system_buffer = Vec::new();
     system_buffer.resize(system_buffer_len, 0);
     system_buffer[..in_data.len()].copy_from_slice(in_data);
-    let (status, information) = io_manager_mut()
+    let result = io_manager_mut()
         .build_and_dispatch_external_to_device(
             ClientId(IO_MANAGER_COMPONENT_ID),
             nt_io_manager::DeviceId(device_id),
@@ -28978,11 +29002,19 @@ fn dispatch_external_irp_to_device_record_result(
             &mut system_buffer,
         )
         .map_err(|status| status.raw() as u32)?;
-    let copy_len = (information as usize)
-        .min(out.len())
-        .min(system_buffer.len());
-    out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
-    Ok((status.raw(), information))
+    match result {
+        ExternalDispatchResult::Completed {
+            status,
+            information,
+        } => {
+            let copy_len = (information as usize)
+                .min(out.len())
+                .min(system_buffer.len());
+            out[..copy_len].copy_from_slice(&system_buffer[..copy_len]);
+            Ok((status.raw(), information))
+        }
+        ExternalDispatchResult::Pending { .. } => Ok((STATUS_PENDING as i32, 0)),
+    }
 }
 
 fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {

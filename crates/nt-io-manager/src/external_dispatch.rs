@@ -13,10 +13,19 @@ use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection};
 use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState};
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
+/// Result of dispatching an externally constructed IRP. A pending request stays
+/// owned by the I/O Manager until its driver publishes a terminal completion and
+/// the integration host acknowledges that completion.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ExternalDispatchResult {
+    Completed { status: NtStatus, information: u64 },
+    Pending { irp_id: IrpId },
+}
+
 impl<P> IoManager<P> {
     /// Build one IRP for `device_id`, route it through the owning driver's
-    /// dispatch table, complete it synchronously, and return the raw completion
-    /// status plus `IoStatus.Information`.
+    /// dispatch table, and return either its synchronous result or the canonical
+    /// id retained for asynchronous completion.
     ///
     /// This path is for hosts that have not yet moved open/handle lifetime into
     /// this crate but still need canonical driver/device/IRP dispatch. Warning
@@ -34,7 +43,7 @@ impl<P> IoManager<P> {
         input_len: u32,
         output_len: u32,
         system_buffer: &mut [u8],
-    ) -> Result<(NtStatus, u64), NtStatus> {
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
@@ -56,7 +65,7 @@ impl<P> IoManager<P> {
 
     /// Build one IRP for a driver that does not expose a control device yet,
     /// route it through the driver's dispatch table, and complete it
-    /// synchronously.
+    /// synchronously or retain it under a canonical IRP id.
     pub fn build_and_dispatch_external_to_driver(
         &mut self,
         client: ClientId,
@@ -69,7 +78,7 @@ impl<P> IoManager<P> {
         input_len: u32,
         output_len: u32,
         system_buffer: &mut [u8],
-    ) -> Result<(NtStatus, u64), NtStatus> {
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         self.build_and_dispatch_external(
             client,
             driver_id,
@@ -98,12 +107,13 @@ impl<P> IoManager<P> {
         input_len: u32,
         output_len: u32,
         system_buffer: &mut [u8],
-    ) -> Result<(NtStatus, u64), NtStatus> {
+    ) -> Result<ExternalDispatchResult, NtStatus> {
         if self.driver(driver_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
 
         let mut irp = IrpRecord::new(client, device_id, file_id, major);
+        irp.driver_id = driver_id;
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
         let mut sl = IoStackLocation::new(major, device_id, file_id);
@@ -117,7 +127,7 @@ impl<P> IoManager<P> {
             output_len: output_len.min(system_buffer.len() as u32),
             access: BufferAccess::ReadWrite,
         });
-        let irp_id = self.allocate_irp(irp);
+        let irp_id = self.allocate_irp(irp)?;
         self.irp_mut(irp_id)
             .expect("just allocated")
             .transition(IrpState::Initialized);
@@ -125,7 +135,7 @@ impl<P> IoManager<P> {
             .expect("just allocated")
             .transition(IrpState::Dispatched);
         let outcome = self.dispatch_to_driver(driver_id, irp_id, system_buffer);
-        Ok(self.complete_external_sync(irp_id, outcome))
+        Ok(self.complete_external_dispatch(irp_id, outcome))
     }
 
     pub(crate) fn dispatch_to_driver(
@@ -191,11 +201,18 @@ impl<P> IoManager<P> {
         )
     }
 
-    fn complete_external_sync(
+    fn complete_external_dispatch(
         &mut self,
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,
-    ) -> (NtStatus, u64) {
+    ) -> ExternalDispatchResult {
+        if self
+            .irp(irp_id)
+            .map(|irp| irp.state != IrpState::Dispatched)
+            .unwrap_or(true)
+        {
+            return ExternalDispatchResult::Pending { irp_id };
+        }
         match outcome {
             Ok(DispatchOutcome::Completed {
                 status,
@@ -208,7 +225,10 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Completed);
                 }
                 self.free_irp(irp_id);
-                (status, information)
+                ExternalDispatchResult::Completed {
+                    status,
+                    information,
+                }
             }
             Ok(DispatchOutcome::Failed { status }) | Err(status) => {
                 if let Some(irp) = self.irp_mut(irp_id) {
@@ -216,17 +236,19 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Failed);
                 }
                 self.free_irp(irp_id);
-                (status, 0)
+                ExternalDispatchResult::Completed {
+                    status,
+                    information: 0,
+                }
             }
             Ok(DispatchOutcome::Pending) => {
                 if let Some(irp) = self.irp_mut(irp_id) {
-                    irp.status = NtStatus::PENDING;
-                    irp.transition(IrpState::Pending);
-                    irp.transition(IrpState::Completing);
-                    irp.transition(IrpState::Completed);
+                    if irp.state == IrpState::Dispatched {
+                        irp.status = NtStatus::PENDING;
+                        irp.transition(IrpState::Pending);
+                    }
                 }
-                self.free_irp(irp_id);
-                (NtStatus::PENDING, 0)
+                ExternalDispatchResult::Pending { irp_id }
             }
         }
     }

@@ -294,6 +294,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let device_id = self
             .find_device_by_object(device_object)
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        let driver_id = self
+            .device(device_id)
+            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?
+            .driver_id;
 
         // 2. Allocate the FileRecord.
         let file_id = self.add_file(FileRecord::new(
@@ -315,14 +319,27 @@ impl<P: ObjectManagerPort> IoManager<P> {
         ) {
             Ok(x) => x,
             Err(e) => {
-                self.remove_file(file_id);
+                self.release_file_record(file_id)?;
                 return Err(e);
             }
         };
-        self.file_mut(file_id).expect("just added").object_id = file_object;
+        let object_reference = match self.port.retain_file_object(client, handle) {
+            Ok(reference) => reference,
+            Err(status) => {
+                let _ = self.port.close_handle(client, handle);
+                self.release_file_record(file_id)?;
+                return Err(status);
+            }
+        };
+        {
+            let file = self.file_mut(file_id).expect("just added");
+            file.object_id = file_object;
+            file.object_reference = object_reference;
+        }
 
         // 4. Build + dispatch IRP_MJ_CREATE.
         let mut irp = IrpRecord::new(client, device_id, Some(file_id), major::IRP_MJ_CREATE);
+        irp.driver_id = driver_id;
         let mut sl = IoStackLocation::new(major::IRP_MJ_CREATE, device_id, Some(file_id));
         sl.parameters = IoParameters::Create(CreateParameters {
             desired_access,
@@ -331,7 +348,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             create_disposition,
         });
         irp.stack.push(sl);
-        let irp_id = self.allocate_irp(irp);
+        let irp_id = match self.allocate_irp(irp) {
+            Ok(id) => id,
+            Err(status) => {
+                let _ = self.port.close_handle(client, handle);
+                self.release_file_record(file_id)?;
+                return Err(status);
+            }
+        };
         self.irp_mut(irp_id)
             .unwrap()
             .transition(IrpState::Initialized);
@@ -344,6 +368,22 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
         let mut empty: [u8; 0] = [];
         let outcome = self.dispatch(irp_id, &mut empty);
+
+        // A re-entrant completion may have published the IRP before dispatch
+        // returned. Preserve that canonical completion and let the consumer ACK
+        // it; this synchronous API cannot return a live handle in that case.
+        if self
+            .irp(irp_id)
+            .map(|irp| irp.state != IrpState::Dispatched)
+            .unwrap_or(true)
+        {
+            if let Some(file) = self.file_mut(file_id) {
+                file.transition(FileState::ClosePending);
+                file.close_deferred = true;
+            }
+            let _ = self.port.close_handle(client, handle);
+            return Err(NtStatus::PENDING);
+        }
 
         // 5. Apply the outcome.
         match outcome {
@@ -362,21 +402,27 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 Ok(handle)
             }
             Ok(DispatchOutcome::Completed { status, .. }) => {
-                self.cleanup_failed_open(client, file_id, handle, irp_id);
+                self.cleanup_failed_open(client, file_id, handle, irp_id)?;
                 Err(status)
             }
             Ok(DispatchOutcome::Failed { status }) => {
-                self.cleanup_failed_open(client, file_id, handle, irp_id);
+                self.cleanup_failed_open(client, file_id, handle, irp_id)?;
                 Err(status)
             }
             Ok(DispatchOutcome::Pending) => {
-                // v0.1 open is synchronous; async create arrives with the
-                // completion engine (later milestone).
-                self.cleanup_failed_open(client, file_id, handle, irp_id);
-                Err(NtStatus::NOT_SUPPORTED)
+                if let Some(irp) = self.irp_mut(irp_id) {
+                    irp.transition(IrpState::Pending);
+                }
+                if let Some(file) = self.file_mut(file_id) {
+                    file.transition(FileState::ClosePending);
+                    file.close_deferred = true;
+                }
+                let _ = self.port.close_handle(client, handle);
+                let _ = self.cancel(client, irp_id);
+                Err(NtStatus::PENDING)
             }
             Err(status) => {
-                self.cleanup_failed_open(client, file_id, handle, irp_id);
+                self.cleanup_failed_open(client, file_id, handle, irp_id)?;
                 Err(status)
             }
         }
@@ -414,10 +460,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         file_id: FileId,
         handle: HandleValue,
         irp_id: IrpId,
-    ) {
-        // Closing the handle drops the last reference, reaping the OM File object.
+    ) -> Result<(), NtStatus> {
+        // The I/O Manager's retained ObjectRef keeps the File alive until the
+        // IRP reference is gone and this teardown releases the record.
         let _ = self.port.close_handle(client, handle);
-        self.remove_file(file_id);
         self.free_irp(irp_id);
+        self.release_file_record(file_id)
     }
 }

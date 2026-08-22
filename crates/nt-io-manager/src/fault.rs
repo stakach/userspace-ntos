@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use nt_status::NtStatus;
 
+use crate::dispatch::DriverCompletion;
 use crate::driver::DriverFlags;
 use crate::irp::IrpState;
 use crate::object_port::ObjectManagerPort;
@@ -18,12 +19,12 @@ use crate::{DeviceId, DriverId, IoManager, IrpId};
 impl<P: ObjectManagerPort> IoManager<P> {
     /// Fault a driver (spec §16.6): mark it faulted, fail its in-flight IRPs, and
     /// mark its devices delete-pending. Idempotent-safe (skip if already faulted).
-    pub fn fault_driver(&mut self, driver: DriverId) {
+    pub fn fault_driver(&mut self, driver: DriverId) -> usize {
         match self.driver_mut(driver) {
             Some(d) if !d.flags.contains(DriverFlags::FAULTED) => {
                 d.flags |= DriverFlags::FAULTED;
             }
-            _ => return,
+            _ => return 0,
         }
 
         let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
@@ -33,23 +34,24 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .irps
             .iter()
             .filter(|(_, i)| {
-                devices.contains(&i.device_id)
+                i.driver_id == driver
                     && matches!(
                         i.state,
-                        IrpState::Dispatched
-                            | IrpState::Pending
-                            | IrpState::CancelRequested
-                            | IrpState::Completing
+                        IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
                     )
             })
             .map(|(id, _)| id)
             .collect();
+        let mut published = 0;
         for id in irps {
-            if let Some(irp) = self.irp_mut(id) {
-                irp.status = NtStatus::DEVICE_NOT_CONNECTED;
-                irp.transition(IrpState::Failed);
-            }
-            self.free_irp(id);
+            published += usize::from(self.publish_driver_completion(
+                driver,
+                DriverCompletion {
+                    irp_id: id,
+                    status: NtStatus::DEVICE_NOT_CONNECTED,
+                    information: 0,
+                },
+            ));
         }
 
         for dev in devices {
@@ -57,10 +59,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 d.delete_pending = true;
             }
         }
+        published
     }
 
     /// Detect backends that have faulted + fault their drivers (called by `pump`).
-    pub(crate) fn detect_driver_faults(&mut self) {
+    pub(crate) fn detect_driver_faults(&mut self) -> usize {
+        let mut published = 0;
         for driver in self.drivers.ids() {
             let (idx, already) = match self.driver(driver) {
                 Some(d) => (d.backend.0 as usize, d.flags.contains(DriverFlags::FAULTED)),
@@ -75,8 +79,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 .map(|b| b.is_faulted())
                 .unwrap_or(false)
             {
-                self.fault_driver(driver);
+                published += self.fault_driver(driver);
             }
         }
+        published
     }
 }

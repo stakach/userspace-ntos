@@ -63,10 +63,12 @@ impl FileState {
             (Allocated, CreateIrpDispatched)
                 | (Allocated, Closed) // create never dispatched (early failure)
                 | (CreateIrpDispatched, Open)
+                | (CreateIrpDispatched, ClosePending) // pending create cancelled by sync caller
                 | (CreateIrpDispatched, Closed) // create failed
                 | (Open, CleanupPending)
                 | (Open, ClosePending)
                 | (CleanupPending, CleanupComplete)
+                | (CleanupPending, ClosePending)
                 | (CleanupComplete, ClosePending)
                 | (CleanupComplete, Closed)
                 | (ClosePending, Closed)
@@ -93,6 +95,8 @@ impl FileState {
 pub struct FileRecord {
     pub id: FileId,
     pub object_id: ObjectId,
+    /// Opaque Object Manager strong-reference token held for this record.
+    pub object_reference: u64,
     pub client_id: ClientId,
     pub device_id: DeviceId,
     pub desired_access: AccessMask,
@@ -102,6 +106,13 @@ pub struct FileRecord {
     pub related_file: Option<FileId>,
     pub file_name: Option<NtPath>,
     pub state: FileState,
+    /// IRPs whose canonical records still reference this file, including
+    /// terminal completions that have not yet been acknowledged by their owner.
+    pub outstanding_irp_refs: u32,
+    /// The user handle is gone, but final close is waiting for IRP references.
+    pub close_deferred: bool,
+    /// `IRP_MJ_CLOSE` has been handed to the driver exactly once.
+    pub close_dispatched: bool,
 }
 
 impl FileRecord {
@@ -118,6 +129,7 @@ impl FileRecord {
         Self {
             id: FileId::NULL,
             object_id,
+            object_reference: 0,
             client_id,
             device_id,
             desired_access,
@@ -127,6 +139,9 @@ impl FileRecord {
             related_file: None,
             file_name,
             state: FileState::Allocated,
+            outstanding_irp_refs: 0,
+            close_deferred: false,
+            close_dispatched: false,
         }
     }
 

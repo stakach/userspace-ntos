@@ -9855,3 +9855,108 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the real `IoCompleteRequest` stack unwinder, including completion controls, pending propagation,
     driver-local IRPs, and `STATUS_MORE_PROCESSING_REQUIRED`. Contended executive synchronization
     handoff and the remaining fail-closed win32k import surface remain open in parallel workstreams.
+
+    Canonical I/O Manager pending/completion checkpoint (2026-08-22): the host-tested I/O core now
+    distinguishes a synchronous external completion from `Pending { irp_id }`; a pending request is
+    retained in the generation-protected IRP store instead of being converted to a terminal
+    `STATUS_PENDING` record and immediately freed. Every IRP records its owning `DriverId`, including
+    driver-level requests without a device object, so cancellation and peer-fault completion route
+    through the correct backend. Driver completions publish a stable `CompletedIrp` projection into
+    an ordered enumeration queue and remain canonical until the consumer acknowledges that exact
+    generation-protected id. Independent completions may be acknowledged out of enumeration order,
+    so one temporarily undeliverable client cannot block the systemwide completion broker.
+    Duplicate, stale, unauthenticated-driver, and nonterminal `STATUS_PENDING` publications cannot
+    reclaim or mutate the record.
+
+    Cancellation now leaves the request in `CancelRequested` and asks the backend to complete it;
+    the same publication path selects either an already-ready normal result or
+    `STATUS_CANCELLED`, exactly once. Driver-peer failure publishes
+    `STATUS_DEVICE_NOT_CONNECTED` through that path rather than freeing in-flight state underneath
+    the completion consumer. `FileRecord` holds a checked outstanding-IRP reference through terminal
+    delivery and acknowledgement. The I/O Manager also obtains a real strong Object Manager
+    reference token for every File object. The isolated Object Manager service implements the
+    existing reference/dereference opcodes with client-scoped, disconnect-cleaned `ObjectRef`
+    leases; library and mock ports implement the same contract. Closing the user handle therefore
+    makes the file unusable immediately without destroying its Object Manager identity, and defers
+    the one real `IRP_MJ_CLOSE`, reference release, and final FileRecord removal until all request
+    references drain. Pending CREATE cancellation and cleanup follow the same terminal
+    completion/ACK path rather than freeing driver-owned state.
+
+    Validation is green for `cargo fmt --all`, `cargo test -p nt-object-abi` (`2/2`),
+    `cargo test -p nt-object-server` (four unit plus seven roundtrip tests), `cargo test -p
+    nt-io-manager` (`138/138`), executive `cargo check --manifest-path
+    components/ntos-executive/Cargo.toml --target x86_64-unknown-none`, and `git diff --check`. New
+    coverage proves external pending identity, authenticated completion publication, exact-id ACK,
+    cancel-versus-completion races, peer-fault publication, pending-CREATE cancellation, strong
+    Object Manager lifetime after handle close, and close deferral across one and multiple
+    outstanding IRPs. The executive adapter understands the new result type but intentionally does
+    not yet consume asynchronous output; the currently hosted backend continues to expose its
+    established synchronous wrapper result.
+
+    The first serialized desktop attempt
+    `.tmp/run-desktop-canonical-irp-checkpoint-20260823.log` is rejected. Services failed ReactOS
+    LastKnownGood copy with Win32 error 2 and exited before credential delivery; LSASS then remained
+    in its ordinary one-second IOCP timeout loop, so no summary or sentinel was reached. Comparing
+    the accepted and rejected traces shows identical hive mounts and service identity but a
+    different concurrent LSASS `NtFlushKey`/SCM `RegCopyTreeW` interleaving: the failure occurs in
+    Configuration Manager key-copy progress, not in the new I/O record APIs or process teardown.
+    Do not count this as a desktop proof. Retry once from the audited lifecycle implementation; if
+    LastKnownGood fails again, add a bounded services-badge failure trace for key query/enumerate/
+    open/create/set with resolved paths and fix the generic CM race before accepting this checkpoint.
+
+    The serialized retry `.tmp/run-desktop-canonical-irp-objectref-retry-20260823.log` did not repeat
+    the LastKnownGood failure: SCM stayed alive and winlogon reached the fully painted credential
+    dialog. It is nevertheless rejected. One `NtUserGetMessage` completed after a long chain of
+    real `WM_SETTINGCHANGE` user callbacks; the returned `WM_CHAR` reached user32, but executive
+    credential accounting compared the generic pointer-width transport result to the full-width
+    value `1`. USER Get/Peek return a 32-bit `BOOL`, while the transport intentionally preserves the
+    handler's full RAX for pointer-width USER/GDI services, so undefined high bits made the valid
+    completion fail that proof comparison. The counter remained at 12/13, Return was not posted,
+    and the next blocking GetMessage entered win32k on an empty queue.
+
+    The ABI rule is now host-tested in `nt-user-callback`: completed Get/Peek message availability
+    is classified from the low 32-bit BOOL, rejects FALSE/error/other service results, and credential
+    observation also requires each exact UTF-16 code unit in order instead of counting any WM_CHAR
+    targeted at the edit control. Completed callback copyout continues to snapshot the staged MSG
+    only after the outer win32k dispatch has finished. An experimental run that captured the shared
+    argument page at callback suspension reached `293/293`, but it is explicitly rejected and that
+    code was removed: ReactOS keeps the MSG kernel-local until every sent-message callback finishes,
+    so the shared page is not dispatch-owned at suspension and can contain nested-dispatch bytes.
+
+    The corrected serialized proof `.tmp/run-desktop-canonical-irp-bool-width-20260823.log` is
+    accepted. All 13 exact credential characters and Return are delivered, the edit control renders
+    the exact username through real GDI, userinit and Explorer launch dynamically, and Explorer
+    completes 668 api0 callbacks with zero live/dead callback failures or win32k pool exhaustion.
+    Paint reaches 5 BeginPaint, 20 EndPaint, 187 direct GDI returns, and 135 batch flushes carrying
+    184 records; all 786,432 framebuffer pixels are non-background with at least 32 colors. Pool
+    corruption, double-free, list-cycle, and invalid-free counters remain zero. The gate passes
+    `293/293` and emits the sentinel. Validation is green for `cargo fmt --all`, `cargo test -p
+    nt-user-callback` (`57/57`), `cargo test -p nt-io-manager` (`138/138`), `cargo test -p
+    nt-object-server` (four unit plus seven roundtrip tests), the freestanding executive check, and
+    `git diff --check`.
+
+    Review adjustment: this closes the crate-first ownership tranche. Next, pass the canonical
+    `IrpId` through the hosted dispatch ABI, establish a canonical `(device, FsContext) -> FileId`
+    binding, and insert the hosted raw WDM owner before calling `MajorFunction` so inline
+    `IoCompleteRequest` cannot race owner publication. The generic completion broker must publish
+    every device/major result into the I/O Manager queue, copy output to the executive delivery
+    target, ACK only after that copy, and then delete the old fid/direction-specific retained
+    delivery and completion-discard cancellation paths. Client/driver teardown must request and
+    drain terminal completion rather than directly discard driver-owned pending IRPs. Only after
+    that ownership bridge is green should the plan move to the real stack unwinder and
+    `STATUS_MORE_PROCESSING_REQUIRED` semantics. Canonical async transfer buffers also remain open:
+    the raw hosted graph currently owns their lifetime, while `IrpRecord` alone carries only a
+    buffer projection. The bridge must transfer that owned/registered buffer lifetime through ACK;
+    a borrowed local `Vec` is not an acceptable generic async completion source.
+
+    Review adjustment after the rejected boots: keep the hosted canonical-IRP bridge as the primary
+    next tranche, but close three generic correctness debts alongside it. First, completed win32k
+    dispatch metadata must explicitly say whether an output was staged in the shared argument
+    window; SSN or process role must not imply ownership for future direct-attached GUI clients.
+    Second, a callback raised while redriving a queue-event GetMessage must transfer the parked
+    caller/reply ownership into the callback completion record instead of cancelling the real
+    callback after it may have dequeued a message. Third, Configuration Manager must never report
+    successful enumeration with a failed user copyout: `NtEnumerateKey` still discards the result of
+    its KEY_INFORMATION write, and registry counted-string capture must require exactly the declared
+    `UNICODE_STRING.Length`. These are mechanism fixes, not reasons to reintroduce message, registry,
+    or boot-order fallbacks.

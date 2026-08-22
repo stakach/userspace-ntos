@@ -163,6 +163,30 @@ pub struct ObReferenceFileHandleRequest {
     pub handle: u64,
 }
 
+/// `OB_OP_REFERENCE_HANDLE` payload. The service retains the returned object
+/// until the caller releases the opaque reference id.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObReferenceHandleRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub desired_access: u32,
+    /// Expected object type id (0 = any).
+    pub expected_type: u64,
+    pub handle: u64,
+}
+
+/// `OB_OP_DEREFERENCE_OBJECT` payload. `reference_id` is the client-scoped
+/// token returned by `OB_OP_REFERENCE_HANDLE`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObDereferenceObjectRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub reference_id: u64,
+}
+
 /// `OB_OP_LOOKUP_PATH` payload.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -224,6 +248,8 @@ const _: () = {
     assert!(size_of::<ObCreateIoObjectRequest>() == 32);
     assert!(size_of::<ObCreateFileHandleRequest>() == 32);
     assert!(size_of::<ObReferenceFileHandleRequest>() == 16);
+    assert!(size_of::<ObReferenceHandleRequest>() == 24);
+    assert!(size_of::<ObDereferenceObjectRequest>() == 16);
     assert!(size_of::<ObLookupPathRequest>() == 12);
     assert!(size_of::<ObQueryObjectInfo>() == 48);
     assert!(size_of::<ObCloseHandleRequest>() == 16);
@@ -232,6 +258,7 @@ const _: () = {
     assert!(align_of::<ObOpenObjectRequest>() == 8);
     assert!(align_of::<ObCreateFileHandleRequest>() == 8);
     assert!(align_of::<ObReferenceFileHandleRequest>() == 8);
+    assert!(align_of::<ObReferenceHandleRequest>() == 8);
     assert!(align_of::<ObLookupPathRequest>() == 4);
 };
 

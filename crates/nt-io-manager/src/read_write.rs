@@ -196,7 +196,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
         type3_input_buffer: Option<&mut [u8]>,
         user_buffer: Option<&mut [u8]>,
     ) -> Result<u64, NtStatus> {
+        let driver_id = self
+            .device(device_id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
         let mut irp = IrpRecord::new(client, device_id, file_id, major);
+        irp.driver_id = driver_id;
         let mut sl = IoStackLocation::new(major, device_id, file_id);
         sl.parameters = params;
         irp.stack.push(sl);
@@ -218,7 +223,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             output_len,
             access: BufferAccess::ReadWrite,
         });
-        let irp_id = self.allocate_irp(irp);
+        let irp_id = self.allocate_irp(irp)?;
         self.irp_mut(irp_id)
             .unwrap()
             .transition(IrpState::Initialized);
@@ -226,9 +231,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .unwrap()
             .transition(IrpState::Dispatched);
         let outcome = self.dispatch_to_driver_with_transfer_buffers(
-            self.device(device_id)
-                .ok_or(NtStatus::INVALID_PARAMETER)?
-                .driver_id,
+            driver_id,
             irp_id,
             system_buffer,
             direct_buffer,
@@ -245,6 +248,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,
     ) -> Result<u64, NtStatus> {
+        if self
+            .irp(irp_id)
+            .map(|irp| irp.state != IrpState::Dispatched)
+            .unwrap_or(true)
+        {
+            return Err(NtStatus::PENDING);
+        }
         match outcome {
             Ok(DispatchOutcome::Completed {
                 status,

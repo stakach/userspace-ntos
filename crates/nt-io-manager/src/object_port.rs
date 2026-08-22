@@ -77,6 +77,21 @@ pub trait ObjectManagerPort {
         desired_access: AccessMask,
     ) -> Result<ObjectId, NtStatus>;
 
+    /// Take a strong Object Manager reference to the File behind `handle`.
+    /// Returns an opaque client-scoped token released after final close.
+    fn retain_file_object(
+        &mut self,
+        client: ClientId,
+        handle: HandleValue,
+    ) -> Result<u64, NtStatus>;
+
+    /// Release a token returned by [`retain_file_object`](Self::retain_file_object).
+    fn release_object_reference(
+        &mut self,
+        client: ClientId,
+        reference: u64,
+    ) -> Result<(), NtStatus>;
+
     /// Validate that `device_object` still names a live `Device` object.
     fn reference_device(&mut self, device_object: ObjectId) -> Result<(), NtStatus>;
 
@@ -98,6 +113,12 @@ struct MockHandle {
     live: bool,
 }
 
+struct MockReference {
+    client: ClientId,
+    id: u64,
+    object: ObjectId,
+}
+
 /// An in-memory [`ObjectManagerPort`] for tests: it assigns object ids + handles,
 /// tracks named devices/drivers, symbolic links, and per-client handles, and does
 /// exact + symlink path resolution. Not generation-protected (test fake).
@@ -112,11 +133,23 @@ pub struct MockObjectPort {
     files: Vec<ObjectId>,
     symlinks: Vec<(NtPath, NtPath)>,
     handles: Vec<MockHandle>,
+    references: Vec<MockReference>,
+    next_reference: u64,
 }
 
 impl MockObjectPort {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn retained_reference_count(&self) -> usize {
+        self.references.len()
+    }
+
+    pub fn is_object_retained(&self, object: ObjectId) -> bool {
+        self.references
+            .iter()
+            .any(|reference| reference.object == object)
     }
 
     fn new_object(&mut self) -> ObjectId {
@@ -147,6 +180,8 @@ impl ObjectManagerPort for MockObjectPort {
         for h in self.handles.iter_mut().filter(|h| h.client == client) {
             h.live = false;
         }
+        self.references
+            .retain(|reference| reference.client != client);
         Ok(())
     }
 
@@ -275,6 +310,40 @@ impl ObjectManagerPort for MockObjectPort {
         Ok(h.object)
     }
 
+    fn retain_file_object(
+        &mut self,
+        client: ClientId,
+        handle: HandleValue,
+    ) -> Result<u64, NtStatus> {
+        let object = self
+            .handles
+            .iter()
+            .find(|entry| entry.live && entry.client == client && entry.handle == handle)
+            .map(|entry| entry.object)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        self.next_reference = self
+            .next_reference
+            .checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let id = self.next_reference;
+        self.references.push(MockReference { client, id, object });
+        Ok(id)
+    }
+
+    fn release_object_reference(
+        &mut self,
+        client: ClientId,
+        reference: u64,
+    ) -> Result<(), NtStatus> {
+        let index = self
+            .references
+            .iter()
+            .position(|entry| entry.client == client && entry.id == reference)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        self.references.remove(index);
+        Ok(())
+    }
+
     fn reference_device(&mut self, device_object: ObjectId) -> Result<(), NtStatus> {
         if self.device_ids.contains(&device_object) {
             Ok(())
@@ -302,6 +371,8 @@ pub use library::ObjectManagerLibraryPort;
 /// Object Manager share a node; the port owns a bootstrapped `ObjectManager`.
 #[cfg(feature = "object-manager")]
 mod library {
+    use alloc::vec::Vec;
+
     use super::ObjectManagerPort;
     use nt_object_manager::{ClientKind, ComponentId, ObjectManager, ObjectRef};
     use nt_status::NtStatus;
@@ -316,6 +387,8 @@ mod library {
     pub struct ObjectManagerLibraryPort {
         om: ObjectManager,
         component: ComponentId,
+        references: Vec<(u64, ClientId, ObjectRef)>,
+        next_reference: u64,
     }
 
     impl ObjectManagerLibraryPort {
@@ -324,7 +397,12 @@ mod library {
         pub fn new(component: ComponentId) -> Result<Self, NtStatus> {
             let mut om = ObjectManager::new();
             om.bootstrap_namespace()?;
-            Ok(Self { om, component })
+            Ok(Self {
+                om,
+                component,
+                references: Vec::new(),
+                next_reference: 0,
+            })
         }
 
         /// Borrow the underlying Object Manager (e.g. to seed test devices).
@@ -348,6 +426,7 @@ mod library {
         }
 
         fn close_client(&mut self, client: ClientId) -> Result<(), NtStatus> {
+            self.references.retain(|(_, owner, _)| *owner != client);
             self.om.close_client(client)
         }
 
@@ -445,6 +524,40 @@ mod library {
                 self.om
                     .reference_by_handle(client, handle, self.om.file_type(), desired_access)?;
             Ok(r.id())
+        }
+
+        fn retain_file_object(
+            &mut self,
+            client: ClientId,
+            handle: HandleValue,
+        ) -> Result<u64, NtStatus> {
+            let object = self.om.reference_by_handle(
+                client,
+                handle,
+                self.om.file_type(),
+                AccessMask::empty(),
+            )?;
+            self.next_reference = self
+                .next_reference
+                .checked_add(1)
+                .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+            let id = self.next_reference;
+            self.references.push((id, client, object));
+            Ok(id)
+        }
+
+        fn release_object_reference(
+            &mut self,
+            client: ClientId,
+            reference: u64,
+        ) -> Result<(), NtStatus> {
+            let index = self
+                .references
+                .iter()
+                .position(|(id, owner, _)| *id == reference && *owner == client)
+                .ok_or(NtStatus::INVALID_HANDLE)?;
+            self.references.remove(index);
+            Ok(())
         }
 
         fn reference_device(&mut self, device_object: ObjectId) -> Result<(), NtStatus> {

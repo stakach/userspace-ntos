@@ -255,6 +255,14 @@ pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
 pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
 pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
 pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
+
+/// Whether a completed Get/Peek dispatch returned a message. These USER services return a 32-bit
+/// `BOOL`; the generic win32k transport preserves the handler's full RAX so its high half is not
+/// part of this ABI result and must not participate in the comparison.
+pub const fn message_dispatch_returned_message(ssn: u64, raw_result: u64) -> bool {
+    matches!(ssn, NTUSER_GET_MESSAGE_SSN | NTUSER_PEEK_MESSAGE_SSN) && raw_result as u32 == 1
+}
+
 /// `w32ksvc64.h`: `SVC_(UserPostMessage, 4)` — the REAL keyboard/message post path. Used both for
 /// the simulated Ctrl-Alt-Del SAS and for the credential keystrokes injected into the logon dialog.
 pub const NTUSER_POST_MESSAGE_SSN: u64 = 0x100e;
@@ -652,7 +660,11 @@ impl CredentialInjectionSequence {
         if self.username_hwnd == 0 || hwnd != self.username_hwnd {
             return false;
         }
-        if message == WM_CHAR && (self.retrieved_chars as usize) < LOGON_USERNAME.len() {
+        let retrieved_index = self.retrieved_chars as usize;
+        if message == WM_CHAR
+            && retrieved_index < LOGON_USERNAME.len()
+            && wparam == LOGON_USERNAME[retrieved_index] as u64
+        {
             self.retrieved_chars += 1;
             return true;
         }
@@ -2488,8 +2500,8 @@ mod tests {
             injection.record_return_post(0x2008c),
             Err(ValidationError::Sequence)
         );
-        for _ in 0..LOGON_USERNAME.len() {
-            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        for unit in LOGON_USERNAME {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, unit as u64));
         }
         assert_eq!(
             injection.record_return_post(0x20088),
@@ -2511,11 +2523,12 @@ mod tests {
         // A paint for another control is not a keystroke; a WM_CHAR for another window is not ours.
         assert!(!injection.observe_retrieved(0x2008c, WM_PAINT, 0));
         assert!(!injection.observe_retrieved(0x2008e, WM_CHAR, b'A' as u64));
-        for _ in 0..LOGON_USERNAME.len() {
-            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert!(!injection.observe_retrieved(0x2008c, WM_CHAR, b'X' as u64));
+        for unit in LOGON_USERNAME {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, unit as u64));
         }
         // The queue can never hand back more characters than were typed.
-        assert!(!injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert!(!injection.observe_retrieved(0x2008c, WM_CHAR, b'X' as u64));
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
         assert!(!injection.keystrokes_delivered());
         assert!(injection.observe_retrieved(0x2008c, WM_KEYDOWN, VK_RETURN));
@@ -2530,8 +2543,8 @@ mod tests {
         for index in 0..LOGON_USERNAME.len() {
             assert_eq!(injection.record_char_post(0x2008c, index), Ok(()));
         }
-        for _ in 0..LOGON_USERNAME.len() - 1 {
-            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        for unit in LOGON_USERNAME.iter().take(LOGON_USERNAME.len() - 1) {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, *unit as u64));
         }
         assert!(!injection.username_chars_delivered());
         assert_eq!(
@@ -2544,7 +2557,11 @@ mod tests {
             injection.record_return_post(0x2008c),
             Err(ValidationError::Sequence)
         );
-        assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert!(injection.observe_retrieved(
+            0x2008c,
+            WM_CHAR,
+            LOGON_USERNAME[LOGON_USERNAME.len() - 1] as u64,
+        ));
         assert!(injection.username_ready_for_return());
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
     }
@@ -2565,14 +2582,18 @@ mod tests {
         );
         // Route while posted characters are still pending. A single routed call often drains many
         // nested modal messages, but it is not required to drain the whole user name.
-        for _ in 0..LOGON_USERNAME.len() - 1 {
+        for unit in LOGON_USERNAME.iter().take(LOGON_USERNAME.len() - 1) {
             assert!(injection.may_route_get_message());
             injection.record_routed_get_message();
-            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, *unit as u64));
         }
         assert!(injection.may_route_get_message());
         injection.record_routed_get_message();
-        assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        assert!(injection.observe_retrieved(
+            0x2008c,
+            WM_CHAR,
+            LOGON_USERNAME[LOGON_USERNAME.len() - 1] as u64,
+        ));
         assert!(!injection.may_route_get_message());
         assert!(injection.username_chars_delivered());
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
@@ -2595,8 +2616,8 @@ mod tests {
             injection.record_routed_get_message();
         }
         assert!(!injection.may_route_get_message());
-        for _ in 0..LOGON_USERNAME.len() {
-            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, b'A' as u64));
+        for unit in LOGON_USERNAME {
+            assert!(injection.observe_retrieved(0x2008c, WM_CHAR, unit as u64));
         }
         assert!(!injection.may_route_get_message());
         assert_eq!(injection.record_return_post(0x2008c), Ok(()));
@@ -3737,5 +3758,34 @@ mod gdi_batch_tests {
             records += 1;
         });
         assert_eq!(records, 1);
+    }
+}
+
+#[cfg(test)]
+mod message_result_tests {
+    use super::*;
+
+    #[test]
+    fn message_result_uses_the_32_bit_bool_abi() {
+        assert!(message_dispatch_returned_message(
+            NTUSER_GET_MESSAGE_SSN,
+            0xfeed_beef_0000_0001,
+        ));
+        assert!(message_dispatch_returned_message(
+            NTUSER_PEEK_MESSAGE_SSN,
+            0xdead_cafe_0000_0001,
+        ));
+        assert!(!message_dispatch_returned_message(
+            NTUSER_GET_MESSAGE_SSN,
+            0x0000_0001_0000_0000,
+        ));
+        assert!(!message_dispatch_returned_message(
+            NTUSER_GET_MESSAGE_SSN,
+            u32::MAX as u64,
+        ));
+        assert!(!message_dispatch_returned_message(
+            NTUSER_DISPATCH_MESSAGE_SSN,
+            1,
+        ));
     }
 }

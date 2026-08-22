@@ -14708,6 +14708,26 @@ pub(crate) unsafe fn object_manager_reference_file_handle(
         .map(|id| id.0)
 }
 
+pub(crate) unsafe fn object_manager_retain_file_handle(
+    handle: nt_types::HandleValue,
+) -> Result<u64, nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client
+        .reference_handle(handle, None, nt_types::AccessMask::empty())
+        .map(|(_, reference)| reference)
+}
+
+pub(crate) unsafe fn object_manager_release_reference(
+    reference: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client.dereference_object(reference)
+}
+
 pub(crate) unsafe fn object_manager_close_handle(
     handle: nt_types::HandleValue,
 ) -> Result<(), nt_status::NtStatus> {

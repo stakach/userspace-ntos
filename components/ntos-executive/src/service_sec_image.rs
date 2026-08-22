@@ -744,7 +744,9 @@ unsafe fn process_completed_user_callback_outer_dispatch(
             }
             return false;
         }
-        if completion_pi == 2 && dispatch.status == 1 {
+        if completion_pi == 2
+            && nt_user_callback::message_dispatch_returned_message(dispatch.ssn, dispatch.status)
+        {
             let hwnd = u64::from_le_bytes(dispatch.arg_snapshot[0..8].try_into().unwrap());
             let wparam = u64::from_le_bytes(dispatch.arg_snapshot[16..24].try_into().unwrap());
             winlogon_credential_observe_retrieved(hwnd, message, wparam);

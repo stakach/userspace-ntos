@@ -119,6 +119,64 @@ fn service_creates_and_references_file_handles() {
 }
 
 #[test]
+fn persistent_reference_keeps_file_alive_after_handle_close() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let (file, reference) = {
+        let mut c = client(&mut server, cid);
+        let dev = c.create_device("\\Device\\Ref0", 0x494f, 10, true).unwrap();
+        let (file, handle) = c
+            .create_file_handle(0x494f, 99, dev, AccessMask::GENERIC_READ)
+            .unwrap();
+        let (referenced, reference) = c
+            .reference_handle(handle, None, AccessMask::GENERIC_READ)
+            .unwrap();
+        assert_eq!(referenced, file);
+        c.close_handle(handle).unwrap();
+        (file, reference)
+    };
+
+    assert!(server.object_manager().reference_by_id(file).is_ok());
+    client(&mut server, cid)
+        .dereference_object(reference)
+        .unwrap();
+    assert_eq!(
+        server.object_manager().reference_by_id(file).unwrap_err(),
+        NtStatus::INVALID_HANDLE
+    );
+}
+
+#[test]
+fn persistent_reference_is_client_scoped_and_disconnect_releases_it() {
+    let mut server = Server::new().unwrap();
+    let owner = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let other = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let (file, reference) = {
+        let mut c = client(&mut server, owner);
+        let dev = c.create_device("\\Device\\Ref1", 0x494f, 10, true).unwrap();
+        let (file, handle) = c
+            .create_file_handle(0x494f, 99, dev, AccessMask::GENERIC_READ)
+            .unwrap();
+        let (_, reference) = c
+            .reference_handle(handle, None, AccessMask::empty())
+            .unwrap();
+        c.close_handle(handle).unwrap();
+        (file, reference)
+    };
+    assert_eq!(
+        client(&mut server, other)
+            .dereference_object(reference)
+            .unwrap_err(),
+        NtStatus::INVALID_HANDLE
+    );
+    server.disconnect(owner).unwrap();
+    assert_eq!(
+        server.object_manager().reference_by_id(file).unwrap_err(),
+        NtStatus::INVALID_HANDLE
+    );
+}
+
+#[test]
 fn client_death_closes_handles_permanent_survives() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);

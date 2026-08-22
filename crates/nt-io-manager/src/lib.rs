@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use nt_status::NtStatus;
 use nt_types::{NtPath, ObjectId};
@@ -39,6 +40,7 @@ mod retained_completion;
 mod store;
 mod wdm_x64;
 
+pub use complete::CompletedIrp;
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use dispatch::{
     DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
@@ -51,6 +53,7 @@ pub use driver_host::{DriverHostRoutine, MvpStatus};
 pub use driver_peer::{
     DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl, PeerTransferBuffers,
 };
+pub use external_dispatch::ExternalDispatchResult;
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
@@ -103,6 +106,7 @@ pub struct IoManager<P> {
     devices: GenStore<DeviceId, DeviceRecord>,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
+    completed_irps: VecDeque<IrpId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
 }
@@ -115,6 +119,7 @@ impl<P> IoManager<P> {
             devices: GenStore::new(),
             files: GenStore::new(),
             irps: GenStore::new(),
+            completed_irps: VecDeque::new(),
             port,
             backends: Vec::new(),
         }
@@ -480,7 +485,15 @@ impl<P> IoManager<P> {
     pub fn file_mut(&mut self, id: FileId) -> Option<&mut FileRecord> {
         self.files.get_mut(id)
     }
-    pub fn remove_file(&mut self, id: FileId) -> Option<FileRecord> {
+    pub(crate) fn remove_file(&mut self, id: FileId) -> Option<FileRecord> {
+        if self
+            .files
+            .get(id)
+            .map(|file| file.outstanding_irp_refs != 0)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         self.files.remove(id)
     }
     pub fn file_count(&self) -> usize {
@@ -490,10 +503,36 @@ impl<P> IoManager<P> {
     // --- IRPs --------------------------------------------------------------
 
     /// Allocate an IRP record, assigning + returning its id.
-    pub fn allocate_irp(&mut self, record: IrpRecord) -> IrpId {
+    pub fn allocate_irp(&mut self, record: IrpRecord) -> Result<IrpId, NtStatus> {
+        if let Some(file_id) = record.file_id {
+            let file = self.files.get(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+            let file_driver = self
+                .devices
+                .get(file.device_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+                .driver_id;
+            let valid_state = match record.major {
+                nt_io_abi::major::IRP_MJ_CREATE => file.state == FileState::Allocated,
+                nt_io_abi::major::IRP_MJ_CLEANUP => file.state == FileState::CleanupPending,
+                nt_io_abi::major::IRP_MJ_CLOSE => file.state == FileState::ClosePending,
+                _ => file.state == FileState::Open,
+            };
+            if file.client_id != record.client_id
+                || file_driver != record.driver_id
+                || (record.device_id != DeviceId::NULL && file.device_id != record.device_id)
+                || !valid_state
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let file = self.files.get_mut(file_id).expect("validated file");
+            file.outstanding_irp_refs = file
+                .outstanding_irp_refs
+                .checked_add(1)
+                .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        }
         let id = self.irps.insert(record);
         self.irps.get_mut(id).expect("just inserted").id = id;
-        id
+        Ok(id)
     }
 
     pub fn irp(&self, id: IrpId) -> Option<&IrpRecord> {
@@ -503,7 +542,17 @@ impl<P> IoManager<P> {
         self.irps.get_mut(id)
     }
     pub fn free_irp(&mut self, id: IrpId) -> Option<IrpRecord> {
-        self.irps.remove(id)
+        let record = self.irps.remove(id)?;
+        self.completed_irps.retain(|queued| *queued != id);
+        if let Some(file_id) = record.file_id {
+            if let Some(file) = self.files.get_mut(file_id) {
+                file.outstanding_irp_refs = file
+                    .outstanding_irp_refs
+                    .checked_sub(1)
+                    .expect("canonical FILE_OBJECT IRP reference underflow");
+            }
+        }
+        Some(record)
     }
     pub fn irp_count(&self) -> usize {
         self.irps.len()
@@ -868,7 +917,9 @@ mod tests {
         let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
-        let iid = om.allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_CREATE));
+        let iid = om
+            .allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_CREATE))
+            .unwrap();
 
         let irp = om.irp_mut(iid).unwrap();
         assert_eq!(irp.state, IrpState::Allocated);
@@ -888,7 +939,9 @@ mod tests {
         let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
-        let iid = om.allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_READ));
+        let iid = om
+            .allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_READ))
+            .unwrap();
         let irp = om.irp_mut(iid).unwrap();
         assert!(irp.transition(IrpState::Initialized));
         assert!(irp.transition(IrpState::Dispatched));
@@ -1637,7 +1690,7 @@ mod tests {
             length: buf.len() as u32,
         });
 
-        let (status, info) = om
+        let result = om
             .build_and_dispatch_external_to_device(
                 ClientId(44),
                 device,
@@ -1652,7 +1705,13 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!((status, info), (warning, 3));
+        assert_eq!(
+            result,
+            ExternalDispatchResult::Completed {
+                status: warning,
+                information: 3,
+            }
+        );
         assert_eq!(&buf[..3], b"out");
         assert_eq!(om.irp_count(), 0);
         let seen = seen.borrow();
@@ -1687,7 +1746,7 @@ mod tests {
         });
         let mut buf = *b"ping";
 
-        let (status, info) = om
+        let result = om
             .build_and_dispatch_external_to_driver(
                 ClientId(55),
                 driver,
@@ -1702,7 +1761,13 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!((status, info), (NtStatus::SUCCESS, 4));
+        assert_eq!(
+            result,
+            ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 4,
+            }
+        );
         assert_eq!(&buf, b"pong");
         assert_eq!(om.irp_count(), 0);
         let seen = seen.borrow();
@@ -1737,6 +1802,183 @@ mod tests {
 
     // --- Completion / cancellation engine + cleanup/close ------------------
 
+    #[test]
+    fn external_pending_dispatch_retains_canonical_irp() {
+        let mut om = io();
+        let client = om.register_client();
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let driver = om
+            .create_driver(&path("\\Driver\\ExternalPending"), Box::new(mock))
+            .unwrap();
+        let mut buffer = [0u8; 4];
+        let result = om
+            .build_and_dispatch_external_to_driver(
+                client,
+                driver,
+                None,
+                0xCAFE,
+                99,
+                major::IRP_MJ_DEVICE_CONTROL,
+                IoParameters::DeviceControl(DeviceControlParameters {
+                    ioctl_code: 0x222000,
+                    input_len: 4,
+                    output_len: 4,
+                }),
+                4,
+                4,
+                &mut buffer,
+            )
+            .unwrap();
+        let irp_id = match result {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending external dispatch, got {other:?}"),
+        };
+        let irp = om.irp(irp_id).unwrap();
+        assert_eq!(irp.state, IrpState::Pending);
+        assert_eq!(irp.driver_id, driver);
+        assert_eq!((irp.user_data, irp.requestor_tid), (0xCAFE, 99));
+
+        om.cancel(client, irp_id).unwrap();
+        assert_eq!(om.irp(irp_id).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
+        om.acknowledge_completed_irp(irp_id).unwrap();
+        assert!(om.irp(irp_id).is_none());
+    }
+
+    #[test]
+    fn completion_publication_authenticates_driver_and_terminal_status() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, _client, irp) = pending_read(mock);
+        let owner = om.irp(irp).unwrap().driver_id;
+        let other = om
+            .create_driver(
+                &path("\\Driver\\OtherCompletionSource"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let completion = DriverCompletion {
+            irp_id: irp,
+            status: NtStatus::SUCCESS,
+            information: 1,
+        };
+        assert!(!om.publish_driver_completion(other, completion));
+        assert!(!om.publish_driver_completion(
+            owner,
+            DriverCompletion {
+                status: NtStatus::PENDING,
+                ..completion
+            }
+        ));
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::Pending);
+        assert!(om.publish_driver_completion(owner, completion));
+        assert!(!om.publish_driver_completion(owner, completion));
+        om.acknowledge_completed_irp(irp).unwrap();
+    }
+
+    #[test]
+    fn external_dispatch_rejects_stale_file_identity() {
+        let (mut om, client, handle) =
+            open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
+        let (file_id, device_id) = om
+            .reference_open_file(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let driver_id = om.device(device_id).unwrap().driver_id;
+        om.close(client, handle).unwrap();
+        let mut buffer = [0u8; 1];
+        assert_eq!(
+            om.build_and_dispatch_external_to_driver(
+                client,
+                driver_id,
+                Some(file_id),
+                0,
+                0,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 1,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                1,
+                &mut buffer,
+            ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
+    #[derive(Default)]
+    struct PendingCreateBackend {
+        ready: std::vec::Vec<DriverCompletion>,
+    }
+
+    impl DriverDispatchBackend for PendingCreateBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            if irp.major == major::IRP_MJ_CREATE {
+                Ok(DispatchOutcome::Pending)
+            } else {
+                Ok(DispatchOutcome::Completed {
+                    status: NtStatus::SUCCESS,
+                    information: 0,
+                })
+            }
+        }
+
+        fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+            self.ready.push(DriverCompletion {
+                irp_id,
+                status: NtStatus::CANCELLED,
+                information: 0,
+            });
+            Ok(())
+        }
+
+        fn poll_completion(&mut self) -> Option<DriverCompletion> {
+            self.ready.pop()
+        }
+    }
+
+    #[test]
+    fn pending_create_is_cancelled_and_retained_until_ack() {
+        let mut om = io();
+        let client = om.register_client();
+        om.create_driver(
+            &path("\\Driver\\PendingCreate"),
+            Box::new(PendingCreateBackend::default()),
+        )
+        .and_then(|driver| {
+            om.create_device(
+                driver,
+                Some(&path("\\Device\\PendingCreate0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            open_read(&mut om, client, "\\Device\\PendingCreate0"),
+            Err(NtStatus::PENDING)
+        );
+        let irp = om.pending_irps()[0];
+        let file_id = om.irp(irp).unwrap().file_id.unwrap();
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.file(file_id).unwrap().state, FileState::ClosePending);
+        assert_eq!(om.port().retained_reference_count(), 1);
+        assert_eq!(om.pump(), 1);
+        assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om.file(file_id).is_none());
+        assert_eq!(om.port().retained_reference_count(), 0);
+    }
+
     fn pending_read(mock: MockDriverBackend) -> (IoManager<MockObjectPort>, ClientId, IrpId) {
         let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
         let mut out = [0u8; 8];
@@ -1754,7 +1996,24 @@ mod tests {
         assert_eq!(om.pending_irps().len(), 1);
         assert_eq!(om.pump(), 1); // driver's completion is delivered
         assert!(om.pending_irps().is_empty());
-        assert!(om.irp(irp).is_none()); // finalized + freed
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::Completed);
+        assert_eq!(
+            om.next_completed_irp(),
+            Some(CompletedIrp {
+                id: irp,
+                client_id: om.irp(irp).unwrap().client_id,
+                driver_id: om.irp(irp).unwrap().driver_id,
+                file_id: om.irp(irp).unwrap().file_id,
+                device_id: om.irp(irp).unwrap().device_id,
+                major: major::IRP_MJ_READ,
+                user_data: 0,
+                requestor_tid: 0,
+                status: NtStatus::SUCCESS,
+                information: 4,
+            })
+        );
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om.irp(irp).is_none());
     }
 
     #[test]
@@ -1763,9 +2022,12 @@ mod tests {
         mock.set_force_pending(true); // no completion queued
         let (mut om, client, irp) = pending_read(mock);
         om.cancel(client, irp).unwrap();
-        assert!(om.irp(irp).is_none()); // finalized as cancelled + freed
+        assert_eq!(om.irp(irp).unwrap().state, IrpState::CancelRequested);
+        assert_eq!(om.pump(), 1);
         assert!(om.pending_irps().is_empty());
-        assert_eq!(om.pump(), 0);
+        assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om.irp(irp).is_none());
     }
 
     #[test]
@@ -1780,26 +2042,94 @@ mod tests {
 
     #[test]
     fn cancel_racing_completion_is_exactly_once() {
-        // Order A: cancel before pump — cancellation wins, completion dropped.
+        // Order A: no completion was ready, so the driver's cancellation result wins.
+        {
+            let mut mock = MockDriverBackend::new();
+            mock.set_force_pending(true);
+            let (mut om, client, irp) = pending_read(mock);
+            om.cancel(client, irp).unwrap();
+            assert_eq!(om.pump(), 1);
+            assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
+            om.acknowledge_completed_irp(irp).unwrap();
+            assert!(om.irp(irp).is_none());
+        }
+        // Order B: a completion was already ready when cancel arrived, so it wins.
         {
             let mut mock = MockDriverBackend::new();
             mock.set_force_pending(true);
             mock.set_pending_completion(NtStatus::SUCCESS, 4);
             let (mut om, client, irp) = pending_read(mock);
             om.cancel(client, irp).unwrap();
-            assert_eq!(om.pump(), 0); // no double finalize
-            assert!(om.irp(irp).is_none());
-        }
-        // Order B: pump before cancel — completion wins, cancel is a no-op.
-        {
-            let mut mock = MockDriverBackend::new();
-            mock.set_force_pending(true);
-            mock.set_pending_completion(NtStatus::SUCCESS, 4);
-            let (mut om, client, irp) = pending_read(mock);
             assert_eq!(om.pump(), 1);
-            om.cancel(client, irp).unwrap(); // already final: no-op
+            assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::SUCCESS);
+            om.cancel(client, irp).unwrap();
+            om.acknowledge_completed_irp(irp).unwrap();
             assert!(om.irp(irp).is_none());
         }
+    }
+
+    #[test]
+    fn close_waits_for_completed_irp_acknowledgement() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        mock.set_pending_completion(NtStatus::SUCCESS, 4);
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let (file_id, _) = om
+            .reference_open_file(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let mut out = [0u8; 8];
+        assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+        let irp = om.pending_irps()[0];
+        let object = om.file(file_id).unwrap().object_id;
+        assert_eq!(om.file(file_id).unwrap().outstanding_irp_refs, 1);
+        assert!(om.port().is_object_retained(object));
+
+        om.close(client, handle).unwrap();
+        let file = om.file(file_id).unwrap();
+        assert_eq!(file.state, FileState::ClosePending);
+        assert!(file.close_deferred);
+        assert!(!file.close_dispatched);
+        assert_eq!(file.outstanding_irp_refs, 1);
+        assert_eq!(
+            om.read(client, handle, 0, &mut out),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+
+        assert_eq!(om.pump(), 1);
+        assert!(om.file(file_id).is_some());
+        assert!(om.port().is_object_retained(object));
+        assert_eq!(om.file(file_id).unwrap().outstanding_irp_refs, 1);
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om.file(file_id).is_none());
+        assert!(!om.port().is_object_retained(object));
+    }
+
+    #[test]
+    fn completion_acknowledgement_can_release_independent_file_refs() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let (file_id, _) = om
+            .reference_open_file(client, handle, AccessMask::GENERIC_READ)
+            .unwrap();
+        let mut out = [0u8; 1];
+        assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+        assert_eq!(om.read(client, handle, 1, &mut out), Err(NtStatus::PENDING));
+        let irps = om.pending_irps();
+        assert_eq!(irps.len(), 2);
+        assert_eq!(om.file(file_id).unwrap().outstanding_irp_refs, 2);
+        om.close(client, handle).unwrap();
+
+        om.cancel(client, irps[0]).unwrap();
+        om.cancel(client, irps[1]).unwrap();
+        assert_eq!(om.pump(), 2);
+        let oldest = om.next_completed_irp().unwrap().id;
+        let newer = if oldest == irps[0] { irps[1] } else { irps[0] };
+        om.acknowledge_completed_irp(newer).unwrap();
+        assert_eq!(om.file(file_id).unwrap().outstanding_irp_refs, 1);
+        assert_eq!(om.next_completed_irp().unwrap().id, oldest);
+        om.acknowledge_completed_irp(oldest).unwrap();
+        assert!(om.file(file_id).is_none());
     }
 
     #[test]
@@ -1945,8 +2275,11 @@ mod tests {
             let (mut om, client, handle) = peer_device(&ctrl, AccessMask::GENERIC_READ);
             let mut out = [0u8; 8];
             assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+            let irp = om.pending_irps()[0];
             assert_eq!(om.pump(), 1);
             assert!(om.pending_irps().is_empty());
+            assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::SUCCESS);
+            om.acknowledge_completed_irp(irp).unwrap();
         }
         // Pending then cancel.
         {
@@ -1957,6 +2290,9 @@ mod tests {
             let _ = om.read(client, handle, 0, &mut out);
             let irp = om.pending_irps()[0];
             om.cancel(client, irp).unwrap();
+            assert_eq!(om.pump(), 1);
+            assert_eq!(om.next_completed_irp().unwrap().status, NtStatus::CANCELLED);
+            om.acknowledge_completed_irp(irp).unwrap();
             assert!(om.irp(irp).is_none());
         }
     }
@@ -2028,8 +2364,11 @@ mod tests {
 
         // The peer faults; pump detects it + fails the peer's in-flight IRPs.
         peer.set_faulted(true);
-        om.pump();
-        assert!(om.irp(irp).is_none());
+        assert_eq!(om.pump(), 1);
+        assert_eq!(
+            om.next_completed_irp().unwrap().status,
+            NtStatus::DEVICE_NOT_CONNECTED
+        );
         assert!(om.pending_irps().is_empty());
         assert!(om.device(pdev).unwrap().delete_pending);
         assert!(om
@@ -2037,6 +2376,8 @@ mod tests {
             .unwrap()
             .flags
             .contains(DriverFlags::FAULTED));
+        om.acknowledge_completed_irp(irp).unwrap();
+        assert!(om.irp(irp).is_none());
 
         // The unrelated mock device is untouched + still usable.
         assert!(!om.device(mdev).unwrap().delete_pending);

@@ -339,7 +339,18 @@ impl DriverPeerTransport for MockDriverPeer {
     }
 
     fn cancel(&mut self, irp_id: IrpId) {
-        self.state.borrow_mut().ready.retain(|c| c.irp_id != irp_id);
+        let mut state = self.state.borrow_mut();
+        if !state
+            .ready
+            .iter()
+            .any(|completion| completion.irp_id == irp_id)
+        {
+            state.ready.push(DriverCompletion {
+                irp_id,
+                status: NtStatus::CANCELLED,
+                information: 0,
+            });
+        }
     }
 
     fn poll_completion(&mut self) -> Option<DriverCompletion> {

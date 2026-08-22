@@ -232,12 +232,21 @@ impl DriverDispatchBackend for MockDriverBackend {
     }
 
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
-        // Drop any queued completion so a cancelled IRP is not also completed.
-        self.ready.retain(|c| c.irp_id != irp_id);
         match self.pending.iter().position(|&i| i == irp_id) {
             Some(pos) => {
                 self.pending.remove(pos);
-                self.cancelled.push(irp_id);
+                if !self
+                    .ready
+                    .iter()
+                    .any(|completion| completion.irp_id == irp_id)
+                {
+                    self.cancelled.push(irp_id);
+                    self.ready.push(DriverCompletion {
+                        irp_id,
+                        status: NtStatus::CANCELLED,
+                        information: 0,
+                    });
+                }
                 Ok(())
             }
             None => Err(NtStatus::INVALID_PARAMETER),

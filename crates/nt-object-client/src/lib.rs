@@ -18,8 +18,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
-    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObLookupPathRequest, ObOpenObjectRequest,
-    ObQueryObjectInfo, ObReferenceFileHandleRequest, ObReply,
+    ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
+    ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
+    ObReferenceHandleRequest, ObReply,
 };
 use nt_status::NtStatus;
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId};
@@ -94,6 +95,47 @@ impl<B: Backend> ObjectClient<B> {
         };
         let buf = bytemuck::bytes_of(&req).to_vec();
         let r = self.backend.call(opcode::OB_OP_CLOSE_HANDLE, &buf, &mut []);
+        NtStatus(r.status).to_result()
+    }
+
+    /// Take a persistent, client-scoped object reference through `handle`.
+    /// Returns the object id and an opaque token that must be released with
+    /// [`dereference_object`](Self::dereference_object).
+    pub fn reference_handle(
+        &mut self,
+        handle: HandleValue,
+        expected_type: Option<ObjectTypeId>,
+        desired_access: AccessMask,
+    ) -> Result<(ObjectId, u64), NtStatus> {
+        let req = ObReferenceHandleRequest {
+            abi_size: size_of::<ObReferenceHandleRequest>() as u16,
+            _reserved: 0,
+            desired_access: desired_access.bits(),
+            expected_type: expected_type.map_or(0, |ty| ty.0 as u64),
+            handle: handle.0,
+        };
+        let r = self.backend.call(
+            opcode::OB_OP_REFERENCE_HANDLE,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
+        NtStatus(r.status).to_result()?;
+        Ok((ObjectId(r.detail0), r.detail1))
+    }
+
+    /// Release a persistent object reference token owned by this client.
+    pub fn dereference_object(&mut self, reference_id: u64) -> Result<(), NtStatus> {
+        let req = ObDereferenceObjectRequest {
+            abi_size: size_of::<ObDereferenceObjectRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            reference_id,
+        };
+        let r = self.backend.call(
+            opcode::OB_OP_DEREFERENCE_OBJECT,
+            bytemuck::bytes_of(&req),
+            &mut [],
+        );
         NtStatus(r.status).to_result()
     }
 
